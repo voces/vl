@@ -20252,21 +20252,23 @@ function lcatBaseOfRep(kind: i32, slot: i32) {
 // Where a struct compare's field chain reads each side's root from: `expr` the operand node
 // itself, legacy's (`EQ_ROOTS_EXPR`); `local` local `epSlot`; `elem` the operand's ref list
 // element read over receiver local `epSlot` and index local `epIdx`, or immediate `epImm` where
-// `epIdx` is -1.
+// `epIdx` is -1. Each `elem` read writes its element-read row into `epRows` as node, from, to.
 export type EqRootKind = "expr" | "local" | "elem"
 export type EqRootPlace = {
   epKind: EqRootKind,
   epSlot: i32,
   epIdx: i32,
   epImm: i32,
+  epRows: i32[],
 }
 export type EqRootPlan = { erL: EqRootPlace, erR: EqRootPlace }
 
-const EQ_ROOT_EXPR: EqRootPlace = {
+export const EQ_ROOT_EXPR: EqRootPlace = {
   epKind: "expr",
   epSlot: -1,
   epIdx: -1,
   epImm: 0,
+  epRows: [],
 }
 
 export const EQ_ROOTS_EXPR: EqRootPlan = {
@@ -20324,12 +20326,33 @@ function emitChainRead(
 // receiver and index `place` names.
 function emitChainRootElem(rootIx: i32, fnIx: i32, place: EqRootPlace): i32 {
   const nd = nodeAt(rootIx)
-  if !(nd is Index) || idxArmOf(nd, fnIx) != "ref" {
+  if !(nd is Index) || !refListReadPlain(rootIx, fnIx) {
     return emitFail(
-      "emitProgram: internal: an element compare root is no ref list read",
+      "emitProgram: internal: an element compare root is no plain ref list read",
     )
   }
-  return refListReadAt(nd, rootIx, fnIx, place)
+  const from = curBuf.length
+  if refListReadAt(nd, rootIx, fnIx, place) < 0 { return -1 }
+  if idxRowsOn() && curBuf.length > from {
+    place.epRows.push(rootIx)
+    place.epRows.push(from)
+    place.epRows.push(curBuf.length)
+  }
+  return 0
+}
+
+// Whether `emitIndex` writes `idxIx` as `refListReadAt` alone: a ref list read with no arm
+// override, arm site or null cell ahead of it, over a minted, non-nullable ref list receiver.
+export function refListReadPlain(idxIx: i32, fnIx: i32): boolean {
+  const nd = nodeAt(idxIx)
+  if !(nd is Index) || idxArmOf(nd, fnIx) != "ref" { return false }
+  if luOvLocNodes.length > 0 && luOvLocalOf(idxIx) >= 0 { return false }
+  if armSiteReads(idxIx, fnIx) || idxCellReadIsNull(idxIx, fnIx) {
+    return false
+  }
+  return rlRowsMinted()
+    && !exprNullableRefArray(nd.idxArr, fnIx)
+    && refListSlotOfExpr(nd.idxArr, fnIx) >= 0
 }
 
 // Compare two closure fat-pointers already on the stack (left below right), leaving a
