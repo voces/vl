@@ -25,10 +25,15 @@ is the third route of the class, after `nulNiche` (#9476) and `numUnion`.
 
 ## Measured
 
-Against master 040768a4's fixpoint seed:
-- the 39 `structEq` witness files go from 246 to 268 functions covered = verified = matched, with
-  no mismatch;
-- the 25 left are `record compare place operand`.
+Against master 898b840d's fixpoint seed (lane IR-N8, which took the branch over from IR-N7):
+- `tests/cases` covered = verified 68,120 → 68,142 (+22), matched 68,119 → 68,141, no new fail or
+  mismatch row; the corpus is unchanged at 45,028;
+- the 25 `structEq` compares left are `record compare place operand`: a field or index place
+  legacy re-reads at every field;
+- `ir-identity --cases`, `--claimless` and `--names` differ 0; the legacy A/B over `tests/cases`
+  differs 0;
+- L2 fuel +0.12% per PR, all source growth: the head seed compiles the base tree within +0.0004%
+  of the base seed's fuel.
 
 The row `tests/ir-shadow-rows/record-struct-eq.vl` has 7 functions; 6 are `operand type` on
-master's seed, and here all 7 are covered and matched. The full table is in the PR body.
+master's seed, and here all 7 are covered and matched.
