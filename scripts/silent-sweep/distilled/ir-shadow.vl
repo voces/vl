@@ -16,8 +16,9 @@
 // functions a coverage step unblocks, an upper bound since a statement stops at its first miss.
 // `--claims` builds disarmed (`$VL_IR_SHADOW=5`), as shipped, and exits 1 on any `claim fell back`
 // row: a claimed function whose lowering or verifier failed would hide behind legacy's bytes.
-// `--claims` also builds the programs `claims-fallbacks.txt` names from outside the corpus, and
-// reds when one falls back more than that file says; `--write-fallbacks` rewrites the counts.
+// `--claims` also builds the programs `claims-fallbacks.txt` names from outside the corpus and
+// every inventory witness filed `runs`, and reds when one falls back more than that file says
+// (a witness by its row's file); `--write-fallbacks` rewrites the counts.
 // `--cases` runs the armed shadow over every `tests/cases` program instead, against
 // `ir-shadow-cases-baseline.txt`, which also holds that population's verifier failures. In both
 // populations a `bytes` class is never baselined: a claimable function whose bytes differ ships
@@ -105,10 +106,14 @@ function countOf(rows: Row[], key: string): i32 {
   return 0
 }
 
-// Adds the `[ir] <path>: <n>\t<row>` lines of one chunk's stderr into `m`, each class prefixed
-// by its path and a tab when `keyed`. A verifier failure's row carries its function's IR on the
-// lines after it; only its first line is the class.
-function addRows(m: Measured, text: string, keyed: boolean) {
+// Which rows carry their program's path ahead of the class, and a tab: none, every row, or only
+// the fallback rows, so a large population keeps few distinct keys.
+type Keying = "none" | "every row" | "fallback rows"
+
+// Adds the `[ir] <path>: <n>\t<row>` lines of one chunk's stderr into `m`, keyed by `keying`. A
+// verifier failure's row carries its function's IR on the lines after it; only its first line is
+// the class.
+function addRows(m: Measured, text: string, keying: Keying) {
   let last = ""
   for line in split(text, "\n") {
     if !startsWith(line, PREFIX) { continue }
@@ -123,6 +128,9 @@ function addRows(m: Measured, text: string, keyed: boolean) {
       last = path
     }
     const row = line.slice(t + 1, line.length)
+    const keyed = keying == "every row"
+      || keying == "fallback rows"
+      && startsWith(row, "claim fell back")
     bump(m.rows, if keyed { path + "\t" + row } else { row }, n ?? 0)
   }
   return 0
@@ -134,7 +142,7 @@ function measure(
   seed: string,
   jobs: string,
   mode: string,
-  keyed: boolean,
+  keying: Keying,
 ): Measured {
   const vl = envOr("VL", "scripts/vl-host/target/release/vl")
   const root = makeTempDir()
@@ -166,7 +174,7 @@ function measure(
     const rc = parseI32(trim(readOr(f + ".rc")))
     // 0 and 1 are `vl check` grading the chunk; anything else is the chunk not finishing.
     if rc != 0 && rc != 1 { m.broken.push(f + " (rc=\{toString(rc ?? -1)})") }
-    addRows(m, readOr(f + ".err"), keyed)
+    addRows(m, readOr(f + ".err"), keying)
   }
   spawn("rm", ["-rf", root])
   return m
@@ -265,20 +273,79 @@ function loadFallbacks(): Row[] {
   return rows
 }
 
-// The paths the fallback file names, each once, in its order.
+// The programs the fallback file names, each once, in its order. A filed witness's row is not
+// one: the whole filed population is built apart.
 function fallbackPaths(rows: Row[]): string[] {
   const out: string[] = []
   for r in rows {
     const p = r.key.slice(0, r.key.indexOf("\t"))
-    if out.indexOf(p) < 0 { out.push(p) }
+    if !isWitnessKey(p) && out.indexOf(p) < 0 { out.push(p) }
   }
   return out
+}
+
+// The inventories whose `runs` witnesses the claims run also builds, in the order
+// `ir-i8-census/witnesses.vl` numbers them (`inv1`, `inv2`).
+const WITNESS_DOCS = ["docs/internals/inventory", "docs/internals/inventory-2"]
+
+// Whether a fallback key names a filed witness, by its row's file, rather than a program.
+function isWitnessKey(key: string): boolean {
+  for d in WITNESS_DOCS {
+    if startsWith(key, d + "/") { return true }
+  }
+  return false
+}
+
+// Writes the witness of every row filed `runs` under `root` and returns each entry's path.
+function witnessPaths(root: string, seed: string): string[] {
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  const x = spawn(
+    vl,
+    concat(
+      [
+        "run",
+        "scripts/ir-i8-census/witnesses.vl",
+        "--compiler",
+        seed,
+        "--",
+        root,
+      ],
+      WITNESS_DOCS,
+    ),
+  )
+  if x.code != 0 {
+    die(
+      "ir-shadow: staging the filed witnesses failed (rc=\{x.code})\n\{x.err}",
+      2,
+    )
+  }
+  const out: string[] = []
+  for line in split(x.out, "\n") {
+    if line != "" { out.push(line) }
+  }
+  return out
+}
+
+// A witness row's key, `<root>/inv<k>/<id>/<file>\t<class>`, as its row's file and the class.
+function witnessKey(root: string, key: string): string {
+  const t = key.indexOf("\t")
+  const parts = split(key.slice(root.length + 1, t), "/")
+  const k = if parts.length < 3 { null } else { parseI32(parts[0].slice(3, parts[0].length)) }
+  if k == null || k < 1 || k > WITNESS_DOCS.length {
+    die("ir-shadow: a witness row outside the staged layout: \{key}", 2)
+  }
+  return WITNESS_DOCS[(k ?? 1) - 1]
+    + "/"
+    + parts[1]
+    + ".md"
+    + key.slice(t, key.length)
 }
 
 function writeFallbacks(paths: string[], fell: Row[]) {
   let text = "# Claims that fall back outside the distilled corpus, which `ir-shadow.vl -- --claims` holds\n"
   text = text
-    + "# at these counts. A path with none left keeps a 0 row. Rewrite: -- --claims --write-fallbacks\n"
+    + "# at these counts. A path with none left keeps a 0 row; a filed witness, named by its row's\n"
+    + "# file, is listed only while it falls back. Rewrite: -- --claims --write-fallbacks\n"
   for p in paths {
     let any = false
     for r in fell {
@@ -289,6 +356,9 @@ function writeFallbacks(paths: string[], fell: Row[]) {
     }
     if !any { text = text + "0\t\{p}\tclaim fell back: none\n" }
   }
+  for r in fell {
+    if isWitnessKey(r.key) { text = text + "\{r.n}\t\{r.key}\n" }
+  }
   const w = writeTextFile(FALLBACKS, text)
   if w != null { die("ir-shadow: cannot write \{FALLBACKS} (\{w.msg})", 2) }
   print(
@@ -298,9 +368,19 @@ function writeFallbacks(paths: string[], fell: Row[]) {
 }
 
 // The shipped claim: how many functions the IR emitted, and every fallback, which reds in the
-// corpus and above the fallback file's count in the programs it names.
-function reportClaims(m: Measured, x: Measured, want: Row[], rewrite: boolean) {
-  if m.broken.length > 0 || x.broken.length > 0 { exit(2) }
+// corpus, and above the fallback file's count in the programs it names and the `nw` filed
+// witnesses `w` measured.
+function reportClaims(
+  m: Measured,
+  x: Measured,
+  w: Measured,
+  nw: i32,
+  want: Row[],
+  rewrite: boolean,
+) {
+  if m.broken.length > 0 || x.broken.length > 0 || w.broken.length > 0 {
+    exit(2)
+  }
   const fell = classes(m.rows, "claim fell back")
   const n = countOf(m.rows, "claimed")
   if n == 0 {
@@ -314,7 +394,7 @@ function reportClaims(m: Measured, x: Measured, want: Row[], rewrite: boolean) {
   const paths = fallbackPaths(want)
   const xfell: Row[] = []
   let xn = 0
-  for r in x.rows {
+  for r in x.rows.concat(w.rows) {
     const t = r.key.indexOf("\t")
     if t >= 0 && r.key.slice(t + 1, r.key.length) == "claimed" { xn = xn + r.n }
     if (
@@ -338,16 +418,19 @@ function reportClaims(m: Measured, x: Measured, want: Row[], rewrite: boolean) {
       red = true
     }
   }
-  for w in want {
-    const now = countOf(xfell, w.key)
-    if now < w.n {
+  for f in want {
+    const now = countOf(xfell, f.key)
+    if now < f.n {
       print(
-        "ir-shadow: \{w.key} fell: \{w.n} -> \{now} (re-run with --write-fallbacks)",
+        "ir-shadow: \{f.key} fell: \{f.n} -> \{now} (re-run with --write-fallbacks)",
       )
     }
   }
   print(
     "ir claims outside the corpus: \{xn} functions over \{paths.length} programs",
+  )
+  print(
+    "ir claims over the filed witnesses: \{countOf(w.rows, "claimed")} functions over \{nw} witnesses filed runs",
   )
   if red { exit(1) }
   print("ir-shadow: ok")
@@ -362,13 +445,34 @@ function main(args: readonly string[]) {
   const census = hasFlag(args, "--blockers")
   const claims = hasFlag(args, "--claims")
   const mode = if census { "4" } else if claims { "5" } else { "1" }
-  const m = measure(paths, seed, envOr("JOBS", "4"), mode, false)
+  const m = measure(paths, seed, envOr("JOBS", "4"), mode, "none")
   for b in m.broken { print("ir-shadow: chunk did not finish: \{b}") }
   if claims {
     const want = loadFallbacks()
-    const x = measure(fallbackPaths(want), seed, envOr("JOBS", "4"), mode, true)
+    const x = measure(
+      fallbackPaths(want),
+      seed,
+      envOr("JOBS", "4"),
+      mode,
+      "every row",
+    )
     for b in x.broken { print("ir-shadow: chunk did not finish: \{b}") }
-    return reportClaims(m, x, want, hasFlag(args, "--write-fallbacks"))
+    const root = makeTempDir()
+    const wit = witnessPaths(root, seed)
+    const w = measure(wit, seed, envOr("JOBS", "4"), mode, "fallback rows")
+    spawn("rm", ["-rf", root])
+    for b in w.broken { print("ir-shadow: chunk did not finish: \{b}") }
+    for r in w.rows {
+      if r.key.indexOf("\t") >= 0 { r.key = witnessKey(root, r.key) }
+    }
+    return reportClaims(
+      m,
+      x,
+      w,
+      wit.length,
+      want,
+      hasFlag(args, "--write-fallbacks"),
+    )
   }
   if m.cells == 0 {
     die(
