@@ -205,6 +205,27 @@ Deno.test({
   },
 });
 
+// A nullable map coalesced into a wider map that stores alike yields that map; under control 7 the
+// join's out sits at an unrelated map's rep, which the verifier must refuse.
+Deno.test({
+  name: "ir shadow: a map join's out at an unrelated map's rep fails the nullable-reference rule",
+  ignore,
+  fn: () => {
+    const src = `function pick(m: {[string]: string} | null, d: {[string]: string | null}, z: {[string]: i32}) {\n` +
+      `  const x = m ?? d\n  print(x.length + z.length)\n}\n` +
+      `const w: {[string]: string | null} = Map()\nconst q: {[string]: i32} = Map()\npick(null, w, q)\n`;
+    const ok = run(src, true);
+    if (failures(ok.rows).length > 0 || ok.rows.get("matched") !== 1) {
+      throw new Error(`want pick matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 7);
+    const want = "a map whose value widens the inner's";
+    if (!failures(rows).some((k) => k.includes(want))) {
+      throw new Error(`want a fail row naming "${want}", got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The file rows' controls: an unreadable directive is refused, and a row whose expectation the
 // compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
 Deno.test({
