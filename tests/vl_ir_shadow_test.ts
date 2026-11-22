@@ -1523,7 +1523,7 @@ print(two("a", "b"))
 const PRE_PATHS: [string, string][] = [
   [
     "atom hook",
-    `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
+    `const JX = "x"\nconst B: "y" = "y"\nfunction join(c: boolean) {\n  const M: "x" | "y" | "z" = if c { JX } else { B }\n  return M == "z"\n}\nprint(join(true))\n`,
   ],
 ];
 Deno.test({
