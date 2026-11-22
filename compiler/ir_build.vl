@@ -5,7 +5,7 @@ import { blockHasContinueFor } from "./emit_query"
 // (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
 // globals); any other construct leaves the function uncovered, a counted reason, not an error.
 // A covered function is verified and then discarded: nothing is claimed, so no byte moves.
-import { emitFail } from "./emit_bytes"
+import { emitFail, htStructHeap } from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
@@ -143,6 +143,7 @@ import {
   irHexOf,
   irLowerClaim,
   irLowerFragment,
+  irLowerHelper,
   irLowerProbe,
   irLoweredEntry,
   irSlotRunAgrees,
@@ -461,6 +462,7 @@ import {
   repNodeGen,
   repNodeKids,
   repNodeOfTy,
+  repRawOf,
   repRecordKidOf,
   repRowOfTyStruct,
   repScanLim,
@@ -9102,6 +9104,111 @@ export function irShadowStart(
   count("start verified")
   dualEmit("start ", ibGlobalCtx(), out, outStart, spanBase)
   return 0
+}
+
+// The closure thunk of the function at `fnStmts` slot `fe`, one `collectCloThunks` gave a thunk:
+// an env parameter it ignores, then the target's parameters forwarded to one call of it, a tail
+// call whatever the target returns, as `emitCloThunkCode` writes it. "" or the miss.
+function buildThunk(fe: i32): string {
+  ib = irFnNew(-1, "@thunk")
+  ib.irHelper = true
+  ib.irThunk = true
+  ibFnIx = -1
+  ibFnPos = -1
+  ibMiss = ""
+  ibNoValue = repNodeOfTy(TY_NEVER)
+  if fe < 0 || fe >= fnStmts.length { return "thunk target" }
+  const d = fnStmts[fe]
+  const fn = nodeAt(d)
+  if !(fn is FuncDecl) { return "thunk target" }
+  ib.irName = "@thunk " + fn.fnName
+  ib.irParams.push(irVarNew(ib, repRawOf(htStructHeap(), true), -1, "param", 0))
+  // Each parameter is forwarded as it stands, at the rep the target's own frame gives it
+  // (`buildParams`), whatever that rep is.
+  const ps: i32[] = []
+  const args: Opnd[] = []
+  for p in fn.fnParams {
+    const pt = paramHeldTy(p, d)
+    const r = repNodeOfTy(pt)
+    if irTyHeldOpen(pt, r) { return "thunk open parameter type" }
+    const v = irVarNew(ib, r, pt, "param", 1 + ps.length)
+    ib.irParams.push(v)
+    ps.push(r)
+    args.push({ ov: v })
+  }
+  const rr = resultRep(fe, fn.fnRet, d)
+  irSigNote(ib, fe, ps, rr)
+  ib.irRetRep = rr
+  const c: RCall = {
+    caCallee: fe,
+    caArgs: args,
+    caNever: false,
+    caEnv: false,
+    caCaps: [],
+  }
+  if repIsNoValue(rr) {
+    ib.irRetTy = TY_NEVER
+    ib.irBody = [irNodeNew(ib, { efRhs: c }, -1, ibNoValue, -1)]
+    return ""
+  }
+  ib.irRetTy = resultTy(fe, fn.fnRet, d)
+  if irTyOpen(ib.irRetTy) { return "thunk open result type" }
+  const t = irVarNew(ib, rr, ib.irRetTy, "temp", -1)
+  const call = irNodeNew(ib, { lDst: t, lRhs: c }, ib.irRetTy, rr, -1)
+  const ret = irNodeNew(ib, { rtHas: true, rtV: { ov: t } }, -1, ibNoValue, -1)
+  ib.irBody = [call, ret]
+  return ""
+}
+
+// The claim seam for the thunk of `fe`, before legacy writes it: when it builds and every node is
+// in a claimed family, the lowering writes its code entry onto `out` and this answers true.
+export function irClaimThunk(fe: i32, out: u8[]): boolean {
+  if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
+  if buildThunk(fe) != "" || !claimable() { return false }
+  corrupt()
+  if irVerify(ib).vfRule != 0 { return thunkFellBack("verifier") }
+  const why = irLowerHelper(ib, out)
+  if why != "" { return thunkFellBack(why) }
+  count("claimed thunk")
+  return true
+}
+
+function thunkFellBack(why: string): boolean {
+  count("claim fell back: thunk " + why)
+  return false
+}
+
+// Under the armed shadow, the thunk of `fe` legacy wrote onto `out` from `from`, against its IR
+// lowering: `thunk matched`, `thunk uncovered <why>`, or a `mismatch thunk` class.
+export function irShadowThunk(fe: i32, out: u8[], from: i32) {
+  if !ibArmed { return 0 }
+  count("thunk fns")
+  const why = buildThunk(fe)
+  if why != "" { return count("thunk uncovered " + why) }
+  corrupt()
+  const v = irVerify(ib)
+  if v.vfRule != 0 {
+    return count(
+      "fail rule "
+        + i32ToStr(v.vfRule)
+        + " in "
+        + ib.irName
+        + ": "
+        + v.vfMsg
+        + "\n"
+        + irFnText(ib),
+    )
+  }
+  const got: u8[] = []
+  const lw = irLowerHelper(ib, got)
+  if lw != "" { return count("mismatch thunk " + lw) }
+  // The dual emit's control 3 adds a byte, which must turn a match into a differ.
+  if ibCorrupt == 3 { got.push(1) }
+  if !bytesFrom(out, from, got) {
+    const hex = if ibDetail { " " + irHexOf(out.slice(from)) + "| " + irHexOf(got) } else { "" }
+    return count("mismatch bytes: thunk" + hex)
+  }
+  return count("thunk matched")
 }
 
 // Builds a start body: each top-level statement, or global `orderGi[i]`'s initializer, in order,
