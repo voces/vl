@@ -11,13 +11,13 @@ and the box. That is the `rec` shape.
 
 ## The change
 
-- `structArmPlainOf` (`emit_plan_union.vl`) names that rung's decision once. It takes a non-null
-  struct value, the arm `unionArmVariantForStructExpr` names, and the two heaps agreeing.
-  `emitUnionCoerceRecord` and `holeBoxPlanOf` both ask it. Off the arm's heap, legacy still
-  rebuilds the struct onto it.
-- The plan's rung sits after the null-niche rung. A struct that may be null is excluded, as
-  `armValuePlainOf` excludes it: legacy boxes such a value through a null test earlier in its
-  ladder. A first cut without the exclusion boxed `mkB()`'s `B | null` raw and trapped in
+- `structArmHeapOf` (`emit_plan_union.vl`) names that rung's decision once: the arm
+  `unionArmVariantForStructExpr` names, and the struct's heap agreeing with it.
+  `emitUnionCoerceRecord` asks it as before, nullable or not. Off the arm's heap, legacy still
+  rebuilds the struct onto it, so legacy's bytes cannot move.
+- The plan's rung sits after the null-niche rung and adds its own non-null test, as
+  `armValuePlainOf` does. Legacy boxes a struct that may be null through a null test earlier in
+  its ladder. A first cut without that test boxed `mkB()`'s `B | null` raw and trapped in
   `tests/cases/unions/record-join-place-elimination.vl`.
 
 Covered = matched over the files the ladder census named: 631 → 644. Legacy bytes are identical
