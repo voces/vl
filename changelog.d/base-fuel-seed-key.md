@@ -1,0 +1,3 @@
+## Testing
+
+- **The per-PR self-compile fuel's base cache is keyed by the base's fixpoint seed.** `scripts/self-compile-time.sh` builds the base's fixpoint (or takes `$SELF_COMPILE_BASE_SEED`), keys the cached L2 by its hash with the base tree, `$SRC` and the host, and reads an entry only while its stored seed is that seed byte for byte; a fixpoint from another lineage of the same tree is measured again. A default base behind `origin/master`'s tip prints `WARNING: graded against a base N merges old` with both shas, since a stale fetch grades a PR against master's drift (IR-N4's +0.40% on #9506 against a live −0.0006%).

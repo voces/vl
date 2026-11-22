@@ -90,7 +90,7 @@ import {
   readOwesNonNullRecover,
   structIndexOfExpr,
 } from "./emit_classify"
-import { storageReadEnter, storageReadLeave } from "./emit_elab"
+import { elabSpreadNote, storageReadEnter, storageReadLeave } from "./emit_elab"
 import { forInStringSrc, forInU8Src } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
 import { RC_MAP } from "./emit_start_block"
@@ -174,6 +174,7 @@ import {
   RStage,
   RStashSet,
   RStrOp,
+  RStructEq,
   RTagIs,
   RTagOf,
   RTagStash,
@@ -482,6 +483,11 @@ import {
   stageListRecvTail,
   staticAtomId,
   strSiteArmMint,
+  structEqEnter,
+  structEqRoots,
+  structEqStagesLeft,
+  structEqStagesRight,
+  structEqTail,
   structFieldTail,
   structUnionBoxTail,
   tagDispatchIfOf,
@@ -498,7 +504,7 @@ import {
   unionEqPayloadTail,
   unionEqTagTail,
   unionLetSinkClose,
-  unionUnionEqTail,
+  unionUnionBoxesTail,
   urLocalRead,
   userGlobalIdx,
   userGlobalReadClass,
@@ -973,6 +979,7 @@ function rhs(r: Rhs, tail: boolean) {
       RListSlice |
       RMapFilter |
       RStrOp => irLowerListHook(r)
+    RStructEq => structEq(r)
     RListClear => irLMiss("clear value")
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
@@ -1542,24 +1549,25 @@ function listEmpty(r: RListEmpty) {
 // `RLitArms`: the operand and its arm's tail, as `emitIsTestLitArms` writes it; `atomEq` reads the
 // operand once per member. Every other arm is the builder's miss.
 function litArms(r: RLitArms) {
+  lw.irLitReads = 0
   const n = nodeAt(r.liAt)
   if !(n is IsExpr) || litIsArmOf(r.liAt, n, lw.irAt) != r.liArm {
     return irLMiss("literal arms plan")
   }
   return match r.liArm {
     "nicheRaw" => {
-      irLOpnd(r.liV)
+      litRecv(r)
       nicheRawIsTail(r.liAt)
     }
     "atomNotNul" => {
-      irLOpnd(r.liV)
+      litRecv(r)
       atomNotNulIsTail()
     }
     "atomEq" => {
       const texts = litIsMemberTexts(r.liAt)
       let i = 0
       while i < texts.length {
-        irLOpnd(r.liV)
+        litRecv(r)
         atomEqIsTail(texts[i], i)
         i = i + 1
       }
@@ -1594,7 +1602,7 @@ function memberEqLits(r: RLitArms, recvIx: i32) {
       if unionLitIs(r, recvIx, lex) < 0 { return -1 }
     } else if a == "str" || a == "nulStr" {
       if a == "nulStr" { nulStrMemberOpen() }
-      irLOpnd(r.liV)
+      litRecv(r)
       if a == "nulStr" { nulStrMemberGuard() }
       if strMemberEqTail(lex, lw.irAt) < 0 {
         return irLMiss("literal member compare")
@@ -1616,13 +1624,13 @@ function unionLitIs(r: RLitArms, recvIx: i32, lex: string): i32 {
   const p = unionLitIsPlanOf(recvIx, lex, lw.irAt)
   return match p.ulArm {
     "never" => {
-      irLOpnd(r.liV)
+      litRecv(r)
       unionLitNeverTail()
     }
     "tag" => {
-      irLOpnd(r.liV)
+      litRecv(r)
       unionLitTagHead(p)
-      if !p.ulOnce { irLOpnd(r.liV) }
+      if !p.ulOnce { litRecv(r) }
       unionLitPayloadTail(p, lex, lw.irAt)
     }
     "noSet" | "noArm" => {
@@ -1630,6 +1638,18 @@ function unionLitIs(r: RLitArms, recvIx: i32, lex: string): i32 {
       -1
     }
   }
+}
+
+// `RLitArms`' receiver: its operand the first time, then read again as the builder read it.
+function litRecv(r: RLitArms): i32 {
+  const n = nodeAt(r.liAt)
+  const k = lw.irLitReads
+  lw.irLitReads = k + 1
+  if k == 0 || !(n is IsExpr) {
+    irLOpnd(r.liV)
+    return 0
+  }
+  return opndAgain(r.liV, n.isObj)
 }
 
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
@@ -2624,13 +2644,13 @@ function unionConcreteEqOp(r: RUnionConcreteEq) {
   return unionEqCmpTail(qp, r.ucNe, lw.irAt)
 }
 
-// `RUnionEq`: both boxes, then legacy's staged compare.
+// `RUnionEq`: both boxes, then legacy's compare over them (`unionUnionBoxesTail`).
 function unionEq(r: RUnionEq) {
   const n = nodeAt(r.ueAt)
   if !(n is BinExpr) { return irLMiss("union compare node") }
   irLOpnd(r.ueL)
   irLOpnd(r.ueR)
-  return unionUnionEqTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
+  return unionUnionBoxesTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
 }
 
 // `RNumUnionBin`: legacy's `numUnion` dispatch in `emitNumUnionBin`'s order: each side's value
@@ -2680,8 +2700,39 @@ function closureEq(r: RClosureEq) {
   return 0
 }
 
+// `RStructEq`: legacy's field-wise record compare (`emitStructEq`): the stashed operands' values,
+// their slots, then the compare, which reads an unstashed operand from its variable's local.
+function structEq(r: RStructEq) {
+  const n = nodeAt(r.seAt)
+  if !(n is BinExpr) { return irLMiss("record compare node") }
+  const fnIx = lw.irAt
+  const row = r.seRow
+  const lS = structEqStagesLeft(n.binLeft, n.binRight)
+  const rS = structEqStagesRight(n.binRight)
+  const lLoc = if lS { -1 } else { structEqSideLocal(r.seL) }
+  const rLoc = if rS { -1 } else { structEqSideLocal(r.seR) }
+  if !lS && lLoc < 0 || !rS && rLoc < 0 {
+    return irLMiss("record compare place")
+  }
+  const saved = structEqEnter()
+  if lS { irLOpnd(r.seL) }
+  if rS { irLOpnd(r.seR) }
+  const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
+  if structEqTail(n, row, roots, saved, fnIx) < 0 {
+    return irLMiss("record compare fields")
+  }
+  return 0
+}
+
+// The local a record compare reads unstashed operand `o` from: a variable's slot, else -1.
+function structEqSideLocal(o: Opnd): i32 {
+  if !(o is OVar) || isTemp(o.ov) { return -1 }
+  if o.ov < lwStackVal.length && lwStackVal[o.ov] { return -1 }
+  return varSlot(o.ov)
+}
+
 // `RNulNicheEq`: legacy's `nulNiche` compare in `emitNulNicheEq`'s order: the guard's head, the
-// left operand, the right twice around the rep's own compare, and `i32.eqz` for `!=`.
+// left operand, the right twice (`neR`, `neR2`) around the rep's own compare, and `i32.eqz` for `!=`.
 function nulNicheEq(r: RNulNicheEq) {
   const n = nodeAt(r.neAt)
   if !(n is BinExpr) { return irLMiss("nullable compare node") }
@@ -2695,7 +2746,7 @@ function nulNicheEq(r: RNulNicheEq) {
   if nulNicheEqRightTail(r.neAt, lw.irAt) < 0 {
     return irLMiss("nullable compare core")
   }
-  irLOpnd(r.neR)
+  irLOpnd(r.neR2)
   nulNicheEqNullTail()
   if n.binOp == "!=" { fbI32Eqz() }
   return 0
@@ -2719,6 +2770,7 @@ function boxOp(r: RToBox) {
     || p.hbArm == "atomList"
     || p.hbArm == "atomStr"
     || p.hbArm == "nulNiche"
+    || p.hbArm == "nulBool"
     || p.hbArm == "rec"
     || p.hbArm == "obj"
     || p.hbArm == "refList"
@@ -2774,6 +2826,10 @@ function irHoistRecv(ix: i32): i32 {
     return 0
   }
   if irLReadAgain(ix) { return 0 }
+  if lw.irReadElem.has(ix) {
+    const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
+    return rhs(lw.irReadElem[ix] ?? none, false)
+  }
   const m = nodeAt(ix)
   if lw.irReadField.has(ix) && m is Member {
     if irHoistRecv(m.memObj) < 0 { return -1 }
@@ -2783,16 +2839,21 @@ function irHoistRecv(ix: i32): i32 {
   return -1
 }
 
-// Receiver `o` of member `lhsIx` read once more: a variable's read, or a temp's read written again
-// as the builder read it (`irHoistRecv`).
-function recvAgain(o: Opnd, lhsIx: i32): i32 {
+// Operand `o` of node `ix` read once more: a variable's read, or a temp's read written again as the
+// builder read it (`irHoistRecv`).
+function opndAgain(o: Opnd, ix: i32): i32 {
   if o is OVar && o.ov >= 0 && lw.irVars[o.ov].vKind == "temp" {
-    const m = nodeAt(unwrapParen(lhsIx))
-    if !(m is Member) { return irLMiss("receiver read again") }
-    return irHoistRecv(unwrapParen(m.memObj))
+    return irHoistRecv(unwrapParen(ix))
   }
   irLOpnd(o)
   return 0
+}
+
+// Receiver `o` of member `lhsIx` read once more (`opndAgain`).
+function recvAgain(o: Opnd, lhsIx: i32): i32 {
+  const m = nodeAt(unwrapParen(lhsIx))
+  if !(m is Member) { return irLMiss("receiver read again") }
+  return opndAgain(o, m.memObj)
 }
 
 // Writes the global read the builder built at node `ix` once more, as legacy re-reads a name;
@@ -2924,6 +2985,7 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
       const id = b[i]
       rowOpenNote(id)
       siteArmMintAt(id)
+      spreadPairMintAt(id)
       spanOpen(id)
       // A valueless `return` after a call in its tail form writes nothing.
       if !(i > 0 && callReturns(b, i - 1)) {
@@ -3035,7 +3097,9 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       lwSeq = []
       const r = n.efRhs
       if r is RCall {
-        const t = tail && voidTailCallee(r.caCallee) && !irNoTailEffHas(lw, id)
+        const t = tail
+          && (lw.irThunk || voidTailCallee(r.caCallee))
+          && !irNoTailEffHas(lw, id)
         call(r, t)
         irLSettle(pending)
         const si = irSigOf(lw, r.caCallee)
@@ -3174,8 +3238,14 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       fbBr(d)
     }
     SReturn => {
-      // A helper's last value falls through its `end`, as the hand-written bodies did.
-      if lw.irHelper && n.rtHas && id == lw.irBody[lw.irBody.length - 1] {
+      // A helper's last value falls through its `end`, as the hand-written bodies did; a
+      // thunk's is its call's tail form.
+      if (
+        lw.irHelper
+        && !lw.irThunk
+        && n.rtHas
+        && id == lw.irBody[lw.irBody.length - 1]
+      ) {
         cond(n.rtV, pending)
         return 0
       }
@@ -3411,7 +3481,8 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     || rr is RClosure)
     && at >= 0
     && nodeAt(unwrapParen(at)) is Call
-  const rj = if vt < 0 && !refOut && !strOut && !boxOut && at >= 0 { ifRefJoinOf(if n.siJoinAt >= 0 { n.siJoinAt } else { at }, lw.irAt) } else { noRefJoin() }
+  const decided = n.siJoin.rjKind != null
+  const rj = if vt < 0 && !refOut && !strOut && !boxOut && decided { n.siJoin } else if vt < 0 && !refOut && !strOut && !boxOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
   const rk = rj.rjKind
   if vt < 0 && !refOut && !strOut && !boxOut && rk == null {
     irLMiss("valued if rep")
@@ -3436,7 +3507,11 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     fbValtype("union", -1)
   } else if rk != null {
     fbOpenIf()
-    fbRefIfOpenType(rk, rj.rjSlot, ifLinkYieldsNull(at, lw.irAt))
+    fbRefIfOpenType(
+      rk,
+      rj.rjSlot,
+      if decided { n.siJoinNul } else { ifLinkYieldsNull(at, lw.irAt) },
+    )
   } else {
     fbIf(vt)
   }
@@ -3610,7 +3685,7 @@ function coalNicheCell(
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   coalNicheElse(reEval)
-  if reEval { irLOpnd(n.cbL) }
+  if reEval && opndAgain(n.cbL, e.binLeft) < 0 { return -1 }
   lwFrames.pop()
   fbEnd()
   return 0
@@ -3787,6 +3862,20 @@ function siteArmMintAt(id: i32) {
   return 0
 }
 
+// Asks the list pair of the spread literal whose groups' writing opens at node `id`
+// (`irSpreadPair`), as `emitArrSpread` asks it before its groups; a first ask mints it.
+function spreadPairMintAt(id: i32) {
+  const nt = lw.irSpreadPair[id]
+  if nt == null { return 0 }
+  const lb: ListBuild = { lbKind: nt.sqKind, lbSlot: nt.sqSlot }
+  elabSpreadNote(nt.sqAt)
+  const p = spreadPlanOf(nt.sqAt, lw.irAt, lb)
+  if p.spWhy != "" { return irLMiss("spread plan") }
+  spreadWrapIdx(p.spKind, p.spRow)
+  spreadBackIdx(p.spKind, p.spRow)
+  return 0
+}
+
 // Notes where node `id` began, where an element read's row opens at it (`irRowOpens`).
 function rowOpenNote(id: i32) {
   if lw.irHasRowOpens && lw.irRowOpens.has(id) { lwRowOpenAt[id] = curLen() }
@@ -3893,7 +3982,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   // The single start body opens with legacy's pool fill; an init function's does not.
   if f.irPoolFill { irStartPrologueHook() }
   // Legacy tail-calls a void body's last call, but not the start function's.
-  body(f.irBody, !valued && f.irAt >= 0, -1, false)
+  body(f.irBody, !valued && (f.irAt >= 0 || f.irThunk), -1, false)
   const pad = if valued { fnFallThroughPadOf(f.irAt) } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
@@ -4174,6 +4263,18 @@ export function irLowerClaim(
     r = r + 1
   }
   return ""
+}
+
+// Lowers `f` for the order check (shadow mode 6) and returns its code entry, writing nothing and
+// banking no row; empty on a miss. Legacy then lowers from the empty lazy frame.
+export function irLowerProbe(f: IrFn, ctx: GlobalCtx): u8[] {
+  const callees0 = dfeCallee.length
+  fbResetLazyFrame()
+  const got = entry(f, ctx)
+  while dfeCallee.length > callees0 { dfeCallee.pop() }
+  fbResetLazyFrame()
+  if lwMiss != "" { return [] }
+  return got
 }
 
 // Lowers runtime helper `f` onto `out`: its locals are its `local` variables, one per slot after
