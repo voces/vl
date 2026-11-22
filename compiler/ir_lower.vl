@@ -90,7 +90,7 @@ import {
   readOwesNonNullRecover,
   structIndexOfExpr,
 } from "./emit_classify"
-import { storageReadEnter, storageReadLeave } from "./emit_elab"
+import { elabSpreadNote, storageReadEnter, storageReadLeave } from "./emit_elab"
 import { forInStringSrc, forInU8Src } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
 import { RC_MAP } from "./emit_start_block"
@@ -502,7 +502,7 @@ import {
   unionEqPayloadTail,
   unionEqTagTail,
   unionLetSinkClose,
-  unionUnionEqTail,
+  unionUnionBoxesTail,
   urLocalRead,
   userGlobalIdx,
   userGlobalReadClass,
@@ -1546,24 +1546,25 @@ function listEmpty(r: RListEmpty) {
 // `RLitArms`: the operand and its arm's tail, as `emitIsTestLitArms` writes it; `atomEq` reads the
 // operand once per member. Every other arm is the builder's miss.
 function litArms(r: RLitArms) {
+  lw.irLitReads = 0
   const n = nodeAt(r.liAt)
   if !(n is IsExpr) || litIsArmOf(r.liAt, n, lw.irAt) != r.liArm {
     return irLMiss("literal arms plan")
   }
   return match r.liArm {
     "nicheRaw" => {
-      irLOpnd(r.liV)
+      litRecv(r)
       nicheRawIsTail(r.liAt)
     }
     "atomNotNul" => {
-      irLOpnd(r.liV)
+      litRecv(r)
       atomNotNulIsTail()
     }
     "atomEq" => {
       const texts = litIsMemberTexts(r.liAt)
       let i = 0
       while i < texts.length {
-        irLOpnd(r.liV)
+        litRecv(r)
         atomEqIsTail(texts[i], i)
         i = i + 1
       }
@@ -1598,7 +1599,7 @@ function memberEqLits(r: RLitArms, recvIx: i32) {
       if unionLitIs(r, recvIx, lex) < 0 { return -1 }
     } else if a == "str" || a == "nulStr" {
       if a == "nulStr" { nulStrMemberOpen() }
-      irLOpnd(r.liV)
+      litRecv(r)
       if a == "nulStr" { nulStrMemberGuard() }
       if strMemberEqTail(lex, lw.irAt) < 0 {
         return irLMiss("literal member compare")
@@ -1620,13 +1621,13 @@ function unionLitIs(r: RLitArms, recvIx: i32, lex: string): i32 {
   const p = unionLitIsPlanOf(recvIx, lex, lw.irAt)
   return match p.ulArm {
     "never" => {
-      irLOpnd(r.liV)
+      litRecv(r)
       unionLitNeverTail()
     }
     "tag" => {
-      irLOpnd(r.liV)
+      litRecv(r)
       unionLitTagHead(p)
-      if !p.ulOnce { irLOpnd(r.liV) }
+      if !p.ulOnce { litRecv(r) }
       unionLitPayloadTail(p, lex, lw.irAt)
     }
     "noSet" | "noArm" => {
@@ -1634,6 +1635,18 @@ function unionLitIs(r: RLitArms, recvIx: i32, lex: string): i32 {
       -1
     }
   }
+}
+
+// `RLitArms`' receiver: its operand the first time, then read again as the builder read it.
+function litRecv(r: RLitArms): i32 {
+  const n = nodeAt(r.liAt)
+  const k = lw.irLitReads
+  lw.irLitReads = k + 1
+  if k == 0 || !(n is IsExpr) {
+    irLOpnd(r.liV)
+    return 0
+  }
+  return opndAgain(r.liV, n.isObj)
 }
 
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
@@ -2628,13 +2641,13 @@ function unionConcreteEqOp(r: RUnionConcreteEq) {
   return unionEqCmpTail(qp, r.ucNe, lw.irAt)
 }
 
-// `RUnionEq`: both boxes, then legacy's staged compare.
+// `RUnionEq`: both boxes, then legacy's compare over them (`unionUnionBoxesTail`).
 function unionEq(r: RUnionEq) {
   const n = nodeAt(r.ueAt)
   if !(n is BinExpr) { return irLMiss("union compare node") }
   irLOpnd(r.ueL)
   irLOpnd(r.ueR)
-  return unionUnionEqTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
+  return unionUnionBoxesTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
 }
 
 // `RNumUnionBin`: legacy's `numUnion` dispatch in `emitNumUnionBin`'s order: each side's value
@@ -2704,7 +2717,7 @@ function structEqSideLocal(o: Opnd): i32 {
 }
 
 // `RNulNicheEq`: legacy's `nulNiche` compare in `emitNulNicheEq`'s order: the guard's head, the
-// left operand, the right twice around the rep's own compare, and `i32.eqz` for `!=`.
+// left operand, the right twice (`neR`, `neR2`) around the rep's own compare, and `i32.eqz` for `!=`.
 function nulNicheEq(r: RNulNicheEq) {
   const n = nodeAt(r.neAt)
   if !(n is BinExpr) { return irLMiss("nullable compare node") }
@@ -2718,7 +2731,7 @@ function nulNicheEq(r: RNulNicheEq) {
   if nulNicheEqRightTail(r.neAt, lw.irAt) < 0 {
     return irLMiss("nullable compare core")
   }
-  irLOpnd(r.neR)
+  irLOpnd(r.neR2)
   nulNicheEqNullTail()
   if n.binOp == "!=" { fbI32Eqz() }
   return 0
@@ -2742,6 +2755,7 @@ function boxOp(r: RToBox) {
     || p.hbArm == "atomList"
     || p.hbArm == "atomStr"
     || p.hbArm == "nulNiche"
+    || p.hbArm == "nulBool"
     || p.hbArm == "rec"
     || p.hbArm == "obj"
     || p.hbArm == "refList"
@@ -2956,6 +2970,7 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
       const id = b[i]
       rowOpenNote(id)
       siteArmMintAt(id)
+      spreadPairMintAt(id)
       spanOpen(id)
       // A valueless `return` after a call in its tail form writes nothing.
       if !(i > 0 && callReturns(b, i - 1)) {
@@ -3829,6 +3844,20 @@ function siteArmMintAt(id: i32) {
   if !lw.irHasSiteArms { return 0 }
   const ix = lw.irSiteArmAt[id] ?? -1
   if ix >= 0 { strSiteArmMint(ix, lw.irAt) }
+  return 0
+}
+
+// Asks the list pair of the spread literal whose groups' writing opens at node `id`
+// (`irSpreadPair`), as `emitArrSpread` asks it before its groups; a first ask mints it.
+function spreadPairMintAt(id: i32) {
+  const nt = lw.irSpreadPair[id]
+  if nt == null { return 0 }
+  const lb: ListBuild = { lbKind: nt.sqKind, lbSlot: nt.sqSlot }
+  elabSpreadNote(nt.sqAt)
+  const p = spreadPlanOf(nt.sqAt, lw.irAt, lb)
+  if p.spWhy != "" { return irLMiss("spread plan") }
+  spreadWrapIdx(p.spKind, p.spRow)
+  spreadBackIdx(p.spKind, p.spRow)
   return 0
 }
 
