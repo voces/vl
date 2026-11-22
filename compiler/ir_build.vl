@@ -117,6 +117,7 @@ import {
   irGlobalRepOf,
   irNodeFamily,
   irNodeNew,
+  irRecHeapNote,
   irSigNote,
   irSigOf,
   irSpanNote,
@@ -125,10 +126,12 @@ import {
   sIf,
 } from "./ir"
 import {
+  cloHoleRetag,
   listRetag,
   listRetagHole,
   mapBoxReadsAt,
   mapNicheReadsAt,
+  recHeapOf,
   recRetag,
   repBoolNiche,
   repBoxCore,
@@ -495,8 +498,12 @@ import {
   RClosure,
   RList,
   RMap,
+  RNoValue,
   RNullable,
+  RPrim,
+  RRaw,
   RRecord,
+  RUnsup,
   repClosureOfReps,
   repNodeAt,
   repNodeGen,
@@ -4014,8 +4021,15 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       if i > 0 && !irBStageLeads(b, at, starts, args, c.callArgs) {
         return missRhs("short-circuit argument after another")
       }
-      if irBOpRep(a) != pr { return missRhs("argument coercion") }
-      args.push(a)
+      // A list handed at its parameter's storage is the same list where no coercion is recorded,
+      // as a binding's and a return's are: a twin, or closures apart only in a hole.
+      const ra = if (irBOpRep(a) != pr
+        && (listRetag(irBOpRep(a), pr)
+        || holeRetagNoted(irBOpRep(a), pr, true)
+        || recRetag(irBOpRep(a), pr))
+        && exprPrePathWhy(c.callArgs[i], ibFnIx) == "") { repTemp(b, { rgV: a }, c.callArgs[i], pr) } else { a }
+      if irBOpRep(ra) != pr { return missRhs("argument coercion") }
+      args.push(ra)
       i = i + 1
     }
   }
@@ -7789,9 +7803,9 @@ function tagDispatchAt(b: i32[], ix: i32, read: boolean): Opnd {
   return o
 }
 
-// A tagged call's callee `f`, as `emitFnTagDispatch` writes it (`emitExpr`). On legacy's
-// `nonlocal` arm, a module global that is no function value (`emitIdentNonLocalRead`) is read as
-// its cell stores it, the member id `global.get` reads, where its checked rep differs.
+// A tagged call's callee `f`, as `emitFnTagDispatch` writes it (`emitExpr`): where its checked rep
+// differs from its storage's, a module global that is no function value (`emitIdentNonLocalRead`)
+// or a capture of an unlifted closure (`emitCapturedRead`) is read as stored, the member id.
 function tagCallee(b: i32[], f: i32): Opnd {
   const n = nodeAt(f)
   if n is Ident && identReadArmOf(n, f, ibFnIx, false) == "nonlocal" {
@@ -7805,6 +7819,26 @@ function tagCallee(b: i32[], f: i32): Opnd {
       && globalRep(g, d) != exprRepOf(f)
     ) {
       return globalStoredRead(b, g, d, f, globalRep(g, d))
+    }
+  }
+  if n is Ident && identReadArmOf(n, f, ibFnIx, false) == "capture" {
+    const fe = fnStmtsPosOf(ibFnIx)
+    const cr = capRepOf(fe, n.identName)
+    const d = identDeclOf(f)
+    if (
+      cr >= 0
+      && cr != exprRepOf(f)
+      && !cloLifted(fe)
+      && d >= 0
+      && nodeAt(d) is LetDecl
+    ) {
+      return irBLetTempTy(
+        b,
+        { evSlot: captureSlotOf(n.identName, ibFnIx), evAt: f },
+        f,
+        cr,
+        heldTy(letBindTy(d, -1)),
+      )
     }
   }
   return irBExpr(b, f)
@@ -9472,7 +9506,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     const v = if (ibMiss == ""
       && irBOpRep(built) != ib.irRetRep
       && (listRetag(irBOpRep(built), ib.irRetRep)
-      || listRetagHole(irBOpRep(built), ib.irRetRep)
+      || holeRetagNoted(irBOpRep(built), ib.irRetRep, false)
       || recRetag(irBOpRep(built), ib.irRetRep))
       && exprPrePathWhy(n.retArg, ibFnIx) == "") { repTemp(b, { rgV: built }, n.retArg, ib.irRetRep) } else { built }
     const vr = if ibMiss == "" { irBOpRep(v) } else { -1 }
@@ -10736,5 +10770,33 @@ function censusRow(why: string) {
     k = k + 1
   }
   count("blockers " + key)
+  return 0
+}
+
+// Whether rep `src` is `dst` as it stands, a list (`listRetagHole`) or, with `clo`, any value
+// (`cloHoleRetag`), apart only in closure openness; each record rep's heap is noted first, which
+// the walk and the verifier compare.
+function holeRetagNoted(src: i32, dst: i32, clo: boolean): boolean {
+  noteRecHeaps(src)
+  noteRecHeaps(dst)
+  return listRetagHole(ib, src, dst) || clo && cloHoleRetag(ib, src, dst)
+}
+
+// Notes the heap of each record rep the hole walk reaches from `r`: through lists, nullables, a
+// map's values and closures, stopping at a record, as `repFillsHole` does.
+function noteRecHeaps(r: i32) {
+  const n = repNodeAt(r)
+  if n == null { return 0 }
+  match n {
+    RRecord => irRecHeapNote(ib, r, recHeapOf(r))
+    RList => noteRecHeaps(n.rlsElem)
+    RNullable => noteRecHeaps(n.rnInner)
+    RMap => noteRecHeaps(n.rmVal)
+    RClosure => {
+      for p in n.rcParams { noteRecHeaps(p) }
+      noteRecHeaps(n.rcRet)
+    }
+    RAtom | RBox | RNoValue | RPrim | RRaw | RUnsup => 0
+  }
   return 0
 }
