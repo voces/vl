@@ -68,6 +68,7 @@ import {
   RMapSet,
   RMemAccess,
   RMemOp,
+  RNicheRead,
   RNulNicheEq,
   RNulTest,
   RNullOf,
@@ -111,6 +112,7 @@ import {
   SForIn,
   SGlobalSet,
   SIf,
+  SIntSwitch,
   SLet,
   SListSet,
   SLoop,
@@ -125,6 +127,8 @@ import {
   irGlobalRepOf,
   irPushBodies,
   irSigOf,
+  mapBoxReadsAt,
+  mapNicheReadsAt,
 } from "./ir"
 import {
   RAtom,
@@ -573,6 +577,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if !(sn is RBox) && !(sn is RNullable && sn.rnDisc == 4) {
         return fail(2, at, "a shared read's receiver is a box")
       }
+      0
+    }
+    RNicheRead => {
+      use(r.nrV, at)
+      if !boxShaped(opRep(r.nrV)) {
+        return fail(2, at, "a niche read's operand is a box")
+      }
+      const dn = repNodeAt(dst)
+      const nulStr = dn is RNullable && dn.rnDisc == 1 && dn.rnInner == vfStr
+      const fits = if r.nrKind == 1 { repBoolNiche(dst) } else { r.nrKind == 2 && nulStr }
+      if !fits { return fail(2, at, "a niche read is at its niche's rep") }
       0
     }
     RBoxNarrow => {
@@ -1301,8 +1316,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 && r.mgForm == 0 && dst != vfI32 {
         return fail(2, at, "a map read through a helper is an i32")
       }
-      // The miss arm's default is the read's value, so it is at the read's rep.
-      if dst >= 0 && r.mgForm > 0 && opRep(r.mgDef) != dst {
+      // The miss arm's default is the read's value, so it is at the read's rep; a union box's
+      // default is boxed into the map's value, whose box the read is (`mapBoxReadsAt`).
+      const mgRep = if r.mgSym >= 0 { irGlobalRepOf(vf, r.mgSym) } else { opRep(r.mgLoc) }
+      const dw = if r.mgForm == 5 { mapValOf(mgRep) } else { dst }
+      if r.mgForm == 5 && dst >= 0 && !mapBoxReadsAt(mgRep, dst) {
+        return fail(2, at, "a map read's union box yields no value of its map")
+      }
+      if dst >= 0 && r.mgForm > 0 && opRep(r.mgDef) != dw {
         return fail(2, at, "a map read's default is not at its rep")
       }
       0
@@ -1673,8 +1694,14 @@ function coalPopOrWhy(n: SCoalBox): string {
   return ""
 }
 
+// The value rep of map rep `mrep`, or -1 for no map.
+function mapValOf(mrep: i32): i32 {
+  const mr = repNodeAt(mrep)
+  return if mr is RMap { mr.rmVal } else { -1 }
+}
+
 // Why a fused map read whose default computes is ill-formed, or "": it probes a map receiver by a
-// key along an inline form, `i32` (1), mv (2) or a scalar union value's (3), into an out of the read's
+// key along an inline form, `i32` (1), mv (2), a scalar union value's (3), a ref niche's (4) or a union box's (5), into an out of the read's
 // own rep.
 function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   const mp = n.cbMap
@@ -1683,7 +1710,7 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   if !mapRecvOk(mp.prSym, n.cbL, id) {
     return "a map read of a receiver that is no map"
   }
-  if mp.prForm < 1 || mp.prForm > 3 {
+  if mp.prForm < 1 || mp.prForm > 5 {
     return "a fused map read writes its default in no miss arm"
   }
   const o = n.cbOut
@@ -1700,6 +1727,26 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   )
   if mp.prForm == 2 && (!(mr is RMap) || mr.rmVal != vf.irVars[o].vRep) {
     return "a map read's mv slot yields no value of its map"
+  }
+  // A boxed nullable union's read is its box.
+  if (
+    mp.prForm == 5
+    && !mapBoxReadsAt(
+      if mp.prSym >= 0 { irGlobalRepOf(vf, mp.prSym) } else { opRep(n.cbL) },
+      vf.irVars[o].vRep,
+    )
+  ) {
+    return "a map read's union box yields no value of its map"
+  }
+  // A ref niche's read is its non-null value.
+  if (
+    mp.prForm == 4
+    && !mapNicheReadsAt(
+      if mp.prSym >= 0 { irGlobalRepOf(vf, mp.prSym) } else { opRep(n.cbL) },
+      vf.irVars[o].vRep,
+    )
+  ) {
+    return "a map read's niche yields no value of its map"
   }
   // A union value's read peels to its scalar.
   if mp.prForm == 3 && (!(mr is RMap) || p == null) {
@@ -2005,6 +2052,7 @@ function stmt(id: i32, prev: i32) {
     SIf => ifSpine(id)
     SCoalBox => coalBoxCheck(n, id)
     SSwitch => switchCheck(n, id)
+    SIntSwitch => intSwitchCheck(n, id)
     SBr => {
       if n.brHas && !vf.irHelper {
         return fail(10, id, "a valued branch outside a runtime helper")
@@ -2065,6 +2113,31 @@ function stmt(id: i32, prev: i32) {
     SDrop => use(n.dpV, id)
     SRawOp => rawEff(n, id)
   }
+  return 0
+}
+
+// Rule 7: an integer switch reads a 32-bit integer, or a 64-bit one when wide, and every table
+// entry names an arm or the else.
+function intSwitchCheck(n: SIntSwitch, id: i32) {
+  use(n.isOn, id)
+  const p = repPrim(opRep(n.isOn))
+  if p == null { return fail(7, id, "an integer switch over a non-scalar") }
+  const w = match p {
+    "i32" | "u8" => 1
+    "i64" => 2
+    "bool" | "f64" | "f32" | "str" | "null" | "v128" => 0
+  }
+  if w == 0 { return fail(7, id, "an integer switch over a non-integer") }
+  if (w == 2) != n.isWide {
+    return fail(7, id, "an integer switch's width is not its scrutinee's")
+  }
+  for t in n.isTable {
+    if t < 0 || t > n.isArms.length {
+      return fail(7, id, "a table entry names no arm")
+    }
+  }
+  for a in n.isArms { nested(a) }
+  nested(n.isElse)
   return 0
 }
 
@@ -2145,6 +2218,7 @@ function touchesList(n: IrNode): boolean {
       SForIn |
       SGlobalSet |
       SIf |
+      SIntSwitch |
       SLoop |
       SRangeLoop |
       SRawOp |
@@ -2368,6 +2442,7 @@ function rhsReadsList(r: Rhs): boolean {
       RMapSet |
       RMemAccess |
       RMemOp |
+      RNicheRead |
       RNulNicheEq |
       RNulTest |
       RNullOf |
