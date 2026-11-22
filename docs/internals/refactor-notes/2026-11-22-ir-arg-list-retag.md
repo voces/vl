@@ -26,10 +26,21 @@ then cut to the ingredient that decides it.
 - `ir.vl`: `cloHoleRetag(src, dst)` is the one predicate for two reps that differ only in closure
   openness, either way round, a map's values included. It is IR-N6's (`ir-closure-hole-retag`),
   added here under the same name, signature and body; whichever lands second takes the other's.
+- `ir.vl` `repFillsHole`: a record arm is heap identity. Two records are one value exactly where
+  one heap stores both, so a recursive record pair (`L1 = {n: L1 | null}` beside its twin `L2`)
+  ends the walk, and twins on two heaps never retag. The heap is the one the builder noted on the
+  IR (`irRecHeapNote`, from `recHeapOf`, before it asks a hole retag); the verifier compares the
+  notes and makes no emit query. An unnoted record retags nothing.
 - `ir_verify.vl`: the `RRetag` rule admits `cloHoleRetag`. The negative self-test is a retag
-  between closure lists that differ in a concrete parameter, refused under rule 2.
+  between the lists of two field-alike records (`{a: i32}`, `{b: i32}`) noted on two heaps, refused
+  under rule 2.
+- The remaining edge is `recRetag`, whose verifier arm still calls `recHeapOf`, an emit query
+  (D17049, IR-D1's to move onto the same note).
 
 ## Witness
+
+`tests/ir-shadow-rows/recursive-twin-list-handed-across.vl` hands a recursive record's list to its
+twin's: a seed whose record arm recursed through fields traps on it.
 
 `tests/cases/closures/hole-fn-list-handed-to-concrete-param.vl` hands each B shape to a
 concrete-parameter callee that calls the closures and reads the records. The old seed leaves its
