@@ -142,6 +142,7 @@ row_mem() {
     "rep-fuzz") echo 1600 ;;
     "deno task test"|"plumb-shape cost") echo 1400 ;;
     "ir shadow"|"ir shadow cases") echo 1300 ;;
+    "ir shadow suite") echo 600 ;;
     "lsp suites (ci list)") echo 1100 ;;
     "scaling shape") echo 900 ;;
     "capability probes"|"kind-ladder sets") echo 800 ;;
@@ -256,6 +257,9 @@ run "deno task test"           deno test --preload tests/support/signal_guard.ts
 run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check --parallel $CI_NATIVE
 # shellcheck disable=SC2086
 run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check --parallel $LSP_CI
+# The IR shadow suite on this tree's seed. The full gate runs it inside `ci-native`; `--fast`
+# skips that row, so here it runs alone, and a stale miss expectation reds before the queue.
+[ "$FAST" = 1 ] && run "ir shadow suite"   env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_ir_shadow_test.ts
 # Root deno.json excludes lsp/ and every suite runs --no-check, so a type error
 # in lsp/src/*.ts is invisible to all the other gates (esbuild strips types
 # without checking). Mirrors ci.yml's "Type-check (lsp)" step.
