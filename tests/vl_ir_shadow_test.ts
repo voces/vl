@@ -1481,10 +1481,10 @@ Deno.test({
     if (exp.compileSrc() !== 0) throw new Error("want the priming compile to pass");
     // Each case's id and the rule the verifier must name for it (0: the function holds). Rules 1
     // to 7 each have the case named for them; the rest break rule 2 (a store, an effectful
-    // immediate, a pop, map read, shared read, niche read, unbox, numeric conversion, result pick
-    // or `??` of the wrong operand or out, a stashed record's order, a held global read off its
-    // rep), rule 5 (a fall-through, an out left unwritten) or rule 8 (a bounds check with the
-    // bounds rule uninstalled).
+    // immediate, a pop, map read, shared read, niche read, unbox, numeric conversion, result pick,
+    // retag or `??` of the wrong operand or out, a stashed record's order, a held global read off
+    // its rep), rule 5 (a fall-through, an out left unwritten), rule 8 (a bounds check with the
+    // bounds rule uninstalled) or rule 10 (a valued block outside a helper whose out is a temp).
     const want: Record<string, number> = {
       "holds": 0,
       "var-rep-outside-tree": 1,
@@ -1498,6 +1498,7 @@ Deno.test({
       "i32-into-bool-global": 2,
       "bounds-rule-uninstalled": 8,
       "box-immediate-for-call": 2,
+      "box-at-union-type-into-i32": 2,
       "pop-or-of-i32": 2,
       "pop-or-bool-out": 2,
       "pop-or-out-unwritten": 5,
@@ -1513,11 +1514,35 @@ Deno.test({
       "shared-read-global-not-box": 2,
       "niche-read-of-i32": 2,
       "arm-unbox-of-i32": 2,
+      "box-list-retag-into-i32-list": 2,
+      "box-list-retag-into-niche-record-list": 2,
       "num-union-conversion-of-non-box": 2,
       "num-union-conversion-off-result-kind": 2,
       "held-global-read-off-noted-rep": 2,
+      "null-into-nullable-record-global": 0,
+      "null-into-bool-niche-global": 2,
       "result-pick-of-i32": 2,
       "result-pick-record-into-i32": 2,
+      "record-retag-of-i32": 2,
+      "record-retag-into-i32": 2,
+      "record-retag-field-other-valtype": 2,
+      "record-retag-two-noted-heaps": 2,
+      "record-retag-one-noted-heap": 0,
+      "width-retag-noted-leading": 0,
+      "width-retag-field-not-leading": 2,
+      "width-retag-pair-unnoted": 2,
+      "retag-closures-of-differing-arity": 2,
+      "retag-field-alike-records-two-heaps": 2,
+      "global-read-off-store-type": 2,
+      "valued-block-temp-out": 10,
+      "atom-sole-into-i32": 2,
+      "atom-tower-i32-read": 2,
+      "atom-tower-zero-reads": 2,
+      "atom-staged-of-i32": 2,
+      "trunc-sat-operand-off-plan": 2,
+      "atomic-value-off-plan": 2,
+      "memory-store-value-off-plan": 2,
+      "simd-operand-off-plan": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -1578,7 +1603,7 @@ print(two("a", "b"))
 const PRE_PATHS: [string, string][] = [
   [
     "atom hook",
-    `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
+    `const JX = "x"\nconst B: "y" = "y"\nfunction join(c: boolean) {\n  const M: "x" | "y" | "z" = if c { JX } else { B }\n  return M == "z"\n}\nprint(join(true))\n`,
   ],
 ];
 Deno.test({
@@ -2817,6 +2842,48 @@ Deno.test({
     }
     if ((rows.get("uncovered indirect call") ?? 0) !== 1) {
       throw new Error(`want direct a named indirect-call miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A record argument on its parameter's own struct heap goes in retagged (`recRowRetag`) where its
+// fields lower alike by name: a reordered spelling, a recursive structural twin, and a field holding
+// a generic's open closure (every closure lowers to the one closure struct).
+const ROW_RETAG_ARG =
+  `type AB = { a: i32, b: f64 }\ntype BA = { b: f64, a: i32 }\nfunction takeAB(v: AB): i32 { return v.a }\nconst y: BA = { b: 3.5, a: 7 }\nprint(takeAB(y))\ntype L1 = { n: L1 | null, v: i32 }\ntype L2 = { n: L2 | null, v: i32 }\nfunction headV(x: L1) { return x.v }\nconst t2: L2 = { n: null, v: 9 }\nprint(headV(t2))\n`;
+const ROW_RETAG_OPEN =
+  `type G = { g: i32 }\nfunction k<T>(x: T): T { return x }\nfunction show(o: G) { print(o.g) }\nconst r = { f: k, g: 7 }\nshow(r)\n`;
+Deno.test({
+  name: "ir shadow: a record argument on its parameter's struct heap is retagged where its fields lower alike",
+  ignore,
+  fn: () => {
+    for (const src of [ROW_RETAG_ARG, ROW_RETAG_OPEN]) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+      if ((rows.get("start uncovered argument coercion") ?? 0) !== 0 || (rows.get("start matched") ?? 0) !== 1) {
+        throw new Error(`want the start body covered and matched, got ${JSON.stringify([...rows])}`);
+      }
+    }
+  },
+});
+
+// A record delivered by width (`Cat` to `Animal`) is its value as it stands, the supertype legacy's
+// type section declares (`recSubRetag`): at a module initializer, a local declaration and an
+// argument.
+const WIDTH_RETAG =
+  `type Animal = { legs: i32 }\ntype Cat = { legs: i32, purr: boolean }\nfunction mkCat(): Cat { return { legs: 4, purr: true } }\nfunction take(a: Animal) { print(a.legs) }\nfunction local(c: Cat) {\n  const a: Animal = c\n  print(a.legs)\n}\nconst asAnimal: Animal = mkCat()\nprint(asAnimal.legs)\nlocal(mkCat())\ntake(mkCat())\n`;
+Deno.test({
+  name: "ir shadow: a record delivered at a declared supertype is retagged and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(WIDTH_RETAG, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== (rows.get("fns") ?? -1) || (rows.get("start matched") ?? 0) !== 1) {
+      throw new Error(`want every function and the start body covered, got ${JSON.stringify([...rows])}`);
     }
   },
 });
