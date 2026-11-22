@@ -6923,9 +6923,7 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("coalesce string shape")
   }
   const dIx = unwrapParen(n.binRight)
-  if dIx < 0 || !(nodeAt(dIx) is StrLit) {
-    return irBMiss("coalesce string default")
-  }
+  if dIx < 0 || !(nodeAt(dIx) is StrLit) { return coalNulStr(b, n, ix, rep) }
   const lat = b.length
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
@@ -6940,6 +6938,43 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !(d is OStr) { return irBMiss("coalesce string default") }
   const r: Rhs = { czL: l, czD: d, czAt: ix }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// `l ?? d` over a `string | null` whose default computes: legacy's `br_on_non_null` core at the
+// string heap (`emitCoalesceNulRefCtx` at `sTy()`), the operand built into the block and the
+// default built where it runs only on `null`, the block nullable as `coalesceNulStrStaysNullable`.
+function coalNulStr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const lb: i32[] = []
+  const l = irBExpr(lb, n.binLeft)
+  if ibMiss != "" { return l }
+  if !(l is OVar) || l.ov < 0 { return irBMiss("coalesce string operand") }
+  if !strNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
+  const nul = coalesceNulStrStaysNullable(ix, ibFnIx)
+  const want = if nul { irBOpRep(l) } else { strInnerOf(irBOpRep(l)) }
+  if rep != want { return irBMiss("coalesce result rep") }
+  const nb: i32[] = []
+  const d = irBExpr(nb, n.binRight)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce string default rep") }
+  // A default and an operand that build nothing are written in place, as the literal's core is.
+  if lb.length == 0 && nb.length == 0 {
+    const r: Rhs = { czL: l, czD: d, czAt: ix }
+    return irBLetTemp(b, r, ix, rep)
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  const arm: CoalValArm = "nulStr"
+  irBNode(
+    b,
+    { cbL: l, cbLB: lb, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // `l ?? d` over a boxed operand along `coalBoxArmOf`'s arm: the operand's box, then legacy's
