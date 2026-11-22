@@ -10094,6 +10094,70 @@ function emitUnionEqOther(otherIx: i32, k: i32, fnIx: i32) {
   return emitExpr(otherIx, fnIx)
 }
 
+// A union `==` against a concrete operand on its plain arm: the box's tag `uqTag`, and value-atom
+// kind `uqKind` the payload and operand compare at; -1 where a stash, null leg or other arm writes.
+export type UnionEqPlan = { uqKind: i32, uqTag: i32 }
+
+// The plan of box `boxIx` against `otherIx`: a re-readable box whose union carries the operand's
+// arm, with no null leg on the operand's side. `emitUnionConcreteEq` writes the rest itself.
+export function unionConcreteEqPlanOf(
+  boxIx: i32,
+  otherIx: i32,
+  fnIx: i32,
+): UnionEqPlan {
+  const no: UnionEqPlan = { uqKind: -1, uqTag: -1 }
+  if !unionEqOperandOk(boxIx) { return no }
+  const unr: i32[] = []
+  const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
+  const usid = msSetOfUnionBox(boxIx, fnIx)
+  const bty = unionBoxTyOfRead(boxIx, fnIx)
+  const eak = unionEqAtomKindOf(otherIx, usid, bty, fnIx)
+  if eak < 0 || uname == "" { return no }
+  let hasArm = unionEqArmPresent(usid, valueAtomNameOfKind(eak), eak)
+  if !hasArm && eak == 2 && msSetTakesAtomAsStr(usid) { hasArm = true }
+  if !hasArm { return no }
+  // The operand's null legs (`nulOther`, `nulStrOther`, `nulBoolOther`) test it first.
+  if unionEqOperandOk(otherIx) && unionSetHasNullTy(uname, bty) {
+    const nul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+    if eak == 2 && (exprNulLitUnion(otherIx, fnIx) || nul) { return no }
+    if eak == 1 && nul { return no }
+  }
+  const tag = unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], fnIx))
+  const p: UnionEqPlan = { uqKind: eak, uqTag: tag }
+  return p
+}
+
+// What a union `==` takes before its first box read: its stash slot, which the frame holds.
+export function unionEqHead(): i32 {
+  unionEqStashSlot()
+  return 0
+}
+
+// After the box's first read: its tag against the plan's, opening the payload compare's `if`.
+export function unionEqTagTail(qp: UnionEqPlan): i32 {
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, qp.uqTag)
+  fbI32Bin(70)
+  fbIf(127)
+  return 0
+}
+
+// After the box's second read: its payload unboxed at the plan's kind.
+export function unionEqPayloadTail(qp: UnionEqPlan): i32 {
+  fbStructGet(uBoxIdx, 1)
+  return emitUnionPayloadUnbox(qp.uqKind)
+}
+
+// After the operand: the payload compare, the other arms' 0, and `!=`'s negation.
+export function unionEqCmpTail(qp: UnionEqPlan, isNe: boolean, fnIx: i32): i32 {
+  if emitUnionAtomPayloadEq(qp.uqKind, fnIx) < 0 { return -1 }
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  if isNe { fbI32Eqz() }
+  return 0
+}
+
 // Union against a concrete value, in either operand order: the box's tag must select the arm
 // whose rep matches the other side, then the unboxed payload value-compares it. A rep with no
 // arm is statically unequal, `==` 0 and `!=` 1, with both operands still evaluated for side
@@ -10104,6 +10168,17 @@ function emitUnionConcreteEq(
   isNe: boolean,
   fnIx: i32,
 ) {
+  // The plain arm: the box read twice, the operand once, through the plan the IR writes too.
+  const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
+  if qp.uqKind >= 0 {
+    unionEqHead()
+    if emitExpr(boxIx, fnIx) < 0 { return -1 }
+    unionEqTagTail(qp)
+    if emitExpr(boxIx, fnIx) < 0 { return -1 }
+    if unionEqPayloadTail(qp) < 0 { return -1 }
+    if emitUnionEqOther(otherIx, qp.uqKind, fnIx) < 0 { return -1 }
+    return unionEqCmpTail(qp, isNe, fnIx)
+  }
   // D972 — a non-re-readable operand is stashed at its first read, not refused. This compare
   // reads the box up to three times — the no-arm fold, the tag, and the payload inside the
   // tag-matched arm — which is the whole content of `unionEqOperandOk` (Ident, NumLit, StrLit,
