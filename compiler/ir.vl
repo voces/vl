@@ -342,8 +342,8 @@ export type RSimd = { sdArgs: Opnd[], sdAt: i32 }
 export type RPrint = { pnV: Opnd, pnAt: i32 }
 // `m[k] ?? d` at `??` node `mgAt`: map global `mgSym` (recovered for `mgNonNull`), else receiver
 // `mgLoc`, key `mgKey`; by `mgForm` the default goes to `__map_get_<row>__`'s miss (0), or is `mgDef`
-// in the miss arm of the probe's `i32` read (1), mv slot read (2) or `scalar | null` union value's
-// scalar (3) (`mapGetOrArmOf`, `mapGetOrMvPlain`, `mapGetOrUnionScalarPlanOf`).
+// in the miss arm of the probe's `i32` read (1), mv slot read (2), `scalar | null` union value's
+// scalar (3), a ref niche's null (4) or a nullable union's box (5) (`mapGetOrArmOf` and its arms).
 export type RMapGetOr = {
   mgSym: i32,
   mgNonNull: boolean,
@@ -407,6 +407,9 @@ export type REnvDrop = { edFn: i32 }
 // The closure the bundle parameter or record holder `bpV` holds for call `bpAt`, as `bundlePickOf`
 // picks it.
 export type RBundlePick = { bpV: Opnd, bpAt: i32 }
+// The member closure direct call `rkAt` of `fnStmts` slot `rkFe` picks from the bundle record
+// `rkV` it returned, as `bundleResultPickOf` (legacy's `emitBundleResultPick`) names it.
+export type RResultPick = { rkV: Opnd, rkAt: i32, rkFe: i32 }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
 // reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing. `tag64`
@@ -490,6 +493,7 @@ export type Rhs = RArmUnbox
   | RRecCopyPure
   | RRecover
   | RRel
+  | RResultPick
   | RRetNull
   | RRetag
   | RSharedRead
@@ -594,6 +598,18 @@ export function coalArmStagesLeads(a: CoalValArm): boolean {
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" => false
   }
 }
+// An integer `match` chain written as one `br_table` (`IntSwitchPlan`): operand `isOn` less
+// `isLo`, read again under the range test when `isWide`; `isTable[d]` the arm index `d` takes,
+// `isArms.length` the else, whose body is `isElse`. A tail chain's (`isTail`) arms return.
+export type SIntSwitch = {
+  isTail: boolean,
+  isOn: Opnd,
+  isWide: boolean,
+  isLo: i32,
+  isTable: i32[],
+  isArms: i32[][],
+  isElse: i32[],
+}
 // A `??` at `cbAt` whose head and present arm are legacy's shared tails along arm `cbArm`, with a
 // lazy default and a valued out: operand `cbL`, the `if` or block the tails open on it, and the
 // default `cbNull`, which writes out `cbOut` on the null path; `cbMap`, a fused map read's probe.
@@ -609,7 +625,7 @@ export type SCoalBox = {
 }
 // A fused map read's probe: map global `prSym` (recovered for `prNonNull`), or where it is -1 the
 // receiver in `cbL`, key `prKey`, and `RMapGetOr`'s inline form `prForm` (1 the `i32` read, 2 mv,
-// 3 a union value's scalar).
+// 3 a union value's scalar, 4 a ref niche, 5 a nullable union's box).
 export type MapProbe = {
   prSym: i32,
   prNonNull: boolean,
@@ -646,6 +662,7 @@ export type IrNode = SAssign
   | SForIn
   | SGlobalSet
   | SIf
+  | SIntSwitch
   | SLet
   | SListSet
   | SLoop
@@ -694,6 +711,9 @@ export type IrFn = {
   irGlobalSym: i32[],
   irGlobalRep: i32[],
   irGlobalAt: {[i32]: i32},
+  // The globals whose cell holds the record a holding binding holds whole, noted at that record's
+  // rep: a read of one at that rep is at its storage.
+  irGlobalHeld: {[i32]: boolean},
   irSpanAst: i32[],
   irSpanFirst: i32[],
   irSpanLast: i32[],
@@ -778,6 +798,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irGlobalSym: [],
     irGlobalRep: [],
     irGlobalAt: Map(),
+    irGlobalHeld: Map(),
     irSpanAst: [],
     irSpanFirst: [],
     irSpanLast: [],
@@ -907,6 +928,12 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
         if !irBodyLeaves(f, n.siThen) { return false }
         cur = n.siElse
       }
+      SIntSwitch => {
+        for a in n.isArms {
+          if !irBodyLeaves(f, a) { return false }
+        }
+        cur = n.isElse
+      }
       SAssign |
         SBlock |
         SBoundsCheck |
@@ -927,6 +954,26 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
       }
     }
   }
+}
+
+// Whether a map of rep `mrep` holds a ref niche (discipline 1) whose non-null value is rep `out`:
+// the value a `??` read over that niche yields.
+export function mapNicheReadsAt(mrep: i32, out: i32): boolean {
+  const mr = repNodeAt(mrep)
+  if !(mr is RMap) { return false }
+  const v = repNodeAt(mr.rmVal)
+  return v is RNullable && v.rnDisc == 1 && v.rnInner == out
+}
+
+// Whether a map of rep `mrep` holds a boxed nullable union (discipline 4) whose `??` read is rep
+// `out`: the value's rep itself under a nullable default, else the box inside it.
+export function mapBoxReadsAt(mrep: i32, out: i32): boolean {
+  const mr = repNodeAt(mrep)
+  if !(mr is RMap) { return false }
+  const v = repNodeAt(mr.rmVal)
+  return v is RNullable
+    && v.rnDisc == 4
+    && (out == mr.rmVal || out == v.rnInner)
 }
 
 // Whether rep `r` is the `boolean | null` niche (discipline 2): an i32 cell, `2` for null.
@@ -1044,6 +1091,16 @@ export function irPushBodies(f: IrFn, id: i32, bodies: i32[][], pos: i32[]) {
       let k = n.swArms.length - 1
       while k >= 0 {
         bodies.push(n.swArms[k].swBody)
+        pos.push(0)
+        k = k - 1
+      }
+    }
+    SIntSwitch => {
+      bodies.push(n.isElse)
+      pos.push(0)
+      let k = n.isArms.length - 1
+      while k >= 0 {
+        bodies.push(n.isArms[k])
         pos.push(0)
         k = k - 1
       }
@@ -1199,6 +1256,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     REnvGet => []
     REnvDrop => []
     RBundlePick => [r.bpV]
+    RResultPick => [r.rkV]
     RRawOp => r.rwArgs
     RRel => []
     RStage => [r.sgV]
@@ -1327,6 +1385,7 @@ function rhsText(r: Rhs): string {
     REnvGet => "env " + i32ToStr(r.evSlot)
     REnvDrop => "env drop f" + i32ToStr(r.edFn)
     RBundlePick => "bundle pick " + opndText(r.bpV)
+    RResultPick => "result pick " + opndText(r.rkV)
     RGlobalGet => "global " + i32ToStr(r.ggSym) + (if r.ggNonNull { " nonnull" } else { "" })
   }
 }
@@ -1467,6 +1526,24 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
       }
       s
     }
+    SIntSwitch => {
+      let s = p + "intswitch " + opndText(n.isOn) + " lo " + i32ToStr(n.isLo)
+      if n.isWide { s = s + " wide" }
+      s = s + " table"
+      for t in n.isTable { s = s + " " + i32ToStr(t) }
+      s = s + "\n"
+      let k = 0
+      while k < n.isArms.length {
+        s = s
+          + p
+          + "arm "
+          + i32ToStr(k)
+          + "\n"
+          + bodyText(f, n.isArms[k], d + 1)
+        k = k + 1
+      }
+      s + p + "else\n" + bodyText(f, n.isElse, d + 1)
+    }
     SBr => {
       if n.brHas {
         return p + "br L" + i32ToStr(n.brLabel) + " " + opndText(n.brVal) + "\n"
@@ -1516,6 +1593,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
       SDrop |
       SForIn |
       SIf |
+      SIntSwitch |
       SLoop |
       SRangeLoop |
       SReturn |
@@ -1608,7 +1686,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RCallRef |
       REnvDrop |
       REnvGet |
-      RMakeClo => "closure"
+      RMakeClo |
+      RResultPick => "closure"
     RCellGet |
       RCellNew |
       RFnId |
