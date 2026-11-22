@@ -1521,6 +1521,7 @@ Deno.test({
       "retag-field-alike-records-two-heaps": 2,
       "global-read-off-store-type": 2,
       "valued-block-temp-out": 10,
+      "atom-sole-into-i32": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
