@@ -8,22 +8,25 @@ Legacy writes the earlier operand first, then the `??`, its value staying on the
 
 ## Change
 
-- `coalBox` (ir_lower) stages the temps an earlier operand left pending below its operand with
-  the valued `if`'s own `stageLead`, under the same floor push and pop. A fused map read
-  (`cbMap`) also reads its key, which `stageLead` does not count as its condition, so it stages
-  none and keeps the old order.
-- `irBStageLeads` stages earlier arguments below an `SCoalBox` as it does below a valued `if`:
-  `coalBoxFrom` and `coalBoxOut`, siblings of `valuedIfFrom` and `valuedIfOut`. Its in-place
-  refusal keeps only the receiver stage, `receiverStageFrom`, split out of `inPlaceFrom`;
-  `inPlaceFrom`'s other four callers are unchanged.
-- The six `coalesce … after an operand` refusals are dropped.
+- `coalArmStagesLeads` (ir.vl) names the arms that stage: a niche cell's `if` (`litUnion`,
+  `nulBool`) and a nullable reference's block (`nulRef`), which read only their operand before
+  they open. It is an exhaustive match, and both sides call it.
+- `coalBox` (ir_lower) stages, along those arms, the temps an earlier operand left pending below
+  its operand with the valued `if`'s own `stageLead`, under the same floor push and pop.
+- `irBStageLeads` stages earlier arguments below such an `SCoalBox` as it does below a valued
+  `if` (`coalBoxFrom(b, at, true)`, `coalBoxOut`); one along any other arm stays in place and
+  refused, as before. `inPlaceFrom` and its other callers are unchanged.
+- The niche and nulRef builders drop their `after an operand` refusals; the boxed, field,
+  optional and fused-pop ones keep theirs.
 
-New predicates (R8): `coalBoxFrom`, `coalBoxOut` and `receiverStageFrom` read only the IR's own
-nodes; none restates a legacy condition.
+New predicates (R8): `coalArmStagesLeads` is a fact about the lowering's own arms, and
+`coalBoxFrom`, `coalBoxOut` and `receiverStageFrom` read only the IR's nodes. None restates a
+legacy condition.
 
-The first cut widened `valuedIfFrom`/`valuedIfOut` themselves and dropped `SCoalBox` from
-`inPlaceFrom`. Narrowing to `irBStageLeads` alone still left 12 self functions as
-`unlowered: stack value read out of order`; the map probe's key was the cause, and the `cbMap`
-exclusion took them to 0.
+The first cut staged along every arm. On the self it left 12 functions
+`unlowered: stack value read out of order` (a fused map read also reads its key). Once that was
+excluded, the armed `tests/cases` shadow found a field arm after an interpolation part
+(`operand above a valued if's value`) and a numeric box arm after a literal argument
+(`spans: read index`). So the change is cut to the arms the self-compile's witnesses use.
 
 The shadow row is `tests/ir-shadow-rows/coalesce-after-operand.vl`.
