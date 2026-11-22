@@ -273,6 +273,7 @@ import {
 } from "./emit_bytes"
 import {
   GlobalCtx,
+  MapUnionPlan,
   SHARED_NULL_NONE,
   arrCopyBacking,
   arrCopyPlanOf,
@@ -391,6 +392,10 @@ import {
   mapGetOrMvHead,
   mapGetOrMvPlain,
   mapGetOrMvTail,
+  mapGetOrUnionHead,
+  mapGetOrUnionScalarOpen,
+  mapGetOrUnionScalarPlanOf,
+  mapGetOrUnionScalarTail,
   mapHasTail,
   mapKeysFrameOf,
   mapLengthPlain,
@@ -2348,10 +2353,11 @@ function mapGetOr(r: RMapGetOr) {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(r.mgAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if r.mgForm == 1 { "i32" } else if r.mgForm == 2 { "mv" } else { "helper" }
+  const want = if r.mgForm == 1 { "i32" } else if r.mgForm >= 2 { "mv" } else { "helper" }
   if (
     arm != want
     || r.mgForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
+    || r.mgForm == 3 && mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk).muKind < 0
   ) {
     return irLMiss("map read route")
   }
@@ -2366,9 +2372,14 @@ function mapGetOr(r: RMapGetOr) {
       r.mgNonNull,
       r.mgLoc,
       r.mgKey,
+      mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
     )
     irLOpnd(r.mgDef)
-    return mapGetOrInlineTail(r.mgForm, sh)
+    return mapGetOrInlineTail(
+      r.mgForm,
+      sh,
+      mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
+    )
   }
   const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
   const fi = mapGetHelperFnOf(rd.idxArr, fnIx, miss[0])
@@ -2449,15 +2460,29 @@ function mapGetOrInlineHead(
   nonNull: boolean,
   loc: Opnd,
   key: Opnd,
+  qp: MapUnionPlan,
 ): i32 {
   const sh = mapProbeHead(recvIx, sym, nonNull, loc, key)
-  if form == 2 { mapGetOrMvHead(sh) } else { mapGetOrI32Head() }
+  if form == 3 {
+    mapGetOrUnionHead(sh)
+    mapGetOrUnionScalarOpen(sh, qp)
+  } else if form == 2 {
+    mapGetOrMvHead(sh)
+  } else {
+    mapGetOrI32Head()
+  }
   return sh
 }
 
 // An inline map read's tail after its default, by `form`.
-function mapGetOrInlineTail(form: i32, sh: i32) {
+function mapGetOrInlineTail(form: i32, sh: i32, qp: MapUnionPlan) {
+  if form == 3 { return mapGetOrUnionScalarTail(sh, qp) }
   return if form == 2 { mapGetOrMvTail(sh) } else { mapGetOrI32Tail() }
+}
+
+// The scalar union plan of `recvIx[k] ?? defIx` at result kind `rk` (`mapGetOrUnionScalarPlanOf`).
+function mapGetOrUnionPlanAt(recvIx: i32, defIx: i32, rk: i32): MapUnionPlan {
+  return mapGetOrUnionScalarPlanOf(mapRecvShapeOf(recvIx, lw.irAt), defIx, rk)
 }
 
 // The fused map read whose default computes: the route `mapGetOr` checks, the shared head, the
@@ -2471,11 +2496,12 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(n.cbAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if mp.prForm == 1 { "i32" } else if mp.prForm == 2 { "mv" } else { "helper" }
+  const want = if mp.prForm == 1 { "i32" } else if mp.prForm >= 2 { "mv" } else { "helper" }
   if (
     arm != want
     || want == "helper"
     || mp.prForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
+    || mp.prForm == 3 && mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk).muKind < 0
   ) {
     return irLMiss("map read route")
   }
@@ -2490,12 +2516,17 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
     mp.prNonNull,
     n.cbL,
     mp.prKey,
+    mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
   )
   irLSettle(pending)
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   lwFrames.pop()
-  mapGetOrInlineTail(mp.prForm, sh)
+  mapGetOrInlineTail(
+    mp.prForm,
+    sh,
+    mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
+  )
   return 0
 }
 
