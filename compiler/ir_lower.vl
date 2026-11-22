@@ -7,7 +7,7 @@ import { blockHasContinueFor } from "./emit_query"
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
 import { fnEnvIdxOf } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
-import { printUnionPlan } from "./emit_fn_scans"
+import { binEqStructRow, printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import {
@@ -157,6 +157,7 @@ import {
   RNullOf,
   RNumCast,
   RNumIntr,
+  RNumUnionBin,
   RNumWiden,
   RPrimOp,
   RPrint,
@@ -172,6 +173,7 @@ import {
   RStage,
   RStashSet,
   RStrOp,
+  RStructEq,
   RTagIs,
   RTagOf,
   RTagStash,
@@ -420,6 +422,13 @@ import {
   nulTestRefTail,
   numCastTail,
   numIntrTail,
+  numUnionBinTail,
+  numUnionIsUnionSide,
+  numUnionSideKindOf,
+  numUnionSideLit,
+  numUnionStashEnter,
+  numUnionStashLeave,
+  numUnionStashTail,
   numWidenTail,
   objLitLayoutRowAt,
   objLitLayoutRowOf,
@@ -472,6 +481,11 @@ import {
   stageListRecvTail,
   staticAtomId,
   strSiteArmMint,
+  structEqEnter,
+  structEqRoots,
+  structEqStagesLeft,
+  structEqStagesRight,
+  structEqTail,
   structFieldTail,
   structUnionBoxTail,
   tagDispatchIfOf,
@@ -922,6 +936,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMapHas => mapHas(r)
     RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
+    RNumUnionBin => numUnionBin(r)
     RNumIntr => {
       for a in r.nxArgs { irLOpnd(a) }
       numIntrTail(r.nxOp)
@@ -962,6 +977,7 @@ function rhs(r: Rhs, tail: boolean) {
       RListSlice |
       RMapFilter |
       RStrOp => irLowerListHook(r)
+    RStructEq => structEq(r)
     RListClear => irLMiss("clear value")
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
@@ -2621,6 +2637,73 @@ function unionEq(r: RUnionEq) {
   return unionUnionEqTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
 }
 
+// `RNumUnionBin`: legacy's `numUnion` dispatch in `emitNumUnionBin`'s order: each side's value
+// and its stash, one level deeper for a dispatch inside it, then the member dispatch over the
+// stashed sides (`numUnionBinTail`). A literal side stashes nothing.
+function numUnionBin(r: RNumUnionBin) {
+  const n = nodeAt(r.nbAt)
+  if !(n is BinExpr) { return irLMiss("numeric union node") }
+  const fnIx = lw.irAt
+  const key = numUnionStashEnter()
+  let k = 0
+  const sides = [n.binLeft, n.binRight]
+  const slots: i32[] = []
+  let j = 0
+  while j < 2 {
+    const ix = sides[j]
+    const isU = numUnionIsUnionSide(ix, fnIx)
+    if !isU && numUnionSideLit(ix) {
+      slots.push(-2)
+    } else {
+      if k >= r.nbArgs.length {
+        numUnionStashLeave()
+        return irLMiss("numeric union operands")
+      }
+      irLOpnd(r.nbArgs[k])
+      k = k + 1
+      slots.push(numUnionStashTail(isU, numUnionSideKindOf(ix), key + j))
+    }
+    j = j + 1
+  }
+  numUnionStashLeave()
+  if numUnionBinTail(n, r.nbAt, fnIx, slots[0], slots[1]) < 0 {
+    return irLMiss("numeric union dispatch")
+  }
+  return 0
+}
+
+// `RStructEq`: legacy's field-wise record compare (`emitStructEq`): the stashed operands' values,
+// their slots, then the compare, which reads an unstashed operand from its variable's local.
+function structEq(r: RStructEq) {
+  const n = nodeAt(r.seAt)
+  if !(n is BinExpr) { return irLMiss("record compare node") }
+  const fnIx = lw.irAt
+  const row = binEqStructRow(r.seAt, fnIx)
+  if row < 0 { return irLMiss("record compare row") }
+  const lS = structEqStagesLeft(n.binLeft, n.binRight)
+  const rS = structEqStagesRight(n.binRight)
+  const lLoc = if lS { -1 } else { structEqSideLocal(r.seL) }
+  const rLoc = if rS { -1 } else { structEqSideLocal(r.seR) }
+  if !lS && lLoc < 0 || !rS && rLoc < 0 {
+    return irLMiss("record compare place")
+  }
+  const saved = structEqEnter()
+  if lS { irLOpnd(r.seL) }
+  if rS { irLOpnd(r.seR) }
+  const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
+  if structEqTail(n, row, roots, saved, fnIx) < 0 {
+    return irLMiss("record compare fields")
+  }
+  return 0
+}
+
+// The local a record compare reads unstashed operand `o` from: a variable's slot, else -1.
+function structEqSideLocal(o: Opnd): i32 {
+  if !(o is OVar) || isTemp(o.ov) { return -1 }
+  if o.ov < lwStackVal.length && lwStackVal[o.ov] { return -1 }
+  return varSlot(o.ov)
+}
+
 // `RNulNicheEq`: legacy's `nulNiche` compare in `emitNulNicheEq`'s order: the guard's head, the
 // left operand, the right twice around the rep's own compare, and `i32.eqz` for `!=`.
 function nulNicheEq(r: RNulNicheEq) {
@@ -3361,7 +3444,8 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     || rr is RClosure)
     && at >= 0
     && nodeAt(unwrapParen(at)) is Call
-  const rj = if vt < 0 && !refOut && !strOut && !boxOut && at >= 0 { ifRefJoinOf(if n.siJoinAt >= 0 { n.siJoinAt } else { at }, lw.irAt) } else { noRefJoin() }
+  const decided = n.siJoin.rjKind != null
+  const rj = if vt < 0 && !refOut && !strOut && !boxOut && decided { n.siJoin } else if vt < 0 && !refOut && !strOut && !boxOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
   const rk = rj.rjKind
   if vt < 0 && !refOut && !strOut && !boxOut && rk == null {
     irLMiss("valued if rep")
@@ -3386,7 +3470,11 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     fbValtype("union", -1)
   } else if rk != null {
     fbOpenIf()
-    fbRefIfOpenType(rk, rj.rjSlot, ifLinkYieldsNull(at, lw.irAt))
+    fbRefIfOpenType(
+      rk,
+      rj.rjSlot,
+      if decided { n.siJoinNul } else { ifLinkYieldsNull(at, lw.irAt) },
+    )
   } else {
     fbIf(vt)
   }
