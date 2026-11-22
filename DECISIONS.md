@@ -12960,3 +12960,8 @@ A rep pair on the global (option 2) is a second rep channel. Leaving it to the e
   miss stays wholly on its current path until the carrier read lands, so the initializer and the
   carrier read land together.
 - The carrier is a stored table legacy filled, named in the PR, not a re-derivation from the type.
+- Carrier = D14434 binding storage column (coordinator ruling): `letBindTy`, the column legacy
+  lays `letCellSlot` out from. A build stores the cell at that row only where its initializer
+  builds it, and the global's reads in that build take it as it is. The verifier holds a global
+  read off its type's rep to the column's rep (`globalReadAtTyOrStorage`). A local's twin retypes
+  the variable to the column's type, so rule 3 holds it.

@@ -176,6 +176,11 @@ export type RListCopy = { lcArgs: Opnd[], lcAt: i32 }
 // A linear-memory load or store intrinsic at call node `mmAt` over its address and, for a store,
 // its value (`memAccessPlanOf`).
 export type RMemAccess = { mmArgs: Opnd[], mmAt: i32 }
+// An atomic intrinsic at call node `amAt` over its address and value operands (`atomicPlanOf`);
+// a fence has none.
+export type RAtomic = { amArgs: Opnd[], amAt: i32 }
+// A scalar saturating truncation at call node `tsAt` of float operand `tsV` (`truncSatPlanOf`).
+export type RTruncSat = { tsV: Opnd, tsAt: i32 }
 // A memory-management intrinsic at call node `moAt` over its i32 operands (`memOpPlanOf`).
 export type RMemOp = { moArgs: Opnd[], moAt: i32 }
 // `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on.
@@ -223,6 +228,15 @@ export type RAtomEq = {
 }
 // The `==` (or, with `ueNe`, `!=`) of two union boxes at compare node `ueAt`, written by legacy's
 // staged compare (`unionUnionEqTail`) over the two operands.
+// A union box `ucBox` against concrete `ucOther` at compare node `ucAt` (`ucSwap` where the box
+// is the right side), by legacy's plan: the box's tag, its payload, the operand and the compare.
+export type RUnionConcreteEq = {
+  ucBox: Opnd,
+  ucOther: Opnd,
+  ucNe: boolean,
+  ucSwap: boolean,
+  ucAt: i32,
+}
 export type RUnionEq = { ueL: Opnd, ueR: Opnd, ueNe: boolean, ueAt: i32 }
 // The `==` (or `!=`) of two lists at compare node `qeAt`, written by legacy's list compare
 // (`listEqTail`) after each operand's own recovery (`listEqOperandTail`).
@@ -310,7 +324,8 @@ export type RMapGetOr = {
 }
 // A bare `m[k]` at Index node `mtAt`: map global `mtSym` read (recovered for `mtNonNull`), or where
 // it is -1 receiver operand `mtLoc`, and key `mtKey`, by legacy's arm (`mapGetArmOf`). A read the
-// box plan boxes (`mapScalar`) carries the value's atom kind `mtBox`, else -1.
+// box plan boxes (`mapScalar`) carries the value's atom kind `mtBox`, else -1. `mtRow` where legacy
+// banks the read's element-read row, which its union-valued binding arm does not.
 export type RMapGet = {
   mtSym: i32,
   mtNonNull: boolean,
@@ -318,6 +333,7 @@ export type RMapGet = {
   mtKey: Opnd,
   mtAt: i32,
   mtBox: i32,
+  mtRow: boolean,
 }
 // `m.keys()` or, under `miVals`, `m.values()` at call `miAt` over map variable `miV`, which legacy's
 // writer reads three times (`mapListStep`): a fresh list of the live entries.
@@ -365,6 +381,7 @@ export type RStage = { sgV: Opnd }
 export type Rhs = RAsUnion
   | RAtomEq
   | RAtomStr
+  | RAtomic
   | RBoxField
   | RBoxNarrow
   | RBundlePick
@@ -436,6 +453,8 @@ export type Rhs = RAsUnion
   | RTagStash
   | RTest
   | RToBox
+  | RTruncSat
+  | RUnionConcreteEq
   | RUnionEq
 
 // A `match` arm: union arm `swArm` (-1 for the default, which names what it excludes in
@@ -599,6 +618,10 @@ export type IrFn = {
   irIdxRowAt: {[i32]: i32},
   irRowOpens: {[i32]: boolean},
   irHasRowOpens: boolean,
+  // The assignment whose writing opens at each node whose right side may be an append site: the
+  // lowering asks legacy's site arm there, as `emitAssignUnder` does, which mints its global pair.
+  irSiteArmAt: {[i32]: i32},
+  irHasSiteArms: boolean,
   // The variable each name read the builder took as a plain read of it, by the read's node.
   irReadVar: {[i32]: i32},
   // A global read the builder built, by the read's node: written again as it stands.
@@ -651,6 +674,8 @@ export function irFnNew(at: i32, name: string): IrFn {
     irIdxRowAt: Map(),
     irRowOpens: Map(),
     irHasRowOpens: false,
+    irSiteArmAt: Map(),
+    irHasSiteArms: false,
     irReadVar: Map(),
     irNoTail: [],
     irReadAgain: Map(),
@@ -789,6 +814,18 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
 export function repBoolNiche(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RNullable && n.rnDisc == 2 && repPrim(n.rnInner) == "bool"
+}
+
+// The union box rep `r` holds: the box under any boxed nullables (discipline 4, whose `null` is
+// one more tag of the same box), else `r`.
+export function repBoxCore(r: i32): i32 {
+  let c = r
+  let n = repNodeAt(c)
+  while n is RNullable && n.rnDisc == 4 {
+    c = n.rnInner
+    n = repNodeAt(c)
+  }
+  return c
 }
 
 // Rep `r`'s primitive when it is an unpacked primitive leaf, else null.
@@ -978,6 +1015,8 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListNewDefault => [r.ldLen]
     RListCopy => r.lcArgs
     RMemAccess => r.mmArgs
+    RAtomic => r.amArgs
+    RTruncSat => [r.tsV]
     RMemOp => r.moArgs
     RListGet => [r.lgV, r.lgIx]
     RListLen => [r.llV]
@@ -1018,6 +1057,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListEmpty => [r.leV]
     RListEmptyArms => [r.lfV]
     RLitArms => [r.liV]
+    RUnionConcreteEq => [r.ucBox, r.ucOther]
     RUnionEq => [r.ueL, r.ueR]
     RListEq => [r.qeL, r.qeR]
     RListCat => [r.ljL, r.ljR]
@@ -1067,6 +1107,8 @@ function rhsText(r: Rhs): string {
     RListNewDefault => "list_new_default(" + opndText(r.ldLen) + ")"
     RListCopy => "list_copy(" + opndsText(r.lcArgs) + ")"
     RMemAccess => "mem_access(" + opndsText(r.mmArgs) + ")"
+    RAtomic => "atomic(" + opndsText(r.amArgs) + ")"
+    RTruncSat => "trunc_sat(" + opndText(r.tsV) + ")"
     RMemOp => "mem_op(" + opndsText(r.moArgs) + ")"
     RListGet => "get " + opndText(r.lgV) + "[" + opndText(r.lgIx) + "]"
     RListLen => "len " + opndText(r.llV)
@@ -1088,6 +1130,7 @@ function rhsText(r: Rhs): string {
     RNulTest => "isnull " + opndText(r.ntV)
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RAsUnion => "as.union " + opndText(r.auV)
+    RUnionConcreteEq => "union.eqc " + opndText(r.ucBox) + " " + opndText(r.ucOther)
     RUnionEq => "union.eq " + opndText(r.ueL) + " " + opndText(r.ueR)
     RListEq => "list.eq " + opndText(r.qeL) + " " + opndText(r.qeR)
     RListCat => "list.cat " + opndText(r.ljL) + " " + opndText(r.ljR)
@@ -1361,6 +1404,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RTagIs |
       RTagStash |
       RToBox |
+      RUnionConcreteEq |
       RUnionEq => "scalar"
     RCall | RPrint => "call"
     RGlobalGet => "global"
@@ -1402,7 +1446,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       REnvDrop |
       REnvGet |
       RMakeClo => "closure"
-    RCallHost |
+    RAtomic |
+      RCallHost |
       RCast |
       RCellGet |
       RCellNew |
@@ -1413,7 +1458,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RMemAccess |
       RMemOp |
       RSimd |
-      RTagOf => "other"
+      RTagOf |
+      RTruncSat => "other"
     RRawOp | RRel => "raw"
     RStage => "scalar"
   }

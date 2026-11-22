@@ -103,6 +103,7 @@ import {
   RAsUnion,
   RAtomEq,
   RAtomStr,
+  RAtomic,
   RBoxField,
   RBoxNarrow,
   RBundlePick,
@@ -174,6 +175,8 @@ import {
   RTagStash,
   RTest,
   RToBox,
+  RTruncSat,
+  RUnionConcreteEq,
   RUnionEq,
   Rhs,
   SAssign,
@@ -283,6 +286,9 @@ import {
   atomNotNulIsTail,
   atomStrPlanOf,
   atomStrTail,
+  atomicPlanOf,
+  atomicResultPrim,
+  atomicTail,
   boxTagIsTail,
   bundlePickOf,
   callRefCallTail,
@@ -457,14 +463,22 @@ import {
   spreadJoinGroups,
   stageListRecvTail,
   staticAtomId,
+  strSiteArmMint,
   structFieldTail,
   structUnionBoxTail,
   tagDispatchIfOf,
   tagIsTail,
   tagStashTail,
+  truncSatPlanOf,
+  truncSatTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
   unionBoxToPairTail,
+  unionConcreteEqPlanOf,
+  unionEqCmpTail,
+  unionEqHead,
+  unionEqPayloadTail,
+  unionEqTagTail,
   unionLetSinkClose,
   unionUnionEqTail,
   urLocalRead,
@@ -527,6 +541,7 @@ import {
   fbRefIfOpenType,
   litIsBoxLexes,
   litMemberEqArmOf,
+  mapGetUnionBoxTail,
   memberOrTail,
   nulStrMemberClose,
   nulStrMemberGuard,
@@ -891,7 +906,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMapGet => {
       const from = irLAt()
       const got = mapGet(r)
-      if r.mtBox < 0 { irLIndexRow(r.mtAt, from) }
+      if r.mtBox < 0 && r.mtRow { irLIndexRow(r.mtAt, from) }
       got
     }
     RMapHas => mapHas(r)
@@ -959,6 +974,7 @@ function rhs(r: Rhs, tail: boolean) {
         return irLMiss("union cast tail")
       }
     }
+    RUnionConcreteEq => unionConcreteEqOp(r)
     RUnionEq => unionEq(r)
     RRetag => irLOpnd(r.rgV)
     RStage => irLOpnd(r.sgV)
@@ -1006,6 +1022,8 @@ function rhs(r: Rhs, tail: boolean) {
     RListNewDefault => listNewDefault(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
+    RAtomic => atomic(r)
+    RTruncSat => truncSat(r)
     RMemOp => memOp(r)
     RCallHost => hostCall(r)
     RCast => {
@@ -1878,6 +1896,40 @@ function memAccess(r: RMemAccess) {
   return memAccessTail(p, ap.maOff)
 }
 
+// `RAtomic`: legacy's atomic arm in `emitAtomicIntrinsic`'s order: the address the builder took
+// along `memAddrPlanOf`'s arm, each value, then the instruction at the plan's offset.
+function atomic(r: RAtomic) {
+  const c = nodeAt(r.amAt)
+  if !(c is Call) { return irLMiss("atomic node") }
+  const pl = atomicPlanOf(c)
+  if pl.apFail != "" { return irLMiss("atomic plan") }
+  if pl.apBase == 0 { return atomicTail(pl.apRow, 0) }
+  const ap = memAddrPlanOf(c, pl.apBase, lw.irAt)
+  if ap.maArm != "const" && ap.maArm != "rest" { return irLMiss("atomic plan") }
+  for o in r.amArgs { irLOpnd(o) }
+  return atomicTail(pl.apRow, ap.maOff)
+}
+
+// `RAtomic` as a statement: the atomic, then a drop of the value a valued row leaves.
+function atomicEffect(r: RAtomic, pending: i32[]): i32 {
+  atomic(r)
+  irLSettle(pending)
+  const c = nodeAt(r.amAt)
+  const pl = if c is Call { atomicPlanOf(c) } else { null }
+  if pl != null && atomicResultPrim(pl.apRow) != "" { fbDrop() }
+  return 0
+}
+
+// `RTruncSat`: legacy's saturating-truncation arm, the float operand then `truncSatTail`.
+function truncSat(r: RTruncSat) {
+  const c = nodeAt(r.tsAt)
+  if !(c is Call) { return irLMiss("trunc_sat node") }
+  const pl = truncSatPlanOf(c)
+  if pl.tpOp < 0 { return irLMiss("trunc_sat plan") }
+  irLOpnd(r.tsV)
+  return truncSatTail(pl.tpOp)
+}
+
 // `RCallHost`: legacy's host-call arm in `emitCallCoreHost`'s order, the arguments then the call.
 function hostCall(r: RCallHost) {
   for a in r.chArgs { irLOpnd(a) }
@@ -2293,7 +2345,8 @@ function mapGet(r: RMapGet) {
   const arm = mapGetArmOf(r.mtAt, fnIx)
   match arm {
     "unionBox" => {
-      return irLMiss("map get route")
+      mapProbeHead(nd.idxArr, r.mtSym, r.mtNonNull, r.mtLoc, r.mtKey)
+      if mapGetUnionBoxTail() < 0 { return -1 }
     }
     "helper" => {
       const fi = mapGetHelperFnOf(
@@ -2505,6 +2558,24 @@ function staticSide(o: Opnd, lex: string) {
     fbDrop()
   }
   return staticAtomId(lex)
+}
+
+// `RUnionConcreteEq`: legacy's plan around the box read twice and the operand once (the tag test,
+// the payload, the compare), as `emitUnionConcreteEq` writes it.
+function unionConcreteEqOp(r: RUnionConcreteEq) {
+  const n = nodeAt(r.ucAt)
+  if !(n is BinExpr) { return irLMiss("union compare node") }
+  const boxIx = if r.ucSwap { n.binRight } else { n.binLeft }
+  const otherIx = if r.ucSwap { n.binLeft } else { n.binRight }
+  const qp = unionConcreteEqPlanOf(boxIx, otherIx, lw.irAt)
+  if qp.uqKind < 0 { return irLMiss("union compare plan") }
+  unionEqHead()
+  irLOpnd(r.ucBox)
+  unionEqTagTail(qp)
+  irLOpnd(r.ucBox)
+  unionEqPayloadTail(qp)
+  irLOpnd(r.ucOther)
+  return unionEqCmpTail(qp, r.ucNe, lw.irAt)
 }
 
 // `RUnionEq`: both boxes, then legacy's staged compare.
@@ -2725,6 +2796,7 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
     if lwMiss == "" && i < b.length {
       const id = b[i]
       rowOpenNote(id)
+      siteArmMintAt(id)
       spanOpen(id)
       // A valueless `return` after a call in its tail form writes nothing.
       if !(i > 0 && callReturns(b, i - 1)) {
@@ -2888,6 +2960,14 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         memAccess(r)
         irLSettle(pending)
         if r.mmArgs.length == 1 { fbDrop() }
+        return 0
+      }
+      // A store and a fence leave nothing; any other discarded atomic's value is dropped.
+      if r is RAtomic { return atomicEffect(r, pending) }
+      if r is RTruncSat {
+        truncSat(r)
+        irLSettle(pending)
+        fbDrop()
         return 0
       }
       // The bulk pair leaves nothing; any other memory op's discarded value is dropped.
@@ -3570,6 +3650,14 @@ function curLen(): i32 { return lwBuf.length }
 
 // The lowering's write position, which an element read's row starts at.
 export function irLAt(): i32 { return lwBuf.length }
+
+// Asks legacy's site arm of the assignment whose writing opens at node `id` (`irSiteArmAt`).
+function siteArmMintAt(id: i32) {
+  if !lw.irHasSiteArms { return 0 }
+  const ix = lw.irSiteArmAt[id] ?? -1
+  if ix >= 0 { strSiteArmMint(ix, lw.irAt) }
+  return 0
+}
 
 // Notes where node `id` began, where an element read's row opens at it (`irRowOpens`).
 function rowOpenNote(id: i32) {
