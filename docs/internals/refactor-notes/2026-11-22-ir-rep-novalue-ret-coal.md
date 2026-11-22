@@ -20,14 +20,12 @@ exhaustive match over `Rhs`. Verifier self-test cases 25 to 28 pin it: a returni
 leaves neither a dead return (25) nor an unwritten `??` out (26) valid, and a never call's does
 (27, 28).
 
-## Per class (the class's 41 tests/cases programs, armed shadow)
+## Per class (the class's 41 tests/cases programs, armed shadow, measured after each step)
 
-| class | before (step 2) | after |
+| class | before | after |
 | --- | ---: | ---: |
-| covered = matched | 560 | 574 |
-| return position | 8 `rep novalue` | 3 (2 closure calls, 1 `return a ?? fail()`) |
-| `??` default | 17 `rep novalue` | 1 widened (`f64` cell) |
-| `rep novalue` total | 33 | 14 |
+| return position (step 3) | `rep novalue` 33, covered = matched 560 | `rep novalue` 28, covered = matched 564 |
+| `??` default (step 4) | `rep novalue` 28, covered = matched 564 | `rep novalue` 14, covered = matched 574, plus 1 `coalesce never default widened` |
 
 ## Readings (base 26e961da = #9606's head, fixpoint seeds on both sides, head 5002c817)
 
