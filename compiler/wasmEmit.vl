@@ -17703,6 +17703,20 @@ function emitIndexNulScalarList(nd: Index, fnIx: i32): i32 {
 // union box) — slots in `[0,len)` are always populated, so the cast never traps. Returns 0, or
 // -1 on a refusal or a failed operand.
 function emitIndexRefList(nd: Index, idxIx: i32, fnIx: i32): i32 {
+  return refListReadAt(nd, idxIx, fnIx, EQ_ROOT_EXPR)
+}
+
+// A ref list read whose receiver and index are written as `place` says: the operand nodes
+// (`expr`), or a receiver local and an index local or immediate (`elem`).
+function refListReadAt(
+  nd: Index,
+  idxIx: i32,
+  fnIx: i32,
+  place: EqRootPlace,
+): i32 {
+  if place.epKind == "local" {
+    return emitFail("emitProgram: internal: a local root is no list read")
+  }
   if !rlRowsMinted() {
     return emitFail(
       "emitProgram: ref index access but ref array type not collected",
@@ -17711,13 +17725,21 @@ function emitIndexRefList(nd: Index, idxIx: i32, fnIx: i32): i32 {
   const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
   if rslot < 0 { return refListRowRefused(nd.idxArr) }
   const rlHz = refListHoistOf(nd, rslot)
+  const elem = place.epKind == "elem"
   if rlHz < 0 {
-    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
+    if elem { fbLocalGet(place.epSlot) }
+    else if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
     // A NULLABLE ref-array receiver (`t: i32[][] | null`, kind 18, narrowed) reads `(ref null …)` —
     // recover non-null before `struct.get` (the `if t != null` guard makes this safe).
     if exprNullableRefArray(nd.idxArr, fnIx) { fbRefAsNonNull() }
   }
-  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  if !elem {
+    if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  } else if place.epIdx >= 0 {
+    fbLocalGet(place.epIdx)
+  } else {
+    fbI32Const(place.epImm)
+  }
   return refListGetTail(nd, idxIx, fnIx, rslot, rlHz)
 }
 
@@ -20228,14 +20250,28 @@ function lcatBaseOfRep(kind: i32, slot: i32) {
 }
 
 // Where a struct compare's field chain reads each side's root from: `expr` the operand node
-// itself, legacy's (`EQ_ROOTS_EXPR`); `local` local `epSlot`.
-export type EqRootKind = "expr" | "local"
-export type EqRootPlace = { epKind: EqRootKind, epSlot: i32 }
+// itself, legacy's (`EQ_ROOTS_EXPR`); `local` local `epSlot`; `elem` the operand's ref list
+// element read over receiver local `epSlot` and index local `epIdx`, or immediate `epImm` where
+// `epIdx` is -1.
+export type EqRootKind = "expr" | "local" | "elem"
+export type EqRootPlace = {
+  epKind: EqRootKind,
+  epSlot: i32,
+  epIdx: i32,
+  epImm: i32,
+}
 export type EqRootPlan = { erL: EqRootPlace, erR: EqRootPlace }
 
+const EQ_ROOT_EXPR: EqRootPlace = {
+  epKind: "expr",
+  epSlot: -1,
+  epIdx: -1,
+  epImm: 0,
+}
+
 export const EQ_ROOTS_EXPR: EqRootPlan = {
-  erL: { epKind: "expr", epSlot: -1 },
-  erR: { epKind: "expr", epSlot: -1 },
+  erL: EQ_ROOT_EXPR,
+  erR: EQ_ROOT_EXPR,
 }
 
 // Re-evaluate the field access chain `root.f1.f2…` onto `body`: the root expression, then
@@ -20266,8 +20302,15 @@ function emitChainRead(
     if eqChainRecover { fbRefAsNonNull() }
     return 0
   }
-  if place.epKind == "local" { fbLocalGet(place.epSlot) }
-  else if emitExpr(rootIx, fnIx) < 0 { return -1 }
+  const rd = match place.epKind {
+    "expr" => emitExpr(rootIx, fnIx)
+    "local" => {
+      fbLocalGet(place.epSlot)
+      0
+    }
+    "elem" => emitChainRootElem(rootIx, fnIx, place)
+  }
+  if rd < 0 { return -1 }
   let k = 0
   while k < pathSi.length {
     fbStructGet(eqRowHeapIdx(pathSi[k]), pathFi[k]) // 0xfb 0x02 <ht> <field>
@@ -20275,6 +20318,18 @@ function emitChainRead(
   }
   if eqChainRecover { fbRefAsNonNull() }
   return 0
+}
+
+// The `elem` root of a field chain: compare operand `rootIx`, a ref list element read, over the
+// receiver and index `place` names.
+function emitChainRootElem(rootIx: i32, fnIx: i32, place: EqRootPlace): i32 {
+  const nd = nodeAt(rootIx)
+  if !(nd is Index) || idxArmOf(nd, fnIx) != "ref" {
+    return emitFail(
+      "emitProgram: internal: an element compare root is no ref list read",
+    )
+  }
+  return refListReadAt(nd, rootIx, fnIx, place)
 }
 
 // Compare two closure fat-pointers already on the stack (left below right), leaving a
