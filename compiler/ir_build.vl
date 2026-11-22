@@ -433,6 +433,7 @@ import {
   RMap,
   RNullable,
   RRecord,
+  repClosureOfReps,
   repNodeAt,
   repNodeGen,
   repNodeKids,
@@ -561,7 +562,7 @@ import {
   fnCheckedRetTy,
   globalIndexOfSid,
 } from "./emit_fn_ret_kinds"
-import { identDeclOf, sidOfNode } from "./symbols"
+import { identDeclOf, nodeSrc, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
 import {
   charLitCp,
@@ -3438,6 +3439,33 @@ function capturedCalleeTy(c: Call, pos: i32): i32 {
   return heldTy(exprTyOf(c.callFn))
 }
 
+// The type of the declaration call `c` names, read at its source node where it is a clone; -1 for
+// none.
+function genericDeclTy(c: Call): i32 {
+  const d = identDeclOf(c.callFn)
+  if d < 0 { return -1 }
+  return nodeTyAt(nodeSrc.get(d) ?? d, -1)
+}
+
+// The closure rep of instance `pos` built from its own parameter and result reps, where no type
+// spells its signature (a generic instanced at two types); void as its `$fnsig` key says. -1 when
+// a part has no rep.
+function instanceClosureRep(pos: i32): i32 {
+  const inst = fnStmts[pos]
+  const fn = nodeAt(inst)
+  if !(fn is FuncDecl) { return -1 }
+  const ps: i32[] = []
+  for p in fn.fnParams {
+    const r = repNodeOfTy(scopeTyAt(p, inst))
+    if r < 0 { return -1 }
+    ps.push(r)
+  }
+  const isVoid = sigKeyRetIsVoid(cloSigKeyExt(pos))
+  const ret = repNodeOfTy(resultTy(pos, fn.fnRet, inst))
+  if ret < 0 && !isVoid { return -1 }
+  return repClosureOfReps(ps, ret, isVoid)
+}
+
 // A direct call `ix` of nested function `pos`, which reads its captures from its environment, as
 // `emitCapturedCall` writes it: the function's closure over a fresh environment, called through
 // legacy's shared head and tail at the function's own `$fnsig`, each argument on the plain arm.
@@ -3449,8 +3477,11 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   if sig < 0 { return missRhs("captured call signature") }
   // The closure is the instance `pos` legacy builds and calls at `sig`: its declaration's type as
   // that instance closes it. A generic's read carries no type of its own in the caller's frame.
-  const fty = capturedCalleeTy(c, pos)
-  const frep = repNodeOfTy(fty)
+  const cty = capturedCalleeTy(c, pos)
+  // With no type the instance closes, the closure is its own reps' rep, held at the generic's
+  // open signature, which a function held at a closure rep does not leave open.
+  const fty = if cty >= 0 { cty } else { genericDeclTy(c) }
+  const frep = if cty >= 0 { repNodeOfTy(cty) } else { instanceClosureRep(pos) }
   if !(repNodeAt(frep) is RClosure) {
     return missRhs("captured call closure rep")
   }
