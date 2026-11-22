@@ -2139,8 +2139,16 @@ function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
 function nulNicheEqCheck(r: RNulNicheEq, dst: i32, at: i32) {
   use(r.neL, at)
   use(r.neR, at)
+  use(r.neR2, at)
   if repIsScalar(opRep(r.neL)) || repIsScalar(opRep(r.neR)) {
     return fail(2, at, "a guarded nullable compare's operands are references")
+  }
+  if opRep(r.neR2) != opRep(r.neR) {
+    return fail(
+      2,
+      at,
+      "a guarded nullable compare writes its right operand twice at one rep",
+    )
   }
   if dst >= 0 && repPrim(dst) != "bool" {
     return fail(2, at, "a guarded nullable compare is a bool")
@@ -2388,7 +2396,15 @@ export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
 // Whether a variable of type `ty` at rep `rep` is open (rule 1): a type whose every open part is
 // a function held at a rep no instance changes is not (`tyOpenHeldAsIds`).
 export function irTyHeldOpen(ty: i32, rep: i32): boolean {
+  if irUntypedClosure(ty, rep) { return false }
   return irTyOpen(ty) && !tyOpenHeldAsIds(ty, rep, [])
+}
+
+// Whether a variable is a closure no arena type spells (a generic's instance, built by
+// `repClosureOfReps`): typed -1 at an interned closure rep of no type, which its calls are checked
+// against, as a function held at a closure rep is (`tyOpenHeldAsIds`).
+export function irUntypedClosure(ty: i32, rep: i32): boolean {
+  return ty < 0 && repNodeAt(rep) is RClosure && repTyOf(rep) < 0
 }
 
 // The valtype bytes legacy's `fbValtype` writes a value of rep `r` at: a held closure's, or a
@@ -2420,6 +2436,14 @@ export function repStoresAs(dst: i32, src: i32): boolean {
 // stored alike (`repStoresAs`).
 export function openRepTakes(ty: i32, rep: i32, v: i32): boolean {
   return irTyOpen(ty) && repStoresAs(rep, v)
+}
+
+// Whether open type `ty`'s rep `rep` has no valtype legacy writes (`refRepValtype`) and `v` has
+// one. Permissive alone: a caller ties `v` to a legacy declaration of the storage it reads.
+export function undeclaredRepTakes(ty: i32, rep: i32, v: i32): boolean {
+  return irTyOpen(ty)
+    && refRepValtype(rep).length == 0
+    && refRepValtype(v).length > 0
 }
 
 // Whether record `r` is built at a variant's row, as `makeRec` lowers it.
@@ -2470,7 +2494,8 @@ export function irVerify(f: IrFn): IrVerdict {
   while i < f.irVars.length {
     const v = f.irVars[i]
     vfDefined.push(false)
-    if rawAt(v.vRep, -1) || v.vTy < 0 {
+    const untyped = irUntypedClosure(v.vTy, v.vRep)
+    if (rawAt(v.vRep, -1) || v.vTy < 0) && !untyped {
       // A raw variable has no VL type, and only a helper holds one. One whose heap is not
       // tracked is a temp, on the stack between its read and its one use.
       if !f.irHelper || v.vTy >= 0 || !rawAt(v.vRep, -1) {
@@ -2494,7 +2519,7 @@ export function irVerify(f: IrFn): IrVerdict {
       )
     } else if irTyHeldOpen(v.vTy, v.vRep) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
-    } else if repNodeOfTy(v.vTy) != v.vRep {
+    } else if !untyped && repNodeOfTy(v.vTy) != v.vRep {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
     }
     i = i + 1
