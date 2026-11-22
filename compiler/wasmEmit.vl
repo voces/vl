@@ -6685,17 +6685,22 @@ export function variantTagTail(vi: i32) {
   return 0
 }
 
-// How the variant rung tests `recv is V` where `V` has no tested row (`isTestedRowOf`): a record
-// the receiver always is (`recordTrue`), the tag chain of a union alias arm, its tags into `tags`
-// (`tagChain`), a pin whose join holds no such arm (`pinFalse`), or none (`noArm`). The constant
-// arms evaluate the receiver and drop it.
-export type IsVariantNoRowArm = "recordTrue" | "tagChain" | "pinFalse" | "noArm"
-export function isVariantNoRowArmOf(
+// How the variant rung tests `recv is V` past its plain tag: at `V`'s tested row (`row`,
+// `isTestedRowOf`), else a record the receiver always is (`recordTrue`), the tag chain of a union
+// alias arm, its tags into `tags` (`tagChain`), a pin whose join holds no such arm (`pinFalse`),
+// or none (`noArm`). The constant arms evaluate the receiver and drop it.
+export type VariantIsArm = "row"
+  | "recordTrue"
+  | "tagChain"
+  | "pinFalse"
+  | "noArm"
+export function variantIsArmOf(
   isIx: i32,
   nd: IsExpr,
   fnIx: i32,
   tags: i32[],
-): IsVariantNoRowArm {
+): VariantIsArm {
+  if isTestedRowOf(isVarTyIxOf(isIx), nd.isObj) >= 0 { return "row" }
   if recvIsTestedRecord(nd.isObj, isVarTyIxOf(isIx)) { return "recordTrue" }
   // A union alias arm has no single variant row because it is a SUBSET of the outer box's tags,
   // so the test is the tag chain `as?` emits for a sub-union target (D1774). A layout-twin arm
@@ -6755,49 +6760,51 @@ export function isVariantNoRowArmOf(
   return "noArm"
 }
 
-// The variant rung of `emitIsTest`: `recv is V` for a union variant, alias arm or record,
-// by a static row fold where the row is the answer, else the box tag and discriminant test.
-// Returns 0 once the test is on the stack, -1 on failure.
+// The variant rung of `emitIsTest`: `recv is V` for a union variant, alias arm or record, by its
+// plain tag, else along `variantIsArmOf`. Returns 0 once the test is on the stack, -1 on failure.
 function emitIsTestVariant(isIx: i32, nd: IsExpr, fnIx: i32) {
   const plain = isVariantTagPlain(isIx, fnIx)
   if plain >= 0 {
     if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
     return variantTagTail(plain)
   }
-  const vi = isTestedRowOf(isVarTyIxOf(isIx), nd.isObj)
-  if vi < 0 {
-    const isTags: i32[] = []
-    const na = isVariantNoRowArmOf(isIx, nd, fnIx, isTags)
-    return match na {
-      "recordTrue" | "pinFalse" => {
+  const isTags: i32[] = []
+  const na = variantIsArmOf(isIx, nd, fnIx, isTags)
+  return match na {
+    "row" => emitIsTestVariantRow(isIx, nd, fnIx)
+    "recordTrue" | "pinFalse" => {
+      if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+      fbDrop()
+      fbI32Const(if na == "recordTrue" { 1 } else { 0 })
+      0
+    }
+    "tagChain" => {
+      let ti = 0
+      while ti < isTags.length {
         if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-        fbDrop()
-        fbI32Const(if na == "recordTrue" { 1 } else { 0 })
-        0
+        fbStructGet(uBoxIdx, 0)
+        fbI32Rel(RS_TAG, isTags[ti])
+        fbI32Bin(70)
+        if ti > 0 { fbI32Bin(114) }
+        ti = ti + 1
       }
-      "tagChain" => {
-        let ti = 0
-        while ti < isTags.length {
-          if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-          fbStructGet(uBoxIdx, 0)
-          fbI32Rel(RS_TAG, isTags[ti])
-          fbI32Bin(70)
-          if ti > 0 { fbI32Bin(114) }
-          ti = ti + 1
-        }
-        0
+      0
+    }
+    "noArm" => {
+      if tyIsUnionMemberOf(nodeTyIxOf(nd.isObj), isVarTyIxOf(isIx)) {
+        return emitFail(
+          "emitProgram: `is` names a declared union member with no interned arm representation (deferred value-union composition)",
+        )
       }
-      "noArm" => {
-        if tyIsUnionMemberOf(nodeTyIxOf(nd.isObj), isVarTyIxOf(isIx)) {
-          return emitFail(
-            "emitProgram: `is` names a declared union member with no interned arm representation (deferred value-union composition)",
-          )
-        }
-        emitFail("emitProgram: `is` names a type that is not a union variant")
-      }
+      emitFail("emitProgram: `is` names a type that is not a union variant")
     }
   }
+}
 
+// The variant rung at `V`'s tested row (`variantIsArmOf`'s `row`): a static row fold where
+// the row is the answer, else the box tag and discriminant test. 0 once on the stack, -1 failed.
+function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32) {
+  const vi = isTestedRowOf(isVarTyIxOf(isIx), nd.isObj)
   // A row holding several members answers from the value's fields after its tag (D5157).
   const shared = armRowSharedAtRecv(nd.isObj, vi)
   const rvi = exprVariantIndex(nd.isObj, fnIx)
