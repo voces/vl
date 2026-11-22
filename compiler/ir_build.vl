@@ -57,6 +57,7 @@ import {
   WhileStmt,
   blockTailIsDead,
   callIsNever,
+  condLitTrue,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
@@ -114,8 +115,11 @@ import {
   irFnText,
   irGlobalNote,
   irGlobalRepOf,
+  irGlobalStoreNote,
+  irGlobalStoreTyOf,
   irNodeFamily,
   irNodeNew,
+  irRecHeapNote,
   irSigNote,
   irSigOf,
   irSpanNote,
@@ -124,10 +128,12 @@ import {
   sIf,
 } from "./ir"
 import {
+  cloHoleRetag,
   listRetag,
   listRetagHole,
   mapBoxReadsAt,
   mapNicheReadsAt,
+  recHeapOf,
   recRetag,
   repBoolNiche,
   repBoxCore,
@@ -273,6 +279,7 @@ import {
   letIfInitPerArmRep,
   listOpRecvHeldPlan,
   lowMemFoldsCallee,
+  lvTailAssigns,
   mapFilterWhy,
   mapGetArmOf,
   mapGetMissOf,
@@ -494,8 +501,12 @@ import {
   RClosure,
   RList,
   RMap,
+  RNoValue,
   RNullable,
+  RPrim,
+  RRaw,
   RRecord,
+  RUnsup,
   repClosureOfReps,
   repNodeAt,
   repNodeGen,
@@ -948,6 +959,8 @@ let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
 let ibLoopCont: i32[] = []
+// The result binding of each break label whose frame carries a loop value.
+let ibLvOf: {[i32]: i32} = Map()
 let ibLabelN = 0
 // The statements whose end closes a list reserve region the body opened (`reserve.open`).
 let ibReserveEnd: i32[] = []
@@ -3103,7 +3116,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && globalCellKind(d) == "map"
       && rep == globalTyRep(letBindTy(d, -1))
     ) {
-      irGlobalNote(ib, g, rep)
+      globalNoteAt(g, d, rep)
     }
     const cellRep = globalRep(g, d)
     // A union cell narrowed to an atom or a record arm unboxes its box, as a local's does.
@@ -3645,7 +3658,7 @@ function globalRep(g: i32, d: i32): i32 {
   const ht = if elabHasHolderRecords() { holderRecordTy(d, -1) } else { -1 }
   const r = globalTyRep(if ht >= 0 { ht } else { scopeTyAt(d, -1) })
   if r >= 0 {
-    irGlobalNote(ib, g, r)
+    globalNoteAt(g, d, r)
     if ht >= 0 { ib.irGlobalHeld[g] = true }
   }
   return r
@@ -3656,6 +3669,20 @@ function globalRep(g: i32, d: i32): i32 {
 function globalHeldTy(d: i32): i32 {
   const ht = if elabHasHolderRecords() { holderRecordTy(d, -1) } else { -1 }
   return if ht >= 0 { ht } else { scopeTyAt(d, -1) }
+}
+
+// Notes global `g`'s rep `rep` in `ib`, with its declaration `d`'s storage-row type
+// (`letBindTy`), which the verifier checks a read off the checked type's rep against.
+function globalNoteAt(g: i32, d: i32, rep: i32) {
+  const st = letBindTy(d, -1)
+  if irGlobalRepOf(ib, g) < 0 {
+    irGlobalStoreNote(ib, g, st)
+  } else if irGlobalStoreTyOf(ib, g) != st {
+    // One global has one declaration, so a second storage row for it is a builder fault.
+    irBMiss("global storage row disagrees")
+  }
+  irGlobalNote(ib, g, rep)
+  return 0
 }
 
 // The rep a global held at type `ty` takes; -1 when it is no scalar.
@@ -4011,8 +4038,15 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       if i > 0 && !irBStageLeads(b, at, starts, args, c.callArgs) {
         return missRhs("short-circuit argument after another")
       }
-      if irBOpRep(a) != pr { return missRhs("argument coercion") }
-      args.push(a)
+      // A list handed at its parameter's storage is the same list where no coercion is recorded,
+      // as a binding's and a return's are: a twin, or closures apart only in a hole.
+      const ra = if (irBOpRep(a) != pr
+        && (listRetag(irBOpRep(a), pr)
+        || holeRetagNoted(irBOpRep(a), pr, true)
+        || recRetag(irBOpRep(a), pr))
+        && exprPrePathWhy(c.callArgs[i], ibFnIx) == "") { repTemp(b, { rgV: a }, c.callArgs[i], pr) } else { a }
+      if irBOpRep(ra) != pr { return missRhs("argument coercion") }
+      args.push(ra)
       i = i + 1
     }
   }
@@ -7677,7 +7711,7 @@ function mapGlobalOf(recvIx: i32): i32 {
   const d = identDeclOf(recvIx)
   const r = repNodeOfTy(scopeTyAt(d, -1))
   if !(repNodeAt(r) is RMap) { return -1 }
-  irGlobalNote(ib, g, r)
+  globalNoteAt(g, d, r)
   return g
 }
 
@@ -7790,9 +7824,9 @@ function tagDispatchAt(b: i32[], ix: i32, read: boolean): Opnd {
   return o
 }
 
-// A tagged call's callee `f`, as `emitFnTagDispatch` writes it (`emitExpr`). On legacy's
-// `nonlocal` arm, a module global that is no function value (`emitIdentNonLocalRead`) is read as
-// its cell stores it, the member id `global.get` reads, where its checked rep differs.
+// A tagged call's callee `f`, as `emitFnTagDispatch` writes it (`emitExpr`): where its checked rep
+// differs from its storage's, a module global that is no function value (`emitIdentNonLocalRead`)
+// or a capture of an unlifted closure (`emitCapturedRead`) is read as stored, the member id.
 function tagCallee(b: i32[], f: i32): Opnd {
   const n = nodeAt(f)
   if n is Ident && identReadArmOf(n, f, ibFnIx, false) == "nonlocal" {
@@ -7806,6 +7840,26 @@ function tagCallee(b: i32[], f: i32): Opnd {
       && globalRep(g, d) != exprRepOf(f)
     ) {
       return globalStoredRead(b, g, d, f, globalRep(g, d))
+    }
+  }
+  if n is Ident && identReadArmOf(n, f, ibFnIx, false) == "capture" {
+    const fe = fnStmtsPosOf(ibFnIx)
+    const cr = capRepOf(fe, n.identName)
+    const d = identDeclOf(f)
+    if (
+      cr >= 0
+      && cr != exprRepOf(f)
+      && !cloLifted(fe)
+      && d >= 0
+      && nodeAt(d) is LetDecl
+    ) {
+      return irBLetTempTy(
+        b,
+        { evSlot: captureSlotOf(n.identName, ibFnIx), evAt: f },
+        f,
+        cr,
+        heldTy(letBindTy(d, -1)),
+      )
     }
   }
   return irBExpr(b, f)
@@ -8700,6 +8754,19 @@ function loopIx(label: string): i32 {
   return -1
 }
 
+// The loop a `continue` to `label` targets: a labelled block takes no `continue`, so a bare one
+// inside it finds the loop around it, as legacy's continue stack holds loops only.
+function contIx(label: string): i32 {
+  let i = ibLoopName.length - 1
+  while i >= 0 {
+    if ibLoopCont[i] >= 0 && (label == "" || ibLoopName[i] == label) {
+      return i
+    }
+    i = i - 1
+  }
+  return -1
+}
+
 // Whether map walk receiver `mr`'s operand rep `r` is one the walk's stash takes: a map, or a
 // nullable map the shared `mapRecvRefTail` recovers.
 function mapRecvRepOk(r: i32, mr: i32): boolean {
@@ -9022,27 +9089,40 @@ function rangeImmAt(d: i32): i32 {
 }
 
 function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
-  if n.whileBlk != 0 || n.whileLv >= 0 { return skip("labelled block") }
+  // A loop value leaves its frame through its result binding (`lvFrameOpen`).
+  const lv = if n.whileLv >= 0 { irBDeclVar(n.whileLv) } else { -1 }
+  if n.whileLv >= 0 && lv < 0 { return skip("loop value binding") }
+  // The frame takes a scalar binding's valtype; a reference one's blocktype is not built here.
+  if lv >= 0 && !scalarLvRep(ib.irVars[lv].vRep) {
+    return skip("loop value rep")
+  }
+  if n.whileBlk != 0 { return labelBlock(b, n, ix, lv) }
   const brk = labelNew()
   const cont = labelNew()
+  if lv >= 0 { ibLvOf[brk] = lv }
   ibLoopName.push(n.whileLabel)
   ibLoopBrk.push(brk)
   ibLoopCont.push(cont)
   const loopBody: i32[] = []
-  const c = irBExpr(loopBody, n.whileCond)
-  if ibMiss == "" && irBOpRep(c) != ibBool { irBMiss("loop condition") }
-  const exit: IrNode = { brLabel: brk, brHas: false, brVal: c }
-  const exitBody = [irNodeNew(ib, exit, -1, ibNoValue, ix)]
-  irBNode(loopBody, sIf(c, [], exitBody, -1, true), -1, ibNoValue, ix)
+  // A valued frame's `while true` writes no test (`condLitTrue`); it has no exit but its breaks.
+  if lv >= 0 && !condLitTrue(n.whileCond) { skip("loop value condition") }
+  if lv < 0 {
+    const c = irBExpr(loopBody, n.whileCond)
+    if ibMiss == "" && irBOpRep(c) != ibBool { irBMiss("loop condition") }
+    const exit: IrNode = { brLabel: brk, brHas: false, brVal: c }
+    const exitBody = [irNodeNew(ib, exit, -1, ibNoValue, ix)]
+    irBNode(loopBody, sIf(c, [], exitBody, -1, true), -1, ibNoValue, ix)
+  }
   const wb = nodeAt(n.whileBody)
   if wb is Block {
     stmtRun(loopBody, wb.blkStmts)
   } else {
     stmt(loopBody, n.whileBody, NO_SIBS, -1)
   }
+  const none: Opnd = { ov: -1 }
   irBNode(
     loopBody,
-    { brLabel: cont, brHas: false, brVal: c },
+    { brLabel: cont, brHas: false, brVal: none },
     -1,
     ibNoValue,
     ix,
@@ -9052,7 +9132,56 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   ibLoopName.pop()
   ibLoopBrk.pop()
   ibLoopCont.pop()
-  irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: -1 }, -1, ibNoValue, ix)
+  // A valued frame is left only by a `break v`, so falling out of its loop cannot happen.
+  if lv >= 0 { irBNode(blockBody, { tpWhy: 0 }, -1, ibNoValue, ix) }
+  irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: lv }, -1, ibNoValue, ix)
+  return 0
+}
+
+// Whether rep `r` is a scalar a loop value's frame is typed by.
+function scalarLvRep(r: i32): boolean {
+  const p = repPrim(r)
+  if p == null { return false }
+  return match p {
+    "i32" | "bool" | "u8" | "i64" | "f64" | "f32" => true
+    "str" | "null" | "v128" => false
+  }
+}
+
+// A labelled block (`emitLabelBlock`): one block frame a `break` leaves, which takes no
+// `continue`. One carrying value `lv` ends with its tail falling out of it when the tail assigns
+// the result binding, and with `unreachable` otherwise.
+function labelBlock(b: i32[], n: WhileStmt, ix: i32, lv: i32) {
+  const brk = labelNew()
+  if lv >= 0 { ibLvOf[brk] = lv }
+  ibLoopName.push(n.whileLabel)
+  ibLoopBrk.push(brk)
+  ibLoopCont.push(-1)
+  const body: i32[] = []
+  const wb = nodeAt(n.whileBody)
+  if wb is Block {
+    stmtRun(body, wb.blkStmts)
+  } else {
+    stmt(body, n.whileBody, NO_SIBS, -1)
+  }
+  ibLoopName.pop()
+  ibLoopBrk.pop()
+  ibLoopCont.pop()
+  if lv >= 0 {
+    const out: Opnd = { ov: lv }
+    if lvTailAssigns(n) {
+      irBNode(
+        body,
+        { brLabel: brk, brHas: true, brVal: out },
+        -1,
+        ibNoValue,
+        ix,
+      )
+    } else {
+      irBNode(body, { tpWhy: 0 }, -1, ibNoValue, ix)
+    }
+  }
+  irBNode(b, { bkLabel: brk, bkBody: body, bkOut: lv }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -9322,11 +9451,14 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is ForRange { return forRangeStmt(b, n, ix) }
   if n is BreakStmt {
     const l = loopIx(n.brkLabel)
-    if l < 0 || n.brkHasVal != 0 { return skip("break") }
-    const z: Opnd = { ov: -1 }
+    if l < 0 { return skip("break") }
+    // A `break v` reads the value its statement before stored into the frame's result binding.
+    const lv = ibLvOf[ibLoopBrk[l]] ?? -1
+    if (n.brkHasVal != 0) != (lv >= 0) { return skip("break") }
+    const z: Opnd = { ov: lv }
     irBNode(
       b,
-      { brLabel: ibLoopBrk[l], brHas: false, brVal: z },
+      { brLabel: ibLoopBrk[l], brHas: lv >= 0, brVal: z },
       -1,
       ibNoValue,
       ix,
@@ -9334,7 +9466,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     return 0
   }
   if n is ContinueStmt {
-    const l = loopIx(n.contLabel)
+    const l = contIx(n.contLabel)
     if l < 0 { return skip("continue") }
     const z: Opnd = { ov: -1 }
     irBNode(
@@ -9395,7 +9527,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     const v = if (ibMiss == ""
       && irBOpRep(built) != ib.irRetRep
       && (listRetag(irBOpRep(built), ib.irRetRep)
-      || listRetagHole(irBOpRep(built), ib.irRetRep)
+      || holeRetagNoted(irBOpRep(built), ib.irRetRep, false)
       || recRetag(irBOpRep(built), ib.irRetRep))
       && exprPrePathWhy(n.retArg, ibFnIx) == "") { repTemp(b, { rgV: built }, n.retArg, ib.irRetRep) } else { built }
     const vr = if ibMiss == "" { irBOpRep(v) } else { -1 }
@@ -9718,6 +9850,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibLoopName = []
   ibLoopBrk = []
   ibLoopCont = []
+  ibLvOf = Map()
   ibLabelN = 0
   ibBool = repNodeOfTy(TY_BOOL)
   return 0
@@ -10398,6 +10531,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibLoopName = []
   ibLoopBrk = []
   ibLoopCont = []
+  ibLvOf = Map()
   ibLabelN = 0
   ibBool = repNodeOfTy(TY_BOOL)
   ibNoValue = repNodeOfTy(TY_NEVER)
@@ -10491,7 +10625,7 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   const vr = irBOpRep(v)
   const stored = noted < 0 && vr != rep && vr == globalTyRep(letBindTy(gst, -1))
   if vr != rep && !stored { return irBMiss("global initializer coercion") }
-  irGlobalNote(ib, gi, vr)
+  globalNoteAt(gi, gst, vr)
   if noted < 0 && vr == rep && holderRecordTy(gst, -1) >= 0 {
     ib.irGlobalHeld[gi] = true
   }
@@ -10546,7 +10680,7 @@ function mapNewInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     && nr != rep
     && nr == globalTyRep(letBindTy(gst, -1))
   if nr != rep && !stored { return irBMiss("global initializer coercion") }
-  irGlobalNote(ib, gi, nr)
+  globalNoteAt(gi, gst, nr)
   return irBLetTemp(b, { mnAt: ix }, ix, nr)
 }
 
@@ -10568,7 +10702,7 @@ function cloInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     return irBMiss("global initializer coercion")
   }
   const v = cloValue(b, ix, rep, heldTy(exprTyOf(ix)))
-  if ibMiss == "" { irGlobalNote(ib, gi, rep) }
+  if ibMiss == "" { globalNoteAt(gi, gst, rep) }
   return v
 }
 
@@ -10657,5 +10791,33 @@ function censusRow(why: string) {
     k = k + 1
   }
   count("blockers " + key)
+  return 0
+}
+
+// Whether rep `src` is `dst` as it stands, a list (`listRetagHole`) or, with `clo`, any value
+// (`cloHoleRetag`), apart only in closure openness; each record rep's heap is noted first, which
+// the walk and the verifier compare.
+function holeRetagNoted(src: i32, dst: i32, clo: boolean): boolean {
+  noteRecHeaps(src)
+  noteRecHeaps(dst)
+  return listRetagHole(ib, src, dst) || clo && cloHoleRetag(ib, src, dst)
+}
+
+// Notes the heap of each record rep the hole walk reaches from `r`: through lists, nullables, a
+// map's values and closures, stopping at a record, as `repFillsHole` does.
+function noteRecHeaps(r: i32) {
+  const n = repNodeAt(r)
+  if n == null { return 0 }
+  match n {
+    RRecord => irRecHeapNote(ib, r, recHeapOf(r))
+    RList => noteRecHeaps(n.rlsElem)
+    RNullable => noteRecHeaps(n.rnInner)
+    RMap => noteRecHeaps(n.rmVal)
+    RClosure => {
+      for p in n.rcParams { noteRecHeaps(p) }
+      noteRecHeaps(n.rcRet)
+    }
+    RAtom | RBox | RNoValue | RPrim | RRaw | RUnsup => 0
+  }
   return 0
 }
