@@ -119,6 +119,7 @@ import {
 import {
   listRetag,
   listRetagHole,
+  mapNicheReadsAt,
   recRetag,
   repBoolNiche,
   repBoxCore,
@@ -262,6 +263,7 @@ import {
   mapGetMissOf,
   mapGetOrArmOf,
   mapGetOrMvPlain,
+  mapGetOrNicheStash,
   mapGetOrUnionScalarPlanOf,
   mapKeyArmOf,
   mapNewCall,
@@ -6825,6 +6827,11 @@ function strInnerOf(r: i32): i32 {
   return -1
 }
 
+// The rep of map read receiver `rcv`: its global's cell or its operand.
+function rcvMapRep(rcv: MapRecvKey): i32 {
+  return if rcv.mkSym >= 0 { irGlobalRepOf(ib, rcv.mkSym) } else { irBOpRep(rcv.mkLoc) }
+}
+
 // Why a null-free union map value read under `??` at `rep` is not the plain mv arm's read, or "":
 // the read is the slot's box and the default boxes into it as `emitMapValDefault` does, never
 // from another union's box.
@@ -6834,9 +6841,7 @@ function mapGetOrUnionMiss(
   rep: i32,
   sh: i32,
 ): string {
-  const mr = repNodeAt(
-    if rcv.mkSym >= 0 { irGlobalRepOf(ib, rcv.mkSym) } else { irBOpRep(rcv.mkLoc) },
-  )
+  const mr = repNodeAt(rcvMapRep(rcv))
   if !(mr is RMap) || mr.rmVal != rep { return "map read union rep" }
   if exprUnion(def, ibFnIx) && boxIntoOtherUnion(def, rep, mvValTyIxAt(sh)) {
     return "map read union default from a box"
@@ -6859,7 +6864,11 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   // A `scalar | null` union value peels to its scalar, the default in the result's kind.
   const uq = if arm == "mv" && !mv { mapGetOrUnionScalarPlanOf(mapRecvShapeOf(rd.idxArr, ibFnIx), n.binRight, rk) } else { null }
   const mvu = uq != null && uq.muKind >= 0
-  if arm != "helper" && arm != "i32" && !mv && !mvu {
+  const nz = arm == "mv"
+    && !mv
+    && !mvu
+    && mapGetOrNicheStash(rd.idxArr, n.binRight, ibFnIx)
+  if arm != "helper" && arm != "i32" && !mv && !mvu && !nz {
     return irBMiss("map read " + arm)
   }
   const inline = arm != "helper"
@@ -6872,7 +6881,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if ka != "plain" { return irBMiss("map key " + ka) }
   const rp = repPrim(rep)
   const uk = if uq != null { uq.muWide } else { -1 }
-  const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32" || arm == "i32" && rp == "bool" || mv }
+  const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32" || arm == "i32" && rp == "bool" || mv || nz }
   if !repOk { return irBMiss("map read rep") }
   // A default the miss arm writes as a body leaves the read's value on the stack from here.
   const clear = !endsInTemp(b)
@@ -6884,10 +6893,13 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const ub = mv && mvValKindAt(sh) == "union"
   const um = if ub { mapGetOrUnionMiss(rcv, n.binRight, rep, sh) } else { "" }
   if um != "" { return irBMiss(um) }
+  if nz && !mapNicheReadsAt(rcvMapRep(rcv), rep) {
+    return irBMiss("map read niche rep")
+  }
   const dv: Opnd = if ub { deliver(db, n.binRight, rep, mvValTyIxAt(sh)) } else if inline { irBExpr(db, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
   if ibMiss != "" { return dv }
   if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
-  const form = if mvu { 3 } else if mv { 2 } else if inline { 1 } else { 0 }
+  const form = if nz { 4 } else if mvu { 3 } else if mv { 2 } else if inline { 1 } else { 0 }
   if !defaultSelfContained(db, 0, dv) {
     if !clear { return irBMiss("map read default after an operand") }
     return mapGetOrBox(

@@ -14046,6 +14046,12 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
     }
     return mapGetOrMvTail(pslot)
   }
+  if arm == "mv" && mapGetOrNicheStash(recvIx, defIx, fnIx) {
+    const nslot = cmSlot
+    mapGetOrNicheHead(nslot)
+    if emitMapValDefault(nslot, null, defIx, fnIx) < 0 { return -1 }
+    return mapGetOrNicheTail(nslot)
+  }
   if arm == "mv" {
     // Ref values route through the slot's nullable valStash local rather than a
     // value-typed `if` (needs no interned blocktype): the hit arm sets it from the
@@ -14204,6 +14210,54 @@ export function mapGetOrMvPlain(recvIx: i32, defIx: i32, fnIx: i32): boolean {
   if ms < 0 || defExprNullable(defIx) { return false }
   if mvValKindAt(ms) == "union" && mvValUnionHasNull(ms) { return false }
   return mvScalarValKind(ms) != null || !mvSlotNullable(ms)
+}
+
+// Whether `recvIx[k] ?? defIx` at an mv slot takes the nullable ref niche's arm under a default that
+// is not nullable: a miss and a stored null both read as null, and one `ref.is_null` writes `d`.
+export function mapGetOrNicheStash(
+  recvIx: i32,
+  defIx: i32,
+  fnIx: i32,
+): boolean {
+  const ms = mapRecvShapeOf(recvIx, fnIx)
+  if ms < 0 || defExprNullable(defIx) { return false }
+  if mvValKindAt(ms) == "union" && mvValUnionHasNull(ms) { return false }
+  return mvScalarValKind(ms) == null && mvSlotNullable(ms)
+}
+
+// The niche arm's head after the probe: the slot's value on a hit, else its null, in the stash; then
+// `if stash is null`, a void `if` whose body is the default, then `mapGetOrNicheTail`.
+export function mapGetOrNicheHead(mslot: i32) {
+  const stashL = fnMvValStashLocal(mslot)
+  pushMapScr(5)                // entry
+  fbIf(64)                     // if (entry != 0 → found), void
+  pushMapVals()
+  fbStructGet(cmValsWrap(), 0) // vals backing
+  pushMapScr(5)                // entry
+  fbI32Const(1)
+  fbI32Bin(107)                // i32.sub (entry - 1)
+  fbArrayGet(cmValsBack())     // (ref null <elem>) slot read
+  fbLocalSet(stashL)
+  fbElse()                     // a miss is the read's null
+  fbRefNull(mvValElemHeapOf(mslot))
+  fbLocalSet(stashL)
+  fbEnd()
+  fbLocalGet(stashL)
+  fbRefIsNull()
+  fbIf(64)
+  return 0
+}
+
+// After the niche arm's default: the stash set from it, the `if` closed, and the stash read
+// recovered to non-null.
+export function mapGetOrNicheTail(mslot: i32) {
+  cmSlot = mslot
+  const stashL = fnMvValStashLocal(mslot)
+  fbLocalSet(stashL)
+  fbEnd()
+  fbLocalGet(stashL)
+  fbRefAsNonNull()
+  return 0
 }
 
 // The mv plain arm's head after the probe: `if entry != 0 { stash = vals.backing[entry-1] } else`,
