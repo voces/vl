@@ -66,6 +66,22 @@ running took available memory from 32 GiB to 3 GiB on 2026-10-19.
 builder re-running proof that the merge queue re-proves on the merged tree is the first thing
 to cut: the full identity diff, the three-run L2 fuel comparison, the whole `vl_*` shard.
 
+<a id="one-fix-per-pr"></a>
+
+## One-fix-per-PR does not apply to large refactors
+
+**Owner ruling 2026-11-22, relayed by the coordinator** (`merge-queue.md` Q16, with the velocity
+ruling of the same day, Q17). The IR programme's lanes were landing one rung per PR, and a
+train costs about 35 minutes of gate whatever its size (Q2), so the queue, not the lanes, was
+the constraint. So
+a large refactor batches: 30 or more functions, or a whole class family, in one PR, with a
+before→after reading per class and one commit per mechanism, so that a veto can split off one
+mechanism rather than reject the PR. Two separations stay, because each protects a reading the
+batch would blur. A deliberate legacy byte change (Q15) is graded by an exact list of moved
+programs, which IR bytes riding beside it would hide; Q17 (1) lets it ride only when the PR lists
+the programs whose bytes moved and shows claimed-vs-claimless at head differ 0. A soundness fix is
+kept small so it can jump the queue: D17048 shipped invalid wasm from #9259 until #9567.
+
 <a id="disk"></a>
 
 ## Disk — every tree, target and temp dir is removed by whoever made it
