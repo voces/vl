@@ -164,6 +164,47 @@ Deno.test({
   },
 });
 
+// A closure thunk's IR lowering under the dual emit's control 3 must report a bytes mismatch;
+// unbroken, each thunk matches legacy's `emitCloThunkCode` (a valued and a void target).
+Deno.test({
+  name: "ir shadow: a closure thunk whose lowering differs is a bytes mismatch",
+  ignore,
+  fn: () => {
+    const src = `function sq(x: i32): i32 { return x * x }\nfunction say(x: i32) { print(x) }\n` +
+      `const f: (x: i32) => i32 = sq\nconst g: (x: i32) => void = say\nprint(f(3))\ng(4)\n`;
+    const ok = run(src, true);
+    if (ok.rows.get("thunk fns") !== 2 || ok.rows.get("thunk matched") !== 2) {
+      throw new Error(`want 2 thunks matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 3);
+    if (rows.get("mismatch bytes: thunk") !== 2 || rows.has("thunk matched")) {
+      throw new Error(`want each thunk a "mismatch bytes: thunk" row, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A folded constant's cell is its folded value, the one `*.const` legacy's `emitConstFoldValue`
+// writes, at both integer widths; under the dual emit's control 3 each is a bytes mismatch.
+Deno.test({
+  name: "ir shadow: a folded const cell whose value differs is a bytes mismatch",
+  ignore,
+  fn: () => {
+    // Read from a function, so neither cell is promoted into the start body.
+    const src = `const A = 3\nconst B: i32 = A << 4\nconst C: i64 = (1 as i64) << 40\n` +
+      `function show() {\n  print(B)\n  print(C)\n}\nshow()\n`;
+    const ok = run(src, true);
+    const folded = [...ok.rows].filter(([k]) => k.startsWith("const cell folded "));
+    if (folded.length === 0 || folded.some(([k]) => !k.endsWith(": matched"))) {
+      throw new Error(`want every folded cell matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 3);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("mismatch bytes: const cell folded "));
+    if (bad.length === 0 || [...rows.keys()].some((k) => k.startsWith("const cell folded ") && k.endsWith(": matched"))) {
+      throw new Error(`want each folded cell a "mismatch bytes: const cell folded" row, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The file rows' controls: an unreadable directive is refused, and a row whose expectation the
 // compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
 Deno.test({
