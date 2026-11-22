@@ -6192,15 +6192,45 @@ function isTagWhollyTested(
 function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
+  const p = listIsAcrossPlanOf(isIx, nd, fnIx)
+  if !p.lpOk { return 0 }
+  const slot = sharedFieldRecvSlot()
+  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+  return listIsAcrossTail(nd, slot, p, fnIx)
+}
+
+// `listIsAcrossRepsPlan`'s answer for `is` test `isIx`: the tested list type, per tag how it is
+// tested and the slots its loop walks; `lpOk` false when the test is not that shape.
+export type ListIsAcrossPlan = {
+  lpChk: i32,
+  lpTags: i32[],
+  lpFits: i32[],
+  lpSlots: i32[][],
+  lpOk: boolean,
+}
+
+// The plan `emitListIsAcrossReps` and the IR's `RListIsAcross` write `nd` (at `isIx`) by.
+export function listIsAcrossPlanOf(
+  isIx: i32,
+  nd: IsExpr,
+  fnIx: i32,
+): ListIsAcrossPlan {
   const chk = isVarTyIxOf(isIx)
   const tags: i32[] = []
   const fits: i32[] = []
   const slotsAt: i32[][] = []
-  if !listIsAcrossRepsPlan(nd.isObj, chk, fnIx, tags, fits, slotsAt) {
-    return 0
-  }
-  const slot = sharedFieldRecvSlot()
-  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+  const ok = listIsAcrossRepsPlan(nd.isObj, chk, fnIx, tags, fits, slotsAt)
+  return { lpChk: chk, lpTags: tags, lpFits: fits, lpSlots: slotsAt, lpOk: ok }
+}
+
+// After `nd`'s receiver: its box into `slot`, then plan `p`'s test, false on a null box. 1 once
+// written, -1 on failure.
+export function listIsAcrossTail(
+  nd: IsExpr,
+  slot: i32,
+  p: ListIsAcrossPlan,
+  fnIx: i32,
+): i32 {
   fbLocalSet(slot)
   // A nullable operand is false on null; the box is a null reference then (D4953).
   const nullable = nodeTyIsNullable(nd.isObj)
@@ -6211,7 +6241,10 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
     fbI32Const(0)
     fbElse()
   }
-  if emitListIsAcrossRepsAt(slot, chk, tags, fits, slotsAt, fnIx) < 0 {
+  if (
+    emitListIsAcrossRepsAt(slot, p.lpChk, p.lpTags, p.lpFits, p.lpSlots, fnIx)
+    < 0
+  ) {
     return -1
   }
   if nullable { fbEnd() }
@@ -40219,15 +40252,24 @@ function emitNumRepNarrow(from: VKind, to: VKind): i32 {
   )
 }
 
+// The list arms `emitArmIndexWrite` stores `target` through, or none: an identifier receiver whose
+// box of list arms no list-union rewrite overrides.
+export function armIndexWriteArmsOf(target: Index, fnIx: i32): i32[] {
+  const recv = unwrapParen(target.idxArr)
+  if recv < 0 || recv >= P.nodes.length || !(nodeAt(recv) is Ident) {
+    return []
+  }
+  if luOvLocalOf(recv) >= 0 || !exprUnion(recv, fnIx) { return [] }
+  return luMembersAt(nodeTyAt(recv, fnIx))
+}
+
 // `recv[i] = v` through a union-of-lists box a pin or an `is K[]` arm left unrewritten: per list
 // arm, the store lowers with `recv` overridden to that arm, its value converted to the arm's
 // element as any store converts it. 0 when `target` is no such store, 1 when emitted.
 function emitArmIndexWrite(fnIx: i32, a: BinExpr, target: Index): i32 {
-  const recv = unwrapParen(target.idxArr)
-  if recv < 0 || recv >= P.nodes.length || !(nodeAt(recv) is Ident) { return 0 }
-  if luOvLocalOf(recv) >= 0 || !exprUnion(recv, fnIx) { return 0 }
-  const arms = luMembersAt(nodeTyAt(recv, fnIx))
+  const arms = armIndexWriteArmsOf(target, fnIx)
   if arms.length == 0 { return 0 }
+  const recv = unwrapParen(target.idxArr)
   if emitArmIndexWriteAt(fnIx, a, target, recv, arms, 0) < 0 { return -1 }
   asgParkedSlot = -1
   return 1
