@@ -27,6 +27,7 @@ import {
   repNodeAt,
   repTyOf,
 } from "./emit_rep"
+import { TyObj, objFieldIndexOf, tyAt } from "./check_types"
 
 // An operand: a variable, an immediate of a primitive rep, or an interned string.
 export type OVar = { ov: i32 }
@@ -1843,6 +1844,114 @@ export function recRetag(src: i32, dst: i32): boolean {
   while i < a.rrFields.length {
     if a.rrFields[i] != d.rrFields[i] { return false }
     i = i + 1
+  }
+  return true
+}
+
+// Whether a plain record at rep `src` is the record at plain rep `dst` as it stands: one struct
+// heap (`recordHeapOfTy`, legacy's storage of both types) and fields that lower alike by name.
+export function recRowRetag(src: i32, dst: i32): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if (
+    !(a is RRecord)
+    || !(d is RRecord)
+    || a.rrVariant
+    || d.rrVariant
+    || src == dst
+  ) {
+    return false
+  }
+  const h = recHeapOf(src)
+  return h >= 0 && h == recHeapOf(dst) && repsLowerAlike(src, dst)
+}
+
+// Whether reps `a` and `b` lower to the same valtypes: one scalar class, or the same reference
+// shape kid by kid, a record's fields matched by name. A pair met again on its own path holds.
+export function repsLowerAlike(a: i32, b: i32): boolean {
+  return lowerAlikeOn(a, b, [], [])
+}
+
+function lowerAlikeOn(a: i32, b: i32, pa: i32[], pb: i32[]): boolean {
+  if a == b { return true }
+  let k = 0
+  while k < pa.length {
+    if pa[k] == a && pb[k] == b { return true }
+    k = k + 1
+  }
+  const x = repNodeAt(a)
+  const y = repNodeAt(b)
+  if x == null || y == null { return false }
+  pa.push(a)
+  pb.push(b)
+  const ok = match x {
+    RPrim => y is RPrim && primLowersAs(x) == primLowersAs(y) && x.rpPacked == y.rpPacked
+    RAtom => y is RAtom
+    RNullable => y is RNullable
+      && x.rnDisc == y.rnDisc
+      && lowerAlikeOn(x.rnInner, y.rnInner, pa, pb)
+    RList => y is RList && lowerAlikeOn(x.rlsElem, y.rlsElem, pa, pb)
+    RMap => y is RMap && lowerAlikeOn(x.rmVal, y.rmVal, pa, pb)
+    RBox => y is RBox && kidsLowerAlike(x.rbArms, y.rbArms, pa, pb)
+    RClosure => y is RClosure
+      && x.rcVoid == y.rcVoid
+      && kidsLowerAlike(x.rcParams, y.rcParams, pa, pb)
+      && lowerAlikeOn(x.rcRet, y.rcRet, pa, pb)
+    RRecord => y is RRecord && x.rrVariant == y.rrVariant && fieldsLowerAlike(a, b, pa, pb)
+    RNoValue |
+      RRaw |
+      RUnsup => false
+  }
+  pa.pop()
+  pb.pop()
+  return ok
+}
+
+// The valtype class a primitive rep lowers to: `bool` is stored as an `i32`.
+function primLowersAs(p: RPrim): string {
+  return match p.rpK {
+    "bool" => "i32"
+    "i32" | "i64" | "f32" | "f64" | "v128" | "str" | "u8" | "null" => p.rpK
+  }
+}
+
+function kidsLowerAlike(xs: i32[], ys: i32[], pa: i32[], pb: i32[]): boolean {
+  if xs.length != ys.length { return false }
+  let i = 0
+  while i < xs.length {
+    if !lowerAlikeOn(xs[i], ys[i], pa, pb) { return false }
+    i = i + 1
+  }
+  return true
+}
+
+// A record rep's fields follow its type's spelling, so `b`'s are matched to `a`'s by name.
+function fieldsLowerAlike(a: i32, b: i32, pa: i32[], pb: i32[]): boolean {
+  const x = repNodeAt(a)
+  const y = repNodeAt(b)
+  const ta = repTyOf(a)
+  const tb = repTyOf(b)
+  if !(x is RRecord) || !(y is RRecord) || ta < 0 || tb < 0 { return false }
+  const oa = tyAt(ta)
+  const ob = tyAt(tb)
+  if !(oa is TyObj) || !(ob is TyObj) { return false }
+  if (
+    oa.objFieldNames.length != ob.objFieldNames.length
+    || x.rrFields.length != y.rrFields.length
+  ) {
+    return false
+  }
+  let j = 0
+  while j < ob.objFieldNames.length && j < y.rrFields.length {
+    const i = objFieldIndexOf(oa, ob.objFieldNames[j])
+    if (
+      i < 0
+      || i >= x.rrFields.length
+      || !lowerAlikeOn(x.rrFields[i], y.rrFields[j], pa, pb)
+    ) {
+      return false
+    }
+    j = j + 1
   }
   return true
 }
