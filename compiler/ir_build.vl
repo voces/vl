@@ -1911,8 +1911,9 @@ function exprTyOf(ix: i32): i32 {
   }
   if ix < 0 || ix >= P.nodes.length { return t }
   const n = nodeAt(ix)
-  // A direct call typed open is of its callee's result as the IR holds it (`resultTy`).
-  if t >= 0 && !(n is Call && irTyOpen(t)) { return t }
+  // A direct call typed open, or typed at the closure its callee returns a bundle record for
+  // (`fnRetHeldAsBundle`), is of its callee's result as the IR holds it (`resultTy`).
+  if t >= 0 && !(n is Call && (irTyOpen(t) || bundleCallOf(n, t))) { return t }
   if n is Call {
     if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return t }
     const d = identDeclOf(n.callFn)
@@ -1928,6 +1929,14 @@ function exprTyOf(ix: i32): i32 {
   const v = boundVarOf(ix)
   if v >= 0 { return ib.irVars[v].vTy }
   return if t < 0 { capturedClosureTy(ix) } else { t }
+}
+
+// Whether direct call `n`, typed `t`, calls a function legacy returns a bundle record from at
+// that type (`fnRetHeldAsBundle`), so its value is the callee's `resultTy`.
+function bundleCallOf(n: Call, t: i32): boolean {
+  if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return false }
+  const pos = fnIndexOfNode(n.callFn)
+  return pos >= 0 && pos < fnStmts.length && fnRetHeldAsBundle(pos, t)
 }
 
 // The type an untyped read `ix` of a captured hole-lambda binding is held at: its open type, at
@@ -1950,14 +1959,20 @@ function capturedClosureTy(ix: i32): i32 {
 }
 
 // The record type read `ix` of a holding binding is (`holderRecordTy`), where this frame's
-// variable for it holds that record; -1 otherwise, a global or a capture included.
+// variable for it, or the module cell of a global one, holds that record; -1 otherwise.
 function holderReadTy(ix: i32): i32 {
   if !elabHasHolderRecords() { return -1 }
   if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return -1 }
-  const ht = holderRecordTy(identDeclOf(ix), ibFnIx)
+  const d = identDeclOf(ix)
+  const ht = holderRecordTy(d, ibFnIx)
   if ht < 0 { return -1 }
   const v = boundVarOf(ix)
-  return if v >= 0 && ib.irVars[v].vTy == ht { ht } else { -1 }
+  if v >= 0 { return if ib.irVars[v].vTy == ht { ht } else { -1 } }
+  // A module holder's read is of the record its cell holds (`globalRep`).
+  const g = globalIndexOfSid(sidOfNode(ix))
+  if g < 0 { return -1 }
+  const mt = holderRecordTy(d, -1)
+  return if mt >= 0 && globalRep(g, d) == repNodeOfTy(mt) { mt } else { -1 }
 }
 
 // `boundVarOf(ix)` for read `ix` of open type `t`, where the IR holds it closed and legacy stores
@@ -3363,9 +3378,16 @@ function nullNarrowArmOf(ix: i32, cellRep: i32, rep: i32): NullNarrowArm {
 function globalRep(g: i32, d: i32): i32 {
   const noted = irGlobalRepOf(ib, g)
   if noted >= 0 { return noted }
-  const r = globalTyRep(scopeTyAt(d, -1))
+  const r = globalTyRep(globalHeldTy(d))
   if r >= 0 { irGlobalNote(ib, g, r) }
   return r
+}
+
+// The type global `d`'s cell holds: the record a holding binding holds whole (`holderRecordTy`, the
+// struct legacy's `letCellKindGo` gives its cell), else its own type.
+function globalHeldTy(d: i32): i32 {
+  const ht = holderRecordTy(d, -1)
+  return if ht >= 0 { ht } else { scopeTyAt(d, -1) }
 }
 
 // The rep a global held at type `ty` takes; -1 when it is no scalar.
@@ -9755,7 +9777,7 @@ function globalInitVariant(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
 // and this build's reads of the global then meet that rep (D14426, DECISIONS.md).
 function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   const noted = irGlobalRepOf(ib, gi)
-  const rep = if noted >= 0 { noted } else { globalTyRep(scopeTyAt(gst, -1)) }
+  const rep = if noted >= 0 { noted } else { globalTyRep(globalHeldTy(gst)) }
   if rep < 0 { return irBMiss("global initializer rep") }
   const v = deliver(b, init, rep, -1)
   if ibMiss != "" { return v }
