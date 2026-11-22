@@ -118,6 +118,7 @@ import {
   sIf,
 } from "./ir"
 import {
+  cloHoleRetag,
   listRetag,
   listRetagHole,
   recRetag,
@@ -2979,7 +2980,14 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !narrowed
       && rep == globalTyRep(scopeTyAt(d, -1))
       && cellRep == globalTyRep(letBindTy(d, -1))
-    if cellRep != rep && !narrowed && !stored {
+    // A closure cell read where its type leaves a closure part open or fills one is the same
+    // closure struct, retagged.
+    const holed = cellRep != rep
+      && !narrowed
+      && !stored
+      && cloHoleRetag(cellRep, rep)
+      && exprPrePathWhy(ix, ibFnIx) == ""
+    if cellRep != rep && !narrowed && !stored && !holed {
       return irBMiss("global read coercion")
     }
     const gm = irGlobalReadMiss(g, ibGlobalCtx())
@@ -2991,6 +2999,13 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       ggNn: if narrowed { if readOwesNonNullRecover(ix, ibFnIx) { 1 } else { 0 } } else { -1 },
     }
     ib.irReadAgain[ix] = gr
+    if holed {
+      // The cell is read at its storage row, the binding's type.
+      const lt = heldTy(letBindTy(d, -1))
+      if repNodeOfTy(lt) != cellRep { return irBMiss("global read coercion") }
+      const cell = irBLetTempTy(b, gr, ix, cellRep, lt)
+      return repTemp(b, { rgV: cell }, ix, rep)
+    }
     if stored {
       return irBLetTempTy(b, gr, ix, cellRep, heldTy(letBindTy(d, -1)))
     }
@@ -3265,6 +3280,9 @@ function narrowedLocalRead(
     return o
   }
   if localReadStored(v, identDeclOf(ix), rep) { return o }
+  if cloHoleRetag(ib.irVars[v].vRep, rep) && exprPrePathWhy(ix, ibFnIx) == "" {
+    return repTemp(b, { rgV: o }, ix, rep)
+  }
   return irBMiss("narrowed read")
 }
 
