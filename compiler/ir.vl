@@ -8,6 +8,7 @@ import { i32ToStr } from "./ast"
 import { CoalValArm } from "./emit_plan_null"
 import { ArrLitArm } from "./emit_plan_list"
 import { LitIsArm } from "./emit_plan_union"
+import { VKind } from "./emit_state"
 import {
   RAtom,
   RBox,
@@ -203,12 +204,16 @@ export type RFieldNull = { fnRow: i32, fnFi: i32 }
 // The function's own `null` at its nullable return rep (`nullRetPlanOf`), as legacy pads a returned
 // value `if` with it at `rnrAt` (`emitNullForRet`).
 export type RRetNull = { rnrAt: i32 }
+// A reference join's bare `null` arm: the `ref.null` of join kind `jnKind`'s heap at row `jnSlot`,
+// as legacy writes it (`fbRefNullOfKind`). The builder takes both from `ifRefJoinOf` once.
+export type RJoinNull = { jnKind: VKind, jnSlot: i32 }
 // `ntV`, a `K | null`, a nullable reference or a union box, tested against `null` at compare node `ntAt`; `ntInvert` for `!=`, as the
 // binary dispatch hands it to legacy's null test (`binNulTestOf`).
 export type RNulTest = { ntV: Opnd, ntInvert: boolean, ntAt: i32 }
 // The `==` (or, with `aeNe`, `!=`) of two atoms at compare node `aeAt`. `aeStatic` 1 or 2 names
 // the left or right side typed as one string literal, whose id comes from its lexeme: its operand
-// is an unread immediate for a literal, else a value evaluated and dropped. 0 is two atom values.
+// is an unread immediate for a literal, else a value evaluated and dropped. 0 is two atom values,
+// 3 two literal sides the compare folds to a constant.
 export type RAtomEq = {
   aeL: Opnd,
   aeR: Opnd,
@@ -378,6 +383,7 @@ export type Rhs = RAsUnion
   | RFnId
   | RGetField
   | RGlobalGet
+  | RJoinNull
   | RListCat
   | RListClear
   | RListCopy
@@ -1014,6 +1020,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RNullOf => []
     RFieldNull => []
     RRetNull => []
+    RJoinNull => []
     RNulTest => [r.ntV]
     RAtomEq => [r.aeL, r.aeR]
     RAsUnion => [r.auV]
@@ -1089,6 +1096,7 @@ function rhsText(r: Rhs): string {
     RNullOf => "null"
     RFieldNull => "field null"
     RRetNull => "return null"
+    RJoinNull => "join null"
     RNulTest => "isnull " + opndText(r.ntV)
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RAsUnion => "as.union " + opndText(r.auV)
@@ -1351,6 +1359,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RAtomStr |
       RCoalAtomStr |
       RCoalStr |
+      RJoinNull |
       RLitArms |
       RNulTest |
       RNullOf |
@@ -1565,4 +1574,33 @@ export function lexOpcode(op: string, p: RpPrim): i32 {
   const o = binPrimOp(op, false)
   if o == null { return -1 }
   return primOpcode(o, p)
+}
+
+// Whether a list at rep `src` is the list at rep `dst` as it stands: the same record elements, one
+// side's possibly `| null`, which one ref list holds (its backing is already nullable).
+export function listRetag(src: i32, dst: i32): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if !(a is RList) || !(d is RList) { return false }
+  const ea = recElemCore(a.rlsElem)
+  return ea >= 0 && ea == recElemCore(d.rlsElem)
+}
+
+// The record rep of list element `e`, under a `| null`, or -1.
+function recElemCore(e: i32): i32 {
+  const n = repNodeAt(e)
+  if n == null { return -1 }
+  return match n {
+    RRecord => e
+    RNullable => if repNodeAt(n.rnInner) is RRecord { n.rnInner } else { -1 }
+    RAtom |
+      RBox |
+      RClosure |
+      RList |
+      RMap |
+      RNoValue |
+      RPrim |
+      RRaw |
+      RUnsup => -1
+  }
 }

@@ -63,6 +63,12 @@ For lanes:
   `ir-identity.sh --cases` alone.
 - **R3.** `--claimless` runs once per functional change, not per master merge.
 - **R4.** A stack is proved once, at its top.
+- **R5.** One owner per blocker class; the coordinator assigns it.
+- **R6.** An OK'd PR waiting only on a waived re-proof counts as READY.
+- **R7.** A PR touching `compiler/ir*.vl`, or moving an IR miss name or coverage, runs
+  `deno test -A --no-check tests/vl_ir_shadow_test.ts` on its head before READY and quotes the
+  summary line (coordinator ruling, 2026-11-21: batch AB was red on two stale miss expectations,
+  and `gate.sh --fast` does not run that file).
 
 For the queue:
 
@@ -70,7 +76,20 @@ For the queue:
 - **Q2.** A train departs at 6 to 8 READY PRs, or when the gate has been idle 15 minutes with at
   least one READY. The next candidate is assembled while the current one is in verify.
 - **Q3.** The queue resolves a purely additive conflict itself: a union of list members in sorted
-  or declared order, or the whole single-line items of step 2. Anything else goes back to the lane.
+  or declared order, or the whole single-line items of step 2. A hunk where one side edits a line
+  and the other only adds lines beside it, so that no line is edited by both, is resolved the same
+  way (coordinator ruling, 2026-11-21). Anything else goes back to the lane.
+
+### Squash artifacts and Q3 members
+
+- A lane PR that merged an unsquashed batch member or stack parent can meet a criss-cross merge
+  base. Build its candidate step with `git merge-tree --write-tree --merge-base=M <cand> <pr>`,
+  where M is its merge base with master, or its stack parent's head; use this only when both sides
+  contain M tree-wise.
+- After a batch squashes, a member stacked on an unsquashed head, or one carrying a Q3 resolution,
+  no longer squashes alone. Push a merge commit onto the lane's branch: tree = the gated candidate
+  step merged with master's docs-only moves, parents = PR head and master. Check the tree, then
+  squash at that sha (precedent #9409 at 722d19a6; train AD's #9411, #9431, #9439).
 
 ### CI proof
 
