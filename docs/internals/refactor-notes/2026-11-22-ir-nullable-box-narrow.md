@@ -23,3 +23,17 @@ The family's record, list and atom rows take other arms; this covers the str and
 
 `tests/ir-shadow-rows/narrowed-box-read-at-its-niche.vl`: a `string | i32 | null` and a
 `boolean | i32 | null` local narrowed past `i32` and passed at their niche.
+
+## Measured vs merge-base 14d707ae (fixpoint seeds on both sides)
+
+- `--names` self-compile identical; mode 3 self-compile byte-identical.
+- `ir-identity.sh --cases`: identical 7624, fail under both 68, differ 0; witnesses same 61,
+  differ 0. `--claimless`: identical 14019, fail under both 3267, differ 0.
+- tests/cases shadow sum: covered and matched 69434 → 69447 and 69433 → 69446 (+13);
+  `uncovered narrowed read` 62 → 49. Those are the 13 niche rows of family A; the 14 record, atom
+  and list rows still miss.
+- Corpus shadow: 45201 of 45678 functions covered, verified and matched.
+- L2 self-compile fuel +0.13% on base 14d707ae (per-PR tier +1%).
+- Deep-nesting margin: base and branch alike, 920 KB fail, 930 KB pass.
+- Late demands 9 (baseline 9); late tag rows 307 (baseline 307); `ladder-sets` 100 sets clean;
+  `ir prepost` (mode 6) and `ir claims` ok, with no new row.
