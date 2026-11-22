@@ -480,6 +480,7 @@ import {
   cloStructIdx,
   cmSlot,
   coalLinkChains,
+  coalNullTestIfs,
   coalesceCallBoolSlot,
   coalesceCallSlot,
   coalesceCallStrSlot,
@@ -10094,6 +10095,70 @@ function emitUnionEqOther(otherIx: i32, k: i32, fnIx: i32) {
   return emitExpr(otherIx, fnIx)
 }
 
+// A union `==` against a concrete operand on its plain arm: the box's tag `uqTag`, and value-atom
+// kind `uqKind` the payload and operand compare at; -1 where a stash, null leg or other arm writes.
+export type UnionEqPlan = { uqKind: i32, uqTag: i32 }
+
+// The plan of box `boxIx` against `otherIx`: a re-readable box whose union carries the operand's
+// arm, with no null leg on the operand's side. `emitUnionConcreteEq` writes the rest itself.
+export function unionConcreteEqPlanOf(
+  boxIx: i32,
+  otherIx: i32,
+  fnIx: i32,
+): UnionEqPlan {
+  const no: UnionEqPlan = { uqKind: -1, uqTag: -1 }
+  if !unionEqOperandOk(boxIx) { return no }
+  const unr: i32[] = []
+  const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
+  const usid = msSetOfUnionBox(boxIx, fnIx)
+  const bty = unionBoxTyOfRead(boxIx, fnIx)
+  const eak = unionEqAtomKindOf(otherIx, usid, bty, fnIx)
+  if eak < 0 || uname == "" { return no }
+  let hasArm = unionEqArmPresent(usid, valueAtomNameOfKind(eak), eak)
+  if !hasArm && eak == 2 && msSetTakesAtomAsStr(usid) { hasArm = true }
+  if !hasArm { return no }
+  // The operand's null legs (`nulOther`, `nulStrOther`, `nulBoolOther`) test it first.
+  if unionEqOperandOk(otherIx) && unionSetHasNullTy(uname, bty) {
+    const nul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+    if eak == 2 && (exprNulLitUnion(otherIx, fnIx) || nul) { return no }
+    if eak == 1 && nul { return no }
+  }
+  const tag = unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], fnIx))
+  const p: UnionEqPlan = { uqKind: eak, uqTag: tag }
+  return p
+}
+
+// What a union `==` takes before its first box read: its stash slot, which the frame holds.
+export function unionEqHead(): i32 {
+  unionEqStashSlot()
+  return 0
+}
+
+// After the box's first read: its tag against the plan's, opening the payload compare's `if`.
+export function unionEqTagTail(qp: UnionEqPlan): i32 {
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, qp.uqTag)
+  fbI32Bin(70)
+  fbIf(127)
+  return 0
+}
+
+// After the box's second read: its payload unboxed at the plan's kind.
+export function unionEqPayloadTail(qp: UnionEqPlan): i32 {
+  fbStructGet(uBoxIdx, 1)
+  return emitUnionPayloadUnbox(qp.uqKind)
+}
+
+// After the operand: the payload compare, the other arms' 0, and `!=`'s negation.
+export function unionEqCmpTail(qp: UnionEqPlan, isNe: boolean, fnIx: i32): i32 {
+  if emitUnionAtomPayloadEq(qp.uqKind, fnIx) < 0 { return -1 }
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  if isNe { fbI32Eqz() }
+  return 0
+}
+
 // Union against a concrete value, in either operand order: the box's tag must select the arm
 // whose rep matches the other side, then the unboxed payload value-compares it. A rep with no
 // arm is statically unequal, `==` 0 and `!=` 1, with both operands still evaluated for side
@@ -10104,6 +10169,17 @@ function emitUnionConcreteEq(
   isNe: boolean,
   fnIx: i32,
 ) {
+  // The plain arm: the box read twice, the operand once, through the plan the IR writes too.
+  const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
+  if qp.uqKind >= 0 {
+    unionEqHead()
+    if emitExpr(boxIx, fnIx) < 0 { return -1 }
+    unionEqTagTail(qp)
+    if emitExpr(boxIx, fnIx) < 0 { return -1 }
+    if unionEqPayloadTail(qp) < 0 { return -1 }
+    if emitUnionEqOther(otherIx, qp.uqKind, fnIx) < 0 { return -1 }
+    return unionEqCmpTail(qp, isNe, fnIx)
+  }
   // D972 — a non-re-readable operand is stashed at its first read, not refused. This compare
   // reads the box up to three times — the no-arm fold, the tag, and the payload inside the
   // tag-matched arm — which is the whole content of `unionEqOperandOk` (Ident, NumLit, StrLit,
@@ -14220,27 +14296,54 @@ function emitMonoMapDefault(recvIx: i32, defIx: i32, fnIx: i32) {
 // `emitMapGet` leaves a nullable element for every ref-valued map; a union value (kind
 // 2) then unboxes to the tested atom, unless the narrow leaves two or more atoms.
 export function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
-  const mrs = mapReadNarrowableSlot(idxIx, fnIx)
-  if mrs < 0 { return 0 }
-  const rt = nodeTyAt(unwrapParen(idxIx), fnIx)
-  if rt < 0 || tyAdmitsNull(rt) { return 0 }
-  // A UNION value already left the NON-null box (`emitMapGetUnionBox` recovers it), so only
-  // the unbox is owed; every other ref value is the raw `(ref null <elem>)` vals slot.
-  if mvValKindAt(mrs) == "union" {
-    const ak = mapReadNarrowedAtomKind(idxIx, fnIx)
-    if ak >= 0 { return emitUnionUnboxTail(ak) }
-    // The CONTAINER arms of the same narrowing (`if m[k] is {[string]: V}`, `… is K[]`),
-    // which the atom question above answers -1 for. `mapReadNarrowedContainer` is the gate
-    // rather than the unbox's own answer, so the classifiers that stop calling this read a
-    // box and the lowering that opens it are deciding off one predicate (D1866).
-    if mapReadNarrowedContainer(idxIx, fnIx) {
+  const p = narrowedMapReadOf(idxIx, fnIx)
+  return match p.nmArm {
+    "none" => 0
+    // A UNION value already left the NON-null box (`emitMapGetUnionBox` recovers it), so only
+    // the unbox is owed; every other ref value is the raw `(ref null <elem>)` vals slot.
+    "unbox" => emitUnionUnboxTail(p.nmAk)
+    // `mapReadNarrowedContainer` is the gate rather than the unbox's own answer, so the
+    // classifiers that stop calling this read a box and the lowering that opens it are deciding
+    // off one predicate (D1866).
+    "container" => {
       const con = emitPlaceNarrowContainerUnbox(idxIx, fnIx)
-      if con != 0 { return con - 1 }
+      if con != 0 { con - 1 } else { 0 }
     }
-    return 0
+    "nonNull" => {
+      fbRefAsNonNull() // 0xd4 (the `is` guard proved the key present)
+      0
+    }
   }
-  fbRefAsNonNull() // 0xd4 (the `is` guard proved the key present)
-  return 0
+}
+
+// What a bare map read `m[k]` at `idxIx` owes after its read, as `emitNarrowedMapReadTail` writes
+// it: nothing (`none`, the read not narrowed past `null`), a union value's unbox to atom kind
+// `nmAk`, a union value's container narrowing, or a ref value's non-null recovery.
+export type NarrowedMapReadArm = "none" | "unbox" | "container" | "nonNull"
+export type NarrowedMapRead = { nmArm: NarrowedMapReadArm, nmAk: i32 }
+
+export function narrowedMapReadOf(idxIx: i32, fnIx: i32): NarrowedMapRead {
+  const none: NarrowedMapRead = { nmArm: "none", nmAk: -1 }
+  const mrs = mapReadNarrowableSlot(idxIx, fnIx)
+  if mrs < 0 { return none }
+  const rt = nodeTyAt(unwrapParen(idxIx), fnIx)
+  if rt < 0 || tyAdmitsNull(rt) { return none }
+  if mvValKindAt(mrs) != "union" {
+    const nn: NarrowedMapRead = { nmArm: "nonNull", nmAk: -1 }
+    return nn
+  }
+  const ak = mapReadNarrowedAtomKind(idxIx, fnIx)
+  if ak >= 0 {
+    const u: NarrowedMapRead = { nmArm: "unbox", nmAk: ak }
+    return u
+  }
+  // The CONTAINER arms of the same narrowing (`if m[k] is {[string]: V}`, `… is K[]`), which
+  // the atom question above answers -1 for.
+  if mapReadNarrowedContainer(idxIx, fnIx) {
+    const c: NarrowedMapRead = { nmArm: "container", nmAk: -1 }
+    return c
+  }
+  return none
 }
 
 // How a bare map read `m[k]` at Index node `idxIx` reads its map: a union value through its
@@ -14418,6 +14521,12 @@ export function mapGetMissOf(recvIx: i32, fnIx: i32): i32 {
 // Exported for `emitStartFnCode`'s identical module-scope miss arm.
 export function emitMapGetUnionBox(recvIx: i32, keyIx: i32, fnIx: i32) {
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
+  return mapGetUnionBoxTail()
+}
+
+// After a union-valued map's probe: the stored box on a hit, the null-tagged box on a miss, read
+// back non-null from the mv slot's stash.
+export function mapGetUnionBoxTail() {
   if cmSlot < 0 {
     return emitFail(
       "emitProgram: union-valued map read but no mv slot resolved",
@@ -18393,19 +18502,17 @@ export function strSiteArmMint(binIx: i32, fnIx: i32) {
 
 // `strInPlaceMode` asked ahead of the site's writing, minting no global pair.
 export function strInPlaceModeAsked(binIx: i32, fnIx: i32): i32 {
-  const was = ssAskOnly
   ssAskOnly = true
   const m = strInPlaceMode(binIx, fnIx)
-  ssAskOnly = was
+  ssAskOnly = false
   return m
 }
 
 // `strSiteOfRhs` asked ahead of the site's writing, minting no global pair.
 export function strSiteOfRhsAsked(rhsIx: i32, fnIx: i32): i32 {
-  const was = ssAskOnly
   ssAskOnly = true
   const s = strSiteOfRhs(rhsIx, fnIx)
-  ssAskOnly = was
+  ssAskOnly = false
   return s
 }
 
@@ -27216,37 +27323,45 @@ function armCalleeName(c: Call, callee: Ident): string {
   return if f is FuncDecl { f.fnName } else { "" }
 }
 
-// `emitCallCore`'s user-function tail for callee `callee`: the scope-resolved function's
-// direct, captured or low-memory call, a closure binding's `call_ref`, or a numeric
-// intrinsic when the name resolves to no function. Returns 0 or -1.
-function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
-  // Scope-aware: `buildFnMap` keys lifted functions by name, first wins, so the flat map
-  // would give every frame's `inner(…)` the module's first `inner`. The positioned lookup
-  // takes the block-local function whose scope covers this call, else a top-level one.
-  const target = fnIndexOfInScopeChainAt(
+// The function call `c` of `callee` names in frame `fnIx`, or -1. Scope-aware: the flat map keys
+// lifted functions by name, first wins, so this takes the block-local function covering the call.
+function userFnCallTarget(c: Call, callee: Ident, fnIx: i32): i32 {
+  return fnIndexOfInScopeChainAt(
     sidOfNode(c.callFn),
     armCalleeName(c, callee),
     fnIx,
     c.callFn,
   )
-  // A live closure binding of the name outranks that scan, which cannot see a param or a
-  // local (D1602); a local declared later does not yet shadow the function (D3607). Asked
-  // only on a hit, so a plain call pays nothing.
+}
+
+// Whether `emitCallCoreUserFn` sends call `c` to `emitCallRef`, given `target` from
+// `userFnCallTarget`: a live closure binding (D1602) or bundle parameter of the name outranks the
+// function, and a name with none routes by `unknownCallRoutesRef`. A later local does not (D3607).
+function userFnCallRoutesRef(
+  c: Call,
+  callee: Ident,
+  fnIx: i32,
+  target: i32,
+): boolean {
+  if target < 0 { return unknownCallRoutesRef(c, callee, fnIx) }
   if (
-    target >= 0
-    && identNameIsLiveBound(callee.identName, fnIx)
+    identNameIsLiveBound(callee.identName, fnIx)
     && identIsBoundClosure(c.callFn, fnIx)
   ) {
-    return emitCallRef(callIx, fnIx)
+    return true
   }
-  // So does a bundle parameter of the name, which is a record of closures, not one.
-  if target >= 0 && bundleParamOfRead(c.callFn, fnIx) >= 0 {
+  return bundleParamOfRead(c.callFn, fnIx) >= 0
+}
+
+// `emitCallCore`'s user-function tail for callee `callee`: the scope-resolved function's
+// direct, captured or low-memory call, a closure binding's `call_ref`, or a numeric
+// intrinsic when the name resolves to no function. Returns 0 or -1.
+function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
+  const target = userFnCallTarget(c, callee, fnIx)
+  if userFnCallRoutesRef(c, callee, fnIx, target) {
     return emitCallRef(callIx, fnIx)
   }
   if target < 0 {
-    if unknownCallRoutesRef(c, callee, fnIx) {
-      return emitCallRef(callIx, fnIx)
-    }
     if !identNameIsLiveBound(callee.identName, fnIx) {
       const niRc = emitNumIntr(callIx, fnIx, callee.identName)
       if niRc != NUM_INTR_NONE { return niRc }
@@ -28061,12 +28176,9 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   if cloTailRefusal(callIx, fnIx) != "" || callEndsNever(callIx) { return "" }
   if fnTagArmsAt(callIx, emitTagSetAt(callIx, fnIx)).length > 0 { return "" }
   if holderRecordSigs(d, fnIx).length > 0 { return "" }
-  // A function of the name in scope makes legacy ask its live scope which one the name means.
-  if fnIndexOfInScopeChainAt(sidOfNode(c.callFn), nm, fnIx, c.callFn) >= 0 {
-    return ""
-  }
+  // Routed as `emitCallCoreUserFn` routes it; a bundle parameter is `bundleCallRefPlainKey`'s.
   if (
-    !unknownCallRoutesRef(c, callee, fnIx)
+    !userFnCallRoutesRef(c, callee, fnIx, userFnCallTarget(c, callee, fnIx))
     || bundleParamOfRead(c.callFn, fnIx) >= 0
   ) {
     return ""
@@ -42356,7 +42468,11 @@ function coalHoleMapReadNullTest(
 
 // `if l != null { l } else { d }` for `l ?? d`, carrying the `??`'s type. A declared atom niche's
 // arm re-reads `l` at its non-null set, the narrowing the checker would have recorded.
-function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+export function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  // Minted once per `??` and instance: a later reader, legacy's or the IR builder's, takes it.
+  const key = i32ToStr(exprIx) + ":" + i32ToStr(fnIx)
+  const had = coalNullTestIfs[key] ?? -1
+  if had >= 0 { return had }
   const thenS: i32[] = []
   thenS.push(coalNarrowedReRead(unwrapParen(e.binLeft), fnIx))
   const elseS: i32[] = []
@@ -42369,6 +42485,7 @@ function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     pos,
   )
   nodeTyCarry(ifIx, exprIx)
+  coalNullTestIfs[key] = ifIx
   return ifIx
 }
 
