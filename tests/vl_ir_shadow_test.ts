@@ -1525,6 +1525,7 @@ Deno.test({
       "atom-tower-i32-read": 2,
       "atom-tower-zero-reads": 2,
       "atom-staged-of-i32": 2,
+      "opt-read-of-i32": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {

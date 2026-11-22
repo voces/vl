@@ -1,4 +1,4 @@
-# IR: standalone `?.` and a `.length` that reaches `emitMem` (2026-11-22, lane IR-N5)
+# IR: standalone `?.` (2026-11-22, lane IR-N5)
 
 Batch 2 of the coordinator's classes for IR-N5, on master 4cb73575, stacked on
 ir-object-member-batch.
@@ -33,15 +33,6 @@ A probe of the 40 by leaf and chain shape: almost all are one link over an unsta
 - The rest stay named misses: `optional read chain` (two links), `optional read staged`, and
   `optional read base`.
 
-## `.length` reaching `emitMem` (`member record`, 28 of 38)
-
-`memberReadPlain` refused every `.length` that is no field of a record row (`lengthIsField`). On
-the `.length` arm, legacy's `emitMemberNode` reaches `emitMem` whenever no earlier arm takes the
-receiver: a list-fit grow row, an arm site, an atom's string, a list, a string or a map. A
-binding narrowed to a record arm out of a union with a list is one. `lengthReachesMem` mirrors
-that order; the plain predicates it gates are the IR's alone.
-
-New test cases: `objects/optional-member-standalone-leaf-kinds.vl` and
-`records/length-field-read-on-a-narrowed-record-arm.vl`.
+New test case: `objects/optional-member-standalone-leaf-kinds.vl`.
 
 The measurements are in the PR body.
