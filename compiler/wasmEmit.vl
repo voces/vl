@@ -1807,6 +1807,7 @@ import {
   njSideTyOf,
   njStoreKind,
   nodeIsNumUnion,
+  nulBoolBoxesInto,
   nulNicheIsTestImpossible,
   nulRecvNeedsRecover,
   nullInstanceIsResult,
@@ -1817,6 +1818,7 @@ import {
   sFieldElemTyIxOfRow,
   scalarAtomNameOfKind,
   strLexSameValue,
+  structArmHeapOf,
   tagIsArmOf,
   unionArmRowsOfTy,
   unionArmTagClash,
@@ -6684,105 +6686,139 @@ export function variantTagTail(vi: i32) {
   return 0
 }
 
-// The variant rung of `emitIsTest`: `recv is V` for a union variant, alias arm or record,
-// by a static row fold where the row is the answer, else the box tag and discriminant test.
-// Returns 0 once the test is on the stack, -1 on failure.
+// How the variant rung tests `recv is V` past its plain tag: at `V`'s tested row (`row`,
+// `isTestedRowOf`, into `tags`), else a record the receiver always is (`recordTrue`), the tag chain
+// of a union alias arm, its tags into `tags` (`tagChain`), a pin whose join holds no such arm
+// (`pinFalse`), or none (`noArm`). The constant arms evaluate the receiver and drop it.
+export type VariantIsArm = "row"
+  | "recordTrue"
+  | "tagChain"
+  | "pinFalse"
+  | "noArm"
+export function variantIsArmOf(
+  isIx: i32,
+  nd: IsExpr,
+  fnIx: i32,
+  tags: i32[],
+): VariantIsArm {
+  const row = isTestedRowOf(isVarTyIxOf(isIx), nd.isObj)
+  if row >= 0 {
+    tags.push(row)
+    return "row"
+  }
+  if recvIsTestedRecord(nd.isObj, isVarTyIxOf(isIx)) { return "recordTrue" }
+  // A union alias arm has no single variant row because it is a SUBSET of the outer box's tags,
+  // so the test is the tag chain `as?` emits for a sub-union target (D1774). A layout-twin arm
+  // is excluded: its tag alone does not settle membership.
+  const isTags: i32[] = []
+  const isVis: i32[] = []
+  if unionArmTagsOfTy(isVarTyIxOf(isIx), -1, isTags, isVis) {
+    let chainOk = isTags.length > 1
+      && exprUnion(nd.isObj, fnIx)
+      && unionEqOperandOk(nd.isObj)
+    // A variant told apart by a field's value shares its tag; the tag alone answers where every
+    // operand arm holding that tag is tested (`tyTestMeet`'s members, D16320).
+    const opTags: i32[] = []
+    const opVis: i32[] = []
+    const opArms = unionArmTagsOfTy(nodeTyAt(nd.isObj, fnIx), -1, opTags, opVis)
+    let ci = 0
+    while ci < isVis.length {
+      if (
+        variantHasDiscrimField(isVis[ci])
+        && !(opArms && isTagWhollyTested(isTags[ci], opTags, opVis, isVis))
+      ) {
+        chainOk = false
+      }
+      ci = ci + 1
+    }
+    if chainOk {
+      for t in isTags { tags.push(t) }
+      return "tagChain"
+    }
+  }
+  // A record no union of the program has as a variant is in no box, so a box's test of it is
+  // false, as a pin whose join lacks it answers (D3344). A `K | null` niche holds no record and
+  // no value of a primitive other than `string`.
+  const nlPrim = isTestValuePrimName(isVarTyIxOf(isIx))
+  const nlNo = exprNulLitUnion(nd.isObj, fnIx)
+    && !exprUnion(nd.isObj, fnIx)
+    && ((nlPrim != "" && nlPrim != "string")
+    || tyIsRecord(isVarTyIxOf(isIx)))
+  // A box of value arms only holds no record.
+  const boxr: i32[] = []
+  const boxNm = unionNameRowOfExpr(nd.isObj, fnIx, boxr)
+  const boxNo = exprUnion(nd.isObj, fnIx)
+    && tyIsRecord(isVarTyIxOf(isIx))
+    && boxNm != ""
+    && (isValueUnionOfSet(msSetOfRow(boxr[0]), boxr[1])
+    || unionCarriesLitUnionArmOfSet(msSetOfRow(boxr[0]), boxr[1]))
+  // Only a join the checker kept apart over declared parameters reaches here by design.
+  if (
+    (nlNo || boxNo)
+    && fnInPinnedInstance(fnIx)
+    && holeOperandTyOf(nd.isObj, fnIx) < 0
+    && !criFnIsAnonLambda(fnStmtsPosOf(fnIx))
+    && !readIsCallResult(nd.isObj, fnIx)
+  ) {
+    return "pinFalse"
+  }
+  return "noArm"
+}
+
+// The variant rung of `emitIsTest`: `recv is V` for a union variant, alias arm or record, by its
+// plain tag, else along `variantIsArmOf`. Returns 0 once the test is on the stack, -1 on failure.
 function emitIsTestVariant(isIx: i32, nd: IsExpr, fnIx: i32) {
   const plain = isVariantTagPlain(isIx, fnIx)
   if plain >= 0 {
     if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
     return variantTagTail(plain)
   }
-  const vi = isTestedRowOf(isVarTyIxOf(isIx), nd.isObj)
-  if vi < 0 {
-    if recvIsTestedRecord(nd.isObj, isVarTyIxOf(isIx)) {
+  const isTags: i32[] = []
+  const na = variantIsArmOf(isIx, nd, fnIx, isTags)
+  return match na {
+    "row" => emitIsTestVariantRow(
+      isIx,
+      nd,
+      fnIx,
+      if isTags.length > 0 { isTags[0] } else { -1 },
+    )
+    "recordTrue" | "pinFalse" => {
       if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
       fbDrop()
-      fbI32Const(1)
-      return 0
+      fbI32Const(if na == "recordTrue" { 1 } else { 0 })
+      0
     }
-    // A union alias arm has no single variant row because it is a SUBSET of the outer
-    // box's tags, so the test is the tag chain `as?` already emits for a sub-union target
-    // (D1774). A layout-twin arm is excluded: its tag alone does not settle membership,
-    // and the per-arm discriminant test has no home inside a chain.
-    const isTags: i32[] = []
-    const isVis: i32[] = []
-    if unionArmTagsOfTy(isVarTyIxOf(isIx), -1, isTags, isVis) {
-      let chainOk = isTags.length > 1
-        && exprUnion(nd.isObj, fnIx)
-        && unionEqOperandOk(nd.isObj)
-      // A variant told apart by a field's value shares its tag; the tag alone answers where
-      // every operand arm holding that tag is tested (`tyTestMeet`'s members, D16320).
-      const opTags: i32[] = []
-      const opVis: i32[] = []
-      const opArms = unionArmTagsOfTy(
-        nodeTyAt(nd.isObj, fnIx),
-        -1,
-        opTags,
-        opVis,
-      )
-      let ci = 0
-      while ci < isVis.length {
-        if (
-          variantHasDiscrimField(isVis[ci])
-          && !(opArms && isTagWhollyTested(isTags[ci], opTags, opVis, isVis))
-        ) {
-          chainOk = false
-        }
-        ci = ci + 1
+    "tagChain" => {
+      let ti = 0
+      while ti < isTags.length {
+        if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+        fbStructGet(uBoxIdx, 0)
+        fbI32Rel(RS_TAG, isTags[ti])
+        fbI32Bin(70)
+        if ti > 0 { fbI32Bin(114) }
+        ti = ti + 1
       }
-      if chainOk {
-        let ti = 0
-        while ti < isTags.length {
-          if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-          fbStructGet(uBoxIdx, 0)
-          fbI32Rel(RS_TAG, isTags[ti])
-          fbI32Bin(70)
-          if ti > 0 { fbI32Bin(114) }
-          ti = ti + 1
-        }
-        return 0
+      0
+    }
+    "noArm" => {
+      if tyIsUnionMemberOf(nodeTyIxOf(nd.isObj), isVarTyIxOf(isIx)) {
+        return emitFail(
+          "emitProgram: `is` names a declared union member with no interned arm representation (deferred value-union composition)",
+        )
       }
+      emitFail("emitProgram: `is` names a type that is not a union variant")
     }
-    // A record no union of the program has as a variant is in no box, so a box's test of it
-    // is false, as a pin whose join lacks it answers (D3344).
-    // A `K | null` niche holds no record and no value of a primitive other than `string` (D3344).
-    const nlPrim = isTestValuePrimName(isVarTyIxOf(isIx))
-    const nlNo = exprNulLitUnion(nd.isObj, fnIx)
-      && !exprUnion(nd.isObj, fnIx)
-      && ((nlPrim != "" && nlPrim != "string")
-      || tyIsRecord(isVarTyIxOf(isIx)))
-    // A box of value arms only holds no record.
-    const boxr: i32[] = []
-    const boxNm = unionNameRowOfExpr(nd.isObj, fnIx, boxr)
-    const boxNo = exprUnion(nd.isObj, fnIx)
-      && tyIsRecord(isVarTyIxOf(isIx))
-      && boxNm != ""
-      && (isValueUnionOfSet(msSetOfRow(boxr[0]), boxr[1])
-      || unionCarriesLitUnionArmOfSet(msSetOfRow(boxr[0]), boxr[1]))
-    // Only a join the checker kept apart over declared parameters reaches here by design.
-    if (
-      (nlNo || boxNo)
-      && fnInPinnedInstance(fnIx)
-      && holeOperandTyOf(nd.isObj, fnIx) < 0
-      && !criFnIsAnonLambda(fnStmtsPosOf(fnIx))
-      && !readIsCallResult(nd.isObj, fnIx)
-    ) {
-      if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-      fbDrop()
-      fbI32Const(0)
-      return 0
-    }
-    if tyIsUnionMemberOf(nodeTyIxOf(nd.isObj), isVarTyIxOf(isIx)) {
-      return emitFail(
-        "emitProgram: `is` names a declared union member with no interned arm representation (deferred value-union composition)",
-      )
-    }
+  }
+}
+
+// The variant rung at `V`'s tested row `vi` (`variantIsArmOf`'s `row`): a static row fold where
+// the row is the answer, else the box tag and discriminant test. 0 once on the stack, -1 failed.
+function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
+  if vi < 0 || vi >= uVarTyIx.length {
     return emitFail(
-      "emitProgram: `is` names a type that is not a union variant",
+      "emitProgram: internal: the variant rung lost its tested row",
     )
   }
-
   // A row holding several members answers from the value's fields after its tag (D5157).
   const shared = armRowSharedAtRecv(nd.isObj, vi)
   const rvi = exprVariantIndex(nd.isObj, fnIx)
@@ -8870,21 +8906,20 @@ function emitUnionCoerceRecord(
   // where the box wants the variant struct. Re-box it against the matched arm
   // (`emitStructExprAsVariantBox`). Gated on the heaps differing, so a deduped shape is raw.
   if unionName != "" && exprStruct(exprIx, fnIx) {
+    // On its arm's variant heap the struct is boxed as itself (`structArmHeapOf`, the plan's
+    // `rec` arm), never passed raw: a `(ref $arm)` in a box cell is invalid wasm (D281).
+    const sv = structArmHeapOf(uTy, exprIx, fnIx)
+    if sv >= 0 {
+      fbI32Rel(RS_TAG, uTags[sv]) // 0x41 i32.const <variant tag> (program-global)
+      if emitExpr(exprIx, fnIx) < 0 { return -1 }
+      fbStructNew(uBoxIdx) // { tag, variant-ref }
+      return 0
+    }
     const rbVi = unionArmVariantForStructExpr(uTy, exprIx, fnIx)
     if rbVi >= 0 {
       const rbSsi = structIndexOfExpr(exprIx, fnIx)
       if rbSsi >= 0 {
-        if sHeapIdx[rbSsi] != variantHeap(rbVi) {
-          return emitStructExprAsVariantBox(exprIx, rbVi, rbSsi, fnIx)
-        }
-        // The heaps agreeing is not a reason to pass raw (D281). The test above answers "must
-        // the payload be rebuilt onto another heap type"; the fall-through below answers "is
-        // this value already box-shaped". With the cross-table merge (`uVarSTwin`) the equal
-        // branch is reachable, and raw-passing a `(ref $arm)` into a box cell is invalid wasm.
-        fbI32Rel(RS_TAG, uTags[rbVi]) // 0x41 i32.const <variant tag> (program-global)
-        if emitExpr(exprIx, fnIx) < 0 { return -1 }
-        fbStructNew(uBoxIdx) // { tag, variant-ref }
-        return 0
+        return emitStructExprAsVariantBox(exprIx, rbVi, rbSsi, fnIx)
       }
     }
     // A record built at another row lands on the member the checker names, copied there.
@@ -9183,7 +9218,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
     "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "clo" => true
-    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "mapScalar" | "ladder" => false
+    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "ladder" => false
   }
 }
 
@@ -9206,6 +9241,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     }
     // The niche's stash slot is taken ahead of its value, as legacy's rung takes it.
     "nulNiche" => if nulNicheBoxSlot() < 0 { -1 } else { 0 }
+    "nulBool" => if nulBoolBoxSlot() < 0 { -1 } else { 0 }
     "pass" | "memberBox" | "atomStr" | "mapScalar" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
@@ -9218,6 +9254,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "atom" | "atomList" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
+    "nulBool" => nulBoolBoxTail()
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
   }
 }
@@ -9249,6 +9286,7 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     p.hbArm == "pass"
     || p.hbArm == "atomStr"
     || p.hbArm == "nulNiche"
+    || p.hbArm == "nulBool"
     || p.hbArm == "rec"
     || p.hbArm == "refList"
     || p.hbArm == "map"
@@ -10464,7 +10502,7 @@ function emitUnionConcreteVariantEq(
 ) {
   const vi = eqConcreteVariantRow(otherIx, fnIx)
   if vi < 0 { return -1 }
-  // The same four parallel-table bounds `emitStructUnionEq` takes before it writes a byte,
+  // The same four parallel-table bounds the struct union compare takes before it writes a byte,
   // for the same reason: a variant row the emitter's tables do not cover must DECLINE, never
   // read out of bounds (`emitFail does not halt`).
   if vi >= uVarRow.length { return -1 }
@@ -10515,34 +10553,6 @@ function emitUnionConcreteVariantEq(
   if otherNul { fbEnd() }
   if isNe { fbI32Eqz() }
   return 0
-}
-
-// D973 — `==` over a struct union (`A | B` of declared shapes), both operands the same set.
-// Tags unequal means different arms and therefore unequal; tags equal selects one arm, and that
-// arm's fields are compared through the variant table. -1 declines.
-
-// Not `emitStructEqRec`, which is keyed on a struct-table row: that table is empty when a union
-// is declared, the union path owning the struct types instead, so the arms' fields live in
-// `armFieldNames` and `armFieldStoreTy` and the compare reads them there. A scalar arm beside the
-// struct ones is served too; its tag is `scalarTagOfKind`, which no variant tag can collide with.
-function emitStructUnionEq(
-  lIx: i32,
-  rIx: i32,
-  isNe: boolean,
-  uty: i32,
-  fnIx: i32,
-) {
-  const arms: i32[] = []
-  const vis: i32[] = []
-  const aks: i32[] = []
-  if !unionBoxEqColumns(uty, arms, vis, aks) { return -1 }
-  // Both operands ride the wasm stack until both are computed, and only then are they parked.
-  // These slots are shared per function, so a left operand parked before the right one is
-  // evaluated is a value the right one's code can overwrite — a nested union `==` re-enters this
-  // function and re-uses the two slots. The evaluation order is unchanged: left, then right.
-  if emitExpr(lIx, fnIx) < 0 { return -1 }
-  if emitExpr(rIx, fnIx) < 0 { return -1 }
-  return emitUnionBoxEqStaged(arms, vis, aks, isNe, fnIx)
 }
 
 // The tag-then-arm compare over two boxes already on the stack (left below right), leaving the
@@ -11005,17 +11015,50 @@ const UNION_EQ_NAMELESS_MSG = "emitProgram: union `==`: an operand's type names 
 function emitUnionUnionEq(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
   if unionEqNameless(lIx, fnIx) { emitFail(UNION_EQ_NAMELESS_MSG) }
   if unionEqNameless(rIx, fnIx) { emitFail(UNION_EQ_NAMELESS_MSG) }
-  const nm = unionEqNamesOf(lIx, rIx, fnIx)
-  if unionEqStructFirst(nm) {
-    if emitStructUnionEq(lIx, rIx, isNe, nm.uenTy, fnIx) == 0 { return 0 }
-  }
+  // Both operands ride the wasm stack until both are computed: a nested union `==` re-enters the
+  // compare and re-uses its slots, so a left operand parked first could be overwritten.
   if emitExpr(lIx, fnIx) < 0 { return -1 }
   if emitExpr(rIx, fnIx) < 0 { return -1 }
-  return unionUnionEqTail(lIx, rIx, isNe, fnIx)
+  return unionUnionBoxesTail(lIx, rIx, isNe, fnIx)
+}
+
+export type UnionUnionEqArm = "struct" | "staged"
+
+// Which compare a union `==` over `lIx`/`rIx` takes after its two boxes: `struct` when both are one
+// union of declared shapes whose arms the box compare serves (D973), its columns into
+// `arms`/`vis`/`aks`; else `staged`.
+export function unionUnionEqArmOf(
+  lIx: i32,
+  rIx: i32,
+  fnIx: i32,
+  arms: i32[],
+  vis: i32[],
+  aks: i32[],
+): UnionUnionEqArm {
+  const nm = unionEqNamesOf(lIx, rIx, fnIx)
+  if !unionEqStructFirst(nm) { return "staged" }
+  return if unionBoxEqColumns(nm.uenTy, arms, vis, aks) { "struct" } else { "staged" }
+}
+
+// After a union `==`'s two boxes, left below right: the arm `unionUnionEqArmOf` picks. A struct
+// union's arms are compared through the variant table, not `emitStructEqRec`'s struct rows.
+export function unionUnionBoxesTail(
+  lIx: i32,
+  rIx: i32,
+  isNe: boolean,
+  fnIx: i32,
+): i32 {
+  const arms: i32[] = []
+  const vis: i32[] = []
+  const aks: i32[] = []
+  return match unionUnionEqArmOf(lIx, rIx, fnIx, arms, vis, aks) {
+    "struct" => emitUnionBoxEqStaged(arms, vis, aks, isNe, fnIx)
+    "staged" => unionUnionEqTail(lIx, rIx, isNe, fnIx)
+  }
 }
 
 // After a union `==`'s two boxes, left below right: the staged compare (`emitUnionUnionEq`).
-export function unionUnionEqTail(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
+function unionUnionEqTail(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
   const arms: i32[] = []
   const vis: i32[] = []
   const aks: i32[] = []
@@ -15453,14 +15496,8 @@ function emitMapSetValExpr(
       emitUnionBoxOwed(mvValName[mslot], mvValTyIxAt(mslot), valIx, fnIx)
     }
     "variant" => emitVariantCoerce(mvValVariantOf(mslot), valIx, fnIx)
-    "atomNull" => {
-      fbI32Const(0 - 1)
-      0
-    }
-    "boolNull" => {
-      fbI32Const(2)
-      0
-    }
+    "atomNull" => emitNullOwn(NULL_OWN_ATOM)
+    "boolNull" => emitNullOwn(NULL_OWN_BOOL)
     "boolNulNone" => {
       if emitNulNoneForEffect(valIx, fnIx) < 0 { return -1 }
       fbI32Const(2)
@@ -20422,8 +20459,14 @@ export function emitEqNonNullCore(binIx: i32, fnIx: i32) {
 // ident otherwise recovers itself and traps on the value the guard answers for). A
 // literal-union atom operand still widens to its member string first, as `emitStrEq` does.
 function emitEqOperandRaw(ix: i32, fnIx: i32) {
-  if exprIsLitAtom(ix, fnIx) { return emitStrValue(ix, fnIx) }
+  if eqOperandDecodes(ix, fnIx) { return emitStrValue(ix, fnIx) }
   return emitExpr(ix, fnIx)
+}
+
+// Whether a guarded compare's operand `ix` is a literal-union atom it writes as its member string
+// (`emitEqOperandRaw`) rather than as itself. Legacy and the IR share it.
+export function eqOperandDecodes(ix: i32, fnIx: i32): boolean {
+  return exprIsLitAtom(ix, fnIx)
 }
 
 // A narrowed nullable-niche operand's cell still holds a `(ref null …)`, and every compare
@@ -20467,14 +20510,11 @@ function emitNulNicheEq(binIx: i32, fnIx: i32, niche: EqCmpKind) {
 }
 
 // Why legacy's `nulNiche` `==`/`!=` at `binIx` is not the guarded compare `nulNicheEqHead` opens,
-// or "": a nullable record's compare (`emitNulStructEq`), or a literal atom operand.
+// or "": a nullable record's compare (`emitNulStructEq`).
 export function nulNicheEqWhy(binIx: i32, fnIx: i32): string {
   const e = nodeAt(binIx)
   if !(e is BinExpr) { return "nullable eq node" }
   if binEqNulNiche(binIx, fnIx) == "nulstruct" { return "nullable record eq" }
-  if exprIsLitAtom(e.binLeft, fnIx) || exprIsLitAtom(e.binRight, fnIx) {
-    return "nullable eq atom operand"
-  }
   return ""
 }
 
@@ -20724,6 +20764,11 @@ function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
     return structEqTail(e, row, roots, saved, fnIx)
   }
   return emitFail("emitProgram: expected a struct equality")
+}
+
+// The eq row a `variantEq` compare at `binIx` reads its fields through: its variant's row.
+export function variantEqRowOf(binIx: i32, fnIx: i32): i32 {
+  return eqRowOfVariant(binEqVariantRow(binIx, fnIx))
 }
 
 // The stash slots a struct compare saves before it stages, `[left, right]`, for `structEqTail`.
@@ -25746,8 +25791,8 @@ export function maFoldCandidateCount(fnIx: i32): i32 {
 
 // The declaration-time fold's live table for the function currently emitting: parallel to
 // each qualifying `const`'s own node index, the WASM index of its scratch local and the K it
-// folded out. Cleared at the top of `emitFuncBody` — a node index is emitted at most once, so
-// stale rows from a previous function can never be mistaken for this one's.
+// folded out. Cleared at the top of `emitFuncBody` and at each compile's start: node indices
+// restart per compile, so a row left by an earlier program would name this one's nodes.
 let maFoldDeclIx: i32[] = []
 let maFoldWasmSlot: i32[] = []
 let maFoldK: i64[] = []
@@ -27936,7 +27981,7 @@ function emitCallRefArg(
     "armUnbox" => {
       const cvSlot = sigParamSlotAt(ckey, i)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
-      match armUnboxPlanOf(cvSlot, args[i], fnIx) {
+      match callRefArmUnboxPlan(ckey, i, args[i], fnIx) {
         "asIs" => {}
         "crossTag" => {
           return emitFailCrossTagDelivery(args[i], cvSlot)
@@ -27992,11 +28037,21 @@ function emitCallRefArg(
 
 // How `emitCallRefArg`'s `armUnbox` arm writes argument `a` into the arm at variant slot `slot`:
 // as it stands, unboxed from its union's box, or refused where another arm's tag fits it.
-type ArmUnboxPlan = "asIs" | "unbox" | "crossTag"
+export type ArmUnboxPlan = "asIs" | "unbox" | "crossTag"
 
 function armUnboxPlanOf(slot: i32, a: i32, fnIx: i32): ArmUnboxPlan {
   if !exprUnion(a, fnIx) { return "asIs" }
   return if variantHasCrossTagFits(slot, a, fnIx) { "crossTag" } else { "unbox" }
+}
+
+// `armUnboxPlanOf` for argument `a` at parameter `i` of closure call key `ckey`.
+export function callRefArmUnboxPlan(
+  ckey: string,
+  i: i32,
+  a: i32,
+  fnIx: i32,
+): ArmUnboxPlan {
+  return armUnboxPlanOf(sigParamSlotAt(ckey, i), a, fnIx)
 }
 
 // Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
@@ -28022,7 +28077,7 @@ export function callRefArgPlain(
   }
   const k = sigParamKindAt(ckey, i)
   if arm == "armUnbox" {
-    return armUnboxPlanOf(sigParamSlotAt(ckey, i), a, fnIx) == "unbox"
+    return callRefArmUnboxPlan(ckey, i, a, fnIx) != "crossTag"
   }
   if arm == "scalarList" {
     return k != null && !isNulScalarListKind(k) && plainListArg(a, fnIx)
@@ -38041,6 +38096,10 @@ export function wasmEmitStateReset() {
   lmaCallerFn = -1
   lmaValArg = -1
   lmaValNode = -1
+  maFoldCursor = 0
+  maFoldDeclIx = []
+  maFoldK = []
+  maFoldWasmSlot = []
   coerceHeld = -1
   rawReadNode = -1
   mfSrcSlot = -1
@@ -41091,7 +41150,7 @@ function emitEqRoute(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     "str" => emitStrEq(exprIx, fnIx)
     "list" => emitListEqBin(e, exprIx, fnIx)
     "nulTest" => emitNulTestBin(e, fnIx)
-    "variantEq" => emitStructEq(exprIx, fnIx, eqRowOfVariant(binEqVariantRow(exprIx, fnIx)))
+    "variantEq" => emitStructEq(exprIx, fnIx, variantEqRowOf(exprIx, fnIx))
     "structEq" => emitStructEq(exprIx, fnIx, binEqStructRow(exprIx, fnIx))
     // Either side naming a layout without the two agreeing is a compare this emitter refuses
     // rather than guesses at (D57).
@@ -42330,38 +42389,46 @@ function emitUnionBoxNulNiche(
 ): i32 {
   if unionName == "" { return 0 }
   const nnIx = unwrapParen(exprIx)
-  // The value's shape is asked before the union's `null`, so only a niche reads the set.
-  const nnBool = exprNulBool(nnIx, fnIx)
-  if !nnBool && !coalesceNulRefNicheOperand(nnIx, fnIx) { return 0 }
-  if !unionSetHasNullTy(unionKey, unionTy) { return 0 }
   // A `boolean | null` is the i32 niche whose null is the value 2, so the null test is on the
-  // value, not the ref (D2260).
-  if nnBool {
-    const bvb = vbHeapIdxOfKind(1)
-    if bvb < 0 { return 0 }
-    const bSlot = widenTmpSlot(4000)
+  // value, not the ref (D2260); the plan's `nulBool` arm, whose writers these are.
+  if nulBoolBoxesInto(unionKey, unionTy, nnIx, fnIx) {
+    nulBoolBoxSlot()
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
-    fbLocalTee(bSlot)
-    fbI32Const(2)
-    fbI32Bin(70)     // 0x46 i32.eq → null?
-    fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbRefNullNone()
-    fbStructNew(uBoxIdx)
-    fbElse()
-    fbI32Rel(RS_TAG, scalarTagOfKind(1))
-    fbLocalGet(bSlot)
-    fbStructNew(bvb)
-    fbStructNew(uBoxIdx)
-    fbEnd()
-    return 1
+    return nulBoolBoxTail()
   }
+  // The value's shape is asked before the union's `null`, so only a niche reads the set.
+  if exprNulBool(nnIx, fnIx) || !coalesceNulRefNicheOperand(nnIx, fnIx) {
+    return 0
+  }
+  if !unionSetHasNullTy(unionKey, unionTy) { return 0 }
   const nnTag = nulNicheBoxTagOf(unionTy, exprIx, fnIx)
   if nnTag < 0 { return 0 }
   const hp: HoleBox = { hbArm: "nulNiche", hbKind: unionTy, hbSrc: -1 }
   // Read raw: a nullable-string ident is otherwise recovered non-null, which traps on the very
   // null this rung exists to box (D2260).
   if emitHoleBox(hp, exprIx, fnIx) < 0 { return -1 }
+  return 1
+}
+
+// The slot a `boolean | null` niche's value is parked in for its null test, taken ahead of it.
+export function nulBoolBoxSlot(): i32 { return widenTmpSlot(4000) }
+
+// After a `boolean | null` niche's value: the union's null box if it is 2, else its bool atom box.
+export function nulBoolBoxTail(): i32 {
+  const bSlot = nulBoolBoxSlot()
+  fbLocalTee(bSlot)
+  fbI32Const(2)
+  fbI32Bin(70) // 0x46 i32.eq → null?
+  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbRefNullNone()
+  fbStructNew(uBoxIdx)
+  fbElse()
+  fbI32Rel(RS_TAG, scalarTagOfKind(1))
+  fbLocalGet(bSlot)
+  fbStructNew(vbHeapIdxOfKind(1))
+  fbStructNew(uBoxIdx)
+  fbEnd()
   return 1
 }
 
