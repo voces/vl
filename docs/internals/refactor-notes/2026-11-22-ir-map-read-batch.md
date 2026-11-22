@@ -1,13 +1,17 @@
 # IR: the map-read tail, batched (2026-11-22, lane IR-N2)
 
-The first batch under the owner's batch-big ruling. The census is the forced IR-only one at
-master 14d707ae:
+The first batch under the owner's batch-big ruling. Measured with the forced IR-only census on
+fixpoint seeds of master 4143f3d9 and of this branch (functions):
 
-| class | before | after this PR |
+| class | before | after |
 | --- | ---: | ---: |
-| `map read atom` | 20 fns + 10 starts | measured in the PR |
-| `map read sentinel` | 13 fns | measured in the PR |
-| `map get rep` | 10 fns + 10 starts | measured in the PR |
+| `map read atom` | 21 | 0 |
+| `start: map read atom` | 10 | 0 |
+| `map read sentinel` | 13 | 0 |
+| `map get rep` | 10 | 1 |
+| `start: map get rep` | 10 | 1 |
+
+Programs fully IR-only rise from 4586 to 4618, and the self-compile's misses fall from 44 to 42.
 
 ## The mechanisms, one commit each
 
