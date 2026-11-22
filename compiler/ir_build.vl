@@ -167,6 +167,7 @@ import {
   callRefLegacyPlainKey,
   callRefPlainKey,
   callRefPlainVoid,
+  callStmtDispatches,
   callStmtIdentDrops,
   capturedArgArmOf,
   clearPlanOf,
@@ -193,6 +194,7 @@ import {
   fieldStoreValueArmOf,
   fieldStoreVariantAt,
   fieldTypedNullHas,
+  fnCloFeOf,
   fnTagLeafEmitted,
   fnValueArmOf,
   fnValueFeOf,
@@ -205,6 +207,9 @@ import {
   globalCtxNow,
   globalInitArmUnboxes,
   globalReadRecovers,
+  holderCallRefPlainKey,
+  holderCallSigs,
+  holderPickOf,
   holeBoxLeads,
   holeBoxTyAt,
   hostCallNamed,
@@ -289,12 +294,14 @@ import {
   tagDispatchArms,
   tagDispatchIds,
   tagDispatchTy,
+  tagDispatchTyIsVoid,
   tailIfPlainWhy,
   tplStrHoleOf,
   trapCallNamed,
   truncSatCallNamed,
   truncSatPlanOf,
   unionConcreteEqPlanOf,
+  userFnCallTarget,
   valueIfLitTrue,
   variantFieldArmOf,
   variantFieldBoxTy,
@@ -373,6 +380,7 @@ import {
 import {
   boxOwedAt,
   coerceKindAt,
+  fnCloCoerceAtNode,
   instTyOrSelf,
   listCopyAtNode,
   narrowedArmNeedsUnbox,
@@ -426,6 +434,7 @@ import {
   repTyOf,
 } from "./emit_rep"
 import {
+  captureLoopVarDeclOf,
   ctxTyAt,
   fnEnvIdxOf,
   nodeTyAt,
@@ -945,13 +954,20 @@ function memberEqMissOf(recvIx: i32, ix: i32, r: i32): string {
     const ok = match a {
       "str" => repPrim(r) == "str"
       "nulStr" => rn is RNullable && repPrim(rn.rnInner) == "str"
-      "union" => rn is RBox && boxLitsMissOf(recvIx, [quoteLex(texts[i])]) == ""
+      "union" => tagBoxRep(r) && boxLitsMissOf(recvIx, [quoteLex(texts[i])]) == ""
       "num" => false
     }
     if !ok { return "is literal member " + a + " at " + repWhat(r) }
     i = i + 1
   }
   return ""
+}
+
+// Whether rep `r` is a box whose tag a literal's test reads: a box, or a null-tagged box, whose
+// null is one more tag of the same box.
+function tagBoxRep(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RBox || n is RNullable && n.rnDisc == 4
 }
 
 // Why a box receiver `recvIx` is not tested against each literal of `lexes` by a tag test (or a
@@ -983,7 +999,7 @@ function isLitArmsTest(
     "atomNotNul" => atomNullable(irBOpRep(v))
     "atomEq" => vn is RAtom || atomNullable(irBOpRep(v))
     "memberEq" => true
-    "boxLits" | "numBox" => vn is RBox
+    "boxLits" | "numBox" => tagBoxRep(irBOpRep(v))
     "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "memberNoRecv" | "memberTrue" | "none" => false
   }
   if !ok { return irBMiss("is literal arms operand rep") }
@@ -2678,7 +2694,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if captureValKind(fe, name) == "nulstr" && nulStrReadRecovers(ix, ibFnIx) {
     return irBMiss("capture recover")
   }
-  if capRepOf(fe, name) != rep { return irBMiss("capture binding") }
+  if capRepFor(fe, name, rep) != rep { return irBMiss("capture binding") }
   if !cloLifted(fe) {
     // An `is K[]`-tested capture may read the empty list legacy stands in (D4935).
     if listIsTestedIdent(unwrapParen(ix)) {
@@ -2692,7 +2708,8 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     )
   }
   if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
-  const v = liftCapVar(fe, name)
+  const v = liftCapVar(fe, name, rep)
+  if v < 0 || ib.irVars[v].vRep != rep { return irBMiss("capture binding") }
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
   return o
@@ -2700,8 +2717,15 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
 
 // The rep of capture `name` of function `fe`, its binding's type in the frame that owns it; -1
 // when that rep is no value, open, or not the valtype legacy gives the capture (`captureValKind`).
-function capRepOf(fe: i32, name: string): i32 {
-  const ty = capTyOf(fe, name)
+function capRepOf(fe: i32, name: string): i32 { return capRepFor(fe, name, -1) }
+
+// `capRepOf`, where a captured `for-in` variable, whose declaration records no type, takes read
+// rep `readRep` when legacy's capture valtype for it (`captureValKind`) agrees, else -1.
+function capRepFor(fe: i32, name: string, readRep: i32): i32 {
+  let ty = capTyOf(fe, name)
+  if ty < 0 && readRep >= 0 && captureLoopVarDeclOf(fe, name) >= 0 {
+    ty = repTyOf(readRep)
+  }
   if ty < 0 { return -1 }
   const r = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r) { return -1 }
@@ -2727,13 +2751,16 @@ function capTyOf(fe: i32, name: string): i32 {
 }
 
 // The parameter variable of the lifted function `fe` being built for its capture `name`, at
-// `capRepOf`'s rep, made at its first use.
-function liftCapVar(fe: i32, name: string): i32 {
+// `capRepFor`'s rep for a first read at `readRep` (-1 for none), made at its first use; -1 when a
+// captured `for-in` variable has no rep yet.
+function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
   const w = 1 + captureSlotOf(name, ibFnIx)
   const known = paramVarAt(w)
   if known >= 0 { return known }
-  const r = capRepOf(fe, name)
-  const v = irVarNew(ib, r, capTyOf(fe, name), "param", w)
+  const r = capRepFor(fe, name, readRep)
+  const ty = capTyOf(fe, name)
+  if ty < 0 && r < 0 { return -1 }
+  const v = irVarNew(ib, r, if ty >= 0 { ty } else { repTyOf(r) }, "param", w)
   ib.irParams.push(v)
   return v
 }
@@ -2788,7 +2815,7 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
         if cloLiftWriteCount(self) > 0 {
           v = -1
         } else {
-          v = liftCapVar(self, name)
+          v = liftCapVar(self, name, -1)
         }
       } else {
         const t = irBLetTempTy(
@@ -3083,6 +3110,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     return closureCallRhs(b, c, ix)
   }
   const d = identDeclOf(c.callFn)
+  // A call through a `const` holding a returned record whole picks its member first, as
+  // `emitHolderCall` routes it.
+  if holderCallSigs(ix, ibFnIx).length > 0 { return holderCallRhs(b, c, ix) }
   if arrCopyCallNamed(c, ibFnIx) { return missRhs("list copy value") }
   if memAccessCallNamed(c, ibFnIx) { return memAccessRhs(b, c, ix) }
   if memOpCallNamed(c, ibFnIx) { return memOpRhs(b, c, ix) }
@@ -3107,6 +3137,8 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     }
     return closureCallRhs(b, c, ix)
   }
+  // A loop variable holding a function value is a closure call too.
+  if d >= 0 && nodeAt(d) is LoopVar { return closureCallRhs(b, c, ix) }
   if lf < 0 && (d < 0 || !(nodeAt(d) is FuncDecl)) {
     return missRhs("call of a non-declaration")
   }
@@ -3249,7 +3281,7 @@ function liftCaps(pos: i32): Opnd[] {
         && capRepOf(self, name) >= 0
         && capRepOf(self, name) == capRepOf(pos, name)
       ) {
-        v = liftCapVar(self, name)
+        v = liftCapVar(self, name, -1)
       }
     }
     if v < 0 || capCellTargetOf(name) >= 0 {
@@ -3366,6 +3398,24 @@ function bundleCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const v: Opnd = { ov: pv }
   const crep = repNodeOfTy(pk.bpTy)
   if !(repNodeAt(crep) is RClosure) { return missRhs("bundle member rep") }
+  const f = irBLetTempTy(b, { bpV: v, bpAt: ix }, c.callFn, crep, pk.bpTy)
+  if ibMiss != "" { return missRhs(ibMiss) }
+  return closureCallAt(b, c, ix, key, f)
+}
+
+// A call `ix` through a `const` holding a returned record whole (D15144) that legacy writes
+// plainly (`holderCallRefPlainKey`): the member `holderPickOf` reads, called at its key.
+function holderCallRhs(b: i32[], c: Call, ix: i32): Rhs {
+  const key = holderCallRefPlainKey(ix, ibFnIx)
+  if key == "" { return missRhs("holder call") }
+  if !legacyPlainAgrees(ix, key) {
+    return missRhs("closure call plan disagrees")
+  }
+  const pk = holderPickOf(ix, ibFnIx)
+  const v = irBExpr(b, c.callFn)
+  if ibMiss != "" { return missRhs("holder callee") }
+  const crep = repNodeOfTy(pk.bpTy)
+  if !(repNodeAt(crep) is RClosure) { return missRhs("holder member rep") }
   const f = irBLetTempTy(b, { bpV: v, bpAt: ix }, c.callFn, crep, pk.bpTy)
   if ibMiss != "" { return missRhs(ibMiss) }
   return closureCallAt(b, c, ix, key, f)
@@ -3517,7 +3567,10 @@ export function irBStageLeads(
 // for a literal at neither.
 function stageTyOf(a: Opnd, ix: i32): i32 {
   const own = heldTy(exprTyOf(ix))
-  if !(a is OStr) || repNodeOfTy(own) == irBOpRep(a) { return own }
+  if repNodeOfTy(own) == irBOpRep(a) { return own }
+  // An immediate at a rep its type does not name (a function set's id) has no staged type.
+  if a is OImm { return -1 }
+  if !(a is OStr) { return own }
   const ctx = heldTy(ctxTyAt(ix, ibFnIx))
   return if repNodeOfTy(ctx) == irBOpRep(a) { ctx } else { -1 }
 }
@@ -6215,6 +6268,12 @@ function tagLeaf(ix: i32): Opnd {
 // delivered at the call's rep. A lambda arm, which legacy stages at its instance, and a result
 // past the scalars and strings, are named misses.
 function tagDispatch(b: i32[], ix: i32): Opnd {
+  return tagDispatchAt(b, ix, true)
+}
+
+// `tagDispatch`, its value read at the call's own rep when `read`; a statement's is dropped, so
+// only the dispatch's own result rep matters there.
+function tagDispatchAt(b: i32[], ix: i32, read: boolean): Opnd {
   const c = nodeAt(unwrapParen(ix))
   if !(c is Call) { return irBMiss("tag dispatch node") }
   const arms = tagDispatchArms(ix, ibFnIx)
@@ -6242,7 +6301,7 @@ function tagDispatch(b: i32[], ix: i32): Opnd {
   ) {
     return irBMiss("tag dispatch result")
   }
-  if primRepOf(ix) != rep { return irBMiss("tag dispatch result rep") }
+  if read && primRepOf(ix) != rep { return irBMiss("tag dispatch result rep") }
   const f = irBExpr(b, c.callFn)
   if ibMiss != "" { return f }
   if repPrim(irBOpRep(f)) != "i32" { return irBMiss("tag dispatch callee rep") }
@@ -6304,6 +6363,101 @@ function tagDispatch(b: i32[], ix: i32): Opnd {
   return o
 }
 
+// Whether tagged call `ix` leaves no value (`tagDispatchTyIsVoid` at its dispatch type).
+function tagDispatchStmtIsVoid(ix: i32): boolean {
+  const arms = tagDispatchArms(ix, ibFnIx)
+  if arms.length == 0 { return false }
+  return tagDispatchTyIsVoid(tagDispatchTy(ix, arms, ibFnIx))
+}
+
+// A statement call through a tagged set that leaves no value, as `emitFnTagDispatch` writes it:
+// the callee's set id kept, then a void `if` per member but the last, which takes the final
+// `else`. Each arm is its call as a statement, a valued member's result dropped.
+function tagDispatchVoid(b: i32[], ix: i32): i32 {
+  const c = nodeAt(unwrapParen(ix))
+  if !(c is Call) { return skip("tag dispatch node") }
+  const arms = tagDispatchArms(ix, ibFnIx)
+  const ids = tagDispatchIds(ix, ibFnIx)
+  if arms.length == 0 || ids.length != arms.length {
+    return skip("tag dispatch members")
+  }
+  for a in arms {
+    if tagArmLambdaCallee(a) >= 0 && lambdaArmFe(a) < 0 {
+      return skip("tag dispatch lambda arm")
+    }
+  }
+  // A callee read as an expression stages below the arms' `if`s, which the lowering refuses.
+  if !(nodeAt(unwrapParen(c.callFn)) is Ident) {
+    return skip("tag dispatch callee expression")
+  }
+  const f = irBExpr(b, c.callFn)
+  if ibMiss != "" { return 0 }
+  if repPrim(irBOpRep(f)) != "i32" { return skip("tag dispatch callee rep") }
+  irBNode(b, { efRhs: { tgsV: f } }, -1, ibNoValue, ix)
+  if arms.length == 1 { return tagArmStmt(b, arms[0]) }
+  const bs: i32[][] = []
+  const conds: Opnd[] = []
+  const thens: i32[][] = []
+  let cb = b
+  let k = 0
+  while k < arms.length - 1 {
+    const cv = tagIsTemp(cb, ids[k], ix)
+    const th: i32[] = []
+    tagArmStmt(th, arms[k])
+    if ibMiss != "" { return 0 }
+    bs.push(cb)
+    conds.push(cv)
+    thens.push(th)
+    const eb: i32[] = []
+    cb = eb
+    k = k + 1
+  }
+  tagArmStmt(cb, arms[arms.length - 1])
+  if ibMiss != "" { return 0 }
+  let elseB = cb
+  let j = bs.length - 1
+  while j >= 0 {
+    irBNode(
+      bs[j],
+      {
+        siCond: conds[j],
+        siThen: thens[j],
+        siElse: elseB,
+        siOut: -1,
+        siElseKw: true,
+      },
+      -1,
+      ibNoValue,
+      ix,
+    )
+    elseB = bs[j]
+    j = j - 1
+  }
+  return 0
+}
+
+// Dispatch arm call `a` as a statement into body `b`: a lambda arm a direct call of its instance.
+function tagArmStmt(b: i32[], a: i32): i32 {
+  const ac = nodeAt(a)
+  if !(ac is Call) { return skip("tag dispatch arm node") }
+  const fe = lambdaArmFe(a)
+  if fe >= 0 { return tagArmCall(b, directCallAt(b, ac, a, fe), a) }
+  // A member's call reaches the function legacy's resolves at this instance.
+  const cf = if ac.callFn >= 0 { nodeAt(ac.callFn) } else { null }
+  if !(cf is Ident) { return skip("tag dispatch arm callee") }
+  const t = userFnCallTarget(ac, cf, ibFnIx)
+  if t < 0 || t >= fnStmts.length { return skip("tag dispatch arm target") }
+  return tagArmCall(b, directCallAt(b, ac, a, t), a)
+}
+
+// Arm call `r` as a statement of body `b`, at arm node `a`.
+function tagArmCall(b: i32[], r: Rhs, a: i32): i32 {
+  if ibMiss != "" { return 0 }
+  irBNode(b, { efRhs: r }, -1, ibNoValue, a)
+  if dispatchDeclinesTail() { ib.irNoTailEff.push(b[b.length - 1]) }
+  return 0
+}
+
 // The test of the stashed id against member id `id`, a `bool` temp whatever the call's type.
 function tagIsTemp(b: i32[], id: i32, ix: i32): Opnd {
   const v = irVarNew(ib, ibBool, TY_BOOL, "temp", -1)
@@ -6356,8 +6510,11 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
 function coerced(b: i32[], ix: i32, cell: boolean): Opnd {
   const ck = coerceKindAt(ix, ibFnIx)
   if ck == "recCopy" { return recCopied(b, ix, cell) }
-  if ck != "listCopy" && ck != "mapRetag" && ck != "mapUnbox" {
+  if ck != "listCopy" && ck != "mapRetag" && ck != "mapUnbox" && ck != "fnClo" {
     return irBMiss("pre-path coercion " + ck)
+  }
+  if ck == "fnClo" && fnCloFeOf(ix) < 0 {
+    return irBMiss("pre-path coercion fnClo instance")
   }
   const v = exprAtPre(b, ix, cell, exprPrePathPastCoerce(ix, ibFnIx))
   if ibMiss != "" { return v }
@@ -6380,6 +6537,7 @@ function coercedTy(ix: i32, ck: string): i32 {
     const t = mapUnboxTailTy(ix, ibFnIx)
     if t >= 0 { return heldTy(t) }
   }
+  if ck == "fnClo" { return heldTy(fnCloCoerceAtNode(ix)) }
   return exprTyOf(ix)
 }
 
@@ -7753,6 +7911,14 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       return trapStmt(b, n, ix)
     }
     if arrCopyCallNamed(n, ibFnIx) { return listCopyStmt(b, n, ix) }
+    // A call through a tagged function set is legacy's dispatch, its value dropped.
+    if callStmtDispatches(ix, ibFnIx) {
+      if tagDispatchStmtIsVoid(ix) { return tagDispatchVoid(b, ix) }
+      const v = tagDispatchAt(b, ix, false)
+      if ibMiss != "" { return 0 }
+      irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+      return 0
+    }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return 0 }
     // A discarded slice is a value legacy evaluates and drops.

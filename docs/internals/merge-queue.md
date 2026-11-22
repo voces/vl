@@ -68,13 +68,19 @@ For lanes:
 - **R7.** A PR touching `compiler/ir*.vl`, or moving an IR miss name or coverage, runs
   `deno test -A --no-check tests/vl_ir_shadow_test.ts` on its head before READY and quotes the
   summary line (coordinator ruling, 2026-11-21: batch AB was red on two stale miss expectations,
-  and `gate.sh --fast` does not run that file).
+  and `gate.sh --fast` does not run that file). Since #9456, `gate.sh --fast` runs it.
+- **R8.** A READY lists each new IR admission or route predicate and the legacy function whose
+  answer it calls (coordinator ruling, 2026-11-22, after three parallel-mirror vetoes).
 
 For the queue:
 
 - **Q1.** A candidate is batched when its merge-tree builds cleanly (step 2).
 - **Q2.** A train departs at 6 to 8 READY PRs, or when the gate has been idle 15 minutes with at
-  least one READY. The next candidate is assembled while the current one is in verify.
+  least one READY. The next candidate is assembled while the current one is in verify. When the
+  queue is empty a train departs at one or two READY PRs, and a candidate not yet gating takes
+  each new READY that merges onto it (coordinator ruling, 2026-11-22: a batch costs about 35
+  minutes whatever its size). A force-push to an existing `vl-queue/*` branch is refused, so a
+  replaced candidate takes a new branch name.
 - **Q3.** The queue resolves a purely additive conflict itself: a union of list members in sorted
   or declared order, or the whole single-line items of step 2. A hunk where one side edits a line
   and the other only adds lines beside it, so that no line is edited by both, is resolved the same
@@ -132,6 +138,12 @@ minutes to drift reds and three refresh PRs landed in 13 hours). The base's L2 i
 base tree and cached; `SELF_COMPILE_BASE_FUEL` passes a reading the verifier already took. The
 cumulative rise on `scripts/self-compile-baseline.json` is still printed by every run, and past +3%
 it is reported, not graded: it marks a drift refresh as due.
+
+A per-PR L2 rise past +0.1% is accepted as source growth when the PR shows the same-tree pair
+(its head seed compiling the base tree at the base seed's fuel, within ±0.01%) and attributes the
+rest to source by phase (`self-compile-time.sh --phases`, head on head against base on base). A
+rise the pair does not show is generated-code cost and is graded as before (coordinator ruling,
+2026-11-22; #9441, D17046).
 
 The coordinator rules on a refresh of `scripts/self-compile-baseline.json` that names no single
 mechanism. Its `scripts/self-compile-ledger.txt` line gives the PR range and the cumulative rise
