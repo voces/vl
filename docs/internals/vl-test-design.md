@@ -304,11 +304,26 @@ argument 1: expected () -> void, got () -> i32
    meta-test can assert it whole; wasmtime epoch interruption (which the
    `$VL_PROFILE_GUEST` path already configures) is the mechanism when per-test
    TIMEOUTS land, and timings ride in with it.
-4. **No `--no-capture`, no `dot`/`json` reporters, no watch mode.** All charter
-   follow-ups; the capture is already structural (per-instance sink), so
-   `--no-capture` is a host-side streaming switch when wanted. `--show-output`
-   (diderven DV-903) covers the common half: it prints a PASSING test's captured
-   output under its `ok` line, in the same block a failure uses.
+4. **No `dot` reporter, no watch mode.** Charter follow-ups. The output flags
+   are in (#1347):
+   - `--show-output` (diderven DV-903) prints a PASSING test's captured output
+     under its `ok` line, in the same block a failure uses.
+   - `--no-capture` is the host's sink streaming to stdout, each test headed by
+     `=== RUN  <file>: <name>` so a hang shows where it stopped. It runs one file
+     and one test at a time, so `--jobs` above 1 is a usage error: the flag
+     constrains the schedule, never the machine's core count. Collection runs
+     every top level before the first test, so their output comes first.
+   - `--json` writes one document to stdout in place of the report:
+     `{files: [{path, error, output, tests: [{name, status, message, output}]}],
+     passed, failed, skipped}`, where `error` is null or `{stage, message}` with
+     `stage` "compile" or "top level". It carries every test's output, so a
+     consumer filters instead of asking for a verbosity. It is a usage error
+     beside `--no-capture`, which writes to the same stdout.
+   - **A file's top level** is captured during collection (#1346) and reported as
+     the file's own `--- top-level output ---` block under its header, attributed
+     to no test. It follows the test rule: shown when the file has a failure
+     (output printed before a top-level trap included), else only under
+     `--show-output`.
 5. **`beforeAll`/`afterAll` are absent.** `beforeEach`/`afterEach` ship;
    file-level one-shot setup is expressible today as module top-level code,
    which runs once at instantiation.
