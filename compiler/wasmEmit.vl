@@ -9281,11 +9281,7 @@ function emitUnionBoxArg(
   }
   boxDstShadowEnter()
   const hp = holeBoxPlanOf(exprIx, unionTy, fnIx)
-  // A niche the union has no arm for is the ladder's record rungs' (`emitUnionBoxNulNiche`'s 0).
-  if (
-    hp.hbArm != "ladder"
-    && (hp.hbArm != "nulNiche" || nulNicheBoxTagOf(unionTy, exprIx, fnIx) >= 0)
-  ) {
+  if !unionBoxArgLadders(hp, unionTy, exprIx, fnIx) {
     // The shadow notes the coerce the ladder's value rungs are reached through, as legacy did.
     const viaCoerce = !exprIsNulNone(exprIx, fnIx)
     if viaCoerce && boxDstShadowArmed() {
@@ -9317,6 +9313,47 @@ function emitUnionBoxArg(
   return emitBoxAtomRetagMembers(ft, tt, exprIx)
 }
 
+// Whether `emitUnionBoxArg` into `unionTy` under hole box plan `hp` takes no value by the plan and
+// reaches its ladder: the plan's own `ladder`, or a niche the union has no arm for (the ladder's
+// record rungs, `emitUnionBoxNulNiche`'s 0).
+function unionBoxArgLadders(
+  hp: HoleBox,
+  unionTy: i32,
+  exprIx: i32,
+  fnIx: i32,
+): boolean {
+  return hp.hbArm == "ladder"
+    || hp.hbArm == "nulNiche" && nulNicheBoxTagOf(unionTy, exprIx, fnIx) < 0
+}
+
+// Whether `emitUnionBoxArgGo` writes `exprIx` by its union-valued map read rung: not a `null`, and
+// a read of a map whose value is a union.
+function unionBoxArgGoMapRead(exprIx: i32, fnIx: i32): boolean {
+  if exprIsNulNone(exprIx, fnIx) { return false }
+  const rd = nodeAt(unwrapParen(exprIx))
+  if !(rd is Index) || !exprMap(rd.idxArr, fnIx) { return false }
+  const sh = mapShapeOfExpr(rd.idxArr, fnIx)
+  return sh >= 0 && sh < mvValRep.length && mvValKindAt(sh) == "union"
+}
+
+// Whether `emitUnionBoxArg` into `unionTy` writes map read `exprIx` itself, past `emitExpr`, by its
+// ladder's union-valued map rung (`emitMapGetUnionBox`), so the read banks no element-read row.
+export function unionBoxArgReadsMapBox(
+  unionTy: i32,
+  exprIx: i32,
+  fnIx: i32,
+): boolean {
+  if !unionBoxArgGoMapRead(exprIx, fnIx) || mapTwinUnionMember(unionTy) >= 0 {
+    return false
+  }
+  return unionBoxArgLadders(
+    holeBoxPlanOf(exprIx, unionTy, fnIx),
+    unionTy,
+    exprIx,
+    fnIx,
+  )
+}
+
 function emitUnionBoxArgGo(
   unionName: string,
   unionTy: i32,
@@ -9341,22 +9378,13 @@ function emitUnionBoxArgGo(
   // the rep the two nulls differ: the sentinel is a bare `ref.null` in the vals slot, `J`'s own
   // null arm a null-tagged box. `emitMapGetUnionBox` is exactly that conversion.
   const bxIdx = nodeAt(unwrapParen(exprIx))
-  if bxIdx is Index {
-    if exprMap(bxIdx.idxArr, fnIx) {
-      const bxSh = mapShapeOfExpr(bxIdx.idxArr, fnIx)
-      if bxSh >= 0 && bxSh < mvValRep.length {
-        if mvValKindAt(bxSh) == "union" {
-          const mgFrom: i32[] = []
-          const mgTo: i32[] = []
-          wideRetagPairs(exprIx, fnIx, unionTy, mgFrom, mgTo)
-          if emitMapGetUnionBox(bxIdx.idxArr, bxIdx.idxIndex, fnIx) < 0 {
-            return -1
-          }
-          if mgFrom.length > 0 { emitWideRetagChain(mgFrom, mgTo) }
-          return 0
-        }
-      }
-    }
+  if bxIdx is Index && unionBoxArgGoMapRead(exprIx, fnIx) {
+    const mgFrom: i32[] = []
+    const mgTo: i32[] = []
+    wideRetagPairs(exprIx, fnIx, unionTy, mgFrom, mgTo)
+    if emitMapGetUnionBox(bxIdx.idxArr, bxIdx.idxIndex, fnIx) < 0 { return -1 }
+    if mgFrom.length > 0 { emitWideRetagChain(mgFrom, mgTo) }
+    return 0
   }
   const bxMap = emitUnionMapArmBox(unionName, unionTy, exprIx, fnIx)
   if bxMap < 0 { return -1 }
@@ -17733,13 +17761,27 @@ export function refListGetTail(
   // (D451): without it `vl check` proves `xs[0]` non-null and every classifier calls it
   // an `i32`, but this arm still leaves the raw `(ref $uBox)` for an unboxed consumer —
   // invalid wasm. Routed through the shared `emitUnionUnboxTail`, not an open-coded unbox.
-  const iCon = emitPlaceNarrowContainerUnbox(idxIx, fnIx)
-  if iCon != 0 { return iCon - 1 }
-  if indexElemUnionName(idxIx, fnIx) != "" {
-    const iuk = idxNarrowAtomKind(idxIx, fnIx)
-    if iuk >= 0 && iuk != nullValKind() { return emitUnionUnboxTail(iuk) }
+  const u = refListReadUnboxOf(idxIx, fnIx)
+  if u == REF_READ_CONTAINER {
+    const iCon = emitPlaceNarrowContainerUnbox(idxIx, fnIx)
+    return iCon - 1
   }
+  if u >= 0 { return emitUnionUnboxTail(u) }
   return 0
+}
+
+// `refListReadUnboxOf`'s answer for a read unboxed to its narrowed container's payload.
+export const REF_READ_CONTAINER = 0 - 2
+
+// What `refListGetTail` leaves past the recovered element of a ref list read `idxIx` whose
+// element is not nullable: the narrowed container's payload (`REF_READ_CONTAINER`), an atom
+// kind's unboxed scalar (the kind), or the element itself (-1).
+export function refListReadUnboxOf(idxIx: i32, fnIx: i32): i32 {
+  const con = placeReadContainerAt(idxIx, fnIx)
+  if con == RC_REF_LIST || con == RC_MAP { return REF_READ_CONTAINER }
+  if indexElemUnionName(idxIx, fnIx) == "" { return -1 }
+  const iuk = idxNarrowAtomKind(idxIx, fnIx)
+  return if iuk >= 0 && iuk != nullValKind() { iuk } else { -1 }
 }
 
 // A SCALAR list `xs[i]`: unwrap to its backing and `array.get <back>`,
@@ -31639,11 +31681,10 @@ function emitDelivered(ix: i32, fnIx: i32): i32 {
 function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
   if ck == "box" {
     // The seat is spent, so the value inside the box, and any conversion recorded beside it, runs.
-    const bt = boxRecordTyAt(exprIx, fnIx)
     const seat = boxSeat
     boxSeat = -1
     if boxDstShadowArmed() { boxDstShadowAs("table") }
-    const rb = emitUnionBoxArg("", boxRecordUnionTyOf(bt), exprIx, fnIx)
+    const rb = emitUnionBoxArg("", holeBoxTyAt(exprIx, fnIx), exprIx, fnIx)
     boxSeat = seat
     return rb
   }
