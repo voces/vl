@@ -8,6 +8,26 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-22-ir-variant-eq](2026-11-22-ir-variant-eq.md): IR coverage: `==`/`!=` over records on legacy's `variantEq` route (2026-11-22, lane IR-N8)
+- [2026-11-22-ir-union-union-struct](2026-11-22-ir-union-union-struct.md): IR coverage: `==`/`!=` over a union of records on legacy's `unionUnion` route (2026-11-22, lane IR-N8)
+- [2026-11-22-ir-struct-eq](2026-11-22-ir-struct-eq.md): IR coverage: `==`/`!=` over records on legacy's `structEq` route (2026-11-22, lane IR-N7)
+- [2026-11-22-ir-spread-pair-mint-point](2026-11-22-ir-spread-pair-mint-point.md): IR: a spread's list pair minted where legacy asks it (2026-11-22, lane IR-N3)
+- [2026-11-22-ir-sif-join-general](2026-11-22-ir-sif-join-general.md): IR: SIf's decided join is a value, not a node pointer, 2026-11-22
+- [2026-11-22-ir-return-rec-twin](2026-11-22-ir-return-rec-twin.md): IR: a variant record returned at its nominal struct twin (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-open-list-storage](2026-11-22-ir-open-list-storage.md): IR: a list read at an open type legacy declares no valtype for reads its declared storage, 2026-11-22
+- [2026-11-22-ir-null-read-at-dst](2026-11-22-ir-null-read-at-dst.md): IR: a read narrowed to `null` at its destination (2026-11-22, lane IR-N3)
+- [2026-11-22-ir-nul-niche-str](2026-11-22-ir-nul-niche-str.md): IR: a nullable literal-union compared with a string (nulNiche string operand), 2026-11-22
+- [2026-11-22-ir-mem-fold-decl](2026-11-22-ir-mem-fold-decl.md): IR: the declaration-time address fold is a function-level miss (2026-11-22, lane IR-N7)
+- [2026-11-22-ir-map-store-null-sentinel](2026-11-22-ir-map-store-null-sentinel.md): IR: a map store's `null` sentinel (2026-11-22, lane IR-N3)
+- [2026-11-22-ir-is-lit-recv](2026-11-22-ir-is-lit-recv.md): IR coverage: a literal `is` test re-reads its receiver as built (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-coal-niche-place](2026-11-22-ir-coal-niche-place.md): IR coverage: a niche cell's `??` re-reads its operand as built (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-closure-arg-armunbox-asis](2026-11-22-ir-closure-arg-armunbox-asis.md): IR: a closure-call argument already of its union-arm parameter's arm, 2026-11-22
+- [2026-11-22-ir-claim-raw](2026-11-22-ir-claim-raw.md): The `raw` family is claimed (IR-C1)
+- [2026-11-22-ir-claim-nulniche](2026-11-22-ir-claim-nulniche.md): RNulNicheEq is a scalar compare, and is claimed (IR-C1)
+- [2026-11-22-ir-captured-call-closure-of-reps](2026-11-22-ir-captured-call-closure-of-reps.md): IR: a captured call of a generic instanced at two types, 2026-11-22
+- [2026-11-22-ir-box-struct-on-arm-heap](2026-11-22-ir-box-struct-on-arm-heap.md): IR: a struct boxed as itself on its arm's variant heap (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-box-nul-bool](2026-11-22-ir-box-nul-bool.md): IR: a `boolean | null` boxed into a wider union as its niche (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-box-ladder-v128](2026-11-22-ir-box-ladder-v128.md): IR: a vector boxed into a union of it (2026-11-22, lane IR-N2)
 - [2026-11-22-ir-captured-call-instance-rep](2026-11-22-ir-captured-call-instance-rep.md): IR: a captured call's closure typed by the instance legacy calls, 2026-11-22
 - [2026-11-22-ir-open-read-storage](2026-11-22-ir-open-read-storage.md): IR: an open-typed read of a binding held closed reads its storage, 2026-11-22
 - [2026-11-22-ir-num-union-bin](2026-11-22-ir-num-union-bin.md): IR coverage: operators over a numeric union on legacy's `numUnion` route (2026-11-22, lane IR-N7)
