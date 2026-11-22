@@ -14,8 +14,8 @@ first: `letBindTy` in rule 2's `globalReadAtTyOrStorage`.
 - `globalReadAtTyOrStorage(sym, dst, at)` accepts a read off its checked type's rep only at
   `repNodeOfTy(irGlobalStoreTyOf(vf, sym))`. That is the old check's exact semantics, read from the
   IR. ir_verify drops `letBindTy` and `identDeclOf`.
-- Verifier self-tests: case 120 is refused under rule 2, a read neither the checked type nor the
-  recorded store type justifies; case 121 is its holding control.
+- Verifier self-test case 27 is refused under rule 2: a read that neither the checked type nor
+  the recorded store type justifies.
 
 ## Control
 
