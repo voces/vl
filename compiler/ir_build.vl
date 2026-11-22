@@ -111,6 +111,7 @@ import {
   irSpanNote,
   irSpanNoteKind,
   irVarNew,
+  sIf,
 } from "./ir"
 import {
   listRetag,
@@ -1980,13 +1981,7 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
   while k >= 0 {
     irBNode(
       bs[k],
-      {
-        siCond: conds[k],
-        siThen: thens[k],
-        siElse: elseB,
-        siOut: outs[k],
-        siElseKw: true,
-      },
+      sIf(conds[k], thens[k], elseB, outs[k], true),
       tys[k],
       reps[k],
       ixs[k],
@@ -2034,7 +2029,7 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   }
   const ty = nodeTyAt(ix, ibFnIx)
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
-  return refIfLink(b, n, ix, rep, ty, kind, rj.rjSlot, false)
+  return refIfLink(b, n, ix, rep, ty, kind, rj.rjSlot, false, ix)
 }
 
 // A value `if` on the union join's rung, as legacy's `emitUnionIfValue` writes it: a chain of `if`s
@@ -2091,13 +2086,7 @@ function unionIfLink(
     }
   }
   if ibMiss != "" { return irBMiss(ibMiss) }
-  irBNode(
-    b,
-    { siCond: c, siThen: thenB, siElse: elseB, siOut: t, siElseKw: true },
-    ty,
-    rep,
-    ix,
-  )
+  irBNode(b, sIf(c, thenB, elseB, t, true), ty, rep, ix)
   const o: Opnd = { ov: t }
   return o
 }
@@ -2122,10 +2111,11 @@ function unionIfArm(blockIx: i32, t: i32, rep: i32, uty: i32): i32[] {
   return body
 }
 
-// One link of a reference join's chain (`emitIfExprRefLink`), its out at the head's rep and type:
-// an `else if` is the next link, written into this link's `else` and delivered to its out. The
-// chain's blocktype is nullable from the first link that yields `null` inward, which the lowering
-// reads per link, so a link that disagrees is a miss.
+// One link of a reference join's chain (`emitIfExprRefLink`), its out at the head's rep and type,
+// opened at the join of the chain's head `head` as legacy writes every link: an `else if` is the
+// next link, written into this link's `else` and delivered to its out. The blocktype is nullable
+// from the first link that yields `null` inward, which the lowering reads per link, so a link that
+// disagrees is a miss.
 function refIfLink(
   b: i32[],
   n: IfStmt,
@@ -2135,15 +2125,12 @@ function refIfLink(
   kind: VKind,
   slot: i32,
   nulAcc: boolean,
+  head: i32,
 ): Opnd {
   if intSwitchMayLower(ix) { return irBMiss("ref if switch") }
   const own = ifLinkYieldsNull(ix, ibFnIx)
   const nul = nulAcc || own
   if nul != own { return irBMiss("ref if chain null inward") }
-  const lj = ifRefJoinOf(ix, ibFnIx)
-  if lj.rjKind != kind || lj.rjSlot != slot {
-    return irBMiss("ref if chain join")
-  }
   if n.ifElse < 0 { return irBMiss("ref if else-less") }
   const cat = b.length
   const c = irBExpr(b, n.ifCond)
@@ -2155,7 +2142,7 @@ function refIfLink(
   let elseB: i32[] = []
   const en = nodeAt(n.ifElse)
   if en is IfStmt {
-    const inner = refIfLink(elseB, en, n.ifElse, rep, ty, kind, slot, nul)
+    const inner = refIfLink(elseB, en, n.ifElse, rep, ty, kind, slot, nul, head)
     if ibMiss != "" { return inner }
     irBNode(elseB, { asDst: t, asSrc: inner }, -1, ibNoValue, n.ifElse)
   } else if valueIfLitTrue(n.ifCond) {
@@ -2167,7 +2154,14 @@ function refIfLink(
   if ibMiss != "" { return irBMiss("ref if arm") }
   irBNode(
     b,
-    { siCond: c, siThen: thenB, siElse: elseB, siOut: t, siElseKw: true },
+    {
+      siCond: c,
+      siThen: thenB,
+      siElse: elseB,
+      siOut: t,
+      siElseKw: true,
+      siJoinAt: head,
+    },
     ty,
     rep,
     ix,
@@ -2279,13 +2273,7 @@ function letIfSinkLink(b: i32[], ifIx: i32, v: i32, vr: i32) {
     for x in letIfSinkBody(n.ifElse, v, vr) { elseB.push(x) }
   }
   if ibMiss != "" { return 0 }
-  irBNode(
-    b,
-    { siCond: c, siThen: thenB, siElse: elseB, siOut: -1, siElseKw: true },
-    -1,
-    ibNoValue,
-    ifIx,
-  )
+  irBNode(b, sIf(c, thenB, elseB, -1, true), -1, ibNoValue, ifIx)
   return 0
 }
 
@@ -2345,13 +2333,7 @@ function letIfArmLink(b: i32[], ifIx: i32, v: i32, vr: i32, own: i32) {
     for x in letIfArmBody(n.ifElse, v, vr) { elseB.push(x) }
   }
   if ibMiss != "" { return 0 }
-  irBNode(
-    b,
-    { siCond: c, siThen: thenB, siElse: elseB, siOut: -1, siElseKw: true },
-    -1,
-    ibNoValue,
-    ifIx,
-  )
+  irBNode(b, sIf(c, thenB, elseB, -1, true), -1, ibNoValue, ifIx)
   return 0
 }
 
@@ -2442,21 +2424,9 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const fixed: Opnd = { oiRep: ibBool, oiBits: bits }
   irBNode(fixBody, { asDst: t, asSrc: fixed }, -1, ibNoValue, ix)
   if n.binOp == "&&" {
-    irBNode(
-      b,
-      { siCond: l, siThen: rhsBody, siElse: fixBody, siOut: t, siElseKw: true },
-      ty,
-      rep,
-      ix,
-    )
+    irBNode(b, sIf(l, rhsBody, fixBody, t, true), ty, rep, ix)
   } else {
-    irBNode(
-      b,
-      { siCond: l, siThen: fixBody, siElse: rhsBody, siOut: t, siElseKw: true },
-      ty,
-      rep,
-      ix,
-    )
+    irBNode(b, sIf(l, fixBody, rhsBody, t, true), ty, rep, ix)
   }
   const o: Opnd = { ov: t }
   return o
@@ -6209,19 +6179,7 @@ function tagDispatch(b: i32[], ix: i32): Opnd {
   let elseB = cb
   let j = last - 1
   while j >= 0 {
-    irBNode(
-      bs[j],
-      {
-        siCond: conds[j],
-        siThen: thens[j],
-        siElse: elseB,
-        siOut: outs[j],
-        siElseKw: true,
-      },
-      ty,
-      rep,
-      ix,
-    )
+    irBNode(bs[j], sIf(conds[j], thens[j], elseB, outs[j], true), ty, rep, ix)
     if j == 0 { break }
     const inner: Opnd = { ov: outs[j] }
     irBNode(bs[j], { asDst: outs[j - 1], asSrc: inner }, -1, ibNoValue, ix)
@@ -7133,13 +7091,7 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
   )
   const exit: IrNode = { brLabel: brk, brHas: false, brVal: c }
   const exitBody = [irNodeNew(ib, exit, -1, ibNoValue, ix)]
-  irBNode(
-    loopBody,
-    { siCond: c, siThen: [], siElse: exitBody, siOut: -1, siElseKw: true },
-    -1,
-    ibNoValue,
-    ix,
-  )
+  irBNode(loopBody, sIf(c, [], exitBody, -1, true), -1, ibNoValue, ix)
   ibLoopName.push(n.frLabel)
   ibLoopBrk.push(brk)
   ibLoopCont.push(cont)
@@ -7327,13 +7279,7 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   if ibMiss == "" && irBOpRep(c) != ibBool { irBMiss("loop condition") }
   const exit: IrNode = { brLabel: brk, brHas: false, brVal: c }
   const exitBody = [irNodeNew(ib, exit, -1, ibNoValue, ix)]
-  irBNode(
-    loopBody,
-    { siCond: c, siThen: [], siElse: exitBody, siOut: -1, siElseKw: true },
-    -1,
-    ibNoValue,
-    ix,
-  )
+  irBNode(loopBody, sIf(c, [], exitBody, -1, true), -1, ibNoValue, ix)
   const wb = nodeAt(n.whileBody)
   if wb is Block {
     stmtRun(loopBody, wb.blkStmts)
@@ -7430,13 +7376,7 @@ function ifChain(b: i32[], ix: i32) {
     const kw = kws[k]
     irBNode(
       outs[k],
-      {
-        siCond: conds[k],
-        siThen: thens[k],
-        siElse: elseB,
-        siOut: -1,
-        siElseKw: kw,
-      },
+      sIf(conds[k], thens[k], elseB, -1, kw),
       -1,
       ibNoValue,
       links[k],
@@ -7827,13 +7767,7 @@ function tailIf(b: i32[], ix: i32) {
     for x in eb { elseB.push(x) }
   }
   if ibMiss != "" { return 0 }
-  irBNode(
-    b,
-    { siCond: c, siThen: thenB, siElse: elseB, siOut: -1, siElseKw: hasElse },
-    -1,
-    ibNoValue,
-    ix,
-  )
+  irBNode(b, sIf(c, thenB, elseB, -1, hasElse), -1, ibNoValue, ix)
   return 0
 }
 
