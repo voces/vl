@@ -8,6 +8,23 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-22-ir-operand-rep](2026-11-22-ir-operand-rep.md): IR coverage: a literal `is` test over a null-tagged box (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-capture-for-in-variable](2026-11-22-ir-capture-for-in-variable.md): IR: a captured `for-in` variable at its read's rep, gated by legacy's capture valtype, 2026-11-22
+- [2026-11-21-ir-tag-arms-stmt](2026-11-21-ir-tag-arms-stmt.md): IR coverage: a statement call through a tagged function set (2026-11-21, lane IR-N7)
+- [2026-11-22-ir-box-join](2026-11-22-ir-box-join.md): IR: a valued if or coalesce join boxed as itself (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-closure-call-holder](2026-11-22-ir-closure-call-holder.md): IR: a call through a holder of a returned bundle's record, 2026-11-22
+- [2026-11-21-ir-instance-binding-reads](2026-11-21-ir-instance-binding-reads.md): IR: a hole-lambda binding in an instance body (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-coal-opt-member](2026-11-21-ir-coal-opt-member.md): IR coverage: `p?.f ?? d` over a nullable record's scalar field (2026-11-21, lane IR-N1)
+- [2026-11-22-ir-map-unbox](2026-11-22-ir-map-unbox.md): IR: a union of maps delivered as its one map (mapUnbox), 2026-11-22
+- [2026-11-21-ir-intr-residue](2026-11-21-ir-intr-residue.md): IR coverage: the atomics and the scalar saturating truncations (2026-11-21, lane IR-N7)
+- [2026-11-21-ir-capture-held-i32](2026-11-21-ir-capture-held-i32.md): IR: a captured atom or i32-held niche at the i32 its capture holds, 2026-11-21
+- [2026-11-21-ir-claim-build-mints-nothing](2026-11-21-ir-claim-build-mints-nothing.md): IR claims: the build mints no synthetic global (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-union-concrete-eq](2026-11-21-ir-union-concrete-eq.md): IR: a union box compared with a concrete operand (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-coal-map-join-if](2026-11-21-ir-coal-map-join-if.md): IR coverage: a union-valued map's read, and a `??` over one (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-closure-call-shadow](2026-11-21-ir-closure-call-shadow.md): IR: a closure binding that shadows a function of its name, 2026-11-21
+- [2026-11-21-ir-trap-callee-ty](2026-11-21-ir-trap-callee-ty.md): IR coverage: the callee an operator-field rewrite mints is typed (2026-11-21, lane IR-N7)
+- [2026-11-21-ir-binding-storage-rep](2026-11-21-ir-binding-storage-rep.md): IR: a cell at its storage row where its initializer builds it (D14426 family 2, and its local twin), 2026-11-21
+- [2026-11-21-ir-as-hole-exact](2026-11-21-ir-as-hole-exact.md): IR: a type-parameter operand's exact numeric cast at its pin, 2026-11-21
 - [2026-11-21-ir-reccopy-pure](2026-11-21-ir-reccopy-pure.md): IR: a record copy of a pure source, written whole by legacy (RRecCopyPure), 2026-11-21
 - [2026-11-21-ir-coerce-rec](2026-11-21-ir-coerce-rec.md): IR: a record copy that reads its value once, through RCoerce, 2026-11-21
 - [2026-11-21-ir-global-narrowed-unbox](2026-11-21-ir-global-narrowed-unbox.md): IR: a union global read at its narrowed atom, and a recover count decided at build, 2026-11-21
