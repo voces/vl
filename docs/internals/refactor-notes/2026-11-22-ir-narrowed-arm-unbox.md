@@ -28,3 +28,24 @@ non-delivery positions (an operator, `??`, a receiver) and are not covered here.
 
 `tests/ir-shadow-rows/narrowed-box-arm-unboxed-at-a-record.vl`: a return, an argument and a
 binding of a narrowed record arm. The old seed covers 3 of its 5 functions.
+
+## Measured vs merge-base 454e5ab9 (fixpoint seeds on both sides)
+
+The branch is stacked on #9574 (the niche read), and this proves both.
+
+- `--names` self-compile identical. `ir-identity.sh --cases`: identical 7625, fail under both 68,
+  differ 0; witnesses same 61, differ 0. `--claimless`: identical 14019, fail under both 3267,
+  differ 0.
+- tests/cases shadow sum: matched 69765 → 69789, `uncovered narrowed read` 66 → 44, start matched
+  6217 → 6226. Against the niche-read head alone this change is +7 matched (69773 → 69780), with
+  narrowed read 49 → 44 and start global read coercion 91 → 81. Two start functions move on to the
+  named `object field arm unbox`, and one to `closure env capture`.
+- `tests/cases/unions/narrowed-arm-unbox-field-reads.vl` runs; 9 of its 9 functions are covered
+  and matched, against 5 on the old seed.
+- Corpus shadow: 45225 of 45678 functions covered, verified and matched.
+- L2 self-compile fuel +0.23% on base 454e5ab9 (per-PR tier +1%). The same-tree pair, both
+  seeds compiling the base tree, reads 112290532099 → 112277477718 (−0.0116%), so the rise is
+  source growth.
+- Deep-nesting margin: base and branch alike, 920 KB fail, 930 KB pass.
+- Late demands 9 (baseline 9); late tag rows 307; `ladder-sets` 101 sets clean; `ir prepost`
+  (mode 6) and `ir claims` ok with no new row; `gate.sh --fast` passed.
