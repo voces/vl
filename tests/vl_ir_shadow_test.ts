@@ -1470,8 +1470,9 @@ Deno.test({
     // a fused map read's mv slot read into an out that is not its map's value (rule 2). Cases 21
     // to 23 break a nullable reference's `??`: an `i32` and a non-null list operand, and a
     // nullable list into an `i32` out (rule 2). Case 24 is a shared read whose global receiver's
-    // cell is no box (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2];
+    // cell is no box (rule 2). Cases 25 and 26 end a path in a returning call's effect, a dead
+    // return and an unwritten `??` out (rule 5); 27 and 28 are the same after a never call, held.
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2, 5, 5, 0, 0];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
