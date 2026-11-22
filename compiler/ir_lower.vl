@@ -559,7 +559,9 @@ import {
   unionEqTagTail,
   unionLetSinkClose,
   unionUnionBoxesTail,
+  urBindConst,
   urLocalRead,
+  urUnbind,
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
@@ -2182,7 +2184,15 @@ function makeList(r: RMakeList) {
   // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
   // leaves its elements unwritten, so each must be an immediate.
   if arrLitIsForIter(r.mlAt) {
+    // In the IR's full unroll a range variable is its copy's constant; legacy asks the hoist
+    // inside its copy, which reads the variable as that constant, so the copy is bound first.
+    const bound = bindRangeCopyElems(r, fnIx)
     const g = arrLitHoistGlobal(r.mlAt, fnIx, arm)
+    let k = 0
+    while k < bound {
+      urUnbind()
+      k = k + 1
+    }
     if g == -2 { return -1 }
     if g >= 0 {
       for e in r.mlElems {
@@ -2243,6 +2253,29 @@ function makeList(r: RMakeList) {
   }
   if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
+}
+
+// Binds each element of literal `r` that reads a range loop's variable, held as an immediate, to
+// that constant on legacy's copy stack (`urBindConst`); returns how many it bound.
+function bindRangeCopyElems(r: RMakeList, fnIx: i32): i32 {
+  const a = nodeAt(r.mlAt)
+  if !(a is ArrayLit) || a.arrElems.length != r.mlElems.length { return 0 }
+  let n = 0
+  let k = 0
+  while k < a.arrElems.length {
+    const x = unwrapParen(a.arrElems[k])
+    const o = r.mlElems[k]
+    if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident && o is OImm {
+      const d = identDeclOf(x)
+      const w = localIndexOf(fnIx, x)
+      if d >= 0 && d < P.nodes.length && nodeAt(d) is ForRange && w >= 0 {
+        urBindConst(w, o.oiBits as% i32)
+        n = n + 1
+      }
+    }
+    k = k + 1
+  }
+  return n
 }
 
 // `RSpread`: legacy's prologue, the source, then the group stash and join `emitArrSpread`'s plain
