@@ -23,7 +23,12 @@ wasmEmit's two import lists separately.
 
 - The falls-off-end self-test (record "") is refused under rule 5.
 - The box-immediate-for-call self-test (`bxFree` false) is refused under rule 2.
-- Every other record is set only on a node the builder accepted, so an identity diff of 0 under
-  `--names`, `--cases` and `--claimless` shows the verifier refuses nothing it accepted before.
+- One self-test per plan family, each refused under rule 2 and holding (rule 0) when the plan
+  agrees: `trunc-sat-operand-off-plan` (an i32 operand, `tsFrom` f64), `atomic-value-off-plan` (an
+  i32 value at an i64 row), `memory-store-value-off-plan` (an i32 value at an f64 width) and
+  `simd-operand-off-plan` (an i32 operand at v128).
+- `mrVariant` has no disagreeing spelling to test: the builder sets it from the arm it builds by.
+  Identity at 0 under `--names`, `--cases` and `--claimless` shows the verifier refuses nothing it
+  accepted before.
 
 The measurements are in the PR body.
