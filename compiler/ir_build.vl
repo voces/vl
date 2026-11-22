@@ -114,6 +114,7 @@ import {
 import {
   listRetag,
   repBoolNiche,
+  repBoxCore,
   repIsNoValue,
   repIsScalar,
   repPrim,
@@ -372,6 +373,7 @@ import {
   EmptyFitPlan,
   arrLitIsForIter,
   coalFieldPlanOf,
+  coalNullTestIf,
   emptyFitArmsPlain,
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
@@ -382,6 +384,7 @@ import {
   litArmsReadsOf,
   litIsBoxLexes,
   litMemberEqArmOf,
+  narrowedMapReadOf,
   retRefusedWhy,
   spreadRunLit,
   unionLitIsPlanOf,
@@ -465,6 +468,7 @@ import {
   identIsEnvCapture,
   letBindIsAtom,
   letBindTy,
+  letNulMapReadUnionBox,
   localIndexOf,
   mapShapeOfExpr,
   memberBoxReadEnter,
@@ -4452,7 +4456,7 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // A scalar map read the box plan boxes is the probe's own box.
   if ibMiss == "" && dst >= 0 && boxedNullable(dst) {
     const mk = mapReadBoxKindAt(ix)
-    if mk >= 0 { return mapGetAt(b, unwrapParen(ix), dst, mk) }
+    if mk >= 0 { return mapGetAt(b, unwrapParen(ix), dst, mk, true) }
   }
   // A member record read the box plan passes as its field's box is built at its storage.
   if ibMiss == "" && dst >= 0 && heldAsBox(dst) && memberBoxReadAt(ix, ibFnIx) {
@@ -5279,6 +5283,14 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if arm == "chain" { return coalChain(b, n, ix, rep) }
   if arm == "niche" { return coalNiche(b, n, ix, rep) }
   if arm == "popOr" { return coalPopOr(b, n, ix, rep) }
+  // A map read joining a union is legacy's synthesized null-test `if` (`coalNullTestIf`), built
+  // as the valued `if` it is.
+  if arm == "mapJoinIf" {
+    const v = irBExpr(b, coalNullTestIf(n, ix, ibFnIx))
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != rep { return irBMiss("coalesce mapJoinIf rep") }
+    return v
+  }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
 }
@@ -5678,16 +5690,15 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // A bare map read `m[k]` by legacy's arm (`mapGetArmOf`), its key written as itself: an mv slot's
 // ref value at its niche, or a mono-valued map read at the value's own rep.
 export function mapGetBare(b: i32[], ix: i32, rep: i32): Opnd {
-  return mapGetAt(b, ix, rep, -1)
+  return mapGetAt(b, ix, rep, -1, true)
 }
 
 // `mapGetBare`, or under value-atom kind `box` (not -1) the read the box plan boxes into boxed
 // nullable `rep` (`mapScalar`), its miss the box's null.
-function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32): Opnd {
+function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
   const rd = nodeAt(ix)
   if !(rd is Index) { return irBMiss("map get") }
   const arm = mapGetArmOf(ix, ibFnIx)
-  if arm == "unionBox" { return irBMiss("map get union box") }
   const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
   const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
   if ka != "plain" { return irBMiss("map key " + ka) }
@@ -5696,7 +5707,20 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32): Opnd {
   const mr = if rk.mkSym >= 0 { irGlobalRepOf(ib, rk.mkSym) } else { irBOpRep(rk.mkLoc) }
   const m = repNodeAt(mr)
   if !(m is RMap) { return irBMiss("map get receiver rep") }
-  if box < 0 && !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) {
+  // A union-valued map's read is its value's box, the null-tagged box on a miss; a narrowed read
+  // legacy unboxes after is at another rep and stays a miss.
+  if arm == "unionBox" {
+    // At its narrowing the read is unboxed to the member's scalar after (`narrowedMapReadOf`).
+    const nm = narrowedMapReadOf(ix, ibFnIx)
+    const repOk = match nm.nmArm {
+      // The read is the value's box, its miss the box's `null` tag.
+      "none" => rep == m.rmVal
+        || repNodeAt(repBoxCore(rep)) is RBox && repBoxCore(rep) == repBoxCore(m.rmVal)
+      "unbox" => repPrim(rep) != null && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
+      "container" | "nonNull" => false
+    }
+    if box >= 0 || !repOk { return irBMiss("map get union box rep") }
+  } else if box < 0 && !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) {
     return irBMiss("map get rep")
   }
   const r: Rhs = {
@@ -5706,6 +5730,7 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32): Opnd {
     mtKey: rk.mkKey,
     mtAt: ix,
     mtBox: box,
+    mtRow: row,
   }
   if box < 0 { return irBLetTemp(b, r, ix, rep) }
   // The box is the union's own, typed at it where a narrowed re-read's node is the member's.
@@ -7289,7 +7314,9 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       return letIfSinkArms(b, n.letInit, v)
     }
     if pa >= 0 { return letIfArms(b, n.letInit, v, pa) }
-    const built = deliver(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy)
+    // Legacy's own binding arm reads a union-valued map's box past `emitExpr`, banking no
+    // element-read row (`letNulMapReadUnionBox`).
+    const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(b, unwrapParen(n.letInit), ib.irVars[v].vRep, -1, false) } else { deliver(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy) }
     if ibMiss != "" { return 0 }
     // A ref list bound at its record-or-null twin is the same list; legacy writes no convert where
     // no coercion is recorded at the initializer.
