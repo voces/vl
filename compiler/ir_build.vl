@@ -134,6 +134,7 @@ import {
   refRepValtype,
   repStoresAs,
   u8sSame,
+  undeclaredRepTakes,
 } from "./ir_verify"
 import {
   irAstKind,
@@ -1857,21 +1858,43 @@ function capturedClosureTy(ix: i32): i32 {
 
 // `boundVarOf(ix)` for read `ix` of open type `t`, where the IR holds it closed and legacy stores
 // it as `t`'s rep: a closure its cell holds (`cellTakesClosure`), or a list of closures its cell
-// or its local's declared valtype holds; else -1.
+// or its local's declared valtype holds (where legacy writes no valtype for `t`, that
+// declaration alone); else -1.
 function storedVarOf(ix: i32, t: i32): i32 {
   const v = boundVarOf(ix)
   if v < 0 || irTyOpen(ib.irVars[v].vTy) { return -1 }
   const d = identDeclOf(ix)
   if d < 0 || !(nodeAt(d) is LetDecl) { return -1 }
   const vr = ib.irVars[v].vRep
-  const claims = letBindRepClaims(d, ibFnIx)
-  const kind = if claims { letBindRep(d, ibFnIx).rdKind } else { null }
   if repNodeAt(vr) is RList {
-    if !repStoresAs(repNodeOfTy(t), vr) { return -1 }
-    if claims { return if kind == "reflist" { v } else { -1 } }
+    const tr = repNodeOfTy(t)
+    if letBindRepClaims(d, ibFnIx) {
+      return if repStoresAs(tr, vr) && letBindKindIs(d, "reflist") { v } else { -1 }
+    }
+    if !repStoresAs(tr, vr) {
+      return if slotDeclStores(t, tr, vr, ib.irVars[v].vSlot) { v } else { -1 }
+    }
     return if u8sSame(irSlotValtype(ib.irVars[v].vSlot), refRepValtype(vr)) { v } else { -1 }
   }
-  return if kind == "closure" { v } else { -1 }
+  return if letBindKindIs(d, "closure") { v } else { -1 }
+}
+
+// Whether legacy's cell for `let` `d` claims a rep of kind `k` (`letBindRep`).
+function letBindKindIs(d: i32, k: VKind): boolean {
+  return letBindRepClaims(d, ibFnIx) && letBindRep(d, ibFnIx).rdKind == k
+}
+
+// Whether local `slot`, as legacy declares it, holds variable rep `vr` where it is read or
+// shared at open type `ty`'s rep `rep`, for which legacy declares no valtype.
+function slotDeclStores(ty: i32, rep: i32, vr: i32, slot: i32): boolean {
+  return undeclaredRepTakes(ty, rep, vr)
+    && u8sSame(irSlotValtype(slot), refRepValtype(vr))
+}
+
+// The variable read `ix` is retyped to, its storage (`storedVarOf`), or -1.
+export function storedReadOf(ix: i32): i32 {
+  const t = nodeTyAt(ix, ibFnIx)
+  return if t >= 0 && irTyOpen(t) { storedVarOf(ix, t) } else { -1 }
 }
 
 // The variable the IR built for the `let` or parameter read `ix` names, or -1.
@@ -2070,6 +2093,7 @@ function declVarAt(d: i32, rep: i32, ty: i32): i32 {
     if (
       ib.irVars[held].vRep != rep
       && !openRepTakes(ty, rep, ib.irVars[held].vRep)
+      && !slotDeclStores(ty, rep, ib.irVars[held].vRep, slot)
     ) {
       irBMiss("local slot shared across reps")
       return -1
