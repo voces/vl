@@ -6,7 +6,8 @@ files. Every arm is a function read, e.g. `both(if c { inner } else { ask })`.
 ## The change
 
 - `bundleChoiceArg` / `bundleChoiceRec` (ir_build.vl) mirror `emitBundleChoiceArg`.
-  - The row is that of the parameter's annotated type (`repRowOfTyStruct`), as for `fnRead`.
+  - The row is that of the parameter's annotated type, read through `bundleChoiceTyOf`
+    (wasmEmit.vl), split out of legacy's `choice` arm so both sides ask one query.
   - An `Ident` arm is `bundleRecBuild`'s function-read record. A one-statement block is its
     statement's. An `if` with an `else` is a nested choice.
 - The `if` names its join with IR-N4's decided `SIf` field (`siJoin` {`struct`, row},
