@@ -1752,6 +1752,51 @@ function labelled(label: i32, out: i32, body: i32[]) {
   return 0
 }
 
+// A `??`'s checks: its operand block, operand, out, arm and default. Its own frame, so `stmt`'s
+// per-level frame stays as small as its other arms need.
+function coalBoxCheck(n: SCoalBox, id: i32) {
+  // A fused map read's receiver is read by its probe, which may name a global instead.
+  const mapArm = n.cbArm == "mapIndexGetOr"
+  if (n.cbMap != null) != mapArm {
+    return fail(2, id, "a `??` holds a map probe off the map-read arm")
+  }
+  if n.cbLB.length > 0 && n.cbArm != "nulRef" {
+    return fail(
+      2,
+      id,
+      "a `??` builds its operand inside off the nullable-reference arm",
+    )
+  }
+  // The operand block's definitions are seen by the operand, then dropped with the node.
+  const nDefs = vfDefLog.length
+  let lbPrev = -1
+  for lid in n.cbLB {
+    stmt(lid, lbPrev)
+    lbPrev = lid
+  }
+  if !mapArm { use(n.cbL, id) }
+  if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
+    return fail(4, id, "a boxed `??` writes no variable")
+  }
+  const why = match n.cbArm {
+    "popOr" => coalPopOrWhy(n)
+    "mapIndexGetOr" => coalMapGetOrWhy(n, id)
+    "nulRef" => coalNulRefWhy(n)
+    "litUnion" | "nulBool" => coalNicheWhy(n)
+    "fieldBox" | "fieldVal" => coalFieldWhy(n)
+    "optLeaf" => coalOptLeafWhy(n)
+    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
+  }
+  if why != "" { return fail(2, id, why) }
+  nested(n.cbNull)
+  endsWriting(n.cbNull, n.cbOut, id)
+  while vfDefLog.length > nDefs {
+    const d = vfDefLog.pop() ?? -1
+    if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
+  }
+  return 0
+}
+
 // Checks node `id`, the node before it in its body `prev` (-1 for the first).
 function stmt(id: i32, prev: i32) {
   if vfRule != 0 { return 0 }
@@ -1921,29 +1966,7 @@ function stmt(id: i32, prev: i32) {
       vfLabelOut.pop()
     }
     SIf => ifSpine(id)
-    SCoalBox => {
-      // A fused map read's receiver is read by its probe, which may name a global instead.
-      const mapArm = n.cbArm == "mapIndexGetOr"
-      if (n.cbMap != null) != mapArm {
-        return fail(2, id, "a `??` holds a map probe off the map-read arm")
-      }
-      if !mapArm { use(n.cbL, id) }
-      if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
-        return fail(4, id, "a boxed `??` writes no variable")
-      }
-      const why = match n.cbArm {
-        "popOr" => coalPopOrWhy(n)
-        "mapIndexGetOr" => coalMapGetOrWhy(n, id)
-        "nulRef" => coalNulRefWhy(n)
-        "litUnion" | "nulBool" => coalNicheWhy(n)
-        "fieldBox" | "fieldVal" => coalFieldWhy(n)
-        "optLeaf" => coalOptLeafWhy(n)
-        "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
-      }
-      if why != "" { return fail(2, id, why) }
-      nested(n.cbNull)
-      endsWriting(n.cbNull, n.cbOut, id)
-    }
+    SCoalBox => coalBoxCheck(n, id)
     SSwitch => switchCheck(n, id)
     SBr => {
       if n.brHas && !vf.irHelper {
