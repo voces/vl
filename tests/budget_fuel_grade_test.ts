@@ -4,6 +4,14 @@
 
 const ROOT = new URL("../", import.meta.url).pathname;
 
+// A child's env merges with this process's, so a caller's base (the queue exports all three) would
+// reach the script: each case sets them, empty where it means none.
+const BASE_UNSET = {
+  SELF_COMPILE_BASE: "",
+  SELF_COMPILE_BASE_SEED: "",
+  SELF_COMPILE_BASE_FUEL: "",
+};
+
 type Case = { fuel: number; base: string; baseline: number };
 
 async function grade(c: Case): Promise<{ code: number; out: string }> {
@@ -27,6 +35,7 @@ async function grade(c: Case): Promise<{ code: number; out: string }> {
       SEED: `${dir}/seed.wasm`,
       BASELINE: `${dir}/baseline.json`,
       LEDGER: `${dir}/ledger.txt`,
+      ...BASE_UNSET,
     };
     if (c.base === "none") env.SELF_COMPILE_BASE = "none";
     else env.SELF_COMPILE_BASE_FUEL = c.base;
@@ -186,6 +195,7 @@ async function gradeOnBase(
       SEED: `${dir}/seed.wasm`,
       BASELINE: `${dir}/baseline.json`,
       LEDGER: `${dir}/ledger.txt`,
+      ...BASE_UNSET,
       ...(explicit ? { SELF_COMPILE_BASE: "HEAD~1" } : {}),
       XDG_CACHE_HOME: `${co}/cache`,
       FAKE_SEED: seed,
