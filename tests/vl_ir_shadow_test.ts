@@ -1476,6 +1476,10 @@ Deno.test({
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
     }
+    // Case 120 reads a global off its checked type's rep at a rep its recorded store type is not
+    // (rule 2); case 121 records that store type and holds.
+    if (exp.irVerifySelfTest(120) !== 2) throw new Error(`case 120: want rule 2, got rule ${exp.irVerifySelfTest(120)}`);
+    if (exp.irVerifySelfTest(121) !== 0) throw new Error(`case 121: want rule 0, got rule ${exp.irVerifySelfTest(121)}`);
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
