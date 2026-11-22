@@ -6192,15 +6192,45 @@ function isTagWhollyTested(
 function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
+  const p = listIsAcrossPlanOf(isIx, nd, fnIx)
+  if !p.lpOk { return 0 }
+  const slot = sharedFieldRecvSlot()
+  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+  return listIsAcrossTail(nd, slot, p, fnIx)
+}
+
+// `listIsAcrossRepsPlan`'s answer for `is` test `isIx`: the tested list type, per tag how it is
+// tested and the slots its loop walks; `lpOk` false when the test is not that shape.
+export type ListIsAcrossPlan = {
+  lpChk: i32,
+  lpTags: i32[],
+  lpFits: i32[],
+  lpSlots: i32[][],
+  lpOk: boolean,
+}
+
+// The plan `emitListIsAcrossReps` and the IR's `RListIsAcross` write `nd` (at `isIx`) by.
+export function listIsAcrossPlanOf(
+  isIx: i32,
+  nd: IsExpr,
+  fnIx: i32,
+): ListIsAcrossPlan {
   const chk = isVarTyIxOf(isIx)
   const tags: i32[] = []
   const fits: i32[] = []
   const slotsAt: i32[][] = []
-  if !listIsAcrossRepsPlan(nd.isObj, chk, fnIx, tags, fits, slotsAt) {
-    return 0
-  }
-  const slot = sharedFieldRecvSlot()
-  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+  const ok = listIsAcrossRepsPlan(nd.isObj, chk, fnIx, tags, fits, slotsAt)
+  return { lpChk: chk, lpTags: tags, lpFits: fits, lpSlots: slotsAt, lpOk: ok }
+}
+
+// After `nd`'s receiver: its box into `slot`, then plan `p`'s test, false on a null box. 1 once
+// written, -1 on failure.
+export function listIsAcrossTail(
+  nd: IsExpr,
+  slot: i32,
+  p: ListIsAcrossPlan,
+  fnIx: i32,
+): i32 {
   fbLocalSet(slot)
   // A nullable operand is false on null; the box is a null reference then (D4953).
   const nullable = nodeTyIsNullable(nd.isObj)
@@ -6211,7 +6241,10 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
     fbI32Const(0)
     fbElse()
   }
-  if emitListIsAcrossRepsAt(slot, chk, tags, fits, slotsAt, fnIx) < 0 {
+  if (
+    emitListIsAcrossRepsAt(slot, p.lpChk, p.lpTags, p.lpFits, p.lpSlots, fnIx)
+    < 0
+  ) {
     return -1
   }
   if nullable { fbEnd() }
@@ -9866,6 +9899,14 @@ function armFloorWhy(siteHeap: i32, ix: i32, fnIx: i32): string {
   if siteHeap == uBoxIdx { return "floor: site takes the box" }
   if armRecordHeapAt(ix, fnIx) < 0 { return "floor: no record" }
   return "floor: not seated"
+}
+
+// The table's unbox of the narrowed read `ix` after its box, at its arm record's heap, as
+// `emitCoerced`'s `unbox` writes it; -1 with nothing written where the read has no arm record.
+export function emitArmUnboxAt(ix: i32, fnIx: i32): i32 {
+  const h = armRecordHeapAt(ix, fnIx)
+  if h < 0 || h == uBoxIdx { return -1 }
+  return emitArmUnboxCast(h, armUnboxNullable(ix, fnIx))
 }
 
 // That unbox with its nullability given, for a destination that knows it is a niche. A
@@ -23277,6 +23318,8 @@ function emitNulArmToLocal(
   if valIx < 0 {
     return emitFail("emitProgram: if-expression arm is not a value")
   }
+  // A call that never returns leaves the arm by its `unreachable`, so nothing is stored.
+  if callIsNever(unwrapParen(valIx)) { return emitExpr(valIx, fnIx) }
   if rep == 0 {
     // The binding's local is the union box `(ref $uBox)`, so a concrete-variant arm (a
     // kind-8 `(ref $variant)`) must be boxed to match, exactly as `emitUnionIfArm` and a
@@ -23485,6 +23528,8 @@ function emitUnionArmToPair(
   if valIx < 0 {
     return emitFail("emitProgram: if-expression arm is not a value")
   }
+  // A call that never returns leaves the arm by its `unreachable`: no box reaches the pair.
+  if callIsNever(unwrapParen(valIx)) { return emitExpr(valIx, fnIx) }
   if emitUnionBoxOwed(unionName, unionTy, valIx, fnIx) < 0 { return -1 }
   return unionBoxToPairTail(idx)
 }
@@ -40207,15 +40252,24 @@ function emitNumRepNarrow(from: VKind, to: VKind): i32 {
   )
 }
 
+// The list arms `emitArmIndexWrite` stores `target` through, or none: an identifier receiver whose
+// box of list arms no list-union rewrite overrides.
+export function armIndexWriteArmsOf(target: Index, fnIx: i32): i32[] {
+  const recv = unwrapParen(target.idxArr)
+  if recv < 0 || recv >= P.nodes.length || !(nodeAt(recv) is Ident) {
+    return []
+  }
+  if luOvLocalOf(recv) >= 0 || !exprUnion(recv, fnIx) { return [] }
+  return luMembersAt(nodeTyAt(recv, fnIx))
+}
+
 // `recv[i] = v` through a union-of-lists box a pin or an `is K[]` arm left unrewritten: per list
 // arm, the store lowers with `recv` overridden to that arm, its value converted to the arm's
 // element as any store converts it. 0 when `target` is no such store, 1 when emitted.
 function emitArmIndexWrite(fnIx: i32, a: BinExpr, target: Index): i32 {
-  const recv = unwrapParen(target.idxArr)
-  if recv < 0 || recv >= P.nodes.length || !(nodeAt(recv) is Ident) { return 0 }
-  if luOvLocalOf(recv) >= 0 || !exprUnion(recv, fnIx) { return 0 }
-  const arms = luMembersAt(nodeTyAt(recv, fnIx))
+  const arms = armIndexWriteArmsOf(target, fnIx)
   if arms.length == 0 { return 0 }
+  const recv = unwrapParen(target.idxArr)
   if emitArmIndexWriteAt(fnIx, a, target, recv, arms, 0) < 0 { return -1 }
   asgParkedSlot = -1
   return 1
@@ -40707,13 +40761,17 @@ function njAsConverts(ms: i32[], to: i32): boolean {
 // Converts the numeric union at `ix` to kind `to` at whichever member it holds: an infallible
 // `as`, and a delivery into a numeric primitive every member widens to exactly.
 function emitNumUnionConvert(ix: i32, to: i32, fnIx: i32) {
-  const ms = njMembersOf(ix, fnIx)
-  const key = njDepth * 2
-  njDepth = njDepth + 1
+  const key = numUnionStashEnter()
   const bs = njStash(ix, true, key, fnIx)
-  njDepth = njDepth - 1
+  numUnionStashLeave()
   if bs < 0 { return -1 }
-  return njConvertArm(ms, 0, bs, to)
+  return numUnionConvertTail(ix, to, fnIx, bs)
+}
+
+// After numeric union `ix`'s box is stashed in slot `bs`: its conversion to kind `to` at the
+// member it holds, the dispatch `emitNumUnionConvert` and the IR's conversion both write.
+export function numUnionConvertTail(ix: i32, to: i32, fnIx: i32, bs: i32): i32 {
+  return njConvertArm(njMembersOf(ix, fnIx), 0, bs, to)
 }
 
 // The conversion dispatch from member `i` on; the last member is the bare `else`.
@@ -41841,28 +41899,53 @@ function emitDirectCall(callIx: i32, fnIx: i32, target: i32) {
 // After a direct call to an instance returning its bundle parameter's record: the member the
 // elaboration noted the call's value is used as, nothing for a value dropped. 0, or -1.
 function emitBundleResultPick(callIx: i32, target: i32, fnIx: i32): i32 {
-  const cFn = nodeAt(fnStmts[target])
-  const rp = bundleRetParamOf(fnStmts[target])
-  const own = rp >= 0 && cFn is FuncDecl && rp < cFn.fnParams.length
-  // A function returning another's record as a call's value returns it as that record.
-  const rec = if own { [] } else { calleeReturnsRecord(fnStmts[target]) }
-  if !own && rec.length < 2 { return 0 }
-  // A holder keeps the record whole and picks at each call through it (D15144).
-  if elabCallKeepsRecordAt(nodeSrc[callIx] ?? callIx, elabKeyOfFn(fnIx)) {
-    return 0
-  }
-  const m = callResultMember(callIx, fnIx)
-  if m == -1 { return 0 }
-  const si = if own && cFn is FuncDecl { paramStructIdxOf(cFn.fnParams[rp]) } else { bundleRecordRowOfSigs(rec) }
-  const fi = if m >= 0 { sFieldIndex(si, "c" + i32ToStr(m)) } else { -1 }
-  if fi < 0 || si < 0 || si >= sHeapIdx.length {
+  const pk = bundleResultPickOf(callIx, target, fnIx)
+  if pk.bpHeap == -2 {
     return emitFailAt(
       "emitProgram: a function returning a parameter called at two signatures is called where its result is not used at one of them",
       callIx,
     )
   }
-  fbStructGet(sHeapIdx[si], fi)
+  if pk.bpField >= 0 { fbStructGet(pk.bpHeap, pk.bpField) }
   return 0
+}
+
+// The member direct call `callIx` of `target` picks from the bundle record it returns, as
+// `emitBundleResultPick` writes it: `bpField` -1 where no pick follows (no bundle, a holder keeping
+// the record whole, a value dropped), and `bpHeap` -2 where its use is at none of the members.
+export function bundleResultPickOf(
+  callIx: i32,
+  target: i32,
+  fnIx: i32,
+): BundlePick {
+  const none: BundlePick = { bpHeap: -1, bpField: -1, bpTy: -1, bpKey: "" }
+  const cFn = nodeAt(fnStmts[target])
+  const rp = bundleRetParamOf(fnStmts[target])
+  const own = rp >= 0 && cFn is FuncDecl && rp < cFn.fnParams.length
+  // A function returning another's record as a call's value returns it as that record.
+  const rec = if own { [] } else { calleeReturnsRecord(fnStmts[target]) }
+  if !own && rec.length < 2 { return none }
+  // A holder keeps the record whole and picks at each call through it (D15144).
+  if elabCallKeepsRecordAt(nodeSrc[callIx] ?? callIx, elabKeyOfFn(fnIx)) {
+    return none
+  }
+  const m = callResultMember(callIx, fnIx)
+  if m == -1 { return none }
+  const sigs = if own && cFn is FuncDecl { bundleSigsOfParam(cFn.fnParams[rp]) } else { rec }
+  const si = if own && cFn is FuncDecl { paramStructIdxOf(cFn.fnParams[rp]) } else { bundleRecordRowOfSigs(rec) }
+  const fi = if m >= 0 { sFieldIndex(si, "c" + i32ToStr(m)) } else { -1 }
+  if fi < 0 || si < 0 || si >= sHeapIdx.length {
+    const bad: BundlePick = { bpHeap: -2, bpField: -1, bpTy: -1, bpKey: "" }
+    return bad
+  }
+  const ty = if m < sigs.length { sigs[m] } else { -1 }
+  const pk: BundlePick = {
+    bpHeap: sHeapIdx[si],
+    bpField: fi,
+    bpTy: ty,
+    bpKey: if ty >= 0 { sigKeyOfTy(ty) } else { "" },
+  }
+  return pk
 }
 
 // Does a direct call with `nArgs` operands pass more than callee `target` declares? False when
@@ -44803,6 +44886,18 @@ export function coalNulRefsHeapOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     "mapHeap" => mapTypeIdxOf(coalNulMapShape(e, fnIx))
     "boxStash" | "pinnedCellIf" | "atomJoinIf" | "numJoinIf" | "armIf" | "boxFieldScalar" | "cellIf" | "none" => -1
   }
+}
+
+// Whether `l ?? d` on the `mapHeap` arm yields its default's wider map type (D15050's join), whose
+// shape is the operand's own map heap, so the core's block holds the result as it stands.
+export function coalNulMapJoinStoresAlike(
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+): boolean {
+  if coalNulRefsArmOf(e, exprIx, fnIx) != "mapHeap" { return false }
+  const js = mapShapeOfExpr(exprIx, fnIx)
+  return js != -3 && mapTypeIdxOf(js) == coalNulRefsHeapOf(e, exprIx, fnIx)
 }
 
 // The map shape a nullable map `l ?? d` reads, or -3 where it has none.

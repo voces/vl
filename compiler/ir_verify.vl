@@ -16,6 +16,7 @@ import {
   OVar,
   Opnd,
   PStaged,
+  RArmUnbox,
   RAsUnion,
   RAtomEq,
   RAtomStr,
@@ -47,6 +48,7 @@ import {
   RListEmptyArms,
   RListEq,
   RListGet,
+  RListIsAcross,
   RListLen,
   RListNew,
   RListNewDefault,
@@ -76,6 +78,7 @@ import {
   RNumIntr,
   RNumIs,
   RNumUnionBin,
+  RNumUnionConvert,
   RNumWiden,
   RPrimOp,
   RPrint,
@@ -83,6 +86,7 @@ import {
   RRecCopyPure,
   RRecover,
   RRel,
+  RResultPick,
   RRetNull,
   RRetag,
   RSharedRead,
@@ -577,6 +581,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if !(sn is RBox) && !(sn is RNullable && sn.rnDisc == 4) {
         return fail(2, at, "a shared read's receiver is a box")
       }
+      0
+    }
+    RArmUnbox => {
+      use(r.uaV, at)
+      if !boxShaped(opRep(r.uaV)) {
+        return fail(2, at, "an arm unbox's operand is a box")
+      }
+      const dn = repNodeAt(dst)
+      const rec = dn is RRecord
+        || dn is RNullable && repNodeAt(dn.rnInner) is RRecord
+      if !rec { return fail(2, at, "an arm unbox lands at a record") }
       0
     }
     RNicheRead => {
@@ -1145,6 +1160,11 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RListIsAcross => {
+      use(r.laV, at)
+      if dst != vfBool { return fail(2, at, "a list is-across test is a bool") }
+      0
+    }
     RLitArms => {
       use(r.liV, at)
       if dst != vfBool { return fail(2, at, "a literal arms test is a bool") }
@@ -1222,6 +1242,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RNumUnionBin => {
       uses(r.nbArgs, at)
+      0
+    }
+    RNumUnionConvert => {
+      use(r.nuV, at)
+      if dst >= 0 && numKindOf(dst) != r.nuTo {
+        return fail(2, at, "a numeric union conversion is at its kind")
+      }
+      if !(repNodeAt(opRep(r.nuV)) is RBox) {
+        return fail(2, at, "a numeric union conversion reads a box")
+      }
       0
     }
     RNumIntr => {
@@ -1402,6 +1432,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RResultPick => {
+      use(r.rkV, at)
+      if !(repNodeAt(opRep(r.rkV)) is RRecord) {
+        return fail(2, at, "a result pick of a non-record value")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RClosure) {
+        return fail(2, at, "a result member of a non-closure rep")
+      }
+      0
+    }
     RGlobalGet => {
       const g = irGlobalRepOf(vf, r.ggSym)
       if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
@@ -1410,7 +1450,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 && dst != g && !narrowed {
         return fail(2, at, "a global's rep is not its destination's")
       }
-      if dst >= 0 && !narrowed && !globalReadAtTyOrStorage(dst, at) {
+      // A global the builder noted as holding a record whole is read at that record (`irGlobalHeld`).
+      const held = vf.irGlobalHeld[r.ggSym] ?? false
+      if dst >= 0 && !narrowed && !held && !globalReadAtTyOrStorage(dst, at) {
         return fail(
           2,
           at,
@@ -1666,8 +1708,15 @@ function coalNulRefWhy(n: SCoalBox): string {
   const or = vf.irVars[o].vRep
   const on = repNodeAt(or)
   const boxed = on is RBox || on is RNullable && on.rnDisc == 4
-  if !boxed && or != opRep(n.cbL) && or != lr.rnInner {
-    return "a nullable-reference `??` yields neither the reference, its inner, nor a box"
+  // A nullable map's `??` may yield its default's wider map, stored alike (D15050).
+  const ir = repNodeAt(lr.rnInner)
+  const wv = if on is RMap { repNodeAt(on.rmVal) } else { null }
+  const maps = on is RMap
+    && ir is RMap
+    && (on.rmVal == ir.rmVal
+    || wv is RNullable && wv.rnInner == ir.rmVal)
+  if !boxed && !maps && or != opRep(n.cbL) && or != lr.rnInner {
+    return "a nullable-reference `??` yields neither the reference, its inner, a map whose value widens the inner's, nor a box"
   }
   return ""
 }
@@ -2406,7 +2455,8 @@ function simdCheck(r: RSimd, dst: i32, at: i32) {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RAsUnion |
+    RArmUnbox |
+      RAsUnion |
       RAtomEq |
       RAtomStr |
       RAtomic |
@@ -2436,6 +2486,7 @@ function rhsReadsList(r: Rhs): boolean {
       RListEmpty |
       RListEmptyArms |
       RListEq |
+      RListIsAcross |
       RListLen |
       RListNew |
       RListNewDefault |
@@ -2465,6 +2516,7 @@ function rhsReadsList(r: Rhs): boolean {
       RNumIntr |
       RNumIs |
       RNumUnionBin |
+      RNumUnionConvert |
       RNumWiden |
       RPrimOp |
       RPrint |
@@ -2472,6 +2524,7 @@ function rhsReadsList(r: Rhs): boolean {
       RRecCopyPure |
       RRecover |
       RRel |
+      RResultPick |
       RRetNull |
       RRetag |
       RSharedRead |
