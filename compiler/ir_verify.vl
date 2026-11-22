@@ -19,7 +19,9 @@ import {
   RArmUnbox,
   RAsUnion,
   RAtomEq,
+  RAtomSole,
   RAtomStr,
+  RAtomWide,
   RAtomic,
   RBoxField,
   RBoxNarrow,
@@ -95,6 +97,8 @@ import {
   RStage,
   RStashSet,
   RStrOp,
+  RStrToAtom,
+  RStrToAtomStaged,
   RStructEq,
   RTagIs,
   RTagOf,
@@ -129,6 +133,7 @@ import {
   irBodyLeaves,
   irFnNew,
   irGlobalRepOf,
+  irGlobalStoreTyOf,
   irPushBodies,
   irSigOf,
   mapBoxReadsAt,
@@ -152,6 +157,7 @@ import {
   repTyOf,
 } from "./emit_rep"
 import {
+  cloHoleRetag,
   listRetag,
   listRetagHole,
   recRetag,
@@ -177,12 +183,11 @@ import {
 } from "./wasmEmit"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
-import { closureHeld, letBindTy, tyOpenHeldAsIds } from "./emit_classify"
+import { closureHeld, tyOpenHeldAsIds } from "./emit_classify"
 import { fbValtype, wTarget } from "./emit_bytes"
 import { rlWrapIdx } from "./emit_state"
 import { rlSlotOfTyOrTwin } from "./emit_shape_rows"
 import { tyRefArrElemOf } from "./emit_map_value_slots"
-import { identDeclOf } from "./symbols"
 import {
   atomicPlanOf,
   atomicResultPrim,
@@ -507,13 +512,13 @@ function stageAt(id: i32): RListStage | null {
   return null
 }
 
-// Whether global read node `at`, at rep `dst`, is at its checked type's rep or else at its
-// declaration's storage row, the D14434 binding column (`letBindTy`; D14426, DECISIONS.md).
-function globalReadAtTyOrStorage(dst: i32, at: i32): boolean {
+// Whether a read of global `sym` at node `at`, at rep `dst`, is at its checked type's rep or else at
+// the storage row the builder recorded taking it at (`irGlobalStoreTyOf`; D14434, D14426).
+function globalReadAtTyOrStorage(sym: i32, dst: i32, at: i32): boolean {
   const src = vf.irNodeAt[at] ?? -1
   if src < 0 || dst == repNodeOfTy(nodeTyAt(src, vf.irAt)) { return true }
-  const d = identDeclOf(src)
-  return d >= 0 && dst == repNodeOfTy(letBindTy(d, -1))
+  const st = irGlobalStoreTyOf(vf, sym)
+  return st >= 0 && dst == repNodeOfTy(st)
 }
 
 function rhsCheck(r: Rhs, dst: i32, at: i32) {
@@ -867,7 +872,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const d = repNodeAt(dst)
       if (
         !listRetag(opRep(r.rgV), dst)
-        && !listRetagHole(opRep(r.rgV), dst)
+        && !listRetagHole(vf, opRep(r.rgV), dst)
+        && !cloHoleRetag(vf, opRep(r.rgV), dst)
         && !recRetag(opRep(r.rgV), dst)
         && (!(d is RNullable)
           || !nicheRetag(d.rnDisc, d.rnInner)
@@ -1421,6 +1427,39 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RFnId => if dst >= 0 && dst != vfI32 { fail(2, at, "a function id is an i32") } else { 0 }
+    RAtomSole => if dst >= 0 && !(repNodeAt(dst) is RAtom) { fail(2, at, "a sole atom is an atom") } else { 0 }
+    RAtomWide => {
+      use(r.awV, at)
+      if dst >= 0 && !(repNodeAt(dst) is RAtom) {
+        return fail(2, at, "a wide literal's atom is an atom")
+      }
+      0
+    }
+    RStrToAtomStaged => {
+      use(r.zsV, at)
+      if repPrim(opRep(r.zsV)) != "str" {
+        return fail(2, at, "a staged atom narrowing parks a string")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RAtom) {
+        return fail(2, at, "a staged atom narrowing is an atom")
+      }
+      0
+    }
+    RStrToAtom => {
+      uses(r.saReads, at)
+      for o in r.saReads {
+        if repPrim(opRep(o)) != "str" {
+          return fail(2, at, "an atom tower tests string reads")
+        }
+      }
+      if r.saReads.length == 0 {
+        return fail(2, at, "an atom tower tests at least one member")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RAtom) {
+        return fail(2, at, "an atom tower is an atom")
+      }
+      0
+    }
     RCellNew => use(r.cnInit, at)
     RCellGet => use(r.cgCell, at)
     REnvGet => 0
@@ -1452,7 +1491,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       // A global the builder noted as holding a record whole is read at that record (`irGlobalHeld`).
       const held = vf.irGlobalHeld[r.ggSym] ?? false
-      if dst >= 0 && !narrowed && !held && !globalReadAtTyOrStorage(dst, at) {
+      if (
+        dst >= 0
+        && !narrowed
+        && !held
+        && !globalReadAtTyOrStorage(r.ggSym, dst, at)
+      ) {
         return fail(
           2,
           at,
@@ -1890,6 +1934,11 @@ function ifSpine(id0: i32) {
   }
 }
 
+// Whether `v` is a declared binding, the one a loop value's frame carries out through.
+function declaredVar(v: i32): boolean {
+  return v >= 0 && v < vf.irVars.length && vf.irVars[v].vKind != "temp"
+}
+
 function labelled(label: i32, out: i32, body: i32[]) {
   vfLabels.push(label)
   vfLabelOut.push(out)
@@ -2033,7 +2082,7 @@ function stmt(id: i32, prev: i32) {
     }
     SEffect => rhsCheck(n.efRhs, -1, id)
     SBlock => {
-      if n.bkOut >= 0 && !vf.irHelper {
+      if n.bkOut >= 0 && !vf.irHelper && !declaredVar(n.bkOut) {
         return fail(10, id, "a valued block outside a runtime helper")
       }
       labelled(n.bkLabel, n.bkOut, n.bkBody)
@@ -2119,7 +2168,11 @@ function stmt(id: i32, prev: i32) {
     SSwitch => switchCheck(n, id)
     SIntSwitch => intSwitchCheck(n, id)
     SBr => {
-      if n.brHas && !vf.irHelper {
+      if (
+        n.brHas
+        && !vf.irHelper
+        && !(n.brVal is OVar && declaredVar(n.brVal.ov))
+      ) {
         return fail(10, id, "a valued branch outside a runtime helper")
       }
       let i = vfLabels.length - 1
@@ -2459,7 +2512,9 @@ function rhsReadsList(r: Rhs): boolean {
     RArmUnbox |
       RAsUnion |
       RAtomEq |
+      RAtomSole |
       RAtomStr |
+      RAtomWide |
       RAtomic |
       RBoxField |
       RBoxNarrow |
@@ -2534,6 +2589,8 @@ function rhsReadsList(r: Rhs): boolean {
       RStage |
       RStashSet |
       RStrOp |
+      RStrToAtom |
+      RStrToAtomStaged |
       RStructEq |
       RTagIs |
       RTagOf |
