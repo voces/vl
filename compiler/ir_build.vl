@@ -1,5 +1,6 @@
 import { rangeConstIs, rangeConstVal } from "./emit_plan_list"
 import { blockHasContinueFor } from "./emit_query"
+import { narrowedArmTyAt } from "./emit_local_scope"
 import { cboxElemTyOfCell } from "./emit_rewrite"
 // The IR shadow (ir-design-2026-11.md §5.2, step I0): with the shadow armed, `emitFuncCode`
 // hands each function here after its legacy lowering. The phase-A builder covers I1's set
@@ -5588,6 +5589,12 @@ export function deliverStr(b: i32[], ix: i32): Opnd {
   return deliver(b, ix, repNodeOfTy(TY_STR), TY_STR)
 }
 
+// Whether rep `r` is a record or a nullable record.
+function recordRepOrNull(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RRecord || n is RNullable && repNodeAt(n.rnInner) is RRecord
+}
+
 // The value of `ix` delivered at rep `dst`: as built, or widened where legacy widens it, through
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
@@ -5638,6 +5645,25 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     const hole = holeCloTy(nodeTyAt(unwrapParen(ix), ibFnIx))
     const ty = if dstTy >= 0 && !(hole && repNodeOfTy(dstTy) != dst) { dstTy } else { repTyOf(dst) }
     return cloValue(b, unwrapParen(ix), dst, ty)
+  }
+  // A box local narrowed to a record arm at a record destination: the box, then the table's
+  // unbox to the arm's record (`narrowedArmNeedsUnbox`, `emitCoerced`'s `unbox`).
+  const au = unwrapParen(ix)
+  if (
+    ibMiss == ""
+    && dst >= 0
+    && au >= 0
+    && au < P.nodes.length
+    && nodeAt(au) is Ident
+    && recordRepOrNull(dst)
+    && narrowedArmNeedsUnbox(ix, ibFnIx)
+    && narrowedArmTyAt(au, ibFnIx) >= 0
+  ) {
+    const bo = irBBoxLocal(b, au)
+    if ibMiss != "" { return bo }
+    // The temp is typed at the destination, whose record the arm's may only fit.
+    const ut = if dstTy >= 0 && primRepOfTy(dstTy) == dst { dstTy } else { repTyOf(dst) }
+    return irBLetTempTy(b, { uaV: bo, uaAt: au }, ix, dst, ut)
   }
   // A box local narrowed to a record arm, delivered as it stands: legacy reads the box itself,
   // not the record its narrowing unboxes to at a record destination.
