@@ -408,6 +408,8 @@ import {
   repNodeKids,
   repNodeOfTy,
   repRecordKidOf,
+  repRowOfTyStruct,
+  repScanLim,
   repTyOf,
 } from "./emit_rep"
 import {
@@ -3000,16 +3002,19 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   return directCallAt(b, c, ix, pos)
 }
 
-// The lambda literal `arg` handed to bundle parameter `par`, as `emitBundleArg` builds it: the
-// closure of the instance each signature mints (`monoBundleFe`), in the parameter's record row's
-// field order, then the record.
-function bundleArgRec(b: i32[], arg: i32, par: i32): Opnd {
+// The lambda literal `arg` handed to bundle parameter `par`, as `emitBundleArg` builds it, or the
+// function read `arg` (`fnRead`), as `emitBundleReadArg` does: the closure of each signature's
+// instance (`monoBundleFe`, `monoBundleReadFe`) in the record row's field order, then the record.
+function bundleArgRec(b: i32[], arg: i32, par: i32, fnRead: boolean): Opnd {
   const sigs = bundleSigsOfParam(par)
-  const si = paramStructIdxOf(par)
+  const p = nodeAt(par)
+  const pt = if p is Param && p.parType >= 0 { nodeTyAt(p.parType, -1) } else { -1 }
+  if fnRead && pt < 0 { return irBMiss("bundle argument read type") }
+  const si = if fnRead { repRowOfTyStruct(pt, repScanLim()) } else { paramStructIdxOf(par) }
   if si < 0 || si >= sFieldCount.length || si >= sFieldStart.length {
     return irBMiss("bundle argument row")
   }
-  const rty = bundleRecordTyOf(sigs)
+  const rty = if fnRead { pt } else { bundleRecordTyOf(sigs) }
   const rep = repNodeOfTy(rty)
   const ks = repNodeKids(rep)
   if !(repNodeAt(rep) is RRecord) || ks.length != sFieldCount[si] {
@@ -3023,7 +3028,7 @@ function bundleArgRec(b: i32[], arg: i32, par: i32): Opnd {
     const nm = sFieldNames[sFieldStart[si] + fi]
     let k = 0
     while k < sigs.length && nm != "c" + i32ToStr(k) { k = k + 1 }
-    const fe = if k < sigs.length { monoBundleFe(arg, ibFnIx, sigs, k) } else { -1 }
+    const fe = if k >= sigs.length { -1 } else if fnRead { monoBundleReadFe(arg, ibFnIx, sigs[k]) } else { monoBundleFe(arg, ibFnIx, sigs, k) }
     const kid = repRecordKidOf(rep, rty, nm)
     if (
       fe < 0
@@ -3099,7 +3104,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       // lambda literal's built per signature, or a record read as it is.
       if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
         const barm = bundleArgArmOf(callee.fnParams[i], c.callArgs[i], ibFnIx)
-        if barm == "lambda" {
+        if barm == "lambda" || barm == "fnRead" {
           const bt = bundleHeldTy(
             callee.fnParams[i],
             scopeTyAt(callee.fnParams[i], inst),
@@ -3107,7 +3112,12 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
           if !(repNodeAt(repNodeOfTy(bt)) is RRecord) {
             return missRhs("bundle argument closed parameter")
           }
-          const ba = bundleArgRec(b, c.callArgs[i], callee.fnParams[i])
+          const ba = bundleArgRec(
+            b,
+            c.callArgs[i],
+            callee.fnParams[i],
+            barm == "fnRead",
+          )
           if ibMiss != "" { return missRhs(ibMiss) }
           args.push(ba)
           i = i + 1
