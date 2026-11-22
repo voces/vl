@@ -1483,8 +1483,8 @@ Deno.test({
     // to 7 each have the case named for them; the rest break rule 2 (a store, an effectful
     // immediate, a pop, map read, shared read, niche read, unbox, numeric conversion, result pick
     // or `??` of the wrong operand or out, a stashed record's order, a held global read off its
-    // rep), rule 5 (a fall-through, an out left unwritten) or rule 8 (a bounds check with the
-    // bounds rule uninstalled).
+    // rep), rule 5 (a fall-through, an out left unwritten), rule 8 (a bounds check with the
+    // bounds rule uninstalled) or rule 10 (a valued block outside a helper whose out is a temp).
     const want: Record<string, number> = {
       "holds": 0,
       "var-rep-outside-tree": 1,
@@ -1518,6 +1518,9 @@ Deno.test({
       "held-global-read-off-noted-rep": 2,
       "result-pick-of-i32": 2,
       "result-pick-record-into-i32": 2,
+      "retag-field-alike-records-two-heaps": 2,
+      "global-read-off-store-type": 2,
+      "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
       "atom-tower-i32-read": 2,
       "atom-tower-zero-reads": 2,

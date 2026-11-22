@@ -710,6 +710,8 @@ let lwIfBoxAt: {[i32]: i32} = Map()
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
 let lwFrames: i32[] = []
+// The labels of the open frames that carry a loop value through their result binding.
+let lwLvLabels: i32[] = []
 // Statement spans: rows opened at a node and closed after another, by the node ids.
 let lwSpanOpen: i32[] = []
 let lwSpanAt: i32[] = []
@@ -3448,6 +3450,9 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     }
     SCoalBox => coalBox(n, pending)
     SBlock => {
+      if n.bkOut >= 0 && varSlot(n.bkOut) >= 0 {
+        return loopValueBlock(n, pending, id)
+      }
       if n.bkOut >= 0 { return valuedBlock(n, pending) }
       irLSettle(pending)
       // A loop's list-header hoists open before its block, as legacy's do.
@@ -3473,7 +3478,9 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     SIf => irLMiss("an `if` outside a body walk")
     SBr => {
       if n.brHas {
-        if !lw.irHelper { return irLMiss("valued branch") }
+        if !lw.irHelper && !lvLabelOpen(n.brLabel) {
+          return irLMiss("valued branch")
+        }
         cond(n.brVal, pending)
       }
       irLSettle(pending)
@@ -4040,6 +4047,52 @@ function ifClose(id: i32, k: i32, pending: i32[]) {
   return 0
 }
 
+// A loop value's frame (`lvFrameOpen`): typed by its result binding, which each `break v` reads
+// before branching out; a tail assigning it falls out with it, and the frame's value is stored back
+// into the binding. A `while`'s list-header hoists open around it, as legacy's do.
+function loopValueBlock(n: SBlock, pending: i32[], id: i32) {
+  if n.bkOut < 0 || n.bkOut >= lw.irVars.length {
+    return irLMiss("loop value out")
+  }
+  const slot = varSlot(n.bkOut)
+  const vt = valtypeOf(lw.irVars[n.bkOut].vRep)
+  if vt < 0 { return irLMiss("loop value rep") }
+  irLSettle(pending)
+  const hoists = irLoopOpenHook(lw.irNodeAt[id])
+  if hoists < 0 { return irLMiss("loop hoist prologue") }
+  fbBlock(vt)
+  lwFrames.push(n.bkLabel)
+  lwLvLabels.push(n.bkLabel)
+  const k = n.bkBody.length - 1
+  const last = if k >= 0 { lw.irNodes[n.bkBody[k]] } else { null }
+  if last is SBr && last.brHas && last.brLabel == n.bkLabel {
+    const head: i32[] = []
+    let i = 0
+    while i < k {
+      head.push(n.bkBody[i])
+      i = i + 1
+    }
+    body(head, false, -1, false)
+    irLOpnd(last.brVal)
+  } else {
+    body(n.bkBody, false, -1, false)
+  }
+  lwLvLabels.pop()
+  lwFrames.pop()
+  fbEnd()
+  fbLocalSet(slot)
+  irLoopCloseHook(hoists)
+  return 0
+}
+
+// Whether `label` is an open loop value's frame.
+function lvLabelOpen(label: i32): boolean {
+  for l in lwLvLabels {
+    if l == label { return true }
+  }
+  return false
+}
+
 // A helper's valued block: its out is written by each branch to it and by its last node, and
 // stays on the stack for the out's one later read, as a valued `if`'s does.
 function valuedBlock(n: SBlock, pending: i32[]) {
@@ -4360,6 +4413,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   }
   lwSeq = []
   lwFrames = []
+  lwLvLabels = []
   lwSpanOpen = []
   lwSpanAt = []
   lwRowAst = []
