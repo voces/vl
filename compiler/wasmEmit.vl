@@ -1817,6 +1817,7 @@ import {
   sFieldElemTyIxOfRow,
   scalarAtomNameOfKind,
   strLexSameValue,
+  structArmHeapOf,
   tagIsArmOf,
   unionArmRowsOfTy,
   unionArmTagClash,
@@ -8870,21 +8871,20 @@ function emitUnionCoerceRecord(
   // where the box wants the variant struct. Re-box it against the matched arm
   // (`emitStructExprAsVariantBox`). Gated on the heaps differing, so a deduped shape is raw.
   if unionName != "" && exprStruct(exprIx, fnIx) {
+    // On its arm's variant heap the struct is boxed as itself (`structArmHeapOf`, the plan's
+    // `rec` arm), never passed raw: a `(ref $arm)` in a box cell is invalid wasm (D281).
+    const sv = structArmHeapOf(uTy, exprIx, fnIx)
+    if sv >= 0 {
+      fbI32Rel(RS_TAG, uTags[sv]) // 0x41 i32.const <variant tag> (program-global)
+      if emitExpr(exprIx, fnIx) < 0 { return -1 }
+      fbStructNew(uBoxIdx) // { tag, variant-ref }
+      return 0
+    }
     const rbVi = unionArmVariantForStructExpr(uTy, exprIx, fnIx)
     if rbVi >= 0 {
       const rbSsi = structIndexOfExpr(exprIx, fnIx)
       if rbSsi >= 0 {
-        if sHeapIdx[rbSsi] != variantHeap(rbVi) {
-          return emitStructExprAsVariantBox(exprIx, rbVi, rbSsi, fnIx)
-        }
-        // The heaps agreeing is not a reason to pass raw (D281). The test above answers "must
-        // the payload be rebuilt onto another heap type"; the fall-through below answers "is
-        // this value already box-shaped". With the cross-table merge (`uVarSTwin`) the equal
-        // branch is reachable, and raw-passing a `(ref $arm)` into a box cell is invalid wasm.
-        fbI32Rel(RS_TAG, uTags[rbVi]) // 0x41 i32.const <variant tag> (program-global)
-        if emitExpr(exprIx, fnIx) < 0 { return -1 }
-        fbStructNew(uBoxIdx) // { tag, variant-ref }
-        return 0
+        return emitStructExprAsVariantBox(exprIx, rbVi, rbSsi, fnIx)
       }
     }
     // A record built at another row lands on the member the checker names, copied there.
@@ -15360,14 +15360,8 @@ function emitMapSetValExpr(
       emitUnionBoxOwed(mvValName[mslot], mvValTyIxAt(mslot), valIx, fnIx)
     }
     "variant" => emitVariantCoerce(mvValVariantOf(mslot), valIx, fnIx)
-    "atomNull" => {
-      fbI32Const(0 - 1)
-      0
-    }
-    "boolNull" => {
-      fbI32Const(2)
-      0
-    }
+    "atomNull" => emitNullOwn(NULL_OWN_ATOM)
+    "boolNull" => emitNullOwn(NULL_OWN_BOOL)
     "boolNulNone" => {
       if emitNulNoneForEffect(valIx, fnIx) < 0 { return -1 }
       fbI32Const(2)
@@ -20633,6 +20627,11 @@ function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
   return emitFail("emitProgram: expected a struct equality")
 }
 
+// The eq row a `variantEq` compare at `binIx` reads its fields through: its variant's row.
+export function variantEqRowOf(binIx: i32, fnIx: i32): i32 {
+  return eqRowOfVariant(binEqVariantRow(binIx, fnIx))
+}
+
 // The stash slots a struct compare saves before it stages, `[left, right]`, for `structEqTail`.
 export function structEqEnter(): i32[] { return [eqStashL, eqStashR] }
 
@@ -25653,8 +25652,8 @@ export function maFoldCandidateCount(fnIx: i32): i32 {
 
 // The declaration-time fold's live table for the function currently emitting: parallel to
 // each qualifying `const`'s own node index, the WASM index of its scratch local and the K it
-// folded out. Cleared at the top of `emitFuncBody` — a node index is emitted at most once, so
-// stale rows from a previous function can never be mistaken for this one's.
+// folded out. Cleared at the top of `emitFuncBody` and at each compile's start: node indices
+// restart per compile, so a row left by an earlier program would name this one's nodes.
 let maFoldDeclIx: i32[] = []
 let maFoldWasmSlot: i32[] = []
 let maFoldK: i64[] = []
@@ -27843,7 +27842,7 @@ function emitCallRefArg(
     "armUnbox" => {
       const cvSlot = sigParamSlotAt(ckey, i)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
-      match armUnboxPlanOf(cvSlot, args[i], fnIx) {
+      match callRefArmUnboxPlan(ckey, i, args[i], fnIx) {
         "asIs" => {}
         "crossTag" => {
           return emitFailCrossTagDelivery(args[i], cvSlot)
@@ -27899,11 +27898,21 @@ function emitCallRefArg(
 
 // How `emitCallRefArg`'s `armUnbox` arm writes argument `a` into the arm at variant slot `slot`:
 // as it stands, unboxed from its union's box, or refused where another arm's tag fits it.
-type ArmUnboxPlan = "asIs" | "unbox" | "crossTag"
+export type ArmUnboxPlan = "asIs" | "unbox" | "crossTag"
 
 function armUnboxPlanOf(slot: i32, a: i32, fnIx: i32): ArmUnboxPlan {
   if !exprUnion(a, fnIx) { return "asIs" }
   return if variantHasCrossTagFits(slot, a, fnIx) { "crossTag" } else { "unbox" }
+}
+
+// `armUnboxPlanOf` for argument `a` at parameter `i` of closure call key `ckey`.
+export function callRefArmUnboxPlan(
+  ckey: string,
+  i: i32,
+  a: i32,
+  fnIx: i32,
+): ArmUnboxPlan {
+  return armUnboxPlanOf(sigParamSlotAt(ckey, i), a, fnIx)
 }
 
 // Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
@@ -27929,7 +27938,7 @@ export function callRefArgPlain(
   }
   const k = sigParamKindAt(ckey, i)
   if arm == "armUnbox" {
-    return armUnboxPlanOf(sigParamSlotAt(ckey, i), a, fnIx) == "unbox"
+    return callRefArmUnboxPlan(ckey, i, a, fnIx) != "crossTag"
   }
   if arm == "scalarList" {
     return k != null && !isNulScalarListKind(k) && plainListArg(a, fnIx)
@@ -37948,6 +37957,10 @@ export function wasmEmitStateReset() {
   lmaCallerFn = -1
   lmaValArg = -1
   lmaValNode = -1
+  maFoldCursor = 0
+  maFoldDeclIx = []
+  maFoldK = []
+  maFoldWasmSlot = []
   coerceHeld = -1
   rawReadNode = -1
   mfSrcSlot = -1
@@ -39262,28 +39275,31 @@ function emitNullLitNode(_e: NullLit, exprIx: i32, fnIx: i32) {
 // Push the null the destination of the `null`-typed read `exprIx` holds, when it names a rep
 // other than the read's storage; false, pushing nothing, where the storage read is that null.
 function emitNullReadAtDst(exprIx: i32, fnIx: i32): boolean {
+  const own = nullReadDstOwnOf(exprIx, fnIx)
+  if own < 0 { return false }
+  emitNullOwn(own)
+  return true
+}
+
+// The null (`NULL_OWN_*`) the destination of `null`-typed read `exprIx` holds where its rep's kind
+// is not the read's storage's, else -1: the storage read is that null.
+export function nullReadDstOwnOf(exprIx: i32, fnIx: i32): i32 {
   const at = parenPeelIx(exprIx)
   let dst = ctxTyAt(at, fnIx)
   // A respelled read (a shared cell's `c[0]`) takes the destination of the name it respells.
   if dst < 0 { dst = ctxTyAt(nodeSrc[at] ?? -1, fnIx) }
   const st = readNarrowedStoreAt(exprIx, fnIx)
-  if dst < 0 || st < 0 { return false }
+  if dst < 0 || st < 0 { return -1 }
   const dk = repOfTy(dst).rdKind
-  if dk == repOfTy(st).rdKind { return false }
+  if dk == repOfTy(st).rdKind { return -1 }
   // An open `_ | null` destination (an un-annotated binding of the read) is built at the read's
   // storage, so the storage read is its null.
   const dt = tyAt(dst)
   if dt is TyNullable {
-    if dt.nInner < 0 { return false }
+    if dt.nInner < 0 { return -1 }
   }
-  if dk == "union" {
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbRefNullNone()
-    fbStructNew(uBoxIdx)
-    return true
-  }
-  emitNullOwn(nullOwnOfTy(dst))
-  return true
+  if dk == "union" { return NULL_OWN_BOX }
+  return nullOwnOfTy(dst)
 }
 
 // The `null` value node `exprIx` evaluates to, built at the rep of the type the checker stamped
@@ -40995,7 +41011,7 @@ function emitEqRoute(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     "str" => emitStrEq(exprIx, fnIx)
     "list" => emitListEqBin(e, exprIx, fnIx)
     "nulTest" => emitNulTestBin(e, fnIx)
-    "variantEq" => emitStructEq(exprIx, fnIx, eqRowOfVariant(binEqVariantRow(exprIx, fnIx)))
+    "variantEq" => emitStructEq(exprIx, fnIx, variantEqRowOf(exprIx, fnIx))
     "structEq" => emitStructEq(exprIx, fnIx, binEqStructRow(exprIx, fnIx))
     // Either side naming a layout without the two agreeing is a compare this emitter refuses
     // rather than guesses at (D57).
