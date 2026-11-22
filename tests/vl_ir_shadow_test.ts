@@ -1522,6 +1522,8 @@ Deno.test({
       "global-read-off-store-type": 2,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
+      "atom-tower-i32-read": 2,
+      "atom-tower-zero-reads": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
