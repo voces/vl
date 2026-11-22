@@ -124,6 +124,7 @@ import {
   irGlobalRepOf,
   irPushBodies,
   irSigOf,
+  mapBoxReadsAt,
   mapNicheReadsAt,
 } from "./ir"
 import {
@@ -1284,8 +1285,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 && r.mgForm == 0 && dst != vfI32 {
         return fail(2, at, "a map read through a helper is an i32")
       }
-      // The miss arm's default is the read's value, so it is at the read's rep.
-      if dst >= 0 && r.mgForm > 0 && opRep(r.mgDef) != dst {
+      // The miss arm's default is the read's value, so it is at the read's rep; a union box's
+      // default is boxed into the map's value, whose box the read is (`mapBoxReadsAt`).
+      const mgRep = if r.mgSym >= 0 { irGlobalRepOf(vf, r.mgSym) } else { opRep(r.mgLoc) }
+      const dw = if r.mgForm == 5 { mapValOf(mgRep) } else { dst }
+      if r.mgForm == 5 && dst >= 0 && !mapBoxReadsAt(mgRep, dst) {
+        return fail(2, at, "a map read's union box yields no value of its map")
+      }
+      if dst >= 0 && r.mgForm > 0 && opRep(r.mgDef) != dw {
         return fail(2, at, "a map read's default is not at its rep")
       }
       0
@@ -1644,8 +1651,14 @@ function coalPopOrWhy(n: SCoalBox): string {
   return ""
 }
 
+// The value rep of map rep `mrep`, or -1 for no map.
+function mapValOf(mrep: i32): i32 {
+  const mr = repNodeAt(mrep)
+  return if mr is RMap { mr.rmVal } else { -1 }
+}
+
 // Why a fused map read whose default computes is ill-formed, or "": it probes a map receiver by a
-// key along an inline form, `i32` (1), mv (2), a scalar union value's (3) or a ref niche's (4), into an out of the read's
+// key along an inline form, `i32` (1), mv (2), a scalar union value's (3), a ref niche's (4) or a union box's (5), into an out of the read's
 // own rep.
 function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   const mp = n.cbMap
@@ -1654,7 +1667,7 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   if !mapRecvOk(mp.prSym, n.cbL, id) {
     return "a map read of a receiver that is no map"
   }
-  if mp.prForm < 1 || mp.prForm > 4 {
+  if mp.prForm < 1 || mp.prForm > 5 {
     return "a fused map read writes its default in no miss arm"
   }
   const o = n.cbOut
@@ -1671,6 +1684,16 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   )
   if mp.prForm == 2 && (!(mr is RMap) || mr.rmVal != vf.irVars[o].vRep) {
     return "a map read's mv slot yields no value of its map"
+  }
+  // A boxed nullable union's read is its box.
+  if (
+    mp.prForm == 5
+    && !mapBoxReadsAt(
+      if mp.prSym >= 0 { irGlobalRepOf(vf, mp.prSym) } else { opRep(n.cbL) },
+      vf.irVars[o].vRep,
+    )
+  ) {
+    return "a map read's union box yields no value of its map"
   }
   // A ref niche's read is its non-null value.
   if (
