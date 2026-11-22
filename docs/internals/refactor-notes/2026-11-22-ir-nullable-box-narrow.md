@@ -14,7 +14,8 @@ stashes it, and writes the null tag as the niche's null, any other arm unboxed. 
   `RNicheRead` of the local.
 - `ir_lower.vl`: the operand, then `emitNicheReadTail`.
 - `ir_verify.vl`: the operand is box-shaped; kind 1 lands at a `boolean | null` niche, kind 2 at a
-  `string | null`, anything else rule 2.
+  `string | null`, anything else rule 2. Self-test case 25, a niche read over an `i32` operand, is
+  refused under rule 2.
 
 The family's record, list and atom rows take other arms; this covers the str and bool rows.
 
