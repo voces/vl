@@ -124,7 +124,16 @@ import {
   repPrim,
   repWhat,
 } from "./ir"
-import { irTyHeldOpen, irTyOpen, irVerify, numKindOf } from "./ir_verify"
+import {
+  irTyHeldOpen,
+  irTyOpen,
+  irVerify,
+  numKindOf,
+  openRepTakes,
+  refRepValtype,
+  repStoresAs,
+  u8sSame,
+} from "./ir_verify"
 import {
   irAstKind,
   irDualEmit,
@@ -135,6 +144,7 @@ import {
   irLowerFragment,
   irLoweredEntry,
   irSlotRunAgrees,
+  irSlotValtype,
   mapRecvGlobalIx,
   valtypeOf,
 } from "./ir_lower"
@@ -1219,7 +1229,10 @@ function objLitAt(
     const typed = own < 0 && fieldExplicitNullTyped(arm, row, fi, valIx)
     const v = if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own }, valIx, ks[k]) } else if typed { repTemp(b, { fnRow: row, fnFi: fi }, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
     if ibMiss != "" { return v }
-    if irBOpRep(v) != ks[k] { return irBMiss("object field coercion") }
+    const vr = irBOpRep(v)
+    if vr != ks[k] && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr) {
+      return irBMiss("object field coercion")
+    }
     layout[fi] = k
     if stashRow >= 0 { src.push(k) }
     // Under the order stash a later field's valued `if` sets every field into its slot as legacy
@@ -1701,6 +1714,11 @@ function exprTyOf(ix: i32): i32 {
     if st >= 0 { return st }
   }
   const t = nodeTyAt(ix, ibFnIx)
+  // A read typed open reads its binding's storage where the IR holds that variable closed.
+  if t >= 0 && irTyOpen(t) {
+    const sv = storedVarOf(ix, t)
+    if sv >= 0 { return ib.irVars[sv].vTy }
+  }
   if t >= 0 || ix < 0 || ix >= P.nodes.length { return t }
   const n = nodeAt(ix)
   if n is Call {
@@ -1737,6 +1755,25 @@ function capturedClosureTy(ix: i32): i32 {
   }
   const ty = capTyOf(fe, n.identName)
   return if ty >= 0 && repNodeAt(repNodeOfTy(ty)) is RClosure { ty } else { -1 }
+}
+
+// `boundVarOf(ix)` for read `ix` of open type `t`, where the IR holds it closed and legacy stores
+// it as `t`'s rep: a closure its cell holds (`cellTakesClosure`), or a list of closures its cell
+// or its local's declared valtype holds; else -1.
+function storedVarOf(ix: i32, t: i32): i32 {
+  const v = boundVarOf(ix)
+  if v < 0 || irTyOpen(ib.irVars[v].vTy) { return -1 }
+  const d = identDeclOf(ix)
+  if d < 0 || !(nodeAt(d) is LetDecl) { return -1 }
+  const vr = ib.irVars[v].vRep
+  const claims = letBindRepClaims(d, ibFnIx)
+  const kind = if claims { letBindRep(d, ibFnIx).rdKind } else { null }
+  if repNodeAt(vr) is RList {
+    if !repStoresAs(repNodeOfTy(t), vr) { return -1 }
+    if claims { return if kind == "reflist" { v } else { -1 } }
+    return if u8sSame(irSlotValtype(ib.irVars[v].vSlot), refRepValtype(vr)) { v } else { -1 }
+  }
+  return if kind == "closure" { v } else { -1 }
 }
 
 // The variable the IR built for the `let` or parameter read `ix` names, or -1.
@@ -1932,7 +1969,10 @@ function declVarAt(d: i32, rep: i32, ty: i32): i32 {
   // One variable per wasm local: an instance's read resolves to the template's declaration.
   const held = localVarAt(slot)
   if held >= 0 {
-    if ib.irVars[held].vRep != rep {
+    if (
+      ib.irVars[held].vRep != rep
+      && !openRepTakes(ty, rep, ib.irVars[held].vRep)
+    ) {
       irBMiss("local slot shared across reps")
       return -1
     }
@@ -8063,7 +8103,11 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       && (listRetag(irBOpRep(built), ib.irRetRep)
       || listRetagHole(irBOpRep(built), ib.irRetRep))
       && exprPrePathWhy(n.retArg, ibFnIx) == "") { repTemp(b, { rgV: built }, n.retArg, ib.irRetRep) } else { built }
-    if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
+    const vr = if ibMiss == "" { irBOpRep(v) } else { -1 }
+    if (
+      ibMiss != ""
+      || vr != ib.irRetRep && !openRepTakes(ib.irRetTy, ib.irRetRep, vr)
+    ) {
       return skip("return coercion")
     }
     irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, ix)

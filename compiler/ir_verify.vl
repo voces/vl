@@ -136,6 +136,8 @@ import {
   repNodeAt,
   repNodeKids,
   repNodeOfTy,
+  repOfTy,
+  repTyOf,
 } from "./emit_rep"
 import {
   listRetag,
@@ -153,6 +155,7 @@ import { AsExpr, Call, Ident, IsExpr, P, i32ToStr, nodeAt } from "./ast"
 import {
   memOpIsVoid,
   memOpPlanOf,
+  objLitArmOf,
   simdCallRow,
   simdMemBase,
   simdOperandPrim,
@@ -161,7 +164,11 @@ import {
 } from "./wasmEmit"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
-import { letBindTy, tyOpenHeldAsIds } from "./emit_classify"
+import { closureHeld, letBindTy, tyOpenHeldAsIds } from "./emit_classify"
+import { fbValtype, wTarget } from "./emit_bytes"
+import { rlWrapIdx } from "./emit_state"
+import { rlSlotOfTyOrTwin } from "./emit_shape_rows"
+import { tyRefArrElemOf } from "./emit_map_value_slots"
 import { identDeclOf } from "./symbols"
 import {
   atomicPlanOf,
@@ -171,7 +178,9 @@ import {
   litArmsReadsOf,
   memAccessPlanOf,
   narrowedMapReadOf,
+  structFieldBoxTy,
   truncSatPlanOf,
+  variantFieldBoxTy,
 } from "./wasmEmit"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
@@ -626,7 +635,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       let i = 0
       while i < ks.length {
-        if opRep(r.mrFields[i]) != ks[i] {
+        if (
+          opRep(r.mrFields[i]) != ks[i]
+          && !openRepTakes(recKidSiteTy(r, i), ks[i], opRep(r.mrFields[i]))
+        ) {
           return fail(2, at, "field " + i32ToStr(i) + "'s rep differs")
         }
         i = i + 1
@@ -1958,7 +1970,10 @@ function stmt(id: i32, prev: i32) {
       }
       if n.rtHas {
         use(n.rtV, id)
-        if opRep(n.rtV) != vf.irRetRep {
+        if (
+          opRep(n.rtV) != vf.irRetRep
+          && !openRepTakes(vf.irRetTy, vf.irRetRep, opRep(n.rtV))
+        ) {
           return fail(2, id, "a return's rep is not the result's")
         }
       }
@@ -2350,6 +2365,62 @@ export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
 // a function held at a rep no instance changes is not (`tyOpenHeldAsIds`).
 export function irTyHeldOpen(ty: i32, rep: i32): boolean {
   return irTyOpen(ty) && !tyOpenHeldAsIds(ty, rep, [])
+}
+
+// The valtype bytes legacy's `fbValtype` writes a value of rep `r` at: a held closure's, or a
+// ref-element list's at its wrapper; none for any other rep. Writes nothing to the live writer.
+export function refRepValtype(r: i32): u8[] {
+  const out: u8[] = []
+  const d = repOfTy(repTyOf(r))
+  const k = d.rdKind
+  if k == null || d.rdNul != 0 { return out }
+  // A list's type keys its wrapper by its element (`rlSlotOfTyOrTwin`), as legacy's reads do.
+  const slot = if k == "reflist" && d.rdSlot < 0 { rlSlotOfTyOrTwin(tyRefArrElemOf(repTyOf(r))) } else { d.rdSlot }
+  const clo = k == "closure" && closureHeld(r)
+  const list = k == "reflist" && slot >= 0 && slot < rlWrapIdx.length
+  if !clo && !list { return out }
+  const prev = wTarget(out)
+  fbValtype(k, slot)
+  wTarget(prev)
+  return out
+}
+
+// Whether a value of rep `src` stands where rep `dst` is asked: both write the same valtype
+// (`refRepValtype`).
+export function repStoresAs(dst: i32, src: i32): boolean {
+  const a = refRepValtype(dst)
+  return a.length > 0 && u8sSame(a, refRepValtype(src))
+}
+
+// Whether a destination of open type `ty` at rep `rep` takes a value of rep `v` as it stands,
+// stored alike (`repStoresAs`).
+export function openRepTakes(ty: i32, rep: i32, v: i32): boolean {
+  return irTyOpen(ty) && repStoresAs(rep, v)
+}
+
+// Whether record `r` is built at a variant's row, as `makeRec` lowers it.
+export function recIsVariant(r: RMakeRec, fnIx: i32): boolean {
+  return if r.mrRow >= 0 { r.mrVariant } else { objLitArmOf(r.mrAt, fnIx) == "variant" }
+}
+
+// The site type kid `k` of record `r` is delivered at (the builder's `fieldSiteTy`), or -1.
+function recKidSiteTy(r: RMakeRec, k: i32): i32 {
+  if r.mrBuiltRow < 0 { return -1 }
+  let fi = 0
+  while fi < r.mrLayout.length && r.mrLayout[fi] != k { fi = fi + 1 }
+  if fi >= r.mrLayout.length { return -1 }
+  return if recIsVariant(r, vf.irAt) { variantFieldBoxTy(r.mrBuiltRow, fi) } else { structFieldBoxTy(r.mrBuiltRow, fi) }
+}
+
+// Whether byte lists `a` and `b` are equal.
+export function u8sSame(a: u8[], b: u8[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return true
 }
 
 // Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
