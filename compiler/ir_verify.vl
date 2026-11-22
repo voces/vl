@@ -29,6 +29,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RClosureEq,
   RCoalAtomStr,
   RCoalStr,
   RCoerce,
@@ -541,6 +542,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RSharedRead => {
+      // A global receiver is read again at each push; its recorded cell is the box, `srV` unread.
+      if r.srGlobal >= 0 {
+        if !boxShaped(irGlobalRepOf(vf, r.srGlobal)) {
+          return fail(2, at, "a shared read's global receiver is a box")
+        }
+        if !(r.srV is OImm) {
+          return fail(2, at, "a shared read's global receiver has no operand")
+        }
+        return 0
+      }
       use(r.srV, at)
       // Unstashed, every arm reads the receiver twice, and a temp is read once.
       if (
@@ -915,6 +926,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RNulNicheEq => nulNicheEqCheck(r, dst, at)
+    RClosureEq => closureEqCheck(r, dst, at)
     RNulTest => {
       use(r.ntV, at)
       const d = repNodeAt(opRep(r.ntV))
@@ -1289,8 +1301,20 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RStructEq => {
       uses([r.seL, r.seR], at)
+      uses(r.seLIx, at)
+      uses(r.seRIx, at)
       if repIsScalar(opRep(r.seL)) || repIsScalar(opRep(r.seR)) {
         return fail(2, at, "a record compare's operands are references")
+      }
+      for ixs in [r.seLIx, r.seRIx] {
+        for o in ixs {
+          if repPrim(opRep(o)) != "i32" {
+            return fail(2, at, "a record compare's element index is an i32")
+          }
+        }
+      }
+      if r.seLIx.length > 1 || r.seRIx.length > 1 {
+        return fail(2, at, "a record compare's element read has one index")
       }
       if dst >= 0 && repPrim(dst) != "bool" {
         return fail(2, at, "a record compare's answer is a bool")
@@ -1642,7 +1666,8 @@ function coalPopOrWhy(n: SCoalBox): string {
 }
 
 // Why a fused map read whose default computes is ill-formed, or "": it probes a map receiver by a
-// key along an inline form, `i32` (1) or mv (2), into an out of the read's own rep.
+// key along an inline form, `i32` (1), mv (2) or a scalar union value's (3), into an out of the read's
+// own rep.
 function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   const mp = n.cbMap
   if mp == null { return "a fused map read holds no probe" }
@@ -1650,7 +1675,7 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   if !mapRecvOk(mp.prSym, n.cbL, id) {
     return "a map read of a receiver that is no map"
   }
-  if mp.prForm != 1 && mp.prForm != 2 {
+  if mp.prForm < 1 || mp.prForm > 3 {
     return "a fused map read writes its default in no miss arm"
   }
   const o = n.cbOut
@@ -1667,6 +1692,10 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   )
   if mp.prForm == 2 && (!(mr is RMap) || mr.rmVal != vf.irVars[o].vRep) {
     return "a map read's mv slot yields no value of its map"
+  }
+  // A union value's read peels to its scalar.
+  if mp.prForm == 3 && (!(mr is RMap) || p == null) {
+    return "a map read's union value peels to no scalar"
   }
   return ""
 }
@@ -1749,6 +1778,51 @@ function labelled(label: i32, out: i32, body: i32[]) {
   nested(body)
   vfLabels.pop()
   vfLabelOut.pop()
+  return 0
+}
+
+// A `??`'s checks: its operand block, operand, out, arm and default. Its own frame, so `stmt`'s
+// per-level frame stays as small as its other arms need.
+function coalBoxCheck(n: SCoalBox, id: i32) {
+  // A fused map read's receiver is read by its probe, which may name a global instead.
+  const mapArm = n.cbArm == "mapIndexGetOr"
+  if (n.cbMap != null) != mapArm {
+    return fail(2, id, "a `??` holds a map probe off the map-read arm")
+  }
+  if n.cbLB.length > 0 && n.cbArm != "nulRef" {
+    return fail(
+      2,
+      id,
+      "a `??` builds its operand inside off the nullable-reference arm",
+    )
+  }
+  // The operand block's definitions are seen by the operand, then dropped with the node.
+  const nDefs = vfDefLog.length
+  let lbPrev = -1
+  for lid in n.cbLB {
+    stmt(lid, lbPrev)
+    lbPrev = lid
+  }
+  if !mapArm { use(n.cbL, id) }
+  if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
+    return fail(4, id, "a boxed `??` writes no variable")
+  }
+  const why = match n.cbArm {
+    "popOr" => coalPopOrWhy(n)
+    "mapIndexGetOr" => coalMapGetOrWhy(n, id)
+    "nulRef" => coalNulRefWhy(n)
+    "litUnion" | "nulBool" => coalNicheWhy(n)
+    "fieldBox" | "fieldVal" => coalFieldWhy(n)
+    "optLeaf" => coalOptLeafWhy(n)
+    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
+  }
+  if why != "" { return fail(2, id, why) }
+  nested(n.cbNull)
+  endsWriting(n.cbNull, n.cbOut, id)
+  while vfDefLog.length > nDefs {
+    const d = vfDefLog.pop() ?? -1
+    if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
+  }
   return 0
 }
 
@@ -1921,29 +1995,7 @@ function stmt(id: i32, prev: i32) {
       vfLabelOut.pop()
     }
     SIf => ifSpine(id)
-    SCoalBox => {
-      // A fused map read's receiver is read by its probe, which may name a global instead.
-      const mapArm = n.cbArm == "mapIndexGetOr"
-      if (n.cbMap != null) != mapArm {
-        return fail(2, id, "a `??` holds a map probe off the map-read arm")
-      }
-      if !mapArm { use(n.cbL, id) }
-      if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
-        return fail(4, id, "a boxed `??` writes no variable")
-      }
-      const why = match n.cbArm {
-        "popOr" => coalPopOrWhy(n)
-        "mapIndexGetOr" => coalMapGetOrWhy(n, id)
-        "nulRef" => coalNulRefWhy(n)
-        "litUnion" | "nulBool" => coalNicheWhy(n)
-        "fieldBox" | "fieldVal" => coalFieldWhy(n)
-        "optLeaf" => coalOptLeafWhy(n)
-        "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
-      }
-      if why != "" { return fail(2, id, why) }
-      nested(n.cbNull)
-      endsWriting(n.cbNull, n.cbOut, id)
-    }
+    SCoalBox => coalBoxCheck(n, id)
     SSwitch => switchCheck(n, id)
     SBr => {
       if n.brHas && !vf.irHelper {
@@ -2135,6 +2187,22 @@ function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
   return 0
 }
 
+// A function-value compare's two operands at closure reps, and its 0/1 answer a bool.
+function closureEqCheck(r: RClosureEq, dst: i32, at: i32) {
+  use(r.cqL, at)
+  use(r.cqR, at)
+  if (
+    !(repNodeAt(opRep(r.cqL)) is RClosure)
+    || !(repNodeAt(opRep(r.cqR)) is RClosure)
+  ) {
+    return fail(2, at, "a function-value compare's operands are closures")
+  }
+  if dst >= 0 && repPrim(dst) != "bool" {
+    return fail(2, at, "a function-value compare is a bool")
+  }
+  return 0
+}
+
 // A guarded nullable compare's two operands at reference reps, and its 0/1 answer a bool.
 function nulNicheEqCheck(r: RNulNicheEq, dst: i32, at: i32) {
   use(r.neL, at)
@@ -2254,6 +2322,7 @@ function rhsReadsList(r: Rhs): boolean {
       RCast |
       RCellGet |
       RCellNew |
+      RClosureEq |
       RCoalAtomStr |
       RCoalStr |
       RCoerce |
