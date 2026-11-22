@@ -44184,67 +44184,43 @@ function coalOptCallArmOf(lhs: OptMember, fnIx: i32): CoalOptArm {
 // The last `emitCoalesceGo` arms, the nullable-ref cores (a union arm, a record, a value-union
 // box, a map), and the refusal for any other nullable operand. Returns what
 // `emitCoalesceGo` returns.
-function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
-  // The variant sibling of the arm below, its own arm rather than a widening of it: a `T |
-  // null` whose `T` is a union arm stores `(ref null $variantHeap(vi))`, and
-  // `structIndexOfExpr` has no row to answer with (`collectS` skips a union member). Same
-  // niche, same `br_on_non_null` lowering, one table over.
-  const crHeap = coalNulRefHeapOf(e, unwrapParen(e.binLeft), exprIx, fnIx)
-  if crHeap >= 0 { return emitCoalesceNulRef(e, exprIx, crHeap, fnIx) }
-  // D960 — `??` over a nullable value-union box whose operand cannot be re-read. The
-  // re-readable spelling never arrives here: `emit_rewrite` desugars it to an `if`, which is
-  // right because a rewrite leaves no `??` node for the consumer classifiers to disagree
-  // about. A call operand cannot take that route, so it needs a real emit arm: stash the box once, branch on its tag, and give the `if` the box as its result type so both arms agree.
+// How `emitCoalesceNullableRefs` writes `l ?? d`, in its order: a nullable reference's core
+// (`heap`), a value-union box stashed once (`boxStash`), the null test `coalNullTestIf` spells
+// (`pinnedCellIf`, `atomJoinIf`, `numJoinIf`, `cellIf`), a nullable map's core (`mapHeap`), the
+// `??` moved onto an `if`'s other arm (`armIf`), a shared `scalar | null` field (`boxFieldScalar`).
+export type CoalNulRefsArm = "heap"
+  | "boxStash"
+  | "pinnedCellIf"
+  | "mapHeap"
+  | "atomJoinIf"
+  | "numJoinIf"
+  | "armIf"
+  | "boxFieldScalar"
+  | "cellIf"
+  | "none"
 
-  // The two earlier emit arms fought each other: one emitted a correct `(if (result (ref
-  // $box)) …)`, and the return path wrapped it in a second `struct.new $box` — the pair D969
-  // untangled, since the consumer double-boxes precisely because `exprUnion` answers false for
-  // this node. Teaching `unionNameOfExpr` to answer for a value-union `??` is the other half; neither half works alone.
+export function coalNulRefsArmOf(
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+): CoalNulRefsArm {
+  if coalNulRefHeapOf(e, unwrapParen(e.binLeft), exprIx, fnIx) >= 0 {
+    return "heap"
+  }
   if tyIsNulValueUnionBox(nodeTyAt(e.binLeft, fnIx)) {
-    const coNm = boxTyName(nodeTyIxOf(exprIx))
-    if coNm != "" {
-      const coSlot = sharedFieldRecvSlot()
-      if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-      fbLocalSet(coSlot)
-      fbLocalGet(coSlot)
-      fbStructGet(uBoxIdx, 0) // field 0: tag
-      fbI32Rel(RS_TAG, nullBoxTag())
-      fbI32Bin(71) // 0x47 i32.ne  -> present?
-      fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
-      fbLocalGet(coSlot)
-      fbRefAsNonNull() // the stash cell is nullable, the block type is not
-      fbElse()
-      if (emitUnionBoxOwed(coNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
-        return -1
-      }
-      fbEnd()
-      return 0
-    }
-    // An instance's re-readable list cell, typed at the box only at its pin, is the null test
-    // the rewrite makes of the concrete spelling (D8820).
+    if boxTyName(nodeTyIxOf(exprIx)) != "" { return "boxStash" }
+    // An instance's re-readable list cell, typed at the box only at its pin (D8820).
     const coLhs = unwrapParen(e.binLeft)
     if coLhs >= 0 && fnInPinnedInstance(fnIx) && exprReReadable(coLhs) {
       const coCell = nodeAt(coLhs)
       if coCell is Index && !exprMap(coCell.idxArr, fnIx) {
-        return emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
+        return "pinnedCellIf"
       }
     }
   }
-  // `<e> ?? d` over a nullable map: the cell is a `(ref null $map)` of the operand's shape, so it
-  // takes the same `br_on_non_null` core, and a `Map()` default builds that shape (D3257).
-  if exprNullableMap(e.binLeft, fnIx) {
-    let cms = mapShapeOfExpr(e.binLeft, fnIx)
-    if cms == -3 { cms = mapShapeOfTyPeeled(nodeTyIxOf(e.binLeft)) }
-    if cms != -3 {
-      return emitCoalesceNulRef(e, exprIx, mapTypeIdxOf(cms), fnIx)
-    }
+  if exprNullableMap(e.binLeft, fnIx) && coalNulMapShape(e, fnIx) != -3 {
+    return "mapHeap"
   }
-  // What reaches here is a nullable left operand whose rep has no `??` lowering — not "this is
-  // not a map index get", which is what this said while the overwhelming majority of its
-  // firings are a non-nullable operand. Those fold to the left operand in `emit_rewrite.vl`
-  // and never reach the emitter as a `??` at all, so the message can finally name the actual residue.
-
-  // A re-readable atom niche joining into a box is the null test it spells.
   const lhsIx = unwrapParen(e.binLeft)
   if (
     lhsIx >= 0
@@ -44252,31 +44228,78 @@ function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
     && exprNulLitUnion(lhsIx, fnIx)
     && coalesceResultIsBox(exprIx, fnIx)
   ) {
-    return emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
+    return "atomJoinIf"
   }
-  // A re-readable cell joining numbers of different types apart is the null test it spells,
-  // typed at the instance's join when the shared `??` records only its hole (D9701).
-  if lhsIx >= 0 && exprReReadable(lhsIx) {
-    const nrt = coalResultTyOf(exprIx, fnIx)
-    if numUnionMinted && tyHoldsNumbersApart(nrt) {
-      const nIf = coalNullTestIf(e, exprIx, fnIx)
-      nodeTyRecord(nIf, nrt)
-      return emitExpr(nIf, fnIx)
-    }
+  // A re-readable cell joining numbers of different types apart (D9701).
+  if (
+    lhsIx >= 0
+    && exprReReadable(lhsIx)
+    && numUnionMinted
+    && tyHoldsNumbersApart(coalResultTyOf(exprIx, fnIx))
+  ) {
+    return "numJoinIf"
   }
-  const armIf = coalNullArmIf(e, exprIx)
-  if armIf >= 0 { return emitExpr(armIf, fnIx) }
-  // A record union's shared `scalar | null` field reads as its box (D13280).
-  const fk = coalBoxFieldScalarKind(lhsIx, fnIx)
-  if fk >= 0 { return emitCoalesceBoxFieldScalar(e, exprIx, fk, fnIx) }
-  // A re-readable list cell is the null test it spells, as an instance's is (D16483).
+  if coalNullArmIfFits(e) { return "armIf" }
+  if coalBoxFieldScalarKind(lhsIx, fnIx) >= 0 { return "boxFieldScalar" }
+  // A re-readable list cell (D16483).
   const cell = if lhsIx >= 0 { nodeAt(lhsIx) } else { null }
   if cell is Index && exprReReadable(lhsIx) && !exprMap(cell.idxArr, fnIx) {
-    return emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
+    return "cellIf"
   }
-  return emitFail(
-    "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
-  )
+  return "none"
+}
+
+// The map shape a nullable map `l ?? d` reads, or -3 where it has none.
+function coalNulMapShape(e: BinExpr, fnIx: i32): i32 {
+  const cms = mapShapeOfExpr(e.binLeft, fnIx)
+  return if cms == -3 { mapShapeOfTyPeeled(nodeTyIxOf(e.binLeft)) } else { cms }
+}
+
+function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const lhsIx = unwrapParen(e.binLeft)
+  return match coalNulRefsArmOf(e, exprIx, fnIx) {
+    "heap" => emitCoalesceNulRef(e, exprIx, coalNulRefHeapOf(e, lhsIx, exprIx, fnIx), fnIx)
+    // D960: a value-union box whose operand cannot be re-read, stashed once and branched on its
+    // tag, the `if` typed at the box so both arms agree (D969).
+    "boxStash" => emitCoalesceBoxStash(e, exprIx, fnIx)
+    "pinnedCellIf" | "atomJoinIf" | "cellIf" => emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
+    // A nullable map's cell takes the same `br_on_non_null` core, and a `Map()` default builds
+    // its shape (D3257).
+    "mapHeap" => emitCoalesceNulRef(e, exprIx, mapTypeIdxOf(coalNulMapShape(e, fnIx)), fnIx)
+    "numJoinIf" => {
+      const nIf = coalNullTestIf(e, exprIx, fnIx)
+      nodeTyRecord(nIf, coalResultTyOf(exprIx, fnIx))
+      emitExpr(nIf, fnIx)
+    }
+    "armIf" => emitExpr(coalNullArmIf(e, exprIx), fnIx)
+    // A record union's shared `scalar | null` field reads as its box (D13280).
+    "boxFieldScalar" => emitCoalesceBoxFieldScalar(e, exprIx, coalBoxFieldScalarKind(lhsIx, fnIx), fnIx)
+    "none" => emitFail(
+      "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
+    )
+  }
+}
+
+// D960's stash: the box once into the shared slot, its tag tested, the box or the default boxed
+// into the result's union.
+function emitCoalesceBoxStash(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const coNm = boxTyName(nodeTyIxOf(exprIx))
+  const coSlot = sharedFieldRecvSlot()
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  fbLocalSet(coSlot)
+  fbLocalGet(coSlot)
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Bin(71) // 0x47 i32.ne  -> present?
+  fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
+  fbLocalGet(coSlot)
+  fbRefAsNonNull() // the stash cell is nullable, the block type is not
+  fbElse()
+  if (emitUnionBoxOwed(coNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
+    return -1
+  }
+  fbEnd()
+  return 0
 }
 
 // The scalar atom kind of the `scalar | null` box the field read `lhsIx` yields, read off the
@@ -44342,17 +44365,25 @@ function emitCoalesceBoxFieldScalar(
   return 0
 }
 
+// Whether `coalNullArmIf` moves `l ?? d` onto an `if`'s other arm: a desugared `if` with a `null`
+// arm, each arm one statement.
+function coalNullArmIfFits(e: BinExpr): boolean {
+  if !coalNullArmShaped(e) { return false }
+  const n = nodeAt(unwrapParen(e.binLeft))
+  if !(n is IfStmt) { return false }
+  return coalSoleStmt(n.ifThen) >= 0 && coalSoleStmt(n.ifElse) >= 0
+}
+
 // `if c { d } else { a ?? d }` for `(if c { null } else { a }) ?? d`, and its mirror, which is
 // what `?? d` means for an `if` with a `null` arm: the `??` moves onto the other arm, whose own
 // rep an instance types, where the `if` keeps its generic `V | null` (D10130). Only a desugared
 // `if` reaches here: a written one is already bound to a local. -1 otherwise.
 function coalNullArmIf(e: BinExpr, exprIx: i32): i32 {
-  if !coalNullArmShaped(e) { return -1 }
+  if !coalNullArmIfFits(e) { return -1 }
   const n = nodeAt(unwrapParen(e.binLeft))
   if !(n is IfStmt) { return -1 }
   const tv = coalSoleStmt(n.ifThen)
   const ev = coalSoleStmt(n.ifElse)
-  if tv < 0 || ev < 0 { return -1 }
   const tNull = nodeAt(tv) is NullLit
   const pos = e.pos
   let live = tv
