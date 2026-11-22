@@ -39,5 +39,7 @@ otherwise reads past the null arm, which is the storage local as it stands.
 - tests/cases armed shadow: covered 68,073 → 68,078, matched 68,072 → 68,077 (+5);
   `uncovered narrowed read` 142 → 136; one new `uncovered null read storage rep`.
 - Corpus no-blocker functions unchanged at 44,857 (narrowed read 10 → 10).
-- Self-compile L2 fuel +0.57% per PR: `deliver` asks `nullReadOwnAt`, and through it
-  `identReadArmOf`, for each identifier it delivers.
+- Self-compile L2 fuel +0.07% per PR. A first cut cost +0.57%: `deliver` asked the whole
+  `identReadArmOf` ladder of each identifier it delivered. Legacy's null rung is now its own
+  `identReadsNull`, which both the ladder and `nullReadOwnAt` ask, and the pre-path check runs only
+  on a null read. `--cases` after the cut: identical 7606, differ 0; witnesses same 60, differ 0.
