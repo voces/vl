@@ -2661,7 +2661,13 @@ function refIfArm(
   // An atom arm in a `string` join decodes to its member string (`emitAtomToStr`), from the atom
   // as its cell holds it.
   const built = exprAt(body, tv, arm == "atomStr")
-  const v = if arm == "atomStr" && ibMiss == "" { atomToStr(body, built, tv, rep) } else if ibMiss == "" && refIfArmNiches(built, tv, rep) { repTemp(body, { rgV: built }, tv, rep) } else { built }
+  // An arm built at a closure rep the join's leaves open, or fills, is the same closure retagged.
+  const holed = arm == "plain"
+    && ibMiss == ""
+    && irBOpRep(built) != rep
+    && holeRetagNoted(irBOpRep(built), rep, true)
+    && exprPrePathWhy(tv, ibFnIx) == ""
+  const v = if arm == "atomStr" && ibMiss == "" { atomToStr(body, built, tv, rep) } else if ibMiss == "" && (holed || refIfArmNiches(built, tv, rep)) { repTemp(body, { rgV: built }, tv, rep) } else { built }
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("ref if arm rep") }
   if ibMiss == "" {
     irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
@@ -3101,12 +3107,19 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   // A nullable capture read at the member the checker narrowed it to: the capture at its own rep.
   const na: NullNarrowArm = if cr != rep { nullNarrowArmOf(ix, cr, rep) } else { "none" }
   const narrowed = na == "plain" || na == "held"
-  if cr != rep && !narrowed && !capCellListSame(fe, name, cr, rep) {
+  // A closure capture read where its type leaves a closure part open, or fills one, is the same
+  // closure struct, retagged.
+  const holed = cr != rep
+    && !narrowed
+    && holeRetagNoted(cr, rep, true)
+    && exprPrePathWhy(ix, ibFnIx) == ""
+  if cr != rep && !narrowed && !holed && !capCellListSame(fe, name, cr, rep) {
     return irBMiss("capture binding")
   }
   // The capture is held at its binding's type, whose rep must be the one it is read at first.
-  const cty = if narrowed { capTyOf(fe, name) } else { -1 }
-  if narrowed && (cty < 0 || repNodeOfTy(cty) != cr) {
+  const atOwn = narrowed || holed
+  const cty = if atOwn { capTyOf(fe, name) } else { -1 }
+  if atOwn && (cty < 0 || repNodeOfTy(cty) != cr) {
     return irBMiss("capture binding")
   }
   if !cloLifted(fe) {
@@ -3115,15 +3128,18 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
       return irBMiss("capture list test")
     }
     const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
-    if !narrowed { return irBLetTemp(b, ev, ix, cr) }
-    return captureRecover(b, irBLetTempTy(b, ev, ix, cr, cty), ix, rep, na)
+    if !atOwn { return irBLetTemp(b, ev, ix, cr) }
+    const own = irBLetTempTy(b, ev, ix, cr, cty)
+    if holed { return repTemp(b, { rgV: own }, ix, rep) }
+    return captureRecover(b, own, ix, rep, na)
   }
   if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
   const v = liftCapVar(fe, name, rep)
-  const held = if narrowed { cr } else { rep }
+  const held = if atOwn { cr } else { rep }
   if v < 0 || ib.irVars[v].vRep != held { return irBMiss("capture binding") }
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
+  if holed { return repTemp(b, { rgV: o }, ix, rep) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
 }
 
