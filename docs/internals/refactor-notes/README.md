@@ -8,6 +8,27 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-22-ir-tail-arm-stmt](2026-11-22-ir-tail-arm-stmt.md): IR coverage: a tail arm's last statement, decided by legacy's own question (2026-11-22, lane IR-N7)
+- [2026-11-22-ir-struct-eq-place](2026-11-22-ir-struct-eq-place.md): IR coverage: a record compare side legacy re-reads as a list element (2026-11-22, lane IR-N8)
+- [2026-11-22-ir-start-box-receiver](2026-11-22-ir-start-box-receiver.md): IR: a module global union as a box receiver (2026-11-22, lane IR-N3)
+- [2026-11-22-ir-shared-read-global-recv](2026-11-22-ir-shared-read-global-recv.md): IR: a shared field read off a module global (2026-11-22, lane IR-N3)
+- [2026-11-22-ir-never-arm](2026-11-22-ir-never-arm.md): IR coverage: value and tail arms that never return (2026-11-22, lane IR-N7)
+- [2026-11-22-ir-map-read-union-mv](2026-11-22-ir-map-read-union-mv.md): IR: a nullable-scalar map value read under `??` (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-map-get-atom-niche](2026-11-22-ir-map-get-atom-niche.md): IR: a literal-union map's bare read at its nullable atom (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-is-rung](2026-11-22-ir-is-rung.md): IR coverage: `x is K` over a numeric literal union (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-holder-record](2026-11-22-ir-holder-record.md): IR: a binding holding a returned bundle record (2026-11-22, lane IR-D1)
+- [2026-11-22-ir-coal-opt-next](2026-11-22-ir-coal-opt-next.md): IR coverage: a nullable reference's `??` builds a temp operand inside its block (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-coal-nulref-rungs](2026-11-22-ir-coal-nulref-rungs.md): IR coverage: a `??` past the nullable-reference core takes legacy's named rung (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-closure-global-call-init](2026-11-22-ir-closure-global-call-init.md): IR: a closure global initialized by a call is the value emitExpr writes, 2026-11-22
+- [2026-11-22-ir-closure-eq](2026-11-22-ir-closure-eq.md): IR coverage: function-value compares on legacy's `closure` route (2026-11-22, lane IR-N8)
+- [2026-11-22-ir-clone-param-type](2026-11-22-ir-clone-param-type.md): IR: a clone's parameter takes its annotation's type (2026-11-22, lane IR-D1)
+- [2026-11-22-ir-claim-numunionbin](2026-11-22-ir-claim-numunionbin.md): RNumUnionBin is a scalar numeric operator, and is claimed (IR-C1)
+- [2026-11-22-ir-claim-mem](2026-11-22-ir-claim-mem.md): The `mem` family is claimed (IR-C1)
+- [2026-11-22-ir-claim-listnew](2026-11-22-ir-claim-listnew.md): The list constructors are claimed (IR-C1)
+- [2026-11-22-ir-claim-callhost](2026-11-22-ir-claim-callhost.md): RCallHost is a call, and is claimed (IR-C1)
+- [2026-11-22-ir-capture-instance-decl](2026-11-22-ir-capture-instance-decl.md): IR: a cloned instance's nested function captures the frame's own clone of a binding, 2026-11-22
+- [2026-11-22-ir-bundle-choice](2026-11-22-ir-bundle-choice.md): IR: a choice handed to a bundle parameter (2026-11-22, lane IR-D1)
+- [2026-11-22-ir-arrnew-plan-no-mint](2026-11-22-ir-arrnew-plan-no-mint.md): IR: an `__array_new__` refusal asked without minting (2026-11-22, lane IR-N3)
 - [2026-11-22-ir-variant-eq](2026-11-22-ir-variant-eq.md): IR coverage: `==`/`!=` over records on legacy's `variantEq` route (2026-11-22, lane IR-N8)
 - [2026-11-22-ir-union-union-struct](2026-11-22-ir-union-union-struct.md): IR coverage: `==`/`!=` over a union of records on legacy's `unionUnion` route (2026-11-22, lane IR-N8)
 - [2026-11-22-ir-struct-eq](2026-11-22-ir-struct-eq.md): IR coverage: `==`/`!=` over records on legacy's `structEq` route (2026-11-22, lane IR-N7)
