@@ -12,8 +12,13 @@ struct's. Legacy writes `struct.new $0` and returns it: both rows are one heap, 
 
 ## The change
 
-- `recRetag` (`ir.vl`): a variant record rep and a plain struct rep with the same fields. The
-  verifier's `RRetag` rule accepts such a pair, beside `listRetag` and `listRetagHole`.
+- `recRetag` (`ir.vl`): a variant record rep and a plain struct rep with the same fields, stored
+  on one heap. The verifier's `RRetag` rule accepts such a pair, beside `listRetag` and
+  `listRetagHole`. The heap is `recHeapOf`, from `recordHeapOfTy` (`emit_shape_intern.vl`) of the
+  rep's type: the variant row by shape, else the struct row, with a `new` brand erased to its base
+  as it is at run time. Both reps must name the same heap, so the rule is sound by itself.
+  `armHeapOfTy` cannot answer for the twin, since it does not erase the brand (`W` has no row of its
+  own), and legacy's `armValuePlainOf` layout-twin test does not apply either.
 - The return builder retags a built record into the result where `recRetag` holds and
   `exprPrePathWhy` records no coercion at the value. This is the gate #9472's list retags read.
 
