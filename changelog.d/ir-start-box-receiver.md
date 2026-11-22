@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR: a module global union read as a box receiver is its cell (`box receiver`).** A narrowed field read (`if sh is Rect { print(sh.w) }`) or a box delivery whose receiver is a module global, which the start body reads, is now built. Legacy's `emitUnionBoxPush` reads a name that is neither a local nor a capture as the global's cell, recovered where it is not a constant. The builder reads it the same way, sharing the box read `globalUnboxRead` already wrote. An unstashed shared field read pushes its receiver once per arm, so its global receiver stays a named miss. Legacy bytes are unchanged.
