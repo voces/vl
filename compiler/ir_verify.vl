@@ -7,7 +7,6 @@
 // emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
 // builder, and trap order (rule 9) with the first pass that moves a check. Until steps I2-I7
 // build them, the arms for records, lists, casts, tags, maps and closures have no input.
-import { NULL_OWN_BOX, NULL_OWN_NONE } from "./emit_plan_null"
 import {
   IrFn,
   IrNode,
@@ -131,6 +130,8 @@ import {
   SSwitch,
   STrap,
   irBodyLeaves,
+  irFactIntOf,
+  irFactTyOf,
   irFnNew,
   irGlobalRepOf,
   irGlobalStoreTyOf,
@@ -172,20 +173,13 @@ import {
 } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
-import { AsExpr, Call, IsExpr, i32ToStr, nodeAt } from "./ast"
-import { memOpIsVoid, memOpPlanOf } from "./wasmEmit"
-import { nodeTyAt } from "./emit_capture_frames"
+import { AsExpr, Call, i32ToStr, nodeAt } from "./ast"
 import { closureHeld, tyOpenHeldAsIds } from "./emit_classify"
 import { fbValtype, wTarget } from "./emit_bytes"
 import { rlWrapIdx } from "./emit_state"
 import { rlSlotOfTyOrTwin } from "./emit_shape_rows"
 import { tyRefArrElemOf } from "./emit_map_value_slots"
-import {
-  litArmsReadsOf,
-  narrowedMapReadOf,
-  structFieldBoxTy,
-  variantFieldBoxTy,
-} from "./wasmEmit"
+import { structFieldBoxTy, variantFieldBoxTy } from "./wasmEmit"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -502,7 +496,7 @@ function stageAt(id: i32): RListStage | null {
 // the storage row the builder recorded taking it at (`irGlobalStoreTyOf`; D14434, D14426).
 function globalReadAtTyOrStorage(sym: i32, dst: i32, at: i32): boolean {
   const src = vf.irNodeAt[at] ?? -1
-  if src < 0 || dst == repNodeOfTy(nodeTyAt(src, vf.irAt)) { return true }
+  if src < 0 || dst == repNodeOfTy(irFactTyOf(vf, at)) { return true }
   const st = irGlobalStoreTyOf(vf, sym)
   return st >= 0 && dst == repNodeOfTy(st)
 }
@@ -716,7 +710,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       // A union-box field's read unboxes to the read's own rep (`structUnionBoxTail`).
       const k = kidAt(v, r.gfIx)
       const unboxed = repNodeAt(k) is RBox
-        && dst == repNodeOfTy(nodeTyAt(r.gfAt, vf.irAt))
+        && dst == repNodeOfTy(irFactTyOf(vf, at))
       // A nullable field the checker narrowed past its null reads at its inner rep.
       const kn = repNodeAt(k)
       const narrowed = kn is RNullable && kn.rnInner == dst
@@ -792,8 +786,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           return fail(2, at, "a memory op's operands are i32s")
         }
       }
-      const c = nodeAt(r.moAt)
-      const v = c is Call && memOpIsVoid(memOpPlanOf(c).moArm)
+      const v = irFactIntOf(vf, at, 0) == 1
       if dst >= 0 && (v || dst != vfI32) {
         return fail(
           2,
@@ -905,11 +898,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RNullOf => {
       const d = repNodeAt(dst)
-      if r.nuOwn == NULL_OWN_BOX {
+      const own = irFactIntOf(vf, at, 2)
+      if own == 1 {
         if !(d is RBox) && !(d is RNullable && d.rnDisc == 4) {
           return fail(2, at, "a null box is not delivered into a union box")
         }
-      } else if r.nuOwn == NULL_OWN_NONE && repPrim(dst) == "null" {
+      } else if own == 0 && repPrim(dst) == "null" {
         // The `null` unit's one value is the bottom ref.
       } else if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
         return fail(
@@ -1161,8 +1155,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.liV, at)
       if dst != vfBool { return fail(2, at, "a literal arms test is a bool") }
       // An operand legacy reads more than once (`litArmsReadsOf`) is a variable.
-      const lt = nodeAt(r.liAt)
-      const reads = if lt is IsExpr { litArmsReadsOf(r.liAt, r.liArm, lt.isObj, vf.irAt) } else { 2 }
+      const reads = irFactIntOf(vf, at, 2)
       if reads > 1 && !(r.liV is OVar) {
         return fail(2, at, "a literal arms test re-reads a variable")
       }
@@ -1288,8 +1281,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       const m = repNodeAt(mapRecvRep(r.mtSym, r.mtLoc))
       // A union value's narrowed read is unboxed to its member's scalar (`narrowedMapReadOf`).
-      const unboxed = narrowedMapReadOf(r.mtAt, vf.irAt).nmArm == "unbox"
-        && repPrim(dst) != null
+      const unboxed = irFactIntOf(vf, at, 0) == 1 && repPrim(dst) != null
       // A union value's read is its box, `null` one more tag of it.
       const sameBox = m is RMap
         && repNodeAt(repBoxCore(dst)) is RBox
