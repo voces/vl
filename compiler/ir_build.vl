@@ -114,6 +114,7 @@ import {
 import {
   listRetag,
   repBoolNiche,
+  repBoxCore,
   repIsNoValue,
   repIsScalar,
   repPrim,
@@ -289,6 +290,7 @@ import {
   trapCallNamed,
   truncSatCallNamed,
   truncSatPlanOf,
+  unionConcreteEqPlanOf,
   valueIfLitTrue,
   variantFieldArmOf,
   variantFieldBoxTy,
@@ -377,6 +379,7 @@ import {
   EmptyFitPlan,
   arrLitIsForIter,
   coalFieldPlanOf,
+  coalNullTestIf,
   emptyFitArmsPlain,
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
@@ -387,6 +390,7 @@ import {
   litArmsReadsOf,
   litIsBoxLexes,
   litMemberEqArmOf,
+  narrowedMapReadOf,
   retRefusedWhy,
   spreadRunLit,
   unionLitIsPlanOf,
@@ -470,6 +474,7 @@ import {
   identIsEnvCapture,
   letBindIsAtom,
   letBindTy,
+  letNulMapReadUnionBox,
   localIndexOf,
   mapShapeOfExpr,
   memberBoxReadEnter,
@@ -515,6 +520,7 @@ import {
   sFieldStart,
   sTyIx,
   setIrShadowOn,
+  synthMintCount,
   uFieldCount,
   uFieldStart,
   uTags,
@@ -637,9 +643,11 @@ export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
   const gen = repNodeGen()
+  const minted = synthMintCount()
   ibClaimBuild = true
   const built = build(fnIx, fnPos)
   ibClaimBuild = false
+  if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
   if irVerify(ib).vfRule != 0 {
@@ -652,6 +660,14 @@ export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
     return false
   }
   count("claimed")
+  return true
+}
+
+// Whether a claim's build minted a synthetic global past count `before`: the builder asks plans
+// read-only, so one it minted would move the global section ahead of legacy's writing.
+function claimBuildMinted(before: i32): boolean {
+  if synthMintCount() == before { return false }
+  count("claim fell back: build minted a synthetic global")
   return true
 }
 
@@ -672,9 +688,11 @@ export function irClaimStart(
 ): boolean {
   if !irStartClaimOn() { return false }
   const gen = repNodeGen()
+  const minted = synthMintCount()
   ibClaimBuild = true
   const built = buildStart(order, orderGi, poolFill)
   ibClaimBuild = false
+  if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
   if irVerify(ib).vfRule != 0 {
@@ -2632,7 +2650,10 @@ function capRepOf(fe: i32, name: string): i32 {
   const prev = wTarget(vt)
   fbValtype(captureValKind(fe, name), captureValStructIdx(fe, name))
   wTarget(prev)
-  const t = valtypeOf(r)
+  // An atom and the `K | null` and `boolean | null` niches are held as their i32.
+  const n = repNodeAt(r)
+  const held = n is RAtom || atomNullable(r) || boolNullable(r)
+  const t = if held { 0x7f } else { valtypeOf(r) }
   if vt.length == 0 { return -1 }
   if t >= 0 && (vt.length != 1 || vt[0] != t) { return -1 }
   if t < 0 && vt[0] != 0x63 && vt[0] != 0x64 { return -1 }
@@ -4459,7 +4480,7 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // A scalar map read the box plan boxes is the probe's own box.
   if ibMiss == "" && dst >= 0 && boxedNullable(dst) {
     const mk = mapReadBoxKindAt(ix)
-    if mk >= 0 { return mapGetAt(b, unwrapParen(ix), dst, mk) }
+    if mk >= 0 { return mapGetAt(b, unwrapParen(ix), dst, mk, true) }
   }
   // A member record read the box plan passes as its field's box is built at its storage.
   if ibMiss == "" && dst >= 0 && heldAsBox(dst) && memberBoxReadAt(ix, ibFnIx) {
@@ -4773,6 +4794,64 @@ function unionEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return irBLetTemp(
     b,
     { ueL: l, ueR: r, ueNe: n.binOp == "!=", ueAt: ix },
+    ix,
+    rep,
+  )
+}
+
+// Whether compare operand `ix` may be a union box: no scalar, and held as a box (`eqRouteOf`
+// decides; this only spares the scalar and plain-reference compares the question).
+function unionSideOf(ix: i32): boolean {
+  if operandWhy(ix) != OPERAND_TYPE { return false }
+  return heldAsBox(repNodeOfTy(nodeTyAt(ix, ibFnIx)))
+}
+
+// A union box against a concrete operand (`eqRouteOf`'s `unionLeft`/`unionRight`, `swap` the
+// latter) on legacy's plain plan: the box a variable read twice, the operand at the arm's rep.
+function unionConcreteEq(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  swap: boolean,
+): Opnd {
+  const boxIx = if swap { n.binRight } else { n.binLeft }
+  const otherIx = if swap { n.binLeft } else { n.binRight }
+  const qp = unionConcreteEqPlanOf(boxIx, otherIx, ibFnIx)
+  if qp.uqKind < 0 { return irBMiss("union compare plan") }
+  if rep != ibBool { return irBMiss("union compare rep") }
+  const bx = irBExpr(b, boxIx)
+  if ibMiss != "" { return bx }
+  // Read twice, so a parameter or local, never a temp.
+  if (
+    !(bx is OVar)
+    || bx.ov < 0
+    || bx.ov >= ib.irVars.length
+    || ib.irVars[bx.ov].vKind == "temp"
+    || !heldAsBox(irBOpRep(bx))
+  ) {
+    return irBMiss("union compare box")
+  }
+  const k = qp.uqKind
+  if k != 0 && k != 1 && k != 2 { return irBMiss("union compare kind") }
+  const at = b.length
+  const o = if k == 2 { deliverStr(b, otherIx) } else { irBExpr(b, otherIx) }
+  if ibMiss != "" { return o }
+  // The operand is written inside the tag's `if`, so it is one the lowering reads in place.
+  if b.length != at || !(o is OVar || o is OImm || o is OStr) {
+    return irBMiss("union compare operand")
+  }
+  const want = if k == 2 { repPrim(irBOpRep(o)) == "str" } else if k == 1 { irBOpRep(o) == ibBool } else { repPrim(irBOpRep(o)) == "i32" }
+  if !want { return irBMiss("union compare operand rep") }
+  return irBLetTemp(
+    b,
+    {
+      ucBox: bx,
+      ucOther: o,
+      ucNe: n.binOp == "!=",
+      ucSwap: swap,
+      ucAt: ix,
+    },
     ix,
     rep,
   )
@@ -5346,6 +5425,14 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if arm == "chain" { return coalChain(b, n, ix, rep) }
   if arm == "niche" { return coalNiche(b, n, ix, rep) }
   if arm == "popOr" { return coalPopOr(b, n, ix, rep) }
+  // A map read joining a union is legacy's synthesized null-test `if` (`coalNullTestIf`), built
+  // as the valued `if` it is.
+  if arm == "mapJoinIf" {
+    const v = irBExpr(b, coalNullTestIf(n, ix, ibFnIx))
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != rep { return irBMiss("coalesce mapJoinIf rep") }
+    return v
+  }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
 }
@@ -5745,16 +5832,15 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // A bare map read `m[k]` by legacy's arm (`mapGetArmOf`), its key written as itself: an mv slot's
 // ref value at its niche, or a mono-valued map read at the value's own rep.
 export function mapGetBare(b: i32[], ix: i32, rep: i32): Opnd {
-  return mapGetAt(b, ix, rep, -1)
+  return mapGetAt(b, ix, rep, -1, true)
 }
 
 // `mapGetBare`, or under value-atom kind `box` (not -1) the read the box plan boxes into boxed
 // nullable `rep` (`mapScalar`), its miss the box's null.
-function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32): Opnd {
+function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
   const rd = nodeAt(ix)
   if !(rd is Index) { return irBMiss("map get") }
   const arm = mapGetArmOf(ix, ibFnIx)
-  if arm == "unionBox" { return irBMiss("map get union box") }
   const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
   const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
   if ka != "plain" { return irBMiss("map key " + ka) }
@@ -5763,7 +5849,20 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32): Opnd {
   const mr = if rk.mkSym >= 0 { irGlobalRepOf(ib, rk.mkSym) } else { irBOpRep(rk.mkLoc) }
   const m = repNodeAt(mr)
   if !(m is RMap) { return irBMiss("map get receiver rep") }
-  if box < 0 && !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) {
+  // A union-valued map's read is its value's box, the null-tagged box on a miss; a narrowed read
+  // legacy unboxes after is at another rep and stays a miss.
+  if arm == "unionBox" {
+    // At its narrowing the read is unboxed to the member's scalar after (`narrowedMapReadOf`).
+    const nm = narrowedMapReadOf(ix, ibFnIx)
+    const repOk = match nm.nmArm {
+      // The read is the value's box, its miss the box's `null` tag.
+      "none" => rep == m.rmVal
+        || repNodeAt(repBoxCore(rep)) is RBox && repBoxCore(rep) == repBoxCore(m.rmVal)
+      "unbox" => repPrim(rep) != null && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
+      "container" | "nonNull" => false
+    }
+    if box >= 0 || !repOk { return irBMiss("map get union box rep") }
+  } else if box < 0 && !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) {
     return irBMiss("map get rep")
   }
   const r: Rhs = {
@@ -5773,6 +5872,7 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32): Opnd {
     mtKey: rk.mkKey,
     mtAt: ix,
     mtBox: box,
+    mtRow: row,
   }
   if box < 0 { return irBLetTemp(b, r, ix, rep) }
   // The box is the union's own, typed at it where a narrowed re-read's node is the member's.
@@ -6243,6 +6343,16 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     const bt = binNulTestOf(n)
     if bt != null { return nulTest(b, n, bt, ix, rep) }
     if n.binOp == "??" { return coalesce(b, n, ix, rep) }
+    // A union box against a concrete operand is legacy's union compare, by legacy's own route.
+    if (
+      (n.binOp == "==" || n.binOp == "!=")
+      && (unionSideOf(n.binLeft) || unionSideOf(n.binRight))
+    ) {
+      const rt = eqRouteOf(n, ix, ibFnIx)
+      if rt == "unionLeft" || rt == "unionRight" {
+        return unionConcreteEq(b, n, ix, rep, rt == "unionRight")
+      }
+    }
     // Two operands typed at single string literals fold to a constant (`atomEqPlanOf`).
     if (
       (n.binOp == "==" || n.binOp == "!=")
@@ -6634,6 +6744,24 @@ function writesPlaceValue(rhs: i32): boolean {
 }
 
 function assignTo(b: i32[], n: BinExpr, ix: i32) {
+  const at = b.length
+  assignToGo(b, n, ix)
+  siteArmNote(b, at, n, ix)
+  return 0
+}
+
+// Notes the first node assignment `ix` built into `b` from `at`, where its right side is a `+`
+// chain legacy's `strSiteArm` may arm as an append site.
+function siteArmNote(b: i32[], at: i32, n: BinExpr, ix: i32) {
+  if ibMiss != "" || b.length <= at { return 0 }
+  const r = nodeAt(unwrapParen(n.binRight))
+  if !(r is BinExpr) || r.binOp != "+" { return 0 }
+  ib.irSiteArmAt[b[at]] = ix
+  ib.irHasSiteArms = true
+  return 0
+}
+
+function assignToGo(b: i32[], n: BinExpr, ix: i32) {
   if writesPlaceValue(n.binRight) {
     return skip("store of a field or element write")
   }
@@ -7356,7 +7484,9 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       return letIfSinkArms(b, n.letInit, v)
     }
     if pa >= 0 { return letIfArms(b, n.letInit, v, pa) }
-    const built = deliver(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy)
+    // Legacy's own binding arm reads a union-valued map's box past `emitExpr`, banking no
+    // element-read row (`letNulMapReadUnionBox`).
+    const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(b, unwrapParen(n.letInit), ib.irVars[v].vRep, -1, false) } else { deliver(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy) }
     if ibMiss != "" { return 0 }
     // A ref list bound at its record-or-null twin is the same list; legacy writes no convert where
     // no coercion is recorded at the initializer.
