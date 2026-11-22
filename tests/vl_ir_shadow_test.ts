@@ -205,6 +205,27 @@ Deno.test({
   },
 });
 
+// A nullable map coalesced into a wider map that stores alike yields that map; under control 7 the
+// join's out sits at an unrelated map's rep, which the verifier must refuse.
+Deno.test({
+  name: "ir shadow: a map join's out at an unrelated map's rep fails the nullable-reference rule",
+  ignore,
+  fn: () => {
+    const src = `function pick(m: {[string]: string} | null, d: {[string]: string | null}, z: {[string]: i32}) {\n` +
+      `  const x = m ?? d\n  print(x.length + z.length)\n}\n` +
+      `const w: {[string]: string | null} = Map()\nconst q: {[string]: i32} = Map()\npick(null, w, q)\n`;
+    const ok = run(src, true);
+    if (failures(ok.rows).length > 0 || ok.rows.get("matched") !== 1) {
+      throw new Error(`want pick matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 7);
+    const want = "a map whose value widens the inner's";
+    if (!failures(rows).some((k) => k.includes(want))) {
+      throw new Error(`want a fail row naming "${want}", got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The file rows' controls: an unreadable directive is refused, and a row whose expectation the
 // compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
 Deno.test({
@@ -1460,9 +1481,10 @@ Deno.test({
     if (exp.compileSrc() !== 0) throw new Error("want the priming compile to pass");
     // Each case's id and the rule the verifier must name for it (0: the function holds). Rules 1
     // to 7 each have the case named for them; the rest break rule 2 (a store, an effectful
-    // immediate, a pop, map read, shared read or `??` of the wrong operand or out, a stashed
-    // record's order), rule 5 (a fall-through, an out left unwritten) or rule 8 (a bounds check
-    // with the bounds rule uninstalled).
+    // immediate, a pop, map read, shared read, niche read, unbox, numeric conversion, result pick
+    // or `??` of the wrong operand or out, a stashed record's order, a held global read off its
+    // rep), rule 5 (a fall-through, an out left unwritten) or rule 8 (a bounds check with the
+    // bounds rule uninstalled).
     const want: Record<string, number> = {
       "holds": 0,
       "var-rep-outside-tree": 1,
@@ -1490,6 +1512,12 @@ Deno.test({
       "nul-ref-list-into-i32": 2,
       "shared-read-global-not-box": 2,
       "niche-read-of-i32": 2,
+      "arm-unbox-of-i32": 2,
+      "num-union-conversion-of-non-box": 2,
+      "num-union-conversion-off-result-kind": 2,
+      "held-global-read-off-noted-rep": 2,
+      "result-pick-of-i32": 2,
+      "result-pick-record-into-i32": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -2764,6 +2792,31 @@ Deno.test({
     }
     if ((rows.get("uncovered returned trap widened") ?? 0) !== 1) {
       throw new Error(`want tl a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A returned bundle's record held by a `const` and used at one signature takes that member
+// (`holderMemberTy`), in a plain and a generic function, and matches. A call straight off the
+// result stays a named indirect-call miss.
+const ONE_MEMBER_HOLDER =
+  `function lap(f) {\n  print(f(2.5))\n  print(f(3))\n  return f\n}\nfunction plain(k: i32) {\n  const r = lap((a) => a + k)\n  print(r(4))\n}\nfunction gen<T>(x: T, k: i32) {\n  const r = lap((a) => a + k)\n  print(r(1))\n  print(x)\n}\nfunction direct(k: i32) {\n  print(lap((a) => a + k)(7))\n}\nplain(5)\ngen("s", 20)\ndirect(1)\n`;
+Deno.test({
+  name: "ir shadow: a bundle record held at one signature takes its member and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ONE_MEMBER_HOLDER, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("uncovered open local type") ?? 0) !== 0) {
+      throw new Error(`want no open local type, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("covered") ?? 0) !== (rows.get("matched") ?? 0)) {
+      throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered indirect call") ?? 0) !== 1) {
+      throw new Error(`want direct a named indirect-call miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });

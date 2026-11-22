@@ -9,6 +9,8 @@ listed id the map does not name. Adding a case adds one list line and one map li
 
 ## Migration
 
-26 cases before (`want` had 26 entries) and 26 ids after. With the old seed's
-`irVerifySelfTest(k)` for k = 0..25 against the new seed's case at each list index, all 26 name
-the same rule. `irBoundsStrSelfTest` (two cases, boolean) is a different export and stays as it was.
+Migrated on top of the queue's train tip `vl-queue/BU1` (57177c29), which holds every positional
+case: 32 before (`want` had 29 entries for 0–28, plus assertions for 100, 101 and 102) and 32 ids
+after. The positional seed's `irVerifySelfTest(k)` for each old `k` against the keyed seed's case
+of the same id: all 32 name the same rule, and each matches the map. `irBoundsStrSelfTest` (two
+cases, boolean) is a different export and stays as it was.
