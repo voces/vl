@@ -20,3 +20,12 @@ one member. Legacy's `refListGetTail` writes these as the recovered element, the
 
 `tests/ir-shadow-rows/index-ref-box-element-unboxed.vl`: `xs[0]` of `(i32 | null)[]` under
 `xs[0] != null`, and of `(f64 | string)[]` under `xs[0] is f64`.
+
+## Measured (fixpoint seeds of master 47b9d7bb and the change)
+
+- tests/cases armed shadow: covered and matched +102 (67,752 → 67,854). `uncovered index element
+  coercion` 120 → 15, start 17 → 12. No new `fail` or `mismatch` row. The rest is the scalar arm
+  over a nullable atom or boolean element and the closure element.
+- Corpus: `index element coercion` 51 → 16; no-blocker 44,816 → 44,851 of 45,678.
+- Legacy: tests/cases A/B identical 7,324 (differ 0), `--names` identical, mode-3 self
+  byte-identical. L2 fuel per PR +0.01%.
