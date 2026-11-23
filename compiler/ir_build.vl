@@ -1,3 +1,4 @@
+import { nulAtomWidenTexts } from "./emit_lit_atoms"
 import { rangeConstIs, rangeConstVal } from "./emit_plan_list"
 import { blockHasContinueFor } from "./emit_query"
 import { narrowedArmTyAt } from "./emit_local_scope"
@@ -340,6 +341,7 @@ import {
   objLitVariantLayoutOf,
   objLitVariantStashAt,
   objLitVariantStashOf,
+  plainCoalesceAt,
   popAnyPlanOf,
   popOrPlanOf,
   printArmOf,
@@ -480,6 +482,7 @@ import {
   EmptyFitPlan,
   arrLitIsForIter,
   coalBoxFieldScalarPlanOf,
+  coalDeadJoinIfOf,
   coalFieldPlanOf,
   coalNextArmOf,
   coalNullTestIf,
@@ -657,6 +660,7 @@ import {
   sFieldCount,
   sFieldNames,
   sFieldStart,
+  sTy,
   sTyIx,
   setIrShadowOn,
   synthMintCount,
@@ -708,7 +712,7 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
-import { structIndexOfTy } from "./emit_atom_kinds"
+import { optChainStagesRecv, structIndexOfTy } from "./emit_atom_kinds"
 import { recordHeapOfTy } from "./emit_shape_intern"
 import { callAtCalleeResultRow } from "./emit_nullable_rets"
 import { RC_MAP, RC_REF_LIST, letBindingUnionTy } from "./emit_start_block"
@@ -7268,8 +7272,59 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     if irBOpRep(v) != rep { return irBMiss("coalesce mapJoinIf rep") }
     return v
   }
+  // The operand as itself where its type rules out `null`, or a dead join legacy types at the
+  // join (`coalDeadJoinIfOf`), built as the valued `if` it is.
+  if (
+    arm == "retypedDead"
+    || arm == "pinNonNull"
+    || arm == "fieldFlat"
+    || arm == "popElem"
+  ) {
+    return coalAsBuilt(b, unwrapParen(n.binLeft), rep, arm)
+  }
+  if arm == "deadJoin" {
+    return coalAsBuilt(b, coalDeadJoinIfOf(n, ix, ibFnIx), rep, arm)
+  }
+  // A `null`-typed operand runs for its effect alone, then the default is the value.
+  if arm == "nulnone" {
+    const e = nulNoneEffect(b, n.binLeft, ix)
+    if ibMiss != "" { return e }
+    return coalAsBuilt(b, n.binRight, rep, arm)
+  }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
+}
+
+// A `null`-typed operand `x` run for its effect, as legacy's `emitNulNoneForEffect` writes it:
+// nothing for a `null` or a name, the receiver of a `?.`, both sides of a `??`, else the value
+// built and dropped. An if-expression is a miss.
+function nulNoneEffect(b: i32[], x: i32, ix: i32): Opnd {
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  if nulNoneWritesNothing(x) { return none }
+  const u = unwrapParen(x)
+  if u < 0 { return irBMiss("coalesce nulnone effect") }
+  const n = nodeAt(u)
+  if n is IfStmt { return irBMiss("coalesce nulnone effect if") }
+  if n is OptMember { return nulNoneEffect(b, n.omObj, ix) }
+  const co = plainCoalesceAt(u)
+  if co != null {
+    const l = nulNoneEffect(b, co.binLeft, ix)
+    if ibMiss != "" { return l }
+    return nulNoneEffect(b, co.binRight, ix)
+  }
+  const v = irBExpr(b, u)
+  if ibMiss != "" { return v }
+  irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  return none
+}
+
+// Node `x` built as itself at the `??`'s rep `rep`, or the miss arm `arm` names.
+function coalAsBuilt(b: i32[], x: i32, rep: i32, arm: string): Opnd {
+  if x < 0 { return irBMiss("coalesce " + arm) }
+  const v = irBExpr(b, x)
+  if ibMiss != "" { return v }
+  if irBOpRep(v) != rep { return irBMiss("coalesce " + arm + " rep") }
+  return v
 }
 
 // `a ?? b ?? d` as legacy lowers it: the re-associated outer link `a ?? (b ?? d)` minted ahead of
@@ -7349,12 +7404,13 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if na == "litUnion" { return coalNicheCell(b, n, lhsIx, ix, rep, "litUnion") }
   if na == "nulBool" { return coalNicheCell(b, n, lhsIx, ix, rep, "nulBool") }
   if na != "str" { return irBMiss("coalesce niche " + na) }
-  if coalNulRefArmOf(n, ix, ibFnIx) != "plain" {
-    return irBMiss("coalesce string shape")
-  }
+  const sa = coalNulRefArmOf(n, ix, ibFnIx)
+  if sa == "join" { return coalNulStrJoin(b, n, ix, rep) }
+  if sa == "litAtom" { return coalNulStr(b, n, ix, rep, true) }
+  if sa != "plain" { return irBMiss("coalesce string shape") }
   const dIx = unwrapParen(n.binRight)
   if dIx < 0 || !(nodeAt(dIx) is StrLit) {
-    return irBMiss("coalesce string default")
+    return coalNulStr(b, n, ix, rep, false)
   }
   const lat = b.length
   const l = irBExpr(b, n.binLeft)
@@ -7370,6 +7426,102 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !(d is OStr) { return irBMiss("coalesce string default") }
   const r: Rhs = { czL: l, czD: d, czAt: ix }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// `l ?? d` over a `string | null` whose default joins it into a box: legacy's join at the string
+// heap (`emitCoalesceNulRefJoin` at `sTy()`), the operand staged ahead of its `if` and the default
+// delivered into the result's box on the null path.
+function coalNulStrJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  if coalNulRefJoinWhy(n, sTy(), ibFnIx) != "" {
+    return irBMiss("coalesce string join refused")
+  }
+  if !boxOwedAt(n.binRight, ibFnIx) {
+    return irBMiss("coalesce string join default")
+  }
+  if !heldAsBox(rep) { return irBMiss("coalesce string join rep") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !(l is OVar) || l.ov < 0 { return irBMiss("coalesce string operand") }
+  if !strNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep, -1)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce string default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  const arm: CoalValArm = "nulStr"
+  irBNode(
+    b,
+    { cbL: l, cbLB: [], cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// `l ?? d` over a `string | null` whose default computes: legacy's `br_on_non_null` core at the
+// string heap (`emitCoalesceNulRefCtx` at `sTy()`), the operand built into the block and the
+// default built where it runs only on `null`, the block nullable as `coalesceNulStrStaysNullable`.
+// An `atom` default (the `litAtom` arm) decodes to its member string (`emitCoalesceAtomStrDefault`).
+function coalNulStr(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  atom: boolean,
+): Opnd {
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const lb: i32[] = []
+  const l = irBExpr(lb, n.binLeft)
+  if ibMiss != "" { return l }
+  if !(l is OVar) || l.ov < 0 { return irBMiss("coalesce string operand") }
+  if !strNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
+  const nul = coalesceNulStrStaysNullable(ix, ibFnIx)
+  const want = if nul { irBOpRep(l) } else { strInnerOf(irBOpRep(l)) }
+  if rep != want { return irBMiss("coalesce result rep") }
+  const nb: i32[] = []
+  const d0 = irBExpr(nb, n.binRight)
+  if ibMiss != "" { return d0 }
+  const d = if atom { coalAtomStrDefault(nb, d0, n.binRight, nul, rep) } else { d0 }
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce string default rep") }
+  // A default and an operand that build nothing are written in place, as the literal's core is.
+  if lb.length == 0 && nb.length == 0 {
+    const r: Rhs = { czL: l, czD: d, czAt: ix }
+    return irBLetTemp(b, r, ix, rep)
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  const arm: CoalValArm = "nulStr"
+  irBNode(
+    b,
+    { cbL: l, cbLB: lb, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// Atom default `v` of node `dIx` decoded at string rep `rep`; a `null` the decode keeps where the
+// block is non-null (legacy's `ref.as_non_null` after it) is a miss.
+function coalAtomStrDefault(
+  nb: i32[],
+  v: Opnd,
+  dIx: i32,
+  nul: boolean,
+  rep: i32,
+): Opnd {
+  if !nul && nulAtomWidenTexts(dIx, ibFnIx).length > 0 {
+    return irBMiss("coalesce string atom default non-null")
+  }
+  return atomToStr(nb, v, dIx, rep)
 }
 
 // `l ?? d` over a boxed operand along `coalBoxArmOf`'s arm: the operand's box, then legacy's
@@ -7406,8 +7558,10 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
   if !heldAsBox(irBOpRep(l)) { return irBMiss("coalesce box operand rep") }
+  // A binding's box is read again as the builder read it (`irHoistRecv`).
   if arm == "valBox" || arm == "valScalar" {
-    if !(l is OVar) || l.ov < 0 || ib.irVars[l.ov].vKind == "temp" {
+    if !(l is OVar) || l.ov < 0 { return irBMiss("coalesce box place") }
+    if ib.irVars[l.ov].vKind == "temp" && !recvReadsAgain(lhsIx) {
       return irBMiss("coalesce box place")
     }
   }
@@ -7545,8 +7699,16 @@ function coalOptLeafBuild(
   if endsInTemp(b) { return irBMiss("coalesce optional after an operand") }
   const r = irBExpr(b, m.omObj)
   if ibMiss != "" { return r }
-  if !(r is OVar) || r.ov < 0 || ib.irVars[r.ov].vKind == "temp" {
-    return irBMiss("coalesce optional place")
+  // A receiver legacy re-emits is read again as the builder read it (`irHoistRecv`); one it
+  // stages in its `?.` stash (`optChainStagesRecv`) is a miss.
+  if !(r is OVar) || r.ov < 0 { return irBMiss("coalesce optional place") }
+  if ib.irVars[r.ov].vKind == "temp" {
+    if optChainStagesRecv(lhsIx) {
+      return irBMiss("coalesce optional staged receiver")
+    }
+    if !recvReadsAgain(unwrapParen(m.omObj)) {
+      return irBMiss("coalesce optional place")
+    }
   }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
@@ -7731,7 +7893,7 @@ function coalNicheCell(
 }
 
 // `l ?? d` over a `K | null` at a `string` (legacy's `emitCoalesceNulAtomStr`), its default a
-// plain string literal, which the null branch writes as itself.
+// string that builds nothing, which the null branch writes as itself.
 function coalAtomStr(
   b: i32[],
   n: BinExpr,
@@ -7740,7 +7902,7 @@ function coalAtomStr(
   rep: i32,
 ): Opnd {
   const dIx = unwrapParen(n.binRight)
-  if dIx < 0 || !(nodeAt(dIx) is StrLit) || exprIsLitAtom(dIx, ibFnIx) {
+  if dIx < 0 || exprIsLitAtom(n.binRight, ibFnIx) {
     return irBMiss("coalesce atom default")
   }
   if nulLitAtomTexts(lhsIx, ibFnIx).length == 0 {
@@ -7750,9 +7912,11 @@ function coalAtomStr(
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
   if !atomNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
-  const d = irBExpr(b, n.binRight)
+  // A default that builds nothing (a literal, a name) is written in place in the `null` branch.
+  const nb: i32[] = []
+  const d = irBExpr(nb, n.binRight)
   if ibMiss != "" { return d }
-  if !(d is OStr) || irBOpRep(d) != rep {
+  if nb.length != 0 || irBOpRep(d) != rep {
     return irBMiss("coalesce atom default")
   }
   const r: Rhs = { zaL: l, zaD: d, zaAt: ix }

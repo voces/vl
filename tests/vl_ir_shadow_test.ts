@@ -380,8 +380,8 @@ Deno.test({
   },
 });
 
-// Outside the set: a string coalesce whose default is no literal and a propagating `as`
-// conversion each leave their function uncovered, named. A closure parameter, its baked
+// Outside the set: a `??` over a `null`-typed if-expression and a propagating `as` conversion
+// each leave their function uncovered, named. A closure parameter, its baked
 // callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
@@ -389,13 +389,16 @@ Deno.test({
   fn: () => {
     // A conversion by a propagating `as`, which returns the function's null on a miss, is outside
     // the set too.
-    const src = `function greet(s: string | null, d: string): string { return s ?? d }
+    const src = `function greet(c: boolean): i32 {
+  const x = null
+  return (if c { x } else { x }) ?? 0
+}
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function cv(x: f64): i32 | null {
   const n = x as i32
   return n
 }
-print(greet("a", "!"))
+print(greet(true))
 print(ap((x: i32) => x + 1))
 print(cv(3.0))
 `;
@@ -1546,6 +1549,8 @@ Deno.test({
       "memory-store-value-off-plan": 2,
       "simd-operand-off-plan": 2,
       "call-write-back-not-a-capture": 2,
+      "coal-str-default-off-rep": 2,
+      "coal-atom-str-default-off-rep": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -1576,17 +1581,18 @@ Deno.test({
   ignore,
   fn: () => {
     const src = `function ok(x: i32): i32 { return x + 1 }
-function two(s: string, t: string | null): i32 {
+function two(c: boolean): i32 {
   const xs = [1, 2]
-  if (t ?? s) == s { return xs[0] }
-  return 0
+  const x = null
+  const y = (if c { x } else { x }) ?? 0
+  return xs[0] + y
 }
 print(ok(1))
-print(two("a", "b"))
+print(two(true))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    const want = "blockers coalesce string default";
+    const want = "blockers coalesce nulnone effect if";
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }
