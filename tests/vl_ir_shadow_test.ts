@@ -3060,3 +3060,26 @@ Deno.test({
     }
   },
 });
+
+// A record with two nullable self fields: both `T | null` spellings are one rep node, so a typed
+// `null` field builds at a kid rep its type interns to (D17075) and the start verifies.
+const TWO_NULLABLE_SELF: string[] = [
+  "type T = { v: i32, l: T | null, r: T | null }\nfunction f(t1: T, t2: T): boolean { return t1 == t2 }\nprint(f({ v: 1, l: null, r: null }, { v: 1, l: null, r: null }))\n",
+  "type T = { name: string, l: T | null, r: T | null }\nfunction f(t1: T, t2: T): boolean { return t1 == t2 }\nconst a: T = { name: \"x\", l: null, r: null }\nconst b: T = { name: \"x\", l: null, r: null }\nprint(f(a, b))\n",
+];
+Deno.test({
+  name: "ir shadow: a record's two nullable self fields share one rep, so its null fields build",
+  ignore,
+  fn: () => {
+    for (const src of TWO_NULLABLE_SELF) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const bad = [...rows.keys()].filter((k) => k.includes("record field null rep"));
+      if (bad.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want the start matched with no record field null rep miss, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
+    }
+  },
+});
