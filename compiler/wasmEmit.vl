@@ -14763,6 +14763,7 @@ function emitMapRecvKey(recvIx: i32, keyIx: i32, fnIx: i32) {
   let kr = 0
   if arm == "atom" { kr = emitAtomToStr(keyIx, fnIx) }
   else if arm == "i64" { kr = emitScalarValue(keyIx, fnIx, "i64") }
+  else if keyIx == armIdxNode && armIdxNode >= 0 { kr = emitArmIdx(fnIx) }
   else { kr = emitExpr(keyIx, fnIx) }
   if kr < 0 { return -1 }
   return mapRecvKeyTail(mshape)
@@ -18827,7 +18828,7 @@ function emitIndexStrList(nd: Index, fnIx: i32, nonNull: boolean): i32 {
   if slHz < 0 {
     if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
   }
-  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  if emitIdxIndex(nd, fnIx) < 0 { return -1 }
   return strListGetTail(nd, slHz, nonNull)
 }
 
@@ -18869,7 +18870,7 @@ function emitIndexRawString(nd: Index, fnIx: i32): i32 {
   if shz < 0 {
     if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
   }
-  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  if emitIdxIndex(nd, fnIx) < 0 { return -1 }
   return rawStrGetTail(shz)
 }
 
@@ -18894,7 +18895,7 @@ function emitIndexNulScalarList(nd: Index, fnIx: i32): i32 {
   const nsk = exprNulScalarListKind(nd.idxArr, fnIx)
   if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
   fbRefAsNonNull() // (the `!= null` guard makes this safe)
-  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  if emitIdxIndex(nd, fnIx) < 0 { return -1 }
   if nsk == "nulstrlist" {
     emitListIdxGuard(listIdxWrapSlot("strlist", 0), mkListTy())
     fbArrayGet(mkArrTy()) // 0xfb 0x0b string backing
@@ -18962,7 +18963,7 @@ function refListReadAt(
     if exprNullableRefArray(nd.idxArr, fnIx) { fbRefAsNonNull() }
   }
   if !elem {
-    if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+    if emitIdxIndex(nd, fnIx) < 0 { return -1 }
   } else if place.epIdx >= 0 {
     fbLocalGet(place.epIdx)
   } else {
@@ -19047,7 +19048,7 @@ function emitIndexScalarList(nd: Index, fnIx: i32): i32 {
   if hz < 0 {
     if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
   }
-  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  if emitIdxIndex(nd, fnIx) < 0 { return -1 }
   return scalarListGetTail(nd, ek, fnIx, hz)
 }
 
@@ -37783,6 +37784,11 @@ function getterRangeTrips(stmtIx: i32, fnIx: i32): i32 {
   return t
 }
 
+// Whether local `idx` is a range loop copy `urLocalRead` writes in its place.
+export function urSlotUnrolled(idx: i32): boolean {
+  return unrolledSlotAt(idx) >= 0
+}
+
 // Writes the read of local `idx` where an unrolled range loop's copy binds it: its constant in a
 // full unroll, its trip base plus the copy's offset in a partial one; false where none does.
 export function urLocalRead(idx: i32): boolean {
@@ -41455,8 +41461,6 @@ function emitArmSite(idxIx: i32, fnIx: i32): i32 {
   }
   const recv = armSiteRecv(idxIx)
   if recv < 0 || recv >= P.nodes.length { return 0 }
-  const arms = ctnArmsAt(nodeTyAt(recv, fnIx))
-  const u = nodeTyAt(idxIx, fnIx)
   // A receiver that is no name is read once, into the box stash the arms test.
   let slot = -1
   if !(nodeAt(recv) is Ident) {
@@ -41464,19 +41468,83 @@ function emitArmSite(idxIx: i32, fnIx: i32): i32 {
     if emitExpr(recv, fnIx) < 0 { return -1 }
     fbLocalSet(slot)
   }
+  return armSiteWrite(idxIx, slot, ARM_IDX_NODE, 0, fnIx)
+}
+
+// The index operand `armSiteWrite` takes: the read's own index node, a local, an immediate, or
+// the node's string literal.
+export const ARM_IDX_NODE = -1
+export const ARM_IDX_IMM = -2
+export const ARM_IDX_STR = -3
+
+// The tag chain of arm-site read `idxIx` after its receiver: the box in local `slot`, or the name
+// re-read when -1. The read's index or key is local `ixLocal`, immediate `ixImm` (`ARM_IDX_IMM`),
+// its string literal (`ARM_IDX_STR`) or its own node. 1 when emitted, -1 on failure.
+export function armSiteWrite(
+  idxIx: i32,
+  slot: i32,
+  ixLocal: i32,
+  ixImm: i32,
+  fnIx: i32,
+): i32 {
+  const recv = armSiteRecv(idxIx)
+  if (
+    idxIx < 0
+    || idxIx >= P.nodes.length
+    || recv < 0
+    || recv >= P.nodes.length
+  ) {
+    return emitFail("emitProgram: internal: an arm-site read has no receiver")
+  }
+  const arms = ctnArmsAt(nodeTyAt(recv, fnIx))
+  const u = nodeTyAt(idxIx, fnIx)
   // A read at a numeric literal set is at the set's scalar rep, never boxed (D17001).
   const uName = if numLitUnionBaseName(u) != "" { "" } else { boxTyName(u) }
   // An element union that is no box is a string (a literal union joined with `string`) or an
   // atom (two literal unions); each arm's element is delivered at that rep.
   const k = if uName == "" { repSigKindOfTy(u) } else { "union" }
   // A map arm's read of a nullable string is that string ref at every arm.
-  const nulStr = k == "nulstr" && tyAt(arms[0]) is TyMap
+  const nulStr = k == "nulstr" && arms.length > 0 && tyAt(arms[0]) is TyMap
   if k != "union" && k != "str" && k != "i32" && !nulStr {
     return emitFail(
       "emitProgram: a union-of-lists element read has no element union box",
     )
   }
-  return emitArmSiteAt(idxIx, recv, slot, arms, 0, u, uName, fnIx)
+  const nd = nodeAt(idxIx)
+  const outer = idxSpanNode
+  idxSpanNode = idxIx
+  // An operand stands for the read's index node; the node itself leaves the writer's state alone.
+  const opnd = ixLocal != ARM_IDX_NODE && nd is Index
+  if opnd && nd is Index {
+    armIdxNode = nd.idxIndex
+    armIdxLocal = ixLocal
+    armIdxImm = ixImm
+  }
+  const r = emitArmSiteAt(idxIx, recv, slot, arms, 0, u, uName, fnIx)
+  if opnd { armIdxNode = -1 }
+  idxSpanNode = outer
+  return r
+}
+
+// The index node an `armSiteWrite` operand stands for, and that operand; -1 outside one.
+let armIdxNode = -1
+let armIdxLocal = -1
+let armIdxImm = 0
+
+// Writes list read `nd`'s index: the arm-site writer's operand where it stands for the node.
+function emitIdxIndex(nd: Index, fnIx: i32): i32 {
+  if nd.idxIndex != armIdxNode || armIdxNode < 0 {
+    return emitExpr(nd.idxIndex, fnIx)
+  }
+  return emitArmIdx(fnIx)
+}
+
+// The arm-site writer's index operand.
+function emitArmIdx(fnIx: i32): i32 {
+  if armIdxLocal >= 0 { fbLocalGet(armIdxLocal) }
+  else if armIdxLocal == ARM_IDX_STR { return emitStrLitAt(armIdxNode, fnIx) }
+  else { fbI32Const(armIdxImm) }
+  return 0
 }
 
 // The reads `emitArmSiteAt` overrides to an arm's unboxed payload, and the local each
