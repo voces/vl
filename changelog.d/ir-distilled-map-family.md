@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: five map and print shapes, byte-identical to legacy.** The IR's print takes a `boolean | null` between legacy's own `br_table` blocks. An i64-keyed map's key is delivered at i64. `m.delete(k)` is a new `RMapDelete` over legacy's probe and tombstone. A walk's second name binds an index, or a map's i32 or string value. A map read typed without its `boolean | null` value's null is held at that niche. Legacy's delete, its `boolean | null` print and its pair counter are factored into shared tails, with no byte change. Distilled-corpus functions with no blocker rose 45,401 → 45,424, and tests/cases 71,667 → 71,738.

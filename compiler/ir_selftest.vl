@@ -103,8 +103,14 @@ const selfTestIds: string[] = [
   "width-retag-pair-unnoted",
   "hand-pick-of-i32",
   "hand-pick-record-into-i32",
+  "init-progress-as-value",
+  "init-progress-effect",
+  "literal-cast-of-record",
+  "literal-cast-of-i32",
   "retag-closures-of-differing-arity",
   "retag-closures-of-differing-arity-noted",
+  "map-delete-of-map",
+  "map-delete-of-i32",
   "retag-field-alike-records-two-heaps",
   "push-many-of-i32",
   "global-read-off-store-type",
@@ -128,6 +134,9 @@ const selfTestIds: string[] = [
   "pop-or-default-returning-call",
   "pop-or-default-never-call",
   "dead-return-after-never-call",
+  "never-call-value-at-consumer-rep",
+  "returning-call-temp-typed-never",
+  "never-call-value-into-bool",
 ]
 
 // `f(p: i32): i32 { t = p + 1; return t }`, broken the way case `id` names ("holds": not broken).
@@ -205,6 +214,24 @@ function caseFn(id: string): IrFn {
     f.irBody.push(
       node(f, { lDst: g, lRhs: { hpV: from, hpAt: -1, hpArg: -1, hpI: 0 } }, i32r),
     )
+  }
+  // Rule 2: the start body's progress store (`RInitProgress`) is an effect; one bound to a value
+  // is refused, one in statement position holds.
+  if id == "init-progress-as-value" {
+    const g = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(node(f, { lDst: g, lRhs: { ipOrd: 0 } }, i32r))
+  }
+  if id == "init-progress-effect" {
+    f.irBody.push(node(f, { efRhs: { ipOrd: 0 } }, repNodeOfTy(TY_NEVER)))
+  }
+  // Rule 2: a literal cast (`RAsTail`) stages a scalar or an atom id; one of a record is refused,
+  // one of an i32 holds.
+  if id == "literal-cast-of-record" || id == "literal-cast-of-i32" {
+    const ot = mkObjTy(["c0", "c1"], [TY_I32, TY_I32])
+    const rec = irVarNew(f, repNodeOfTy(ot), ot, "local", 1)
+    const from = if id == "literal-cast-of-i32" { v(p) } else { v(rec) }
+    const g = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(node(f, { lDst: g, lRhs: { akV: from, akAt: -1 } }, i32r))
   }
   // Rule 2: a record retag (`RRetag`) stands one plain record for another on one struct heap the
   // builder noted, whose fields lower alike; one of an i32, into an i32, into a record whose field
@@ -398,6 +425,35 @@ function caseFn(id: string): IrFn {
         i32r,
       ),
     )
+  }
+  // A never call's value at its consumer's rep holds; a returning call's temp typed `never` breaks
+  // rule 3, and the never value assigned into a bool breaks rule 2 at that consumer.
+  if (
+    id == "never-call-value-at-consumer-rep"
+    || id == "returning-call-temp-typed-never"
+    || id == "never-call-value-into-bool"
+  ) {
+    const nv = id != "returning-call-temp-typed-never"
+    irSigNote(f, 0, [i32r], if nv { none } else { i32r })
+    const g = irVarNew(f, i32r, TY_NEVER, "temp", -1)
+    const c: Rhs = {
+      caCallee: 0,
+      caArgs: [v(p)],
+      caNever: nv,
+      caEnv: false,
+      caCaps: [],
+      caWb: [],
+    }
+    f.irBody.push(node(f, { lDst: g, lRhs: c }, i32r))
+    if id == "never-call-value-into-bool" {
+      const bl = irVarNew(f, boolr, TY_BOOL, "local", 1)
+      f.irBody.push(node(f, { asDst: bl, asSrc: v(g) }, none))
+    } else {
+      const h = irVarNew(f, i32r, TY_I32, "temp", -1)
+      const add: Rhs = { poOp: "add", poArgs: [v(g), imm(i32r, 1)] }
+      f.irBody.push(node(f, { lDst: h, lRhs: add }, i32r))
+      f.irBody.push(node(f, { dpV: v(h) }, none))
+    }
   }
   // Rules for a fused `pop ?? d`: a pop of an i32, a bool out from an `i32[]`, and a default that
   // never writes the out.
@@ -665,6 +721,31 @@ function caseFn(id: string): IrFn {
     const l = irVarNew(f, repNodeOfTy(la), la, "local", 1)
     const sn = irVarNew(f, repNodeOfTy(lb), lb, "temp", -1)
     f.irBody.push(node(f, { lDst: sn, lRhs: { rgV: v(l) } }, repNodeOfTy(lb)))
+  }
+  // A map delete whose receiver operand is a map holds; one whose receiver is an i32 is refused
+  // (rule 2).
+  if id == "map-delete-of-map" || id == "map-delete-of-i32" {
+    const mt = mkMapTy(TY_I32, TY_I32, 0)
+    const ml = irVarNew(f, repNodeOfTy(mt), mt, "local", 1)
+    const recv = if id == "map-delete-of-map" { v(ml) } else { v(p) }
+    const sd = irVarNew(f, boolr, TY_BOOL, "temp", -1)
+    f.irBody.push(
+      node(
+        f,
+        {
+          lDst: sd,
+          lRhs: {
+            mdSym: -1,
+            mdNonNull: false,
+            mdLoc: recv,
+            mdRecv: -1,
+            mdKey: v(p),
+            mdAt: -1,
+          },
+        },
+        boolr,
+      ),
+    )
   }
   // Rule 2 again: a variadic push of an i32 onto an i32, neither a list.
   if id == "push-many-of-i32" {

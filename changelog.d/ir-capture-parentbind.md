@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: loop variables forwarded through a sibling, and instance closures over their own parameter.** A nested function's capture of a `for-in` element or range counter, passed on by a frame that never reads it, is now typed by its loop (`capLoopTyOf`: `forInElemTyOf`, or i32). A generic or hole instance's closure over its own parameter, whose binding frame `parentBindingOf` does not reach, is held at that parameter's type (`capRepAtTy`). Both are checked against legacy's capture valtype (`captureValKind`). In the census family's tests/cases programs, `closure env capture` drops from 18 to 11. Legacy's bytes don't change.

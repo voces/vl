@@ -1647,6 +1647,7 @@ import {
   arrRefSlotPlain,
   forInElemRecovers,
   forInLoopAt,
+  forInPairSlotOf,
   identReadIsList,
   idxStorePlanOf,
   listFitElemKind,
@@ -1689,6 +1690,7 @@ import {
   boxRecordUnionTyOf,
   boxSeat,
   boxTyName,
+  boxTyNameAt,
   coerceKindAt,
   copyArmRowOf,
   exprRecordArmsTy,
@@ -4485,7 +4487,7 @@ function emitDiscrimFieldEq(
         + " fields",
     )
   }
-  if emitExpr(recvIx, fnIx) < 0 { return -1 }
+  if fitRecvRead(recvIx, fnIx) < 0 { return -1 }
   return discrimFieldEqTail(vi, fi, lex, fnIx)
 }
 
@@ -4558,7 +4560,7 @@ function emitFieldLitEq(r: i32, lex: string, fnIx: i32) {
 // `r is B` over a single record `r: A` or `A | null` where every `B` is an `A` but not the
 // reverse: the value fits when it is not null and each field `B` narrows holds a member of its
 // literal set, or an arm of its type (D3885, D4058, D16325). 0 when the test is not that shape.
-function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
+export function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
   const recv = nd.isObj
@@ -4592,6 +4594,69 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   const src = if staged { optRecvSlot } else { -1 }
   return emitRecordFitCore(recv, src, si, vi, nullable, names, sets, fnIx)
+}
+
+// How `emitRecordFitIs` answers `is` test `isIx`: 0 not that shape, -1 refused before it writes,
+// 2 over a receiver it stages into the `?.` stash, 1 written over a re-readable receiver.
+export function recordFitPlanOf(isIx: i32, fnIx: i32): i32 {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) { return 0 }
+  const recv = nd.isObj
+  const objTy = nodeTyAt(recv, fnIx)
+  const names: string[] = []
+  const sets: i32[] = []
+  if recFitNarrowedFields(objTy, isVarTyIxOf(isIx), names, sets) < 0 {
+    return 0
+  }
+  if names.length == 0 { return -1 }
+  if !unionEqOperandOk(recv) { return 2 }
+  const si = structIndexOfExpr(recv, fnIx)
+  const vi = if si >= 0 { -1 } else { exprVariantIndex(recv, fnIx) }
+  const nullable = nodeTyIsNullable(recv) || tyAdmitsNull(objTy)
+  if nullable && !exprNullableRefNiche(recv, fnIx) { return -1 }
+  const rows: i32[] = []
+  let laidOut = false
+  if si >= 0 && si < sHeapIdx.length {
+    laidOut = true
+    for f in names {
+      const fi = sFieldIndex(si, f)
+      if fi < 0 { laidOut = false }
+      rows.push(if fi >= 0 { sFieldStart[si] + fi } else { -1 })
+    }
+  } else if vi >= 0 && vi < uVarRow.length {
+    laidOut = true
+    for f in names {
+      const fi = variantFieldIndex(vi, f)
+      if fi < 0 { laidOut = false }
+      rows.push(if fi >= 0 { uFieldStart[vi] + fi } else { -1 })
+    }
+  }
+  if !laidOut { return -1 }
+  let k = 0
+  while k < names.length {
+    const nested = fieldRowIsRecordRef(rows[k]) && tyAt(sets[k]) is TyObj
+    if !nested {
+      const nulStr = fieldRowIsStr(rows[k], true)
+      const lexes = tyLitSetMemberLexes(
+        if nulStr { nonNullTy(sets[k]) } else { sets[k] },
+      )
+      if tyLitSetMemberLexes(sets[k]).length == 0 {
+        const ft: i32[] = []
+        const vis: i32[] = []
+        if (
+          !fieldRowIsUnionBox(rows[k])
+          || !unionArmTagsOfTy(sets[k], -1, ft, vis)
+          || listNeedsDiscrim(vis)
+        ) {
+          return -1
+        }
+      } else if lexes.length > 0 && !fieldLitEqOk(rows[k]) {
+        return -1
+      }
+    }
+    k = k + 1
+  }
+  return 1
 }
 
 // `emitRecordFitIs`'s field tests over the record `recv` reads (or local `src`, when not -1),
@@ -5981,7 +6046,7 @@ function emitListFitElem(
 // One read of the record-fit receiver: local `src` cast back to `heap` (left uncast when `heap`
 // is -1, for the null test) when it is not -1, else the receiver expression itself.
 function emitRecordFitRecv(recv: i32, fnIx: i32, src: i32, heap: i32): i32 {
-  if src < 0 { return emitExpr(recv, fnIx) }
+  if src < 0 { return fitRecvRead(recv, fnIx) }
   fbLocalGet(src)
   if heap >= 0 { fbRefCast(heap) }
   return 0
@@ -7064,6 +7129,25 @@ function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
     if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
     fbLocalSet(ctSlot)
   }
+  return variantRowChainTail(isIx, nd, fnIx, vi, ctSlot)
+}
+
+// The `chain` and `discrim` rows of `emitIsTestVariantRow` past the receiver's staging: the tag,
+// the discriminant, the shared row's fits and the cross-row fits, each receiver read from `ctSlot`
+// or, at -1, through `fitRecvReadHook`.
+export function variantRowChainTail(
+  isIx: i32,
+  nd: IsExpr,
+  fnIx: i32,
+  vi: i32,
+  ctSlot: i32,
+): i32 {
+  if vi < 0 || vi >= uVarTyIx.length {
+    return emitFail(
+      "emitProgram: internal: the variant rung lost its tested row",
+    )
+  }
+  const shared = armRowSharedAtRecv(nd.isObj, vi)
   if emitSharedFieldRecv(nd.isObj, fnIx, ctSlot) < 0 { return -1 }
   variantTagTail(vi)
   if emitVariantDiscrimTest(nd.isObj, vi, fnIx) < 0 { return -1 }
@@ -9026,6 +9110,28 @@ function emitCoerceAtomPayload(cak: i32, exprIx: i32, fnIx: i32) {
   return 0
 }
 
+// The arm `emitUnionCoerceUnder` writes the value `if` at `bareIx` on: `null` for a `null`-typed
+// one, `value` for `emitUnionIfValue`, "" when it is not that function's `IfStmt` arm.
+function unionCoerceIfArmOf(bareIx: i32, fnIx: i32): string {
+  if !(nodeAt(bareIx) is IfStmt) || ifJoinAdaptsScalar(bareIx, fnIx) {
+    return ""
+  }
+  return if nodeTyIsNullType(bareIx) { "null" } else { "value" }
+}
+
+// Why an else-less value `if` delivered into union `unionTy`'s box is not `emitUnionIfValue`'s
+// one link with the null box for its `else` (`emitUnionCoerceUnder`), or "".
+export function elseLessUnionIfWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
+  const ix = unwrapParen(ixIn)
+  if ix < 0 { return "node" }
+  const n = nodeAt(ix)
+  if !(n is IfStmt) || n.ifElse >= 0 { return "has else" }
+  if unionArmTagClash(unionTy) != "" { return "tag clash" }
+  if callIsNever(ix) { return "never" }
+  if unionCoerceIfArmOf(ix, fnIx) != "value" { return "not value arm" }
+  return ifShapeWhyOf(ix, fnIx, false)
+}
+
 // `emitUnionCoerce`'s body: the arms that thread a list or f32 context apply it and leave it
 // for the wrapper's exit to undo.
 function emitUnionCoerceUnder(
@@ -9058,9 +9164,10 @@ function emitUnionCoerceUnder(
   // if-expression that is already a union value hits the raw pass first and is emitted by
   // `emitExpr`, which picks the join's blocktype from the arms' scalar ladder. Only this arm
   // knows the blocktype has to be the box, so it must be asked first.
-  if bare is IfStmt && !ifJoinAdaptsScalar(bareIx, fnIx) {
+  const ifArm = unionCoerceIfArmOf(bareIx, fnIx)
+  if ifArm != "" {
     // A `null`-typed one is the null-tagged box after its arms run for effect (D3355).
-    if nodeTyIsNullType(bareIx) {
+    if ifArm == "null" {
       fbI32Rel(RS_TAG, nullBoxTag())
       if emitNulNoneBoxPayload(bareIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx)
@@ -11728,8 +11835,216 @@ function sharedFieldNulRefSlot(vi: i32, fi: i32): i32 {
   return objOrderStashSlot(null, variantFieldTypeAt(vi, fi), row)
 }
 
-// One member's arm of the shared-field dispatch: the receiver box, cast to member `vi`, read at
-// field `fi` — boxed under the field's atom tag when the plan boxes (`sharedFieldReadBoxes`).
+// The form member `vi`'s arm of shared plan `code` takes: a constant `null` arm or a lone
+// literal's atom, reading nothing; a literal set widened to the string, a string narrowed to its
+// atoms, a `null`-beside-set niche boxed; else the field's read (`read`), boxed where the plan boxes.
+export type SharedArmMode = "null"
+  | "litAtom"
+  | "setToStr"
+  | "strToAtom"
+  | "nulSetBox"
+  | "read"
+
+export function sharedArmModeOf(code: i32, vi: i32, fi: i32): SharedArmMode {
+  if sharedArmNullOf(code, vi, fi) != SHARED_NULL_NONE { return "null" }
+  const own = variantFieldTypeAt(vi, fi)
+  if (
+    (code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32))
+    || (code == FC_STR && own == FC_NUL_LIT_UNION)
+  ) {
+    return "setToStr"
+  }
+  if sharedFieldArmConverts(code, vi, fi) && code == FC_I32 {
+    return if sharedFieldArmLitTexts(vi, fi).length == 1 { "litAtom" } else { "strToAtom" }
+  }
+  if (
+    sharedFieldReadBoxes(code, vi, fi)
+    && sharedFieldArmAtomKind(vi, fi) < 0
+    && sharedFieldArmNulSet(vi, fi)
+  ) {
+    return "nulSetBox"
+  }
+  return "read"
+}
+
+// Whether an arm of form `mode` pushes its receiver between `sharedArmHead` and `sharedArmTail`.
+export function sharedArmModeReads(mode: SharedArmMode): boolean {
+  return match mode {
+    "null" | "litAtom" => false
+    "setToStr" | "strToAtom" | "nulSetBox" | "read" => true
+  }
+}
+
+// The members a string read at its atoms narrows through: its row's literals, else read `readIx`'s.
+function sharedArmAtomTexts(vi: i32, fi: i32, readIx: i32): string[] {
+  const texts = sharedFieldArmLitTexts(vi, fi)
+  if texts.length > 0 { return texts }
+  return tyLitMemberTexts(nodeTyIxOf(readIx))
+}
+
+// Whether a boxing `read` arm boxes a string literal set stored at the atom as its string (D14750).
+function sharedArmSetStr(code: i32, vi: i32, fi: i32): boolean {
+  return sharedFieldReadBoxes(code, vi, fi)
+    && sharedFieldArmAtomKind(vi, fi) < 0
+    && sharedFieldArmBoxesAtomSet(vi, fi)
+}
+
+// A boxing `read` arm's ref field tag in read `readIx`'s union, or -1 for a scalar or set arm.
+function sharedArmRefTag(
+  code: i32,
+  vi: i32,
+  fi: i32,
+  readIx: i32,
+  fnIx: i32,
+): i32 {
+  if (
+    !sharedFieldReadBoxes(code, vi, fi)
+    || sharedFieldArmAtomKind(vi, fi) >= 0
+    || sharedArmSetStr(code, vi, fi)
+  ) {
+    return -1
+  }
+  const rt = if readIx >= 0 { nodeTyAt(readIx, fnIx) } else { -1 }
+  return sharedFieldArmTag(vi, fi, rt)
+}
+
+// What arm `mode` of member `vi`, field `fi`, writes before its receiver push: a box's tag. The
+// constant arms write theirs whole here. Returns -1 on a failure.
+export function sharedArmHead(
+  mode: SharedArmMode,
+  code: i32,
+  vi: i32,
+  fi: i32,
+  readIx: i32,
+  fnIx: i32,
+): i32 {
+  return match mode {
+    "null" => sharedArmNullTail(sharedArmNullOf(code, vi, fi))
+    "litAtom" => {
+      fbI32Rel(RS_ATOM, internAtom(quoteLex(sharedFieldArmLitTexts(vi, fi)[0])))
+      0
+    }
+    "setToStr" => if sharedFieldArmSetTexts(vi, fi).length == 0 { emitFail(
+      "emitProgram: a shared field read widens a literal set with no members",
+    ) } else { 0 }
+    "nulSetBox" => if sharedFieldArmSetTexts(vi, fi).length == 0 { emitFail("emitProgram: a shared field read boxes a literal set with no members") } else { 0 }
+    "strToAtom" => if sharedArmAtomTexts(vi, fi, readIx).length == 0 { emitFail("emitProgram: literal-union atom narrowing with no members") } else { 0 }
+    "read" => sharedArmReadHead(code, vi, fi, readIx, fnIx)
+  }
+}
+
+// A `read` arm's head: the ref tag, the string tag of a boxed set, or a scalar box's tag; a
+// nullable ref's tag waits for the ref (D16170).
+function sharedArmReadHead(
+  code: i32,
+  vi: i32,
+  fi: i32,
+  readIx: i32,
+  fnIx: i32,
+): i32 {
+  const refTag = sharedArmRefTag(code, vi, fi, readIx, fnIx)
+  if refTag >= 0 {
+    if !sharedFieldArmNullable(vi, fi) {
+      sharedArmBoxHead(vi, fi, readIx, fnIx)
+    }
+    return 0
+  }
+  if sharedArmSetStr(code, vi, fi) {
+    fbI32Rel(RS_TAG, scalarTagOfKind(2))
+  } else if sharedFieldReadBoxes(code, vi, fi) {
+    sharedArmBoxHead(vi, fi, readIx, fnIx)
+  }
+  return 0
+}
+
+// What arm `mode` writes after its receiver push: the payload's field read and its conversion
+// or box. Returns -1 on a failure.
+export function sharedArmTail(
+  mode: SharedArmMode,
+  code: i32,
+  vi: i32,
+  fi: i32,
+  readIx: i32,
+  fnIx: i32,
+): i32 {
+  return match mode {
+    "null" | "litAtom" => 0
+    "setToStr" => sharedArmSetToStrTail(code, vi, fi)
+    "strToAtom" => {
+      sharedArmPayloadRead(vi, fi)
+      const strSlot = objOrderStashSlot(
+        "str",
+        FC_STR,
+        uFieldStorageSlot(vi, fi),
+      )
+      fbLocalSet(strSlot)
+      emitStagedStrToAtomChain(
+        sharedArmAtomTexts(vi, fi, readIx),
+        0,
+        strSlot,
+        fnIx,
+      )
+    }
+    "nulSetBox" => sharedArmNulSetBoxTail(vi, fi)
+    "read" => sharedArmReadTail(code, vi, fi, readIx, fnIx)
+  }
+}
+
+// A `read` arm's tail: the payload's field, then a boxed set's string, an atom set widened to
+// the string, a nullable ref's box under its tag or the null tag, or a scalar's box.
+function sharedArmReadTail(
+  code: i32,
+  vi: i32,
+  fi: i32,
+  readIx: i32,
+  fnIx: i32,
+): i32 {
+  sharedArmPayloadRead(vi, fi)
+  const texts = sharedFieldArmLitTexts(vi, fi)
+  if sharedArmSetStr(code, vi, fi) {
+    if texts.length == 0 {
+      return emitFail(
+        "emitProgram: literal-union string boxing with no members",
+      )
+    }
+    const setSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
+    fbLocalSet(setSlot)
+    if emitAtomToStrChain(texts, 0, setSlot) < 0 { return -1 }
+    fbStructNew(uBoxIdx)
+    return 0
+  }
+  if sharedFieldArmConverts(code, vi, fi) {
+    // An atom set read at the string widens through its own members' tower.
+    if texts.length == 0 {
+      return emitFail(
+        "emitProgram: literal-union string widening with no members",
+      )
+    }
+    const idSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
+    fbLocalSet(idSlot)
+    return emitAtomToStrChain(texts, 0, idSlot)
+  }
+  const refTag = sharedArmRefTag(code, vi, fi, readIx, fnIx)
+  if refTag >= 0 && sharedFieldArmNullable(vi, fi) {
+    const rSlot = sharedFieldNulRefSlot(vi, fi)
+    fbLocalSet(rSlot)
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Rel(RS_TAG, refTag)
+    fbLocalGet(rSlot)
+    fbRefIsNull()
+    fbSelect()
+    fbLocalGet(rSlot)
+    fbStructNew(uBoxIdx)
+    return 0
+  }
+  if sharedFieldReadBoxes(code, vi, fi) {
+    sharedArmBoxTail(sharedFieldArmAtomKind(vi, fi))
+  }
+  return sharedArmStrRecover(code, vi, fi)
+}
+
+// One member's arm of the shared-field dispatch, in its form (`sharedArmModeOf`): the head, the
+// receiver box where the form reads it, then the tail.
 function emitSharedFieldArm(
   code: i32,
   vi: i32,
@@ -11742,102 +12057,14 @@ function emitSharedFieldArm(
   if vi < 0 || vi >= uVarRow.length {
     return emitFail("emitProgram: a shared field read names no member row")
   }
-  const nk = sharedArmNullOf(code, vi, fi)
-  if nk != SHARED_NULL_NONE { return sharedArmNullTail(nk) }
-  const own = variantFieldTypeAt(vi, fi)
-  if (
-    (code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32))
-    || (code == FC_STR && own == FC_NUL_LIT_UNION)
-  ) {
-    return emitSharedFieldSetToStr(code, own, vi, fi, recvIx, fnIx, slot)
-  }
-  const converts = sharedFieldArmConverts(code, vi, fi)
-  let texts = sharedFieldArmLitTexts(vi, fi)
-  if converts && code == FC_I32 {
-    // A lone literal stored as its string reads as its one member's atom.
-    if texts.length == 1 {
-      fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[0])))
-      return 0
-    }
-    // A member stored at the string whose row spells no literals narrows through the read's
-    // own members.
-    if texts.length == 0 { texts = tyLitMemberTexts(nodeTyIxOf(readIx)) }
-    if texts.length == 0 {
-      return emitFail(
-        "emitProgram: literal-union atom narrowing with no members",
-      )
-    }
-    if emitSharedFieldRecv(recvIx, fnIx, slot) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(variantHeap(vi))
-    fbStructGet(variantHeap(vi), fi)
-    const strSlot = objOrderStashSlot("str", FC_STR, uFieldStorageSlot(vi, fi))
-    fbLocalSet(strSlot)
-    const r = emitStagedStrToAtomChain(texts, 0, strSlot, fnIx)
-    return r
-  }
-  const boxes = sharedFieldReadBoxes(code, vi, fi)
-  const bk = sharedFieldArmAtomKind(vi, fi)
-  if boxes && bk < 0 && sharedFieldArmNulSet(vi, fi) {
-    return emitSharedFieldNulSetBox(vi, fi, recvIx, fnIx, slot)
-  }
-  // A string literal set stored at the atom boxes as the string it names (D14750).
-  const setStr = boxes && bk < 0 && sharedFieldArmBoxesAtomSet(vi, fi)
-  // A ref field rides the box as it is, under the tag the read's union gives its type.
-  const rt = if readIx >= 0 { nodeTyAt(readIx, fnIx) } else { -1 }
-  const refTag = if boxes && bk < 0 && !setStr { sharedFieldArmTag(vi, fi, rt) } else { -1 }
-  const nulRef = refTag >= 0 && sharedFieldArmNullable(vi, fi)
-  if refTag >= 0 && !nulRef {
-    sharedArmBoxHead(vi, fi, readIx, fnIx)
-  } else if nulRef {
-    // The tag is chosen once the ref is read: a null ref boxes under the null tag (D16170).
-  } else if setStr {
-    fbI32Rel(RS_TAG, scalarTagOfKind(2))
-  } else if boxes {
-    sharedArmBoxHead(vi, fi, readIx, fnIx)
-  }
+  const mode = sharedArmModeOf(code, vi, fi)
+  if sharedArmHead(mode, code, vi, fi, readIx, fnIx) < 0 { return -1 }
+  if !sharedArmModeReads(mode) { return 0 }
   if emitSharedFieldRecv(recvIx, fnIx, slot) < 0 { return -1 }
-  sharedArmPayloadRead(vi, fi)
-  if setStr {
-    if texts.length == 0 {
-      return emitFail(
-        "emitProgram: literal-union string boxing with no members",
-      )
-    }
-    const setSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
-    fbLocalSet(setSlot)
-    if emitAtomToStrChain(texts, 0, setSlot) < 0 { return -1 }
-    fbStructNew(uBoxIdx)
-    return 0
-  }
-  if converts {
-    // An atom set read at the string widens through its own members' tower.
-    if texts.length == 0 {
-      return emitFail(
-        "emitProgram: literal-union string widening with no members",
-      )
-    }
-    const idSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
-    fbLocalSet(idSlot)
-    return emitAtomToStrChain(texts, 0, idSlot)
-  }
-  if nulRef {
-    const rSlot = sharedFieldNulRefSlot(vi, fi)
-    fbLocalSet(rSlot)
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbI32Rel(RS_TAG, refTag)
-    fbLocalGet(rSlot)
-    fbRefIsNull()
-    fbSelect()
-    fbLocalGet(rSlot)
-    fbStructNew(uBoxIdx)
-    return 0
-  }
-  if boxes { sharedArmBoxTail(bk) }
-  return sharedArmStrRecover(code, vi, fi)
+  return sharedArmTail(mode, code, vi, fi, readIx, fnIx)
 }
 
-// The tag a boxing arm (`sharedArmIsBox`) of member `vi`'s field `fi` boxes under: a ref field's
+// The tag a boxing `read` arm of member `vi`'s field `fi` boxes under: a ref field's
 // own tag in read `readIx`'s union, else its scalar atom's.
 function sharedArmBoxTagOf(vi: i32, fi: i32, readIx: i32, fnIx: i32): i32 {
   const bk = sharedFieldArmAtomKind(vi, fi)
@@ -11847,43 +12074,14 @@ function sharedArmBoxTagOf(vi: i32, fi: i32, readIx: i32, fnIx: i32): i32 {
 }
 
 // Before the receiver: a boxing arm's tag.
-export function sharedArmBoxHead(vi: i32, fi: i32, readIx: i32, fnIx: i32) {
+function sharedArmBoxHead(vi: i32, fi: i32, readIx: i32, fnIx: i32) {
   return fbI32Rel(RS_TAG, sharedArmBoxTagOf(vi, fi, readIx, fnIx))
 }
 
 // After the payload read: a boxing arm's value box, where its atom has one, and the union box.
-export function sharedArmBoxTail(bk: i32) {
+function sharedArmBoxTail(bk: i32) {
   if atomKindNeedsValueBox(bk) { fbStructNew(vbHeapIdxOfKind(bk)) }
   return fbStructNew(uBoxIdx)
-}
-
-// Whether `emitSharedFieldArm` writes member `vi`'s arm of plan `code` as a box over the plain
-// read alone: a scalar atom or a non-null ref, no `null` member, no atom set, no conversion.
-export function sharedArmIsBox(
-  code: i32,
-  vi: i32,
-  fi: i32,
-  readIx: i32,
-  fnIx: i32,
-): boolean {
-  if vi < 0 || vi >= uVarRow.length || !sharedFieldReadBoxes(code, vi, fi) {
-    return false
-  }
-  if sharedFieldArmNull(vi, fi) || sharedFieldArmConverts(code, vi, fi) {
-    return false
-  }
-  const own = variantFieldTypeAt(vi, fi)
-  if code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32) {
-    return false
-  }
-  if code == FC_STR && own == FC_NUL_LIT_UNION { return false }
-  const bk = sharedFieldArmAtomKind(vi, fi)
-  if bk >= 0 { return true }
-  if sharedFieldArmNulSet(vi, fi) || sharedFieldArmBoxesAtomSet(vi, fi) {
-    return false
-  }
-  const rt = if readIx >= 0 { nodeTyAt(readIx, fnIx) } else { -1 }
-  return sharedFieldArmTag(vi, fi, rt) >= 0 && !sharedFieldArmNullable(vi, fi)
 }
 
 // After the receiver box: its payload cast to member `vi`, read at field `fi`.
@@ -11905,13 +12103,13 @@ function sharedArmStrRecover(code: i32, vi: i32, fi: i32): i32 {
 // nothing: the atom slot's `-1`, the `boolean | null` sentinel `2`, a record's null ref,
 // `unreachable` for a read the checker narrowed past `null`, or the null-tagged box of a boxing
 // read; `SHARED_NULL_NONE` for any other arm, a `string | null` read of a set included.
-export const SHARED_NULL_NONE = 0
+const SHARED_NULL_NONE = 0
 const SHARED_NULL_ATOM = 1
 const SHARED_NULL_BOOL = 2
 const SHARED_NULL_REF = 3
 const SHARED_NULL_DEAD = 4
 const SHARED_NULL_BOX = 5
-export function sharedArmNullOf(code: i32, vi: i32, fi: i32): i32 {
+function sharedArmNullOf(code: i32, vi: i32, fi: i32): i32 {
   if vi < 0 || vi >= uVarRow.length || !sharedFieldArmNull(vi, fi) {
     return SHARED_NULL_NONE
   }
@@ -11928,7 +12126,7 @@ export function sharedArmNullOf(code: i32, vi: i32, fi: i32): i32 {
 }
 
 // The constant `sharedArmNullOf`'s answer `nk` names. Returns 0.
-export function sharedArmNullTail(nk: i32): i32 {
+function sharedArmNullTail(nk: i32): i32 {
   if nk == SHARED_NULL_ATOM {
     fbI32Const(0 - 1)
   } else if nk == SHARED_NULL_BOOL {
@@ -11947,32 +12145,6 @@ export function sharedArmNullTail(nk: i32): i32 {
     )
   }
   return 0
-}
-
-// Whether `emitSharedFieldArm` writes member `vi`'s arm of plan `code` as the plain read alone:
-// no constant `null` arm (`sharedArmNullOf`), no atom or string conversion, no box. A `null` member
-// no constant answers, a `string | null` read's, takes the same path as any other.
-export function sharedArmIsPlain(code: i32, vi: i32, fi: i32): boolean {
-  if (
-    vi < 0
-    || vi >= uVarRow.length
-    || sharedArmNullOf(code, vi, fi) != SHARED_NULL_NONE
-  ) {
-    return false
-  }
-  const own = variantFieldTypeAt(vi, fi)
-  if code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32) {
-    return false
-  }
-  if code == FC_STR && own == FC_NUL_LIT_UNION { return false }
-  return !sharedFieldArmConverts(code, vi, fi)
-    && !sharedFieldReadBoxes(code, vi, fi)
-}
-
-// After the receiver box: a plain arm of plan `code` for member `vi`, field `fi`.
-export function sharedArmPlainTail(code: i32, vi: i32, fi: i32): i32 {
-  sharedArmPayloadRead(vi, fi)
-  return sharedArmStrRecover(code, vi, fi)
 }
 
 // After the receiver box: arm `i`'s tag test of plan `code` over members `vis`, then the open of
@@ -12041,12 +12213,6 @@ export function sharedReadTail(
   return 0
 }
 
-// After the receiver box: a boxing arm's payload read and its box.
-export function sharedArmBoxBody(vi: i32, fi: i32) {
-  sharedArmPayloadRead(vi, fi)
-  return sharedArmBoxTail(sharedFieldArmAtomKind(vi, fi))
-}
-
 // Whether `emitMemSharedRead` evaluates read `memIx`'s receiver once into its stash slot: anything
 // but an ident, whose `local.get` re-emits per arm for nothing.
 export function sharedReadStashes(memIx: i32): boolean {
@@ -12056,50 +12222,23 @@ export function sharedReadStashes(memIx: i32): boolean {
   return !(r >= 0 && r < P.nodes.length && nodeAt(r) is Ident)
 }
 
-// Whether `emitMemSharedRead` writes read `memIx` as the dispatch the IR writes: every arm the plain
-// read or its box, the receiver re-read per arm or stashed, then `sharedReadTail`.
+// Whether `emitMemSharedRead` writes read `memIx` as the dispatch the IR writes: a plan over at
+// least one member, each arm in its form (`sharedArmModeOf`), then `sharedReadTail`.
 export function sharedReadPlainOf(memIx: i32, fnIx: i32): boolean {
   if memReadArmOf(memIx, fnIx) != "shared" { return false }
   const vis: i32[] = []
   const fis: i32[] = []
   const code = sharedReadPlanOf(memIx, fnIx, vis, fis)
-  if code < 0 || vis.length < 1 || fis.length != vis.length { return false }
-  let i = 0
-  while i < vis.length {
-    if (
-      !sharedArmIsPlain(code, vis[i], fis[i])
-      && !sharedArmIsBox(code, vis[i], fis[i], memIx, fnIx)
-      && sharedArmNullOf(code, vis[i], fis[i]) == SHARED_NULL_NONE
-    ) {
-      return false
-    }
-    i = i + 1
-  }
-  return true
+  return code >= 0 && vis.length >= 1 && fis.length == vis.length
 }
 
-// A string literal set stored at the atom (`own`, `FC_I32` or its `-1` niche) read as the
-// string or `string | null` the shared read is typed as (`code`): the atom widens through its
+// A `setToStr` arm's tail: a string literal set stored at the atom (`FC_I32` or its `-1` niche)
+// read as the string or `string | null` the read is typed as (`code`): the atom widens through its
 // members, the niche's `-1` is `null`, unreachable under a read narrowed past it.
-function emitSharedFieldSetToStr(
-  code: i32,
-  own: i32,
-  vi: i32,
-  fi: i32,
-  recvIx: i32,
-  fnIx: i32,
-  slot: i32,
-) {
+function sharedArmSetToStrTail(code: i32, vi: i32, fi: i32): i32 {
+  const own = variantFieldTypeAt(vi, fi)
   const texts = sharedFieldArmSetTexts(vi, fi)
-  if texts.length == 0 {
-    return emitFail(
-      "emitProgram: a shared field read widens a literal set with no members",
-    )
-  }
-  if emitSharedFieldRecv(recvIx, fnIx, slot) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-  fbRefCast(variantHeap(vi))
-  fbStructGet(variantHeap(vi), fi)
+  sharedArmPayloadRead(vi, fi)
   const idSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
   fbLocalSet(idSlot)
   if own != FC_NUL_LIT_UNION { return emitAtomToStrChain(texts, 0, idSlot) }
@@ -12114,25 +12253,12 @@ function emitSharedFieldSetToStr(
   return 0
 }
 
-// A string literal set beside `null` stored at the atom niche, boxed for a read whose join
-// holds other atoms: the niche's `-1` is the null-tagged box, any other atom its string's box.
-function emitSharedFieldNulSetBox(
-  vi: i32,
-  fi: i32,
-  recvIx: i32,
-  fnIx: i32,
-  slot: i32,
-) {
+// A `nulSetBox` arm's tail: a string literal set beside `null` stored at the atom niche, boxed
+// for a read whose join holds other atoms: the niche's `-1` is the null-tagged box, any other
+// atom its string's box.
+function sharedArmNulSetBoxTail(vi: i32, fi: i32): i32 {
   const texts = sharedFieldArmSetTexts(vi, fi)
-  if texts.length == 0 {
-    return emitFail(
-      "emitProgram: a shared field read boxes a literal set with no members",
-    )
-  }
-  if emitSharedFieldRecv(recvIx, fnIx, slot) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-  fbRefCast(variantHeap(vi))
-  fbStructGet(variantHeap(vi), fi)
+  sharedArmPayloadRead(vi, fi)
   const idSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
   fbLocalSet(idSlot)
   fbLocalGet(idSlot)
@@ -12341,6 +12467,23 @@ function fbIfForSharedPlan(code: i32, vi: i32, fi: i32) {
 // One function so the tag test and the payload read cannot pick different halves.
 function emitSharedFieldRecv(recvIx: i32, fnIx: i32, slot: i32) {
   if slot >= 0 { return sharedRecvSlotGet(slot) }
+  return fitRecvRead(recvIx, fnIx)
+}
+
+// How a fit writer re-reads a receiver it holds in no slot: the IR lowering's read of its own
+// operand while it writes that writer's tail (`irFitTail`, which restores the default), else
+// `emitExpr`. The default reads nothing, so the cell needs no init-order guard.
+export let fitRecvReadHook: (recvIx: i32, fnIx: i32) => i32 = fitRecvLegacy
+
+const FIT_RECV_LEGACY = -2
+
+export function fitRecvLegacy(_recvIx: i32, _fnIx: i32): i32 {
+  return FIT_RECV_LEGACY
+}
+
+function fitRecvRead(recvIx: i32, fnIx: i32): i32 {
+  const r = fitRecvReadHook(recvIx, fnIx)
+  if r != FIT_RECV_LEGACY { return r }
   return emitExpr(recvIx, fnIx)
 }
 
@@ -15790,7 +15933,16 @@ function emitMapClear(recvIx: i32, fnIx: i32) {
 // refs so the payload can be collected, decrements `size`, and pushes 1. A delete never moves an
 // entry, so a walk over the same map stays in step; storage is reclaimed on insert (D2315).
 function emitMapDelete(recvIx: i32, keyIx: i32, fnIx: i32) {
-  if emitMapPrepFor(recvIx, keyIx, fnIx, true) < 0 { return -1 }
+  if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
+  return mapDeleteTail()
+}
+
+// After a map delete's receiver, key and op context: the probe to the entry's slot, then the
+// tombstone and the 0 or 1 `emitMapDelete` writes.
+export function mapDeleteTail(): i32 {
+  fbLocalSet(cmKeyLocal()) // the target key
+  setMapRef()
+  if emitMapProbe(false, true) < 0 { return -1 }
   const mslot = cmSlot
   // if entry == 0 { 0 } else { tombstone ; drop refs ; size-- ; 1 }
   pushMapScr(5) // entry
@@ -23099,18 +23251,27 @@ export function ifExprJoinVt(ifIx: i32, fnIx: i32): i32 {
 // Why the value `if` at `ifIx` has no shape `emitIfExprAs` writes with one value per arm, or "": no
 // `else`, an arm with no lone value, an unwalked prelude, a guard call, or an integer switch.
 export function ifExprShapeWhy(ifIx: i32, fnIx: i32): string {
+  return ifShapeWhyOf(ifIx, fnIx, true)
+}
+
+// `ifExprShapeWhy`, an else-less `if` passing where `needElse` is false: its missing arm is then
+// the join's own null, which the union and reference rungs write (`emitUnionIfValueLink`,
+// `emitIfExprRefLink`).
+function ifShapeWhyOf(ifIx: i32, fnIx: i32, needElse: boolean): string {
   if ifIx < 0 || ifIx >= P.nodes.length { return "node" }
   const n = nodeAt(ifIx)
-  if !(n is IfStmt) || n.ifElse < 0 || n.ifCond < 0 { return "no else" }
+  if !(n is IfStmt) || n.ifCond < 0 { return "no else" }
+  const noElse = n.ifElse < 0
+  if noElse && needElse { return "no else" }
   // An `else if` is the chain's next link, which `emitIfExprAsLink` writes into this one's frame.
-  const elseLink = nodeAt(n.ifElse) is IfStmt
-  if !ifArmHasValue(n.ifThen) || !elseLink && !ifArmHasValue(n.ifElse) {
+  const elseArm = !noElse && !(nodeAt(n.ifElse) is IfStmt)
+  if !ifArmHasValue(n.ifThen) || elseArm && !ifArmHasValue(n.ifElse) {
     return "arm not lone"
   }
   // A prelude local the collect pass did not allocate is legacy's refusal (`emitIfArmOpen`).
   if (
     armPreludeUnwalkedDecl(n.ifThen) >= 0
-    || !elseLink && armPreludeUnwalkedDecl(n.ifElse) >= 0
+    || elseArm && armPreludeUnwalkedDecl(n.ifElse) >= 0
   ) {
     return "arm prelude unwalked"
   }
@@ -23130,12 +23291,19 @@ export function ifExprShapeWhy(ifIx: i32, fnIx: i32): string {
 // (`ifExprShapeWhy`), then its join rung (an atom join is plain), a static `is` or literal-true
 // condition, a prelude, or v128.
 export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
-  const sw = ifExprShapeWhy(ifIx, fnIx)
+  const sw = ifShapeWhyOf(ifIx, fnIx, false)
   if sw != "" { return sw }
   // Classified as `emitIfExpr` classifies it, with the arms' prelude locals bound.
   const scoped = armPreludeScopeOpen(ifIx)
   const p = ifJoinPlanOf(ifIx, fnIx)
   if scoped { scopePop() }
+  const h = nodeAt(ifIx)
+  // An else-less link is the null of the union box, the reference, or an i32 niche.
+  const nicheArm = p.ijArm == "atom" || p.ijArm == "scalar"
+  const ownNull = p.ijArm == "union"
+    || p.ijArm == "ref"
+    || nicheArm && ifNoElseNicheOf(ifIx) != 0
+  if h is IfStmt && h.ifElse < 0 && !ownNull { return "no else" }
   const rung = match p.ijArm {
     "null" => "null join"
     "atom" => ""
@@ -23553,6 +23721,14 @@ function emitIfExprAs(ifIx: i32, fnIx: i32, kind: i32) {
   return closeIfChainFrames(open, rc, false)
 }
 
+// The sentinel an else-less link of `emitIfExprAs` writes for its missing arm, the one a bare
+// `null` takes there: 2 at `boolean | null`, -1 at a nullable literal union, else 0, since a
+// bare number has no spare value.
+export function ifNoElseNicheOf(ifIx: i32): i32 {
+  if nodeTyIsNulBool(ifIx) { return 2 }
+  return if nodeTyIsNulLitUnion(ifIx) { 0 - 1 } else { 0 }
+}
+
 // One link of `emitIfExprAs`: 0 or -1 as that function returns, or 1 when the else is another `if`
 // and this link's frame is left open (its else restore target pushed onto `open`).
 // Whether the value `if` link at `ifIx` may be a valued `br_table` (`emitIntSwitch` mode 2): a
@@ -23575,10 +23751,9 @@ function emitIfExprAsLink(ifIx: i32, fnIx: i32, kind: i32, open: i32[]) {
     // 2 for `boolean | null`, -1 for a nullable literal union — the same values
     // `emitNullLitNode` writes for a bare `null` there; a bare numeric join has no such spare value, so it keeps the loud refusal rather than inventing a sentinel in an i32.
     const noElseNiche = s.ifElse < 0
-    if noElseNiche {
-      if !nodeTyIsNulBool(ifIx) && !nodeTyIsNulLitUnion(ifIx) {
-        return emitFail("emitProgram: if-expression requires an else arm")
-      }
+    const niche = if noElseNiche { ifNoElseNicheOf(ifIx) } else { 0 }
+    if noElseNiche && niche == 0 {
+      return emitFail("emitProgram: if-expression requires an else arm")
     }
     const condStart = wLen()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
@@ -23594,7 +23769,7 @@ function emitIfExprAsLink(ifIx: i32, fnIx: i32, kind: i32, open: i32[]) {
     fbElse() // 0x05 else
     let rc = 0
     if noElseNiche {
-      if nodeTyIsNulBool(ifIx) { fbI32Const(2) } else { fbI32Const(0 - 1) }
+      fbI32Const(niche)
     } else {
       const els = nodeAt(s.ifElse)
       if els is IfStmt {
@@ -25252,26 +25427,60 @@ function emitAsUnionTail(
 // and compared against each target member's; a miss traps, is handed back by `return`, or is the
 // `-1` null sentinel, by mode (D5286).
 function emitAsLitAtom(e: AsExpr, exprIx: i32, fnIx: i32) {
+  const why = asLitAtomWhy(exprIx, fnIx)
+  if why != "" { return emitFail(why) }
+  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
+  return asLitAtomTail(exprIx, fnIx)
+}
+
+// Why legacy refuses the literal-atom cast at `exprIx`, or "": a propagated miss leaves as the
+// id into a literal-union result, or as its member text into a `string` one, and no other way.
+export function asLitAtomWhy(exprIx: i32, fnIx: i32): string {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return asCastNotCastWhy() }
+  if e.asMode != "prop" || fnReturnsLitAtom(fnIx) { return "" }
+  const fd = nodeAt(fnIx)
+  let retStr = false
+  if fd is FuncDecl { retStr = fd.fnRet >= 0 && nodeTyIsStringPrim(fd.fnRet) }
+  if retStr && tyLitMemberTexts(nodeTyIxOf(e.asObj)).length > 0 { return "" }
+  return "emitProgram: `as "
+    + e.asTy
+    + "` over a literal-union atom propagates its miss, and this function returns neither a literal union nor a string — write `as!` or `as?`"
+}
+
+// The tail after a literal-union cast's operand, for the two arms whose operand is the cast's own
+// `emitExpr`: the atom id's (`asLitAtomTail`) and the numeric literal's (`asNumLitScalarTail`).
+export function asLitTail(exprIx: i32, fnIx: i32): i32 {
+  return match asCastArmOf(exprIx, fnIx) {
+    "litAtom" => asLitAtomTail(exprIx, fnIx)
+    "numLitScalar" => asNumLitScalarTail(exprIx, fnIx)
+    "zextLoad" | "v128" | "wrap" | "instMiss" | "numUnion" | "mapProbeTrap" => asLitTailMiss()
+    "mapOptBox" | "mapOptRead" | "holeMiss" | "holeExact" | "holeOpt" => asLitTailMiss()
+    "exact" | "union" | "plain" | "notCast" => asLitTailMiss()
+  }
+}
+
+function asLitTailMiss(): i32 {
+  return emitFail(
+    "emitProgram: a literal cast's tail was asked of a cast of another arm",
+  )
+}
+
+// The sentence for a cast's arm asked of a node that is no cast.
+function asCastNotCastWhy(): string {
+  return "emitProgram: a cast's arm was asked of a node that is no cast"
+}
+
+// After the literal-atom cast's operand (`asLitAtomWhy` ""): the staged id's member test, then
+// the hit, or by mode the trap, the propagated return, or the `-1` sentinel.
+export function asLitAtomTail(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return emitFail(asCastNotCastWhy()) }
   let tty = nodeTyIxOf(exprIx)
   if e.asMode == "null" { tty = tyPeelNul(tty) }
   const texts = tyLitMemberTexts(tty)
-  // A propagated miss leaves as the id into a literal-union result, or as its member text
-  // into a `string` one.
   const retAtom = e.asMode == "prop" && fnReturnsLitAtom(fnIx)
   const missTexts = tyLitMemberTexts(nodeTyIxOf(e.asObj))
-  if e.asMode == "prop" && !retAtom {
-    const fd = nodeAt(fnIx)
-    let retStr = false
-    if fd is FuncDecl { retStr = fd.fnRet >= 0 && nodeTyIsStringPrim(fd.fnRet) }
-    if !retStr || missTexts.length == 0 {
-      return emitFail(
-        "emitProgram: `as "
-          + e.asTy
-          + "` over a literal-union atom propagates its miss, and this function returns neither a literal union nor a string — write `as!` or `as?`",
-      )
-    }
-  }
-  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
   const s = litAtomCastSlot()
   fbLocalSet(s)
   // A lone literal target (`as! "a"`) yields that literal's string, not the id (D5289).
@@ -25323,45 +25532,61 @@ function emitAsLitAtom(e: AsExpr, exprIx: i32, fnIx: i32) {
 // scalar is staged once and compared against each target member. A hit is the scalar, or for `as?`
 // the base-tagged box; a miss traps, is handed back by `return`, or is the null box (D11221).
 function emitAsNumLitScalar(e: AsExpr, exprIx: i32, fnIx: i32) {
-  let tty = nodeTyIxOf(exprIx)
-  if e.asMode == "null" { tty = tyPeelNul(tty) }
-  const base = numLitUnionBaseTy(tty)
-  const texts = tyNumLitMemberTexts(tty)
-  const k = boxTagOfTy(base)
-  if texts.length == 0 || (k != 0 && k != 3) {
-    return emitFail(
-      "emitProgram: `as "
-        + e.asTy
-        + "` names a literal union with no members",
-    )
+  const why = asNumLitScalarWhy(exprIx, fnIx)
+  if why != "" { return emitFail(why) }
+  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
+  return asNumLitScalarTail(exprIx, fnIx)
+}
+
+// The numeric literal union the cast at `exprIx` targets, its `as?` null peeled.
+function numLitCastTargetTy(e: AsExpr, exprIx: i32): i32 {
+  const tty = nodeTyIxOf(exprIx)
+  return if e.asMode == "null" { tyPeelNul(tty) } else { tty }
+}
+
+// The value kind of function `fnIx`'s result, as a propagated numeric-literal miss leaves at it:
+// its annotation's, else the collected return kind; "" when neither is known.
+function numLitPropRetKind(fnIx: i32): string {
+  if fnIx < 0 || fnIx >= P.nodes.length { return "" }
+  const fd = nodeAt(fnIx)
+  if !(fd is FuncDecl) { return "" }
+  if fd.fnRet >= 0 { return vtKindOfType(fd.fnRet) }
+  const fp = fnStmtsPosOf(fnIx)
+  return if fp >= 0 && fp < fRetKind.length { fRetKind[fp] } else { "" }
+}
+
+// Why legacy refuses the numeric-literal cast at `exprIx`, or "": the target has members of an
+// i32 or i64 base, and a propagated miss leaves at that scalar or under its tag in a union box.
+export function asNumLitScalarWhy(exprIx: i32, fnIx: i32): string {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return asCastNotCastWhy() }
+  const tty = numLitCastTargetTy(e, exprIx)
+  const k = boxTagOfTy(numLitUnionBaseTy(tty))
+  if tyNumLitMemberTexts(tty).length == 0 || (k != 0 && k != 3) {
+    return "emitProgram: `as "
+      + e.asTy
+      + "` names a literal union with no members"
   }
+  if e.asMode != "prop" { return "" }
+  const rk = numLitPropRetKind(fnIx)
+  const sk: ListKind = if k == 3 { "i64list" } else { "list" }
+  if rk == "union" || rk == listKindElemKind(sk) { return "" }
+  return "emitProgram: `as "
+    + e.asTy
+    + "` over a numeric literal union propagates its miss, and this function returns neither that number type nor a union — write `as!` or `as?`"
+}
+
+// After the numeric-literal cast's operand (`asNumLitScalarWhy` ""): the staged scalar's member
+// test, then the scalar, or by mode the trap, the propagated return, or the `as?` box.
+export function asNumLitScalarTail(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return emitFail(asCastNotCastWhy()) }
+  const tty = numLitCastTargetTy(e, exprIx)
+  const texts = tyNumLitMemberTexts(tty)
+  const k = boxTagOfTy(numLitUnionBaseTy(tty))
   let sk: ListKind = "list"
   if k == 3 { sk = "i64list" }
-  // A propagated miss leaves at the result's rep: the scalar itself, or boxed under its base's tag.
-  let retBox = false
-  if e.asMode == "prop" {
-    let rk = ""
-    if fnIx >= 0 && fnIx < P.nodes.length {
-      const fd = nodeAt(fnIx)
-      if fd is FuncDecl {
-        if fd.fnRet >= 0 {
-          rk = vtKindOfType(fd.fnRet)
-        } else {
-          const fp = fnStmtsPosOf(fnIx)
-          if fp >= 0 && fp < fRetKind.length { rk = fRetKind[fp] }
-        }
-      }
-    }
-    retBox = rk == "union"
-    if !retBox && rk != listKindElemKind(sk) {
-      return emitFail(
-        "emitProgram: `as "
-          + e.asTy
-          + "` over a numeric literal union propagates its miss, and this function returns neither that number type nor a union — write `as!` or `as?`",
-      )
-    }
-  }
-  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
+  const retBox = e.asMode == "prop" && numLitPropRetKind(fnIx) == "union"
   const s = numLitCastSlot(sk)
   fbLocalSet(s)
   let i = 0
@@ -25588,16 +25813,16 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
 
 // The value kind the cast at `exprIx` builds its operand at, where its arm is an operand and a
 // tail (`numCastTail`): the plain conversion, the wrap that is neither a literal fold nor a
-// narrowed mask, the exact `as!` and `as?`, and a type-parameter operand's exact `as!` and
-// failing `as?` at its pin. -1 for every other arm, which writes its operand its own way.
+// narrowed mask, the exact cast in every mode (a bare `as` returns the function's null), and a
+// type-parameter operand's exact cast and failing `as?` at its pin. -1 for every other arm.
 export function numCastKindOf(exprIx: i32, fnIx: i32): i32 {
   const e = nodeAt(exprIx)
   if !(e is AsExpr) { return -1 }
   return match asCastArmOf(exprIx, fnIx) {
     "plain" => numPlainCastKind(numCastSrcRepOf(e.asObj, fnIx), e.asTy)
     "wrap" => if asWrapArmOf(exprIx, fnIx) == "plain" { numWrapCastKind(exprIx, fnIx) } else { -1 }
-    "exact" => if e.asMode == "trap" || e.asMode == "null" { numExactCastKind(asExprNumSrcName(exprIx)) } else { -1 }
-    "holeExact" => if e.asMode == "trap" { numExactCastKind(asExprHolePinSrc(exprIx, fnIx)) } else { -1 }
+    "exact" => numExactCastKind(asExprNumSrcName(exprIx))
+    "holeExact" => numExactCastKind(asExprHolePinSrc(exprIx, fnIx))
     "holeOpt" => {
       const hs = holeOptExactSrc(exprIx, fnIx)
       if hs != "" { numExactCastKind(hs) } else { -1 }
@@ -37263,15 +37488,13 @@ function forInElemPlain(ek: VKind): boolean {
 }
 
 // Why `for` statement `s` at `stmtIx` is not the plain walk, or "": a list of a `forInElemPlain`
-// kind, a string's code points or a map's keys or values, read once; no second name or
-// node-pinned slot; a body that may reallocate a list, so the header is re-read each step and
+// kind, a string's code points or a map's keys or values, read once; no node-pinned slot; a body that may reallocate a list, so the header is re-read each step and
 // nothing is hoisted or unrolled ("hoisted" where it is). A literal iterable is a list literal.
 export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
   if luForUnionIter(s.fiIter, fnIx) { return "list union" }
   const ek = forInElemKind(s.fiIter, fnIx)
   if ek == null { return "iterable" }
   if !forInElemPlain(ek) { return "element " + ek }
-  if s.fiVar2 != "" { return "pair" }
   if listFitShadowIsRef(s.fiIter, fnIx) { return "shadow" }
   if declSlotPinned(stmtIx) >= 0 { return "pinned slot" }
   if hoistSafeBlock(s.fiBody, fnIx) { return "hoisted" }
@@ -37311,9 +37534,7 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
   const lp = forInLoopAt(s, fnIx, vSlot, ek, strSrc, u8Src)
   if lp == null { return -1 }
   const mapRecv = lp.mapRecv
-  const pairIsVal = lp.pairIsVal
-  const pIdx = lp.pIdx
-  const pSlot = vSlot + 3
+  const pSlot = forInPairSlotOf(vSlot)
   if mapRecv >= 0 {
     if emitForInMapStash(fnIx, lp) < 0 { return -1 }
   }
@@ -37322,17 +37543,7 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
   forInListStore(s.fiIter, fnIx, lp)
   forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
-  // A body that writes the index gets a hidden counter, and the index is a fresh copy of it
-  // each iteration, so the write never moves the walk (D2342).
-  if hasPair && !pairIsVal && stmtAssignsName(s.fiBody, pairName) {
-    lp.pCtr = strI32Slot()
-  }
-  if hasPair && !pairIsVal {
-    // A dense counter of body executions: the cursor is a backing offset for a string and
-    // skips tombstones for a set, so it is not the index at two of the three sequences.
-    fbI32Const(0)
-    if lp.pCtr >= 0 { fbLocalSet(lp.pCtr) } else { fbLocalSet(pIdx) }
-  }
+  forInPairInit(s, lp)
   // The body's own index receivers, as `while` and a range loop hoist theirs.
   const fiHoist = loopHoistOpen(-1, s.fiBody, fnIx, s.fiDecl1, s.fiDecl2)
   if fiHoist < 0 { return -1 }
@@ -37343,6 +37554,17 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
   // The loop variables' scope is the loop (see `scopeUnbind`) — one release per name.
   if hasPair { scopeUnbind() }
   scopeUnbind()
+  return 0
+}
+
+// After a walk's cursor: an index pair's counter at 0. A body that writes the index gets a hidden
+// counter, and the index is a fresh copy of it each iteration, so the write never moves the walk
+// (D2342); the counter is dense, since a string's cursor is a backing offset and a set's skips.
+export function forInPairInit(s: ForIn, lp: ForInLoop): i32 {
+  if !lp.hasPair || lp.pairIsVal { return 0 }
+  if stmtAssignsName(s.fiBody, s.fiVar2) { lp.pCtr = strI32Slot() }
+  fbI32Const(0)
+  if lp.pCtr >= 0 { fbLocalSet(lp.pCtr) } else { fbLocalSet(lp.pIdx) }
   return 0
 }
 
@@ -38023,7 +38245,7 @@ function emitListUnionForArm(
   fbI32Bin(106) // 0x6a i32.add
   fbLocalSet(iIdx)
   scopeBind(s.fiVar, vSlot)
-  if hasPair { scopeBind(s.fiVar2, vSlot + 3) }
+  if hasPair { scopeBind(s.fiVar2, forInPairSlotOf(vSlot)) }
   if emitStmts(s.fiBody, fnIx) < 0 { return -1 }
   if hasPair { scopeUnbind() }
   scopeUnbind()
@@ -39141,25 +39363,37 @@ function emitPrintNulRefNiche(argIx: i32, fnIx: i32) {
 // silently printed true without this arm. A `br_table` on the niche value itself is already
 // the arm index (0 false, 1 true, 2 null), evaluating the argument once with no scratch needed.
 function emitPrintNulBool(argIx: i32, fnIx: i32) {
+  printNulBoolOpen()
+  if emitExpr(argIx, fnIx) < 0 { return -1 }
+  return printNulBoolTail()
+}
+
+// Before a `print` of a `boolean | null`: the `$out`, `$null`, `$true` and `$false` blocks.
+export function printNulBoolOpen(): i32 {
   fbBlock(64) // $out
   fbBlock(64) // $null
   fbBlock(64) // $true
   fbBlock(64) // $false
-  if emitExpr(argIx, fnIx) < 0 { return -1 }
-  wU8(14)     // 0x0e br_table
-  wULEB(3)    // three indexed targets, then the default
-  wULEB(0)    // 0 → $false (depth 0 from here)
-  wULEB(1)    // 1 → $true
-  wULEB(2)    // 2 → $null
-  wULEB(2)    // default → $null (unreachable: the niche is 0/1/2)
+  return 0
+}
+
+// After a `print` argument's `boolean | null` niche: the `br_table` on it, then each arm's print,
+// all three leaving through `$out`.
+export function printNulBoolTail(): i32 {
+  wU8(14)   // 0x0e br_table
+  wULEB(3)  // three indexed targets, then the default
+  wULEB(0)  // 0 → $false (depth 0 from here)
+  wULEB(1)  // 1 → $true
+  wULEB(2)  // 2 → $null
+  wULEB(2)  // default → $null (unreachable: the niche is 0/1/2)
   fbEnd()
   fbI32Const(0)
-  fbCall(1)   // __print_bool__ → "false"
-  fbBr(2)     // → $out
+  fbCall(1) // __print_bool__ → "false"
+  fbBr(2)   // → $out
   fbEnd()
   fbI32Const(1)
-  fbCall(1)   // __print_bool__ → "true"
-  fbBr(1)     // → $out
+  fbCall(1) // __print_bool__ → "true"
+  fbBr(1)   // → $out
   fbEnd()
   emitPrintNullWord()
   fbEnd()
@@ -39318,7 +39552,7 @@ function emitPrintValueUnion(argIx: i32, kinds: i32[], fnIx: i32) {
   const puIf = nodeAt(unwrapParen(argIx))
   let puDone = false
   if puIf is IfStmt {
-    const puNm = boxTyName(nodeTyIxOf(argIx))
+    const puNm = boxTyNameAt(argIx)
     if puNm != "" {
       if emitUnionBoxOwed(puNm, nodeTyIxOf(argIx), argIx, fnIx) < 0 {
         return -1
@@ -41630,7 +41864,7 @@ function srMaskedSource(ix: i32, w: i32, fnIx: i32): i64[] {
 }
 
 // `srMaskedSource` of an `as% i32` wrap over an i64 masked shift, else [].
-function srWrappedMask(x: i32, fnIx: i32): i64[] {
+export function srWrappedMask(x: i32, fnIx: i32): i64[] {
   const none: i64[] = []
   if x < 0 || x >= P.nodes.length { return none }
   const e = nodeAt(x)
