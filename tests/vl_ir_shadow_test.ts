@@ -433,19 +433,19 @@ Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // An `as?` over a type parameter at a pin where it cannot fail, which legacy boxes after the
-    // tag, is outside the set too.
+    // An `as!` over a type parameter pinned at no number, which legacy writes as the operand and a
+    // trap inside the expression, is outside the set too.
     const src = `function greet(c: boolean): i32 {
   const x = null
   return (if c { x } else { x }) ?? 0
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv<T>(u: T): i32 | null {
-  return u as? i32
+function cv<T>(u: T): i32 {
+  return u as! i32
 }
 print(greet(true))
 print(ap((x: i32) => x + 1))
-print(cv(3))
+print(cv("s"))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
