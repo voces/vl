@@ -19,4 +19,17 @@ The callee's `uncovered member record` is a separate gap and is not touched.
 
 ## Readings
 
-PENDING
+Fixpoint seeds, head on master ff34a69e, base master ff34a69e.
+
+| check | result |
+| --- | --- |
+| `$VL_IR_SHADOW=6` | distilled corpus 82,105 rows, 0 `prepost differs`; tests/cases 66,548 rows, 0 not the program's own refusal |
+| `rep-fuzz-check.sh` | exact |
+| `ir-identity.sh --cases` | identical 7720, differ 0 |
+| `ir-identity.sh --claimless` | identical 14044, differ 0 |
+| `ir-identity.sh --names` | identical 9037, differ 0; self-compile identical |
+| L2 self-compile fuel per PR | +0.01% on 120,866,344,591 |
+| armed shadow A/B | covered 76,389 → 76,389, start covered 6,706 → 6,706, mismatch and fail 0 → 0 |
+| ir claims | 21,979 functions over 5,007 witnesses; `ir-shadow: ok` with D17070's fallback line gone |
+
+No tests/cases program moves; the change is D17070's own witness and its spellings.
