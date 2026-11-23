@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **`std:buffer` byte-wide views (#9675):** `buf.u8view(off, n)` and `buf.u16view(off, n)` with the `i32view` contract — one extent check per view, `0 <= i < length` on every read AND write, zero-extended reads, truncating writes — plus `x[i]`/`x[i] = v`, `getU8`/`setU8`/`getU16`/`setU16`, `byteAddrU8`/`byteAddrU16` and the hoisted `u8base`/`u16base` with `getU8At`/`setU8At`/`getU16At`/`setU16At`. No `i8`/`i16` view (no consumer column is signed; `loadI8`/`loadI16` meanwhile). Pinned by `tests/cases/std/buffer-narrow-views.vl` and eight one-past-the-fence trap cases.

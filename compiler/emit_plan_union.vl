@@ -152,6 +152,7 @@ import {
   exprStruct,
   exprU8Array,
   exprUnion,
+  exprValueTyAt,
   exprVariantIndex,
   identCellVKind,
   identReadAtomKindAt,
@@ -276,7 +277,11 @@ import {
   rlSlotOfTyOrTwin,
   uFieldTgtStructIdx,
 } from "./emit_shape_rows"
-import { ListBuild } from "./emit_ref_list_kinds"
+import {
+  ListBuild,
+  emptyArrUnionArmKind,
+  emptyArrUnionArmSlot,
+} from "./emit_ref_list_kinds"
 import { RC_MAP, RC_REF_LIST, readAtomKindOfTy } from "./emit_start_block"
 import {
   LBK_REF,
@@ -2077,6 +2082,7 @@ export type HoleBoxArm = "null"
   | "mapScalar"
   | "map"
   | "clo"
+  | "retag"
   | "ladder"
 
 export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
@@ -2197,6 +2203,9 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   }
   // `emitUnionCoerceUnder`'s literal rung, or the null-typed value's.
   if bare is NullLit { return holeBox("null", -1, -1) }
+  // `emitUnionCoerceList`'s empty-list rung: an empty `[]` under the list arm the checker adopted.
+  const et = if boxDstName("", unionTy) != "" { emptyArrUnionArmTag(unionTy, exprIx, fnIx) } else { -1 }
+  if et >= 0 { return holeBox("refList", et, -1) }
   // `emitUnionCoerceRefArray`'s first rung: a ref-element list under its own ref-list arm's tag.
   const rs = refArrCarrierSlotOf(unionTy, exprIx, bareIx, fnIx)
   if rs >= 0 {
@@ -2374,6 +2383,21 @@ function refArrCarrierSlotOf(
   return if unionHasRefArrayArmSlot(unionTy, slot) { slot } else { -1 }
 }
 
+// The tag an empty `[]` boxes under in `unionTy`: the list arm the checker adopted it as, where
+// the union has no `i32[]` arm the value-atom ladder would take (D2202); -1 for none.
+export function emptyArrUnionArmTag(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const bare = nodeAt(unwrapParen(exprIx))
+  if !(bare is ArrayLit) || bare.arrElems.length != 0 { return -1 }
+  if unionHasAtomOfTy(unionTy, "i32", true) { return -1 }
+  const k = emptyArrUnionArmKind(exprIx)
+  // "string[]", the tag a `(string | null)[]` arm shares.
+  if k == "strlist" { return scalarTagOfKind(9) }
+  if k != "reflist" { return -1 }
+  const slot = emptyArrUnionArmSlot(exprIx)
+  if !unionHasRefArrayArmSlot(unionTy, slot) { return -1 }
+  return refArrBoxTagOf(exprIx, fnIx, slot, unionTy)
+}
+
 // Whether list literal `exprIx` reaches `unionTy`'s value-atom box, every list rung before it
 // (`emitUnionCoerceList`: the empty literal, its own ref-list arm, a map or nested element, an arm
 // built through) declining it.
@@ -2519,10 +2543,22 @@ function holePassPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     return ladder
   }
   if narrowBoxWideArmOf(unionTy, exprIx, fnIx) >= 0 { return ladder }
-  if !boxPassesAsTy(unionBoxTyIxOfExpr(exprIx, fnIx), exprIx, unionTy) {
-    return ladder
+  const sty = unionBoxTyIxOfExpr(exprIx, fnIx)
+  if !boxPassesAsTy(sty, exprIx, unionTy) {
+    // `emitUnionBoxArg`'s tail: a box whose only debt is its members' retag is written as itself,
+    // then rebuilt at `unionTy` (`emitBoxAtomRetagMembers`).
+    return if boxRetagsOnly(sty, exprIx, unionTy) { holeBox("retag", unionTy, -1) } else { ladder }
   }
   return holeBox("pass", -1, -1)
+}
+
+// Whether a box of union `sty` delivered at `exprIx` into `unionTy` owes only its members' retag:
+// no arm re-tagged to a wider record, and a member retag the checker records none of.
+function boxRetagsOnly(sty: i32, exprIx: i32, unionTy: i32): boolean {
+  const ft: i32[] = []
+  wideRetagPairsOfTy(sty, unionTy, ft, [])
+  if ft.length > 0 || deliveryRetagHas(exprIx) { return false }
+  return boxRetagArmsOfTys(sty, unionTy, [], [])
 }
 
 // Whether a box of union `sty`, delivered at `exprIx` into `unionTy`, keeps every member's tag: no
@@ -3113,6 +3149,14 @@ function widenPlan(arm: WidenArm, src: i32, wide: string): WidenPlan {
 // classifier may mint on its first ask, so none is asked that the order does not reach.
 export function widenPlanOf(ix: i32, dst: i32, fnIx: i32): WidenPlan {
   const inner = unwrapParen(ix)
+  // An operator over a `never` operand computes at its other operand's width (D17064).
+  if inner >= 0 && inner < P.nodes.length && nodeTyAt(inner, fnIx) == TY_NEVER {
+    const nb = nodeAt(inner)
+    const nw = if nb is BinExpr { neverBinWidth(nb, fnIx) } else { "" }
+    if nw == "i64" { return widenPlan("plain", 3, "") }
+    if nw == "f64" { return widenPlan("plain", 4, "") }
+    if nw == "f32" { return widenPlan("plain", 5, "") }
+  }
   const instLit = cexLitPeel(ix) >= 0 && fnInPinnedInstance(fnIx)
   if instLit && dst != 4 { return widenPlan("instLit", -1, "") }
   if dst == 5 && cexLitPeel(ix) >= 0 && isFloatLitExpr(inner) {
@@ -3717,6 +3761,8 @@ function fieldStoresRead(row: i32, memIx: i32, fnIx: i32): boolean {
   const rk = repOfNode(memIx, fnIx).rdKind
   if sk == null { return false }
   if sk == rk || sk == "nulstr" && rk == "str" { return true }
+  // A `never` field holds no value, and its slot stores the default i32 (D15530).
+  if sk == "i32" && nodeTyAt(memIx, fnIx) == TY_NEVER { return true }
   return vkNonNullRefTwin(sk) == rk && readOwesNonNullRecover(memIx, fnIx)
 }
 
@@ -4001,4 +4047,14 @@ export function arrLitVariantSlot(arrIx: i32, fnIx: i32, lb: ListBuild): i32 {
     }
   }
   return rslot
+}
+
+// The scalar width an operator with one `never` operand works at: the other operand's prim, or ""
+// where neither or both are `never` (D17064).
+export function neverBinWidth(e: BinExpr, fnIx: i32): string {
+  const lt = exprValueTyAt(e.binLeft, fnIx)
+  const rt = exprValueTyAt(e.binRight, fnIx)
+  const one = if lt == TY_NEVER { rt } else if rt == TY_NEVER { lt } else { -1 }
+  if one < 0 || one == TY_NEVER { return "" }
+  return tyScalarBasePrim(one) ?? ""
 }
