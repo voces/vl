@@ -1,4 +1,3 @@
-import { fnTagTyIsTagged } from "./check_fn_tag_facts"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import { nulAtomWidenTexts } from "./emit_lit_atoms"
 import {
@@ -788,6 +787,7 @@ import {
   TY_NEVER,
   TY_NUL_STR,
   TY_STR,
+  TyFunc,
   TyObj,
   tyAt,
   tyScalarBasePrim,
@@ -1680,27 +1680,52 @@ function recordPartTy(ty: i32): i32 {
 // fields of a tagged set the row stores as the set's i32 id (`structRowFieldStoresAtom`), directly
 // or in a nested record field's own row (`sFieldTgtStructIdx`).
 function rowTyBuildsAt(rt: i32, row: i32): boolean {
+  return rowTyBuildsAtGo(rt, row, [])
+}
+
+// `rowTyBuildsAt` below the rows `seen` on the path; a row met again answers no.
+function rowTyBuildsAtGo(rt: i32, row: i32, seen: i32[]): boolean {
   if !irTyOpen(rt) { return true }
   if row < 0 || irTyHeldOpen(rt, repNodeOfTy(rt)) { return false }
+  for r in seen {
+    if r == row { return false }
+  }
   const t = tyAt(rt)
   if !(t is TyObj) { return false }
+  // The type holds a tagged set as its id where a row may still store it as a closure, so each
+  // open field asks the row's own storage.
+  seen.push(row)
   let k = 0
   while k < t.objFieldTypes.length {
     const ft = t.objFieldTypes[k]
-    const name = t.objFieldNames[k]
-    if irTyOpen(ft) && !openFieldStoredAsIds(ft, row, name) { return false }
+    if (
+      irTyOpen(ft)
+      && !openFieldStoredAsIds(ft, row, t.objFieldNames[k], seen)
+    ) {
+      return false
+    }
     k = k + 1
   }
   return true
 }
 
-// Whether open field `name` of type `ft` in struct row `row` is stored closed: a tagged set's i32
-// id, or a nested record whose own row stores its open parts so (`rowTyBuildsAt`).
-function openFieldStoredAsIds(ft: i32, row: i32, name: string): boolean {
-  if fnTagTyIsTagged(ft) { return structRowFieldStoresAtom(row, name) == 1 }
-  if !(tyAt(ft) is TyObj) { return false }
+// Whether open field `name` of type `ft` in struct row `row` is stored closed: a tagged set, which
+// the rep tree reps as its i32 id, stored as plain i32, or a nested record whose own row stores
+// its open parts so.
+function openFieldStoredAsIds(
+  ft: i32,
+  row: i32,
+  name: string,
+  seen: i32[],
+): boolean {
+  const f = tyAt(ft)
+  if f is TyFunc {
+    return repPrim(repNodeOfTy(ft)) == "i32"
+      && structRowFieldStoresAtom(row, name) == 1
+  }
+  if !(f is TyObj) { return false }
   const fi = sFieldIndex(row, name)
-  return fi >= 0 && rowTyBuildsAt(ft, sFieldTgtStructIdx(row, fi))
+  return fi >= 0 && rowTyBuildsAtGo(ft, sFieldTgtStructIdx(row, fi), seen)
 }
 
 // `objLit` at type `ty`, or, where `at` is not -1, built at the row its destination builds it at:
