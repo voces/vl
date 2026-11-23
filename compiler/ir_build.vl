@@ -3788,7 +3788,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     const stored = cellRep != rep
       && !narrowed
       && rep == globalTyRep(scopeTyAt(d, -1))
-      && cellRep == globalTyRep(letBindTy(d, -1))
+      && cellRep == globalTyRep(globalStoredTy(d))
     // A reference the cell holds at a rep that stores as the read's (`repStoresAs`) is legacy's
     // plain `global.get`, read at the read's rep.
     const alike = cellRep != rep
@@ -3868,7 +3868,14 @@ function globalStoredRead(
     ggNn: -1,
   }
   ib.irReadAgain[ix] = gr
-  return irBLetTempTy(b, gr, ix, cellRep, heldTy(letBindTy(d, -1)))
+  return irBLetTempTy(b, gr, ix, cellRep, heldTy(globalStoredTy(d)))
+}
+
+// The type global `d`'s cell is stored at where that is not its own: the record its cell's struct
+// row records (`globalCellRowTy`), else its binding's storage row (`letBindTy`).
+function globalStoredTy(d: i32): i32 {
+  const rt = globalCellRowTy(d, scopeTyAt(d, -1))
+  return if rt >= 0 { rt } else { letBindTy(d, -1) }
 }
 
 // Capture `n` read at `rep` on legacy's `capture` arm (`emitCapturedRead`): a lifted function's
@@ -4448,7 +4455,7 @@ function globalRep(g: i32, d: i32): i32 {
   const noted = irGlobalRepOf(ib, g)
   if noted >= 0 { return noted }
   const ht = globalHolderTy(d)
-  const r = globalTyRep(if ht >= 0 { ht } else { scopeTyAt(d, -1) })
+  const r = globalTyRep(globalHeldTy(d))
   if r >= 0 {
     globalNoteAt(g, d, r)
     if ht >= 0 { ib.irGlobalHeld[g] = true }
@@ -4460,7 +4467,24 @@ function globalRep(g: i32, d: i32): i32 {
 // of it a binding holds (`globalHolderTy`), else its own type.
 function globalHeldTy(d: i32): i32 {
   const ht = globalHolderTy(d)
-  return if ht >= 0 { ht } else { scopeTyAt(d, -1) }
+  if ht >= 0 { return ht }
+  const t = scopeTyAt(d, -1)
+  const rt = globalCellRowTy(d, t)
+  return if rt >= 0 { rt } else { t }
+}
+
+// WIP (heap identity, route 1): the record type of the struct row legacy declares global `d`'s
+// cell at (`globalCellStructIdx`), where that row's struct heap is not the global's type `t`'s and it
+// is a closed record at another rep; else -1.
+function globalCellRowTy(d: i32, t: i32): i32 {
+  if t < 0 || globalCellKind(d) != "struct" { return -1 }
+  const rt = slotRowTyOf(globalCellStructIdx(d))
+  if rt < 0 || rt == t || irTyOpen(rt) { return -1 }
+  const h = globalCellHeap(d)
+  if h < 0 || h == recordHeapOfTy(t) { return -1 }
+  const rr = repNodeOfTy(rt)
+  const tr = repNodeOfTy(t)
+  return if rr != tr && repNodeAt(rr) is RRecord && repNodeAt(tr) is RRecord { rt } else { -1 }
 }
 
 // The type a module binding `d` holds a returned record at, as `irBDeclVar` holds a local's: the
@@ -4476,7 +4500,7 @@ function globalHolderTy(d: i32): i32 {
 // Notes global `g`'s rep `rep` in `ib`, with its declaration `d`'s storage-row type
 // (`letBindTy`), which the verifier checks a read off the checked type's rep against.
 function globalNoteAt(g: i32, d: i32, rep: i32) {
-  const st = letBindTy(d, -1)
+  const st = globalStoredTy(d)
   if irGlobalRepOf(ib, g) < 0 {
     irGlobalStoreNote(ib, g, st)
   } else if irGlobalStoreTyOf(ib, g) != st {
