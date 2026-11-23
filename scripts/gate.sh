@@ -148,6 +148,7 @@ row_mem() {
     "capability probes"|"kind-ladder sets") echo 800 ;;
     "dead-export budget"|"render-parse budget") echo 600 ;;
     "late demands") echo 500 ;;
+    "self ir misses") echo 1600 ;;
     "lsp typecheck"|"inventory refs") echo 400 ;;
     *) echo 200 ;;
   esac
@@ -310,6 +311,9 @@ run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED"
 # The late-demand RATCHET: elaboration keys minted after `elabRun` returned, per file,
 # against scripts/late-demands-baseline.txt. `$VL_BIN` makes the sweep use this host.
 run "late demands"             env VL_BIN="$VL" "$VL" run scripts/late-demands.vl --compiler "$SEED" -- --check --seed "$SEED"
+# The self-compile IR-miss RATCHET: compiler functions the IR builder misses (the blocker census,
+# `$VL_IR_SHADOW=4`), against scripts/self-ir-misses-baseline.txt, which only lowers. One self-check.
+run "self ir misses"           env VL_BIN="$VL" "$VL" run scripts/self-ir-misses.vl --compiler "$SEED" -- --check --seed "$SEED"
 # The phase-state RATCHET (L5): hidden-argument globals, cross-phase tables and the checker
 # symbols other phases import, per module, against scripts/phase-state-baseline.txt.
 run "phase state"              "$VL" run scripts/phase-state-census.vl --compiler "$SEED" -- --check
