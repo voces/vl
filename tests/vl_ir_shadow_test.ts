@@ -380,27 +380,26 @@ Deno.test({
   },
 });
 
-// Outside the set: a `??` over a `null`-typed if-expression and a propagating `as` conversion
+// Outside the set: a `??` over a `null`-typed if-expression and an `as?` over a type parameter
 // each leave their function uncovered, named. A closure parameter, its baked
 // callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // A conversion by a propagating `as`, which returns the function's null on a miss, is outside
-    // the set too.
+    // An `as?` over a type parameter at a pin where it cannot fail, which legacy boxes after the
+    // tag, is outside the set too.
     const src = `function greet(c: boolean): i32 {
   const x = null
   return (if c { x } else { x }) ?? 0
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv(x: f64): i32 | null {
-  const n = x as i32
-  return n
+function cv<T>(u: T): i32 | null {
+  return u as? i32
 }
 print(greet(true))
 print(ap((x: i32) => x + 1))
-print(cv(3.0))
+print(cv(3))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
@@ -1537,7 +1536,10 @@ Deno.test({
       "width-retag-pair-unnoted": 2,
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
+      "literal-cast-of-record": 2,
+      "literal-cast-of-i32": 0,
       "retag-closures-of-differing-arity": 2,
+      "retag-closures-of-differing-arity-noted": 0,
       "retag-field-alike-records-two-heaps": 2,
       "push-many-of-i32": 2,
       "global-read-off-store-type": 2,
@@ -1546,6 +1548,9 @@ Deno.test({
       "atom-tower-i32-read": 2,
       "atom-tower-zero-reads": 2,
       "atom-staged-of-i32": 2,
+      "map-get-boxed-scalar-into-bool": 2,
+      "field-coalesce-of-i32-receiver": 2,
+      "bool-join-coalesce-of-i32": 2,
       "trunc-sat-operand-off-plan": 2,
       "atomic-value-off-plan": 2,
       "memory-store-value-off-plan": 2,
@@ -1554,6 +1559,10 @@ Deno.test({
       "coal-str-default-off-rep": 2,
       "coal-atom-str-default-off-rep": 2,
       "opt-read-of-i32": 2,
+      "dead-return-after-returning-call": 5,
+      "pop-or-default-returning-call": 5,
+      "pop-or-default-never-call": 0,
+      "dead-return-after-never-call": 0,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -1575,6 +1584,8 @@ Deno.test({
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
+    // A fit tail that misses leaves legacy's receiver read in place (`fitRecvReadHook`).
+    if (exp.irFitTailSelfTest() !== 1) throw new Error("want the fit hook restored after a miss");
   },
 });
 
