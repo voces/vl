@@ -161,8 +161,16 @@ These are preconditions, independent of the ruling. Both are unfiled.
    - the fuel gates.
 3. The `std:simd` rename PR, with std-api-review: collapse the keyed verbs and keep `splat`/`load`/`store` suffixed, with the header line explaining why. #9678's suffixed names ship first, and this renames them.
 
-**Decisions needed:**
-- **D1.** Extend O1 to intra-module candidates? (Recommend yes.)
-- **D2.** Uniform minting (`min@T` for all members) over "first keeps its plain name"? (Recommend uniform.)
-- **D3.** `select` keyed on the value (`t.select(m, f)`) over keeping it free and suffixed? (Recommend keyed on the value.)
-- **D4.** Make §7.1 and §7.2 preconditions? (Recommend yes. They are live bugs today.)
+**Decisions (ruled 2026-11-23):**
+- **D1. Extend O1 to intra-module candidates: yes (owner).**
+  - Today two modules may each declare `min(self: U8x16)` and `min(self: F32x4)`, but one module may not. That is why std:simd, which keeps every vector type in one module, spells `minU8x16`/`minF32x4`.
+  - The extension applies O1's existing disjoint-head test to same-module declarations. No new resolution rule is added.
+- **D2. Uniform minting: yes (owner delegated to the coordinator).**
+  - The minted symbol (`min@F32x4`) is internal and cannot be written in source. It appears only in `--names` trap banners, `wasm-dis` output and similar debug surfaces.
+  - Minting every member, instead of letting the first keep its plain name, keeps those surfaces independent of declaration order.
+- **D3. `select` keyed on the value: yes (owner delegated to the coordinator).**
+  - `select(m, a, b)` picks lanes from `a` or `b` by a mask. Keyed on the mask, F32x4's and I32x4's `select` would share the head `Mask32x4` and collide.
+  - Declaring it as `select(self: F32x4, m: Mask32x4, other: F32x4)` (called `a.select(m, b)`) gives disjoint heads, and the result type follows the value. Mask-only operations stay on `Mask32x4`.
+  - This is std API surface, so std-api-review confirms the final spelling.
+- **D4. §7.1 and §7.2 are preconditions: yes (owner).**
+  - Both are live bugs in shipped O1, and each is being fixed in its own PR. The compiler PR in step 2 waits for both to merge.
