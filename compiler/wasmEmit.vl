@@ -1328,8 +1328,6 @@ import {
   ListBuild,
   emptyArrHoleBuildKind,
   emptyArrHoleBuildSlot,
-  emptyArrUnionArmKind,
-  emptyArrUnionArmSlot,
   rlBoxIntoRowList,
   rlWidenAllowed,
   rlWidenTagOf,
@@ -1456,7 +1454,6 @@ import {
   rlElemUnionName,
   unMemIsMap,
   unMemIsRefElemArray,
-  unionHasAtomOfTy,
   unionMemberSetOfRow,
   unionMemberTysOfRow,
   unionRowKeyAB,
@@ -1779,6 +1776,7 @@ import {
   coerceSetHasNull,
   coerceTakesAtomAsStr,
   coerceValueAtomKind,
+  emptyArrUnionArmTag,
   eqAtomOperandOk,
   eqOperandRecovers,
   holeBoxPlanOf,
@@ -1809,6 +1807,7 @@ import {
   monoStaticIsResult,
   msSetOfUnionBox,
   narrowBoxWideArmOf,
+  neverBinWidth,
   njDispatches,
   njKindOfTy,
   njLitBasesOf,
@@ -2847,7 +2846,8 @@ function variantLitDrops(objIx: i32, vi: i32, fnIx: i32): boolean {
 }
 
 // The variant row object literal `objIx` is built at by `emitVariantStruct`'s layout loop alone:
-// its span sound, every field written, none outside the row, no stash; -1 otherwise.
+// its span sound, every field written, none outside the row but a constant the loop skips (D5342),
+// no stash; -1 otherwise.
 export function objLitVariantLayoutOf(objIx: i32, fnIx: i32): i32 {
   return objLitVariantLayoutAt(objIx, objLitBuildVariantRow(objIx, fnIx))
 }
@@ -2860,7 +2860,7 @@ export function objLitVariantLayoutAt(objIx: i32, vi: i32): i32 {
   const start = uFieldStart[vi]
   const cnt = uFieldCount[vi]
   if start < 0 || cnt < 0 || start + cnt > sFieldNames.length { return -1 }
-  if objLitHasFieldOutside(objIx, start, cnt) { return -1 }
+  if objLitDropsField(objIx, sFieldNames, start, cnt) { return -1 }
   if objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) { return -1 }
   let fj = 0
   while fj < cnt {
@@ -2884,8 +2884,32 @@ export function objLitVariantStashAt(objIx: i32, vi: i32): i32 {
   const start = uFieldStart[vi]
   const cnt = uFieldCount[vi]
   if start < 0 || cnt < 0 || start + cnt > sFieldNames.length { return -1 }
-  if objLitHasFieldOutside(objIx, start, cnt) { return -1 }
+  if objLitDropsField(objIx, sFieldNames, start, cnt) { return -1 }
   if !objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) { return -1 }
+  let fj = 0
+  while fj < cnt {
+    if objFieldVal(objIx, sFieldNames[start + fj]) < 0 { return -1 }
+    fj = fj + 1
+  }
+  return vi
+}
+
+// The variant row literal `objIx` is written at through `emitVariantStruct`'s drop stash (D1696,
+// D15093): `vi` when the checker built it there from a wider record, a dropped initialiser has an
+// effect, and every row field is given; -1 otherwise.
+export function objLitVariantDropStashAt(objIx: i32, vi: i32, fnIx: i32): i32 {
+  if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length {
+    return -1
+  }
+  const start = uFieldStart[vi]
+  const cnt = uFieldCount[vi]
+  if start < 0 || cnt < 0 || start + cnt > sFieldNames.length { return -1 }
+  if (
+    !variantLitDrops(objIx, vi, fnIx)
+    || !objLitDropsField(objIx, sFieldNames, start, cnt)
+  ) {
+    return -1
+  }
   let fj = 0
   while fj < cnt {
     if objFieldVal(objIx, sFieldNames[start + fj]) < 0 { return -1 }
@@ -8601,22 +8625,7 @@ function emitEmptyArrUnionArm(
   fnIx: i32,
 ) {
   if unionName == "" { return 0 }
-  const bare = nodeAt(unwrapParen(exprIx))
-  if bare is ArrayLit {
-    if bare.arrElems.length != 0 { return 0 }
-  } else {
-    return 0
-  }
-  if unionHasAtomOfTy(unionTy, "i32", true) { return 0 }
-  const k = emptyArrUnionArmKind(exprIx)
-  let tag = -1
-  if k == "strlist" {
-    tag = scalarTagOfKind(9) // "string[]", the tag a `(string | null)[]` arm shares
-  } else if k == "reflist" {
-    const slot = emptyArrUnionArmSlot(exprIx)
-    if !unionHasRefArrayArmSlot(unionTy, slot) { return 0 }
-    tag = refArrBoxTagOf(exprIx, fnIx, slot, unionTy)
-  }
+  const tag = emptyArrUnionArmTag(unionTy, exprIx, fnIx)
   if tag < 0 { return 0 }
   fbI32Rel(RS_TAG, tag)
   const rc = emitExpr(exprIx, fnIx)
@@ -9178,6 +9187,19 @@ export function elseLessUnionIfWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
   return ifShapeWhyOf(ix, fnIx, false)
 }
 
+// Why a value `if` with an `else`, delivered into union `unionTy`'s box, is not written arm by arm
+// at that box (`emitUnionCoerceUnder`'s `if` arm, `emitUnionIfValue`), or "".
+export function unionIfAtDstWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
+  const ix = unwrapParen(ixIn)
+  if ix < 0 { return "node" }
+  const n = nodeAt(ix)
+  if !(n is IfStmt) || n.ifElse < 0 { return "no else" }
+  if unionArmTagClash(unionTy) != "" { return "tag clash" }
+  if callIsNever(ix) { return "never" }
+  if unionCoerceIfArmOf(ix, fnIx) != "value" { return "not value arm" }
+  return ifShapeWhyOf(ix, fnIx, true)
+}
+
 // `emitUnionCoerce`'s body: the arms that thread a list or f32 context apply it and leave it
 // for the wrapper's exit to undo.
 function emitUnionCoerceUnder(
@@ -9625,7 +9647,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
     "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "clo" => true
-    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "ladder" => false
+    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "retag" | "ladder" => false
   }
 }
 
@@ -9649,7 +9671,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     // The niche's stash slot is taken ahead of its value, as legacy's rung takes it.
     "nulNiche" => if nulNicheBoxSlot() < 0 { -1 } else { 0 }
     "nulBool" => if nulBoolBoxSlot() < 0 { -1 } else { 0 }
-    "pass" | "memberBox" | "atomStr" | "mapScalar" => 0
+    "pass" | "memberBox" | "atomStr" | "mapScalar" | "retag" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
 }
@@ -9662,6 +9684,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
     "nulBool" => nulBoolBoxTail()
+    "retag" => boxRetagTail(p.hbKind, exprIx, fnIx)
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
   }
 }
@@ -9698,6 +9721,7 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     || p.hbArm == "refList"
     || p.hbArm == "map"
     || p.hbArm == "clo"
+    || p.hbArm == "retag"
   ) {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
   }
@@ -9750,6 +9774,12 @@ function emitUnionBoxArg(
   boxDstShadowLeave()
   if go < 0 { return -1 }
   if !exprUnion(exprIx, fnIx) || deliveryRetagHas(exprIx) { return 0 }
+  return boxRetagTail(unionTy, exprIx, fnIx)
+}
+
+// The box of `exprIx` on the stack rebuilt at `unionTy` where its members' tags owe it
+// (`emitBoxAtomRetagMembers`); nothing where they owe none.
+export function boxRetagTail(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
   const ft: i32[] = []
   const tt: i32[] = []
   if !boxRetagArmsOfTys(unionBoxTyIxOfExpr(exprIx, fnIx), unionTy, ft, tt) {
@@ -10242,12 +10272,14 @@ function armFloorWhy(siteHeap: i32, ix: i32, fnIx: i32): string {
   return "floor: not seated"
 }
 
-// The table's unbox of the narrowed read `ix` after its box, at its arm record's heap, as
-// `emitCoerced`'s `unbox` writes it; -1 with nothing written where the read has no arm record.
-export function emitArmUnboxAt(ix: i32, fnIx: i32): i32 {
+// The table's unbox of narrowed read `ix` after its box, at its arm record's heap, as `emitCoerced`'s
+// `unbox` writes it; nullable where the arm's own type is, or where the destination is a binding
+// whose cell is a nullable arm (`cellNul`, as `emitLetDelivery` casts). -1 with nothing written
+// where the read has no arm record.
+export function emitArmUnboxAtCell(ix: i32, fnIx: i32, cellNul: boolean): i32 {
   const h = armRecordHeapAt(ix, fnIx)
   if h < 0 || h == uBoxIdx { return -1 }
-  return emitArmUnboxCast(h, armUnboxNullable(ix, fnIx))
+  return emitArmUnboxCast(h, cellNul || armUnboxNullable(ix, fnIx))
 }
 
 // That unbox with its nullability given, for a destination that knows it is a niche. A
@@ -13836,15 +13868,7 @@ function emitArrRef(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
   // a bare scalar/string boxes under its atom's tag; an object literal /
   // already-union value passes through to its existing boxing.
   const elemUnionBox = rlElemKindAt(rslot) == RLK_UNION
-  let elemUnionTy = -1
-  if elemUnionBox {
-    // The slot's element, or the literal's own where the slot is a generic body's hole.
-    elemUnionTy = rlElemTyIxAt(rslot)
-    const litEt = tyArrayElemIx(nodeTyInOf(arrIx, fnIx))
-    if litEt >= 0 && !tyHasTyVar(litEt) && tyHasTyVar(elemUnionTy) {
-      elemUnionTy = litEt
-    }
-  }
+  const elemUnionTy = if elemUnionBox { arrRefUnionElemTy(arrIx, rslot, fnIx) } else { -1 }
   // A nested LIST element kind (`i32[][]` 4 / `string[][]` 6 / `f64[][]` 7 / `i64[][]` 8):
   // the elements ARE arrays, each built at its own type.
   const elemNest = rlElemKindAt(rslot)
@@ -13907,6 +13931,36 @@ function emitArrRef(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
     return arrLitLenCap(elems.length, rlWrapIdx[rslot])
   }
   return arrLitRefShortTail(rslot, elems.length)
+}
+
+// The union `emitArrRef` boxes each element of literal `arrIx` into at union-box slot `rslot`: the
+// slot's element, or the literal's own where the slot is a generic body's hole.
+export function arrRefUnionElemTy(arrIx: i32, rslot: i32, fnIx: i32): i32 {
+  const et = rlElemTyIxAt(rslot)
+  const litEt = tyArrayElemIx(nodeTyInOf(arrIx, fnIx))
+  if litEt >= 0 && !tyHasTyVar(litEt) && tyHasTyVar(et) { return litEt }
+  return et
+}
+
+// The union-box slot `emitArrRef`'s per-element path builds literal `arrIx` at, unchunked, each
+// element boxed into `arrRefUnionElemTy`; -1 where a short arm or any other path builds it.
+export function arrLitUnionLongSlot(
+  arrIx: i32,
+  elems: i32[],
+  fnIx: i32,
+  lb: ListBuild,
+): i32 {
+  if !rlRowsMinted() || elems.length > allocLitChunk() { return -1 }
+  const rs = arrRefSlotPlain(arrIx, elems, fnIx, lb)
+  if rs < 0 || rlElemKindAt(rs) != RLK_UNION { return -1 }
+  if (
+    arrLitRefPlainSlot(arrIx, fnIx, lb) == rs
+    || arrLitUnionBoxSlot(arrIx, fnIx, lb) == rs
+    || arrLitVariantSlot(arrIx, fnIx, lb) == rs
+  ) {
+    return -1
+  }
+  return rs
 }
 
 // After a short ref-list literal's `n` elements at slot `rslot`: the backing, its length and
@@ -22301,6 +22355,15 @@ export function eqHelpFnName(si: i32): string {
 export function eqHelpFnBody(si: i32): u8[] {
   const body: u8[] = []
   const prev = wTarget(body)
+  eqHelpTail(si)
+  fbEnd()
+  wTarget(prev)
+  return body
+}
+
+// The compare of `__eq_<si>__`'s two parameters, at slots 0 and 1, onto the live writer: the null
+// guard, then the field-wise compare, leaving its i32.
+export function eqHelpTail(si: i32) {
   const savedL = eqStashL
   const savedR = eqStashR
   const savedRec = eqChainRecover
@@ -22317,9 +22380,7 @@ export function eqHelpFnBody(si: i32): u8[] {
   eqStashL = savedL
   eqStashR = savedR
   eqChainRecover = savedRec
-  fbEnd()
-  wTarget(prev)
-  return body
+  return 0
 }
 
 // `emitStructEqFieldAt`'s `i32[]` field: lengths equal and element-wise equal — `len` from the
@@ -39374,7 +39435,7 @@ function initGuardReaderRow(): i32 {
 
 // Calls `__init_fail__` when the progress cell has not yet passed global `gi` (D2652);
 // `verb` is "read" or "written".
-function emitInitGuard(gi: i32, verb: string) {
+export function emitInitGuard(gi: i32, verb: string) {
   if gInitProgIdx < 0 || gHelpInitFail < 0 || gImports < 4 {
     return emitFail("emitProgram: read-before-init guard with no progress cell")
   }
@@ -41053,6 +41114,23 @@ export function objLitStashRowAt(objIx: i32, si: i32): i32 {
   const cnt = sFieldCount[si]
   if objLitDropsField(objIx, sFieldNames, start, cnt) { return -1 }
   if !objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) { return -1 }
+  let fi = 0
+  while fi < cnt {
+    if objFieldVal(objIx, sFieldNames[start + fi]) < 0 { return -1 }
+    fi = fi + 1
+  }
+  return si
+}
+
+// The struct row literal `objIx` is written at through `emitObj`'s stash with a field dropped
+// (D1696): `si` when every row field is given, the stash fires and a given field is not in the
+// row; -1 otherwise. `objLitStashRowAt` is its no-drop twin.
+export function objLitDropStashRowAt(objIx: i32, si: i32): i32 {
+  if !sDeclared || si < 0 || si >= sFieldCount.length { return -1 }
+  const start = sFieldStart[si]
+  const cnt = sFieldCount[si]
+  if !objLitStashes(objIx, si) { return -1 }
+  if !objLitDropsField(objIx, sFieldNames, start, cnt) { return -1 }
   let fi = 0
   while fi < cnt {
     if objFieldVal(objIx, sFieldNames[start + fi]) < 0 { return -1 }
@@ -42861,6 +42939,9 @@ function binOperandScalarTy(ix: i32, fnIx: i32): i32 {
 // The width a scalar numeric operator works at: the checker's pair rule over its operands
 // (`numPairOpTy`), or `i32` when an operand has no scalar type.
 export function binNumWidth(e: BinExpr, fnIx: i32): string {
+  // A `never` operand holds no value, so the operator works at the other's width (D17064).
+  const nw = neverBinWidth(e, fnIx)
+  if nw != "" { return nw }
   const t = numPairOpTy(
     e,
     binOperandScalarTy(e.binLeft, fnIx),
@@ -45341,7 +45422,7 @@ function emitCoalesceUnionField(
 
 // The stash of a union-field `??`'s receiver `recv` along plan `p`: -1 for a re-readable place,
 // which each arm writes again, else the slot one evaluation is kept in (D17059).
-function coalFieldRecvStash(recv: i32, p: CoalFieldPlan): i32 {
+export function coalFieldRecvStash(recv: i32, p: CoalFieldPlan): i32 {
   if unionEqOperandOk(recv) || p.cfHeap < 0 { return -1 }
   return coalFieldRecvSlot(p.cfHeap)
 }
