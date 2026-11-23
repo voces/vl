@@ -38,4 +38,14 @@ The cells move on to other classes:
 
 ## Readings
 
-PENDING
+Base 55288c87, head 86293dc6, both fixpoint seeds.
+
+- A/B (mode 1, tests/cases): covered 76,540 → 76,541, matched 76,540 → 76,541, mismatch/fail 0 → 0;
+  start covered 6,775 → 6,775.
+- ir-only census (tests/cases run and trap tiers): 5,818 of 7,155 programs on both sides; the
+  covered functions sit in programs that still miss another class (see Left).
+- `ir-identity.sh --cases`: identical 7,724, differ 0; `--claimless`: identical 14,048, differ 0;
+  `--names`: differ 0; self-compile identical.
+- Mode 6 prepost differs: corpus 0 of 82,188 rows, cases 1 of 66,593 (not own refusal 0).
+- rep-fuzz exact; L2 self-compile fuel +0.03% on 121,718,780,196; `self ir misses` 0;
+  deep nesting 8 passed, 0 failed.
