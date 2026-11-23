@@ -7,16 +7,20 @@ still carried the value's rowless record type.
 
 ## The mechanism
 
-`rtOfMap` builds the value rep with `rtMapValTy(v)`: for a record type, the type of the struct row
-legacy stores it in (`structRowOfRecordTy`, then `slotRowTyOf`), else `v`. For a record type with
-its own row that is `v` itself, the same rep node; for a rowless record it is the row another type
-is stored at, the one legacy's mv slot holds. Sets are unchanged (a `bool` leaf).
+`rtOfMap` builds the value rep with `rtMapValTy(v)`: for a record type no struct row records, the
+type of the row legacy stores it in (`structRowOfRecordTy`, then `slotRowTyOf`), the one legacy's
+mv slot holds; else `v`. A record type with a row of its own keeps `v`: answering
+`structRowOfRecordTy` for it too moved two generic-instance maps to a twin row
+(`generics/generic-body-push-record-of-generic-fn-two-instances.vl` and
+`structs/record-literal-beside-declared-record-with-another-field-function.vl` stopped at `map get
+rep`). Sets are unchanged (a `bool` leaf).
 
 The row comes from one new slot in `emit_rep`, installed by `emitProgram` beside
-`rowFieldStorageFn` since `emit_shape_rows` sits above the rep module:
+`rowFieldStorageFn` (as `rowlessRecordRow`: -1 when `structIndexOfTy` names a row, else
+`structRowOfRecordTy`), since both sit above the rep module:
 
 ```
-export let recordRowFn: (ty: i32) => i32   // the struct row legacy stores record type ty at, or -1
+export let recordRowFn: (ty: i32) => i32   // the row legacy stores a rowless record type at, or -1
 export function askRecordRowTy(ty: i32): i32  // that row's type, else ty; recorded once per type
 ```
 
