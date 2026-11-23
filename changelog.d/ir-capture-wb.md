@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage: lifted functions that assign their captures, and their callers.** A lifted body reads and assigns each capture as its own parameter and hands the assigned ones back after its result at every exit (`IrFn.irRetExtra`). A direct call of it sets them back into the bindings it passed (`RCall.caWb`), and its call of itself takes legacy's tail form. `callee writes back captures` (29), `lifted extra results` / `local slot` (34) and `capture written back` (3) fall to 0. On their 16 programs, functions that are covered and match legacy go from 359 to 425. Legacy's bytes don't change.
