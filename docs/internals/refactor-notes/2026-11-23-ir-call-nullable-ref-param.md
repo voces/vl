@@ -46,4 +46,26 @@ non-null and nullable, at a nullable parameter. Master leaves seven functions on
 bytes. The class's own programs in this family move on to `expression null` (a literal `null`
 argument, N5's class), or match.
 
-READINGS
+Fixpoint seeds on both sides, master 1b69a6af1 against this branch, `VL_STD` the tree's:
+
+| class (tests/cases census) | master | branch |
+| --- | ---: | ---: |
+| call of a non-declaration, functions | 31 | 27 |
+| start: call of a non-declaration | 14 | 9 |
+| expression null, functions (moved on) | 18 | 21 |
+| start: expression null (moved on) | 3 | 8 |
+| tests/cases functions matched | 79309 | 79315 |
+
+- No program's covered count fell (per-program `blockers none`, master against branch: 0).
+- Self-compile: 20419 covered, matched and claimed on both; modes 1, 3 and 5 build the plain bytes,
+  the same as master's.
+- `ir-identity --names`: identical 9037, fail under both 3267, differ 0; self-compile identical.
+  `--claimless`: identical 14054, differ 0. `--cases`: identical 7747, fail under both 68, differ 0;
+  witnesses same 61, differ 0.
+- tests/cases legacy A/B: identical 7460, fail under both 67, differ 0. That is the proof that
+  widening `callRefArgPlain` moved no legacy byte.
+- Armed shadow: 0 fail or mismatch rows on both. `--claims`: `ir-shadow: ok`.
+- Order check (mode 6): 0 order rows over the distilled corpus and over tests/cases.
+- `self-ir-misses`: 0 missed. Deep nesting: 8 passed; the labelled-loop margin passes at 910 KB and
+  fails at 900, as master's seed does.
+- Fuel: L2 122267838057 against master's 122267838291.
