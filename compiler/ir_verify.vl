@@ -49,6 +49,7 @@ import {
   RListEmpty,
   RListEmptyArms,
   RListEq,
+  RListFitIs,
   RListGet,
   RListIsAcross,
   RListLen,
@@ -523,6 +524,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCall => {
       uses(r.caCaps, at)
       uses(r.caArgs, at)
+      // A capture handed back goes to a variable the call passed it from.
+      for w in r.caWb {
+        if !opndsHoldVar(r.caCaps, w) {
+          return fail(2, at, "a call's write-back is not a capture it passes")
+        }
+      }
       callSig(r.caCallee, r.caArgs, dst, at)
     }
     RCallRef => {
@@ -1172,6 +1179,11 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RListIsAcross => {
       use(r.laV, at)
       if dst != vfBool { return fail(2, at, "a list is-across test is a bool") }
+      0
+    }
+    RListFitIs => {
+      use(r.lsV, at)
+      if dst != vfBool { return fail(2, at, "a list fit test is a bool") }
       0
     }
     RLitArms => {
@@ -1939,7 +1951,10 @@ function ifSpine(id0: i32) {
 
 // Whether `v` is a declared binding, the one a loop value's frame carries out through.
 function declaredVar(v: i32): boolean {
-  return v >= 0 && v < vf.irVars.length && vf.irVars[v].vKind != "temp"
+  return v >= 0
+    && v < vf.irVars.length
+    && vf.irVars[v].vKind != "temp"
+    && vf.irVars[v].vSlot >= 0
 }
 
 function labelled(label: i32, out: i32, body: i32[]) {
@@ -1949,6 +1964,16 @@ function labelled(label: i32, out: i32, body: i32[]) {
   vfLabels.pop()
   vfLabelOut.pop()
   return 0
+}
+
+// Why a box stash `??` is malformed, or "": its operand is the box the shared slot holds, a null
+// one's null its tag.
+function coalBoxStashWhy(n: SCoalBox): string {
+  const r = repNodeAt(opRep(n.cbL))
+  if !(r is RBox) && !(r is RNullable && r.rnDisc == 4) {
+    return "a box stash `??` reads a box"
+  }
+  return ""
 }
 
 // A `??`'s checks: its operand block, operand, out, arm and default. Its own frame, so `stmt`'s
@@ -1984,6 +2009,7 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
     "litUnion" | "nulBool" => coalNicheWhy(n)
     "fieldBox" | "fieldVal" => coalFieldWhy(n)
     "optLeaf" => coalOptLeafWhy(n)
+    "boxStash" => coalBoxStashWhy(n)
     "boxFieldScalar" => coalBoxFieldScalarWhy(n)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
   }
@@ -2261,8 +2287,12 @@ function intSwitchCheck(n: SIntSwitch, id: i32) {
       return fail(7, id, "a table entry names no arm")
     }
   }
-  for a in n.isArms { nested(a) }
+  for a in n.isArms {
+    nested(a)
+    endsWriting(a, n.isOut, id)
+  }
   nested(n.isElse)
+  endsWriting(n.isElse, n.isOut, id)
   return 0
 }
 
@@ -2531,6 +2561,7 @@ function rhsReadsList(r: Rhs): boolean {
       RListEmpty |
       RListEmptyArms |
       RListEq |
+      RListFitIs |
       RListIsAcross |
       RListLen |
       RListNew |
@@ -2876,4 +2907,12 @@ function plainRecordsLowerAlike(a: i32, b: i32): boolean {
     && !x.rrVariant
     && !y.rrVariant
     && repsLowerAlike(a, b, vf.irRecHeap)
+}
+
+// Whether operands `os` read variable `v`.
+function opndsHoldVar(os: Opnd[], v: i32): boolean {
+  for o in os {
+    if o is OVar && o.ov == v { return true }
+  }
+  return false
 }

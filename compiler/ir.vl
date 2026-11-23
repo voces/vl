@@ -71,13 +71,15 @@ export type CastFail = "trap" | "null"
 export type RPrimOp = { poOp: PrimOp, poArgs: Opnd[] }
 // `caNever`: the callee never returns, so the call is followed by `unreachable` (`callEndsNever`).
 // `caEnv`: the callee takes a hidden environment parameter, passed null before the arguments;
-// `caCaps`: a lifted callee's captures, passed after it.
+// `caCaps`: a lifted callee's captures, passed after it; `caWb`: the variables the captures it
+// assigns go back to after the call, in its result order, the last set first (D3664).
 export type RCall = {
   caCallee: i32,
   caArgs: Opnd[],
   caNever: boolean,
   caEnv: boolean,
   caCaps: Opnd[],
+  caWb: i32[],
 }
 // `crSig`: the `$fnsig` type index; `crVoid`: the key returns nothing; `crDrop`: a call statement
 // drops its result, as legacy decides (`callRefPlainVoid`).
@@ -232,7 +234,7 @@ export type RListGet = { lgV: Opnd, lgIx: Opnd, lgAt: i32 }
 // `llAt`: the `.length` `Member` node, which legacy's hoist and view decisions key on.
 export type RListLen = { llV: Opnd, llAt: i32 }
 // `nwV`, of number kind `nwSrc`, widened to kind `nwDst` at delivery node `nwAt` (kinds as
-// `widenPlanOf` names them: 1 i32, 3 i64, 4 f64, 5 f32).
+// `widenPlanOf` names them: 1 i32, 3 i64, 4 f64, 5 f32); 3 to 1 is a shift-mask fold's wrap.
 export type RNumWiden = { nwV: Opnd, nwSrc: i32, nwDst: i32, nwAt: i32 }
 // A numeric `as` at cast node `ncAt` over operand `ncV`, built at the kind `numCastKindOf`
 // names; legacy's `numCastTail` writes the conversion, and an `as!`'s test and trap.
@@ -354,6 +356,9 @@ export type RListEmptyArms = { lfV: Opnd, lfAt: i32 }
 // `laV is L` for list type `L` over a box of list arms at `is` test `laAt`, along
 // `listIsAcrossRepsPlan`: the box once into the shared receiver slot, then each arm's test.
 export type RListIsAcross = { laV: Opnd, laAt: i32 }
+// `lsV is L` for list type `L` over a list whose elements are wider than `L` at `is` test `lsAt`,
+// along `listFitPlanOf`: each element, at every depth, a member of `L`: a bool.
+export type RListFitIs = { lsV: Opnd, lsAt: i32 }
 // `liV` at literal arm `liArm` of `is` test `liAt` (`litIsArmOf`), read once per member the arm
 // compares, as `emitIsTestLitArms` writes it: a bool.
 export type RLitArms = { liV: Opnd, liArm: LitIsArm, liAt: i32 }
@@ -510,6 +515,7 @@ export type Rhs = RArmUnbox
   | RListEmpty
   | RListEmptyArms
   | RListEq
+  | RListFitIs
   | RListGet
   | RListIsAcross
   | RListLen
@@ -653,14 +659,16 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 export function coalArmStagesLeads(a: CoalValArm): boolean {
   return match a {
     "litUnion" | "nulBool" | "nulRef" => true
-    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "boxFieldScalar" => false
+    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "boxStash" | "boxFieldScalar" => false
   }
 }
 // An integer `match` chain written as one `br_table` (`IntSwitchPlan`): operand `isOn` less
 // `isLo`, read again under the range test when `isWide`; `isTable[d]` the arm index `d` takes,
-// `isArms.length` the else, whose body is `isElse`. A tail chain's (`isTail`) arms return.
+// `isArms.length` the else, whose body is `isElse`. A tail chain's (`isTail`) arms return; a
+// valued one's write out `isOut` (-1 for none), which its frame carries.
 export type SIntSwitch = {
   isTail: boolean,
+  isOut: i32,
   isOn: Opnd,
   isWide: boolean,
   isLo: i32,
@@ -763,6 +771,9 @@ export type IrFn = {
   // A closure thunk: one call forwarding its parameters, in tail form whatever the callee
   // returns, as `emitCloThunkCode` writes it.
   irThunk: boolean,
+  // A lifted function's assigned captures, the parameter variables every exit hands back after
+  // its result (D3664), in legacy's order (`fbSeedRetExtra`).
+  irRetExtra: i32[],
   irSigFn: i32[],
   irSigParams: i32[][],
   irSigRet: i32[],
@@ -860,6 +871,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irHelper: false,
     irFragment: false,
     irThunk: false,
+    irRetExtra: [],
     irSigFn: [],
     irSigParams: [],
     irSigRet: [],
@@ -1352,6 +1364,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListEmpty => [r.leV]
     RListEmptyArms => [r.lfV]
     RListIsAcross => [r.laV]
+    RListFitIs => [r.lsV]
     RLitArms => [r.liV]
     RNumIs => [r.niV]
     RUnionConcreteEq => [r.ucBox, r.ucOther]
@@ -1471,6 +1484,7 @@ function rhsText(r: Rhs): string {
     RListEmpty => "list empty " + opndText(r.leV)
     RListEmptyArms => "list empty arms " + opndText(r.lfV)
     RListIsAcross => "list is across " + opndText(r.laV)
+    RListFitIs => "list fit " + opndText(r.lsV)
     RLitArms => "lit arms " + r.liArm + " " + opndText(r.liV)
     RNumIs => "num is " + opndText(r.niV)
     RNumIntr => "intrinsic " + i32ToStr(r.nxOp) + "(" + opndsText(r.nxArgs) + ")"
@@ -1648,7 +1662,12 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
       s
     }
     SIntSwitch => {
-      let s = p + "intswitch " + opndText(n.isOn) + " lo " + i32ToStr(n.isLo)
+      let s = p
+        + "intswitch "
+        + opndText(n.isOn)
+        + outText(n.isOut)
+        + " lo "
+        + i32ToStr(n.isLo)
       if n.isWide { s = s + " wide" }
       s = s + " table"
       for t in n.isTable { s = s + " " + i32ToStr(t) }
@@ -1721,7 +1740,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
       STrap => "control"
     SCoalBox => match n.cbArm {
       "popOr" => "list"
-      "nulRef" => "box"
+      "nulRef" | "boxStash" => "box"
       "litUnion" | "nulBool" | "boxFieldScalar" => "box"
       "fieldBox" | "fieldVal" | "optLeaf" => "record"
       "mapIndexGetOr" => "map"
@@ -1771,6 +1790,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RListEmpty |
       RListEmptyArms |
       RListEq |
+      RListFitIs |
       RListGet |
       RListIsAcross |
       RListLen |
