@@ -728,7 +728,7 @@ import {
   parseI32,
   parseI64Pair,
 } from "./emit_bignum"
-import { isVoidTy } from "./tyquery"
+import { isVoidTy, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import { optChainStagesRecv, structIndexOfTy } from "./emit_atom_kinds"
 import { recordHeapOfTy } from "./emit_shape_intern"
@@ -8414,9 +8414,14 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
       "container" | "nonNull" => false
     }
     if box >= 0 || !repOk { return irBMiss("map get union box rep") }
-  } else if box < 0 && !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) {
-    return irBMiss("map get rep")
   }
+  // A read the instance types without the null its map's value holds is the helper's value at
+  // that niche, as legacy reads it: a miss and a stored null are both its sentinel.
+  const plain = arm == "unionBox"
+    || box >= 0
+    || mapGetRepOk(sh, m.rmVal, rep, rd.idxArr)
+  const nt = if plain { -1 } else { mapReadNicheTy(sh, m.rmVal, rep, rd.idxArr) }
+  if !plain && nt < 0 { return irBMiss("map get rep") }
   const r: Rhs = {
     mtSym: rk.mkSym,
     mtNonNull: rk.mkNonNull,
@@ -8426,11 +8431,29 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
     mtBox: box,
     mtRow: row,
   }
+  if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
   if box < 0 { return irBLetTemp(b, r, ix, rep) }
   // The box is the union's own, typed at it where a narrowed re-read's node is the member's.
   const bt = holeBoxTyAt(ix, ibFnIx)
   if bt < 0 || repNodeOfTy(bt) != rep { return irBMiss("map get box type") }
   return irBLetTempTy(b, r, ix, rep, heldTy(bt))
+}
+
+// The value type of map `recvIx` where a read the instance types at rep `rep` is held at the
+// map's value rep `val`, the `boolean | null` or `K | null` niche of `rep`; -1 for any other read.
+function mapReadNicheTy(sh: i32, val: i32, rep: i32, recvIx: i32): i32 {
+  if sh >= 0 { return -1 }
+  const vn = repNodeAt(val)
+  if (
+    !(vn is RNullable)
+    || vn.rnInner != rep
+    || !(boolNullable(val) || atomNullable(val))
+  ) {
+    return -1
+  }
+  const vt = tyMapValOf(nodeTyAt(recvIx, ibFnIx))
+  if vt < 0 || repNodeOfTy(vt) != val { return -1 }
+  return vt
 }
 
 // Whether a bare map read of `recvIx` (value rep `val`, shape `sh`) leaves rep `rep`: an mv
