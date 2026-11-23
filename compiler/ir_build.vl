@@ -114,6 +114,7 @@ import {
   coalArmStagesLeads,
   ifCondLetAt,
   irBodyLeaves,
+  irCloFieldRetagNote,
   irFnNew,
   irFnText,
   irGlobalNote,
@@ -123,6 +124,7 @@ import {
   irNodeFamily,
   irNodeNew,
   irRecHeapNote,
+  irRecHeapOf,
   irSigNote,
   irSigOf,
   irSpanNote,
@@ -1613,12 +1615,34 @@ function objLitAt(
     const mark = b.length
     const own = fieldExplicitNullOwn(arm, row, fi, valIx)
     const typed = own < 0 && fieldExplicitNullTyped(arm, row, fi, valIx)
-    const v = if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own }, valIx, ks[k]) } else if typed { repTemp(b, { fnRow: row, fnFi: fi }, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
-    if ibMiss != "" { return v }
-    const vr = irBOpRep(v)
-    if vr != ks[k] && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr) {
+    const v0 = if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own }, valIx, ks[k]) } else if typed { repTemp(b, { fnRow: row, fnFi: fi }, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
+    if ibMiss != "" { return v0 }
+    const vr = irBOpRep(v0)
+    // A closure value at a field whose closure rep leaves a part open, or fills one, is the same
+    // closure struct, retagged.
+    const holed = vr != ks[k]
+      && holeRetagNoted(vr, ks[k], true)
+      && exprPrePathWhy(valIx, ibFnIx) == ""
+    // A closure at a field legacy writes plainly whose kid names another signature: the row's heap
+    // types its closure kid from another row, and the struct holds any closure.
+    const clo = vr != ks[k]
+      && !holed
+      && own < 0
+      && !typed
+      && repNodeAt(vr) is RClosure
+      && repNodeAt(ks[k]) is RClosure
+      && exprPrePathWhy(valIx, ibFnIx) == ""
+      && recHeapNoted(rep)
+    if (
+      vr != ks[k]
+      && !holed
+      && !clo
+      && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr)
+    ) {
       return irBMiss("object field coercion")
     }
+    const v = if holed || clo { repTemp(b, { rgV: v0 }, valIx, ks[k]) } else { v0 }
+    if clo { irCloFieldRetagNote(ib, b[b.length - 1]) }
     layout[fi] = k
     if stashRow >= 0 { src.push(k) }
     // Under the order stash a later field's valued `if` sets every field into its slot as legacy
@@ -4333,7 +4357,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         && (listRetag(irBOpRep(a), pr)
         || holeRetagNoted(irBOpRep(a), pr, true)
         || recRetag(irBOpRep(a), pr))
-        && exprPrePathWhy(c.callArgs[i], ibFnIx) == "") { repTemp(b, { rgV: a }, c.callArgs[i], pr) } else if irBOpRep(a) != pr && recRetagAt(irBOpRep(a), pr, c.callArgs[i]) { repTemp(b, { rgV: a }, c.callArgs[i], pr) } else { a }
+        && exprPrePathWhy(c.callArgs[i], ibFnIx) == "") { repTemp(b, { rgV: a }, c.callArgs[i], pr) } else if irBOpRep(a) != pr && recRetagNoted(irBOpRep(a), pr, c.callArgs[i]) { repTemp(b, { rgV: a }, c.callArgs[i], pr) } else { a }
       // A union parameter boxes the argument as legacy's `emitUnionBoxOwed` does (the floor); a
       // reference its parameter's valtype holds as it stands is passed as is (`repStoresAs`).
       const fa = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, c.callArgs[i], pr, -1, fu) } else { ra }
@@ -10408,7 +10432,8 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       && irBOpRep(built) != ib.irRetRep
       && (listRetag(irBOpRep(built), ib.irRetRep)
       || holeRetagNoted(irBOpRep(built), ib.irRetRep, false)
-      || recRetag(irBOpRep(built), ib.irRetRep))
+      || recRetag(irBOpRep(built), ib.irRetRep)
+      || recRetagNoted(irBOpRep(built), ib.irRetRep, n.retArg))
       && exprPrePathWhy(n.retArg, ibFnIx) == "") { repTemp(b, { rgV: built }, n.retArg, ib.irRetRep) } else { built }
     const vr = if ibMiss == "" { irBOpRep(v) } else { -1 }
     if (
@@ -11522,7 +11547,7 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   const d = deliver(b, init, rep, -1)
   if ibMiss != "" { return d }
   // A record on the cell's own struct heap, or a declared subtype's, is stored retagged.
-  const v = if irBOpRep(d) != rep && recRetagAt(irBOpRep(d), rep, init) { repTemp(b, { rgV: d }, init, rep) } else { d }
+  const v = if irBOpRep(d) != rep && recRetagNoted(irBOpRep(d), rep, init) { repTemp(b, { rgV: d }, init, rep) } else { d }
   const vr = irBOpRep(v)
   const stored = noted < 0 && vr != rep && vr == globalTyRep(letBindTy(gst, -1))
   // A `null`-typed value is the bottom ref, already a value of a nullable reference cell.
@@ -11713,6 +11738,20 @@ function recRetagAt(src: i32, dst: i32, at: i32): boolean {
   return (recRowRetag(src, dst, ib.irRecHeap)
     || recSubAdmit(src, dst, ib.irRecHeap, ib.irRecSub))
     && exprPrePathWhy(at, ibFnIx) == ""
+}
+
+// Whether record rep `r`'s struct heap is noted, noting it first.
+function recHeapNoted(r: i32): boolean {
+  noteRecHeaps(r)
+  return irRecHeapOf(ib, r) >= 0
+}
+
+// `recRetagAt` after noting both reps' record heaps: a record returned at its result's row on one
+// heap whose fields lower alike, a closure field's signature among them.
+function recRetagNoted(src: i32, dst: i32, at: i32): boolean {
+  noteRecHeaps(src)
+  noteRecHeaps(dst)
+  return recRetagAt(src, dst, at)
 }
 
 // Whether rep `src` is `dst` as it stands, a list (`listRetagHole`) or, with `clo`, any value
