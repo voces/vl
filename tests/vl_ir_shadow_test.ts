@@ -1631,6 +1631,8 @@ Deno.test({
       "call-write-back-not-a-capture": 2,
       "coal-str-default-off-rep": 2,
       "coal-atom-str-default-off-rep": 2,
+      "atom-decode-nullable-into-string": 2,
+      "atom-decode-nullable-into-nullable-string": 0,
       "opt-read-of-i32": 2,
       "dead-return-after-returning-call": 5,
       "pop-or-default-returning-call": 5,
