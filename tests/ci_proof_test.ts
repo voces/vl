@@ -47,8 +47,6 @@ const LOCAL: Record<string, string> = {
   "ir shadow cases": "no ci.yml job runs the IR shadow over tests/cases",
   "ir claims":
     "no ci.yml job runs the shipped IR claim over the distilled corpus",
-  "ir prepost":
-    "no ci.yml job runs the IR order check over the corpus and tests/cases",
 };
 
 // What ci.yml must run for each covered row: fragments of the same command, on the seed.

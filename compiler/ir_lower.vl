@@ -136,6 +136,7 @@ import {
   RListEmpty,
   RListEmptyArms,
   RListEq,
+  RListFitIs,
   RListGet,
   RListIsAcross,
   RListLen,
@@ -275,8 +276,8 @@ import {
   fbRefNullStruct,
   fbRefTest,
   fbResetLazyFrame,
-  fbReturn,
   fbReturnCall,
+  fbReturnOp,
   fbSelect,
   fbStructGet,
   fbStructNew,
@@ -620,6 +621,8 @@ import {
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fbRefIfOpenType,
+  listFitIsPlanOf,
+  listFitTail,
   listIsAcrossPlanOf,
   listIsAcrossTail,
   litIsBoxLexes,
@@ -965,10 +968,19 @@ function call(c: RCall, tail: boolean) {
   if c.caEnv { fbRefNullStruct() }
   for a in c.caCaps { irLOpnd(a) }
   for a in c.caArgs { irLOpnd(a) }
-  if tail && !c.caNever {
+  // A call whose callee hands captures back is followed by their sets, so it is never a tail,
+  // except a lifted function's call of itself (`liftSelfTail`).
+  if tail && !c.caNever && (c.caWb.length == 0 || liftSelfTail(c)) {
     fbReturnCall(gImports + c.caCallee)
   } else {
     fbCall(gImports + c.caCallee)
+    let j = c.caWb.length - 1
+    while j >= 0 {
+      const w = varSlot(c.caWb[j])
+      if w < 0 { return irLMiss("call write-back slot") }
+      fbLocalSet(w)
+      j = j - 1
+    }
     if c.caNever { fbUnreachable() }
   }
   return 0
@@ -1023,6 +1035,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListEmpty => listEmpty(r)
     RListEmptyArms => listEmptyArms(r)
     RListIsAcross => listIsAcross(r)
+    RListFitIs => listFitIs(r)
     RLitArms => litArms(r)
     RNumIs => numIs(r)
     RTagIs => {
@@ -1060,7 +1073,12 @@ function rhs(r: Rhs, tail: boolean) {
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
       irLOpnd(r.nwV)
-      numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
+      // The one narrowing, a shift-mask fold's i64 source at width 32, is `srPushSource`'s wrap.
+      if r.nwSrc == 3 && r.nwDst == 1 {
+        fbI32WrapI64()
+      } else {
+        numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
+      }
     }
     RNumCast => {
       irLOpnd(r.ncV)
@@ -1795,6 +1813,16 @@ function listIsAcross(r: RListIsAcross): i32 {
   if !p.lpOk { return irLMiss("list is across plan") }
   irLOpnd(r.laV)
   return listIsAcrossTail(n, sharedFieldRecvSlot(), p, lw.irAt)
+}
+
+// `RListFitIs` as `emitListFitIs` writes it: the receiver, then legacy's walk along the plan.
+function listFitIs(r: RListFitIs): i32 {
+  const n = nodeAt(r.lsAt)
+  if !(n is IsExpr) { return irLMiss("list fit node") }
+  const p = listFitIsPlanOf(r.lsAt, lw.irAt)
+  if p.lftOk != 1 { return irLMiss("list fit plan") }
+  irLOpnd(r.lsV)
+  return listFitTail(p, lw.irAt)
 }
 
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
@@ -3264,15 +3292,36 @@ function retagOperand(t: i32): Opnd {
   return none
 }
 
+// Whether call `c` is a lifted function's call of itself, which returns what the function would,
+// so its tail form drops the write-back with the return's own hand-back (`emitLiftSelfTailRet`).
+function liftSelfTail(c: RCall): boolean {
+  return lw.irRetExtra.length > 0
+    && c.caWb.length > 0
+    && c.caCallee == fnStmtsPosOf(lw.irAt)
+    && !fnUses.unionSink
+}
+
 // 0 for a closure call's right-hand side, which a return takes in its tail form too; -1 else.
 function callRefTemp(r: Rhs): i32 { return if r is RCallRef { 0 } else { -1 } }
 
 function callTemp(o: Opnd): i32 {
+  // A lifted body handing captures back returns them after the call, so no call is its tail but
+  // its call of itself (`liftSelfTail`).
+  if lw.irRetExtra.length > 0 {
+    if !(o is OVar) || !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
+    const r = tempRhs(o.ov)
+    return if r is RCall && liftSelfTail(r) { r.caCallee } else { -1 }
+  }
   return match o {
     OVar => {
       if !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
       const r = tempRhs(o.ov)
-      if r is RCall { r.caCallee } else { callRefTemp(r) }
+      // A callee that hands captures back is followed by their sets, so it has no tail form.
+      if r is RCall {
+        if r.caWb.length == 0 { r.caCallee } else { -1 }
+      } else {
+        callRefTemp(r)
+      }
     }
     OImm | OStr => -1
   }
@@ -3603,11 +3652,16 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
 // the index less its low value (a 64-bit one range-tested onto the default), the `br_table`, then
 // each arm and a branch past the rest, and the else. A tail chain's arms are in tail position.
 function intSwitch(n: SIntSwitch, pending: i32[], tail: boolean) {
+  // A valued switch's outer frame is typed by its out, which each arm leaves for its branch.
+  const t = n.isOut
+  if t >= lw.irVars.length { return irLMiss("valued switch out") }
+  const vt = if t >= 0 { valtypeOf(lw.irVars[t].vRep) } else { 64 }
+  if vt < 0 { return irLMiss("valued switch rep") }
   irLSettle(pending)
   const m = n.isArms.length
   const span = n.isTable.length - 1
   const lo = n.isLo
-  fbBlock(64)
+  fbBlock(vt)
   lwFrames.push(-1)
   const endDepth = ctrlDepth
   let k = 0
@@ -3637,14 +3691,18 @@ function intSwitch(n: SIntSwitch, pending: i32[], tail: boolean) {
   for a in n.isArms {
     fbEnd()
     lwFrames.pop()
-    body(a, armTail, -1, false)
+    body(a, armTail, t, false)
     fbBr(ctrlDepth - endDepth)
   }
   fbEnd()
   lwFrames.pop()
-  body(n.isElse, armTail, -1, false)
+  body(n.isElse, armTail, t, false)
   fbEnd()
   lwFrames.pop()
+  if t >= 0 {
+    livePush(t)
+    pending.push(t)
+  }
   return 0
 }
 
@@ -4225,7 +4283,8 @@ function isBr(id: i32): boolean {
 function ret(n: SReturn, pending: i32[]) {
   if !n.rtHas {
     irLSettle(pending)
-    return fbReturn()
+    retExtra()
+    return fbReturnOp()
   }
   // A call retagged into its `K | null` is the same i32, so legacy tail-calls it too.
   const outer = retagOf(n.rtV)
@@ -4260,7 +4319,19 @@ function sinkExit() {
     lwSinkFired = lwSinkFired + 1
     return 0
   }
-  return fbReturn()
+  retExtra()
+  return fbReturnOp()
+}
+
+// The captures a lifted function hands back after its result (`irRetExtra`), as every legacy exit
+// pushes them (`fbPushRetExtra`); the IR's exits write `fbReturnOp`, never legacy's seeded list.
+function retExtra() {
+  for v in lw.irRetExtra {
+    const w = varSlot(v)
+    if w < 0 { return irLMiss("lifted extra result slot") }
+    fbLocalGet(w)
+  }
+  return 0
 }
 
 function spanOpen(id: i32) {
@@ -4467,8 +4538,14 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   const valued = !repIsNoValue(f.irRetRep)
   // The single start body opens with legacy's pool fill; an init function's does not.
   if f.irPoolFill { irStartPrologueHook() }
-  // Legacy tail-calls a void body's last call, but not the start function's.
-  body(f.irBody, !valued && (f.irAt >= 0 || f.irThunk), -1, false)
+  // Legacy tail-calls a void body's last call, but not the start function's, nor in a lifted
+  // body that hands captures back after it (`irRetExtra`).
+  body(
+    f.irBody,
+    !valued && (f.irAt >= 0 || f.irThunk) && f.irRetExtra.length == 0,
+    -1,
+    false,
+  )
   const pad = if valued { f.irEndPad } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
@@ -4478,6 +4555,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
     fbUnreachable()
   }
   if lwSinkFired > 0 { sinkClose() }
+  retExtra()
   fbEnd()
   wTarget(prev)
   // Every frame a builder opened is closed, so the one depth not given back is the function's
