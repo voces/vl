@@ -6525,22 +6525,8 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   }
   // A box local narrowed to a record arm at a record destination: the box, then the table's
   // unbox to the arm's record (`narrowedArmNeedsUnbox`, `emitCoerced`'s `unbox`).
-  const au = unwrapParen(ix)
-  if (
-    ibMiss == ""
-    && dst >= 0
-    && au >= 0
-    && au < P.nodes.length
-    && nodeAt(au) is Ident
-    && recordRepOrNull(dst)
-    && narrowedArmNeedsUnbox(ix, ibFnIx)
-    && narrowedArmTyAt(au, ibFnIx) >= 0
-  ) {
-    const bo = irBBoxLocal(b, au)
-    if ibMiss != "" { return bo }
-    // The temp is typed at the destination, whose record the arm's may only fit.
-    const ut = if dstTy >= 0 && primRepOfTy(dstTy) == dst { dstTy } else { repTyOf(dst) }
-    return irBLetTempTy(b, { uaV: bo, uaAt: au }, ix, dst, ut)
+  if ibMiss == "" && armUnboxOwed(ix, dst) {
+    return armUnboxTemp(b, ix, dst, dstTy, false)
   }
   // A box local narrowed to a record arm, delivered as it stands: legacy reads the box itself,
   // not the record its narrowing unboxes to at a record destination.
@@ -9337,6 +9323,42 @@ function recCopied(b: i32[], ix: i32, cell: boolean): Opnd {
   return irBLetTempTy(b, { cvV: v, cvAt: ix }, ix, rep, ty)
 }
 
+// Whether binding `letIx`'s initializer `init` is a narrowed arm unboxed into a nullable arm cell
+// (`letCellKind` "nulvariant"), which legacy's `emitLetDelivery` casts to as a nullable ref.
+function letCellNulArmUnbox(letIx: i32, init: i32, dst: i32): boolean {
+  return exprPrePathWhy(init, ibFnIx) == ""
+    && letCellKind(letIx, ibFnIx) == "nulvariant"
+    && armUnboxOwed(init, dst)
+}
+
+// Whether `ix` is a box local narrowed to a record arm, delivered at record destination `dst`.
+function armUnboxOwed(ix: i32, dst: i32): boolean {
+  const au = unwrapParen(ix)
+  return dst >= 0
+    && au >= 0
+    && au < P.nodes.length
+    && nodeAt(au) is Ident
+    && recordRepOrNull(dst)
+    && narrowedArmNeedsUnbox(ix, ibFnIx)
+    && narrowedArmTyAt(au, ibFnIx) >= 0
+}
+
+// The box of `armUnboxOwed`'s `ix`, then the table's unbox to its arm's record, typed at the
+// destination, whose record the arm's may only fit. `cellNul`: a nullable arm cell's binding.
+function armUnboxTemp(
+  b: i32[],
+  ix: i32,
+  dst: i32,
+  dstTy: i32,
+  cellNul: boolean,
+): Opnd {
+  const au = unwrapParen(ix)
+  const bo = irBBoxLocal(b, au)
+  if ibMiss != "" { return bo }
+  const ut = if dstTy >= 0 && primRepOfTy(dstTy) == dst { dstTy } else { repTyOf(dst) }
+  return irBLetTempTy(b, { uaV: bo, uaAt: au, uaCellNul: cellNul }, ix, dst, ut)
+}
+
 // `exprAt` past the pre-path, whose answer for `ix` is `pre`.
 function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   if pre == "pre-path tag leaf" { return tagLeaf(ix) }
@@ -10878,7 +10900,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if pa >= 0 { return letIfArms(b, n.letInit, v, pa) }
     // Legacy's own binding arm reads a union-valued map's box past `emitExpr`, banking no
     // element-read row (`letNulMapReadUnionBox`).
-    const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(b, unwrapParen(n.letInit), ib.irVars[v].vRep, -1, false) } else if letIsArmCell(ix) { variantCoerced(
+    const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(b, unwrapParen(n.letInit), ib.irVars[v].vRep, -1, false) } else if letCellNulArmUnbox(ix, n.letInit, ib.irVars[v].vRep) { armUnboxTemp(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy, true) } else if letIsArmCell(ix) { variantCoerced(
       b,
       n.letInit,
       ib.irVars[v].vRep,
