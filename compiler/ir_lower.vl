@@ -114,6 +114,7 @@ import {
   OStr,
   OVar,
   Opnd,
+  RArmSite,
   RArmUnbox,
   RAsTail,
   RAsUnion,
@@ -315,12 +316,15 @@ import {
   wULEB,
 } from "./emit_bytes"
 import {
+  ARM_IDX_IMM,
+  ARM_IDX_STR,
   EQ_ROOT_EXPR,
   EqRootPlace,
   EqRootPlan,
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
+  armSiteWrite,
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
@@ -605,6 +609,7 @@ import {
   urBindConst,
   urDepth,
   urLocalRead,
+  urSlotUnrolled,
   urUnbind,
   userGlobalIdx,
   userGlobalReadClass,
@@ -1243,6 +1248,7 @@ function rhs(r: Rhs, tail: boolean) {
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
     RNicheRead => nicheRead(r)
+    RArmSite => armSite(r)
     RArmUnbox => armUnbox(r)
     RRecCopyPure => {
       leaf()
@@ -2298,6 +2304,39 @@ function boxNarrow(r: RBoxNarrow) {
 function nicheRead(r: RNicheRead) {
   irLOpnd(r.nrV)
   return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
+}
+
+// `RArmSite`: legacy's tag chain (`armSiteWrite`) over the box variable's local, the index a
+// variable's local, an immediate or a string literal, its element-read row banked around it as legacy's is.
+function armSite(r: RArmSite) {
+  const bl = plainVarLocal(r.asV)
+  if bl < 0 { return irLMiss("arm site receiver") }
+  const ix = r.asIx
+  let il = ARM_IDX_IMM
+  let ii = 0
+  if ix is OImm && repPrim(ix.oiRep) == "i32" {
+    ii = ix.oiBits as% i32
+  } else if ix is OStr {
+    il = ARM_IDX_STR
+  } else {
+    il = plainVarLocal(ix)
+    if il < 0 { return irLMiss("arm site index") }
+  }
+  leaf()
+  const from = irLIndexFrom(r.asAt, lwBuf.length)
+  if armSiteWrite(r.asAt, bl, il, ii, lw.irAt) < 0 { return -1 }
+  irLIndexRow(r.asAt, from)
+  return 0
+}
+
+// The local a named variable `o` is read from with a plain `local.get`, or -1: a temp, a staged
+// value or a range loop copy is read otherwise.
+function plainVarLocal(o: Opnd): i32 {
+  if !(o is OVar) || isTemp(o.ov) { return -1 }
+  if o.ov < lwStackVal.length && lwStackVal[o.ov] { return -1 }
+  const s = varSlot(o.ov)
+  if s < 0 || urSlotUnrolled(s) { return -1 }
+  return s
 }
 
 // `RArmUnbox`: the box, then the table's cast to the read's arm record (`emitArmUnboxAtCell`).
