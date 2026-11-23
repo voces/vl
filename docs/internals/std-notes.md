@@ -272,6 +272,16 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   `-O` and `-O3` inline it away; §M2 has the number. `wasm-opt -O` does NOT inline the
   plain accessor wrappers; `-O3 --closed-world` does (§O1).
 
+- **The byte-wide views (`u8view`/`u16view`, #9675) copy the i32 contract exactly**: an
+  extent check per view, `0 <= i < length` per access, and an out-of-range WRITE traps as
+  `setI32` does, because a silent write corrupts the neighbouring column. A write keeps the
+  low bits like `store8`/`store16`, so storing 300 into a u8 is not checked. A u16 view
+  needs no even `off`: the halfword instructions are legal at any address. There is no
+  `i8`/`i16` view because no consumer column is signed: they would add ~11 exports per
+  width on speculation, and a signed column reads through `loadI8`/`loadI16` meanwhile.
+  `viewNarrowBase` is separate from `view4Base` so the i32/f32 views' bodies, and so every
+  existing program's bytes, stay as they were.
+
 - **`window` is a view, not a copy, and CHECKS its range** — the one `Buf`-returning
   function besides `Buffer`. It traps rather than answering an error, which is this
   module's convention for every range check (`storeBytes`, `loadBytes`, the views), and is
