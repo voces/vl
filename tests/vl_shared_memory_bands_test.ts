@@ -103,8 +103,17 @@ const model = () => {
   return { grid, totals };
 };
 
-/** Run TICKS ticks with one owner and `helpers` helper Workers; answer the totals and grid. */
-const runBands = async (module: WebAssembly.Module, helpers: number) => {
+/**
+ * Run TICKS ticks with one owner and `helpers` helper Workers; answer the totals and grid. The
+ * helpers enter `serve` once `lateBy` ticks are done (TICKS + 1: after `stop`), since a helper
+ * whose Worker is slow to start must neither hang nor change a result.
+ */
+const runBands = async (
+  module: WebAssembly.Module,
+  helpers: number,
+  lateBy: number,
+) => {
+  const what = `${helpers} helpers, ${lateBy} ticks late`;
   const memory = new WebAssembly.Memory({
     initial: 1,
     maximum: 16,
@@ -121,7 +130,7 @@ const runBands = async (module: WebAssembly.Module, helpers: number) => {
   let timer = 0;
   const deadline = new Promise<never>((_, rej) => {
     timer = setTimeout(
-      () => rej(new Error(`${helpers} helpers: no result in 60 s`)),
+      () => rej(new Error(`${what}: no result in 60 s`)),
       60_000,
     );
   });
@@ -133,11 +142,14 @@ const runBands = async (module: WebAssembly.Module, helpers: number) => {
         fn: "setup",
         args: [W, H, BANDS],
       }) as number;
-      const served = rest.map((w) =>
-        call(w, { op: "call", fn: "serve", args: [ctl] })
-      );
+      let served: Promise<unknown>[] = [];
+      const serve = () =>
+        served = rest.map((w) =>
+          call(w, { op: "call", fn: "serve", args: [ctl] })
+        );
       const totals: number[] = [];
       for (let t = 1; t <= TICKS; t++) {
+        if (t === lateBy + 1) serve();
         totals.push(
           await call(owner, {
             op: "call",
@@ -147,10 +159,11 @@ const runBands = async (module: WebAssembly.Module, helpers: number) => {
         );
       }
       await call(owner, { op: "call", fn: "stop", args: [ctl] });
+      if (lateBy > TICKS) serve();
       const seen = await Promise.all(served) as number[];
       for (const s of seen) {
         if (s < 0 || s > TICKS) {
-          throw new Error(`a helper saw ${s} ticks of ${TICKS}`);
+          throw new Error(`${what}: a helper saw ${s} ticks of ${TICKS}`);
         }
       }
       const gridBase = new Int32Array(memory.buffer)[(ctl + 28) >> 2];
@@ -176,23 +189,24 @@ Deno.test({
   async fn() {
     const module = await WebAssembly.compile(await build(SRC) as BufferSource);
     const want = model();
-    for (const helpers of [2, 0, 1, 3]) {
-      const got = await runBands(module, helpers);
+    const runs = [[2, 0], [0, 0], [1, 0], [3, 0], [2, 1], [1, TICKS + 1]];
+    for (const [helpers, lateBy] of runs) {
+      const got = await runBands(module, helpers, lateBy);
       for (let t = 0; t < TICKS; t++) {
         if (!Object.is(got.totals[t], want.totals[t])) {
           throw new Error(
-            `${helpers} helpers, tick ${t + 1}: total\n  want ${
-              want.totals[t]
-            }\n  got  ${got.totals[t]}`,
+            `${helpers} helpers (${lateBy} late), tick ${
+              t + 1
+            }: total\n  want ${want.totals[t]}\n  got  ${got.totals[t]}`,
           );
         }
       }
       for (let i = 0; i < W * H; i++) {
         if (!Object.is(got.grid[i], want.grid[i])) {
           throw new Error(
-            `${helpers} helpers: cell ${i}\n  want ${want.grid[i]}\n  got  ${
-              got.grid[i]
-            }`,
+            `${helpers} helpers (${lateBy} late): cell ${i}\n  want ${
+              want.grid[i]
+            }\n  got  ${got.grid[i]}`,
           );
         }
       }

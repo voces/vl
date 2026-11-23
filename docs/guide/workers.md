@@ -153,6 +153,10 @@ model, bit for bit.
   `band = atomicAddI32(NEXT, 1)` until the band number reaches `BANDS`. It runs each band,
   bumps `DONE`, and the helper that finishes the last band notifies the owner. When `GEN` is
   -1 it returns.
+* **A helper starts from `GEN` 0, not from the current `GEN`.** Ticks start at 1, so 0 is a
+  value no tick uses. A Worker can start late, after a tick or even after `stop`. If it took
+  the current value as already seen, it would wait for a change that never comes. A late
+  helper's first drain finds no band left and does nothing.
 * **The tick is read after the claim.** A helper can still be draining tick t when the owner
   resets `NEXT` for tick t + 1, and its next claim then wins band 0 of the new tick. That band
   must use t + 1. Because `TICK` is stored before `NEXT`, a claim that sees the reset also sees
