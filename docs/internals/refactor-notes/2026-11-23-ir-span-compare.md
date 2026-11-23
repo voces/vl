@@ -38,4 +38,16 @@ No new predicate. No legacy tail is newly called.
 
 ## Readings
 
-READINGS
+Fixpoint seeds on both sides, master d6341e57c against this branch:
+
+- Armed shadow over tests/cases: start matched 6662 → 6663 of 6663 covered; functions 71906
+  covered, 71905 matched, the same on both. The fail-row diff is the one read-index row.
+- Self-compile: 20232 covered, matched and claimed on both. Modes 1, 3 and 5 build the same
+  bytes as the plain build, and the same bytes as master's.
+- `ir-identity --names`: identical 9037, fail under both 3267, differ 0; self-compile identical.
+  `--claimless`: identical 14034, differ 0. `--cases`: differ 0; witnesses same 61, differ 0.
+- tests/cases legacy A/B: identical 7401, differ 0.
+- Order check (mode 6): 0 order rows over the distilled corpus and over tests/cases.
+- Fuel: L2 +0.02% on the base master's 118897695627.
+- The tests/cases shadow baseline loses `mismatch start spans: read index`. The same write drops
+  seven rows master's own seed already reads below the baseline.
