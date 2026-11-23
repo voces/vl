@@ -19,7 +19,7 @@ A probe at the miss on master split the rows:
 | shape | rows | taken |
 | --- | --- | --- |
 | closure → closure, stored alike | 7 | yes |
-| null → nullable, the null fits the ref | 3 | no (see below) |
+| null → nullable, the null fits the ref | 3 | yes, with the null-unit global fold (below) |
 | map → map | 5 | no |
 | record → record, record or closure → nullable, list, box → record | 8 | no |
 
