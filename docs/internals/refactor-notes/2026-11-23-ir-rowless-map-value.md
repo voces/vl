@@ -40,10 +40,10 @@ holds.
 
 None new. `structRowOfRecordTy` is legacy's own answer, read through the slot.
 
-## Readings (fixpoint seeds on both sides, base: #9760's merged fixpoint, b994a210)
+## Readings (fixpoint seeds on both sides, master 1a545edf)
 
-Functions with no blocker, `VL_IR_SHADOW=4`: distilled corpus 45,452 -> 45,461; tests/cases
-79,249 -> 79,247. `map read mv value rep`: corpus 9 -> 0 (all 9 sole blockers). The 3 corpus cells
+Functions with no blocker, `VL_IR_SHADOW=4`: distilled corpus 45,524 -> 45,533; tests/cases
+79,413 -> 79,411. `map read mv value rep`: corpus 9 -> 0 (all 9 sole blockers). The 3 corpus cells
 at `map read default rep` (each also at `null test nullty operand`) are unchanged.
 
 | program | change |
