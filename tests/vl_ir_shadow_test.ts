@@ -1501,6 +1501,8 @@ Deno.test({
       "bounds-rule-uninstalled": 8,
       "box-immediate-for-call": 2,
       "box-at-union-type-into-i32": 2,
+      "if-at-box-writes-i32": 2,
+      "if-at-box-arm-delivers-i32": 2,
       "nul-none-box-of-i32": 2,
       "pop-or-of-i32": 2,
       "pop-or-bool-out": 2,
