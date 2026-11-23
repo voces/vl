@@ -10917,12 +10917,10 @@ function emitUnionConcreteEq(
   // The plain arm: the box read twice, the operand once, through the plan the IR writes too.
   const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
   // An operand with effects runs whatever the box holds: both sides are read once, in source
-  // order, ahead of the tag test (D17068). The IR claims only an operand it reads in place.
-  if !exprEffectFree(unwrapParen(otherIx)) {
-    const pp = if qp.uqKind >= 0 { qp } else { unionEqStashPlanOf(boxIx, otherIx, fnIx) }
-    if pp.uqKind >= 0 {
-      return emitUnionEqStaged(boxIx, otherIx, pp, isNe, boxLeft, fnIx)
-    }
+  // order, ahead of the tag test (D17068).
+  const pp = unionEqStagedPlanOf(boxIx, otherIx, fnIx)
+  if pp.uqKind >= 0 {
+    return emitUnionEqStaged(boxIx, otherIx, pp, isNe, boxLeft, fnIx)
   }
   if qp.uqKind >= 0 {
     unionEqHead()
@@ -11144,24 +11142,75 @@ function emitUnionEqStaged(
   boxLeft: boolean,
   fnIx: i32,
 ): i32 {
+  if unionEqStageOpen(qp.uqKind) < 0 { return -1 }
+  let rc = 0
+  if boxLeft {
+    rc = emitExpr(boxIx, fnIx)
+    if rc >= 0 { unionEqStageSetBox() }
+  }
+  if rc >= 0 { rc = emitUnionEqOther(otherIx, qp.uqKind, fnIx) }
+  if rc >= 0 { unionEqStageSetOther(qp.uqKind) }
+  if rc >= 0 && !boxLeft {
+    rc = emitExpr(boxIx, fnIx)
+    if rc >= 0 { unionEqStageSetBox() }
+  }
+  unionEqStageClose()
+  if rc < 0 { return -1 }
+  return unionEqStagedTail(qp, isNe, fnIx)
+}
+
+// The plan of a union `==` whose operand has effects, read with the box once each in source order
+// (`emitUnionEqStaged`); `uqKind` -1 where another arm writes it.
+export function unionEqStagedPlanOf(
+  boxIx: i32,
+  otherIx: i32,
+  fnIx: i32,
+): UnionEqPlan {
+  const no: UnionEqPlan = { uqKind: -1, uqTag: -1 }
+  if exprEffectFree(unwrapParen(otherIx)) { return no }
+  const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
+  if qp.uqKind >= 0 { return qp }
+  return unionEqStashPlanOf(boxIx, otherIx, fnIx)
+}
+
+// Opens a staged compare at arm kind `k`: this level's operand and box slots, in that order, then
+// one level deeper for a compare nested in a side. -1 where the kind has no slot.
+export function unionEqStageOpen(k: i32): i32 {
+  const lvl = unionEqStageDepth * 100000
+  if unionEqStagedOperandSlot(k, lvl) < 0 { return -1 }
+  unionEqOperandSlot(lvl + 6)
+  unionEqStageDepth = unionEqStageDepth + 1
+  return 0
+}
+
+// After the staged compare's box: parked in the open level's box slot.
+export function unionEqStageSetBox(): i32 {
+  fbLocalSet(unionEqOperandSlot((unionEqStageDepth - 1) * 100000 + 6))
+  return 0
+}
+
+// After the staged compare's operand at kind `k`: parked in the open level's operand slot.
+export function unionEqStageSetOther(k: i32): i32 {
+  fbLocalSet(unionEqStagedOperandSlot(k, (unionEqStageDepth - 1) * 100000))
+  return 0
+}
+
+// Closes the staged compare's level.
+export function unionEqStageClose(): i32 {
+  unionEqStageDepth = unionEqStageDepth - 1
+  return 0
+}
+
+// After a staged compare's sides are parked: the plan's tails over this level's slots.
+export function unionEqStagedTail(
+  qp: UnionEqPlan,
+  isNe: boolean,
+  fnIx: i32,
+): i32 {
   const lvl = unionEqStageDepth * 100000
   const os = unionEqStagedOperandSlot(qp.uqKind, lvl)
   if os < 0 { return -1 }
   const bs = unionEqOperandSlot(lvl + 6)
-  unionEqStageDepth = unionEqStageDepth + 1
-  let rc = 0
-  if boxLeft {
-    rc = emitExpr(boxIx, fnIx)
-    if rc >= 0 { fbLocalSet(bs) }
-  }
-  if rc >= 0 { rc = emitUnionEqOther(otherIx, qp.uqKind, fnIx) }
-  if rc >= 0 { fbLocalSet(os) }
-  if rc >= 0 && !boxLeft {
-    rc = emitExpr(boxIx, fnIx)
-    if rc >= 0 { fbLocalSet(bs) }
-  }
-  unionEqStageDepth = unionEqStageDepth - 1
-  if rc < 0 { return -1 }
   fbLocalGet(bs)
   unionEqTagTail(qp)
   fbLocalGet(bs)
