@@ -47,4 +47,16 @@ These are other mechanisms, not taken here:
 
 ## Readings
 
-PENDING
+Fixpoint seeds, head on master 9c7453e6, base master 9c7453e6.
+
+| check | result |
+| --- | --- |
+| `$VL_IR_SHADOW=6` | distilled corpus 82,096 rows, 0 `prepost differs`; tests/cases 66,560 rows, 0 not the program's own refusal |
+| `rep-fuzz-check.sh` | exact |
+| `ir-identity.sh --cases` | identical 7712, fail under both 68, differ 0 |
+| `ir-identity.sh --claimless` | identical 14042, fail under both 3267, differ 0 |
+| `ir-identity.sh --names` | identical 9037, differ 0; self-compile identical |
+| L2 self-compile fuel per PR | +0.01% on 120,150,056,802 |
+| same-tree pair | 120,150,778,006 vs 120,150,798,386, +0.00002%, byte-identical output |
+| armed shadow A/B | covered 76,342 → 76,344, start covered 6,695 → 6,700, mismatch and fail 2 → 2 |
+| census | fully IR-only 5,669 → 5,675 of 7,143; `object field coercion` 7 → 5, `start: object field coercion` 15 → 8; `start: global read coercion` 31 → 32 and `start: ref if arm rep` 6 → 7 are the two starts that now reach a later miss |
