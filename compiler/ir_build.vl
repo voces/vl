@@ -3426,13 +3426,20 @@ function capCellListSame(fe: i32, name: string, cr: i32, rep: i32): boolean {
 function capRepOf(fe: i32, name: string): i32 { return capRepFor(fe, name, -1) }
 
 // `capRepOf`, where a captured loop variable (`captureLoopNodeOf`), whose declaration records no
-// type, takes read rep `readRep` when legacy's capture valtype for it (`captureValKind`) agrees,
-// else -1.
+// type, takes read rep `readRep`, or with no read its loop's type (`capLoopTyOf`), when legacy's
+// capture valtype for it (`captureValKind`) agrees, else -1.
 function capRepFor(fe: i32, name: string, readRep: i32): i32 {
   let ty = capTyOf(fe, name)
   if ty < 0 && readRep >= 0 && captureLoopNodeOf(fe, name) >= 0 {
     ty = repTyOf(readRep)
   }
+  if ty < 0 && readRep < 0 { ty = capLoopTyOf(fe, name) }
+  return capRepAtTy(fe, name, ty)
+}
+
+// The rep of capture `name` of `fe` held at type `ty`; -1 when `ty` is -1, no value, open, or not
+// the valtype legacy gives the capture (`captureValKind`).
+function capRepAtTy(fe: i32, name: string, ty: i32): i32 {
   if ty < 0 { return -1 }
   const r = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r) { return -1 }
@@ -3465,6 +3472,18 @@ function capTyOf(fe: i32, name: string): i32 {
   return if ht >= 0 { ht } else { ty }
 }
 
+// The type of captured loop variable `name` of `fe` with no read to type it: a `for-in`'s element
+// in the frame that owns the loop (`forInElemTyOf`), a range's i32 counter; -1 for a `for-in`'s
+// second name or no loop.
+function capLoopTyOf(fe: i32, name: string): i32 {
+  const lp = captureLoopNodeOf(fe, name)
+  if lp < 0 { return -1 }
+  const ln = nodeAt(lp)
+  if ln is ForRange { return TY_I32 }
+  if !(ln is ForIn) || ln.fiVar2 == name { return -1 }
+  return forInElemTyOf(ln.fiIter, parentBindingFrameArenaOf(fe, name))
+}
+
 // The parameter variable of the lifted function `fe` being built for its capture `name`, at
 // `capRepFor`'s rep for a first read at `readRep` (-1 for none), made at its first use; -1 when a
 // captured `for-in` variable has no rep yet.
@@ -3473,7 +3492,7 @@ function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
   const known = paramVarAt(w)
   if known >= 0 { return known }
   const r = capRepFor(fe, name, readRep)
-  const ty = capTyOf(fe, name)
+  const ty = if readRep < 0 && capTyOf(fe, name) < 0 { capLoopTyOf(fe, name) } else { capTyOf(fe, name) }
   if ty < 0 && r < 0 { return -1 }
   const v = irVarNew(ib, r, if ty >= 0 { ty } else { repTyOf(r) }, "param", w)
   ib.irParams.push(v)
@@ -3518,7 +3537,11 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
   for name in captureNamesOf(fe) {
     const p = paramIndexOf(ibFnIx, name)
     const lv = if p < 0 { loopCapVar(fe, name) } else { -1 }
-    const r = if lv >= 0 { capRepFor(fe, name, ib.irVars[lv].vRep) } else { capRepOf(fe, name) }
+    const r0 = if lv >= 0 { capRepFor(fe, name, ib.irVars[lv].vRep) } else { capRepOf(fe, name) }
+    // A capture of this frame's own parameter whose binding frame is not found (an instance's
+    // closure) is held at that parameter's type.
+    const pv = if r0 < 0 && p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else { -1 }
+    const r = if pv >= 0 { capRepAtTy(fe, name, ib.irVars[pv].vTy) } else { r0 }
     if r < 0 || capCellTargetOf(name) >= 0 {
       irBMiss("closure env capture")
       return out
