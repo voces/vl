@@ -1555,6 +1555,8 @@ Deno.test({
       "pop-or-bool-out": 2,
       "pop-or-out-unwritten": 5,
       "record-field-read-twice": 2,
+      "stored-read-of-i32-field": 2,
+      "stored-read-of-boxed-nullable-field": 0,
       "map-read-probe-of-i32": 2,
       "map-read-on-pop-arm": 2,
       "map-read-out-unwritten": 5,
