@@ -235,6 +235,8 @@ A memory built with `--shared-memory` never detaches: it is backed by a `SharedA
 which grows in place, but a view taken before a growth still covers only the old length. The
 `bytes()` accessor above never sees a zero length there, so it would keep the stale view: for a
 shared memory compare `u8.length` with `instance.exports.memory.buffer.byteLength` instead.
+Running one module in several workers over one shared memory, and the `std:atomic` operations
+that coordinate them, is [workers.md](workers.md).
 
 `memory.toResizableBuffer()` returns a buffer that grows in place instead of detaching. It is a
 JS API extension, shipping in V8; check support in the engines you target. It requires the memory
