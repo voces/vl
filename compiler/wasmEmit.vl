@@ -13086,6 +13086,12 @@ function listKindElemKind(k: ListKind): VKind {
 export function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
   const ix = mkArrayLit(run, pos)
   adoptNodeTok(ix, arrIx)
+  return spreadRunNoteAt(ix, h)
+}
+
+// Notes run literal `ix`'s holder `h` (or its holder's, for an untyped minted run), as
+// `spreadRunLit` does when it mints the run; returns `ix`.
+function spreadRunNoteAt(ix: i32, h: i32): i32 {
   const up = elabSpreadRunHolderOf(h)
   elabSpreadRunNote(ix, if up >= 0 && nodeTyIxOf(h) < 0 { up } else { h })
   return ix
@@ -30639,99 +30645,179 @@ function pushRunListBuild(
 // then grows once and the new elements arrive as a single `array.copy`. The one-argument
 // push keeps its own element-wise lowering, which is what makes this path free of it.
 function emitPushMany(callIx: i32, fnIx: i32, wantValue: boolean) {
+  const recv = pushManyRecvOf(callIx)
+  if recv < 0 { return emitFail("emitProgram: expected a push call") }
+  const p = pushManyOpen(callIx, fnIx)
+  if p == null { return -1 }
+  // The receiver, evaluated ONCE — an argument that is itself a list op would otherwise
+  // restage it, which is how a hoisted receiver gets clobbered.
+  listCastForPush = true
+  const recvRc = emitExpr(recv, fnIx)
+  listCastForPush = false
+  if recvRc < 0 { return -1 }
+  pushManyRecvTail(p, recv, fnIx)
+  const lstRc = emitArrAt(pushManyRunLit(callIx, fnIx), fnIx, p.pmLb)
+  if lstRc < 0 { return -1 }
+  return pushManyTail(p, wantValue)
+}
+
+// The receiver of variadic push call `callIx` (`xs` of `xs.push(a, b)`), or -1.
+export function pushManyRecvOf(callIx: i32): i32 {
+  if callIx < 0 || callIx >= P.nodes.length { return -1 }
   const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return -1 }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      const kk = mfRecvKindOf(callee.memObj, fnIx)
-      if kk == null {
-        return emitFail("emitProgram: .push receiver is not a list")
-      }
-      let row = 0
-      if kk == "reflist" { row = refListSlotOfExpr(callee.memObj, fnIx) }
-      if kk == "u8list" { row = exprPackedRow(callee.memObj, fnIx) }
-      const wrap = spreadWrapIdx(kk, row)
-      const back = spreadBackIdx(kk, row)
-      if wrap < 0 || back < 0 {
-        return emitFail("emitProgram: .push but list type not collected")
-      }
-      const seq = liKinds.length
-      const recvS = spreadGroupWrapSlot(kk, row, seq)
-      const srcS = spreadGroupWrapSlot(kk, row, seq + 1)
-      const backS = spreadDstBackSlot(kk, row, seq)
-      const totL = widenTmpSlot(3000 + seq)
-      // The receiver, evaluated ONCE — an argument that is itself a list op would otherwise
-      // restage it, which is how a hoisted receiver gets clobbered.
-      listCastForPush = true
-      const recvRc = emitExpr(callee.memObj, fnIx)
-      listCastForPush = false
-      if recvRc < 0 { return -1 }
-      if nulRecvNeedsRecover(callee.memObj, fnIx) { fbRefAsNonNull() }
-      fbLocalSet(recvS)
-      const lst = spreadRunLit(c.callArgs, callIx, callee.memObj, c.pos)
-      const lstRc = emitArrAt(
-        lst,
-        fnIx,
-        pushRunListBuild(callee.memObj, fnIx, kk, row),
-      )
-      if lstRc < 0 { return -1 }
-      fbLocalSet(srcS)
-      // tot = recv.len + new.len
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 1)
-      fbLocalGet(srcS)
-      fbStructGet(wrap, 1)
-      fbI32Bin(106) // 0x6a i32.add
-      fbLocalSet(totL)
-      // if recv.cap < tot, grow the backing to EXACTLY tot — a bulk append knows the length
-      // it needs, so the doubling a one-at-a-time push amortizes over has nothing to buy.
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 2)
-      fbLocalGet(totL)
-      fbI32Bin(72) // 0x48 i32.lt_s
-      fbIf(64)     // 0x04 if, 0x40 void blocktype
-      fbLocalGet(totL)
-      fbArrayNewDefault(back)
-      fbLocalSet(backS)
-      fbLocalGet(backS)
-      fbI32Const(0)
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 0)
-      fbI32Const(0)
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 1)
-      fbArrayCopy(back, back)
-      fbLocalGet(recvS)
-      fbLocalGet(backS)
-      fbRefAsNonNull()
-      fbStructSet(wrap, 0)
-      fbLocalGet(recvS)
-      fbLocalGet(totL)
-      fbStructSet(wrap, 2)
-      fbEnd()      // 0x0b end (if)
-      // recv.backing[recv.len ..] = new
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 0)
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 1)
-      fbLocalGet(srcS)
-      fbStructGet(wrap, 0)
-      fbI32Const(0)
-      fbLocalGet(srcS)
-      fbStructGet(wrap, 1)
-      fbArrayCopy(back, back)
-      fbLocalGet(recvS)
-      fbLocalGet(totL)
-      fbStructSet(wrap, 1)
-      // D1592 — the value a `.push` yields is the new length, read back from the field this
-      // same sequence just wrote, so the two cannot disagree.
-      if wantValue { fbLocalGet(totL) }
-      return 0
-    }
-    return emitFail("emitProgram: .push receiver is not a member access")
+  if !(c is Call) || c.callFn < 0 { return -1 }
+  const callee = nodeAt(c.callFn)
+  return if callee is Member { callee.memObj } else { -1 }
+}
+
+// The plan of a variadic push's append: the receiver's list kind and row, the wrapper and
+// backing types, and the frame slots it stages into, asked before the receiver as legacy asks
+// them; null, after an `emitFail`, where the receiver is not a collected list.
+export type PushManyPlan = {
+  pmWrap: i32,
+  pmBack: i32,
+  pmRecvS: i32,
+  pmSrcS: i32,
+  pmBackS: i32,
+  pmTot: i32,
+  pmLb: ListBuild,
+}
+
+export function pushManyOpen(callIx: i32, fnIx: i32): PushManyPlan | null {
+  const recv = pushManyRecvOf(callIx)
+  const kk = if recv >= 0 { mfRecvKindOf(recv, fnIx) } else { null }
+  if kk == null {
+    emitFail("emitProgram: .push receiver is not a list")
+    return null
   }
-  return emitFail("emitProgram: expected a push call")
+  let row = 0
+  if kk == "reflist" { row = refListSlotOfExpr(recv, fnIx) }
+  if kk == "u8list" { row = exprPackedRow(recv, fnIx) }
+  const wrap = spreadWrapIdx(kk, row)
+  const back = spreadBackIdx(kk, row)
+  if wrap < 0 || back < 0 {
+    emitFail("emitProgram: .push but list type not collected")
+    return null
+  }
+  const seq = liKinds.length
+  const p: PushManyPlan = {
+    pmWrap: wrap,
+    pmBack: back,
+    pmRecvS: spreadGroupWrapSlot(kk, row, seq),
+    pmSrcS: spreadGroupWrapSlot(kk, row, seq + 1),
+    pmBackS: spreadDstBackSlot(kk, row, seq),
+    pmTot: widenTmpSlot(3000 + seq),
+    pmLb: pushRunListBuild(recv, fnIx, kk, row),
+  }
+  return p
+}
+
+// The list build a variadic push's run takes in instance `fnIx` (`pushRunListBuild` at the
+// receiver's kind and row), asking no type or slot; null where the receiver is not a list.
+export function pushManyRunBuild(callIx: i32, fnIx: i32): ListBuild | null {
+  const recv = pushManyRecvOf(callIx)
+  const kk = if recv >= 0 { mfRecvKindOf(recv, fnIx) } else { null }
+  if kk == null { return null }
+  let row = 0
+  if kk == "reflist" { row = refListSlotOfExpr(recv, fnIx) }
+  if kk == "u8list" { row = exprPackedRow(recv, fnIx) }
+  return pushRunListBuild(recv, fnIx, kk, row)
+}
+
+// The run a variadic push appends in instance `fnIx`, as its own literal (`spreadRunLit`), minted
+// once per call and instance so legacy and the IR build the same node.
+export function pushManyRunLit(callIx: i32, fnIx: i32): i32 {
+  const seen = pushRunLits.get(callIx) ?? []
+  let i = 0
+  while i + 1 < seen.length {
+    // The node is the call's, and its holder is noted again on every ask, as `spreadRunLit` notes it.
+    if seen[i] == fnIx {
+      return spreadRunNoteAt(seen[i + 1], pushManyRecvOf(callIx))
+    }
+    i = i + 2
+  }
+  if callIx < 0 || callIx >= P.nodes.length { return -1 }
+  const c = nodeAt(callIx)
+  if !(c is Call) { return -1 }
+  const recv = pushManyRecvOf(callIx)
+  const ix = spreadRunLit(c.callArgs, callIx, recv, c.pos)
+  seen.push(fnIx)
+  seen.push(ix)
+  pushRunLits.set(callIx, seen)
+  return ix
+}
+
+// Each variadic push call's runs, as (instance, node) pairs.
+let pushRunLits: {[i32]: i32[]} = Map()
+
+// After a variadic push's receiver is on the stack: its recover where owed, then its stage.
+export function pushManyRecvTail(p: PushManyPlan, recv: i32, fnIx: i32) {
+  if nulRecvNeedsRecover(recv, fnIx) { fbRefAsNonNull() }
+  fbLocalSet(p.pmRecvS)
+  return 0
+}
+
+// After a variadic push's run is on the stack: the receiver grown to the new length where its
+// capacity is short, the run copied in, the length written, and (`wantValue`) that length.
+export function pushManyTail(p: PushManyPlan, wantValue: boolean) {
+  const wrap = p.pmWrap
+  const back = p.pmBack
+  const recvS = p.pmRecvS
+  const srcS = p.pmSrcS
+  const backS = p.pmBackS
+  const totL = p.pmTot
+  fbLocalSet(srcS)
+  // tot = recv.len + new.len
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 1)
+  fbLocalGet(srcS)
+  fbStructGet(wrap, 1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(totL)
+  // if recv.cap < tot, grow the backing to EXACTLY tot — a bulk append knows the length
+  // it needs, so the doubling a one-at-a-time push amortizes over has nothing to buy.
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 2)
+  fbLocalGet(totL)
+  fbI32Bin(72) // 0x48 i32.lt_s
+  fbIf(64)     // 0x04 if, 0x40 void blocktype
+  fbLocalGet(totL)
+  fbArrayNewDefault(back)
+  fbLocalSet(backS)
+  fbLocalGet(backS)
+  fbI32Const(0)
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 0)
+  fbI32Const(0)
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 1)
+  fbArrayCopy(back, back)
+  fbLocalGet(recvS)
+  fbLocalGet(backS)
+  fbRefAsNonNull()
+  fbStructSet(wrap, 0)
+  fbLocalGet(recvS)
+  fbLocalGet(totL)
+  fbStructSet(wrap, 2)
+  fbEnd()      // 0x0b end (if)
+  // recv.backing[recv.len ..] = new
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 0)
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 1)
+  fbLocalGet(srcS)
+  fbStructGet(wrap, 0)
+  fbI32Const(0)
+  fbLocalGet(srcS)
+  fbStructGet(wrap, 1)
+  fbArrayCopy(back, back)
+  fbLocalGet(recvS)
+  fbLocalGet(totL)
+  fbStructSet(wrap, 1)
+  // D1592 — the value a `.push` yields is the new length, read back from the field this
+  // same sequence just wrote, so the two cannot disagree.
+  if wantValue { fbLocalGet(totL) }
+  return 0
 }
 
 // D1592 — `wantValue` is the value-position flag: the checker types `.push` `i32` (the new
@@ -36817,6 +36903,25 @@ export function urLocalRead(idx: i32): boolean {
   return true
 }
 
+// Binds local `idx` to constant `v` as a full unroll's copy does, so legacy's questions about the
+// copy's nodes (a hoisted iterable's elements) read it as that copy's value; `urUnbind` undoes it.
+export function urBindConst(idx: i32, v: i32) {
+  urSlot.push(idx)
+  urVal.push(v)
+  urBase.push(-1)
+  return 0
+}
+
+// How many copies the unroll stack holds.
+export function urDepth(): i32 { return urSlot.length }
+
+export function urUnbind() {
+  urSlot.pop()
+  urVal.pop()
+  urBase.pop()
+  return 0
+}
+
 // The innermost unrolled copy whose loop var is local `idx`, or -1.
 function unrolledSlotAt(idx: i32) {
   let j = urSlot.length - 1
@@ -38763,6 +38868,7 @@ export function wasmEmitStateReset() {
   eqStashR = -1
   forIterLits = Map()
   forIterScanned = 0
+  pushRunLits = Map()
   hmFn = -2
   hmIdxSeen = 0
   idxSpanNode = -1

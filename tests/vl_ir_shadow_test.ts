@@ -1539,6 +1539,7 @@ Deno.test({
       "hand-pick-record-into-i32": 2,
       "retag-closures-of-differing-arity": 2,
       "retag-field-alike-records-two-heaps": 2,
+      "push-many-of-i32": 2,
       "global-read-off-store-type": 2,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
@@ -1568,6 +1569,8 @@ Deno.test({
       const got = exp.irVerifySelfTest(i);
       if (got !== want[ids[i]]) throw new Error(`case ${ids[i]}: want rule ${want[ids[i]]}, got rule ${got}`);
     }
+    // The hoist asked inside a range copy undoes every binding it made, whether it hoists or misses.
+    if (exp.irRangeCopyHoistSelfTest(-1) !== 0) throw new Error("want the unroll stack depth unchanged after a miss");
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
