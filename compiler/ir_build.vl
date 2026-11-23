@@ -766,7 +766,6 @@ import {
   TY_STR,
   tyScalarBasePrim,
 } from "./check_types"
-import { spreadSlotIdOf } from "./emit_collect"
 import { ListBuild } from "./emit_ref_list_kinds"
 
 let ibArmed = false
@@ -3615,7 +3614,9 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
       return irBMiss("capture list test")
     }
     const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
-    if !atOwn { return irBLetTemp(b, ev, ix, cr) }
+    if !atOwn {
+      return irBLetTempTy(b, ev, ix, cr, capReadTy(fe, name, ix, cr))
+    }
     const own = irBLetTempTy(b, ev, ix, cr, cty)
     if holed { return repTemp(b, { rgV: own }, ix, rep) }
     if unbox { return captureUnbox(b, own, ix, rep, ak) }
@@ -3717,6 +3718,16 @@ function capRepAtTy(fe: i32, name: string, ty: i32): i32 {
   return r
 }
 
+// The type read `ix` of capture `name` of `fe`, at capture rep `cr`, is held at: the read's own,
+// or the binding's where the read's leaves a variable open and the binding's rep is `cr` (a
+// bundle parameter of hole type, held as its record).
+function capReadTy(fe: i32, name: string, ix: i32, cr: i32): i32 {
+  const ty = heldTy(exprTyOf(ix))
+  if !irTyHeldOpen(ty, cr) { return ty }
+  const cty = capTyOf(fe, name)
+  return if cty >= 0 && repNodeOfTy(cty) == cr { cty } else { ty }
+}
+
 // The type of capture `name` of function `fe`: its binding's in the frame that owns it, or -1.
 function capTyOf(fe: i32, name: string): i32 {
   const d = parentBindingOf(fe, name)
@@ -3752,7 +3763,8 @@ function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
   const known = paramVarAt(w)
   if known >= 0 { return known }
   const r = capRepFor(fe, name, readRep)
-  const ty = if readRep < 0 && capTyOf(fe, name) < 0 { capLoopTyOf(fe, name) } else { capTyOf(fe, name) }
+  const bty = capTyOf(fe, name)
+  const ty = if readRep < 0 && bty < 0 { capLoopTyOf(fe, name) } else { bty }
   if ty < 0 && r < 0 { return -1 }
   const v = irVarNew(ib, r, if ty >= 0 { ty } else { repTyOf(r) }, "param", w)
   ib.irParams.push(v)
@@ -3783,18 +3795,17 @@ function retCloAt(b: i32[], retIx: i32): Opnd | null {
 }
 
 // The environment of capturing function `fe`, read at `ix`, as `emitClosureEnvOf` builds it: each
-// capture a parameter or binding of this frame, or this frame's own capture. A cached or shared
-// environment, a cell, or a global capture misses.
+// capture a parameter or binding of this frame, or this frame's own capture; a function-value cell
+// has no operand. A value of `fe` through its cell has none at all: legacy fills the cell. A copy
+// into a cached environment, or a global capture, misses.
 function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
   const out: Opnd[] = []
-  if cloCellReaches(fe, ibFnIx) {
-    irBMiss("closure env cell")
-    return out
-  }
+  if cloCellReaches(fe, ibFnIx) { return out }
   // A cached environment is built inside the slot's test, so each capture is a variable read there.
   const cached = irEnvCached(fe)
   const self = fnStmtsPosOf(ibFnIx)
   for name in captureNamesOf(fe) {
+    if capCellTargetOf(name) >= 0 { continue }
     const p = paramIndexOf(ibFnIx, name)
     const lv = if p < 0 { loopCapVar(fe, name) } else { -1 }
     const r0 = if lv >= 0 { capRepFor(fe, name, ib.irVars[lv].vRep) } else { capRepOf(fe, name) }
@@ -3813,12 +3824,15 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
       if cloLifted(self) {
         v = liftCapVar(self, name, -1)
       } else {
+        // Held at its binding's type, or at the rep's own where no binding frame is found, as
+        // `liftCapVar` holds a lifted frame's.
+        const cty = capTyOf(fe, name)
         const t = irBLetTempTy(
           b,
           { evSlot: fi, evAt: -1 },
           ix,
           r,
-          capTyOf(fe, name),
+          if cty >= 0 { cty } else { repTyOf(r) },
         )
         if t is OVar { v = t.ov }
       }
@@ -5599,15 +5613,15 @@ function listSliceRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
 // A string method legacy's call ladder takes by name (`exprIsStrMethod`): its receiver and
 // arguments, then legacy's own tail. Any other method is a miss that names it.
 function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  // A push onto a list; a record's function-valued field named `push` is the closure call below.
+  const listPush = m.memProp == "push"
+    && repNodeAt(repNodeOfTy(nodeTyAt(m.memObj, ibFnIx))) is RList
   // Several arguments, or a spread, append in bulk: legacy's `emitPushMany`.
-  if (
-    m.memProp == "push"
-    && (c.callArgs.length != 1 || nodeAt(c.callArgs[0]) is Spread)
-  ) {
+  if (listPush && (c.callArgs.length != 1 || nodeAt(c.callArgs[0]) is Spread)) {
     return pushManyRhs(b, m, ix)
   }
   if (
-    m.memProp == "push"
+    listPush
     && c.callArgs.length == 1
     && !(nodeAt(c.callArgs[0]) is Spread)
   ) {
@@ -6076,10 +6090,6 @@ function pushRecvHeldAtRest(recvIx: i32): boolean {
 // A one-argument `.push` legacy writes as the plain append (`pushPlainWhy`): its receiver, then
 // its value at the list's element rep.
 function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
-  // The checker typed the receiver: a record's function-valued field named `push` is a call.
-  if !(repNodeAt(repNodeOfTy(nodeTyAt(m.memObj, ibFnIx))) is RList) {
-    return missRhs("member call on a record field")
-  }
   const pp = pushPlanOf(ix, ibFnIx)
   if pp == null { return missRhs("push plan") }
   // Legacy reads a push receiver with a strict payload cast; the IR's receiver is read before
@@ -6118,9 +6128,6 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
 // A variadic push `ix` (`emitPushMany`): the receiver, then the run legacy builds of the
 // arguments (`pushManyRunLit`) at the receiver's list build, appended in bulk.
 function pushManyRhs(b: i32[], m: Member, ix: i32): Rhs {
-  if !(repNodeAt(repNodeOfTy(nodeTyAt(m.memObj, ibFnIx))) is RList) {
-    return missRhs("member call on a record field")
-  }
   // Legacy reads the receiver with a strict payload cast, which the IR's read does not take.
   if recvReadsListPayload(m.memObj, ibFnIx) {
     return missRhs("push receiver payload cast")
@@ -7562,7 +7569,7 @@ function arrayLit(
   bt: i32,
 ): Opnd {
   const arm = arrLitArmOf(ix, ibFnIx, lb)
-  if arm == "spread" { return spreadLit(b, n, ix, rep, lb) }
+  if arm == "spread" { return spreadLit(b, n, ix, rep, lb, bt) }
   // A ref list builds along `emitArrRef`'s short arms (`arrLitRefShortSlot`) or not at all: each
   // element as is, or each boxed by its record, which `deliver` writes at the box rep.
   // …or a non-null variant's, each element a literal built at the variant's row or a value of it.
@@ -7680,6 +7687,7 @@ function spreadLit(
   ix: i32,
   rep: i32,
   lb: ListBuild,
+  bt: i32,
 ): Opnd {
   if (
     spreadBoxDestRow(n.arrElems, ibFnIx, lb) >= 0
@@ -7687,7 +7695,6 @@ function spreadLit(
   ) {
     return irBMiss("array spread boxed")
   }
-  if spreadSlotIdOf(ix) < 0 { return irBMiss("array spread unrecorded") }
   // Legacy notes the literals the spread holds before its plan, so each is typed at its holder's
   // element; the plan asked without that note mints the literals' own lists. The note is idempotent.
   elabSpreadNote(ix)
@@ -7746,7 +7753,10 @@ function spreadLit(
     spSlot: lb.lbSlot,
     spAt: ix,
   }
-  return irBLetTemp(b, r, ix, rep)
+  // A minted literal (a variadic push's run) has no checker type; it holds its build's.
+  const own = heldTy(exprTyOf(ix))
+  const ty = if irTyHeldOpen(own, rep) && bt >= 0 { heldTy(bt) } else { own }
+  return irBLetTempTy(b, r, ix, rep, ty)
 }
 
 // Group `g`'s list `src` of literal `ix` (rep `rep`) built as `emitSpreadGroup` emits it: a list
@@ -11977,13 +11987,25 @@ function buildThunk(fe: i32): string {
     ib.irBody = [irNodeNew(ib, { efRhs: c }, -1, ibNoValue, -1)]
     return ""
   }
-  ib.irRetTy = resultTy(fe, fn.fnRet, d)
+  const tt = resultTy(fe, fn.fnRet, d)
+  ib.irRetTy = thunkRetTy(tt, rr)
+  ib.irRetFromRep = ib.irRetTy != tt
   if irTyOpen(ib.irRetTy) { return "thunk open result type" }
   const t = irVarNew(ib, rr, ib.irRetTy, "temp", -1)
   const call = irNodeNew(ib, { lDst: t, lRhs: c }, ib.irRetTy, rr, -1)
   const ret = irNodeNew(ib, { rtHas: true, rtV: { ov: t } }, -1, ibNoValue, -1)
   ib.irBody = [call, ret]
   return ""
+}
+
+// The result type a thunk returns at rep `r`: the target's `ty`, or where that is open, the rep's
+// own type (`repTyOf`) when that is closed and is the same rep. A thunk tail-calls and returns the
+// call's value as it stands, so only the rep reaches the lowering.
+function thunkRetTy(ty: i32, r: i32): i32 {
+  if !irTyOpen(ty) { return ty }
+  const own = repTyOf(r)
+  if own < 0 || irTyOpen(own) || repNodeOfTy(own) != r { return ty }
+  return own
 }
 
 // The claim seam for the thunk of `fe`, before legacy writes it: when it builds and every node is
