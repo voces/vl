@@ -578,6 +578,7 @@ import {
 } from "./wasmEmit"
 import {
   mapReadScalarBoxKindIn,
+  mapRecvTyIn,
   nodeTyInOf,
   readContainerTyAt,
 } from "./emit_ty_canon"
@@ -1678,7 +1679,13 @@ function objLit(b: i32[], ix: i32, rep: i32): Opnd {
 // The type a value of `ix` at rep `rep` is held at: its own (`exprTyOf`), or a storage row's
 // (`rowlessRecordTy`).
 function outTyOf(ix: i32, rep: i32): i32 {
-  return rowlessRecordTy(ix, exprTyOf(ix), rep)
+  const t = exprTyOf(ix)
+  // A minted `??` link with no type of its own holds its map's value (`openCoalMapTy`).
+  if t < 0 || irTyOpen(heldTy(t)) {
+    const ct = openCoalMapTy(ix)
+    if ct >= 0 && repNodeOfTy(ct) == rep { return ct }
+  }
+  return rowlessRecordTy(ix, t, rep)
 }
 
 // Type `t` of `ix`, or where `rowlessRecordRep` moved its rep `rep` to a storage row, that row's
@@ -2541,6 +2548,31 @@ function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
   if nd is Ident || nd is Member { return r }
   const rt = rowlessStoredTy(t, r, storeRowTyOf(ix))
   return if rt >= 0 { repNodeOfTy(rt) } else { r }
+}
+
+// The type of `??` `ix` along the `mapIndexGetOr` arm: its map's value, the default filling a
+// miss so it holds no `null`; -1 for any other node.
+function openCoalMapTy(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if (
+    !(n is BinExpr)
+    || n.binOp != "??"
+    || coalArmOf(n, ix, ibFnIx) != "mapIndexGetOr"
+  ) {
+    return -1
+  }
+  const lr = nodeAt(unwrapParen(n.binLeft))
+  if !(lr is Index) { return -1 }
+  const mt = tyMapValOf(mapRecvTyIn(lr.idxArr, ibFnIx))
+  if mt < 0 { return -1 }
+  const inner = recoveredReadTyOf(mt)
+  return if inner >= 0 { inner } else { mt }
+}
+
+// The rep of `openCoalMapTy`'s type, or -1.
+function openCoalMapRep(ix: i32): i32 {
+  const t = openCoalMapTy(ix)
+  return if t >= 0 { repNodeOfTy(t) } else { -1 }
 }
 
 // The rep of arithmetic operator `ix` at legacy's width (`binNumWidth`), or -1 for any other node.
@@ -7289,6 +7321,27 @@ function recordRepOrNull(r: i32): boolean {
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
+  // A `??` whose own type has no rep (a link legacy mints) is built at the destination's rep, as
+  // legacy writes it at the kind its consumer asks.
+  const du = unwrapParen(ix)
+  const dn = if du >= 0 && du < P.nodes.length { nodeAt(du) } else { null }
+  if (
+    ibMiss == ""
+    && dst >= 0
+    && dn is BinExpr
+    && dn.binOp == "??"
+    && exprRepOf(du) < 0
+  ) {
+    // At a box, a map read's `??` is built at the map's value rep and boxed as that member.
+    const lr = nodeAt(unwrapParen(dn.binLeft))
+    const vr = if heldAsBox(dst) && lr is Index { repNodeOfTy(tyMapValOf(mapRecvTyIn(lr.idxArr, ibFnIx))) } else { -1 }
+    if vr >= 0 {
+      const v = coalesce(b, dn, du, vr)
+      if ibMiss != "" { return v }
+      return boxTemp(b, v, du, dst)
+    }
+    return coalesce(b, dn, du, dst)
+  }
   // A read the checker narrowed to `null` is the destination's null where legacy's `nullread` arm
   // writes one (`nullReadDstOwnOf`), not its storage's.
   const nro = if ibMiss == "" && dst >= 0 { nullReadOwnAt(ix) } else { -1 }
@@ -9716,7 +9769,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const rp = repPrim(rep)
   const uk = if uq != null { uq.muWide } else { -1 }
   const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32"
-    || arm == "i32" && rp == "bool"
+    || (arm == "i32" || arm == "helper") && rp == "bool"
     || (at || st) && repHeldAsI32(rep)
     || mv
     || nz
@@ -10489,7 +10542,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   const ar = if own < 0 && n is ArrayLit { openArrLitRep(ix) } else { -1 }
   // A shared field read off a hole receiver is at its arms' one storage type (`ir_build_ref`).
   const mr = if own < 0 && !nv && n is Member { irOpenMemberRepHook(ix) } else { -1 }
-  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else { own }
+  // A `??` map read whose own type has no rep (a link legacy mints) is at the map's value rep,
+  // where legacy's `mapGetOr` arm writes it.
+  const cr = if own < 0 && !nv && pr < 0 && br < 0 { openCoalMapRep(ix) } else { -1 }
+  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else { own }
   // A direct call whose own type has no rep is at its callee's result rep.
   if rep < 0 && n is Call && !nv { return openCallValue(b, n, ix) }
   if rep < 0 {
