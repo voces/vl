@@ -140,6 +140,7 @@ import {
   RGetField,
   RGlobalGet,
   RHandPick,
+  RInitProgress,
   RJoinNull,
   RListCat,
   RListClear,
@@ -162,6 +163,7 @@ import {
   RMakeClo,
   RMakeList,
   RMakeRec,
+  RMapDelete,
   RMapFilter,
   RMapGet,
   RMapGetOr,
@@ -314,7 +316,6 @@ import {
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
-  SHARED_NULL_NONE,
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
@@ -416,6 +417,7 @@ import {
   forInLoopClose,
   forInMapList,
   forInMapStash,
+  forInPairInit,
   forInRolledOpen,
   forRangeTestOf,
   hoistCandRow,
@@ -436,6 +438,7 @@ import {
   listReserveOpen,
   loopHoistCands,
   loopHoistClose,
+  mapDeleteTail,
   mapGetArmOf,
   mapGetHelperFnOf,
   mapGetMissOf,
@@ -517,6 +520,8 @@ import {
   popOrPlanOf,
   printArmOf,
   printAtomTail,
+  printNulBoolOpen,
+  printNulBoolTail,
   printNulStrOpen,
   printNulStrTail,
   printScalarTail,
@@ -534,13 +539,10 @@ import {
   recCopyPureEmit,
   refArrayUnionUnboxTail,
   sFieldStorageSlot,
-  sharedArmBoxBody,
-  sharedArmBoxHead,
-  sharedArmIsBox,
-  sharedArmIsPlain,
-  sharedArmNullOf,
-  sharedArmNullTail,
-  sharedArmPlainTail,
+  sharedArmHead,
+  sharedArmModeOf,
+  sharedArmModeReads,
+  sharedArmTail,
   sharedArmTestTail,
   sharedReadPlainOf,
   sharedReadPlanOf,
@@ -696,7 +698,12 @@ import {
   objOrderStashSlot,
   unionLitIsStashSlot,
 } from "./emit_if_arm_values"
-import { ArrLitArm, allocLitChunk, forInLoopAt } from "./emit_plan_list"
+import {
+  ArrLitArm,
+  allocLitChunk,
+  forInLoopAt,
+  forInPairSlotOf,
+} from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -727,6 +734,7 @@ import {
   uBoxIdx,
   uBoxNewEnd,
   uFieldCount,
+  uVarRow,
   unionSinkBase,
 } from "./emit_state"
 import { ListBuild } from "./emit_ref_list_kinds"
@@ -1062,6 +1070,7 @@ function rhs(r: Rhs, tail: boolean) {
       got
     }
     RMapHas => mapHas(r)
+    RMapDelete => mapDelete(r)
     RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
     RNumUnionBin => numUnionBin(r)
@@ -1245,6 +1254,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMakeClo => makeClo(r)
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
+    RInitProgress => irLMiss("init progress as a value")
     RBundlePick => bundlePick(r)
     RResultPick => resultPick(r)
     RHandPick => handPick(r)
@@ -2094,7 +2104,8 @@ function sharedRead(r: RSharedRead) {
   return 0
 }
 
-// One member's arm of shared read `r`, in the form legacy writes it: the plain read, or its box.
+// One member's arm of shared read `r`, in its form (`sharedArmModeOf`) as legacy writes it: the
+// head, the receiver where the form reads it, then the tail.
 function sharedReadArm(
   r: RSharedRead,
   slot: i32,
@@ -2102,19 +2113,12 @@ function sharedReadArm(
   vi: i32,
   fi: i32,
 ): i32 {
-  // A `null` member's arm is legacy's constant, its receiver unread.
-  const nk = sharedArmNullOf(code, vi, fi)
-  if nk != SHARED_NULL_NONE { return sharedArmNullTail(nk) }
-  if sharedArmIsPlain(code, vi, fi) {
-    sharedReadRecv(r, slot)
-    return sharedArmPlainTail(code, vi, fi)
-  }
-  if !sharedArmIsBox(code, vi, fi, r.srAt, lw.irAt) {
-    return irLMiss("shared read arm")
-  }
-  sharedArmBoxHead(vi, fi, r.srAt, lw.irAt)
+  if vi < 0 || vi >= uVarRow.length { return irLMiss("shared read arm row") }
+  const mode = sharedArmModeOf(code, vi, fi)
+  if sharedArmHead(mode, code, vi, fi, r.srAt, lw.irAt) < 0 { return -1 }
+  if !sharedArmModeReads(mode) { return 0 }
   sharedReadRecv(r, slot)
-  return sharedArmBoxBody(vi, fi)
+  return sharedArmTail(mode, code, vi, fi, r.srAt, lw.irAt)
 }
 
 // One receiver push of shared read `r`: its stash slot's box, its global's, else its box local.
@@ -2640,9 +2644,16 @@ function forIn(n: SForIn, pending: i32[]) {
   forInListStore(s.fiIter, fnIx, lp)
   forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
+  // A second name is the local legacy's walk binds it at (`forInPairSlotOf`).
+  const pair = s.fiVar2 != ""
+  if pair && (n.xfVar2 < 0 || varSlot(n.xfVar2) != lp.pIdx) {
+    return irLMiss("walk pair slot")
+  }
+  forInPairInit(s, lp)
   const h = irLoopHoistOpen(-1, s.fiBody, s.fiDecl1, s.fiDecl2)
   if h < 0 { return irLMiss("walk hoists") }
   scopeBind(s.fiVar, vSlot)
+  if pair { scopeBind(s.fiVar2, forInPairSlotOf(vSlot)) }
   let d0 = ctrlDepth
   forInBreakOpen(s)
   const kb = walkFrames(n, d0)
@@ -2677,6 +2688,7 @@ function forIn(n: SForIn, pending: i32[]) {
   framesPop(kb)
   forInLoopClose(s, lp, seq)
   loopHoistClose(h)
+  if pair { scopeUnbind() }
   scopeUnbind()
   return 0
 }
@@ -2801,6 +2813,11 @@ function printOp(r: RPrint) {
     printNulStrOpen()
     irLOpnd(r.pnV)
     return printNulStrTail()
+  }
+  if arm == "nulBool" {
+    printNulBoolOpen()
+    irLOpnd(r.pnV)
+    return printNulBoolTail()
   }
   if arm == "union" {
     // Legacy reads the plan, writes the box, then takes the stash slot.
@@ -3088,6 +3105,21 @@ function mapHas(r: RMapHas) {
   irLOpnd(r.mhKey)
   mapRecvKeyTail(sh)
   return mapHasTail()
+}
+
+// `RMapDelete`: the global, its recovery, the key and the op context, then legacy's probe and the
+// entry's tombstone.
+function mapDelete(r: RMapDelete) {
+  const fnIx = lw.irAt
+  if r.mdSym >= 0 && userGlobalReadClass(r.mdSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map delete of a global not read plainly")
+  }
+  const sh = mapRecvShapeOf(r.mdRecv, fnIx)
+  mapRecvRead(r.mdSym, r.mdNonNull, r.mdLoc)
+  mapRecvRefTail(r.mdRecv, fnIx)
+  irLOpnd(r.mdKey)
+  mapRecvKeyTail(sh)
+  return mapDeleteTail()
 }
 
 // `RMapSet`: the global, its recovery, the key and the op context, then the value and legacy's
@@ -3813,6 +3845,10 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         const v = memOp(r)
         irLSettle(pending)
         if v == 0 { fbDrop() }
+        return 0
+      }
+      if r is RInitProgress {
+        irInitProgressHook(r.ipOrd)
         return 0
       }
       if r is REnvDrop {
@@ -5466,6 +5502,9 @@ export let irLowerListHook: (r: Rhs) => i32 = listUnset
 // The start function's prologue (`emitStrFillCalls`), set by the emitter that owns it.
 export let irStartPrologueHook: () => i32 = noPrologue
 function noPrologue(): i32 { return irLMiss("start prologue unset") }
+// The start body's progress store after a top-level position (`emitInitProgressAt`), set likewise.
+export let irInitProgressHook: (ord: i32) => i32 = noProgress
+function noProgress(_ord: i32): i32 { return irLMiss("init progress unset") }
 // An element store, given its assignment node.
 export let irLowerListSetHook: (n: SListSet, at: i32) => i32 = listSetUnset
 // A list op in statement position, whose value is not wanted.
