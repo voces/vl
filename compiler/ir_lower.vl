@@ -19,7 +19,7 @@ import {
   emitOptLinkNullOpen,
   optLeafArmOf,
 } from "./wasmEmit"
-import { exprNullableRefNiche } from "./emit_classify"
+import { capCellTargetOf, exprNullableRefNiche } from "./emit_classify"
 import {
   RAtom,
   RBox,
@@ -350,6 +350,7 @@ import {
   callRefCallTail,
   callRefEnvOpen,
   callRefStash,
+  cloCellReaches,
   closureEqTail,
   coalAtomStrClose,
   coalAtomStrOpen,
@@ -372,6 +373,7 @@ import {
   emitArmUnboxAt,
   emitAsUnionTagged,
   emitCapturedRead,
+  emitCloCellRef,
   emitClosureIds,
   emitClosureValueCore,
   emitEnvCacheClose,
@@ -1588,14 +1590,25 @@ function stashSlotOf(at: i32, fi: i32): i32 {
 // `RMakeClo`: legacy's closure writer for a capture-free function, then a name read's recovery,
 // as `emitExpr` writes a function literal or a function name.
 function makeClo(r: RMakeClo) {
-  if r.mcEnv.length > 0 {
-    // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure.
+  if fnEnvIdxOf(r.mcFn) >= 0 && !cloCellReaches(r.mcFn, lw.irAt) {
+    // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure. A
+    // function-value cell capture has no operand: it is legacy's read of the cell this frame reaches.
     const envIdx = fnEnvIdxOf(r.mcFn)
-    if envIdx < 0 { return irLMiss("closure env") }
     // An environment this frame caches is built at its first read in an activation (D7480).
     const ck = envCacheSlotOfFe(r.mcFn)
     if ck >= 0 { emitEnvCacheOpen(ck) }
-    for o in r.mcEnv { irLOpnd(o) }
+    let k = 0
+    for name in captureNamesOf(r.mcFn) {
+      const cell = capCellTargetOf(name)
+      if cell >= 0 {
+        if emitCloCellRef(cell, lw.irAt) < 0 { return -1 }
+      } else {
+        if k >= r.mcEnv.length { return irLMiss("closure env") }
+        irLOpnd(r.mcEnv[k])
+        k = k + 1
+      }
+    }
+    if k != r.mcEnv.length { return irLMiss("closure env") }
     fbStructNew(envIdx)
     if ck >= 0 { emitEnvCacheClose(ck) }
     emitClosureIds(r.mcFn)
