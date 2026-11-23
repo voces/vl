@@ -1250,7 +1250,7 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
   landing shape of u8 widening). Names are width-suffixed because a named function cannot be
   declared once per receiver type (only operators can, #3003), so `min` for two shapes would be
   `redeclared min`. The mask reductions take the bare shape (`bitmask8x16`, not
-  `bitmaskMask8x16`). `narrowU16x8ToU8x16` is `min_u` with 255 then `narrow_i16x8_u`, since the
+  `bitmaskMask8x16`). `narrowSatU16x8ToU8x16` is `min_u` with 255 then `narrow_i16x8_u`, since the
   wasm instruction reads its input as signed and would send 32768..65535 to 0.
   `andNot` is wasm's `a & ~b`. Not built: integer lane access, shifts, integer `*`, `abs`/`neg`,
   `avgr`, `popcnt`, an `I8x16`/`U32x4`; each is a tier-1 intrinsic already, so adding one is a
