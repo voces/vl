@@ -83,10 +83,18 @@ Measured on master ff34a69e / 9c7453e6:
    whose field is nullable over its own field's rep, or where its own field is `null`.
    - Aliasing probe: the checker refuses a widened write through the wider alias in both arms
      ("… writes a widened field. A record is shared, not copied …"), so no pin is owed.
-3. Next: a global's cell heap (`globalCellStructIdx`), for D1's 7 `declaration coercion` cells.
-   Their value reads a global whose `{f: null}` type has no row under any legacy lookup
-   (`structRowOfRecordTy`, the canonical key and `recNarrowRecordOf` all give -1, by D14890).
+3. A global read notes its struct cell's heap (`globalCellStructIdx`) at a record rep with none
+   (`noteCellHeap`), only where the read's fields lower alike with, or widen to, the cell row's
+   own; a second, different answer leaves the rep with no heap (`irRecHeapNoteOne`), and
+   `recRowRetag` reads the noted heaps.
+   - D1's 7 cells: their value's `{f: null}` type has no row under any legacy lookup
+     (`structRowOfRecordTy`, the canonical key and `recNarrowRecordOf` all give -1, by D14890).
+     `closure_capture_unann` reads a global and is now clean.
+   - Without the row-match guard, overload-pick-reads-only-delivery's global (stored on a row
+     that boxes `x`, read with `x` plain) gave a rule-2 FAIL in `@init`.
+4. Next: the six D1 cells that read the value from a local, a capture or a map. Each read moves
+   the value from its storage rep (a minted `J$m…` on row 0) to a heapless `{f: null}` rep.
 
-Quick A/B (mode 1, tests/cases plus the named cells) against N6's 194193920: start covered,
-verified and matched 14,932 → 14,935, no losses, mismatch/fail 0. d15214_plain_inner's start is
-covered.
+Quick A/B (mode 1, tests/cases plus the named cells) against N6's 194193920, after step 3:
+covered, verified and matched 118,179 → 118,180; start covered, verified and matched
+14,932 → 14,935; no losses, mismatch/fail 0. d15214_plain_inner's start is covered.
