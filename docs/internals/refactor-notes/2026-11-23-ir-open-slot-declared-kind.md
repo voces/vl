@@ -12,7 +12,7 @@ section writes (`vtKindOfParam`, `fbValtype`). The kind is not one constant:
 ## The change
 
 - `repDescTy` (in `emit_rep.vl`) is the type a legacy descriptor names by its kind alone: a scalar,
-  `str`, `nulstr` or `nulnone`. A kind that needs more than itself (a row, a list or map shape, a
+  `str` or `nulnone`. A kind that needs more than itself (a row, a list or map shape, a
   closure signature, a box's members), and an atom, answer -1.
 - `repNodeOfDesc` is that type's tree node. `repDescSelfTest` round-trips each named kind through
   `repOfTy`, and the IR shadow suite runs it.
