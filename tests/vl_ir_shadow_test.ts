@@ -1372,10 +1372,10 @@ print(f(-1) ?? 5)
 });
 
 // Only a `null` literal boxes with its value unread. A `null`-typed call has an effect that must
-// run once, so a function returning one boxed stays uncovered (`box ladder`) rather than boxing
-// unread; the `null` unit function itself builds.
+// run once, so it is the box's payload (`RNulNoneBox`, legacy's ladder's first rung), and the
+// function returning it boxed builds and matches.
 Deno.test({
-  name: "ir shadow: a null-typed call delivered into a box is never left unread",
+  name: "ir shadow: a null-typed call delivered into a box is its payload, never left unread",
   ignore,
   fn: () => {
     const src = `function mk(): null {
@@ -1389,9 +1389,9 @@ function f(b: boolean): i32 | null {
 print(f(false) ?? 5)
 `;
     const { rows } = run(src, true);
-    const want = "uncovered box ladder";
-    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
-    if ((rows.get("covered") ?? 0) !== 1) throw new Error(`want only mk covered, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want mk and f covered and matched, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
@@ -1502,6 +1502,7 @@ Deno.test({
       "bounds-rule-uninstalled": 8,
       "box-immediate-for-call": 2,
       "box-at-union-type-into-i32": 2,
+      "nul-none-box-of-i32": 2,
       "pop-or-of-i32": 2,
       "pop-or-bool-out": 2,
       "pop-or-out-unwritten": 5,
