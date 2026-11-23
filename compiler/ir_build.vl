@@ -18,7 +18,7 @@ import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleFe, monoBundleReadFe } from "./emit_mono"
-import { slotRowTyOf } from "./emit_rep"
+import { repElemTyOfName, slotRowTyOf } from "./emit_rep"
 import { optLeafArmOf } from "./wasmEmit"
 import {
   bundleAnyNoted,
@@ -198,6 +198,7 @@ import {
 import {
   BundlePick,
   CallRefArgArm,
+  CapturedArgArm,
   FieldStoreValArm,
   GlobalCtx,
   IntSwitchPlan,
@@ -637,6 +638,7 @@ import {
   fnBundleRetSigs,
   fnIndexOfNode,
   fnRetHeldAsBundle,
+  fnValuePlain,
   forInElemTyOf,
   forInMapRecv,
   globalCellHeap,
@@ -2371,6 +2373,55 @@ function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
   return if rt >= 0 { repNodeOfTy(rt) } else { r }
 }
 
+// The rep of arithmetic operator `ix` at legacy's width (`binNumWidth`), or -1 for any other node.
+function openBinRep(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = nodeAt(ix)
+  if (
+    !(n is BinExpr)
+    || binIsCompare(n.binOp)
+    || binPrimOp(n.binOp, false) == null
+  ) {
+    return -1
+  }
+  const t = repElemTyOfName(binNumWidth(n, ibFnIx))
+  return if t >= 0 { repNodeOfTy(t) } else { -1 }
+}
+
+// Call `n` at `ix`, whose own type has no rep, at its callee's result rep: a direct call of a
+// declaration that returns; any other call misses as the rep it lacks.
+function openCallValue(b: i32[], n: Call, ix: i32): Opnd {
+  const miss = "rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx)))
+  if (
+    mapNewCall(n)
+    || arrNewCallNamed(n, ibFnIx)
+    || tplStrHoleOf(n, ibFnIx) >= 0
+  ) {
+    return irBMiss(miss)
+  }
+  const rhs = callRhs(b, n, ix)
+  if ibMiss != "" { return irBMiss("call") }
+  if !(rhs is RCall) || rhs.caNever { return irBMiss(miss) }
+  const si = irSigOf(ib, rhs.caCallee)
+  const r = if si >= 0 { ib.irSigRet[si] } else { -1 }
+  if r < 0 || repIsNoValue(r) { return irBMiss(miss) }
+  return irBLetTempTy(b, rhs, ix, r, repTyOf(r))
+}
+
+// The rep of the parameter variable read `ix` reads, when `ix` reads this frame's parameter and its
+// own type has no rep; -1 otherwise.
+function openLocalReadRep(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return -1 }
+  const d = identDeclOf(ix)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  const w = if dn is Param { localIndexOf(ibFnIx, ix) } else { -1 }
+  const v = if w >= 0 { paramVarAt(w) } else { -1 }
+  if v < 0 || v >= ib.irVars.length { return -1 }
+  const r = ib.irVars[v].vRep
+  return if valueRep(r, ib.irVars[v].vTy) { r } else { -1 }
+}
+
 // `ix`'s type: its callee's result for an untyped call of a declaration (an operator a generic
 // instance rewrote to its overload), else its recorded type.
 function exprTyOf(ix: i32): i32 {
@@ -3166,7 +3217,15 @@ function unionIfArm(blockIx: i32, t: i32, rep: i32, uty: i32): i32[] {
     }
     return body
   }
-  const x = floorDeliver(body, tv, rep, uty)
+  // An arm that is itself a `??` legacy writes as one chain, not as a nested join of its own.
+  if plainCoalesceAt(tv) != null && heldAsBox(rep) {
+    irBMiss("union if arm coalesce chain")
+    return body
+  }
+  const x0 = floorDeliver(body, tv, rep, uty)
+  // An arm the checker recorded no box for is boxed into the join's union here, as legacy's
+  // `emitUnionIfValue` boxes each arm (`emitUnionBoxArg`).
+  const x = if ibMiss == "" && irBOpRep(x0) != rep && heldAsBox(rep) && uty >= 0 { boxTempIn(body, x0, tv, rep, -1, uty) } else { x0 }
   if ibMiss == "" && irBOpRep(x) != rep { irBMiss("union if arm rep") }
   if ibMiss == "" {
     irBNode(body, { asDst: t, asSrc: x }, -1, ibNoValue, blockIx)
@@ -3694,6 +3753,18 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     if ba == "atom" || ba == "variant" {
       return globalUnboxRead(b, g, d, ix, cellRep, rep, ba, -1)
     }
+    // A union cell narrowed to a smaller union is the same box, staged at the narrowed rep as a
+    // box local's is.
+    if (
+      cellRep != rep
+      && heldAsBox(cellRep)
+      && heldAsBox(rep)
+      && identReadArmOf(n, ix, ibFnIx, false) == "nonlocal"
+    ) {
+      const bx = globalBoxAt(b, g, d, ix, cellRep)
+      if ibMiss != "" { return bx }
+      return irBLetTemp(b, { sgV: bx }, ix, rep)
+    }
     // A union cell narrowed to a ref-element list or a map arm reads unboxed to it.
     const con = if cellRep != rep { boxContainerReadOf(n, ix, cellRep, rep) } else { -1 }
     if con >= 0 {
@@ -3853,9 +3924,11 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if cr != rep && !narrowed && !holed && !capCellListSame(fe, name, cr, rep) {
     return irBMiss("capture binding")
   }
-  // The capture is held at its binding's type, whose rep must be the one it is read at first.
+  // The capture is held at its binding's type, or a walk variable's (`capLoopTyOf`), whose rep
+  // must be the one it is read at first.
   const atOwn = narrowed || holed
-  const cty = if atOwn { capTyOf(fe, name) } else { -1 }
+  const bty = if atOwn { capTyOf(fe, name) } else { -1 }
+  const cty = if atOwn && bty < 0 { capLoopTyOf(fe, name) } else { bty }
   if atOwn && (cty < 0 || repNodeOfTy(cty) != cr) {
     return irBMiss("capture binding")
   }
@@ -3937,14 +4010,17 @@ function capRepOf(fe: i32, name: string): i32 { return capRepFor(fe, name, -1) }
 
 // `capRepOf`, where a captured loop variable (`captureLoopNodeOf`), whose declaration records no
 // type, takes read rep `readRep`, or with no read its loop's type (`capLoopTyOf`), when legacy's
-// capture valtype for it (`captureValKind`) agrees, else -1.
+// capture valtype for it (`captureValKind`) agrees, else -1. A binding whose type gives no rep (open
+// in the frame that owns it) takes `readRep` the same way.
 function capRepFor(fe: i32, name: string, readRep: i32): i32 {
   let ty = capTyOf(fe, name)
   if ty < 0 && readRep >= 0 && captureLoopNodeOf(fe, name) >= 0 {
     ty = repTyOf(readRep)
   }
   if ty < 0 && readRep < 0 { ty = capLoopTyOf(fe, name) }
-  return capRepAtTy(fe, name, ty)
+  const r = capRepAtTy(fe, name, ty)
+  if r >= 0 || readRep < 0 { return r }
+  return capRepAtTy(fe, name, repTyOf(readRep))
 }
 
 // The rep of capture `name` of `fe` held at type `ty`; -1 when `ty` is -1, no value, open, or not
@@ -5130,18 +5206,22 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
       return missRhs("bundle argument")
     }
-    if capturedArgArmOf(c.callArgs[i], i, pos, ibFnIx) != "plain" {
-      return missRhs("captured call argument coercion")
+    // A widening is delivered at its parameter's number (`emitWidened`), and a box at the
+    // parameter's union (`emitDelivered`, `emitUnionBoxOwed`).
+    const arm = capturedArgArmOf(c.callArgs[i], i, pos, ibFnIx)
+    const pty = scopeTyAt(callee.fnParams[i], fnStmts[pos])
+    const dst = repNodeOfTy(pty)
+    const delivers = capturedArgDelivers(arm)
+    if arm != "plain" && !delivers {
+      return missRhs("captured call argument " + arm)
     }
     const at = b.length
-    const a = irBExpr(b, c.callArgs[i])
+    const a = if delivers { deliver(b, c.callArgs[i], dst, pty) } else { irBExpr(b, c.callArgs[i]) }
     if ibMiss != "" { return missRhs("argument") }
     if ifBelowLead(b, at, "short-circuit closure argument") {
       return missRhs("short-circuit closure argument")
     }
-    if irBOpRep(a) != repNodeOfTy(scopeTyAt(callee.fnParams[i], fnStmts[pos])) {
-      return missRhs("captured call argument rep")
-    }
+    if irBOpRep(a) != dst { return missRhs("captured call argument rep") }
     args.push(a)
     i = i + 1
   }
@@ -5154,6 +5234,15 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     crDrop: !isVoid,
   }
   return r
+}
+
+// Whether a captured-call argument on arm `arm` is delivered at its parameter's rep: a widening the
+// IR builds, or a box; `widenF32`, a literal union, an atom and an unbox are legacy's alone.
+function capturedArgDelivers(arm: CapturedArgArm): boolean {
+  return match arm {
+    "widenI64" | "widenF64" | "boxTable" | "boxFloor" => true
+    "widenF32" | "lit" | "atomStr" | "unbox" | "plain" => false
+  }
 }
 
 // A call `ix` through a closure binding that legacy writes plainly (`callRefPlainKey`): the
@@ -5874,7 +5963,11 @@ function mapDeleteRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
 // the callback's value, or the `null` immediate for a capture-free function the lowering builds.
 function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const why = mapFilterWhy(ix, ibFnIx)
-  if why != "" && why != "map callback env" { return missRhs(why) }
+  // A call yielding the callback is written as legacy writes a plain function value (`fnValuePlain`).
+  const callCb = why == "map callback expression"
+    && nodeAt(unwrapParen(c.callArgs[0])) is Call
+    && fnValuePlain(c.callArgs[0], 0)
+  if why != "" && why != "map callback env" && !callCb { return missRhs(why) }
   const v = irBExpr(b, m.memObj)
   if ibMiss != "" { return missRhs("method operand") }
   if !(repNodeAt(irBOpRep(v)) is RList) { return missRhs("map receiver rep") }
@@ -7369,7 +7462,8 @@ function boxPlanWhy(p: HoleBox, v: Opnd): string {
     "mapScalar" => false
     "map" => repNodeAt(r) is RMap
     "clo" => repNodeAt(r) is RClosure
-    "atom" => if p.hbSrc >= 0 { numKindOf(r) == p.hbSrc } else if p.hbKind == V128_ATOM_KIND { repPrim(r) == "v128" } else { holeKindRep(p.hbKind, r) }
+    // A `boolean | null` read boxes its niche's 0/1 as the boolean atom, as legacy's does.
+    "atom" => if p.hbSrc >= 0 { numKindOf(r) == p.hbSrc } else if p.hbKind == V128_ATOM_KIND { repPrim(r) == "v128" } else { holeKindRep(p.hbKind, r) || p.hbKind == 1 && repBoolNiche(r) }
     "ladder" => false
   }
   if ok { return "" }
@@ -9917,7 +10011,14 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   const nv = own < 0
     && (n is Call || n is BinExpr || n is Member || n is Unary)
     && exprTyOf(ix) == TY_NEVER
-  const rep = if nv { repNodeOfTy(TY_I32) } else { own }
+  // A read of a parameter whose own type has no rep is at the rep its frame holds it at
+  // (`paramFrameTy`, legacy's declared kind).
+  const pr = if own < 0 && !nv { openLocalReadRep(ix) } else { -1 }
+  // An arithmetic operator whose own type has no rep computes at legacy's width (`binNumWidth`).
+  const br = if own < 0 && !nv && pr < 0 { openBinRep(ix) } else { -1 }
+  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else { own }
+  // A direct call whose own type has no rep is at its callee's result rep.
+  if rep < 0 && n is Call && !nv { return openCallValue(b, n, ix) }
   if rep < 0 {
     return irBMiss("rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
   }
@@ -10794,6 +10895,16 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   const lr = irBOpRep(l)
   const ln = repNodeAt(lr)
   const lpr = repPrim(lr)
+  // A list read at a stored row's field: legacy declares the loop variable at the element type.
+  if (
+    g < 0
+    && mr < 0
+    && ln is RList
+    && nodeAt(unwrapParen(src)) is Member
+    && lr != repNodeOfTy(nodeTyAt(src, ibFnIx))
+  ) {
+    return skip("for in stored-row receiver")
+  }
   let er = -1
   if ln is RList {
     er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
