@@ -1704,6 +1704,32 @@ print(two(true))
   },
 });
 
+// A start the census builds on past a miss is uncovered at that class, as the armed shadow reports
+// it, never covered and lowered with the miss inside it.
+Deno.test({
+  name: "ir shadow: the blocker census names a start's classes instead of lowering past them",
+  ignore,
+  fn: () => {
+    const src = `type J = { f: i32 | null }
+function mk2() { return { f: null } }
+const dA: J = mk2()
+let xs = [mk2()]
+if xs.length > 9 { xs = [] }
+print(xs.length)
+print(dA.f ?? 1)
+`;
+    const armed = run(src, true);
+    const census = run(src, 4);
+    const starts = (rows: Map<string, number>) => [...rows.keys()].filter((k) => k.startsWith("start uncovered"));
+    const want = starts(armed.rows);
+    if (want.length !== 1) throw new Error(`want one armed start miss, got ${JSON.stringify([...armed.rows])}`);
+    if (JSON.stringify(starts(census.rows)) !== JSON.stringify(want)) {
+      throw new Error(`want the census's start rows ${JSON.stringify(want)}, got ${JSON.stringify([...census.rows])}`);
+    }
+    if (census.rows.has("start covered")) throw new Error(`want no covered start, got ${JSON.stringify([...census.rows])}`);
+  },
+});
+
 // A join of an atom binding whose arms are a literal-bound const and a one-literal const, which the
 // atom hook writes at the destination (`emitIfExprAs`): covered and matched.
 Deno.test({
