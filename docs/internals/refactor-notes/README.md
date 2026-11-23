@@ -8,6 +8,28 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-22-legacy-shared-slot-after-operand](2026-11-22-legacy-shared-slot-after-operand.md): Legacy: a shared stash slot is taken after its operand (2026-11-22, lane IR-N2)
+- [2026-11-22-legacy-never-arm-store](2026-11-22-legacy-never-arm-store.md): Legacy writes no store after a never binding arm (IR-C1)
+- [2026-11-22-ir-verify-global-store-ty](2026-11-22-ir-verify-global-store-ty.md): IR verifier: a global read's storage row is the builder's record (2026-11-22, lane IR-D1)
+- [2026-11-22-ir-tag-stash-frame](2026-11-22-ir-tag-stash-frame.md): IR lowering: a tag dispatch's id stash lowers in its own frame (2026-11-22, lane IR-N7)
+- [2026-11-22-ir-tag-capture-callee](2026-11-22-ir-tag-capture-callee.md): IR coverage: a tagged call's captured callee is read as its cell stores it (2026-11-22, lane IR-N7)
+- [2026-11-22-ir-slot-order-misses-lifted](2026-11-22-ir-slot-order-misses-lifted.md): IR: the slot-order misses lifted (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-selftest-keyed](2026-11-22-ir-selftest-keyed.md): IR verifier self-tests keyed by id (2026-11-22, lane IR-D1)
+- [2026-11-22-ir-rep-novalue-bind-arm](2026-11-22-ir-rep-novalue-bind-arm.md): `rep novalue`, step 2: a binding's never arm (IR-C1)
+- [2026-11-22-ir-loop-value](2026-11-22-ir-loop-value.md): IR: a scalar loop value, 2026-11-22
+- [2026-11-22-ir-label-block](2026-11-22-ir-label-block.md): IR: a void labelled block, 2026-11-22
+- [2026-11-22-ir-is-list-across](2026-11-22-ir-is-list-across.md): IR coverage: `x is L` over a box of list arms, the `listAcross` rung (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-coalesce-nulref-numjoin](2026-11-22-ir-coalesce-nulref-numjoin.md): IR: a nullable number coalesced into a join of numbers apart (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-coalesce-nulref-boxfield](2026-11-22-ir-coalesce-nulref-boxfield.md): IR: a shared `scalar | null` field read under `??` (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-capture-unbox-read](2026-11-22-ir-capture-unbox-read.md): IR: a captured union box narrowed in the closure reads on legacy's unbox arm, 2026-11-22
+- [2026-11-22-ir-atom-hook-tower](2026-11-22-ir-atom-hook-tower.md): IR coverage: `pre-path atom hook`'s two-member place (2026-11-22, lane IR-N8)
+- [2026-11-22-ir-atom-hook-staged-wide](2026-11-22-ir-atom-hook-staged-wide.md): IR coverage: `pre-path atom hook`'s staged and `wideLit` arms (2026-11-22, lane IR-N8)
+- [2026-11-22-ir-atom-hook-sole](2026-11-22-ir-atom-hook-sole.md): IR coverage: `pre-path atom hook`'s one-literal place (2026-11-22, lane IR-N8)
+- [2026-11-22-ir-arg-param-checked-ty](2026-11-22-ir-arg-param-checked-ty.md): IR: a call argument's parameter type is `paramCheckedTy` (2026-11-22, lane IR-D1)
+- [2026-11-22-ir-arg-list-retag](2026-11-22-ir-arg-list-retag.md): IR: a list handed at its parameter's storage is retagged (2026-11-22, lane IR-N3)
+- [2026-11-22-fix-strlist-nullable-arm](2026-11-22-fix-strlist-nullable-arm.md): Fix D17053: `x is S[]` over a `(string | null)[]` arm (2026-11-22, lane IR-N1)
+- [2026-11-22-fix-atom-list-arm-tag](2026-11-22-fix-atom-list-arm-tag.md): Fix D17052: `x is S[]` over `i32[] | string[]` (2026-11-22, lane IR-N1)
+- [2026-11-22-claimed-vs-claimless-sweep](2026-11-22-claimed-vs-claimless-sweep.md): Claimed vs claimless discovery sweep (D17048), 2026-11-22
 - [2026-11-22-narrowed-field-matrix](2026-11-22-narrowed-field-matrix.md): Capability matrix: a narrowed box-field read × its field's storage rep (2026-11-22, lane IR-N1)
 - [2026-11-22-ir-uninit-let](2026-11-22-ir-uninit-let.md): IR coverage: an uninitialized binding, and the shadow reads the frame the claim reads (2026-11-22, lane IR-N7)
 - [2026-11-22-ir-tag-global-callee](2026-11-22-ir-tag-global-callee.md): IR coverage: a tagged call's module-global callee is read as its cell stores it (2026-11-22, lane IR-N7)

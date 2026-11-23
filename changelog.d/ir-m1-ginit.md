@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: a record delivered at a declared supertype, or stored at a global's own heap.** A record argument, global initializer or local declaration whose type's struct heap has the destination's on its `sSuper` chain (`recordHeapSubOf`, the `(sub $dst …)` row legacy's type section writes) goes in as an `RRetag` with no bytes, as legacy writes it; a global initializer on the cell's own heap takes the same retag as an argument (`recRowRetag`). The verifier admits a width retag only where the supertype's fields lead the record's by name and lower alike (`recPrefixLowersAlike`).

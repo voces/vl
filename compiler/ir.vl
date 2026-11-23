@@ -6,7 +6,7 @@
 // (step I3).
 import { i32ToStr } from "./ast"
 import { RefJoin } from "./emit_plan_if_join"
-import { recordHeapOfTy } from "./emit_shape_intern"
+import { recordHeapOfTy, recordHeapSubOf } from "./emit_shape_intern"
 import { CoalValArm } from "./emit_plan_null"
 import { ArrLitArm } from "./emit_plan_list"
 import { LitIsArm } from "./emit_plan_union"
@@ -25,6 +25,9 @@ import {
   RUnsup,
   RpPrim,
   repNodeAt,
+  repNodeKids,
+  repRecordFieldNames,
+  repRecordKidOf,
   repTyOf,
 } from "./emit_rep"
 
@@ -68,13 +71,15 @@ export type CastFail = "trap" | "null"
 export type RPrimOp = { poOp: PrimOp, poArgs: Opnd[] }
 // `caNever`: the callee never returns, so the call is followed by `unreachable` (`callEndsNever`).
 // `caEnv`: the callee takes a hidden environment parameter, passed null before the arguments;
-// `caCaps`: a lifted callee's captures, passed after it.
+// `caCaps`: a lifted callee's captures, passed after it; `caWb`: the variables the captures it
+// assigns go back to after the call, in its result order, the last set first (D3664).
 export type RCall = {
   caCallee: i32,
   caArgs: Opnd[],
   caNever: boolean,
   caEnv: boolean,
   caCaps: Opnd[],
+  caWb: i32[],
 }
 // `crSig`: the `$fnsig` type index; `crVoid`: the key returns nothing; `crDrop`: a call statement
 // drops its result, as legacy decides (`callRefPlainVoid`).
@@ -137,8 +142,8 @@ export type RCast = { ctV: Opnd, ctTarget: i32, ctOnFail: CastFail }
 export type RTagOf = { tgV: Opnd }
 // `mrFields` in kid order; `mrLayout[i]` the kid layout position `i` writes; `mrSrc` the kids in
 // stash source order, else empty; `mrSet` where `RStashSet`s set them (`mrFields` then empty).
-// `mrAt` the literal, at its own row or, where `mrRow` is not -1, its destination's (a variant's
-// where `mrVariant`); `mrBuiltRow` the row the builder built the fields by, which lowering reads.
+// `mrAt` the literal, at its own row or, where `mrRow` is not -1, its destination's; `mrVariant`
+// whether that row is a variant's; `mrBuiltRow` the row the builder built the fields by.
 export type RMakeRec = {
   mrFields: Opnd[],
   mrLayout: i32[],
@@ -161,8 +166,15 @@ export type RStashSet = {
   ssK: i32,
 }
 // A field read at node `gfAt`, kid `gfIx` of `gfV`'s record; `gfStored` where the builder built it
-// at its storage (an `is` receiver's), so it is lowered under the same mark.
-export type RGetField = { gfV: Opnd, gfIx: i32, gfAt: i32, gfStored: boolean }
+// at its storage (an `is` receiver's), so it is lowered under the same mark; `gfStr` where a
+// union-box field's unbox leaves the string a literal-union member is boxed as.
+export type RGetField = {
+  gfV: Opnd,
+  gfIx: i32,
+  gfAt: i32,
+  gfStored: boolean,
+  gfStr: boolean,
+}
 // A list literal at node `mlAt` of elements `mlElems`, built under the list build (`mlKind`,
 // `mlSlot`) its delivery threaded, by legacy's short tail at the arm the builder asked (`mlArm`).
 export type RMakeList = {
@@ -189,13 +201,32 @@ export type RListNewDefault = { ldLen: Opnd, ldAt: i32 }
 // `__array_copy__(dst, dstAt, src, srcAt, count)` at call node `lcAt`, over its five operands.
 export type RListCopy = { lcArgs: Opnd[], lcAt: i32 }
 // A linear-memory load or store intrinsic at call node `mmAt` over its address and, for a store,
-// its value (`memAccessPlanOf`).
-export type RMemAccess = { mmArgs: Opnd[], mmAt: i32 }
-// An atomic intrinsic at call node `amAt` over its address and value operands (`atomicPlanOf`);
-// a fence has none.
-export type RAtomic = { amArgs: Opnd[], amAt: i32 }
-// A scalar saturating truncation at call node `tsAt` of float operand `tsV` (`truncSatPlanOf`).
-export type RTruncSat = { tsV: Opnd, tsAt: i32 }
+// its value: `mmBase` operands (1 a load, 2 a store) at width prim `mmPrim`, as the builder planned.
+export type RMemAccess = {
+  mmArgs: Opnd[],
+  mmAt: i32,
+  mmBase: i32,
+  mmPrim: string,
+}
+// An atomic intrinsic at call node `amAt` over its address and value operands, as the builder
+// planned it: `amBase` operands (0 a fence), operand `k >= 1` at prim `amValPrims[k]`, and a
+// result at `amResPrim` ("" for none).
+export type RAtomic = {
+  amArgs: Opnd[],
+  amAt: i32,
+  amBase: i32,
+  amValPrims: string[],
+  amResPrim: string,
+}
+// A scalar saturating truncation at call node `tsAt` of float operand `tsV`: instruction `tsOp`
+// from float prim `tsFrom` to integer prim `tsTo`, as the builder planned it.
+export type RTruncSat = {
+  tsV: Opnd,
+  tsAt: i32,
+  tsOp: i32,
+  tsFrom: string,
+  tsTo: string,
+}
 // A memory-management intrinsic at call node `moAt` over its i32 operands (`memOpPlanOf`).
 export type RMemOp = { moArgs: Opnd[], moAt: i32 }
 // `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on.
@@ -211,8 +242,10 @@ export type ROptRead = { orV: Opnd, orAt: i32 }
 // A numeric `as` at cast node `ncAt` over operand `ncV`, built at the kind `numCastKindOf`
 // names; legacy's `numCastTail` writes the conversion, and an `as!`'s test and trap.
 export type RNumCast = { ncV: Opnd, ncAt: i32 }
-// `bxV` boxed into the union the checker records delivery node `bxAt` delivered into.
-export type RToBox = { bxV: Opnd, bxAt: i32 }
+// `bxV` boxed into union `bxTy`, which delivery node `bxAt` delivers into: the one the checker
+// records there, or a direct call's parameter union where it records none; `bxFree` whether
+// `bxAt` has no effect, so an immediate may stand for it.
+export type RToBox = { bxV: Opnd, bxAt: i32, bxTy: i32, bxFree: boolean }
 // Atom `rgV` as the `K | null` (discipline 3) that holds it: the same i32, so no bytes.
 export type RRetag = { rgV: Opnd }
 // Atom `sxV`, or its `K | null`, as the string, or `string | null`, legacy's atom decode writes
@@ -326,6 +359,9 @@ export type RListEmptyArms = { lfV: Opnd, lfAt: i32 }
 // `laV is L` for list type `L` over a box of list arms at `is` test `laAt`, along
 // `listIsAcrossRepsPlan`: the box once into the shared receiver slot, then each arm's test.
 export type RListIsAcross = { laV: Opnd, laAt: i32 }
+// `lsV is L` for list type `L` over a list whose elements are wider than `L` at `is` test `lsAt`,
+// along `listFitPlanOf`: each element, at every depth, a member of `L`: a bool.
+export type RListFitIs = { lsV: Opnd, lsAt: i32 }
 // `liV` at literal arm `liArm` of `is` test `liAt` (`litIsArmOf`), read once per member the arm
 // compares, as `emitIsTestLitArms` writes it: a bool.
 export type RLitArms = { liV: Opnd, liArm: LitIsArm, liAt: i32 }
@@ -341,9 +377,16 @@ export type RNumUnionBin = { nbArgs: Opnd[], nbAt: i32 }
 // as legacy's `emitNumUnionConvert` writes it (`widenPlanOf`'s `convert`).
 export type RNumUnionConvert = { nuV: Opnd, nuTo: i32, nuAt: i32 }
 export type RNumIntr = { nxArgs: Opnd[], nxOp: i32, nxAt: i32 }
-// A SIMD intrinsic at call `sdAt` other than a load or store: its value operands, then its one
-// instruction and any lane immediates (`simdTail`).
-export type RSimd = { sdArgs: Opnd[], sdAt: i32 }
+// A SIMD intrinsic at call `sdAt`: its value operands, then its one instruction and any lane
+// immediates (`simdTail`). As the builder planned it, a load or store has `sdMemBase` operands (1
+// or 2, else 0); any other op takes operands at `sdPrims` and leaves `sdResPrim` ("" for none).
+export type RSimd = {
+  sdArgs: Opnd[],
+  sdAt: i32,
+  sdMemBase: i32,
+  sdPrims: string[],
+  sdResPrim: string,
+}
 // A `print` statement at call `pnAt` of argument `pnV`, written by legacy's tail for its arm.
 export type RPrint = { pnV: Opnd, pnAt: i32 }
 // `m[k] ?? d` at `??` node `mgAt`: map global `mgSym` (recovered for `mgNonNull`), else receiver
@@ -475,6 +518,7 @@ export type Rhs = RArmUnbox
   | RListEmpty
   | RListEmptyArms
   | RListEq
+  | RListFitIs
   | RListGet
   | RListIsAcross
   | RListLen
@@ -619,14 +663,16 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 export function coalArmStagesLeads(a: CoalValArm): boolean {
   return match a {
     "litUnion" | "nulBool" | "nulRef" => true
-    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "boxFieldScalar" => false
+    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "boxStash" | "boxFieldScalar" => false
   }
 }
 // An integer `match` chain written as one `br_table` (`IntSwitchPlan`): operand `isOn` less
 // `isLo`, read again under the range test when `isWide`; `isTable[d]` the arm index `d` takes,
-// `isArms.length` the else, whose body is `isElse`. A tail chain's (`isTail`) arms return.
+// `isArms.length` the else, whose body is `isElse`. A tail chain's (`isTail`) arms return; a
+// valued one's write out `isOut` (-1 for none), which its frame carries.
 export type SIntSwitch = {
   isTail: boolean,
+  isOut: i32,
   isOn: Opnd,
   isWide: boolean,
   isLo: i32,
@@ -729,6 +775,9 @@ export type IrFn = {
   // A closure thunk: one call forwarding its parameters, in tail form whatever the callee
   // returns, as `emitCloThunkCode` writes it.
   irThunk: boolean,
+  // A lifted function's assigned captures, the parameter variables every exit hands back after
+  // its result (D3664), in legacy's order (`fbSeedRetExtra`).
+  irRetExtra: i32[],
   irSigFn: i32[],
   irSigParams: i32[][],
   irSigRet: i32[],
@@ -742,6 +791,12 @@ export type IrFn = {
   // The globals whose cell holds the record a holding binding holds whole, noted at that record's
   // rep: a read of one at that rep is at its storage.
   irGlobalHeld: {[i32]: boolean},
+  // The padding a valued body needs at its end, as the builder found it: "" (it leaves on every
+  // path), "null" (a live fall-through returns null) or "unreachable" (a dead one).
+  irEndPad: string,
+  // The width retags' declared supertype pairs the builder found (`recSubAdmit`), `src, dst` rep ids
+  // flat in turn.
+  irRecSub: i32[],
   irSpanAst: i32[],
   irSpanFirst: i32[],
   irSpanLast: i32[],
@@ -820,6 +875,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irHelper: false,
     irFragment: false,
     irThunk: false,
+    irRetExtra: [],
     irSigFn: [],
     irSigParams: [],
     irSigRet: [],
@@ -829,6 +885,8 @@ export function irFnNew(at: i32, name: string): IrFn {
     irRecHeap: Map(),
     irGlobalStoreTy: Map(),
     irGlobalHeld: Map(),
+    irEndPad: "",
+    irRecSub: [],
     irSpanAst: [],
     irSpanFirst: [],
     irSpanLast: [],
@@ -1028,10 +1086,27 @@ export function mapBoxReadsAt(mrep: i32, out: i32): boolean {
     && (out == mr.rmVal || out == v.rnInner)
 }
 
+// Whether rep `r` is held as an `i32`: an `i32` or `boolean`, a literal-union atom, or its
+// `K | null` (discipline 3) or `boolean | null` (discipline 2) niche.
+export function repHeldAsI32(r: i32): boolean {
+  const p = repPrim(r)
+  if p == "i32" || p == "bool" { return true }
+  const n = repNodeAt(r)
+  return n is RAtom || n is RNullable && (n.rnDisc == 2 || n.rnDisc == 3)
+}
+
 // Whether rep `r` is the `boolean | null` niche (discipline 2): an i32 cell, `2` for null.
 export function repBoolNiche(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RNullable && n.rnDisc == 2 && repPrim(n.rnInner) == "bool"
+}
+
+// Whether a value at rep `src` is already one of rep `dst` with nothing written: the `null` unit's
+// bottom ref into a rep that lowers to a nullable reference (`ref null $T`, discipline 1). A niche
+// nullable (an atom's `-1`, a boolean's `2`, a box's null tag) encodes its null, so it is no such rep.
+export function repNullRefFits(src: i32, dst: i32): boolean {
+  const d = repNodeAt(dst)
+  return repPrim(src) == "null" && d is RNullable && d.rnDisc == 1
 }
 
 // The union box rep `r` holds: the box under any boxed nullables (discipline 4, whose `null` is
@@ -1294,6 +1369,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListEmpty => [r.leV]
     RListEmptyArms => [r.lfV]
     RListIsAcross => [r.laV]
+    RListFitIs => [r.lsV]
     RLitArms => [r.liV]
     RNumIs => [r.niV]
     RUnionConcreteEq => [r.ucBox, r.ucOther]
@@ -1414,6 +1490,7 @@ function rhsText(r: Rhs): string {
     RListEmpty => "list empty " + opndText(r.leV)
     RListEmptyArms => "list empty arms " + opndText(r.lfV)
     RListIsAcross => "list is across " + opndText(r.laV)
+    RListFitIs => "list fit " + opndText(r.lsV)
     RLitArms => "lit arms " + r.liArm + " " + opndText(r.liV)
     RNumIs => "num is " + opndText(r.niV)
     RNumIntr => "intrinsic " + i32ToStr(r.nxOp) + "(" + opndsText(r.nxArgs) + ")"
@@ -1591,7 +1668,12 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
       s
     }
     SIntSwitch => {
-      let s = p + "intswitch " + opndText(n.isOn) + " lo " + i32ToStr(n.isLo)
+      let s = p
+        + "intswitch "
+        + opndText(n.isOn)
+        + outText(n.isOut)
+        + " lo "
+        + i32ToStr(n.isLo)
       if n.isWide { s = s + " wide" }
       s = s + " table"
       for t in n.isTable { s = s + " " + i32ToStr(t) }
@@ -1664,7 +1746,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
       STrap => "control"
     SCoalBox => match n.cbArm {
       "popOr" => "list"
-      "nulRef" => "box"
+      "nulRef" | "boxStash" => "box"
       "litUnion" | "nulBool" | "boxFieldScalar" => "box"
       "fieldBox" | "fieldVal" | "optLeaf" => "record"
       "mapIndexGetOr" => "map"
@@ -1714,6 +1796,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RListEmpty |
       RListEmptyArms |
       RListEq |
+      RListFitIs |
       RListGet |
       RListIsAcross |
       RListLen |
@@ -1939,6 +2022,19 @@ export function listRetag(src: i32, dst: i32): boolean {
   return ea >= 0 && ea == recElemCore(d.rlsElem)
 }
 
+// Whether a list at rep `src` and one at rep `dst` hold union boxes of one element kind (both
+// boxes, or both boxed nullables): every union row twins one wasm list over the one box heap
+// (`rlTwinSigOf`), whose tags are program-global, so the one is the other as it stands.
+export function boxListRetag(src: i32, dst: i32): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if !(a is RList) || !(d is RList) { return false }
+  const ea = repNodeAt(a.rlsElem)
+  const ed = repNodeAt(d.rlsElem)
+  if ea is RBox { return ed is RBox }
+  return ea is RNullable && ea.rnDisc == 4 && ed is RNullable && ed.rnDisc == 4
+}
+
 // Whether a list at rep `src` is the list at rep `dst` as it stands, `dst` leaving a closure's
 // parameter or result unknown: a result whose type still holds a hole the value fills.
 export function listRetagHole(f: IrFn, src: i32, dst: i32): boolean {
@@ -2024,6 +2120,232 @@ export function recRetag(src: i32, dst: i32): boolean {
   while i < a.rrFields.length {
     if a.rrFields[i] != d.rrFields[i] { return false }
     i = i + 1
+  }
+  return true
+}
+
+// Whether a plain record at rep `src` is the record at plain rep `dst` as it stands: one struct
+// heap (`recordHeapOfTy`, legacy's storage of both types, noted in `hs`) and fields that lower alike.
+export function recRowRetag(src: i32, dst: i32, hs: {[i32]: i32}): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if (
+    !(a is RRecord)
+    || !(d is RRecord)
+    || a.rrVariant
+    || d.rrVariant
+    || src == dst
+  ) {
+    return false
+  }
+  const h = recHeapOf(src)
+  if h < 0 || h != recHeapOf(dst) { return false }
+  recHeapsNote(hs, src)
+  recHeapsNote(hs, dst)
+  return repsLowerAlike(src, dst, hs)
+}
+
+// Whether a plain record at rep `src` stands at plain rep `dst` as it is, by width, as the builder
+// admits it: `dst`'s heap is a declared supertype of `src`'s (`recordHeapSubOf`), noted in `subs`
+// with both reps' heaps in `hs`, and `recSubRetag` holds over those notes.
+export function recSubAdmit(
+  src: i32,
+  dst: i32,
+  hs: {[i32]: i32},
+  subs: i32[],
+): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if (
+    !(a is RRecord)
+    || !(d is RRecord)
+    || a.rrVariant
+    || d.rrVariant
+    || src == dst
+  ) {
+    return false
+  }
+  if !recordHeapSubOf(repTyOf(src), repTyOf(dst)) { return false }
+  if !recSubNoted(subs, src, dst) {
+    subs.push(src)
+    subs.push(dst)
+  }
+  recHeapsNote(hs, src)
+  recHeapsNote(hs, dst)
+  return recSubRetag(src, dst, hs, subs)
+}
+
+// Whether `subs` holds the pair `src`, `dst`.
+function recSubNoted(subs: i32[], src: i32, dst: i32): boolean {
+  let i = 0
+  while i + 1 < subs.length {
+    if subs[i] == src && subs[i + 1] == dst { return true }
+    i = i + 2
+  }
+  return false
+}
+
+// Whether plain record rep `dst` is a declared supertype of plain record rep `src` the builder
+// noted (`subs`), whose fields lead `src`'s by name and lower alike over the heaps noted in `hs`.
+export function recSubRetag(
+  src: i32,
+  dst: i32,
+  hs: {[i32]: i32},
+  subs: i32[],
+): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if (
+    !(a is RRecord)
+    || !(d is RRecord)
+    || a.rrVariant
+    || d.rrVariant
+    || src == dst
+  ) {
+    return false
+  }
+  return recSubNoted(subs, src, dst) && recPrefixLowersAlike(src, dst, hs)
+}
+
+// Whether record rep `dst`'s fields, in name order, lead record rep `src`'s and lower alike to
+// them, as a wasm supertype's fields lead its subtype's.
+function recPrefixLowersAlike(src: i32, dst: i32, hs: {[i32]: i32}): boolean {
+  const x = repNodeAt(src)
+  const y = repNodeAt(dst)
+  const ns = repRecordFieldNames(src)
+  const nd = repRecordFieldNames(dst)
+  if (
+    !(x is RRecord)
+    || !(y is RRecord)
+    || nd.length >= ns.length
+    || nd.length != y.rrFields.length
+  ) {
+    return false
+  }
+  let last = ""
+  let j = 0
+  while j < nd.length {
+    const i = repRecordKidOf(src, repTyOf(src), nd[j])
+    if (
+      i < 0
+      || i >= x.rrFields.length
+      || !repsLowerAlike(x.rrFields[i], y.rrFields[j], hs)
+    ) {
+      return false
+    }
+    if nd[j] > last { last = nd[j] }
+    j = j + 1
+  }
+  for n in ns {
+    if repRecordKidOf(dst, repTyOf(dst), n) < 0 && n < last { return false }
+  }
+  return true
+}
+
+// Whether reps `a` and `b` lower to the same valtypes: one scalar class, any two closures or any two
+// boxes (each kind is one struct), two records on one struct heap noted in `hs` whose fields, by
+// name, lower alike, or the same list, map or nullable shape kid by kid. A pair met again holds.
+export function repsLowerAlike(a: i32, b: i32, hs: {[i32]: i32}): boolean {
+  return lowerAlikeOn(a, b, [], [], hs)
+}
+
+// Notes in `hs` the struct heap (`recHeapOf`) of each record rep reachable from rep `r`, as the
+// builder's IR fact that `repsLowerAlike` reads.
+export function recHeapsNote(hs: {[i32]: i32}, r: i32) {
+  if (hs[r] ?? -1) >= 0 { return 0 }
+  const todo: i32[] = [r]
+  const seen: {[i32]: boolean} = Map()
+  while todo.length > 0 {
+    const t = todo.pop() ?? -1
+    if t < 0 || (seen[t] ?? false) { continue }
+    seen[t] = true
+    if repNodeAt(t) is RRecord { hs[t] = recHeapOf(t) }
+    for k in repNodeKids(t) { todo.push(k) }
+  }
+  return 0
+}
+
+function lowerAlikeOn(
+  a: i32,
+  b: i32,
+  pa: i32[],
+  pb: i32[],
+  hs: {[i32]: i32},
+): boolean {
+  if a == b { return true }
+  let k = 0
+  while k < pa.length {
+    if pa[k] == a && pb[k] == b { return true }
+    k = k + 1
+  }
+  const x = repNodeAt(a)
+  const y = repNodeAt(b)
+  if x == null || y == null { return false }
+  pa.push(a)
+  pb.push(b)
+  const ok = match x {
+    RPrim => y is RPrim && primLowersAs(x) == primLowersAs(y) && x.rpPacked == y.rpPacked
+    RAtom => y is RAtom
+    RNullable => y is RNullable
+      && x.rnDisc == y.rnDisc
+      && lowerAlikeOn(x.rnInner, y.rnInner, pa, pb, hs)
+    RList => y is RList && lowerAlikeOn(x.rlsElem, y.rlsElem, pa, pb, hs)
+    RMap => y is RMap && lowerAlikeOn(x.rmVal, y.rmVal, pa, pb, hs)
+    RBox => y is RBox
+    RClosure => y is RClosure
+    RRecord => y is RRecord
+      && x.rrVariant == y.rrVariant
+      && (hs[a] ?? -1) >= 0
+      && (hs[a] ?? -1) == (hs[b] ?? -1)
+      && fieldsLowerAlike(a, b, pa, pb, hs)
+    RNoValue |
+      RRaw |
+      RUnsup => false
+  }
+  pa.pop()
+  pb.pop()
+  return ok
+}
+
+// The valtype class a primitive rep lowers to: `bool` is stored as an `i32`.
+function primLowersAs(p: RPrim): string {
+  return match p.rpK {
+    "bool" => "i32"
+    "i32" | "i64" | "f32" | "f64" | "v128" | "str" | "u8" | "null" => p.rpK
+  }
+}
+
+// A record rep's fields follow its type's spelling, so `b`'s are matched to `a`'s by name.
+function fieldsLowerAlike(
+  a: i32,
+  b: i32,
+  pa: i32[],
+  pb: i32[],
+  hs: {[i32]: i32},
+): boolean {
+  const x = repNodeAt(a)
+  const y = repNodeAt(b)
+  const na = repRecordFieldNames(a)
+  const nb = repRecordFieldNames(b)
+  if (
+    !(x is RRecord)
+    || !(y is RRecord)
+    || na.length != nb.length
+    || x.rrFields.length != y.rrFields.length
+  ) {
+    return false
+  }
+  let j = 0
+  while j < nb.length && j < y.rrFields.length {
+    const i = repRecordKidOf(a, repTyOf(a), nb[j])
+    if (
+      i < 0
+      || i >= x.rrFields.length
+      || !lowerAlikeOn(x.rrFields[i], y.rrFields[j], pa, pb, hs)
+    ) {
+      return false
+    }
+    j = j + 1
   }
   return true
 }
