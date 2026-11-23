@@ -4487,10 +4487,40 @@ function emitDiscrimFieldEq(
     )
   }
   if emitExpr(recvIx, fnIx) < 0 { return -1 }
+  return discrimFieldEqTail(vi, fi, lex, fnIx)
+}
+
+// `emitDiscrimFieldEq` past its receiver read: the box on the stack, field `fi` of arm `vi`
+// compared with `lex`.
+export function discrimFieldEqTail(vi: i32, fi: i32, lex: string, fnIx: i32) {
   fbStructGet(uBoxIdx, 1)
   fbRefCast(variantHeap(vi))
   fbStructGet(variantHeap(vi), fi)
   return emitFieldLitEq(uFieldStart[vi] + fi, lex, fnIx)
+}
+
+// Whether `emitFieldLitEq` has a compare for a field stored at flat row `r`.
+function fieldLitEqOk(r: i32): boolean {
+  if fieldRowIsStr(r, false) || fieldRowIsStr(r, true) { return true }
+  const nk = fieldRowNumKind(r)
+  return nk == 0 || nk == 3 || nk == 4
+}
+
+// Whether `emitVariantDiscrimTest` writes arm `vi`'s discriminant fields without a refusal:
+// its spans laid out, and every needed field holding literals its storage can compare.
+function variantDiscrimPlanOk(vi: i32): boolean {
+  if vi < 0 || vi >= uFieldCount.length || !variantFieldSpanOk(vi) {
+    return false
+  }
+  let fi = 0
+  while fi < uFieldCount[vi] {
+    if variantDiscrimFieldNeeded(vi, fi) {
+      if variantFieldLitLexes(vi, fi).length == 0 { return false }
+      if !fieldLitEqOk(uFieldStart[vi] + fi) { return false }
+    }
+    fi = fi + 1
+  }
+  return true
 }
 
 // Compares the field value on the stack, stored at flat field row `r`, with the literal `lex`.
@@ -6939,14 +6969,25 @@ function emitIsTestVariant(isIx: i32, nd: IsExpr, fnIx: i32) {
   }
 }
 
-// The variant rung at `V`'s tested row `vi` (`variantIsArmOf`'s `row`): a static row fold where
-// the row is the answer, else the box tag and discriminant test. 0 once on the stack, -1 failed.
-function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
-  if vi < 0 || vi >= uVarTyIx.length {
-    return emitFail(
-      "emitProgram: internal: the variant rung lost its tested row",
-    )
-  }
+// How `emitIsTestVariantRow` answers `recv is V` at tested row `vi`: lost, a static fold (the
+// receiver unread), a closed record that never fits (evaluated, dropped), no union value, the tag
+// alone, the tag and its discriminant over a re-readable receiver, or the full `chain`.
+export type VariantRowArm = "lost"
+  | "foldTrue"
+  | "foldFalse"
+  | "neverFits"
+  | "notUnion"
+  | "plainTag"
+  | "discrim"
+  | "chain"
+
+export function variantRowArmOf(
+  isIx: i32,
+  nd: IsExpr,
+  fnIx: i32,
+  vi: i32,
+): VariantRowArm {
+  if vi < 0 || vi >= uVarTyIx.length { return "lost" }
   // A row holding several members answers from the value's fields after its tag (D5157).
   const shared = armRowSharedAtRecv(nd.isObj, vi)
   const rvi = exprVariantIndex(nd.isObj, fnIx)
@@ -6964,10 +7005,7 @@ function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
       || (!variantHasDiscrimField(rvi)
       && !variantHasDiscrimField(vi)
       && !isFitsAcrossTagRows(vi, isVarTyIxOf(isIx), nd.isObj, fnIx))
-    if foldOk {
-      if rvi == vi { fbI32Const(1) } else { fbI32Const(0) }
-      return 0
-    }
+    if foldOk { return if rvi == vi { "foldTrue" } else { "foldFalse" } }
   }
   if !exprUnion(nd.isObj, fnIx) {
     // An instance's closed record receiver answers by value fit: a record whose fields can
@@ -6975,13 +7013,48 @@ function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
     if (
       recNeverFitsArm(isVarTyIxOf(isIx), nodeTyAt(unwrapParen(nd.isObj), fnIx))
     ) {
-      if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-      fbDrop()
-      fbI32Const(0)
-      return 0
+      return "neverFits"
     }
+    return "notUnion"
+  }
+  const rows: i32[] = []
+  const kinds: i32[] = []
+  crossTagFitRows(vi, isVarTyIxOf(isIx), nd.isObj, rows, kinds, fnIx)
+  if (
+    shared
+    || rows.length > 0
+    || isFitsAcrossTagRows(vi, isVarTyIxOf(isIx), nd.isObj, fnIx)
+  ) {
+    return "chain"
+  }
+  if !variantNeedsDiscrim(vi) { return "plainTag" }
+  if unionEqOperandOk(nd.isObj) && variantDiscrimPlanOk(vi) { return "discrim" }
+  return "chain"
+}
+
+// The variant rung at `V`'s tested row `vi` (`variantIsArmOf`'s `row`): a static row fold where
+// the row is the answer, else the box tag and discriminant test. 0 once on the stack, -1 failed.
+function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
+  const arm = variantRowArmOf(isIx, nd, fnIx, vi)
+  if arm == "lost" || vi < 0 || vi >= uVarTyIx.length {
+    return emitFail(
+      "emitProgram: internal: the variant rung lost its tested row",
+    )
+  }
+  if arm == "foldTrue" || arm == "foldFalse" {
+    fbI32Const(if arm == "foldTrue" { 1 } else { 0 })
+    return 0
+  }
+  if arm == "neverFits" {
+    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+    fbDrop()
+    fbI32Const(0)
+    return 0
+  }
+  if arm == "notUnion" {
     return emitFail("emitProgram: `is` receiver is not a union value")
   }
+  const shared = armRowSharedAtRecv(nd.isObj, vi)
   // A receiver the cross-arm terms re-read is evaluated once when it is not a place.
   let ctSlot = -1
   if (
@@ -7656,21 +7729,46 @@ function emitOptChainIsNull(exprIx: i32, fnIx: i32) {
       return emitFail("emitProgram: `?.` field is not on the struct")
     }
     if emitOptChainIsNull(e.omObj, fnIx) < 0 { return -1 }
-    fbIf(127)
-    fbI32Const(1)
-    fbElse()
-    if optChainLeafNulDisc(psi, pfi) == 0 {
-      fbI32Const(0)
-    } else {
+    if emitOptLinkNullOpen(exprIx, fnIx) {
       if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[psi], pfi)
-      emitOptChainLeafNulTest(psi, pfi)
     }
-    fbEnd()
-    return 0
+    return emitOptLinkNullClose(exprIx, fnIx)
   }
   if emitOptRecvBase(exprIx, fnIx, false) < 0 { return -1 }
   fbRefIsNull()
+  return 0
+}
+
+// After `?.` link `exprIx`'s receiver null test: the `if` that answers true for a null receiver, else
+// tests the field. Whether the field's own null is tested, so the receiver's value comes next.
+export function emitOptLinkNullOpen(exprIx: i32, fnIx: i32): boolean {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return false }
+  const psi = optChainStructIdxOf(e.omObj, fnIx)
+  if psi < 0 || psi >= sHeapIdx.length { return false }
+  const pfi = sFieldIndex(psi, e.omProp)
+  fbIf(127)
+  fbI32Const(1)
+  fbElse()
+  if optChainLeafNulDisc(psi, pfi) == 0 {
+    fbI32Const(0)
+    return false
+  }
+  return true
+}
+
+// The close of `emitOptLinkNullOpen`: the field read and its null test where the field has one.
+export function emitOptLinkNullClose(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return 0 }
+  const psi = optChainStructIdxOf(e.omObj, fnIx)
+  if psi < 0 || psi >= sHeapIdx.length { return 0 }
+  const pfi = sFieldIndex(psi, e.omProp)
+  if optChainLeafNulDisc(psi, pfi) != 0 {
+    fbStructGet(sHeapIdx[psi], pfi)
+    emitOptChainLeafNulTest(psi, pfi)
+  }
+  fbEnd()
   return 0
 }
 
@@ -7872,191 +7970,217 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
       if emitNulNoneForEffect(e.omObj, fnIx) < 0 { return -1 }
       return emitNullAt(exprIx, fnIx)
     }
-    const osi = optChainStructIdxOf(e.omObj, fnIx)
-    if osi < 0 {
-      return emitFailAt(
-        "emitProgram: `?.` receiver is not a struct chain",
-        exprIx,
-      )
+    const arm = optLeafArmOf(exprIx, fnIx)
+    if arm == "fail" { return optLeafFail(exprIx, fnIx) }
+    // Every arm but a pinned non-null one tests the chain, then opens the leaf's `if`.
+    if arm != "nonNull" {
+      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
+      emitOptLeafHead(exprIx, fnIx)
     }
-    const ofi = sFieldIndex(osi, e.omProp)
-    if ofi < 0 {
-      return emitFailAt("emitProgram: `?.` field is not on the struct", exprIx)
-    }
-    const oRow = sFieldStart[osi] + ofi
-    const oKind = fieldRowKind(oRow)
-    const oRefHeap = optChainLeafRefHeap(osi, ofi)
+    if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
+    return emitOptLeafTail(exprIx, fnIx)
+  }
+  return emitFailAt(
+    "emitProgram: expected an optional-chain member access",
+    exprIx,
+  )
+}
 
-    // The record leaf, the arm the `?.` producer needs (D1084). `o?.f` over
-    // `o: T | null` with `T = {f: S}` has type `S | null`, and the rep for that is the nullable
-    // struct ref the whole `nulstruct` family already speaks.
+// How `emitOptMemberValueGo` writes a standalone `?.` leaf, by the leaf field's kind and the read's
+// own rep: a nullable reference's `if` (`record`, `ref`, `map`, `closure`, `nulstr`), the i32
+// sentinel's (`sentinel`), the union box's over a union field or a scalar (`boxUnion`,
+// `boxScalar`), a chain the instance pins non-null (`nonNull`), or `fail`.
+export type OptLeafArm = "record"
+  | "ref"
+  | "map"
+  | "closure"
+  | "sentinel"
+  | "boxUnion"
+  | "boxScalar"
+  | "nulstr"
+  | "nonNull"
+  | "fail"
 
-    // Shape-identical to the `nulstr` arm below it, with the field's own target struct as the
-    // heap type instead of the string array: a null receiver chain yields `ref.null $S`, a live
-    // one reads the field. The `else` arm leaves a `(ref $S)`, a subtype of the block's
-    // `(ref null $S)`, so the arms join without a cast. `structIndexOfExpr` is the other half.
-    if eqKindIsRecord(oKind) {
-      const oti = sFieldTgtStructIdx(osi, ofi)
-      if oti < 0 {
-        return emitFailAt(
-          "emitProgram: `?.` yields a nullable struct whose field names no struct row",
-          exprIx,
-        )
-      }
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
-      fbIfRefNul(sHeapIdx[oti], true)
-      fbRefNull(sHeapIdx[oti])
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return optReadRecoverNonNull(exprIx, fnIx)
-    }
+// The arm standalone `?.` at `exprIx` takes in `emitOptMemberValueGo`'s order, past its `null`
+// unit read; the IR builder asks it too.
+export function optLeafArmOf(exprIx: i32, fnIx: i32): OptLeafArm {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return "fail" }
+  const osi = optChainStructIdxOf(e.omObj, fnIx)
+  if osi < 0 { return "fail" }
+  const ofi = sFieldIndex(osi, e.omProp)
+  if ofi < 0 { return "fail" }
+  const oRow = sFieldStart[osi] + ofi
+  const oKind = fieldRowKind(oRow)
+  // The record leaf (D1084): `o?.f` over `o: T | null` is the nullable struct ref of `f`'s row.
+  if eqKindIsRecord(oKind) {
+    return if sFieldTgtStructIdx(osi, ofi) < 0 { "fail" } else { "record" }
+  }
+  // A list leaf: the list wrapper's own nullable ref.
+  if optChainLeafRefHeap(osi, ofi) >= 0 { return "ref" }
+  // A map leaf: its map struct's nullable ref, once its value type is closed.
+  if oKind == "map" || oKind == "nulmap" {
+    return if sFieldMapShape(osi, ofi) == -3 { "fail" } else { "map" }
+  }
+  // A function-value leaf: the closure fat pointer's own nullable ref.
+  if oKind == "closure" || oKind == "nulclosure" { return "closure" }
+  if !optChainLeafBoxable(oKind) && fieldRowNumKind(oRow) < 0 { return "fail" }
+  const ord = repOfNode(exprIx, fnIx)
+  // `boolean | null` and `K | null` share one i32 blocktype with their sentinel.
+  if (
+    (ord.rdKind == "nulbool" && ord.rdNul == 2)
+    || (ord.rdKind == "i32" && ord.rdNul == 3)
+  ) {
+    return "sentinel"
+  }
+  // A nullable scalar rides the `{tag, payload}` box, `null` its null tag; a union field is the box.
+  const oBoxKind = fieldRowNumKind(oRow)
+  if (
+    oKind == "union"
+    || (ord.rdKind == "union" && ord.rdNul == 4)
+    || (oBoxKind > 0 && ord.rdNul == 4)
+  ) {
+    const ovb = vbHeapIdxOfKind(optLeafBoxKind(oRow))
+    if !uDeclared || (oKind != "union" && ovb < 0) { return "fail" }
+    return if oKind == "union" { "boxUnion" } else { "boxScalar" }
+  }
+  // `string | null` is the nullable raw-array ref niche.
+  if oKind == "nulstr" || (ord.rdKind == "nulstr" && ord.rdNul == 1) {
+    return "nulstr"
+  }
+  // A chain the hole instance pins non-null is the plain field read, at the field's own rep (D3215).
+  if tyProvesNonNull(nodeTyAt(exprIx, fnIx)) { return "nonNull" }
+  return "fail"
+}
 
-    // A LIST leaf, the record arm one table over: `T[] | null` is the list wrapper's own
-    // nullable ref, so a null link yields `ref.null $wrap` and a live one reads the field.
-    // A nullable-list field is already `(ref null $wrap)`, which the same blocktype accepts.
-    if oRefHeap >= 0 {
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
-      fbIfRefNul(oRefHeap, true)
-      fbRefNull(oRefHeap)
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return optReadRecoverNonNull(exprIx, fnIx)
-    }
-    // A MAP leaf: `{[K]: V} | null` is the field's map struct's own nullable ref, the list
-    // arm's shape over the struct `sFieldMapShape` names.
-    if oKind == "map" || oKind == "nulmap" {
-      const msh = sFieldMapShape(osi, ofi)
-      if msh == -3 {
-        return emitFailAt(
-          "emitProgram: a standalone `?.` map leaf's value type is still open",
-          exprIx,
-        )
-      }
-      const mHeap = mapTypeIdxOf(msh)
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
-      fbIfRefNul(mHeap, true)
-      fbRefNull(mHeap)
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return optReadRecoverNonNull(exprIx, fnIx)
-    }
-    // A function-value leaf: `F | null` is the closure fat pointer's own nullable ref.
-    if oKind == "closure" || oKind == "nulclosure" {
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
-      fbIfRefNul(cloStructIdx, true)
-      fbRefNull(cloStructIdx)
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return optReadRecoverNonNull(exprIx, fnIx)
-    }
-    // The leaf reps this arm can build, in the order the arms below take them: a nullable
-    // REF (a list, a map, a function value, a nested struct, a string), the scalar box
-    // (i32/boolean/f64/i64/f32), and the value-union box. Any other leaf is named as such.
-    if (
-      !optChainLeafBoxable(oKind)
-      && fieldRowNumKind(oRow) < 0
-      && oRefHeap < 0
-    ) {
-      return emitFailAt(
-        "emitProgram: a standalone `?.` has no rep for this leaf field — read it through a `!= null` guard",
-        exprIx,
-      )
-    }
-    const ord = repOfNode(exprIx, fnIx)
+// The failure `optLeafArmOf`'s `fail` names, by the first check that refused.
+function optLeafFail(exprIx: i32, fnIx: i32) {
+  const e = nodeAt(unwrapParen(exprIx))
+  const osi = if e is OptMember { optChainStructIdxOf(e.omObj, fnIx) } else { -1 }
+  if !(e is OptMember) || osi < 0 {
+    return emitFailAt(
+      "emitProgram: `?.` receiver is not a struct chain",
+      exprIx,
+    )
+  }
+  const ofi = sFieldIndex(osi, e.omProp)
+  if ofi < 0 {
+    return emitFailAt("emitProgram: `?.` field is not on the struct", exprIx)
+  }
+  const oRow = sFieldStart[osi] + ofi
+  const oKind = fieldRowKind(oRow)
+  if eqKindIsRecord(oKind) {
+    return emitFailAt(
+      "emitProgram: `?.` yields a nullable struct whose field names no struct row",
+      exprIx,
+    )
+  }
+  if oKind == "map" || oKind == "nulmap" {
+    return emitFailAt(
+      "emitProgram: a standalone `?.` map leaf's value type is still open",
+      exprIx,
+    )
+  }
+  if !optChainLeafBoxable(oKind) && fieldRowNumKind(oRow) < 0 {
+    return emitFailAt(
+      "emitProgram: a standalone `?.` has no rep for this leaf field — read it through a `!= null` guard",
+      exprIx,
+    )
+  }
+  const ord = repOfNode(exprIx, fnIx)
+  if (
+    oKind == "union"
+    || (ord.rdKind == "union" && ord.rdNul == 4)
+    || (fieldRowNumKind(oRow) > 0 && ord.rdNul == 4)
+  ) {
+    return emitFailAt(
+      "emitProgram: `?.` yields a nullable scalar but its union box was not collected",
+      exprIx,
+    )
+  }
+  return emitFailAt(
+    "emitProgram: a standalone `?.` has no rep for this result type — read it through `?? d` or a `!= null` guard",
+    exprIx,
+  )
+}
 
-    // `boolean | null` shares one unconditional i32 blocktype: the sentinel 2 (`null`) and
-    // the live 0/1 result are the same valtype, so the two arms below need no cast to join.
-    // `K | null` is the same shape over the literal union's atom, `-1` its null.
-    if (
-      (ord.rdKind == "nulbool" && ord.rdNul == 2)
-      || (ord.rdKind == "i32" && ord.rdNul == 3)
-    ) {
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
+// The leaf's head, after the chain's null test: the `if` at its blocktype, the null arm, `else`.
+// A scalar box's `else` also opens the box with the leaf's tag before the value.
+export function emitOptLeafHead(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return 0 }
+  const osi = optChainStructIdxOf(e.omObj, fnIx)
+  if osi < 0 || osi >= sFieldStart.length || osi >= sHeapIdx.length { return 0 }
+  const ofi = sFieldIndex(osi, e.omProp)
+  const oRow = sFieldStart[osi] + ofi
+  match optLeafArmOf(exprIx, fnIx) {
+    "record" => optLeafNulRefHead(sHeapIdx[sFieldTgtStructIdx(osi, ofi)])
+    "ref" => optLeafNulRefHead(optChainLeafRefHeap(osi, ofi))
+    "map" => optLeafNulRefHead(mapTypeIdxOf(sFieldMapShape(osi, ofi)))
+    "closure" => optLeafNulRefHead(cloStructIdx)
+    "nulstr" => optLeafNulRefHead(sTy())
+    "sentinel" => {
       fbIf(127)
-      if ord.rdNul == 2 { fbI32Const(2) } else { fbI32Const(0 - 1) }
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return 0
-    }
-
-    // `i32 | null` (and a boxed code-16 leaf) rides the `{tag, payload}` box, `null` as the
-    // null tag over an unread payload; both heap types are usage-gated against an uncollected union.
-    // A wide scalar leaf rides the same box: `f64 | null` and `i32 | null` are one rep with
-    // a different tag, so the kind comes from the leaf's own code and never from `i32`.
-    const oBoxKind = fieldRowNumKind(oRow)
-    if (
-      oKind == "union"
-      || (ord.rdKind == "union" && ord.rdNul == 4)
-      || (oBoxKind > 0 && ord.rdNul == 4)
-    ) {
-      let ovbKind = 0
-      if oBoxKind > 0 { ovbKind = oBoxKind }
-      const ovb = vbHeapIdxOfKind(ovbKind)
-      if !uDeclared || (oKind != "union" && ovb < 0) {
-        return emitFailAt(
-          "emitProgram: `?.` yields a nullable scalar but its union box was not collected",
-          exprIx,
-        )
+      if repOfNode(exprIx, fnIx).rdNul == 2 {
+        fbI32Const(2)
+      } else {
+        fbI32Const(0 - 1)
       }
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
+      fbElse()
+    }
+    "boxUnion" | "boxScalar" => {
       fbOpenIf()
       fbValtype("union", -1)
       fbI32Rel(RS_TAG, nullBoxTag())
       fbRefNullNone()
       fbStructNew(uBoxIdx)
       fbElse()
-      if oKind == "union" {
-        if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-        fbStructGet(sHeapIdx[osi], ofi)
-        fbEnd()
-        return 0
+      if fieldRowKind(oRow) != "union" {
+        fbI32Rel(RS_TAG, scalarTagOfKind(optLeafBoxKind(oRow)))
       }
-      fbI32Rel(RS_TAG, scalarTagOfKind(ovbKind))
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbStructNew(ovb)
+    }
+    "nonNull" | "fail" => {}
+  }
+  return 0
+}
+
+// The scalar kind a boxed `?.` leaf at field row `row` rides: its number kind, else 0.
+function optLeafBoxKind(row: i32): i32 {
+  const k = fieldRowNumKind(row)
+  return if k > 0 { k } else { 0 }
+}
+
+// A nullable reference leaf's head over heap `h`: a null link is `ref.null h`.
+function optLeafNulRefHead(h: i32) {
+  fbIfRefNul(h, true)
+  fbRefNull(h)
+  fbElse()
+  return 0
+}
+
+// The leaf's tail, after the non-null chain value: the field read, a scalar's box, the `if`'s end,
+// and a reference leaf's non-null recover.
+export function emitOptLeafTail(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return 0 }
+  const osi = optChainStructIdxOf(e.omObj, fnIx)
+  if osi < 0 || osi >= sFieldStart.length || osi >= sHeapIdx.length { return 0 }
+  const ofi = sFieldIndex(osi, e.omProp)
+  fbStructGet(sHeapIdx[osi], ofi)
+  match optLeafArmOf(exprIx, fnIx) {
+    "record" | "ref" | "map" | "closure" => {
+      fbEnd()
+      return optReadRecoverNonNull(exprIx, fnIx)
+    }
+    "boxScalar" => {
+      fbStructNew(vbHeapIdxOfKind(optLeafBoxKind(sFieldStart[osi] + ofi)))
       fbStructNew(uBoxIdx)
       fbEnd()
-      return 0
     }
-
-    // `string | null` is the nullable raw-array ref niche, so a null link is `ref.null
-    // $sTypeIdx` and a present one the field's own string — no box needed.
-    if oKind == "nulstr" || (ord.rdKind == "nulstr" && ord.rdNul == 1) {
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
-      fbIfRefNul(sTy(), true)
-      fbRefNull(sTy())
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return 0
-    }
-    // A chain the hole instance pins non-null is the plain field read, at the field's own rep (D3215).
-    if tyProvesNonNull(nodeTyAt(exprIx, fnIx)) {
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      return 0
-    }
-    return emitFailAt(
-      "emitProgram: a standalone `?.` has no rep for this result type — read it through `?? d` or a `!= null` guard",
-      exprIx,
-    )
+    "sentinel" | "boxUnion" | "nulstr" => fbEnd()
+    "nonNull" | "fail" => {}
   }
-  return emitFailAt(
-    "emitProgram: expected an optional-chain member access",
-    exprIx,
-  )
+  return 0
 }
 
 // Push the raw union box ref of the binding the `Ident` read at `ix` denotes (a local, param,
@@ -13086,6 +13210,12 @@ function listKindElemKind(k: ListKind): VKind {
 export function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
   const ix = mkArrayLit(run, pos)
   adoptNodeTok(ix, arrIx)
+  return spreadRunNoteAt(ix, h)
+}
+
+// Notes run literal `ix`'s holder `h` (or its holder's, for an untyped minted run), as
+// `spreadRunLit` does when it mints the run; returns `ix`.
+function spreadRunNoteAt(ix: i32, h: i32): i32 {
   const up = elabSpreadRunHolderOf(h)
   elabSpreadRunNote(ix, if up >= 0 && nodeTyIxOf(h) < 0 { up } else { h })
   return ix
@@ -30689,99 +30819,179 @@ function pushRunListBuild(
 // then grows once and the new elements arrive as a single `array.copy`. The one-argument
 // push keeps its own element-wise lowering, which is what makes this path free of it.
 function emitPushMany(callIx: i32, fnIx: i32, wantValue: boolean) {
+  const recv = pushManyRecvOf(callIx)
+  if recv < 0 { return emitFail("emitProgram: expected a push call") }
+  const p = pushManyOpen(callIx, fnIx)
+  if p == null { return -1 }
+  // The receiver, evaluated ONCE — an argument that is itself a list op would otherwise
+  // restage it, which is how a hoisted receiver gets clobbered.
+  listCastForPush = true
+  const recvRc = emitExpr(recv, fnIx)
+  listCastForPush = false
+  if recvRc < 0 { return -1 }
+  pushManyRecvTail(p, recv, fnIx)
+  const lstRc = emitArrAt(pushManyRunLit(callIx, fnIx), fnIx, p.pmLb)
+  if lstRc < 0 { return -1 }
+  return pushManyTail(p, wantValue)
+}
+
+// The receiver of variadic push call `callIx` (`xs` of `xs.push(a, b)`), or -1.
+export function pushManyRecvOf(callIx: i32): i32 {
+  if callIx < 0 || callIx >= P.nodes.length { return -1 }
   const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return -1 }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      const kk = mfRecvKindOf(callee.memObj, fnIx)
-      if kk == null {
-        return emitFail("emitProgram: .push receiver is not a list")
-      }
-      let row = 0
-      if kk == "reflist" { row = refListSlotOfExpr(callee.memObj, fnIx) }
-      if kk == "u8list" { row = exprPackedRow(callee.memObj, fnIx) }
-      const wrap = spreadWrapIdx(kk, row)
-      const back = spreadBackIdx(kk, row)
-      if wrap < 0 || back < 0 {
-        return emitFail("emitProgram: .push but list type not collected")
-      }
-      const seq = liKinds.length
-      const recvS = spreadGroupWrapSlot(kk, row, seq)
-      const srcS = spreadGroupWrapSlot(kk, row, seq + 1)
-      const backS = spreadDstBackSlot(kk, row, seq)
-      const totL = widenTmpSlot(3000 + seq)
-      // The receiver, evaluated ONCE — an argument that is itself a list op would otherwise
-      // restage it, which is how a hoisted receiver gets clobbered.
-      listCastForPush = true
-      const recvRc = emitExpr(callee.memObj, fnIx)
-      listCastForPush = false
-      if recvRc < 0 { return -1 }
-      if nulRecvNeedsRecover(callee.memObj, fnIx) { fbRefAsNonNull() }
-      fbLocalSet(recvS)
-      const lst = spreadRunLit(c.callArgs, callIx, callee.memObj, c.pos)
-      const lstRc = emitArrAt(
-        lst,
-        fnIx,
-        pushRunListBuild(callee.memObj, fnIx, kk, row),
-      )
-      if lstRc < 0 { return -1 }
-      fbLocalSet(srcS)
-      // tot = recv.len + new.len
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 1)
-      fbLocalGet(srcS)
-      fbStructGet(wrap, 1)
-      fbI32Bin(106) // 0x6a i32.add
-      fbLocalSet(totL)
-      // if recv.cap < tot, grow the backing to EXACTLY tot — a bulk append knows the length
-      // it needs, so the doubling a one-at-a-time push amortizes over has nothing to buy.
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 2)
-      fbLocalGet(totL)
-      fbI32Bin(72) // 0x48 i32.lt_s
-      fbIf(64)     // 0x04 if, 0x40 void blocktype
-      fbLocalGet(totL)
-      fbArrayNewDefault(back)
-      fbLocalSet(backS)
-      fbLocalGet(backS)
-      fbI32Const(0)
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 0)
-      fbI32Const(0)
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 1)
-      fbArrayCopy(back, back)
-      fbLocalGet(recvS)
-      fbLocalGet(backS)
-      fbRefAsNonNull()
-      fbStructSet(wrap, 0)
-      fbLocalGet(recvS)
-      fbLocalGet(totL)
-      fbStructSet(wrap, 2)
-      fbEnd()      // 0x0b end (if)
-      // recv.backing[recv.len ..] = new
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 0)
-      fbLocalGet(recvS)
-      fbStructGet(wrap, 1)
-      fbLocalGet(srcS)
-      fbStructGet(wrap, 0)
-      fbI32Const(0)
-      fbLocalGet(srcS)
-      fbStructGet(wrap, 1)
-      fbArrayCopy(back, back)
-      fbLocalGet(recvS)
-      fbLocalGet(totL)
-      fbStructSet(wrap, 1)
-      // D1592 — the value a `.push` yields is the new length, read back from the field this
-      // same sequence just wrote, so the two cannot disagree.
-      if wantValue { fbLocalGet(totL) }
-      return 0
-    }
-    return emitFail("emitProgram: .push receiver is not a member access")
+  if !(c is Call) || c.callFn < 0 { return -1 }
+  const callee = nodeAt(c.callFn)
+  return if callee is Member { callee.memObj } else { -1 }
+}
+
+// The plan of a variadic push's append: the receiver's list kind and row, the wrapper and
+// backing types, and the frame slots it stages into, asked before the receiver as legacy asks
+// them; null, after an `emitFail`, where the receiver is not a collected list.
+export type PushManyPlan = {
+  pmWrap: i32,
+  pmBack: i32,
+  pmRecvS: i32,
+  pmSrcS: i32,
+  pmBackS: i32,
+  pmTot: i32,
+  pmLb: ListBuild,
+}
+
+export function pushManyOpen(callIx: i32, fnIx: i32): PushManyPlan | null {
+  const recv = pushManyRecvOf(callIx)
+  const kk = if recv >= 0 { mfRecvKindOf(recv, fnIx) } else { null }
+  if kk == null {
+    emitFail("emitProgram: .push receiver is not a list")
+    return null
   }
-  return emitFail("emitProgram: expected a push call")
+  let row = 0
+  if kk == "reflist" { row = refListSlotOfExpr(recv, fnIx) }
+  if kk == "u8list" { row = exprPackedRow(recv, fnIx) }
+  const wrap = spreadWrapIdx(kk, row)
+  const back = spreadBackIdx(kk, row)
+  if wrap < 0 || back < 0 {
+    emitFail("emitProgram: .push but list type not collected")
+    return null
+  }
+  const seq = liKinds.length
+  const p: PushManyPlan = {
+    pmWrap: wrap,
+    pmBack: back,
+    pmRecvS: spreadGroupWrapSlot(kk, row, seq),
+    pmSrcS: spreadGroupWrapSlot(kk, row, seq + 1),
+    pmBackS: spreadDstBackSlot(kk, row, seq),
+    pmTot: widenTmpSlot(3000 + seq),
+    pmLb: pushRunListBuild(recv, fnIx, kk, row),
+  }
+  return p
+}
+
+// The list build a variadic push's run takes in instance `fnIx` (`pushRunListBuild` at the
+// receiver's kind and row), asking no type or slot; null where the receiver is not a list.
+export function pushManyRunBuild(callIx: i32, fnIx: i32): ListBuild | null {
+  const recv = pushManyRecvOf(callIx)
+  const kk = if recv >= 0 { mfRecvKindOf(recv, fnIx) } else { null }
+  if kk == null { return null }
+  let row = 0
+  if kk == "reflist" { row = refListSlotOfExpr(recv, fnIx) }
+  if kk == "u8list" { row = exprPackedRow(recv, fnIx) }
+  return pushRunListBuild(recv, fnIx, kk, row)
+}
+
+// The run a variadic push appends in instance `fnIx`, as its own literal (`spreadRunLit`), minted
+// once per call and instance so legacy and the IR build the same node.
+export function pushManyRunLit(callIx: i32, fnIx: i32): i32 {
+  const seen = pushRunLits.get(callIx) ?? []
+  let i = 0
+  while i + 1 < seen.length {
+    // The node is the call's, and its holder is noted again on every ask, as `spreadRunLit` notes it.
+    if seen[i] == fnIx {
+      return spreadRunNoteAt(seen[i + 1], pushManyRecvOf(callIx))
+    }
+    i = i + 2
+  }
+  if callIx < 0 || callIx >= P.nodes.length { return -1 }
+  const c = nodeAt(callIx)
+  if !(c is Call) { return -1 }
+  const recv = pushManyRecvOf(callIx)
+  const ix = spreadRunLit(c.callArgs, callIx, recv, c.pos)
+  seen.push(fnIx)
+  seen.push(ix)
+  pushRunLits.set(callIx, seen)
+  return ix
+}
+
+// Each variadic push call's runs, as (instance, node) pairs.
+let pushRunLits: {[i32]: i32[]} = Map()
+
+// After a variadic push's receiver is on the stack: its recover where owed, then its stage.
+export function pushManyRecvTail(p: PushManyPlan, recv: i32, fnIx: i32) {
+  if nulRecvNeedsRecover(recv, fnIx) { fbRefAsNonNull() }
+  fbLocalSet(p.pmRecvS)
+  return 0
+}
+
+// After a variadic push's run is on the stack: the receiver grown to the new length where its
+// capacity is short, the run copied in, the length written, and (`wantValue`) that length.
+export function pushManyTail(p: PushManyPlan, wantValue: boolean) {
+  const wrap = p.pmWrap
+  const back = p.pmBack
+  const recvS = p.pmRecvS
+  const srcS = p.pmSrcS
+  const backS = p.pmBackS
+  const totL = p.pmTot
+  fbLocalSet(srcS)
+  // tot = recv.len + new.len
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 1)
+  fbLocalGet(srcS)
+  fbStructGet(wrap, 1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(totL)
+  // if recv.cap < tot, grow the backing to EXACTLY tot — a bulk append knows the length
+  // it needs, so the doubling a one-at-a-time push amortizes over has nothing to buy.
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 2)
+  fbLocalGet(totL)
+  fbI32Bin(72) // 0x48 i32.lt_s
+  fbIf(64)     // 0x04 if, 0x40 void blocktype
+  fbLocalGet(totL)
+  fbArrayNewDefault(back)
+  fbLocalSet(backS)
+  fbLocalGet(backS)
+  fbI32Const(0)
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 0)
+  fbI32Const(0)
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 1)
+  fbArrayCopy(back, back)
+  fbLocalGet(recvS)
+  fbLocalGet(backS)
+  fbRefAsNonNull()
+  fbStructSet(wrap, 0)
+  fbLocalGet(recvS)
+  fbLocalGet(totL)
+  fbStructSet(wrap, 2)
+  fbEnd()      // 0x0b end (if)
+  // recv.backing[recv.len ..] = new
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 0)
+  fbLocalGet(recvS)
+  fbStructGet(wrap, 1)
+  fbLocalGet(srcS)
+  fbStructGet(wrap, 0)
+  fbI32Const(0)
+  fbLocalGet(srcS)
+  fbStructGet(wrap, 1)
+  fbArrayCopy(back, back)
+  fbLocalGet(recvS)
+  fbLocalGet(totL)
+  fbStructSet(wrap, 1)
+  // D1592 — the value a `.push` yields is the new length, read back from the field this
+  // same sequence just wrote, so the two cannot disagree.
+  if wantValue { fbLocalGet(totL) }
+  return 0
 }
 
 // D1592 — `wantValue` is the value-position flag: the checker types `.push` `i32` (the new
@@ -36867,6 +37077,25 @@ export function urLocalRead(idx: i32): boolean {
   return true
 }
 
+// Binds local `idx` to constant `v` as a full unroll's copy does, so legacy's questions about the
+// copy's nodes (a hoisted iterable's elements) read it as that copy's value; `urUnbind` undoes it.
+export function urBindConst(idx: i32, v: i32) {
+  urSlot.push(idx)
+  urVal.push(v)
+  urBase.push(-1)
+  return 0
+}
+
+// How many copies the unroll stack holds.
+export function urDepth(): i32 { return urSlot.length }
+
+export function urUnbind() {
+  urSlot.pop()
+  urVal.pop()
+  urBase.pop()
+  return 0
+}
+
 // The innermost unrolled copy whose loop var is local `idx`, or -1.
 function unrolledSlotAt(idx: i32) {
   let j = urSlot.length - 1
@@ -38813,6 +39042,7 @@ export function wasmEmitStateReset() {
   eqStashR = -1
   forIterLits = Map()
   forIterScanned = 0
+  pushRunLits = Map()
   hmFn = -2
   hmIdxSeen = 0
   idxSpanNode = -1

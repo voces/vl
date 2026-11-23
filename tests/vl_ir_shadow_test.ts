@@ -1539,7 +1539,9 @@ Deno.test({
       "literal-cast-of-record": 2,
       "literal-cast-of-i32": 0,
       "retag-closures-of-differing-arity": 2,
+      "retag-closures-of-differing-arity-noted": 0,
       "retag-field-alike-records-two-heaps": 2,
+      "push-many-of-i32": 2,
       "global-read-off-store-type": 2,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
@@ -1553,6 +1555,11 @@ Deno.test({
       "call-write-back-not-a-capture": 2,
       "coal-str-default-off-rep": 2,
       "coal-atom-str-default-off-rep": 2,
+      "opt-read-of-i32": 2,
+      "dead-return-after-returning-call": 5,
+      "pop-or-default-returning-call": 5,
+      "pop-or-default-never-call": 0,
+      "dead-return-after-never-call": 0,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -1569,6 +1576,8 @@ Deno.test({
       const got = exp.irVerifySelfTest(i);
       if (got !== want[ids[i]]) throw new Error(`case ${ids[i]}: want rule ${want[ids[i]]}, got rule ${got}`);
     }
+    // The hoist asked inside a range copy undoes every binding it made, whether it hoists or misses.
+    if (exp.irRangeCopyHoistSelfTest(-1) !== 0) throw new Error("want the unroll stack depth unchanged after a miss");
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
