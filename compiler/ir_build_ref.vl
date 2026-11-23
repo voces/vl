@@ -21,7 +21,13 @@ import {
   repWhat,
 } from "./ir"
 import { unwrapParen } from "./emit_base"
-import { letBindIsAtom, letBindIsNulAtom, localIndexOf } from "./emit_classify"
+import {
+  letBindIsAtom,
+  letBindIsNulAtom,
+  localIndexOf,
+  structIndexOfExpr,
+} from "./emit_classify"
+import { repStructRowIsOrTwin } from "./emit_shape_rows"
 import { isStorageRead, storageReadEnter, storageReadLeave } from "./emit_elab"
 import { identDeclOf } from "./symbols"
 import {
@@ -428,10 +434,20 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     if kr != rep && !own && !narrowed { return irBMiss("field read coercion") }
     const rv = irBExpr(b, n.memObj)
     if missed(rv) { return rv }
-    // A receiver held at its storage row (D14426) lays its fields out as that row does.
-    if irBOpRep(rv) != r { return irBMiss("field read of a stored row") }
+    // A receiver held at its storage row (D14426) reads that row's field, where it holds the read's
+    // own rep or the union box the read unboxes.
+    const sk = if irBOpRep(rv) == r { k } else { storedRowKid(n, irBOpRep(rv), fnIx) }
+    const skr = if sk >= 0 { repNodeKids(irBOpRep(rv))[sk] } else { -1 }
+    if sk < 0 || sk != k { return irBMiss("field read of a stored row") }
     irBNoteFieldReread(ix, k)
     const ur = if own { irBUnboxKindRep(unionFieldUnboxKindOf(ix, fnIx), rep) } else { rep }
+    const sn = repNodeAt(skr)
+    const boxRead = sn is RNullable
+      && sn.rnDisc == 4
+      && (rep == sn.rnInner || repPrim(rep) == "null")
+    if skr != kr && own && !boxRead {
+      return irBMiss("field read of a stored row's box")
+    }
     const gf: Rhs = {
       gfV: rv,
       gfIx: k,
@@ -441,6 +457,7 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
       gfShared: false,
     }
     if ur != rep { return irBLetStrTemp(b, gf, ix) }
+    if skr != kr && !own { return irBLetTempTy(b, gf, ix, skr, repTyOf(skr)) }
     // A raw read at the field's storage (`rawFieldRepOf`) is typed at that rep.
     if rep == kr && rep != repNodeOfTy(nodeTyAt(ix, fnIx)) {
       return irBLetTempTy(b, gf, ix, rep, repTyOf(rep))
@@ -637,4 +654,14 @@ export function irRefInstall() {
   irLoopCloseHook = irLowerRefLoopClose
   irBoundsRuleHook = irBoundsRule
   return 0
+}
+
+// The kid of stored row `sr` that member read `n` reads, or -1 where legacy reads another row:
+// legacy reads the receiver's struct row (`structIndexOfExpr`), the row `sr` is stored under.
+function storedRowKid(n: Member, sr: i32, fnIx: i32): i32 {
+  if !(repNodeAt(sr) is RRecord) { return -1 }
+  if !repStructRowIsOrTwin(repTyOf(sr), structIndexOfExpr(n.memObj, fnIx)) {
+    return -1
+  }
+  return repRecordKidOf(sr, repTyOf(sr), n.memProp)
 }
