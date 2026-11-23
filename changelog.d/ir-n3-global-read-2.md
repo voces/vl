@@ -1,5 +1,3 @@
-### Codegen
+## Codegen, memory & runtime (Track B)
 
-- The IR builder covers two more global reads with legacy bytes unchanged: an assignment's value
-  re-reading a literal-union global (decoded to its string), and a global whose record type has
-  no struct row (read at the row its initializer stored).
+- **IR coverage, `global read coercion` part 2:** an assignment whose value re-reads a literal-union global reads the cell's atom and decodes it to its string, and a global whose record type has no struct row is read at the row its initializer stored, which is also the storage row the verifier checks. In tests/cases, `start uncovered global read coercion` 14 → 7 and `uncovered global read coercion` 6 → 3; no legacy bytes moved.
