@@ -278,6 +278,7 @@ import {
   ifExprJoinVt,
   ifExprPlainWhy,
   ifExprShapeWhy,
+  ifExprSwitchMay,
   ifLinkExhausts,
   ifThenIsDead,
   ifWritesElse,
@@ -289,6 +290,7 @@ import {
   keptDeclStoresNothing,
   legacyContextLiveWhy,
   letIfInitPerArmRep,
+  listFitIsPlanOf,
   listOpRecvHeldPlan,
   lowMemFoldsCallee,
   lvTailAssigns,
@@ -631,8 +633,14 @@ import {
   LiFrame,
   VKind,
   cboxReadsCell,
+  cloLiftWriteCapAt,
   cloLiftWriteCount,
+  cloLiftWriteSlot,
+  emitErr,
+  emitFailed,
   fRecRetTy,
+  fRetKind,
+  fRetStructIdx,
   fRetVoid,
   fnMemAddrFoldCount,
   fnStmts,
@@ -717,6 +725,7 @@ import { spreadSlotIdOf } from "./emit_collect"
 import { ListBuild } from "./emit_ref_list_kinds"
 
 let ibArmed = false
+let ibMode = 0
 let ibDetail = false
 let ibCorrupt = 0
 let ibRowKey: string[] = []
@@ -726,13 +735,19 @@ let ibRowN: i32[] = []
 // 3 disarmed claiming every family but `other` (the claim path's test), 4 the blocker census (each
 // row names every class the function missed), 5 disarmed with the shipped claim's rows printed.
 export function irShadowArm(on: i32) {
-  ibArmed = on == 1 || on == 2 || on == 4 || on == 6
+  ibMode = on
+  ibArmed = armedIn(on)
   setIrShadowOn(ibArmed)
   ibDetail = on == 2
   ibClaimAll = on == 3
   ibAllMiss = on == 4
   ibPrePost = on == 6
   return 0
+}
+
+// Whether shadow mode `on` arms the checks that compare the IR with what legacy wrote.
+function armedIn(on: i32): boolean {
+  return on == 1 || on == 2 || on == 4 || on == 6
 }
 
 // Mode 6, the order check: each function is also built and lowered where a claim builds it,
@@ -748,6 +763,25 @@ let ibPreCode: u8[] = []
 export function irPreBuild(fnIx: i32, fnPos: i32) {
   ibPreBuilt = false
   if !ibPrePost { return 0 }
+  // The early build runs where a claim does, so unarmed as a claim is: an armed check that
+  // legacy has written the function already would fail it. A failure it causes stays a failure,
+  // since the writer has stopped, and the row names the function.
+  const failedBefore = emitFailed
+  ibArmed = false
+  preBuildUnarmed(fnIx, fnPos)
+  ibArmed = armedIn(ibMode)
+  if !failedBefore && emitFailed {
+    count(
+      "prepost differs: the early build failed the compile ("
+        + emitErr
+        + ") in "
+        + ib.irName,
+    )
+  }
+  return 0
+}
+
+function preBuildUnarmed(fnIx: i32, fnPos: i32) {
   const gen = repNodeGen()
   const minted = synthMintCount()
   const why = build(fnIx, fnPos)
@@ -1013,10 +1047,18 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   const d = isDecidedPlanOf(ix, ibFnIx)
   if d.idArm == "storage" { return storedBoxTest(b, n, ix, rep) }
   if d.idArm != "test" { return isDecidedTest(b, n, d, ix, rep) }
-  if n.isFit >= 0 || isRecvStageRep(ix, ibFnIx) >= 0 {
-    return irBMiss("is staged")
-  }
+  if n.isFit >= 0 { return isFitTest(b, n, rep) }
+  if isRecvStageRep(ix, ibFnIx) >= 0 { return irBMiss("is staged") }
   return isRung(b, n, ix, rep, isArmOf(ix, ibFnIx, 0, false))
+}
+
+// A test the checker minted as a content check (`isFit`, a map against a narrower map): the check
+// itself, as `emitIsTest` writes it.
+function isFitTest(b: i32[], n: IsExpr, rep: i32): Opnd {
+  const v = irBExpr(b, n.isFit)
+  if ibMiss != "" { return v }
+  if irBOpRep(v) != rep { return irBMiss("is fit rep") }
+  return v
 }
 
 // An `is` decided before any rung (`isDecidedPlanOf`), as `isDecidedOperand` writes it: the operand
@@ -1111,6 +1153,23 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   }
   if arm == "numLit" { return isNumLit(b, n, ix, rep) }
   if arm == "listAcross" { return isListAcross(b, n, ix, rep) }
+  if arm == "listFit" {
+    const p = listFitIsPlanOf(ix, ibFnIx)
+    if p.lftOk == 0 {
+      return isRung(
+        b,
+        n,
+        ix,
+        rep,
+        isArmOf(ix, ibFnIx, isArmRank(arm) + 1, false),
+      )
+    }
+    if p.lftOk < 0 { return irBMiss("is list fit refused") }
+    if rep != ibBool { return irBMiss("is result rep") }
+    const v = irBExpr(b, n.isObj)
+    if ibMiss != "" { return v }
+    return irBLetTemp(b, { lsV: v, lsAt: ix }, ix, rep)
+  }
   if arm == "litMember" { return isLitMember(b, n, ix, rep) }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   // Each rung's own answer, asked once: the arm tag's `tagIsArmOf`, the variant's plain row.
@@ -2329,6 +2388,7 @@ export function irBDeclVar(d: i32): i32 {
   }
   const lt = declRowLetTy(d, rep)
   if lt >= 0 { return declVarAt(d, repNodeOfTy(lt), lt) }
+  if letLitUndeclaredRow(d) { ibDeclRowSeen = true }
   return declVarAt(d, rep, ty)
 }
 
@@ -2463,6 +2523,18 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
 // `ifExpr`, its first link built at type `ty0` where that is not -1: a destination's own, whose
 // rep `rep0` each arm then delivers at. Such a link ends the chain.
 function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
+  // A dense integer `match` at a scalar join is one `br_table` whose arms carry the value
+  // (`emitIfExprAsLink`'s `emitIntSwitch` mode 2), where its plan has an `else`.
+  if (
+    ty0 < 0
+    && ifExprShapeWhy(ix0, ibFnIx) == "int match"
+    && ifExprSwitchMay(ix0)
+    && valtypeOf(rep0) >= 0
+    && valtypeOf(rep0) == ifExprJoinVt(ix0, ibFnIx)
+  ) {
+    const p = intSwitchPlanOf(ix0, ibFnIx)
+    if p != null && p.ispElse >= 0 { return valuedSwitch(b, ix0, p, rep0) }
+  }
   const rj = ifRefJoinOf(ix0, ibFnIx)
   const rk = rj.rjKind
   if ty0 < 0 && rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
@@ -2701,9 +2773,12 @@ function refIfLink(
   slot: i32,
   nulAcc: boolean,
 ): Opnd {
-  if intSwitchMayLower(ix) { return irBMiss("ref if switch") }
   const own = ifLinkYieldsNull(ix, ibFnIx)
   const nul = nulAcc || own
+  // Legacy tries a `br_table` on a link whose chain yields no null (`emitIfExprRefLink`); one whose
+  // plan declines is the plain link.
+  const sp = if !nul && intSwitchMayLower(ix) { intSwitchPlanOf(ix, ibFnIx) } else { null }
+  if sp != null && sp.ispElse >= 0 { return irBMiss("ref if switch") }
   if nul != own { return irBMiss("ref if chain null inward") }
   if n.ifElse < 0 { return irBMiss("ref if else-less") }
   const cat = b.length
@@ -3296,7 +3371,6 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     if unbox { return captureUnbox(b, own, ix, rep, ak) }
     return captureRecover(b, own, ix, rep, na)
   }
-  if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
   const v = liftCapVar(fe, name, if unbox { -1 } else { rep })
   const held = if atOwn { cr } else { rep }
   if v < 0 || ib.irVars[v].vRep != held { return irBMiss("capture binding") }
@@ -3454,11 +3528,7 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
     const fi = if v < 0 { captureSlotOf(name, ibFnIx) } else { -1 }
     if fi >= 0 && capRepOf(self, name) == r {
       if cloLifted(self) {
-        if cloLiftWriteCount(self) > 0 {
-          v = -1
-        } else {
-          v = liftCapVar(self, name, -1)
-        }
+        v = liftCapVar(self, name, -1)
       } else {
         const t = irBLetTempTy(
           b,
@@ -3814,7 +3884,20 @@ function resultTy(pos: i32, ann: i32, d: i32): i32 {
   // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`),
   // whether its result is recorded or checked.
   const bs = if pos >= 0 && pos < fnStmts.length && fnRetHeldAsBundle(pos, t) { fnBundleRetSigs(pos) } else { [] }
-  return if bs.length > 0 { bundleRecordTyOf(bs) } else { t }
+  if bs.length > 0 { return bundleRecordTyOf(bs) }
+  const dt = retDeclRowTy(pos, t)
+  return if dt >= 0 { dt } else { t }
+}
+
+// The record type of the struct row legacy declares `fnStmts` slot `pos`'s inferred result at
+// (`fRetKind`, `fRetStructIdx`) where result type `t` is not that row (`declRowTy`), or -1.
+function retDeclRowTy(pos: i32, t: i32): i32 {
+  if pos < 0 || pos >= fRetKind.length || pos >= fRetStructIdx.length {
+    return -1
+  }
+  if fRetKind[pos] != "struct" || fRetStructIdx[pos] < 0 { return -1 }
+  if repRowOfTyStruct(t, repScanLim()) == fRetStructIdx[pos] { return -1 }
+  return declRowTy(fRetStructIdx[pos])
 }
 
 // The result rep of that function. Legacy's voidness (`fRetVoid`) decides no value, as its
@@ -3867,6 +3950,18 @@ function callTargetIs(pos: i32, d: i32): boolean {
     k = k + 1
   }
   return false
+}
+
+// Render call `c`'s template hole that this instance pins to a string or atom, as that hole's
+// string: `emitCallCore` writes it before any call route (`emitStrValue`).
+function tplHoleStr(b: i32[], c: Call): Opnd {
+  const h = tplStrHoleOf(c, ibFnIx)
+  const v = if exprIsLitAtom(h, ibFnIx) { deliverStr(b, h) } else { irBExpr(b, h) }
+  if ibMiss != "" { return v }
+  if repPrim(irBOpRep(v)) != "str" {
+    return irBMiss("template hole pinned rep")
+  }
+  return v
 }
 
 // A direct call `ix` of a declared, capture-free function by name; its arguments by position.
@@ -4076,9 +4171,8 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   const caps = if cloLifted(pos) { liftCaps(pos) } else { [] }
   if ibMiss != "" { return missRhs("callee captures") }
   // A lifted callee that assigns a capture hands it back after its result (D3664).
-  if cloLiftWriteCount(pos) > 0 {
-    return missRhs("callee writes back captures")
-  }
+  const wb = liftWriteBacks(pos, caps)
+  if ibMiss != "" { return missRhs(ibMiss) }
   if env && !cloLifted(pos) && captureCountOf(pos) > 0 {
     return capturedCallRhs(b, c, ix, pos)
   }
@@ -4182,8 +4276,57 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     caNever: callEndsNever(ix),
     caEnv: env,
     caCaps: caps,
+    caWb: wb,
   }
   return r
+}
+
+// The parameter variables lifted function `pos` hands back after its result: each capture it
+// assigns, at the slot legacy's exits read (`fbSeedRetExtra`, `1 +` its capture index).
+function liftRetExtra(pos: i32): i32[] {
+  const out: i32[] = []
+  const n = cloLiftWriteCount(pos)
+  if n == 0 { return out }
+  const names = captureNamesOf(pos)
+  let j = 0
+  while j < n {
+    const k = cloLiftWriteCapAt(pos, j)
+    const v = if k >= 0 && k < names.length { liftCapVar(pos, names[k], -1) } else { -1 }
+    if v < 0 || ib.irVars[v].vSlot != 1 + k {
+      irBMiss("lifted extra result")
+      return out
+    }
+    out.push(v)
+    j = j + 1
+  }
+  return out
+}
+
+// The parameter variable of capture `name` that this lifted frame assigns at legacy's local `w`
+// (`cloLiftWriteSlot`), or -1 where `name` is no such capture.
+function liftWriteVar(name: string, w: i32): i32 {
+  const self = fnStmtsPosOf(ibFnIx)
+  if !cloLifted(self) || cloLiftWriteSlot(self, name) != w { return -1 }
+  const v = liftCapVar(self, name, -1)
+  return if v >= 0 && ib.irVars[v].vSlot == w { v } else { -1 }
+}
+
+// The variables lifted callee `pos` hands its assigned captures back to, in its result order: each
+// the binding its capture is passed from (`caps`), which holds legacy's declared or parameter slot.
+function liftWriteBacks(pos: i32, caps: Opnd[]): i32[] {
+  const out: i32[] = []
+  let j = 0
+  while j < cloLiftWriteCount(pos) {
+    const k = cloLiftWriteCapAt(pos, j)
+    const o = if k >= 0 && k < caps.length { caps[k] } else { null }
+    if !(o is OVar) || o.ov < 0 || ib.irVars[o.ov].vKind == "temp" {
+      irBMiss("callee write-back operand")
+      return out
+    }
+    out.push(o.ov)
+    j = j + 1
+  }
+  return out
 }
 
 // The `let` or `const` of the function being built that capture `name` of lifted function `pos`
@@ -4282,8 +4425,7 @@ function liftCaps(pos: i32): Opnd[] {
         return out
       }
       if (
-        cloLiftWriteCount(self) == 0
-        && capRepOf(self, name) >= 0
+        capRepOf(self, name) >= 0
         && capRepOf(self, name) == capRepOf(pos, name)
       ) {
         v = liftCapVar(self, name, -1)
@@ -8539,6 +8681,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       return irBLetTemp(b, { mnAt: ix }, ix, rep)
     }
     if arrNewCallNamed(n, ibFnIx) { return arrNew(b, n, ix, rep) }
+    if tplStrHoleOf(n, ibFnIx) >= 0 {
+      const hv = tplHoleStr(b, n)
+      if ibMiss == "" && irBOpRep(hv) != rep {
+        return irBMiss("template hole pinned rep")
+      }
+      return hv
+    }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return irBMiss("call") }
     // A call typed past its callee's result (a joined result legacy widens) is legacy's.
@@ -8686,9 +8835,8 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 
 // Legacy's strength-reduced masked shift (`shiftMaskFoldOf`'s [x, k, narrow, m, j]): x at the
 // fold's width, then the shift netting `k` against `j` and the mask `m << j`, both constants, as
-// `emitShiftMaskFold` writes them. The narrowing form's wrap is legacy's.
+// `emitShiftMaskFold` writes them.
 function shiftMaskFold(b: i32[], f: i64[], w: i32, ix: i32, rep: i32): Opnd {
-  if f[4] < 0 { return irBMiss("shift-mask fold narrowing") }
   const ir = repNodeOfTy(if w == 64 { numCastKindTy(3) } else { TY_I32 })
   if rep != ir { return irBMiss("shift-mask fold rep") }
   const x = f[0] as% i32
@@ -8702,10 +8850,30 @@ function shiftMaskFold(b: i32[], f: i64[], w: i32, ix: i32, rep: i32): Opnd {
     v = widenTo(b, v, x, ir, -1)
     if ibMiss != "" { return v }
   }
-  // A narrowing source (an i64 read at width 32) takes legacy's `i32.wrap_i64`.
+  // A narrowing source (an i64 read at width 32) is legacy's `srPushSource`: the source at i64,
+  // then `i32.wrap_i64`.
+  if f[2] == 1 && irBOpRep(v) != ir {
+    const w64 = repNodeOfTy(numCastKindTy(3))
+    const p = widenPlanOf(x, 3, ibFnIx)
+    if p.wpArm != "plain" { return irBMiss("widen " + p.wpArm) }
+    const v64 = widenTo(b, v, x, w64, -1)
+    if ibMiss != "" { return v64 }
+    if irBOpRep(v64) != w64 {
+      return irBMiss("shift-mask fold narrowing source")
+    }
+    v = irBLetTempTy(
+      b,
+      { nwV: v64, nwSrc: 3, nwDst: 1, nwAt: x },
+      x,
+      ir,
+      TY_I32,
+    )
+    if ibMiss != "" { return v }
+  }
   if irBOpRep(v) != ir { return irBMiss("shift-mask fold narrowing source") }
   const k = f[1]
-  const j = f[4]
+  // The narrowing form `(y >>> k) as% i32 & m` has no outer shift: `srEmitNarrowed`'s j of 0.
+  const j = if f[4] < 0 { 0 } else { f[4] }
   let s = v
   if k != j {
     const by: Opnd = { oiRep: ir, oiBits: if k > j { k - j } else { j - k } }
@@ -8889,8 +9057,10 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
   if t is Member { return fieldStore(b, n, t, ix) }
   if !(t is Ident) { return skip("assignment target") }
   const d = identDeclOf(n.binLeft)
-  if d >= 0 && localIndexOf(ibFnIx, n.binLeft) >= 0 {
-    const v = irBDeclVar(d)
+  const w = if d >= 0 { localIndexOf(ibFnIx, n.binLeft) } else { -1 }
+  if w >= 0 {
+    const lv = liftWriteVar(t.identName, w)
+    const v = if lv >= 0 { lv } else { irBDeclVar(d) }
     if v < 0 { return skip("assignment coercion") }
     const src = deliver(b, n.binRight, ib.irVars[v].vRep, -1)
     if ibMiss != "" { return 0 }
@@ -9076,6 +9246,11 @@ function mapRecvRepOk(r: i32, mr: i32): boolean {
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
   const why = forInPlainWhy(n, ix, ibFnIx)
   if why != "" && why != "hoisted" { return skip("for in " + why) }
+  // Inside an unrolled range copy a list literal of the copy's constants is legacy's pooled
+  // global, read with `global.get`, where the IR builds the list.
+  if ibRangeImmAt.length > 0 && nodeAt(unwrapParen(n.fiIter)) is ArrayLit {
+    return skip("for in literal in an unrolled copy")
+  }
   // A map walk's operand is its receiver, whose keys or values list the lowering reads.
   const mr = forInMapRecv(n.fiIter, ibFnIx)
   const g = if mr >= 0 { mapGlobalOf(mr) } else { -1 }
@@ -9575,6 +9750,38 @@ function elseStmts(e: i32): i32[] {
   return [e]
 }
 
+// The valued integer `match` at `ix` that `p` plans: each arm and the else writes its value at
+// `rep` into the out the frame carries, as `ifArm` writes a value `if`'s.
+function valuedSwitch(b: i32[], ix: i32, p: IntSwitchPlan, rep: i32): Opnd {
+  const n0 = b.length
+  const on = irBExpr(b, p.ispOn)
+  if ibMiss != "" { return on }
+  if b.length != n0 || !(on is OVar) || on.ov < 0 || on.ov >= ib.irVars.length {
+    return irBMiss("int switch scrutinee")
+  }
+  if ib.irVars[on.ov].vKind == "temp" { return irBMiss("int switch scrutinee") }
+  const ty = byteHeld(nodeTyAt(ix, ibFnIx))
+  if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const arms: i32[][] = []
+  for th in p.ispThens { arms.push(ifArm(th, t, rep)) }
+  const els = ifArm(p.ispElse, t, rep)
+  if ibMiss != "" { return irBMiss("if arm") }
+  const sn: SIntSwitch = {
+    isTail: false,
+    isOut: t,
+    isOn: on,
+    isWide: p.ispWide,
+    isLo: p.ispLo,
+    isTable: p.ispTable,
+    isArms: arms,
+    isElse: els,
+  }
+  irBNode(b, sn, ty, rep, ix)
+  const o: Opnd = { ov: t }
+  return o
+}
+
 // The integer `match` chain at `ix` that `p` plans as one `br_table`: legacy reads the place itself,
 // twice when 64-bit, so its operand is the place's variable. A tail chain's arms return their
 // last value (`tailArm`); a statement chain's are statement lists, as `emitSwitchArm` writes them.
@@ -9594,6 +9801,7 @@ function intSwitch(b: i32[], ix: i32, p: IntSwitchPlan, tail: boolean) {
   if ibMiss != "" { return 0 }
   const sn: SIntSwitch = {
     isTail: tail,
+    isOut: -1,
     isOn: on,
     isWide: p.ispWide,
     isLo: p.ispLo,
@@ -9863,6 +10071,12 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       irBNode(b, { dpV: v }, -1, ibNoValue, ix)
       return 0
     }
+    if tplStrHoleOf(n, ibFnIx) >= 0 {
+      const hv = tplHoleStr(b, n)
+      if ibMiss != "" { return 0 }
+      irBNode(b, { dpV: hv }, -1, ibNoValue, ix)
+      return 0
+    }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return 0 }
     // A discarded slice is a value legacy evaluates and drops.
@@ -10073,6 +10287,8 @@ function build(fnIx: i32, fnPos: i32): string {
   ibNoValue = if none { ib.irRetRep } else { -1 }
   const pw = buildParams(fn, fnIx, true)
   if pw != "" { return pw }
+  ib.irRetExtra = liftRetExtra(fnPos)
+  if ibMiss != "" { return ibMiss }
   if ibNoValue < 0 { ibNoValue = repNodeOfTy(TY_NEVER) }
   if !repIsNoValue(ibNoValue) { return "no void rep" }
   if fn.fnBody < 0 || fn.fnBody >= P.nodes.length { return "body" }
@@ -10161,7 +10377,12 @@ function declRowParamVarOf(ix: i32): i32 {
   const dn = nodeAt(d)
   if dn is LetDecl {
     const st = irSlotRowTy(ib.irVars[v].vSlot)
-    return if st >= 0 && ib.irVars[v].vTy == st && st != heldTy(scopeTyAt(d, ibFnIx)) { v } else { -1 }
+    if st < 0 || ib.irVars[v].vTy != st { return -1 }
+    if st != heldTy(scopeTyAt(d, ibFnIx)) { return v }
+    // A read typed at a record whose row is not the slot's reads the row the slot is declared at.
+    const t = nodeTyAt(ix, ibFnIx)
+    if t < 0 || t == st || !(repNodeAt(repNodeOfTy(t)) is RRecord) { return -1 }
+    return if repRowOfTyStruct(t, repScanLim()) != repRowOfTyStruct(st, repScanLim()) { v } else { -1 }
   }
   if !(dn is Param) { return -1 }
   const fn = nodeAt(ibFnIx)
@@ -10169,6 +10390,23 @@ function declRowParamVarOf(ix: i32): i32 {
   const i = ib.irVars[v].vSlot - envSlotShift(ibFnIx)
   if i < 0 || i >= fn.fnParams.length { return -1 }
   return if ib.irVars[v].vTy == paramDeclRowTy(fn.fnParams[i]) { v } else { -1 }
+}
+
+// Whether `let` `d` is initialized by a record literal whose own type's row is not the row its
+// slot is declared at, so legacy builds it at the slot's (D16463) and a read may be of that row.
+function letLitUndeclaredRow(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letInit < 0 { return false }
+  const init = unwrapParen(n.letInit)
+  if init < 0 || init >= P.nodes.length || !(nodeAt(init) is ObjLit) {
+    return false
+  }
+  const t = nodeTyAt(init, ibFnIx)
+  const s = declaredSlotOfDecl(d)
+  const st = irSlotRowTy(if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 })
+  if t < 0 || st < 0 { return false }
+  return repRowOfTyStruct(t, repScanLim()) != repRowOfTyStruct(st, repScanLim())
 }
 
 // The type parameter read `ix` is held at where that is legacy's declared row, or -1.
@@ -10714,6 +10952,7 @@ function buildThunk(fe: i32): string {
     caNever: false,
     caEnv: false,
     caCaps: [],
+    caWb: [],
   }
   if repIsNoValue(rr) {
     ib.irRetTy = TY_NEVER
