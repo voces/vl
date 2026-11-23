@@ -71,6 +71,7 @@ import {
 } from "./typeFeatures.ts";
 import type {
   WasmChecker,
+  WasmDefinitionSite,
   WasmExactConstAt,
   WasmImportedSource,
   WasmMemberToken,
@@ -184,9 +185,11 @@ export const wordRangeAt = (text: string, pos: FeaturePosition): LspRange | null
 export type DefinitionTarget = { key?: string; range: LspRange };
 
 /**
- * The declaration the name at `pos` resolves to. An imported name answers with the
- * exporting module's declaration first: `definitionAt` would give that span with no
- * module, and the host would place it in this file.
+ * The declaration the name at `pos` resolves to, as the checker resolved that site:
+ * a method call names the candidate its receiver picked, never the last import of
+ * its spelling. Off any tracked binding (an import specifier, which the parser skips)
+ * an imported name answers with the exporting module's declaration; a member
+ * property names no lexical binding, so it never takes that name-keyed answer.
  */
 export const definitionAt = async (
   text: string,
@@ -194,15 +197,17 @@ export const definitionAt = async (
   ctx: FeatureContext,
 ): Promise<DefinitionTarget | null> => {
   const { checker, entryKey, reader, log } = ctx;
+  const site = await siteAt(text, pos, ctx);
+  if (site) return site.key === entryKey ? { range: site.range } : { key: site.key, range: site.range };
   const word = wordAt(lineAt(text, pos.line), pos.character);
-  if (word && checker.importedNameSources !== undefined) {
+  if (word && !onMemberProperty(text, pos) && checker.importedNameSources !== undefined) {
     const sources = await checker
       .importedNameSources(text, entryKey, reader)
       .catch((err) => {
         log(`[wasm-symbols] importedNameSources failed: ${err}`);
         return {} as Record<string, WasmImportedSource>;
       });
-    const s = sources[word];
+    const s = Object.hasOwn(sources, word) ? sources[word] : undefined;
     if (s) {
       const line = s.line > 0 ? s.line - 1 : 0;
       return {
@@ -224,6 +229,30 @@ export const definitionAt = async (
   return decl ? { range: decl } : null;
 };
 
+// The checker's site-resolved declaration under `pos`, or undefined off any binding.
+const siteAt = async (
+  text: string,
+  pos: FeaturePosition,
+  ctx: FeatureContext,
+): Promise<WasmDefinitionSite | undefined> => {
+  const { checker, entryKey, reader, log } = ctx;
+  if (checker.definitionSiteAt === undefined) return undefined;
+  return await checker
+    .definitionSiteAt(text, entryKey, reader, pos.line, pos.character)
+    .catch((err) => {
+      log(`[wasm-symbols] definitionSiteAt failed: ${err}`);
+      return undefined;
+    });
+};
+
+// Whether the word at `pos` is a member property (`r.f`, `r?.f`), which names no
+// lexical binding, so no name-keyed table may answer for it.
+const onMemberProperty = (text: string, pos: FeaturePosition): boolean => {
+  const line = lineAt(text, pos.line);
+  const span = wordSpan(line, pos.character);
+  return span !== null && /\.\s*$/.test(line.slice(0, span.start));
+};
+
 // ---- find references --------------------------------------------------------
 
 /** One occurrence, in the document `uri`. */
@@ -232,7 +261,8 @@ export type FeatureLocation = { uri: string; range: LspRange };
 /**
  * Every occurrence of the binding at `pos`. The checker answers single-file; on a
  * miss the symbol may be cross-module, and the open buffers plus the capped disk
- * crawl are searched for it. Null when neither finds anything.
+ * crawl are searched for it by name, unless it is a member property, which a name
+ * does not identify. Null when neither finds anything.
  */
 export const referencesAt = async (
   text: string,
@@ -261,7 +291,7 @@ export const referencesAt = async (
     return localRefs.map((range) => ({ uri: workspace.uri, range }));
   }
   const word = wordAt(lineAt(text, pos.line), pos.character);
-  if (!word) return null;
+  if (!word || onMemberProperty(text, pos)) return null;
   const crossRefs = await crossFileReferences(
     word,
     text,
@@ -271,6 +301,7 @@ export const referencesAt = async (
     checker,
     includeDeclaration,
     workspace.diskFiles(),
+    pos,
   );
   return crossRefs ?? null;
 };
@@ -879,6 +910,7 @@ export const codeLensLocationsAt = async (
     ctx.checker,
     true,
     workspace.diskFiles(),
+    { line: data.line, character: data.character },
   ).catch((err) => {
     ctx.log(`[code-lens] reference crawl failed: ${err}`);
     return undefined;
