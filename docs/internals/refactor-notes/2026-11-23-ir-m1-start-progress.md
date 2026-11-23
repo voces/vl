@@ -36,11 +36,13 @@ it as a narrowed read with `ggNn` 0, which the verifier's narrowed arm already a
 
 ## Left in `start: global read coercion`
 
-The remaining shapes are each a consumer's own receiver path, not one mechanism:
+Parked by the coordinator. After this batch, 32 functions remain (25 start, 7 body). Each shape is
+a consumer's own receiver path, not one mechanism:
 
-- `box>record`: a coalesce or member read over a narrowed global, such as `u.r ?? 0` on an
-  `i32 | null` field.
-- `nullable>nullable`
-- `atom>str`
-- `box>box` / `box>nullable`
-- one-offs
+| cell rep > read rep | start | body | what reads it |
+| --- | --- | --- | --- |
+| `box>record` | 9 | 3 | a coalesce or member read over a narrowed global, such as `u.r ?? 0` on an `i32 \| null` field |
+| `nullable>nullable` | 5 | 0 | |
+| `atom>str` | 2 | 3 | |
+| `box>box`, `box>nullable` | 4 | 0 | |
+| one-offs (`i32>closure`, `str>atom`, `record>record`, …) | 5 | 1 | |
