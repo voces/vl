@@ -1599,6 +1599,8 @@ Deno.test({
       "return-not-stored-alike": 2,
       "return-stored-alike": 0,
       "return-stored-unlike": 2,
+      "niche-return-not-stored-alike": 2,
+      "niche-return-stored-alike": 0,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
       "atom-tower-i32-read": 2,
