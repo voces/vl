@@ -380,27 +380,26 @@ Deno.test({
   },
 });
 
-// Outside the set: a `??` over a `null`-typed if-expression and a propagating `as` conversion
+// Outside the set: a `??` over a `null`-typed if-expression and an `as?` over a type parameter
 // each leave their function uncovered, named. A closure parameter, its baked
 // callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // A conversion by a propagating `as`, which returns the function's null on a miss, is outside
-    // the set too.
+    // An `as?` over a type parameter at a pin where it cannot fail, which legacy boxes after the
+    // tag, is outside the set too.
     const src = `function greet(c: boolean): i32 {
   const x = null
   return (if c { x } else { x }) ?? 0
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv(x: f64): i32 | null {
-  const n = x as i32
-  return n
+function cv<T>(u: T): i32 | null {
+  return u as? i32
 }
 print(greet(true))
 print(ap((x: i32) => x + 1))
-print(cv(3.0))
+print(cv(3))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
@@ -1539,6 +1538,8 @@ Deno.test({
       "hand-pick-record-into-i32": 2,
       "init-progress-as-value": 2,
       "init-progress-effect": 0,
+      "literal-cast-of-record": 2,
+      "literal-cast-of-i32": 0,
       "retag-closures-of-differing-arity": 2,
       "retag-closures-of-differing-arity-noted": 0,
       "retag-field-alike-records-two-heaps": 2,
