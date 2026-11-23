@@ -1,3 +1,4 @@
+import { recFieldTyOf } from "./emit_rec_field_codes"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import { nulAtomWidenTexts } from "./emit_lit_atoms"
 import {
@@ -18,7 +19,12 @@ import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleFe, monoBundleReadFe } from "./emit_mono"
-import { repElemTyOfName, slotRowTyOf } from "./emit_rep"
+import {
+  repElemTyOfName,
+  repRecordFieldNames,
+  slotRowTyOf,
+  tyDenotesFunc,
+} from "./emit_rep"
 import {
   asInstMissNullOwn,
   holeOptBoxScalarTy,
@@ -490,7 +496,12 @@ import {
   spreadPairKnown,
   spreadPlanOf,
 } from "./emit_plan_list"
-import { annTyOf, mvValVariantOf, rlElemVariantRow } from "./emit_shape_rows"
+import {
+  annTyOf,
+  mvValVariantOf,
+  rlElemVariantRow,
+  structRowFieldStoresAtom,
+} from "./emit_shape_rows"
 import { mvValTyIxAt } from "./emit_map_value_slots"
 import {
   BinNulTest,
@@ -784,7 +795,11 @@ import {
 } from "./emit_bignum"
 import { isVoidTy, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
-import { optChainStagesRecv, structIndexOfTy } from "./emit_atom_kinds"
+import {
+  optChainStagesRecv,
+  sFieldTgtStructIdx,
+  structIndexOfTy,
+} from "./emit_atom_kinds"
 import { recordHeapOfTy } from "./emit_shape_intern"
 import { RC_MAP, RC_REF_LIST, letBindingUnionTy } from "./emit_start_block"
 import {
@@ -1612,7 +1627,7 @@ function objLit(b: i32[], ix: i32, rep: i32): Opnd {
       return objLitAt(b, ix, cr, ct, built, false)
     }
     const rt = if row >= 0 && row < sTyIx.length { sTyIx[row] } else { -1 }
-    const rr = if rt >= 0 && !irTyOpen(rt) { repNodeOfTy(rt) } else { -1 }
+    const rr = if rt >= 0 && rowTyBuildsAt(rt, row) { repNodeOfTy(rt) } else { -1 }
     if rr >= 0 && rr != rep && repNodeAt(rr) is RRecord {
       return objLitAt(b, ix, rr, rt, row, false)
     }
@@ -1680,6 +1695,53 @@ function recordPartTy(ty: i32): i32 {
   const r = repNodeOfTy(ty)
   const n = repNodeAt(r)
   return if n is RNullable && refNullable(r) { repTyOf(n.rnInner) } else { ty }
+}
+
+// Whether struct row `row`'s recorded type `rt` closes at its rep: closed, or open only in function
+// fields of a tagged set the row stores as the set's i32 id (`structRowFieldStoresAtom`), directly
+// or in a nested record field's own row (`sFieldTgtStructIdx`).
+function rowTyBuildsAt(rt: i32, row: i32): boolean {
+  return rowTyBuildsAtGo(rt, row, [])
+}
+
+// `rowTyBuildsAt` below the rows `seen` on the path; a row met again answers no.
+function rowTyBuildsAtGo(rt: i32, row: i32, seen: i32[]): boolean {
+  if !irTyOpen(rt) { return true }
+  const rr = repNodeOfTy(rt)
+  if row < 0 || irTyHeldOpen(rt, rr) || !(repNodeAt(rr) is RRecord) {
+    return false
+  }
+  for r in seen {
+    if r == row { return false }
+  }
+  // The type holds a tagged set as its id where a row may still store it as a closure, so each
+  // open field asks the row's own storage.
+  seen.push(row)
+  for name in repRecordFieldNames(rr) {
+    const ft = recFieldTyOf(rt, name)
+    if irTyOpen(ft) && !openFieldStoredAsIds(ft, row, name, seen) {
+      return false
+    }
+  }
+  return true
+}
+
+// Whether open field `name` of type `ft` in struct row `row` is stored closed: a tagged set, which
+// the rep tree reps as its i32 id, stored as plain i32, or a nested record whose own row stores
+// its open parts so.
+function openFieldStoredAsIds(
+  ft: i32,
+  row: i32,
+  name: string,
+  seen: i32[],
+): boolean {
+  if tyDenotesFunc(ft) {
+    return repPrim(repNodeOfTy(ft)) == "i32"
+      && structRowFieldStoresAtom(row, name) == 1
+  }
+  if !(repNodeAt(repNodeOfTy(ft)) is RRecord) { return false }
+  const fi = sFieldIndex(row, name)
+  return fi >= 0 && rowTyBuildsAtGo(ft, sFieldTgtStructIdx(row, fi), seen)
 }
 
 // `objLit` at type `ty`, or, where `at` is not -1, built at the row its destination builds it at:
@@ -1888,8 +1950,9 @@ function objLitAt(
     return irBLetTemp(b, rhs, ix, rep)
   }
   // Built at a destination's row, or at the storage row of a type no row records
-  // (`rowlessRecordTy`), the record is that row's type, not the literal's own.
-  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // (`rowlessRecordTy`), the record is that row's type, not the literal's own. A type open only in
+  // parts held as ids (a tagged function set's i32) is closed at its rep.
+  if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "temp", -1)
   irBNode(b, { lDst: t, lRhs: rhs }, ty, rep, ix)
   const o: Opnd = { ov: t }
