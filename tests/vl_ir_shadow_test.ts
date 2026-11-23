@@ -1569,6 +1569,8 @@ Deno.test({
       "niche-read-of-i32": 2,
       "arm-unbox-of-i32": 2,
       "box-list-retag-into-i32-list": 2,
+      "list-of-lists-retag-into-nullable-lists": 0,
+      "list-of-lists-retag-into-other-lists": 2,
       "box-list-retag-into-niche-record-list": 2,
       "num-union-conversion-of-non-box": 2,
       "num-union-conversion-off-result-kind": 2,
