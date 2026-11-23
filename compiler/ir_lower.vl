@@ -137,6 +137,7 @@ import {
   RCoerce,
   REnvDrop,
   REnvGet,
+  REqHelp,
   RFieldNull,
   RFnId,
   RGetField,
@@ -378,7 +379,7 @@ import {
   coalNulRefOpen,
   coalNulRefPlanOf,
   elseLessUnionIfWhy,
-  emitArmUnboxAt,
+  emitArmUnboxAtCell,
   emitAsUnionTagged,
   emitCapturedRead,
   emitCloCellRef,
@@ -403,6 +404,7 @@ import {
   emitUnionNullToPair,
   emitUnionUnboxTail,
   envCacheSlotOfFe,
+  eqHelpTail,
   f64RemCallTail,
   f64RemOperandTail,
   fieldStoreArmOf,
@@ -654,6 +656,7 @@ import {
   variantFieldLitLexes,
 } from "./emit_map_twins"
 import {
+  arrLitUnionLongSlot,
   atomFoldSideTail,
   atomFoldTail,
   atomHookArmOf,
@@ -662,6 +665,7 @@ import {
   coalFieldBoxOpen,
   coalFieldPlanOf,
   coalFieldRead,
+  coalFieldRecvStash,
   coalFieldUnbox,
   coalFieldValOpen,
   coalNulBoolJoinOpen,
@@ -810,6 +814,8 @@ let lwRowTo: i32[] = []
 let lwRowKind: i32[] = []
 // Where each node an element read's row opens at began, in the buffer (`irRowOpens`).
 let lwRowOpenAt: {[i32]: i32} = Map()
+// The row-opening node a pending temp's definition is, by temp: its row opens where it is written.
+let lwRowOpenTemp: {[i32]: i32} = Map()
 
 export function irLMiss(why: string) {
   if lwMiss == "" { lwMiss = why }
@@ -880,6 +886,7 @@ export function irLOpnd(o: Opnd) {
       if isTemp(v) {
         if !tempDefined(v) { return irLMiss("temp used before its definition") }
         if !takeUse(v) { return irLMiss("non-stack temp: used twice") }
+        tempOpenNote(v)
         rhs(tempRhs(v), false)
         lwSeq.push(v)
         return 0
@@ -1143,6 +1150,7 @@ function rhs(r: Rhs, tail: boolean) {
       RMapFilter |
       RStrOp => irLowerListHook(r)
     RStructEq => structEq(r)
+    REqHelp => eqHelp(r)
     RListClear => irLMiss("clear value")
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
@@ -2292,10 +2300,12 @@ function nicheRead(r: RNicheRead) {
   return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
 }
 
-// `RArmUnbox`: the box, then the table's cast to the read's arm record (`emitArmUnboxAt`).
+// `RArmUnbox`: the box, then the table's cast to the read's arm record (`emitArmUnboxAtCell`).
 function armUnbox(r: RArmUnbox) {
   irLOpnd(r.uaV)
-  if emitArmUnboxAt(r.uaAt, lw.irAt) < 0 { return irLMiss("arm unbox heap") }
+  if emitArmUnboxAtCell(r.uaAt, lw.irAt, r.uaCellNul) < 0 {
+    return irLMiss("arm unbox heap")
+  }
   return 0
 }
 
@@ -2548,10 +2558,11 @@ function makeList(r: RMakeList) {
   for e in r.mlElems { irLOpnd(e) }
   if arm == "ref" {
     const sl = arrLitRefShortSlot(r.mlAt, fnIx, lb)
-    return arrLitRefShortTail(
-      if sl >= 0 { sl } else { arrLitVariantSlot(r.mlAt, fnIx, lb) },
-      r.mlElems.length,
-    )
+    const vl = if sl >= 0 { sl } else { arrLitVariantSlot(r.mlAt, fnIx, lb) }
+    const a = nodeAt(r.mlAt)
+    const ul = if vl < 0 && a is ArrayLit { arrLitUnionLongSlot(r.mlAt, a.arrElems, fnIx, lb) } else { -1 }
+    if vl < 0 && ul < 0 { return irLMiss("ref list slot") }
+    return arrLitRefShortTail(if vl >= 0 { vl } else { ul }, r.mlElems.length)
   }
   if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
@@ -3425,6 +3436,21 @@ function structEq(r: RStructEq) {
   return 0
 }
 
+// `REqHelp`: `__eq_<row>__`'s compare, which reads its operands at their parameter slots.
+function eqHelp(r: REqHelp) {
+  if !paramAtSlot(r.ehL, 0) || !paramAtSlot(r.ehR, 1) {
+    return irLMiss("compare helper operands")
+  }
+  return eqHelpTail(r.ehRow)
+}
+
+// Whether `o` is the function's parameter at wasm slot `slot`.
+function paramAtSlot(o: Opnd, slot: i32): boolean {
+  if !(o is OVar) || o.ov < 0 || o.ov >= lw.irVars.length { return false }
+  const v = lw.irVars[o.ov]
+  return v.vKind == "param" && v.vSlot == slot
+}
+
 // Banks the element-read rows a record compare's `elem` roots wrote (node, from, to), ordered by
 // where each starts.
 function structEqRowsBank(lRows: i32[], rRows: i32[]) {
@@ -3847,6 +3873,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       if n.lDst >= lwTempRhs.length { return irLMiss("let of a non-temp") }
       lwTempRhs[n.lDst] = n.lRhs
       lwTempDef[n.lDst] = true
+      tempOpenMark(id, n.lDst)
       pending.push(n.lDst)
       // A push is consumed through `lwPushed`, not the pending order of the next node.
       const r = n.lRhs
@@ -4293,6 +4320,7 @@ function liveCountIn(vs: i32[]): i32 {
 function stageRoot(v: i32) {
   // It lands above the roots staged before it, as legacy writes the operands in turn.
   lwPushing = true
+  tempOpenNote(v)
   rhs(lwTempRhs[v], false)
   lwPushing = false
   return livePush(v)
@@ -4368,6 +4396,8 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
   }
   const roots = stageLead(n.siCond, pending)
   if lwMiss != "" { return IF_DONE }
+  // A row this `if` opens starts above the earlier operands staged below it (`emitIndexBanked`).
+  rowOpenNote(id)
   joinBoxHead(t, true)
   // The condition is written before the `if` opens and may read values already on the stack;
   // the `if` itself reads none of the values beneath it.
@@ -4462,14 +4492,23 @@ function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if p.cfArm != (if boxed { "boxed" } else { "unbox" }) {
     return irLMiss("coalesce field plan")
   }
+  // A receiver legacy keeps in its stash is teed there and read back (`coalFieldRecvStash`).
+  const m = nodeAt(unwrapParen(e.binLeft))
+  if !(m is Member) { return irLMiss("coalesce field node") }
+  const st = coalFieldRecvStash(m.memObj, p)
   cond(n.cbL, pending)
   coalArmRecvCast(p.cfCast)
+  if st >= 0 { fbLocalTee(st) }
   if boxed { coalFieldBoxOpen(p) } else { coalFieldValOpen(p) }
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   fbElse()
-  if recvAgain(n.cbL, e.binLeft) < 0 { return -1 }
-  coalArmRecvCast(p.cfCast)
+  if st >= 0 {
+    fbLocalGet(st)
+  } else {
+    if recvAgain(n.cbL, e.binLeft) < 0 { return -1 }
+    coalArmRecvCast(p.cfCast)
+  }
   if boxed { coalFieldRead(p) }
   else if coalFieldUnbox(p) < 0 { return -1 }
   lwFrames.pop()
@@ -4901,6 +4940,20 @@ function rowOpenNote(id: i32) {
   return 0
 }
 
+// Marks temp `v` as the row node `id` opens, when it opens one, so `tempOpenNote` re-notes it.
+function tempOpenMark(id: i32, v: i32) {
+  if lw.irHasRowOpens && lw.irRowOpens.has(id) { lwRowOpenTemp[v] = id }
+  return 0
+}
+
+// Re-notes the row a pending temp `v` opens where its definition is written, as legacy's row
+// starts at the receiver's first byte, after any earlier operand staged below it.
+function tempOpenNote(v: i32) {
+  const id = lwRowOpenTemp[v] ?? -1
+  if id >= 0 { lwRowOpenAt[id] = curLen() }
+  return 0
+}
+
 // Where element read `ix`'s row starts: where its receiver's opening statement began, else `from`.
 export function irLIndexFrom(ix: i32, from: i32): i32 {
   const id = lw.irIdxRowAt[ix] ?? -1
@@ -5073,6 +5126,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwRowTo = []
   lwRowKind = []
   lwRowOpenAt = Map()
+  lwRowOpenTemp = Map()
   lwBuf = buf
   lwSinkFired = 0
   lwPushed = []
@@ -5102,6 +5156,7 @@ type LwFrame = {
   lfRowTo: i32[],
   lfRowKind: i32[],
   lfRowOpenAt: {[i32]: i32},
+  lfRowOpenTemp: {[i32]: i32},
   lfBuf: u8[],
   lfSinkFired: i32,
   lfPushed: i32[],
@@ -5130,6 +5185,7 @@ function lwSave(): LwFrame {
     lfRowTo: lwRowTo,
     lfRowKind: lwRowKind,
     lfRowOpenAt: lwRowOpenAt,
+    lfRowOpenTemp: lwRowOpenTemp,
     lfBuf: lwBuf,
     lfSinkFired: lwSinkFired,
     lfPushed: lwPushed,
@@ -5159,6 +5215,7 @@ function lwRestore(f: LwFrame) {
   lwRowTo = f.lfRowTo
   lwRowKind = f.lfRowKind
   lwRowOpenAt = f.lfRowOpenAt
+  lwRowOpenTemp = f.lfRowOpenTemp
   lwBuf = f.lfBuf
   lwSinkFired = f.lfSinkFired
   lwPushed = f.lfPushed
@@ -5312,6 +5369,37 @@ export function irLowerProbe(f: IrFn, ctx: GlobalCtx): u8[] {
   fbResetLazyFrame()
   if lwMiss != "" { return [] }
   return got
+}
+
+// Lowers the compare helper `f` onto `out` in the frame `eqHelpFnCode` opened, its locals vector
+// that frame's, as legacy's helper writes it. "" when written, else the miss, with nothing written
+// and the lazy frame left empty for legacy.
+export function irLowerEqHelper(f: IrFn, out: u8[]): string {
+  // The lazy frame grows from empty, as `fbBeginFunc` left it; the shadow's follows legacy's.
+  fbResetLazyFrame()
+  lowerBody(f, lwGlobalCtx)
+  if lwPushed.length > 0 { irLMiss("push never consumed") }
+  if lwMiss != "" {
+    fbResetLazyFrame()
+    return lwMiss
+  }
+  const locals: u8[] = []
+  fbEmitLocalsVec(locals, 0)
+  const p = wTarget(out)
+  wBytes(framed(locals))
+  wTarget(p)
+  return ""
+}
+
+// `irLowerEqHelper` for the shadow, before legacy writes the helper: the callees it notes are
+// taken back and the lazy frame is left empty again, so legacy writes from the state it would
+// have had unarmed.
+export function irShadowLowerEqHelper(f: IrFn, out: u8[]): string {
+  const callees0 = dfeCallee.length
+  const why = irLowerEqHelper(f, out)
+  while dfeCallee.length > callees0 { dfeCallee.pop() }
+  fbResetLazyFrame()
+  return why
 }
 
 // Lowers runtime helper `f` onto `out`: its locals are its `local` variables, one per slot after
