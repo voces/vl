@@ -10851,9 +10851,9 @@ function emitUnionConcreteEq(
   const eqOnce = !unionEqOperandOk(boxIx)
   // A `K | null` operand equals the box's null when it is `-1`, and is a member string
   // otherwise, where the widened operand is non-null (D3347).
-  const nulOther = eak == 2
-    && exprNulLitUnion(otherIx, fnIx)
-    && unionEqOperandOk(otherIx)
+  const nulOther = eak == 2 && exprNulLitUnion(otherIx, fnIx)
+  // A `K | null` operand that is no place is read once, as its id, into its own slot (D17066).
+  const atomStage = nulOther && !unionEqOperandOk(otherIx)
   // A nullable string at the instance (`T` pinned to `string | null`) equals the box's null when
   // it is null, read raw for the test; present, it compares as the string below.
   const nulStrOperand = eak == 2
@@ -10863,17 +10863,6 @@ function emitUnionConcreteEq(
   // A nullable string operand that is no place is read once, into its own slot (`opStage`).
   const opStage = nulStrOperand && !unionEqOperandOk(otherIx)
   const nulStrOther = nulStrOperand
-  if (
-    eak == 2
-    && !nulOther
-    && !nulStrOther
-    && (exprNulLitUnion(otherIx, fnIx)
-      || tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx)))
-  ) {
-    return emitFail(
-      "emitProgram: a union `==` against a `K | null` atom operand that is no place is not supported yet",
-    )
-  }
   // The `boolean | null` niche's null is the value 2 (D2260); an operand that is no place is
   // read once, into its own slot (`boolStage`).
   const nulBoolOther = eak == 1
@@ -10891,7 +10880,7 @@ function emitUnionConcreteEq(
   const bs = if staged { unionEqOperandSlot(lvl + 6) } else { -1 }
   unionEqStageDepth = unionEqStageDepth + 1
   // An operand left of a staged box is read first, into its slot (D17068).
-  const opFirst = !boxLeft && staged && (opStage || boolStage)
+  const opFirst = !boxLeft && staged && (opStage || boolStage || atomStage)
   if opFirst {
     if emitExpr(otherIx, fnIx) < 0 { return -1 }
     fbLocalSet(unionEqOperandSlot(lvl + (if opStage { 0 } else { 1 })))
@@ -10901,7 +10890,9 @@ function emitUnionConcreteEq(
     fbLocalSet(bs)
   }
   if nulOther {
-    if emitExpr(otherIx, fnIx) < 0 { return -1 }
+    if opFirst { fbLocalGet(unionEqOperandSlot(lvl + 1)) }
+    else if emitExpr(otherIx, fnIx) < 0 { return -1 }
+    if atomStage && !opFirst { fbLocalTee(unionEqOperandSlot(lvl + 1)) }
     fbI32Const(-1)
     fbI32Bin(70)
     fbIf(127)
@@ -10942,9 +10933,18 @@ function emitUnionConcreteEq(
   if staged { fbLocalGet(bs) }
   else if emitExpr(boxIx, fnIx) < 0 { return -1 }
   if unionEqPayloadTail(qt) < 0 { return -1 }
-  if opStage { fbLocalGet(unionEqOperandSlot(lvl)) }
-  else if boolStage { fbLocalGet(unionEqOperandSlot(lvl + 1)) }
-  else if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
+  if opStage {
+    fbLocalGet(unionEqOperandSlot(lvl))
+  } else if boolStage {
+    fbLocalGet(unionEqOperandSlot(lvl + 1))
+  } else if atomStage {
+    fbLocalGet(unionEqOperandSlot(lvl + 1))
+    if atomStrTail(atomStrPlanOf(otherIx, fnIx, otherIx == coerceHeld)) < 0 {
+      return -1
+    }
+  } else if emitUnionEqOther(otherIx, eak, fnIx) < 0 {
+    return -1
+  }
   // The null took the other branch, so a nullable operand is the non-null ref here.
   if (
     nulOther
