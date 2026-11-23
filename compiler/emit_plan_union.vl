@@ -152,6 +152,7 @@ import {
   exprStruct,
   exprU8Array,
   exprUnion,
+  exprValueTyAt,
   exprVariantIndex,
   identCellVKind,
   identReadAtomKindAt,
@@ -1678,13 +1679,14 @@ export function memReadArmOf(memIx: i32, fnIx: i32): MemReadArm {
   return if nulVariantIdxOfExpr(m.memObj, fnIx) >= 0 { "nulVariant" } else { "shared" }
 }
 
-// The variant field `emitExpr` reads off a narrowed box local in `emitNarrowedMem`'s plain form,
-// or -1: no null-unit or niche read, no `length`, a box receiver read raw. A union-box field's
-// unbox is `narrowedMemTail`'s, at the rep `unionFieldNarrowUnboxOf` decides.
+// The variant field `emitExpr` reads off a narrowed box local or field in `emitNarrowedMem`'s
+// plain form, or -1: no null-unit or niche read, no `length`, a box receiver read raw. A union-box
+// field's unbox is `narrowedMemTail`'s, at the rep `unionFieldNarrowUnboxOf` decides.
 export function narrowedFieldPlain(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
   if !memberReadPlain(memIx, fnIx) || !(m is Member) { return -1 }
-  if !(nodeAt(m.memObj) is Ident) || memReadArmOf(memIx, fnIx) != "narrowed" {
+  const o = nodeAt(m.memObj)
+  if !(o is Ident || o is Member) || memReadArmOf(memIx, fnIx) != "narrowed" {
     return -1
   }
   const vi = memNarrowVariantIndex(memIx, fnIx)
@@ -3112,6 +3114,14 @@ function widenPlan(arm: WidenArm, src: i32, wide: string): WidenPlan {
 // classifier may mint on its first ask, so none is asked that the order does not reach.
 export function widenPlanOf(ix: i32, dst: i32, fnIx: i32): WidenPlan {
   const inner = unwrapParen(ix)
+  // An operator over a `never` operand computes at its other operand's width (D17064).
+  if inner >= 0 && inner < P.nodes.length && nodeTyAt(inner, fnIx) == TY_NEVER {
+    const nb = nodeAt(inner)
+    const nw = if nb is BinExpr { neverBinWidth(nb, fnIx) } else { "" }
+    if nw == "i64" { return widenPlan("plain", 3, "") }
+    if nw == "f64" { return widenPlan("plain", 4, "") }
+    if nw == "f32" { return widenPlan("plain", 5, "") }
+  }
   const instLit = cexLitPeel(ix) >= 0 && fnInPinnedInstance(fnIx)
   if instLit && dst != 4 { return widenPlan("instLit", -1, "") }
   if dst == 5 && cexLitPeel(ix) >= 0 && isFloatLitExpr(inner) {
@@ -4000,4 +4010,14 @@ export function arrLitVariantSlot(arrIx: i32, fnIx: i32, lb: ListBuild): i32 {
     }
   }
   return rslot
+}
+
+// The scalar width an operator with one `never` operand works at: the other operand's prim, or ""
+// where neither or both are `never` (D17064).
+export function neverBinWidth(e: BinExpr, fnIx: i32): string {
+  const lt = exprValueTyAt(e.binLeft, fnIx)
+  const rt = exprValueTyAt(e.binRight, fnIx)
+  const one = if lt == TY_NEVER { rt } else if rt == TY_NEVER { lt } else { -1 }
+  if one < 0 || one == TY_NEVER { return "" }
+  return tyScalarBasePrim(one) ?? ""
 }

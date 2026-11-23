@@ -183,6 +183,26 @@ Deno.test({
   },
 });
 
+// A thunk whose target's result type is open is typed by its rep's own type where that is closed
+// and round-trips to the rep (`thunkRetTy`), and matches; where it does not, it stays uncovered.
+Deno.test({
+  name: "ir shadow: a thunk's open result type stands as its rep's own only where that round-trips",
+  ignore,
+  fn: () => {
+    const fits = `export function id<T>(x: T): T { return x }\nconst k = () => id\nprint(k()(9))\n`;
+    const ok = run(fits, true);
+    if (ok.rows.get("thunk fns") !== 1 || ok.rows.get("thunk matched") !== 1) {
+      throw new Error(`want the thunk matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const open = `function inc(x) { return x + 1 }\nfunction run(f) { return f()(41) }\n` +
+      `print(run(() => inc) + run(() => inc))\n`;
+    const { rows } = run(open, true);
+    if (rows.get("thunk uncovered thunk open result type") !== 2) {
+      throw new Error(`want two thunks uncovered on their open result type, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A folded constant's cell is its folded value, the one `*.const` legacy's `emitConstFoldValue`
 // writes, at both integer widths; under the dual emit's control 3 each is a bytes mismatch.
 Deno.test({
@@ -537,16 +557,16 @@ Deno.test({
   },
 });
 
-// A code-point list that is no local is legacy's spill through a scratch slot: a named miss,
-// never a byte mismatch.
+// A code-point list that is no local is legacy's spill through a scratch slot, read once into
+// it (`fcpSpillTail`): covered and matched.
 Deno.test({
-  name: "ir shadow: a spilled code-point list is a named miss",
+  name: "ir shadow: a spilled code-point list is read once into its spill slot",
   ignore,
   fn: () => {
     const src = `function sp(n: i32): string { return fromCodePoints([n, 33]) }\nprint(sp(111))\n`;
     const { rows } = run(src, true);
-    if (rows.get("uncovered code point list spill") !== 1) {
-      throw new Error(`want one "uncovered code point list spill" row, got ${JSON.stringify([...rows])}`);
+    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
+      throw new Error(`want the spill covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -1536,6 +1556,9 @@ Deno.test({
       "width-retag-pair-unnoted": 2,
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
+      "rep-typed-thunk-forwards": 0,
+      "rep-typed-thunk-forwards-env": 1,
+      "rep-typed-result-not-thunk": 1,
       "init-progress-as-value": 2,
       "init-progress-effect": 0,
       "literal-cast-of-record": 2,
@@ -1593,6 +1616,9 @@ Deno.test({
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
     // A fit tail that misses leaves legacy's receiver read in place (`fitRecvReadHook`).
     if (exp.irFitTailSelfTest() !== 1) throw new Error("want the fit hook restored after a miss");
+    // Each kind legacy's descriptor names alone maps to a type that describes back at that kind.
+    const rd = exp.repDescSelfTest();
+    if (rd !== 0) throw new Error(`want every descriptor kind to round-trip, got kind ${rd} off`);
   },
 });
 
@@ -1629,34 +1655,19 @@ print(two(true))
   },
 });
 
-// `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
-// bound to a literal delivered to an atom (a record copy re-read per field builds, as
-// `RRecCopyPure`: `record-copy-into-wider-row.vl`). Each program is the smallest the corpus has.
-const PRE_PATHS: [string, string][] = [
-  [
-    "atom hook",
-    `const JX = "x"\nconst B: "y" = "y"\nfunction join(c: boolean) {\n  const M: "x" | "y" | "z" = if c { JX } else { B }\n  return M == "z"\n}\nprint(join(true))\n`,
-  ],
-];
+// A join of an atom binding whose arms are a literal-bound const and a one-literal const, which the
+// atom hook writes at the destination (`emitIfExprAs`): covered and matched.
 Deno.test({
-  name:
-    "ir shadow: a node emitExpr takes a generic pre-path for is a named miss",
+  name: "ir shadow: a join the atom hook writes at its destination is built and matched",
   ignore,
   fn: () => {
-    for (const [why, src] of PRE_PATHS) {
-      const { rc, rows } = run(src, true);
-      if (rc !== 0) throw new Error(`${why}: want compileSrc rc 0, got ${rc}`);
-      const fails = failures(rows);
-      if (fails.length > 0) {
-        throw new Error(`${why}: want no failure, got:\n${fails.join("\n")}`);
-      }
-      if (!rows.has(`uncovered pre-path ${why}`)) {
-        throw new Error(
-          `${why}: want an "uncovered pre-path ${why}" row, got ${
-            JSON.stringify([...rows])
-          }`,
-        );
-      }
+    const src = `const JX = "x"\nconst B: "y" = "y"\nfunction join(c: boolean) {\n  const M: "x" | "y" | "z" = if c { JX } else { B }\n  return M == "z"\n}\nprint(join(true))\n`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
+      throw new Error(`want the join covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
