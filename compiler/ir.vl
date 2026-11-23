@@ -167,13 +167,15 @@ export type RStashSet = {
 }
 // A field read at node `gfAt`, kid `gfIx` of `gfV`'s record; `gfStored` where the builder built it
 // at its storage (an `is` receiver's), so it is lowered under the same mark; `gfStr` where a
-// union-box field's unbox leaves the string a literal-union member is boxed as.
+// union-box field's unbox leaves the string a literal-union member is boxed as; `gfShared` where
+// `gfAt` is a generic's shared template node no instance typed, read at the field's own storage.
 export type RGetField = {
   gfV: Opnd,
   gfIx: i32,
   gfAt: i32,
   gfStored: boolean,
   gfStr: boolean,
+  gfShared: boolean,
 }
 // A list literal at node `mlAt` of elements `mlElems`, built under the list build (`mlKind`,
 // `mlSlot`) its delivery threaded, by legacy's short tail at the arm the builder asked (`mlArm`).
@@ -236,6 +238,9 @@ export type RListLen = { llV: Opnd, llAt: i32 }
 // `nwV`, of number kind `nwSrc`, widened to kind `nwDst` at delivery node `nwAt` (kinds as
 // `widenPlanOf` names them: 1 i32, 3 i64, 4 f64, 5 f32); 3 to 1 is a shift-mask fold's wrap.
 export type RNumWiden = { nwV: Opnd, nwSrc: i32, nwDst: i32, nwAt: i32 }
+// A standalone `?.` at node `orAt` over the chain base `orV`, read twice: its null test and leaf
+// head, then the base as non-null and the leaf's tail, as `emitOptMemberValueGo` writes them.
+export type ROptRead = { orV: Opnd, orAt: i32 }
 // A numeric `as` at cast node `ncAt` over operand `ncV`, built at the kind `numCastKindOf`
 // names; legacy's `numCastTail` writes the conversion, and an `as!`'s test and trap.
 export type RNumCast = { ncV: Opnd, ncAt: i32 }
@@ -308,6 +313,9 @@ export type PStaged = { pstNode: i32 }
 export type PushRecv = OVar | OImm | OStr | PStaged
 // A one-argument `.push` of `lpX` onto list `lpV`, its call `lpAt`; as a value, the new length.
 export type RListPush = { lpV: PushRecv, lpX: Opnd, lpAt: i32 }
+// A variadic `.push` (several arguments, or a spread) onto list `pmV`, its call `pmAt`: the run
+// `pmL`, legacy's own literal of the arguments, appended in bulk; as a value, the new length.
+export type RListPushMany = { pmV: Opnd, pmL: Opnd, pmAt: i32 }
 // The receiver `rsgV` of push call `rsgAt`, staged into that push's frame slot ahead of a value
 // that writes a valued `if`; a statement, named by exactly one later push.
 export type RListStage = { rsgV: Opnd, rsgAt: i32 }
@@ -531,6 +539,7 @@ export type Rhs = RArmUnbox
   | RListNewDefault
   | RListPop
   | RListPush
+  | RListPushMany
   | RListSlice
   | RListStage
   | RLitArms
@@ -558,6 +567,7 @@ export type Rhs = RArmUnbox
   | RNumUnionBin
   | RNumUnionConvert
   | RNumWiden
+  | ROptRead
   | RPrimOp
   | RPrint
   | RRawOp
@@ -793,6 +803,16 @@ export type IrFn = {
   irRecHeap: {[i32]: i32},
   // The storage-row type (`letBindTy`) of each global the builder reads or stores at that row.
   irGlobalStoreTy: {[i32]: i32},
+  // Facts the builder notes for the verifier by node (`irNoteVerifyFacts`): the checked type of a
+  // global or field read's node, and an int a node's own check reads (see `irFactIntOf`).
+  irFactTy: {[i32]: i32},
+  irFactInt: {[i32]: i32},
+  // A record's site type per layout position, by node (legacy's field box type at its built row).
+  irFactKidTy: {[i32]: i32[]},
+  // The valtype bytes legacy writes a rep at, for each rep the verifier compares stored alike, and
+  // whether each open-typed variable's open parts are functions held at a fixed rep.
+  irRepValtype: {[i32]: u8[]},
+  irVarHeldIds: {[i32]: boolean},
   // The globals whose cell holds the record a holding binding holds whole, noted at that record's
   // rep: a read of one at that rep is at its storage.
   irGlobalHeld: {[i32]: boolean},
@@ -889,6 +909,11 @@ export function irFnNew(at: i32, name: string): IrFn {
     irGlobalAt: Map(),
     irRecHeap: Map(),
     irGlobalStoreTy: Map(),
+    irFactTy: Map(),
+    irFactInt: Map(),
+    irFactKidTy: Map(),
+    irRepValtype: Map(),
+    irVarHeldIds: Map(),
     irGlobalHeld: Map(),
     irEndPad: "",
     irRecSub: [],
@@ -1014,6 +1039,21 @@ export function irGlobalStoreTyOf(f: IrFn, sym: i32): i32 {
 export function irGlobalStoreNote(f: IrFn, sym: i32, ty: i32) {
   f.irGlobalStoreTy[sym] = ty
   return 0
+}
+
+// The checked type the builder noted for node `i`'s read, or -1.
+export function irFactTyOf(f: IrFn, i: i32): i32 { return f.irFactTy[i] ?? -1 }
+
+// The int the builder noted for node `i`, else `d`: a memory op's void (1) or value (0), a literal
+// arms test's read count, a narrowed map read's unbox (1) or not (0), and a `null`'s kind (1 the
+// null box, 0 the bottom ref, 2 another).
+export function irFactIntOf(f: IrFn, i: i32, d: i32): i32 {
+  return f.irFactInt[i] ?? d
+}
+
+// The site types the builder noted per layout position for record node `i`, or none.
+export function irFactKidTyOf(f: IrFn, i: i32): i32[] {
+  return f.irFactKidTy[i] ?? []
 }
 
 // Records global `sym`'s rep once.
@@ -1332,6 +1372,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListGet => [r.lgV, r.lgIx]
     RListLen => [r.llV]
     RListPush => pushOpnds(r)
+    RListPushMany => [r.pmV, r.pmL]
     RListStage => [r.rsgV]
     RListPop => [r.lqV]
     RListClear => [r.lkV]
@@ -1348,6 +1389,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RStrOp => r.soArgs
     RStructEq => opndsCat([r.seL, r.seR], opndsCat(r.seLIx, r.seRIx))
     RNumWiden => [r.nwV]
+    ROptRead => [r.orV]
     RNumCast => [r.ncV]
     RNumIntr => r.nxArgs
     RNumUnionBin => r.nbArgs
@@ -1441,12 +1483,14 @@ function rhsText(r: Rhs): string {
     RListGet => "get " + opndText(r.lgV) + "[" + opndText(r.lgIx) + "]"
     RListLen => "len " + opndText(r.llV)
     RListPush => "push " + pushRecvText(r.lpV) + " " + opndText(r.lpX)
+    RListPushMany => "push_many " + opndText(r.pmV) + " " + opndText(r.pmL)
     RListStage => "stage_recv " + opndText(r.rsgV)
     RListPop => "pop " + opndText(r.lqV)
     RListClear => "clear " + opndText(r.lkV)
     RMapFilter => "mapfilter " + opndText(r.hfV) + ", " + opndText(r.hfC)
     RListSlice => "slice " + opndText(r.scV) + ", " + opndsText(r.scArgs)
     RNumWiden => "widen " + opndText(r.nwV)
+    ROptRead => "opt_read " + opndText(r.orV)
     RNumCast => "cast " + opndText(r.ncV)
     RToBox => "box " + opndText(r.bxV)
     RAtomStr => "atomstr " + opndText(r.sxV)
@@ -1812,6 +1856,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RListNewDefault |
       RListPop |
       RListPush |
+      RListPushMany |
       RListSlice |
       RListStage |
       RMakeList |
@@ -1837,6 +1882,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RFieldNull |
       RGetField |
       RMakeRec |
+      ROptRead |
       RRecCopyPure |
       RStashSet => "record"
     RBundlePick |
