@@ -1,0 +1,161 @@
+// @run
+// @log u16 0 1 127 128 254 255 9 10
+// @log u16 200 201 202 203 252 253 254 255
+// @log i32 0 1 32767 32768
+// @log i32 65534 65535 7 40000
+// @log i32 0 1 32767 -32768
+// @log i32 -2 -1 7 -25536
+// @log u16 510 510 510 510 510 510 510 510
+// @log i32 1020 1020 1020 1020
+// @log u8 0 0 0 1 254 255 255 255 100 200 255 0 128 127 255 0
+// @log u8 0 1 255 255 255 255 255 128 0 1 255 255 255 255 255 128
+// @log i16 -32768 -32768 32767 32767 -32768 32767 -1 0
+// @log u16 0 0 65535 65535 0 65535 0 0
+// `std:simd`'s widening keeps each value (zero-extending u8 and u16, sign-extending i16), and
+// its narrowing clamps to the target range: u8 at 0 and 255, i16 at -32768/32767, u16 at 0/65535.
+import {
+  Buffer,
+  loadI16,
+  loadI32,
+  loadU16,
+  loadU8,
+  store16,
+  store8,
+  storeI32,
+} from "std:buffer"
+import { toString } from "std:fmt"
+import {
+  I16x8,
+  I32x4,
+  U16x8,
+  U8x16,
+  loadI16x8,
+  loadI32x4,
+  loadU16x8,
+  loadU8x16,
+  narrowI16x8ToU8x16,
+  narrowI32x4ToI16x8,
+  narrowI32x4ToU16x8,
+  narrowU16x8ToU8x16,
+  splatU8,
+  storeI16x8,
+  storeI32x4,
+  storeU16x8,
+  storeU8x16,
+  widenHighI16x8,
+  widenHighU16x8,
+  widenHighU8x16,
+  widenLowI16x8,
+  widenLowU16x8,
+  widenLowU8x16,
+} from "std:simd"
+
+const buf = Buffer(64)
+
+function showU8(v: U8x16) {
+  storeU8x16(buf, 0, v)
+  let s = "u8"
+  let i = 0
+  while i < 16 {
+    s = s + " " + toString(loadU8(buf, i))
+    i = i + 1
+  }
+  print(s)
+}
+
+function showU16(v: U16x8) {
+  storeU16x8(buf, 0, v)
+  let s = "u16"
+  let i = 0
+  while i < 8 {
+    s = s + " " + toString(loadU16(buf, i * 2))
+    i = i + 1
+  }
+  print(s)
+}
+
+function showI16(v: I16x8) {
+  storeI16x8(buf, 0, v)
+  let s = "i16"
+  let i = 0
+  while i < 8 {
+    s = s + " " + toString(loadI16(buf, i * 2))
+    i = i + 1
+  }
+  print(s)
+}
+
+function showI32(v: I32x4) {
+  storeI32x4(buf, 0, v)
+  let s = "i32"
+  let i = 0
+  while i < 4 {
+    s = s + " " + toString(loadI32(buf, i * 4))
+    i = i + 1
+  }
+  print(s)
+}
+
+function halves(xs: i32[]) {
+  let i = 0
+  while i < 8 {
+    store16(buf, 32 + i * 2, xs[i])
+    i = i + 1
+  }
+  return 32
+}
+
+function words(a: i32, b: i32, c: i32, d: i32): I32x4 {
+  storeI32(buf, 32, a)
+  storeI32(buf, 36, b)
+  storeI32(buf, 40, c)
+  storeI32(buf, 44, d)
+  return loadI32x4(buf, 32)
+}
+
+function main() {
+  // u8 → u16: 0, 1, 127, 128, 254, 255 stay themselves, the high half too
+  const bytes = [
+    0, 1, 127, 128, 254, 255, 9, 10, 200, 201, 202, 203, 252, 253, 254, 255,
+  ]
+  let i = 0
+  while i < 16 {
+    store8(buf, 32 + i, bytes[i])
+    i = i + 1
+  }
+  const b = loadU8x16(buf, 32)
+  showU16(widenLowU8x16(b))
+  showU16(widenHighU8x16(b))
+
+  // u16 → i32 keeps 32768 and 65535; the same bits as i16 → i32 become -32768 and -1
+  const u = loadU16x8(buf, halves([0, 1, 32767, 32768, 65534, 65535, 7, 40000]))
+  showI32(widenLowU16x8(u))
+  showI32(widenHighU16x8(u))
+  const s = loadI16x8(buf, halves([0, 1, 32767, 32768, 65534, 65535, 7, 40000]))
+  showI32(widenLowI16x8(s))
+  showI32(widenHighI16x8(s))
+
+  // u8 → u16 → i32: summing 255s overflows neither the u16 nor the i32 lanes
+  const full = splatU8(255)
+  const pairs = widenLowU8x16(full) + widenHighU8x16(full)
+  showU16(pairs)
+  showI32(widenLowU16x8(pairs) + widenHighU16x8(pairs))
+
+  // i16 → u8 clamps negatives to 0 and anything above 255 to 255
+  const lo = loadI16x8(buf, halves([-32768, -1, 0, 1, 254, 255, 256, 32767]))
+  const hi = loadI16x8(buf, halves([100, 200, 300, -7, 128, 127, 1000, 0]))
+  showU8(narrowI16x8ToU8x16(lo, hi))
+
+  // u16 → u8 reads 32768 and 65535 as large, so they clamp to 255, not to 0
+  const ul = loadU16x8(buf, halves([0, 1, 255, 256, 32767, 32768, 65535, 128]))
+  showU8(narrowU16x8ToU8x16(ul, ul))
+
+  // i32 → i16 and i32 → u16 at each bound and one past it
+  const x = words(-32769, -32768, 32767, 32768)
+  const y = words(-2147483647 - 1, 2147483647, -1, 0)
+  showI16(narrowI32x4ToI16x8(x, y))
+  const z = words(-1, 0, 65535, 65536)
+  showU16(narrowI32x4ToU16x8(z, y))
+}
+
+main()
