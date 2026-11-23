@@ -197,7 +197,7 @@ For the queue:
 - **Q25.** While trains are in flight, a lane merges the newest announced
   `origin/vl-queue/<train>` tip, not `origin/master`. Master lags the trains, so merging it gave
   cross-lineage conflicts that refused four PRs on 2026-11-22 (#9609, #9605, #9627, #9628) (queue
-  practice).
+  practice; replaced by Q31: a lane now merges `origin/master` only).
 - **Q26.** A Q15/Q17 moved-programs list covers `scripts/capability-probes` as well as tests/cases
   and the distilled corpus. On 2026-11-22 #9599's list missed
   `scripts/capability-probes/numeric-as-exact-trio.vl` and #9596's missed 33 tests/cases programs;
@@ -214,6 +214,31 @@ For the queue:
   back to the lane (queue practice).
 - **Q30.** The subset guard treats `scripts/vl-host/` as code, not docs, because #9615 changed
   `scripts/vl-host/src/main.rs` (queue practice).
+- **Q31.** A lane merges `origin/master` only, never a `vl-queue` tip. The queue merges each
+  master-based PR into the in-flight train tip with `git merge-tree --merge-base=<master>`. That
+  is valid only while master's tree equals the last merged train's tree outside docs (the subset
+  guard). A real conflict goes back to the lane. This replaces Q25 (coordinator ruling,
+  2026-11-23).
+- **Q32.** A train that passes verification merges at once. A question about a PR's value goes to
+  its lane in parallel and never blocks a squash (coordinator ruling, 2026-11-23).
+- **Q33.** When the shadow's covered count holds flat, read the start-body line before
+  questioning a PR: a gain can be in start bodies only, as #9627's +20 starts were (coordinator
+  ruling, 2026-11-23).
+- **Q34.** The self-compile fuel attribution line is needed only past the +1% gate. A phase-state
+  rise from test-only constructors in a negative self-test is accepted with `--write-baseline` and
+  named in the PR body (#9650) (coordinator ruling, 2026-11-23).
+- **Q35.** A shadow mismatch row may rise with a filed row when claimed bytes equal claimless
+  bytes for the affected programs; the row need not be "unclaimed". The case is the
+  `ir-closure-record-family` lane's row D17060 (coordinator ruling, 2026-11-23).
+- **Q36.** Before every squash, check whether it would re-add a `changelog.d` entry that
+  `CHANGELOG.md` already holds; if so, delete the entry on the branch first, in a docs-only
+  commit. #9640 and #9647 each had to drop entries a squash re-added after #9636's fold (queue
+  practice).
+- **Q37.** A PR that fixes a filed inventory row closes that row's status line in the same PR.
+  #9641 fixed D17056 but left its row open, and master's ci-witnesses step was red until #9652
+  (queue practice).
+- **Q38.** A docs merge conflict on a squash reparent, such as an inventory add/add, takes the
+  train's version, which is the closed row. D17055 in #9639 was that case (queue practice).
 
 ### Squash artifacts and Q3 members
 

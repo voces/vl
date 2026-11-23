@@ -13,6 +13,14 @@ import { mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
 import {
+  emitOptLeafHead,
+  emitOptLeafTail,
+  emitOptLinkNullClose,
+  emitOptLinkNullOpen,
+  optLeafArmOf,
+} from "./wasmEmit"
+import { exprNullableRefNiche } from "./emit_classify"
+import {
   RAtom,
   RBox,
   RClosure,
@@ -96,7 +104,7 @@ import { elabSpreadNote, storageReadEnter, storageReadLeave } from "./emit_elab"
 import { forInStringSrc, forInU8Src } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
 import { RC_MAP } from "./emit_start_block"
-import { declaredSlotOfDecl } from "./emit_struct_order"
+import { declaredSlotOfDecl, sFieldIndex } from "./emit_struct_order"
 import {
   IrFn,
   OImm,
@@ -129,6 +137,7 @@ import {
   RFnId,
   RGetField,
   RGlobalGet,
+  RHandPick,
   RJoinNull,
   RListCat,
   RListClear,
@@ -136,6 +145,7 @@ import {
   RListEmpty,
   RListEmptyArms,
   RListEq,
+  RListFitIs,
   RListGet,
   RListIsAcross,
   RListLen,
@@ -143,6 +153,7 @@ import {
   RListNewDefault,
   RListPop,
   RListPush,
+  RListPushMany,
   RListSlice,
   RListStage,
   RLitArms,
@@ -161,6 +172,7 @@ import {
   RMemOp,
   RNicheRead,
   RNulNicheEq,
+  RNulNoneBox,
   RNulTest,
   RNullOf,
   RNumCast,
@@ -169,6 +181,7 @@ import {
   RNumUnionBin,
   RNumUnionConvert,
   RNumWiden,
+  ROptRead,
   RPrimOp,
   RPrint,
   RRawOp,
@@ -195,6 +208,7 @@ import {
   RTruncSat,
   RUnionConcreteEq,
   RUnionEq,
+  RVariantDiscrim,
   Rhs,
   SAssign,
   SBlock,
@@ -271,12 +285,13 @@ import {
   fbRefEq,
   fbRefIsNull,
   fbRefNull,
+  fbRefNullNone,
   fbRefNullOfKind,
   fbRefNullStruct,
   fbRefTest,
   fbResetLazyFrame,
-  fbReturn,
   fbReturnCall,
+  fbReturnOp,
   fbSelect,
   fbStructGet,
   fbStructNew,
@@ -299,12 +314,18 @@ import {
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
+  arrLitDataTry,
   arrLitHoistGlobal,
   arrLitIsForIter,
+  arrLitLongRouteOf,
   arrLitPackedShortTail,
   arrLitPrologue,
   arrLitRefShortTail,
   arrLitShortTail,
+  arrLitShortWhy,
+  arrLitStrChunkClose,
+  arrLitStrChunkOpen,
+  arrLitStrChunkStep,
   arrNewDefaultTail,
   arrNewFillStep,
   arrNewLenStash,
@@ -319,6 +340,8 @@ import {
   atomicResultPrim,
   atomicTail,
   boxTagIsTail,
+  bundleHandMemberAt,
+  bundleMemberPickOf,
   bundlePickOf,
   bundleResultPickOf,
   callRefCallTail,
@@ -339,6 +362,7 @@ import {
   coalNulRefBranch,
   coalNulRefJoinOpen,
   coalNulRefJoinPresent,
+  coalNulRefJoinTag,
   coalNulRefOpen,
   coalNulRefPlanOf,
   emitArmUnboxAt,
@@ -457,6 +481,8 @@ import {
   nulNicheEqNullTail,
   nulNicheEqRightTail,
   nulNicheEqWhy,
+  nulNoneBoxHead,
+  nulNoneBoxTail,
   nulTestAtomTail,
   nulTestBoolTail,
   nulTestBoxTagTail,
@@ -552,7 +578,10 @@ import {
   unionEqTagTail,
   unionLetSinkClose,
   unionUnionBoxesTail,
+  urBindConst,
+  urDepth,
   urLocalRead,
+  urUnbind,
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
@@ -565,6 +594,7 @@ import {
   arrLitVariantSlot,
   atomEqPlanOf,
   holeBoxPlanOf,
+  isArmOf,
   litIsArmOf,
   litIsMemberTexts,
   memRecvOwesNonNull,
@@ -576,7 +606,12 @@ import {
   structFieldPlain,
   variantFieldPlain,
 } from "./emit_plan_union"
-import { CoalBoxArm, coalValBoxArm, nullRetPlanOf } from "./emit_plan_null"
+import {
+  CoalBoxArm,
+  coalNulRefArmOf,
+  coalValBoxArm,
+  nullRetPlanOf,
+} from "./emit_plan_null"
 import {
   NulTestArm,
   binNulTestOf,
@@ -590,11 +625,16 @@ import {
   spreadPlanOf,
   spreadWrapIdx,
 } from "./emit_plan_list"
-import { fbOpenIf, fbValtype } from "./emit_bytes"
+import { emitFail, fbOpenIf, fbValtype } from "./emit_bytes"
+import {
+  variantDiscrimFieldNeeded,
+  variantFieldLitLexes,
+} from "./emit_map_twins"
 import {
   atomFoldSideTail,
   atomFoldTail,
   atomHookArmOf,
+  coalBoxStashOpen,
   coalFieldBoxOpen,
   coalFieldPlanOf,
   coalFieldRead,
@@ -604,6 +644,7 @@ import {
   coalOptLeafOpen,
   coalOptLeafPlanOf,
   coalOptLeafRead,
+  discrimFieldEqTail,
   emitListEmptyLoop,
   emptyFitArmBody,
   emptyFitArmHead,
@@ -611,6 +652,8 @@ import {
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fbRefIfOpenType,
+  listFitIsPlanOf,
+  listFitTail,
   listIsAcrossPlanOf,
   listIsAcrossTail,
   litIsBoxLexes,
@@ -629,6 +672,7 @@ import {
   unionLitNeverTail,
   unionLitPayloadTail,
   unionLitTagHead,
+  variantTagTail,
 } from "./wasmEmit"
 import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
@@ -637,7 +681,7 @@ import {
   objOrderStashSlot,
   unionLitIsStashSlot,
 } from "./emit_if_arm_values"
-import { forInLoopAt } from "./emit_plan_list"
+import { ArrLitArm, allocLitChunk, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -667,6 +711,7 @@ import {
   shIdxTo,
   uBoxIdx,
   uBoxNewEnd,
+  uFieldCount,
   unionSinkBase,
 } from "./emit_state"
 import { ListBuild } from "./emit_ref_list_kinds"
@@ -956,10 +1001,19 @@ function call(c: RCall, tail: boolean) {
   if c.caEnv { fbRefNullStruct() }
   for a in c.caCaps { irLOpnd(a) }
   for a in c.caArgs { irLOpnd(a) }
-  if tail && !c.caNever {
+  // A call whose callee hands captures back is followed by their sets, so it is never a tail,
+  // except a lifted function's call of itself (`liftSelfTail`).
+  if tail && !c.caNever && (c.caWb.length == 0 || liftSelfTail(c)) {
     fbReturnCall(gImports + c.caCallee)
   } else {
     fbCall(gImports + c.caCallee)
+    let j = c.caWb.length - 1
+    while j >= 0 {
+      const w = varSlot(c.caWb[j])
+      if w < 0 { return irLMiss("call write-back slot") }
+      fbLocalSet(w)
+      j = j - 1
+    }
     if c.caNever { fbUnreachable() }
   }
   return 0
@@ -1014,6 +1068,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListEmpty => listEmpty(r)
     RListEmptyArms => listEmptyArms(r)
     RListIsAcross => listIsAcross(r)
+    RListFitIs => listFitIs(r)
     RLitArms => litArms(r)
     RNumIs => numIs(r)
     RTagIs => {
@@ -1043,6 +1098,7 @@ function rhs(r: Rhs, tail: boolean) {
       RListLen |
       RListPop |
       RListPush |
+      RListPushMany |
       RListSlice |
       RMapFilter |
       RStrOp => irLowerListHook(r)
@@ -1051,12 +1107,18 @@ function rhs(r: Rhs, tail: boolean) {
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
       irLOpnd(r.nwV)
-      numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
+      // The one narrowing, a shift-mask fold's i64 source at width 32, is `srPushSource`'s wrap.
+      if r.nwSrc == 3 && r.nwDst == 1 {
+        fbI32WrapI64()
+      } else {
+        numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
+      }
     }
     RNumCast => {
       irLOpnd(r.ncV)
       numCastTail(r.ncAt, lw.irAt)
     }
+    ROptRead => optRead(r)
     RToBox => boxOp(r)
     RAtomStr => {
       irLOpnd(r.sxV)
@@ -1074,6 +1136,18 @@ function rhs(r: Rhs, tail: boolean) {
     RRetag => irLOpnd(r.rgV)
     RStage => irLOpnd(r.sgV)
     RNulTest => nulTestOp(r)
+    RNulNoneBox => {
+      // Legacy's null tag, the payload (the call, else the bottom ref), then the box.
+      leaf()
+      nulNoneBoxHead()
+      if r.nnPay {
+        irLOpnd(r.nnV)
+      } else {
+        leaf()
+        fbRefNullNone()
+      }
+      nulNoneBoxTail()
+    }
     RNulNicheEq => nulNicheEq(r)
     RClosureEq => closureEq(r)
     RFieldNull => {
@@ -1103,6 +1177,7 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.teV)
       boxTagIsTail(r.teTag)
     }
+    RVariantDiscrim => variantDiscrim(r)
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
@@ -1151,6 +1226,7 @@ function rhs(r: Rhs, tail: boolean) {
     REnvDrop => irLMiss("env drop as a value")
     RBundlePick => bundlePick(r)
     RResultPick => resultPick(r)
+    RHandPick => handPick(r)
     RMakeList => makeList(r)
     RSpread => spreadList(r)
     RMapNew => {
@@ -1528,6 +1604,19 @@ function bundlePick(r: RBundlePick) {
   return 0
 }
 
+// `RHandPick`: the bundle record read, then the member legacy's `emitBundleMemberPick` picks.
+function handPick(r: RHandPick) {
+  const pk = bundleMemberPickOf(
+    r.hpArg,
+    bundleHandMemberAt(r.hpAt, r.hpI, r.hpArg, lw.irAt),
+    lw.irAt,
+  )
+  if pk.bpHeap < 0 { return irLMiss("hand pick") }
+  irLOpnd(r.hpV)
+  fbStructGet(pk.bpHeap, pk.bpField)
+  return 0
+}
+
 // `RResultPick`: the returned record, then the member legacy's `emitBundleResultPick` picks.
 function resultPick(r: RResultPick) {
   const pk = bundleResultPickOf(r.rkAt, r.rkFe, lw.irAt)
@@ -1638,12 +1727,20 @@ function listEmpty(r: RListEmpty) {
   return emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
 }
 
+// Whether `RLitArms` `r` over `is` node `n` is still the test legacy writes: its literal arm, or
+// a `memberEq` the `litMember` rung writes as its one member's compare (`emitLitMemberEq`).
+function litArmsPlanHolds(r: RLitArms, n: IsExpr): boolean {
+  if litIsArmOf(r.liAt, n, lw.irAt) == r.liArm { return true }
+  return r.liArm == "memberEq"
+    && isArmOf(r.liAt, lw.irAt, 0, false) == "litMember"
+}
+
 // `RLitArms`: the operand and its arm's tail, as `emitIsTestLitArms` writes it; `atomEq` reads the
 // operand once per member. Every other arm is the builder's miss.
 function litArms(r: RLitArms) {
   lw.irLitReads = 0
   const n = nodeAt(r.liAt)
-  if !(n is IsExpr) || litIsArmOf(r.liAt, n, lw.irAt) != r.liArm {
+  if !(n is IsExpr) || !litArmsPlanHolds(r, n) {
     return irLMiss("literal arms plan")
   }
   return match r.liArm {
@@ -1757,6 +1854,40 @@ function numIs(r: RNumIs): i32 {
   return 1
 }
 
+// `RVariantDiscrim` as `emitIsTestVariantRow` writes a `discrim` row: the variable and the arm's
+// tag, then in an `if` each needed field's literals, or'd within a field and and'd across fields.
+function variantDiscrim(r: RVariantDiscrim): i32 {
+  const n = nodeAt(r.vdAt)
+  if !(n is IsExpr) { return irLMiss("variant discriminant node") }
+  if r.vdVi < 0 || r.vdVi >= uFieldCount.length {
+    return irLMiss("variant discriminant row")
+  }
+  irLOpnd(r.vdV)
+  variantTagTail(r.vdVi)
+  fbIf(127)
+  let first = true
+  let fi = 0
+  while fi < uFieldCount[r.vdVi] {
+    if variantDiscrimFieldNeeded(r.vdVi, fi) {
+      const lexes = variantFieldLitLexes(r.vdVi, fi)
+      let li = 0
+      while li < lexes.length {
+        if opndAgain(r.vdV, n.isObj) < 0 { return -1 }
+        if discrimFieldEqTail(r.vdVi, fi, lexes[li], lw.irAt) < 0 { return -1 }
+        if li > 0 { fbI32Bin(114) }
+        li = li + 1
+      }
+      if !first { fbI32Bin(113) }
+      first = false
+    }
+    fi = fi + 1
+  }
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  return 0
+}
+
 // `RLitArms`' receiver: its operand the first time, then read again as the builder read it.
 function litRecv(r: RLitArms): i32 {
   const n = nodeAt(r.liAt)
@@ -1769,16 +1900,25 @@ function litRecv(r: RLitArms): i32 {
   return opndAgain(r.liV, n.isObj)
 }
 
-// `RListIsAcross` as `emitListIsAcrossReps` writes it: the plan, the shared slot, the receiver,
-// then legacy's tail over the slot.
+// `RListIsAcross` as `emitListIsAcrossReps` writes it: the plan, the receiver, then legacy's tail
+// over the shared slot.
 function listIsAcross(r: RListIsAcross): i32 {
   const n = nodeAt(r.laAt)
   if !(n is IsExpr) { return irLMiss("list is across node") }
   const p = listIsAcrossPlanOf(r.laAt, n, lw.irAt)
   if !p.lpOk { return irLMiss("list is across plan") }
-  const slot = sharedFieldRecvSlot()
   irLOpnd(r.laV)
-  return listIsAcrossTail(n, slot, p, lw.irAt)
+  return listIsAcrossTail(n, sharedFieldRecvSlot(), p, lw.irAt)
+}
+
+// `RListFitIs` as `emitListFitIs` writes it: the receiver, then legacy's walk along the plan.
+function listFitIs(r: RListFitIs): i32 {
+  const n = nodeAt(r.lsAt)
+  if !(n is IsExpr) { return irLMiss("list fit node") }
+  const p = listFitIsPlanOf(r.lsAt, lw.irAt)
+  if p.lftOk != 1 { return irLMiss("list fit plan") }
+  irLOpnd(r.lsV)
+  return listFitTail(p, lw.irAt)
 }
 
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
@@ -1909,6 +2049,7 @@ function setField(n: SSetField, at: i32) {
 function getField(r: RGetField) {
   const m = nodeAt(r.gfAt)
   if !(m is Member) { return irLMiss("field node") }
+  if r.gfShared { return sharedField(r, m) }
   if fieldIdxAt(r.gfAt, m) < 0 { return irLMiss("field shape") }
   irLOpnd(r.gfV)
   // A member record read the box plan passes as its field's box is lowered at its storage, as
@@ -1925,6 +2066,22 @@ function getField(r: RGetField) {
   const rs = fieldTail(r.gfAt, m)
   storageReadLeave(mark)
   return rs
+}
+
+// A shared template member's read (`gfShared`): the record, then the field at its storage, as
+// `emitMemStructRead` writes it for a node no instance typed.
+function sharedField(r: RGetField, m: Member) {
+  const fnIx = lw.irAt
+  const si = structIndexOfExpr(m.memObj, fnIx)
+  const idx = if si >= 0 { sFieldIndex(si, m.memProp) } else { -1 }
+  if idx < 0 { return irLMiss("shared field shape") }
+  irLOpnd(r.gfV)
+  if memRecvOwesNonNull(r.gfAt, fnIx) { fbRefAsNonNull() }
+  structFieldTail(si, idx, r.gfAt, fnIx)
+  if structUnionBoxTail(si, idx, r.gfAt, fnIx) < 0 {
+    return irLMiss("field unbox")
+  }
+  return 0
 }
 
 // The plain field index member read `at` reads, or -1.
@@ -2174,7 +2331,9 @@ function makeList(r: RMakeList) {
   // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
   // leaves its elements unwritten, so each must be an immediate.
   if arrLitIsForIter(r.mlAt) {
-    const g = arrLitHoistGlobal(r.mlAt, fnIx, arm)
+    // In the IR's full unroll a range variable is its copy's constant; legacy asks the hoist
+    // inside its copy, which reads the variable as that constant, so the copy is bound first.
+    const g = hoistInRangeCopy(r, fnIx, arm)
     if g == -2 { return -1 }
     if g >= 0 {
       for e in r.mlElems {
@@ -2183,6 +2342,50 @@ function makeList(r: RMakeList) {
       for e in r.mlElems { irLSkip(e) }
       return fbGlobalGet(g)
     }
+  }
+  // A long literal of constants is legacy's data segment, built from the AST's own literals: the
+  // operands, immediates the builder held it to, are left unwritten.
+  if (
+    arm != "ref"
+    && arm != "str"
+    && arrLitShortWhy(r.mlAt, fnIx, arm, r.mlElems.length) == "long"
+  ) {
+    if r.mlAt < 0 || r.mlAt >= P.nodes.length {
+      return irLMiss("array long node")
+    }
+    const a = nodeAt(r.mlAt)
+    if !(a is ArrayLit) { return irLMiss("array long node") }
+    for e in r.mlElems {
+      if !(e is OImm) { return irLMiss("array long element") }
+    }
+    if arrLitLongRouteOf(a.arrElems, fnIx, arm, lb.lbSlot) != "dataConst" {
+      return irLMiss("array long route")
+    }
+    for e in r.mlElems { irLSkip(e) }
+    const d = arrLitDataTry(a.arrElems, fnIx, arm, lb.lbSlot)
+    if d < 0 { return -1 }
+    if d == 0 {
+      return emitFail(
+        "emitProgram: internal: a constant long literal declined its data segment",
+      )
+    }
+    return 0
+  }
+  // A string list past the operand cap builds in chunks, as `emitArrStr` does: opened before its
+  // elements, each element then the chunk's flush.
+  if arm == "str" && r.mlElems.length > allocLitChunk() {
+    for e in r.mlElems {
+      if !(e is OImm || e is OStr) { return irLMiss("long list element") }
+    }
+    const dst = arrLitStrChunkOpen(r.mlElems.length)
+    let coff = 0
+    let i = 0
+    for e in r.mlElems {
+      irLOpnd(e)
+      i = i + 1
+      coff = arrLitStrChunkStep(dst, coff, i, r.mlElems.length)
+    }
+    return arrLitStrChunkClose(dst, r.mlElems.length)
   }
   for e in r.mlElems { irLOpnd(e) }
   if arm == "ref" {
@@ -2194,6 +2397,58 @@ function makeList(r: RMakeList) {
   }
   if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
+}
+
+// Legacy's hoist of `for` iterable `r` (`arrLitHoistGlobal`), asked with each range variable its
+// elements read bound to its copy's constant; every binding is undone before it returns.
+function hoistInRangeCopy(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
+  const bound = bindRangeCopyElems(r, fnIx)
+  const g = arrLitHoistGlobal(r.mlAt, fnIx, arm)
+  let k = 0
+  while k < bound {
+    urUnbind()
+    k = k + 1
+  }
+  return g
+}
+
+// The unroll stack's depth change across `hoistInRangeCopy` of a literal node `at` (a miss where
+// it is no list literal), for the host test: 0, the bindings undone.
+export function irRangeCopyHoistSelfTest(at: i32): i32 {
+  const d = urDepth()
+  const r: RMakeList = {
+    mlElems: [],
+    mlKind: 0,
+    mlSlot: 0,
+    mlAt: at,
+    mlArm: "i32",
+  }
+  hoistInRangeCopy(r, -1, "i32")
+  return urDepth() - d
+}
+
+// Binds each element of literal `r` that reads a range loop's variable, held as an immediate, to
+// that constant on legacy's copy stack (`urBindConst`); returns how many it bound.
+function bindRangeCopyElems(r: RMakeList, fnIx: i32): i32 {
+  if r.mlAt < 0 || r.mlAt >= P.nodes.length { return 0 }
+  const a = nodeAt(r.mlAt)
+  if !(a is ArrayLit) || a.arrElems.length != r.mlElems.length { return 0 }
+  let n = 0
+  let k = 0
+  while k < a.arrElems.length {
+    const x = unwrapParen(a.arrElems[k])
+    const o = r.mlElems[k]
+    if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident && o is OImm {
+      const d = identDeclOf(x)
+      const w = localIndexOf(fnIx, x)
+      if d >= 0 && d < P.nodes.length && nodeAt(d) is ForRange && w >= 0 {
+        urBindConst(w, o.oiBits as% i32)
+        n = n + 1
+      }
+    }
+    k = k + 1
+  }
+  return n
 }
 
 // `RSpread`: legacy's prologue, the source, then the group stash and join `emitArrSpread`'s plain
@@ -3207,15 +3462,36 @@ function retagOperand(t: i32): Opnd {
   return none
 }
 
+// Whether call `c` is a lifted function's call of itself, which returns what the function would,
+// so its tail form drops the write-back with the return's own hand-back (`emitLiftSelfTailRet`).
+function liftSelfTail(c: RCall): boolean {
+  return lw.irRetExtra.length > 0
+    && c.caWb.length > 0
+    && c.caCallee == fnStmtsPosOf(lw.irAt)
+    && !fnUses.unionSink
+}
+
 // 0 for a closure call's right-hand side, which a return takes in its tail form too; -1 else.
 function callRefTemp(r: Rhs): i32 { return if r is RCallRef { 0 } else { -1 } }
 
 function callTemp(o: Opnd): i32 {
+  // A lifted body handing captures back returns them after the call, so no call is its tail but
+  // its call of itself (`liftSelfTail`).
+  if lw.irRetExtra.length > 0 {
+    if !(o is OVar) || !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
+    const r = tempRhs(o.ov)
+    return if r is RCall && liftSelfTail(r) { r.caCallee } else { -1 }
+  }
   return match o {
     OVar => {
       if !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
       const r = tempRhs(o.ov)
-      if r is RCall { r.caCallee } else { callRefTemp(r) }
+      // A callee that hands captures back is followed by their sets, so it has no tail form.
+      if r is RCall {
+        if r.caWb.length == 0 { r.caCallee } else { -1 }
+      } else {
+        callRefTemp(r)
+      }
     }
     OImm | OStr => -1
   }
@@ -3391,6 +3667,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       }
       if (
         r is RListPush
+        || r is RListPushMany
         || r is RListStage
         || r is RListPop
         || r is RListClear
@@ -3542,15 +3819,47 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
   return 0
 }
 
+// A standalone `?.` as `emitOptMemberValueGo` writes it over an unstaged base: the base's null test
+// and the leaf's head, then the base as non-null (its niche recovered) and the leaf's tail.
+function optRead(r: ROptRead) {
+  const arm = optLeafArmOf(r.orAt, lw.irAt)
+  if arm == "fail" { return irLMiss("optional read arm") }
+  if arm != "nonNull" {
+    irLOpnd(r.orV)
+    fbRefIsNull()
+    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r) }
+    emitOptLinkNullClose(r.orAt, lw.irAt)
+    emitOptLeafHead(r.orAt, lw.irAt)
+  }
+  optReadBase(r)
+  emitOptLeafTail(r.orAt, lw.irAt)
+  return 0
+}
+
+// The optional read's base as `emitOptChainValue` pushes an unstaged one: its niche recovered.
+function optReadBase(r: ROptRead) {
+  irLOpnd(r.orV)
+  const m = nodeAt(r.orAt)
+  if m is OptMember && exprNullableRefNiche(m.omObj, lw.irAt) {
+    fbRefAsNonNull()
+  }
+  return 0
+}
+
 // An integer switch as `emitIntSwitch` writes it: the outer frame, the default's, one per arm,
 // the index less its low value (a 64-bit one range-tested onto the default), the `br_table`, then
 // each arm and a branch past the rest, and the else. A tail chain's arms are in tail position.
 function intSwitch(n: SIntSwitch, pending: i32[], tail: boolean) {
+  // A valued switch's outer frame is typed by its out, which each arm leaves for its branch.
+  const t = n.isOut
+  if t >= lw.irVars.length { return irLMiss("valued switch out") }
+  const vt = if t >= 0 { valtypeOf(lw.irVars[t].vRep) } else { 64 }
+  if vt < 0 { return irLMiss("valued switch rep") }
   irLSettle(pending)
   const m = n.isArms.length
   const span = n.isTable.length - 1
   const lo = n.isLo
-  fbBlock(64)
+  fbBlock(vt)
   lwFrames.push(-1)
   const endDepth = ctrlDepth
   let k = 0
@@ -3580,14 +3889,18 @@ function intSwitch(n: SIntSwitch, pending: i32[], tail: boolean) {
   for a in n.isArms {
     fbEnd()
     lwFrames.pop()
-    body(a, armTail, -1, false)
+    body(a, armTail, t, false)
     fbBr(ctrlDepth - endDepth)
   }
   fbEnd()
   lwFrames.pop()
-  body(n.isElse, armTail, -1, false)
+  body(n.isElse, armTail, t, false)
   fbEnd()
   lwFrames.pop()
+  if t >= 0 {
+    livePush(t)
+    pending.push(t)
+  }
   return 0
 }
 
@@ -3867,7 +4180,9 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "nulBool" => coalNicheCell(n, e, 2, pending)
     "fieldBox" | "fieldVal" => coalUnionField(n, e, pending)
     "optLeaf" => coalOptLeaf(n, e, pending)
+    "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
+    "nulStr" => coalNulStr(n, e, pending)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
@@ -3877,6 +4192,20 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   for r in roots { pending.push(r) }
   livePush(t)
   pending.push(t)
+  return 0
+}
+
+// `l ?? d` along legacy's `boxStash` rung, as `emitCoalesceBoxStash` writes it: the operand box,
+// the shared slot, its tag tested present opening the box-typed `if`, the stash, the else, then
+// the default writing the slotless out.
+function coalBoxStash(n: SCoalBox, _e: BinExpr, pending: i32[]): i32 {
+  cond(n.cbL, pending)
+  coalBoxStashOpen(sharedFieldRecvSlot())
+  fbElse()
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  fbEnd()
   return 0
 }
 
@@ -3904,7 +4233,7 @@ function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
 
 // `p?.f ?? d` over a nullable record's scalar or string field along `coalOptLeafPlanOf`, as
 // `emitCoalesceOptNulRecord` writes it: the receiver variable, its null test opening the leaf's
-// `if`, the default writing the slotless out, the else, the receiver again, and its field.
+// `if`, the default writing the slotless out, the else, the receiver read again, and its field.
 function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   const m = nodeAt(unwrapParen(e.binLeft))
   if (
@@ -3923,7 +4252,7 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   fbElse()
-  irLOpnd(n.cbL)
+  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
   lwFrames.pop()
   return coalOptLeafRead(lp)
 }
@@ -3962,7 +4291,7 @@ function coalBoxArm(
     "valBox" | "valScalar" => true
     "elem" | "callBox" | "callScalar" | "boolPop" | "valNoKind" | "callNoKind" | "next" => false
   }
-  if reread { irLOpnd(n.cbL) }
+  if reread && opndAgain(n.cbL, e.binLeft) < 0 { return -1 }
   lwFrames.pop()
   return coalBoxEnd(arm, e, lhsIx, n.cbAt, fnIx)
 }
@@ -3991,6 +4320,22 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.pop()
   fbEnd()
   return 0
+}
+
+// A `string | null` `??` whose default computes: the plain block at the string heap, nullable as
+// `coalesceNulStrStaysNullable`, the operand inside it, the branch out on non-null, then the tail.
+function coalNulStr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  // A join stages the operand ahead of its `if` and boxes it on the present path.
+  if coalNulRefArmOf(e, n.cbAt, lw.irAt) == "join" {
+    cond(n.cbL, pending)
+    coalNulRefJoinOpen()
+    return coalNulRefTail(n, coalNulRefJoinTag(e, sTy(), lw.irAt))
+  }
+  if pending.length > 0 { return irLMiss("coalesce string below a temp") }
+  coalNulRefOpen(sTy(), coalesceNulStrStaysNullable(n.cbAt, lw.irAt))
+  cond(n.cbL, body(n.cbLB, false, -1, true))
+  coalNulRefBranch()
+  return coalNulRefTail(n, -1)
 }
 
 // A nullable reference's `??` along its plan: the plain block (the operand inside it, the branch
@@ -4151,7 +4496,8 @@ function isBr(id: i32): boolean {
 function ret(n: SReturn, pending: i32[]) {
   if !n.rtHas {
     irLSettle(pending)
-    return fbReturn()
+    retExtra()
+    return fbReturnOp()
   }
   // A call retagged into its `K | null` is the same i32, so legacy tail-calls it too.
   const outer = retagOf(n.rtV)
@@ -4186,7 +4532,19 @@ function sinkExit() {
     lwSinkFired = lwSinkFired + 1
     return 0
   }
-  return fbReturn()
+  retExtra()
+  return fbReturnOp()
+}
+
+// The captures a lifted function hands back after its result (`irRetExtra`), as every legacy exit
+// pushes them (`fbPushRetExtra`); the IR's exits write `fbReturnOp`, never legacy's seeded list.
+function retExtra() {
+  for v in lw.irRetExtra {
+    const w = varSlot(v)
+    if w < 0 { return irLMiss("lifted extra result slot") }
+    fbLocalGet(w)
+  }
+  return 0
 }
 
 function spanOpen(id: i32) {
@@ -4393,8 +4751,14 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   const valued = !repIsNoValue(f.irRetRep)
   // The single start body opens with legacy's pool fill; an init function's does not.
   if f.irPoolFill { irStartPrologueHook() }
-  // Legacy tail-calls a void body's last call, but not the start function's.
-  body(f.irBody, !valued && (f.irAt >= 0 || f.irThunk), -1, false)
+  // Legacy tail-calls a void body's last call, but not the start function's, nor in a lifted
+  // body that hands captures back after it (`irRetExtra`).
+  body(
+    f.irBody,
+    !valued && (f.irAt >= 0 || f.irThunk) && f.irRetExtra.length == 0,
+    -1,
+    false,
+  )
   const pad = if valued { f.irEndPad } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
@@ -4404,6 +4768,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
     fbUnreachable()
   }
   if lwSinkFired > 0 { sinkClose() }
+  retExtra()
   fbEnd()
   wTarget(prev)
   // Every frame a builder opened is closed, so the one depth not given back is the function's

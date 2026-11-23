@@ -37,6 +37,7 @@ import {
   irBFnIx,
   irBGlobalBoxRecovers,
   irBGlobalBoxRecv,
+  irBLetStrTemp,
   irBLetTemp,
   irBLetTempTy,
   irBMiss,
@@ -45,6 +46,7 @@ import {
   irBNoteFieldReread,
   irBOpRep,
   irBStageLeads,
+  irBUnboxKindRep,
   irInPlaceHook,
   irIndexHook,
   irListCatHook,
@@ -65,7 +67,8 @@ import {
   irLowerListHook,
   irLowerListSetHook,
 } from "./ir_lower"
-import { irBoundsRuleHook, openRepTakes, undeclaredRepTakes } from "./ir_verify"
+import { irBoundsRuleHook } from "./ir_verify"
+import { openRepTakes, undeclaredRepTakes } from "./ir_verify_facts"
 import {
   irLowerRefBounds,
   irLowerRefEffect,
@@ -115,6 +118,7 @@ import {
   strOrderSwaps,
   strSiteOfRhsAsked,
   unionFieldNarrowUnboxOf,
+  unionFieldUnboxKindOf,
   unionUnionEqArmOf,
 } from "./wasmEmit"
 import { memFieldUnionBox, narrowedFieldIsUnionBox } from "./emit_plan_union"
@@ -125,13 +129,7 @@ import {
   unionUnionEqStagedOf,
   variantFieldPlain,
 } from "./emit_plan_union"
-import {
-  exprIsLitAtom,
-  exprIsStrConcat,
-  exprMap,
-  memNarrowAtomKind,
-  memReadUnboxAtomKind,
-} from "./emit_classify"
+import { exprIsLitAtom, exprIsStrConcat, exprMap } from "./emit_classify"
 import { exprIsStrEq, exprIsStrOrder } from "./emit_fn_scans"
 
 // The corrupt mode that drops every bounds check, rule 8's failing control, and the mode armed.
@@ -287,11 +285,9 @@ function refUnboxedAt(n: Index, ix: i32, fnIx: i32, rep: i32): boolean {
 // Whether a union-box field read `ix` leaves rep `rep` by the unbox legacy writes after it
 // (`unionFieldNarrowUnboxOf`): the box itself, or the atom it unboxes to. A container is a miss.
 function narrowUnboxRepIs(ix: i32, rep: i32): boolean {
-  const fnIx = irBFnIx()
-  return match unionFieldNarrowUnboxOf(ix, fnIx) {
+  return match unionFieldNarrowUnboxOf(ix, irBFnIx()) {
     "container" => false
-    "atom" => irBAtomKindRep(memNarrowAtomKind(ix, fnIx), rep)
-    "unbox" => irBAtomKindRep(memReadUnboxAtomKind(ix, fnIx), rep)
+    "atom" | "unbox" => irBAtomKindRep(unionFieldUnboxKindOf(ix, irBFnIx()), rep)
     "none" => repNodeAt(rep) is RBox
   }
 }
@@ -320,7 +316,14 @@ function holeCloFieldRead(b: i32[], n: Member, ix: i32, k: i32): Opnd {
   irBNoteFieldReread(ix, k)
   return irBLetTempTy(
     b,
-    { gfV: rv, gfIx: k, gfAt: ix, gfStored: isStorageRead(ix) },
+    {
+      gfV: rv,
+      gfIx: k,
+      gfAt: ix,
+      gfStored: isStorageRead(ix),
+      gfStr: false,
+      gfShared: false,
+    },
     ix,
     bk,
     repTyOf(bk),
@@ -380,12 +383,17 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     // A receiver held at its storage row (D14426) lays its fields out as that row does.
     if irBOpRep(rv) != r { return irBMiss("field read of a stored row") }
     irBNoteFieldReread(ix, k)
-    return irBLetTemp(
-      b,
-      { gfV: rv, gfIx: k, gfAt: ix, gfStored: isStorageRead(ix) },
-      ix,
-      rep,
-    )
+    const ur = if own { irBUnboxKindRep(unionFieldUnboxKindOf(ix, fnIx), rep) } else { rep }
+    const gf: Rhs = {
+      gfV: rv,
+      gfIx: k,
+      gfAt: ix,
+      gfStored: isStorageRead(ix),
+      gfStr: ur != rep,
+      gfShared: false,
+    }
+    if ur != rep { return irBLetStrTemp(b, gf, ix) }
+    return irBLetTemp(b, gf, ix, rep)
   }
   // A field read off a box local narrowed to one variant.
   const idx = narrowedFieldPlain(ix, irBFnIx())
