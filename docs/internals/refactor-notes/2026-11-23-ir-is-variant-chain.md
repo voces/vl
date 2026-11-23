@@ -20,6 +20,11 @@ the queue's recommendation, with five conditions. recordFit uses the same hook i
   `irFitTailSelfTest`, asserted in `tests/vl_ir_shadow_test.ts`, misses on purpose and checks the
   hook is back at `fitRecvLegacy`. A control compiler built without the restore reds it.
 
+## Legacy tails the IR calls
+
+- `variantRowChainTail` (`wasmEmit`): the variant row's chain past its receiver's staging, called by `irFitTail` for an `RVariantChain`.
+- `fitRecvReadHook` (`wasmEmit`): the receiver read of `emitSharedFieldRecv` and `emitDiscrimFieldEq`, set by `irFitTail` while that tail runs.
+
 ## The IR→legacy-tail hooks the legacy deletion keeps
 
 No document lists them, so this note does. `irVarRepOkHook`, `irIndexHook`, `irMemberHook`,
