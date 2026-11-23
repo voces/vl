@@ -135,7 +135,9 @@ export type RBoxNarrow = {
 }
 // A box value narrowed to a record arm, unboxed at a record destination as legacy's
 // `emitArmUnboxCast` writes it after the box: the payload cast to the arm's heap, `uaAt` the read.
-export type RArmUnbox = { uaV: Opnd, uaAt: i32 }
+// `uaCellNul`: the destination is a binding whose cell is a nullable arm, which legacy casts to as
+// a nullable ref whatever the value's own nullability (`emitLetDelivery`).
+export type RArmUnbox = { uaV: Opnd, uaAt: i32, uaCellNul: boolean }
 // A box local read at its storage as the niche (`nicheReadKindAt`, kind `nrKind`) its narrowing
 // names, `nrAt` the read: the null tag is the niche's null, any other arm its payload.
 export type RNicheRead = { nrV: Opnd, nrAt: i32, nrKind: i32 }
@@ -492,6 +494,8 @@ export type RStructEq = {
   seLIx: Opnd[],
   seRIx: Opnd[],
 }
+// `__eq_<ehRow>__`'s compare of its two parameters `ehL` and `ehR`, as `eqHelpTail` writes it.
+export type REqHelp = { ehL: Opnd, ehR: Opnd, ehRow: i32 }
 export type RStrOp = { soOp: StrOp, soArgs: Opnd[], soAt: i32 }
 export type RMakeClo = { mcFn: i32, mcEnv: Opnd[], mcAt: i32 }
 export type RFnId = { fiMember: i32 }
@@ -566,6 +570,7 @@ export type Rhs = RArmUnbox
   | RCoerce
   | REnvDrop
   | REnvGet
+  | REqHelp
   | RFieldNull
   | RFnId
   | RGetField
@@ -706,6 +711,9 @@ export type SIf = {
   siElseKw: boolean,
   siJoin: RefJoin,
   siJoinNul: boolean,
+  // A value `if` written into a box arm by arm, opening at that box's blocktype whatever its own
+  // join (`emitUnionCoerceUnder`'s `if` arm).
+  siAtDst: boolean,
 }
 
 // An `if` that opens at its own join (no decided `siJoin`).
@@ -724,6 +732,7 @@ export function sIf(
     siElseKw: elseKw,
     siJoin: { rjKind: null, rjSlot: -1 },
     siJoinNul: false,
+    siAtDst: false,
   }
 }
 export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
@@ -1213,6 +1222,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RCoerce |
       REnvDrop |
       REnvGet |
+      REqHelp |
       RFieldNull |
       RFnId |
       RGetField |
@@ -1579,6 +1589,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RPrint => [r.pnV]
     RStrOp => r.soArgs
     RStructEq => opndsCat([r.seL, r.seR], opndsCat(r.seLIx, r.seRIx))
+    REqHelp => [r.ehL, r.ehR]
     RNumWiden => [r.nwV]
     ROptRead => [r.orV]
     RNumCast => [r.ncV]
@@ -1712,7 +1723,11 @@ function rhsText(r: Rhs): string {
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RAsUnion => "as.union " + opndText(r.auV)
     RAsTail => "as.tail " + opndText(r.akV)
-    RArmUnbox => "arm_unbox " + opndText(r.uaV) + " @" + i32ToStr(r.uaAt)
+    RArmUnbox => "arm_unbox "
+      + opndText(r.uaV)
+      + " @"
+      + i32ToStr(r.uaAt)
+      + (if r.uaCellNul { " cellnul" } else { "" })
     RUnionConcreteEq => "union.eqc "
       + (if r.ucStash { "stash " } else { "" })
       + opndText(r.ucBox)
@@ -1769,6 +1784,7 @@ function rhsText(r: Rhs): string {
     RStructEq => "struct_eq("
       + opndsText(opndsCat([r.seL, r.seR], opndsCat(r.seLIx, r.seRIx)))
       + ")"
+    REqHelp => "eq_helper " + i32ToStr(r.ehRow) + "(" + opndsText([r.ehL, r.ehR]) + ")"
     RMakeClo => "closure f" + i32ToStr(r.mcFn) + "(" + opndsText(r.mcEnv) + ")"
     RFnId => "fn_id " + i32ToStr(r.fiMember)
     RAtomSole => "atom_sole @" + i32ToStr(r.asAt)
@@ -2037,6 +2053,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RClosureEq |
       RCoalAtomStr |
       RCoalStr |
+      REqHelp |
       RJoinNull |
       RLitArms |
       RNulNicheEq |
