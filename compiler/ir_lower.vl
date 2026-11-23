@@ -276,8 +276,8 @@ import {
   fbRefNullStruct,
   fbRefTest,
   fbResetLazyFrame,
-  fbReturn,
   fbReturnCall,
+  fbReturnOp,
   fbSelect,
   fbStructGet,
   fbStructNew,
@@ -300,12 +300,18 @@ import {
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
+  arrLitDataTry,
   arrLitHoistGlobal,
   arrLitIsForIter,
+  arrLitLongRouteOf,
   arrLitPackedShortTail,
   arrLitPrologue,
   arrLitRefShortTail,
   arrLitShortTail,
+  arrLitShortWhy,
+  arrLitStrChunkClose,
+  arrLitStrChunkOpen,
+  arrLitStrChunkStep,
   arrNewDefaultTail,
   arrNewFillStep,
   arrNewLenStash,
@@ -592,7 +598,7 @@ import {
   spreadPlanOf,
   spreadWrapIdx,
 } from "./emit_plan_list"
-import { fbOpenIf, fbValtype } from "./emit_bytes"
+import { emitFail, fbOpenIf, fbValtype } from "./emit_bytes"
 import {
   atomFoldSideTail,
   atomFoldTail,
@@ -642,7 +648,7 @@ import {
   objOrderStashSlot,
   unionLitIsStashSlot,
 } from "./emit_if_arm_values"
-import { forInLoopAt } from "./emit_plan_list"
+import { allocLitChunk, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -961,10 +967,19 @@ function call(c: RCall, tail: boolean) {
   if c.caEnv { fbRefNullStruct() }
   for a in c.caCaps { irLOpnd(a) }
   for a in c.caArgs { irLOpnd(a) }
-  if tail && !c.caNever {
+  // A call whose callee hands captures back is followed by their sets, so it is never a tail,
+  // except a lifted function's call of itself (`liftSelfTail`).
+  if tail && !c.caNever && (c.caWb.length == 0 || liftSelfTail(c)) {
     fbReturnCall(gImports + c.caCallee)
   } else {
     fbCall(gImports + c.caCallee)
+    let j = c.caWb.length - 1
+    while j >= 0 {
+      const w = varSlot(c.caWb[j])
+      if w < 0 { return irLMiss("call write-back slot") }
+      fbLocalSet(w)
+      j = j - 1
+    }
     if c.caNever { fbUnreachable() }
   }
   return 0
@@ -2207,6 +2222,47 @@ function makeList(r: RMakeList) {
       return fbGlobalGet(g)
     }
   }
+  // A long literal of constants is legacy's data segment, built from the AST's own literals: the
+  // operands, immediates the builder held it to, are left unwritten.
+  if (
+    arm != "ref"
+    && arm != "str"
+    && arrLitShortWhy(r.mlAt, fnIx, arm, r.mlElems.length) == "long"
+  ) {
+    const a = nodeAt(r.mlAt)
+    if !(a is ArrayLit) { return irLMiss("array long node") }
+    for e in r.mlElems {
+      if !(e is OImm) { return irLMiss("array long element") }
+    }
+    if arrLitLongRouteOf(a.arrElems, fnIx, arm, lb.lbSlot) != "dataConst" {
+      return irLMiss("array long route")
+    }
+    for e in r.mlElems { irLSkip(e) }
+    const d = arrLitDataTry(a.arrElems, fnIx, arm, lb.lbSlot)
+    if d < 0 { return -1 }
+    if d == 0 {
+      return emitFail(
+        "emitProgram: internal: a constant long literal declined its data segment",
+      )
+    }
+    return 0
+  }
+  // A string list past the operand cap builds in chunks, as `emitArrStr` does: opened before its
+  // elements, each element then the chunk's flush.
+  if arm == "str" && r.mlElems.length > allocLitChunk() {
+    for e in r.mlElems {
+      if !(e is OImm || e is OStr) { return irLMiss("long list element") }
+    }
+    const dst = arrLitStrChunkOpen(r.mlElems.length)
+    let coff = 0
+    let i = 0
+    for e in r.mlElems {
+      irLOpnd(e)
+      i = i + 1
+      coff = arrLitStrChunkStep(dst, coff, i, r.mlElems.length)
+    }
+    return arrLitStrChunkClose(dst, r.mlElems.length)
+  }
   for e in r.mlElems { irLOpnd(e) }
   if arm == "ref" {
     const sl = arrLitRefShortSlot(r.mlAt, fnIx, lb)
@@ -3230,15 +3286,36 @@ function retagOperand(t: i32): Opnd {
   return none
 }
 
+// Whether call `c` is a lifted function's call of itself, which returns what the function would,
+// so its tail form drops the write-back with the return's own hand-back (`emitLiftSelfTailRet`).
+function liftSelfTail(c: RCall): boolean {
+  return lw.irRetExtra.length > 0
+    && c.caWb.length > 0
+    && c.caCallee == fnStmtsPosOf(lw.irAt)
+    && !fnUses.unionSink
+}
+
 // 0 for a closure call's right-hand side, which a return takes in its tail form too; -1 else.
 function callRefTemp(r: Rhs): i32 { return if r is RCallRef { 0 } else { -1 } }
 
 function callTemp(o: Opnd): i32 {
+  // A lifted body handing captures back returns them after the call, so no call is its tail but
+  // its call of itself (`liftSelfTail`).
+  if lw.irRetExtra.length > 0 {
+    if !(o is OVar) || !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
+    const r = tempRhs(o.ov)
+    return if r is RCall && liftSelfTail(r) { r.caCallee } else { -1 }
+  }
   return match o {
     OVar => {
       if !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
       const r = tempRhs(o.ov)
-      if r is RCall { r.caCallee } else { callRefTemp(r) }
+      // A callee that hands captures back is followed by their sets, so it has no tail form.
+      if r is RCall {
+        if r.caWb.length == 0 { r.caCallee } else { -1 }
+      } else {
+        callRefTemp(r)
+      }
     }
     OImm | OStr => -1
   }
@@ -4189,7 +4266,8 @@ function isBr(id: i32): boolean {
 function ret(n: SReturn, pending: i32[]) {
   if !n.rtHas {
     irLSettle(pending)
-    return fbReturn()
+    retExtra()
+    return fbReturnOp()
   }
   // A call retagged into its `K | null` is the same i32, so legacy tail-calls it too.
   const outer = retagOf(n.rtV)
@@ -4224,7 +4302,19 @@ function sinkExit() {
     lwSinkFired = lwSinkFired + 1
     return 0
   }
-  return fbReturn()
+  retExtra()
+  return fbReturnOp()
+}
+
+// The captures a lifted function hands back after its result (`irRetExtra`), as every legacy exit
+// pushes them (`fbPushRetExtra`); the IR's exits write `fbReturnOp`, never legacy's seeded list.
+function retExtra() {
+  for v in lw.irRetExtra {
+    const w = varSlot(v)
+    if w < 0 { return irLMiss("lifted extra result slot") }
+    fbLocalGet(w)
+  }
+  return 0
 }
 
 function spanOpen(id: i32) {
@@ -4431,8 +4521,14 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   const valued = !repIsNoValue(f.irRetRep)
   // The single start body opens with legacy's pool fill; an init function's does not.
   if f.irPoolFill { irStartPrologueHook() }
-  // Legacy tail-calls a void body's last call, but not the start function's.
-  body(f.irBody, !valued && (f.irAt >= 0 || f.irThunk), -1, false)
+  // Legacy tail-calls a void body's last call, but not the start function's, nor in a lifted
+  // body that hands captures back after it (`irRetExtra`).
+  body(
+    f.irBody,
+    !valued && (f.irAt >= 0 || f.irThunk) && f.irRetExtra.length == 0,
+    -1,
+    false,
+  )
   const pad = if valued { f.irEndPad } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
@@ -4442,6 +4538,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
     fbUnreachable()
   }
   if lwSinkFired > 0 { sinkClose() }
+  retExtra()
   fbEnd()
   wTarget(prev)
   // Every frame a builder opened is closed, so the one depth not given back is the function's

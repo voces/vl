@@ -1543,6 +1543,7 @@ Deno.test({
       "atomic-value-off-plan": 2,
       "memory-store-value-off-plan": 2,
       "simd-operand-off-plan": 2,
+      "call-write-back-not-a-capture": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
