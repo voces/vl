@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage, control-flow batch 3: an else-less value `if`, a left operand or earlier field staged below a valued `if`, a start body's bare block, a decided `is` in a value or tail `if`, and a valued `break` out of a `for`.** The else-less `if` takes the join's own null: the union box's null tag, the reference kind's typed null, or the `i32` niche sentinel. It shares legacy's predicates (`elseLessUnionIfWhy`, `ifNoElseNicheOf`) instead of mirroring them. tests/cases: covered functions +76, starts +27. `expression if no else` 19 → 0, `decided is condition` 29 → 0, `break` 20 → 0, `short-circuit right operand` 11 → 2, `top-level bare block` 32 → 0 starts. No legacy bytes moved.
