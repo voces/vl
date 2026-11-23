@@ -8,6 +8,24 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-23-ir-cf-batch2](2026-11-23-ir-cf-batch2.md): IR: the valued integer switch, 2026-11-23
+- [2026-11-23-coalesce-field-call-receiver-once](2026-11-23-coalesce-field-call-receiver-once.md): D17059: a union-field `??` evaluates a call receiver once (2026-11-23, lane IR-N2)
+- [2026-11-22-ir-verify-end-pad](2026-11-22-ir-verify-end-pad.md): IR verifier: thirteen legacy queries become builder records (2026-11-22, lane IR-D1)
+- [2026-11-22-ir-print-unbox-str](2026-11-22-ir-print-unbox-str.md): IR: an unbox to the string kind reads at `string` (2026-11-22, lane IR-N8)
+- [2026-11-22-ir-prepost-fold](2026-11-22-ir-prepost-fold.md): IR order check: the early build runs unarmed, and the order check folds into the shadow, 2026-11-22
+- [2026-11-22-ir-object-member-batch](2026-11-22-ir-object-member-batch.md): IR: shift-mask fold narrowing sources and pinned template holes (2026-11-22, lane IR-N5)
+- [2026-11-22-ir-narrowed-read-residue](2026-11-22-ir-narrowed-read-residue.md): IR: a record written at a row its binding is not declared at (2026-11-22, lane IR-N5)
+- [2026-11-22-ir-n7-batch-b](2026-11-22-ir-n7-batch-b.md): IR coverage, batch B: a tagged call's union result, and a closure cell initialized from a closure global (2026-11-22, lane IR-N7)
+- [2026-11-22-ir-n7-batch-a](2026-11-22-ir-n7-batch-a.md): IR coverage: a reference that stores as its destination's valtype passes as it stands (2026-11-22, lane IR-N7, batch A)
+- [2026-11-22-ir-n3-batch1](2026-11-22-ir-n3-batch1.md): IR-N3 batch 1: long list literals (2026-11-22, lane IR-N3)
+- [2026-11-22-ir-map-read-batch](2026-11-22-ir-map-read-batch.md): IR: the map-read tail, batched (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-is-staged](2026-11-22-ir-is-staged.md): IR batch: an `is` content check (`isFit`) and the `listFit` rung (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-is-rung-batch](2026-11-22-ir-is-rung-batch.md): IR batch: the `litMember` rung, the `boxStash` rung, two slot-after-operand moves (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-indirect-call-tag-arg](2026-11-22-ir-indirect-call-tag-arg.md): IR: a tagged set's id handed to the closure adapter as a plain argument (2026-11-22, lane IR-N5)
+- [2026-11-22-ir-if-ref-closure](2026-11-22-ir-if-ref-closure.md): IR: a value `if` joined at a closure, 2026-11-22
+- [2026-11-22-ir-closure-hole-retag](2026-11-22-ir-closure-hole-retag.md): IR: a closure read across closure openness is the same closure struct, retagged, 2026-11-22
+- [2026-11-22-ir-capture-write-back](2026-11-22-ir-capture-write-back.md): IR: lifted capture write-back, both sides (2026-11-22, lane IR-N8)
+- [2026-11-22-d17055-coalesce-set-list](2026-11-22-d17055-coalesce-set-list.md): D17055: a `??` default over a holder of a function set is built as the set's ids, 2026-11-22
 - [2026-11-22-legacy-shared-slot-after-operand](2026-11-22-legacy-shared-slot-after-operand.md): Legacy: a shared stash slot is taken after its operand (2026-11-22, lane IR-N2)
 - [2026-11-22-legacy-never-arm-store](2026-11-22-legacy-never-arm-store.md): Legacy writes no store after a never binding arm (IR-C1)
 - [2026-11-22-ir-verify-global-store-ty](2026-11-22-ir-verify-global-store-ty.md): IR verifier: a global read's storage row is the builder's record (2026-11-22, lane IR-D1)
