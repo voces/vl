@@ -116,6 +116,9 @@ const selfTestIds: string[] = [
   "retag-field-alike-records-two-heaps",
   "push-many-of-i32",
   "global-read-off-store-type",
+  "return-not-stored-alike",
+  "return-stored-alike",
+  "return-stored-unlike",
   "valued-block-temp-out",
   "atom-sole-into-i32",
   "atom-tower-i32-read",
@@ -139,10 +142,45 @@ const selfTestIds: string[] = [
   "never-call-value-at-consumer-rep",
   "returning-call-temp-typed-never",
   "never-call-value-into-bool",
+  "never-field-read-at-its-storage",
+  "never-field-read-off-its-storage",
+  "rep-typed-thunk-forwards",
+  "rep-typed-thunk-forwards-env",
+  "rep-typed-result-not-thunk",
 ]
+
+// Rule 1 for a result typed by its rep (`irRetFromRep`): `thunk(env, p) { t = call f0(p); return
+// t }` holds; forwarding the env in `p`'s place, or the mark outside a thunk, is refused.
+function repTypedThunkFn(id: string): IrFn {
+  const i32r = repNodeOfTy(TY_I32)
+  const f = irFnNew(-1, "selftest thunk")
+  f.irThunk = id != "rep-typed-result-not-thunk"
+  f.irRetFromRep = true
+  f.irRetRep = i32r
+  f.irRetTy = TY_I32
+  const e = irVarNew(f, i32r, TY_I32, "param", 0)
+  const p = irVarNew(f, i32r, TY_I32, "param", 1)
+  f.irParams.push(e)
+  f.irParams.push(p)
+  irSigNote(f, 0, [i32r], i32r)
+  const t = irVarNew(f, i32r, TY_I32, "temp", -1)
+  const arg = if id == "rep-typed-thunk-forwards-env" { v(e) } else { v(p) }
+  const c: Rhs = {
+    caCallee: 0,
+    caArgs: [arg],
+    caNever: false,
+    caEnv: false,
+    caCaps: [],
+    caWb: [],
+  }
+  f.irBody.push(node(f, { lDst: t, lRhs: c }, i32r))
+  f.irBody.push(node(f, { rtHas: true, rtV: v(t) }, repNodeOfTy(TY_NEVER)))
+  return f
+}
 
 // `f(p: i32): i32 { t = p + 1; return t }`, broken the way case `id` names ("holds": not broken).
 function caseFn(id: string): IrFn {
+  if id.slice(0, 10) == "rep-typed-" { return repTypedThunkFn(id) }
   const i32r = repNodeOfTy(TY_I32)
   const boolr = repNodeOfTy(TY_BOOL)
   const none = repNodeOfTy(TY_NEVER)
@@ -184,6 +222,29 @@ function caseFn(id: string): IrFn {
     f.irBody.push(node(f, { swOn: p, swArms: [], swOut: -1 }, none))
   }
   // Rule 5 again: the body ends in an `if` whose arms fall through, and nothing returns.
+  // Rule 2 at a return: an `i32[]` result returned a `boolean[]` parameter, refused unless the
+  // builder noted both reps stored at one valtype (`irRepValtype`), and refused where it noted two.
+  if (
+    id == "return-not-stored-alike"
+    || id == "return-stored-alike"
+    || id == "return-stored-unlike"
+  ) {
+    const la = mkArrayTy(TY_I32)
+    const lb = mkArrayTy(TY_BOOL)
+    f.irRetRep = repNodeOfTy(la)
+    f.irRetTy = la
+    const pb = irVarNew(f, repNodeOfTy(lb), lb, "param", 1)
+    f.irParams.push(pb)
+    const one: u8[] = [7]
+    const two: u8[] = [8]
+    if id != "return-not-stored-alike" {
+      f.irRepValtype[f.irRetRep] = one
+      f.irRepValtype[repNodeOfTy(lb)] = two
+      if id == "return-stored-alike" { f.irRepValtype[repNodeOfTy(lb)] = one }
+    }
+    f.irBody.push(node(f, { rtHas: true, rtV: v(pb) }, none))
+    return f
+  }
   if id == "if-falls-off-end" {
     f.irBody.push(node(f, sIf(imm(boolr, 1), [], [], -1, false), none))
     return f
@@ -204,6 +265,28 @@ function caseFn(id: string): IrFn {
     f.irBody.push(
       node(f, { lDst: g, lRhs: { rkV: from, rkAt: -1, rkFe: -1 } }, i32r),
     )
+  }
+  // Rule 3: a field read typed `never` holds at the rep its record's row stores the field at,
+  // and breaks the rule at any other.
+  if (
+    id == "never-field-read-at-its-storage"
+    || id == "never-field-read-off-its-storage"
+  ) {
+    const ot = mkObjTy(["c0", "c1"], [TY_I32, TY_I32])
+    const rec = irVarNew(f, repNodeOfTy(ot), ot, "param", 1)
+    f.irParams.push(rec)
+    const at = if id == "never-field-read-at-its-storage" { i32r } else { boolr }
+    const g = irVarNew(f, at, TY_NEVER, "temp", -1)
+    const gf: Rhs = {
+      gfV: v(rec),
+      gfIx: 0,
+      gfAt: -1,
+      gfStored: false,
+      gfStr: false,
+      gfShared: false,
+    }
+    f.irBody.push(node(f, { lDst: g, lRhs: gf }, at))
+    f.irBody.push(node(f, { dpV: v(g) }, none))
   }
   // Rule 2: a hand pick (`RHandPick`) reads a member of a bundle record into a closure; one of an
   // i32, or of a record into an i32, is refused.

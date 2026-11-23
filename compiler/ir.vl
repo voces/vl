@@ -65,6 +65,7 @@ export type StrOp = "concat"
   | "indexof"
   | "includes"
   | "charcode"
+  | "cpat"
 export type CastFail = "trap" | "null"
 
 // The right-hand side of an `SLet`; the result rep is its destination's.
@@ -297,13 +298,14 @@ export type RAtomEq = {
 }
 // The `==` (or, with `ueNe`, `!=`) of two union boxes at compare node `ueAt`, written by legacy's
 // compare over the two operands (`unionUnionBoxesTail`): the struct union's, or the staged one.
-// A union box `ucBox` against concrete `ucOther` at compare node `ucAt` (`ucSwap` where the box
-// is the right side), by legacy's plan: the box's tag, its payload, the operand and the compare.
+// A union box `ucBox` against `ucOther` at `ucAt` (`ucSwap`: the box on the right) by legacy's plan;
+// `ucStash`: a box that is no place, read once into legacy's stash (`unionEqStashPlanOf`).
 export type RUnionConcreteEq = {
   ucBox: Opnd,
   ucOther: Opnd,
   ucNe: boolean,
   ucSwap: boolean,
+  ucStash: boolean,
   ucAt: i32,
 }
 export type RUnionEq = { ueL: Opnd, ueR: Opnd, ueNe: boolean, ueAt: i32 }
@@ -336,9 +338,16 @@ export type RListStage = { rsgV: Opnd, rsgAt: i32 }
 export type RListPop = { lqV: Opnd, lqAt: i32 }
 // A `.clear()` statement on list `lkV`, its call `lkAt`: the length is zeroed, the backing kept.
 export type RListClear = { lkV: Opnd, lkAt: i32 }
+// `RMapFilter`'s operands: the list, the callback, then the captures it builds the callback from.
+function mapFilterOpnds(r: RMapFilter): Opnd[] {
+  const out: Opnd[] = [r.hfV, r.hfC]
+  for o in r.hfEnv { out.push(o) }
+  return out
+}
+
 // A `.map` or `.filter` of list `hfV` at call `hfAt` by callback `hfC`: a function-typed value, or
-// the `null` immediate for a capture-free function legacy's closure writer builds at the loop.
-export type RMapFilter = { hfV: Opnd, hfC: Opnd, hfAt: i32 }
+// the `null` immediate for a function built at the loop, from its captures `hfEnv` when it has any.
+export type RMapFilter = { hfV: Opnd, hfC: Opnd, hfEnv: Opnd[], hfAt: i32 }
 // A list `.slice` of list `scV` at call `scAt` over its bounds `scArgs` (start, then an optional end).
 export type RListSlice = { scV: Opnd, scArgs: Opnd[], scAt: i32 }
 // A map operation `mpOp` at node `mpAt` over `mpArgs`, its receiver first: `size` is `m.length`,
@@ -439,6 +448,17 @@ export type RMapGet = {
 // `m.keys()` or, under `miVals`, `m.values()` at call `miAt` over map variable `miV`, which legacy's
 // writer reads three times (`mapListStep`): a fresh list of the live entries.
 export type RMapIter = { miV: Opnd, miAt: i32, miVals: boolean }
+// A scalar map read `m[k]` against operand `mqOther` at compare node `mqAt` (`scalarMapEqPlanOf`'s
+// `read` arm): map global `mqSym` (recovered for `mqNonNull`) or receiver `mqLoc`, key `mqKey`;
+// a miss equals nothing. An i32 0 or 1.
+export type RMapEq = {
+  mqSym: i32,
+  mqNonNull: boolean,
+  mqLoc: Opnd,
+  mqKey: Opnd,
+  mqOther: Opnd,
+  mqAt: i32,
+}
 // `m.has(k)` at call `mhAt` on map global `mhSym` (receiver node `mhRecv`, recovered for
 // `mhNonNull`), or with `mhSym` -1 receiver operand `mhLoc`, key `mhKey`: legacy's probe and hit flag, an
 // i32 0 or 1.
@@ -575,6 +595,7 @@ export type Rhs = RArmUnbox
   | RMakeList
   | RMakeRec
   | RMapDelete
+  | RMapEq
   | RMapFilter
   | RMapGet
   | RMapGetOr
@@ -827,6 +848,9 @@ export type IrFn = {
   // A closure thunk: one call forwarding its parameters, in tail form whatever the callee
   // returns, as `emitCloThunkCode` writes it.
   irThunk: boolean,
+  // A thunk whose result type is its rep's own (`repTyOf`), its target's being open: the verifier
+  // then checks the thunk forwards faithfully, since that type round-trips to its rep by origin.
+  irRetFromRep: boolean,
   // A lifted function's assigned captures, the parameter variables every exit hands back after
   // its result (D3664), in legacy's order (`fbSeedRetExtra`).
   irRetExtra: i32[],
@@ -940,6 +964,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irHelper: false,
     irFragment: false,
     irThunk: false,
+    irRetFromRep: false,
     irRetExtra: [],
     irSigFn: [],
     irSigParams: [],
@@ -1221,6 +1246,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RMakeList |
       RMakeRec |
       RMapDelete |
+      RMapEq |
       RMapFilter |
       RMapGet |
       RMapGetOr |
@@ -1543,7 +1569,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListStage => [r.rsgV]
     RListPop => [r.lqV]
     RListClear => [r.lkV]
-    RMapFilter => [r.hfV, r.hfC]
+    RMapFilter => mapFilterOpnds(r)
     RListSlice => opndsCat([r.scV], r.scArgs)
     RMapOp => r.mpArgs
     RMapNew => []
@@ -1552,6 +1578,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMapGet => [r.mtLoc, r.mtKey]
     RMapHas => [r.mhLoc, r.mhKey]
     RMapDelete => [r.mdLoc, r.mdKey]
+    RMapEq => [r.mqLoc, r.mqKey, r.mqOther]
     RMapIter => [r.miV]
     RPrint => [r.pnV]
     RStrOp => r.soArgs
@@ -1660,7 +1687,13 @@ function rhsText(r: Rhs): string {
     RListStage => "stage_recv " + opndText(r.rsgV)
     RListPop => "pop " + opndText(r.lqV)
     RListClear => "clear " + opndText(r.lkV)
-    RMapFilter => "mapfilter " + opndText(r.hfV) + ", " + opndText(r.hfC)
+    RMapFilter => "mapfilter "
+      + opndText(r.hfV)
+      + ", "
+      + opndText(r.hfC)
+      + "("
+      + opndsText(r.hfEnv)
+      + ")"
     RListSlice => "slice " + opndText(r.scV) + ", " + opndsText(r.scArgs)
     RNumWiden => "widen " + opndText(r.nwV)
     ROptRead => "opt_read " + opndText(r.orV)
@@ -1684,7 +1717,11 @@ function rhsText(r: Rhs): string {
     RAsUnion => "as.union " + opndText(r.auV)
     RAsTail => "as.tail " + opndText(r.akV)
     RArmUnbox => "arm_unbox " + opndText(r.uaV) + " @" + i32ToStr(r.uaAt)
-    RUnionConcreteEq => "union.eqc " + opndText(r.ucBox) + " " + opndText(r.ucOther)
+    RUnionConcreteEq => "union.eqc "
+      + (if r.ucStash { "stash " } else { "" })
+      + opndText(r.ucBox)
+      + " "
+      + opndText(r.ucOther)
     RUnionEq => "union.eq " + opndText(r.ueL) + " " + opndText(r.ueR)
     RListEq => "list.eq " + opndText(r.qeL) + " " + opndText(r.qeR)
     RClosureEq => "closure_eq(" + opndText(r.cqL) + ", " + opndText(r.cqR) + ")"
@@ -1725,6 +1762,12 @@ function rhsText(r: Rhs): string {
     RMapGet => "map.get " + mapRecvText(r.mtSym, r.mtLoc) + "[" + opndText(r.mtKey) + "]"
     RMapHas => "map.has " + mapRecvText(r.mhSym, r.mhLoc) + "[" + opndText(r.mhKey) + "]"
     RMapDelete => "map.delete " + mapRecvText(r.mdSym, r.mdLoc) + "[" + opndText(r.mdKey) + "]"
+    RMapEq => "map.eq "
+      + mapRecvText(r.mqSym, r.mqLoc)
+      + "["
+      + opndText(r.mqKey)
+      + "] "
+      + opndText(r.mqOther)
     RMapIter => (if r.miVals { "map.values " } else { "map.keys " }) + opndText(r.miV)
     RStrOp => "str." + r.soOp + "(" + opndsText(r.soArgs) + ")"
     RStructEq => "struct_eq("
@@ -2046,6 +2089,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RSpread |
       RStrOp => "list"
     RMapDelete |
+      RMapEq |
       RMapGet |
       RMapGetOr |
       RMapHas |

@@ -67,6 +67,7 @@ import {
   RMakeList,
   RMakeRec,
   RMapDelete,
+  RMapEq,
   RMapFilter,
   RMapGet,
   RMapGetOr,
@@ -1075,11 +1076,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.ucBox, at)
       use(r.ucOther, at)
       const bv = r.ucBox
+      // A stashed box is read once, so it may be any value.
       if (
-        !(bv is OVar)
-        || bv.ov < 0
-        || bv.ov >= vf.irVars.length
-        || vf.irVars[bv.ov].vKind == "temp"
+        !r.ucStash
+        && (!(bv is OVar)
+          || bv.ov < 0
+          || bv.ov >= vf.irVars.length
+          || vf.irVars[bv.ov].vKind == "temp")
       ) {
         return fail(2, at, "a union compare's box is not a re-read variable")
       }
@@ -1182,6 +1185,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(2, at, "a map or filter of a non-list")
       }
       if !(r.hfC is OImm) { use(r.hfC, at) }
+      uses(r.hfEnv, at)
+      if r.hfEnv.length > 0 && !(r.hfC is OImm) {
+        return fail(2, at, "a map callback built from captures is no value")
+      }
       0
     }
     RListSlice => {
@@ -1449,6 +1456,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RMapEq => {
+      use(r.mqKey, at)
+      use(r.mqOther, at)
+      if !mapRecvOk(r.mqSym, r.mqLoc, at) {
+        return fail(2, at, "a map compare of a receiver that is no map")
+      }
+      if dst >= 0 && dst != vfBool && dst != vfI32 {
+        return fail(2, at, "a map compare is a boolean")
+      }
+      0
+    }
     RMapHas => {
       use(r.mhKey, at)
       if !mapRecvOk(r.mhSym, r.mhLoc, at) {
@@ -1536,7 +1554,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       let i = 0
       while i < r.soArgs.length {
-        const idx = (r.soOp == "slice" || r.soOp == "charcode") && i > 0
+        const idx = (r.soOp == "slice"
+          || r.soOp == "charcode"
+          || r.soOp == "cpat")
+          && i > 0
         const want = if r.soOp == "fromcp" || idx { vfI32 } else { vfStr }
         if opRep(r.soArgs[i]) != want {
           return fail(2, at, "a string operator's operand rep")
@@ -2443,6 +2464,8 @@ function stmt(id: i32, prev: i32) {
         if (
           opRep(n.rtV) != vf.irRetRep
           && !vfOpenTakes(vf.irRetTy, vf.irRetRep, opRep(n.rtV))
+          && !vfStoresAs(vf.irRetRep, opRep(n.rtV))
+          && !repNullRefFits(opRep(n.rtV), vf.irRetRep)
         ) {
           return fail(2, id, "a return's rep is not the result's")
         }
@@ -2768,6 +2791,7 @@ function rhsReadsList(r: Rhs): boolean {
       RMakeList |
       RMakeRec |
       RMapDelete |
+      RMapEq |
       RMapFilter |
       RMapGet |
       RMapGetOr |
@@ -3025,6 +3049,11 @@ export function irVerify(f: IrFn): IrVerdict {
   if vfRule == 0 && vfPushed.length > 0 {
     fail(10, -1, "a push no store consumes")
   }
+  // Rule 1 for a result typed by its rep (`irRetFromRep`): only a faithful thunk may carry one.
+  if vfRule == 0 && f.irRetFromRep {
+    const tw = thunkForwardWhy(f)
+    if tw != "" { fail(1, -1, tw) }
+  }
   // Rule 5 at the end: a function with a result leaves its body on every path, or falls into
   // the `null` or `unreachable` the lowering pads its end with, as legacy does.
   if (
@@ -3036,6 +3065,52 @@ export function irVerify(f: IrFn): IrVerdict {
   }
   const v: IrVerdict = { vfRule: vfRule, vfNode: vfAt, vfMsg: vfMsg }
   return v
+}
+
+// Why function `f`, whose result type is its rep's own, is no faithful thunk, or "": one call of the
+// callee its signature notes, on each parameter after the env at that signature's rep, in order,
+// its value at the signature's result rep returned as it stands.
+function thunkForwardWhy(f: IrFn): string {
+  if !f.irThunk { return "a result typed by its rep outside a thunk" }
+  if f.irBody.length != 2 {
+    return "a rep-typed thunk is not one call and its return"
+  }
+  const n0 = f.irNodes[f.irBody[0]]
+  const n1 = f.irNodes[f.irBody[1]]
+  if !(n0 is SLet) || !(n1 is SReturn) {
+    return "a rep-typed thunk is not one call and its return"
+  }
+  const c = n0.lRhs
+  if !(c is RCall) || !n1.rtHas {
+    return "a rep-typed thunk is not one call and its return"
+  }
+  const rv = n1.rtV
+  if !(rv is OVar) || rv.ov != n0.lDst {
+    return "a rep-typed thunk returns no call's value"
+  }
+  const si = irSigOf(f, c.caCallee)
+  if si < 0 { return "a rep-typed thunk's callee has no signature" }
+  const ps = f.irSigParams[si]
+  if c.caArgs.length != ps.length || f.irParams.length != ps.length + 1 {
+    return "a rep-typed thunk does not forward every parameter"
+  }
+  let i = 0
+  while i < ps.length {
+    const a = c.caArgs[i]
+    if (
+      !(a is OVar)
+      || a.ov != f.irParams[i + 1]
+      || f.irVars[a.ov].vRep != ps[i]
+    ) {
+      return "a rep-typed thunk does not forward its parameters in order at the callee's reps"
+    }
+    i = i + 1
+  }
+  const r = f.irSigRet[si]
+  if f.irVars[n0.lDst].vRep != r || f.irRetRep != r {
+    return "a rep-typed thunk's result is not its callee's"
+  }
+  return ""
 }
 
 // Whether a nullable of discipline `disc` over rep `inner` is a niche that holds its inner value
@@ -3092,7 +3167,8 @@ function opndsHoldVar(os: Opnd[], v: i32): boolean {
 }
 
 // Whether variable `i` of `f` is a temp whose checker type has no value, defined by a call that
-// never returns: no value reaches it, so it takes the rep of the consumer legacy writes after it.
+// never returns or by a field read at the rep its record's row stores the field at. No value
+// reaches it, so it takes the rep legacy writes its consumer at.
 function neverCallTemp(f: IrFn, i: i32): boolean {
   const v = f.irVars[i]
   if v.vKind != "temp" || v.vTy < 0 || !repIsNoValue(repNodeOfTy(v.vTy)) {
@@ -3101,6 +3177,10 @@ function neverCallTemp(f: IrFn, i: i32): boolean {
   for n in f.irNodes {
     if n is SLet && n.lDst == i {
       const r = n.lRhs
+      if r is RGetField {
+        const ks = repNodeKids(opRep(r.gfV))
+        return r.gfIx >= 0 && r.gfIx < ks.length && ks[r.gfIx] == v.vRep
+      }
       return r is RCall && r.caNever
     }
   }
