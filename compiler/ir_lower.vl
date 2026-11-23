@@ -73,6 +73,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  addNode,
   condLitTrue,
   i32ToStr,
   nodeAt,
@@ -112,6 +113,7 @@ import {
   OVar,
   Opnd,
   RArmUnbox,
+  RAsTail,
   RAsUnion,
   RAtomEq,
   RAtomSole,
@@ -187,6 +189,7 @@ import {
   RPrint,
   RRawOp,
   RRecCopyPure,
+  RRecordFitIs,
   RRecover,
   RRel,
   RResultPick,
@@ -209,6 +212,7 @@ import {
   RTruncSat,
   RUnionConcreteEq,
   RUnionEq,
+  RVariantChain,
   RVariantDiscrim,
   Rhs,
   SAssign,
@@ -332,6 +336,7 @@ import {
   arrNewLenStash,
   arrNewPlanOf,
   arrNewTail,
+  asLitTail,
   atomEqIsTail,
   atomEqTail,
   atomNotNulIsTail,
@@ -366,6 +371,7 @@ import {
   coalNulRefJoinTag,
   coalNulRefOpen,
   coalNulRefPlanOf,
+  elseLessUnionIfWhy,
   emitArmUnboxAt,
   emitAsUnionTagged,
   emitCapturedRead,
@@ -655,12 +661,15 @@ import {
   coalOptLeafRead,
   discrimFieldEqTail,
   emitListEmptyLoop,
+  emitRecordFitIs,
   emptyFitArmBody,
   emptyFitArmHead,
   emptyFitArmsPlain,
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fbRefIfOpenType,
+  fitRecvLegacy,
+  fitRecvReadHook,
   listFitIsPlanOf,
   listFitTail,
   listIsAcrossPlanOf,
@@ -676,11 +685,13 @@ import {
   numLitOnceMember,
   numLitOnceStash,
   optRecvStagedAt,
+  recordFitPlanOf,
   strMemberEqTail,
   unionLitIsPlanOf,
   unionLitNeverTail,
   unionLitPayloadTail,
   unionLitTagHead,
+  variantRowChainTail,
   variantTagTail,
 } from "./wasmEmit"
 import { coalLhsStashes } from "./emit_query"
@@ -1140,6 +1151,10 @@ function rhs(r: Rhs, tail: boolean) {
       atomStrTail(atomStrPlanOf(r.sxAt, lw.irAt, false))
     }
     RAtomEq => atomEq(r)
+    RAsTail => {
+      irLOpnd(r.akV)
+      if asLitTail(r.akAt, lw.irAt) < 0 { return irLMiss("literal cast tail") }
+    }
     RAsUnion => {
       irLOpnd(r.auV)
       if emitAsUnionTagged(r.auAt, lw.irAt) < 0 {
@@ -1192,6 +1207,8 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.teV)
       boxTagIsTail(r.teTag)
     }
+    RRecordFitIs => irFitTail(r.rfV, r.rfAt, -1, true)
+    RVariantChain => irFitTail(r.vcV, r.vcAt, r.vcVi, false)
     RVariantDiscrim => variantDiscrim(r)
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
@@ -1867,6 +1884,79 @@ function numIs(r: RNumIs): i32 {
     i = i + 1
   }
   return 1
+}
+
+// The operands legacy fit writers' tails re-read through `fitRecvReadHook` while `irFitTail`
+// lowers them, innermost last, the receiver node the innermost stands for, and its reads so far.
+// A stack, not a `let` of `Opnd`: a mutable union-typed module cell is checked dearly (D17063).
+const fitRecvOs: Opnd[] = []
+let fitRecvIx = -1
+let fitRecvReads = 0
+
+// `fitRecvReadHook` under `irFitTail`: the operand the first time, then read again as the builder
+// read it. A receiver other than the one the IR holds misses.
+function irFitRecvRead(recvIx: i32, _fnIx: i32): i32 {
+  if unwrapParen(recvIx) != fitRecvIx {
+    return irLMiss("fit receiver other") - 1
+  }
+  const at = fitRecvOs.length - 1
+  if at < 0 { return irLMiss("fit receiver unset") - 1 }
+  const k = fitRecvReads
+  fitRecvReads = k + 1
+  if k == 0 {
+    irLOpnd(fitRecvOs[at])
+    return 0
+  }
+  return opndAgain(fitRecvOs[at], recvIx)
+}
+
+// Legacy's fit writer for `is` test `isIx` over operand `o`, `emitRecordFitIs` when `record`, else
+// the variant chain tail at arm `vi`: the hook set to read `o` and every piece of its state
+// restored at the one exit, whatever the writer answered.
+function irFitTail(o: Opnd, isIx: i32, vi: i32, record: boolean): i32 {
+  const svHook = fitRecvReadHook
+  const svIx = fitRecvIx
+  const svReads = fitRecvReads
+  fitRecvReadHook = irFitRecvRead
+  fitRecvOs.push(o)
+  fitRecvIx = -1
+  fitRecvReads = 0
+  let rc = -1
+  if isIx >= 0 && isIx < P.nodes.length {
+    const n = nodeAt(isIx)
+    if n is IsExpr {
+      fitRecvIx = unwrapParen(n.isObj)
+      rc = if !record { variantRowChainTail(isIx, n, lw.irAt, vi, -1) } else if recordFitPlanOf(isIx, lw.irAt) == 1 { emitRecordFitIs(isIx, lw.irAt) } else { irLMiss("record fit plan") - 1 }
+    }
+  }
+  if fitRecvIx < 0 { irLMiss("variant chain node") }
+  fitRecvReadHook = svHook
+  fitRecvOs.pop()
+  fitRecvIx = svIx
+  fitRecvReads = svReads
+  return rc
+}
+
+// `irFitTail` on each arm, missing: the chain over a node that is no `is` test, the record writer
+// over an `is` whose plan is no record fit. Each misses, and the hook is back at legacy's default.
+export function irFitTailSelfTest(): i32 {
+  const svMiss = lwMiss
+  const o: Opnd = { oiRep: -1, oiBits: 0 }
+  const rc = irFitTail(o, -1, -1, false)
+  const chainMissed = lwMiss != "" && fitRecvReadHook === fitRecvLegacy
+  lwMiss = ""
+  const s: StrLit = { strText: "s", pos: -1 }
+  const t: IsExpr = {
+    isObj: addNode(s),
+    isVariant: "",
+    pos: -1,
+    isNeg: 0,
+    isFit: -1,
+  }
+  const rr = irFitTail(o, addNode(t), -1, true)
+  const recordMissed = lwMiss != "" && fitRecvReadHook === fitRecvLegacy
+  lwMiss = svMiss
+  return if rc < 0 && rr < 0 && chainMissed && recordMissed { 1 } else { 0 }
 }
 
 // `RVariantDiscrim` as `emitIsTestVariantRow` writes a `discrim` row: the variable and the arm's
@@ -4146,11 +4236,13 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     return IF_DONE
   }
   const vt = if atomJoin || atomOut { 127 } else { valtypeOf(lw.irVars[t].vRep) }
-  // A union join opens at the box's blocktype, as `emitUnionIfValueLink` does.
+  // A union join opens at the box's blocktype, as `emitUnionIfValueLink` does; so does an
+  // else-less one its destination's union coercion writes there.
   const boxOut = !lw.irHelper
     && (rr is RBox || rr is RNullable && rr.rnDisc == 4)
     && at >= 0
-    && ifJoinPlanOf(at, lw.irAt).ijArm == "union"
+    && (ifJoinPlanOf(at, lw.irAt).ijArm == "union"
+    || elseLessUnionIfWhy(at, lw.irAt, lw.irVars[t].vTy) == "")
   // A string or reference out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
   const strOut = (repPrim(lw.irVars[t].vRep) == "str"
     || rr is RRecord
