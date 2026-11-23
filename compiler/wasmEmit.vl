@@ -1234,6 +1234,7 @@ import {
   spreadSrcNulMode,
   structEqStashSlot,
   unionEqArmSlot,
+  unionEqOperandSlot,
   unionEqStashSlot,
   unionEqStashSlot2,
   unionLitIsStashSlot,
@@ -1326,8 +1327,6 @@ import {
   ListBuild,
   emptyArrHoleBuildKind,
   emptyArrHoleBuildSlot,
-  emptyArrUnionArmKind,
-  emptyArrUnionArmSlot,
   rlBoxIntoRowList,
   rlWidenAllowed,
   rlWidenTagOf,
@@ -1454,7 +1453,6 @@ import {
   rlElemUnionName,
   unMemIsMap,
   unMemIsRefElemArray,
-  unionHasAtomOfTy,
   unionMemberSetOfRow,
   unionMemberTysOfRow,
   unionRowKeyAB,
@@ -1777,6 +1775,7 @@ import {
   coerceSetHasNull,
   coerceTakesAtomAsStr,
   coerceValueAtomKind,
+  emptyArrUnionArmTag,
   eqAtomOperandOk,
   eqOperandRecovers,
   holeBoxPlanOf,
@@ -8625,22 +8624,7 @@ function emitEmptyArrUnionArm(
   fnIx: i32,
 ) {
   if unionName == "" { return 0 }
-  const bare = nodeAt(unwrapParen(exprIx))
-  if bare is ArrayLit {
-    if bare.arrElems.length != 0 { return 0 }
-  } else {
-    return 0
-  }
-  if unionHasAtomOfTy(unionTy, "i32", true) { return 0 }
-  const k = emptyArrUnionArmKind(exprIx)
-  let tag = -1
-  if k == "strlist" {
-    tag = scalarTagOfKind(9) // "string[]", the tag a `(string | null)[]` arm shares
-  } else if k == "reflist" {
-    const slot = emptyArrUnionArmSlot(exprIx)
-    if !unionHasRefArrayArmSlot(unionTy, slot) { return 0 }
-    tag = refArrBoxTagOf(exprIx, fnIx, slot, unionTy)
-  }
+  const tag = emptyArrUnionArmTag(unionTy, exprIx, fnIx)
   if tag < 0 { return 0 }
   fbI32Rel(RS_TAG, tag)
   const rc = emitExpr(exprIx, fnIx)
@@ -9202,6 +9186,19 @@ export function elseLessUnionIfWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
   return ifShapeWhyOf(ix, fnIx, false)
 }
 
+// Why a value `if` with an `else`, delivered into union `unionTy`'s box, is not written arm by arm
+// at that box (`emitUnionCoerceUnder`'s `if` arm, `emitUnionIfValue`), or "".
+export function unionIfAtDstWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
+  const ix = unwrapParen(ixIn)
+  if ix < 0 { return "node" }
+  const n = nodeAt(ix)
+  if !(n is IfStmt) || n.ifElse < 0 { return "no else" }
+  if unionArmTagClash(unionTy) != "" { return "tag clash" }
+  if callIsNever(ix) { return "never" }
+  if unionCoerceIfArmOf(ix, fnIx) != "value" { return "not value arm" }
+  return ifShapeWhyOf(ix, fnIx, true)
+}
+
 // `emitUnionCoerce`'s body: the arms that thread a list or f32 context apply it and leave it
 // for the wrapper's exit to undo.
 function emitUnionCoerceUnder(
@@ -9649,7 +9646,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
     "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "clo" => true
-    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "ladder" => false
+    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "retag" | "ladder" => false
   }
 }
 
@@ -9673,7 +9670,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     // The niche's stash slot is taken ahead of its value, as legacy's rung takes it.
     "nulNiche" => if nulNicheBoxSlot() < 0 { -1 } else { 0 }
     "nulBool" => if nulBoolBoxSlot() < 0 { -1 } else { 0 }
-    "pass" | "memberBox" | "atomStr" | "mapScalar" => 0
+    "pass" | "memberBox" | "atomStr" | "mapScalar" | "retag" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
 }
@@ -9686,6 +9683,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
     "nulBool" => nulBoolBoxTail()
+    "retag" => boxRetagTail(p.hbKind, exprIx, fnIx)
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
   }
 }
@@ -9722,6 +9720,7 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     || p.hbArm == "refList"
     || p.hbArm == "map"
     || p.hbArm == "clo"
+    || p.hbArm == "retag"
   ) {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
   }
@@ -9774,6 +9773,12 @@ function emitUnionBoxArg(
   boxDstShadowLeave()
   if go < 0 { return -1 }
   if !exprUnion(exprIx, fnIx) || deliveryRetagHas(exprIx) { return 0 }
+  return boxRetagTail(unionTy, exprIx, fnIx)
+}
+
+// The box of `exprIx` on the stack rebuilt at `unionTy` where its members' tags owe it
+// (`emitBoxAtomRetagMembers`); nothing where they owe none.
+export function boxRetagTail(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
   const ft: i32[] = []
   const tt: i32[] = []
   if !boxRetagArmsOfTys(unionBoxTyIxOfExpr(exprIx, fnIx), unionTy, ft, tt) {
@@ -10632,12 +10637,11 @@ export function unionConcreteEqPlanOf(
   let hasArm = unionEqArmPresent(usid, valueAtomNameOfKind(eak), eak)
   if !hasArm && eak == 2 && msSetTakesAtomAsStr(usid) { hasArm = true }
   if !hasArm { return no }
-  // The operand's null legs (`nulOther`, `nulStrOther`, `nulBoolOther`) test it first.
-  if unionEqOperandOk(otherIx) && unionSetHasNullTy(uname, bty) {
-    const nul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
-    if eak == 2 && (exprNulLitUnion(otherIx, fnIx) || nul) { return no }
-    if eak == 1 && nul { return no }
-  }
+  // The operand's null legs (`nulOther`, `nulStrOther`, `nulBoolOther`) test it first. A string
+  // or atom operand that holds `null` takes its leg whether or not the union does (D17065).
+  const nul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+  if eak == 2 && (exprNulLitUnion(otherIx, fnIx) || nul) { return no }
+  if eak == 1 && nul && unionSetHasNullTy(uname, bty) { return no }
   const tag = unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], fnIx))
   const p: UnionEqPlan = { uqKind: eak, uqTag: tag }
   return p
@@ -10665,6 +10669,11 @@ export function unionEqStashPlanOf(
   let hasArm = unionEqArmPresent(usid, valueAtomNameOfKind(eak), eak)
   if !hasArm && eak == 2 && msSetTakesAtomAsStr(usid) { hasArm = true }
   if !hasArm { return no }
+  // An operand with a null leg takes the re-reading arms, which stage the box (D17065).
+  const nul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+  if eak == 2 && (exprNulLitUnion(otherIx, fnIx) || nul) { return no }
+  const bty = unionBoxTyOfRead(boxIx, fnIx)
+  if eak == 1 && nul && unionSetHasNullTy(uname, bty) { return no }
   const p: UnionEqPlan = {
     uqKind: eak,
     uqTag: unionEqTagOfArmTy(
@@ -10824,60 +10833,75 @@ function emitUnionConcreteEq(
     if isNe { fbI32Const(1) } else { fbI32Const(0) }
     return 0
   }
-  // The arms below read the box more than once: a box that is no place left through the stash.
-  if !unionEqOperandOk(boxIx) {
-    return emitFail(
-      "emitProgram: internal: a union compare reached its re-reading arms with a box that is no place (unionEqStashPlanOf takes every such box)",
-    )
-  }
+  // A string or atom operand holding `null` is tested first, with or without the union's `null`
+  // arm (D17065); a box that is no place is read once, into the stash, ahead of it.
+  const boxNul = unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
+  const eqStash = unionEqStashSlot()
+  const eqOnce = !unionEqOperandOk(boxIx)
   // A `K | null` operand equals the box's null when it is `-1`, and is a member string
   // otherwise, where the widened operand is non-null (D3347).
   const nulOther = eak == 2
     && exprNulLitUnion(otherIx, fnIx)
     && unionEqOperandOk(otherIx)
-    && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
+  // A nullable string at the instance (`T` pinned to `string | null`) equals the box's null when
+  // it is null, read raw for the test; present, it compares as the string below.
+  const nulStrOperand = eak == 2
+    && !nulOther
+    && !exprNulLitUnion(otherIx, fnIx)
+    && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+  // A nullable string operand that is no place is read once, into its own slot (`opStage`).
+  const opStage = nulStrOperand && !unionEqOperandOk(otherIx)
+  const nulStrOther = nulStrOperand
+  if (
+    eak == 2
+    && !nulOther
+    && !nulStrOther
+    && (exprNulLitUnion(otherIx, fnIx)
+      || tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx)))
+  ) {
+    return emitFail(
+      "emitProgram: a union `==` against a `K | null` atom operand that is no place is not supported yet",
+    )
+  }
+  // The `boolean | null` niche's null is the value 2 (D2260); an operand that is no place is
+  // read once, into its own slot (`boolStage`).
+  const nulBoolOther = eak == 1
+    && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+    && boxNul
+  const boolStage = nulBoolOther && !unionEqOperandOk(otherIx)
+  const staged = eqOnce && (nulOther || nulStrOther || nulBoolOther)
+  if eqOnce && !staged {
+    return emitFail(
+      "emitProgram: internal: a union compare reached its re-reading arms with a box that is no place and no null leg (unionEqStashPlanOf takes every such box)",
+    )
+  }
+  if staged {
+    if emitExpr(boxIx, fnIx) < 0 { return -1 }
+    fbLocalSet(eqStash)
+  }
   if nulOther {
     if emitExpr(otherIx, fnIx) < 0 { return -1 }
     fbI32Const(-1)
     fbI32Bin(70)
     fbIf(127)
-    if emitExpr(boxIx, fnIx) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbI32Bin(70)
+    if unionEqNullLeg(boxIx, boxNul, staged, eqStash, fnIx) < 0 { return -1 }
     fbElse()
   }
-  // A nullable string at the instance (`T` pinned to `string | null`) equals the box's null when
-  // it is null, read raw for the test; present, it compares as the string below.
-  const nulStrOther = eak == 2
-    && !nulOther
-    && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
-    && unionEqOperandOk(otherIx)
-    && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
-  // The `boolean | null` niche's null is the value 2 (D2260).
-  const nulBoolOther = eak == 1
-    && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
-    && unionEqOperandOk(otherIx)
-    && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   if nulBoolOther {
     if emitExpr(otherIx, fnIx) < 0 { return -1 }
+    if boolStage { fbLocalTee(unionEqOperandSlot(1)) }
     fbI32Const(2)
     fbI32Bin(70)
     fbIf(127)
-    if emitExpr(boxIx, fnIx) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbI32Bin(70)
+    if unionEqNullLeg(boxIx, boxNul, staged, eqStash, fnIx) < 0 { return -1 }
     fbElse()
   }
   if nulStrOther {
     if emitExpr(otherIx, fnIx) < 0 { return -1 }
+    if opStage { fbLocalTee(unionEqOperandSlot(0)) }
     fbRefIsNull()
     fbIf(127)
-    if emitExpr(boxIx, fnIx) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbI32Bin(70)
+    if unionEqNullLeg(boxIx, boxNul, staged, eqStash, fnIx) < 0 { return -1 }
     fbElse()
   }
   // The plain arm's tails, around a stashed box and the operand's null legs. The tag is the
@@ -10889,11 +10913,15 @@ function emitUnionConcreteEq(
       cloBoxEqArmTy(otherIx, unr[0], fnIx),
     ),
   }
-  if emitExpr(boxIx, fnIx) < 0 { return -1 }
+  if staged { fbLocalGet(eqStash) }
+  else if emitExpr(boxIx, fnIx) < 0 { return -1 }
   unionEqTagTail(qt)
-  if emitExpr(boxIx, fnIx) < 0 { return -1 }
+  if staged { fbLocalGet(eqStash) }
+  else if emitExpr(boxIx, fnIx) < 0 { return -1 }
   if unionEqPayloadTail(qt) < 0 { return -1 }
-  if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
+  if opStage { fbLocalGet(unionEqOperandSlot(0)) }
+  else if boolStage { fbLocalGet(unionEqOperandSlot(1)) }
+  else if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
   // The null took the other branch, so a nullable operand is the non-null ref here.
   if (
     nulOther
@@ -10904,6 +10932,27 @@ function emitUnionConcreteEq(
   if unionEqCmpTail(qt, false, fnIx) < 0 { return -1 }
   if nulOther || nulStrOther || nulBoolOther { fbEnd() }
   if isNe { fbI32Eqz() }
+  return 0
+}
+
+// A union `==`'s answer where its operand is `null`: the box's own null tag, read again or off
+// the stash where `staged`, or `0` for a union with no `null` arm (`boxNul` false, D17065).
+function unionEqNullLeg(
+  boxIx: i32,
+  boxNul: boolean,
+  staged: boolean,
+  stash: i32,
+  fnIx: i32,
+): i32 {
+  if !boxNul {
+    fbI32Const(0)
+    return 0
+  }
+  if staged { fbLocalGet(stash) }
+  else if emitExpr(boxIx, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Bin(70)
   return 0
 }
 
@@ -45263,7 +45312,7 @@ function emitCoalesceUnionField(
 
 // The stash of a union-field `??`'s receiver `recv` along plan `p`: -1 for a re-readable place,
 // which each arm writes again, else the slot one evaluation is kept in (D17059).
-function coalFieldRecvStash(recv: i32, p: CoalFieldPlan): i32 {
+export function coalFieldRecvStash(recv: i32, p: CoalFieldPlan): i32 {
   if unionEqOperandOk(recv) || p.cfHeap < 0 { return -1 }
   return coalFieldRecvSlot(p.cfHeap)
 }
