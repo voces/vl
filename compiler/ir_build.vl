@@ -7230,6 +7230,16 @@ export function deliverStr(b: i32[], ix: i32): Opnd {
   return deliver(b, ix, repNodeOfTy(TY_STR), TY_STR)
 }
 
+// Element `e` of a union-row list literal, built for its box: a `null` literal has no value of its
+// own, so the box writer writes the null tag alone, as `deliver` hands it a `null`.
+function unionElemValue(b: i32[], e: i32): Opnd {
+  if nodeAt(unwrapParen(e)) is NullLit {
+    const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+    return none
+  }
+  return irBExpr(b, e)
+}
+
 // Whether rep `r` is a record or a nullable record.
 function recordRepOrNull(r: i32): boolean {
   const n = repNodeAt(r)
@@ -7262,9 +7272,10 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     const atom = atomNullable(dst)
     const ref = refNullable(dst) || repPrim(dst) == "null"
     const bool = boolNullable(dst)
-    const own = if atom || ref || bool || strNullable(dst) { nullOwnAt(ix, ibFnIx) } else { -1 }
+    const lit = unwrapParen(ix)
+    const own = if atom || ref || bool || strNullable(dst) { nullOwnAt(lit, ibFnIx) } else { -1 }
     const want = if atom { NULL_OWN_ATOM } else if ref { NULL_OWN_NONE } else if bool { NULL_OWN_BOOL } else { NULL_OWN_STR }
-    if own == want { return repTemp(b, { nuAt: ix, nuOwn: own }, ix, dst) }
+    if own == want { return repTemp(b, { nuAt: lit, nuOwn: own }, ix, dst) }
   }
   // A `null` literal has no value of its own: the box writer writes the null tag alone.
   if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
@@ -8507,7 +8518,14 @@ function arrayLit(
   for e in n.arrElems {
     const at = b.length
     starts.push(at)
-    const v = if dataConst { longConstElem(e, er) } else if vslot >= 0 { variantElem(b, e, er, vslot) } else if uslot >= 0 { boxTempIn(b, irBExpr(b, e), e, er, -1, arrRefUnionElemTy(ix, uslot, ibFnIx)) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else { deliver(b, e, er, -1) }
+    const v = if dataConst { longConstElem(e, er) } else if vslot >= 0 { variantElem(b, e, er, vslot) } else if uslot >= 0 { boxTempIn(
+      b,
+      unionElemValue(b, e),
+      e,
+      er,
+      -1,
+      arrRefUnionElemTy(ix, uslot, ibFnIx),
+    ) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
     // An element written before a valued `if` is staged below it, as a call's argument is.
     if elems.length > 0 && !irBStageLeads(b, at, starts, elems, n.arrElems) {
@@ -10631,6 +10649,15 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   }
   if n is ObjLit { return objLit(b, ix, rep) }
   if n is OptMember { return optRead(b, n, ix, rep) }
+  // A `null` literal at the `null` unit, naming no null of its own, is the bottom ref, as legacy's
+  // `emitNullAt` writes it.
+  if (
+    n is NullLit
+    && repPrim(rep) == "null"
+    && nullOwnAt(ix, ibFnIx) == NULL_OWN_NONE
+  ) {
+    return repTemp(b, { nuAt: ix, nuOwn: NULL_OWN_NONE }, ix, rep)
+  }
   return irBMiss("expression " + irAstKind(ix))
 }
 
