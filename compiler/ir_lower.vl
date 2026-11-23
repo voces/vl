@@ -317,6 +317,7 @@ import {
 } from "./emit_bytes"
 import {
   ARM_IDX_IMM,
+  ARM_IDX_NODE,
   ARM_IDX_STR,
   EQ_ROOT_EXPR,
   EqRootPlace,
@@ -738,6 +739,7 @@ import {
 } from "./emit_plan_list"
 import {
   bankSpanRow,
+  bankedRowsDrop,
   callRefDepth,
   ctrlDepth,
   dfeCallee,
@@ -2329,27 +2331,69 @@ function nicheRead(r: RNicheRead) {
   return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
 }
 
-// `RArmSite`: legacy's tag chain (`armSiteWrite`) over the box variable's local, the index a
-// variable's local, an immediate or a string literal, its element-read row banked around it as legacy's is.
+// `RArmSite`: legacy's tag chain (`armSiteWrite`) over the box: a named variable's local, or the
+// value set into legacy's receiver stash; the index or key a variable's local, an immediate or a
+// string literal. An element read's row is banked around it as legacy's is.
 function armSite(r: RArmSite) {
-  const bl = plainVarLocal(r.asV)
-  if bl < 0 { return irLMiss("arm site receiver") }
-  const ix = r.asIx
-  let il = ARM_IDX_IMM
-  let ii = 0
-  if ix is OImm && repPrim(ix.oiRep) == "i32" {
-    ii = ix.oiBits as% i32
-  } else if ix is OStr {
-    il = ARM_IDX_STR
-  } else {
-    il = plainVarLocal(ix)
-    if il < 0 { return irLMiss("arm site index") }
+  if r.asOps.length < 1 || r.asOps.length > 2 {
+    return irLMiss("arm site operands")
   }
-  leaf()
+  let il = ARM_IDX_NODE
+  let ii = 0
+  if r.asOps.length == 2 {
+    const ix = r.asOps[1]
+    if ix is OImm && repPrim(ix.oiRep) == "i32" {
+      il = ARM_IDX_IMM
+      ii = ix.oiBits as% i32
+    } else if ix is OStr {
+      il = ARM_IDX_STR
+    } else {
+      il = plainVarLocal(ix)
+      if il < 0 { return irLMiss("arm site index") }
+    }
+  }
   const from = irLIndexFrom(r.asAt, lwBuf.length)
+  let bl = -1
+  if r.asStash {
+    // Legacy takes the stash before it writes the box, so the box's own scratch locals follow it.
+    bl = sharedFieldRecvSlot()
+    irLOpnd(r.asOps[0])
+    fbLocalSet(bl)
+  } else {
+    bl = plainVarLocal(r.asOps[0])
+    if bl < 0 { return irLMiss("arm site receiver") }
+    leaf()
+  }
+  const sp = emitFnSpanNode.length
+  const sh = shIdxNode.length
   if armSiteWrite(r.asAt, bl, il, ii, lw.irAt) < 0 { return -1 }
-  irLIndexRow(r.asAt, from)
+  adoptBankedRows(sp, sh)
+  // Only an element read banks a row of its own (`emitIndexBanked`).
+  if nodeAt(r.asAt) is Index { irLIndexRow(r.asAt, from) }
   return 0
+}
+
+// Takes the element-read rows legacy's writer banked since marks `sp` and `sh` as this lowering's,
+// which `fragmentRows` banks again; a writer banks no other kind.
+function adoptBankedRows(sp: i32, sh: i32) {
+  let k = sp
+  while k < emitFnSpanNode.length {
+    if emitFnSpanKind[k] != 6 { return irLMiss("arm site banked row") }
+    lwRowAst.push(emitFnSpanNode[k])
+    lwRowFrom.push(emitFnSpanStart[k])
+    lwRowTo.push(emitFnSpanEnd[k])
+    lwRowKind.push(6)
+    k = k + 1
+  }
+  let q = sh
+  while q < shIdxNode.length {
+    lwRowAst.push(shIdxNode[q])
+    lwRowFrom.push(shIdxFrom[q])
+    lwRowTo.push(shIdxTo[q])
+    lwRowKind.push(6)
+    q = q + 1
+  }
+  return bankedRowsDrop(sp, sh)
 }
 
 // The local a named variable `o` is read from with a plain `local.get`, or -1: a temp, a staged
