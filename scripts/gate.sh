@@ -141,7 +141,7 @@ row_mem() {
     "distilled corpus") echo 1700 ;;
     "rep-fuzz") echo 1600 ;;
     "deno task test"|"plumb-shape cost") echo 1400 ;;
-    "ir shadow"|"ir shadow cases"|"ir prepost") echo 1300 ;;
+    "ir shadow"|"ir shadow cases") echo 1300 ;;
     "ir shadow suite") echo 600 ;;
     "lsp suites (ci list)") echo 1100 ;;
     "scaling shape") echo 900 ;;
@@ -403,15 +403,12 @@ fi
 # The IR shadow over the same corpus: every covered function's lowering must match legacy's
 # bytes and spans, and any verifier failure or mismatch class above
 # `ir-shadow-baseline.txt` reds. The shadow is the check behind every IR claim.
-run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED"
+run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --prepost
 # The same shadow over every tests/cases program, against its own baseline; a byte difference
 # reds in either population, since a claimable function ships its bytes unmatched.
-run "ir shadow cases"          "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --cases
+run "ir shadow cases"          "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --cases --prepost
 # The shipped claim, disarmed: a claimed function emits the IR's bytes, so any fallback reds.
 run "ir claims"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --claims
-# The order check: each function built where a claim builds it and again after legacy, over the
-# corpus and tests/cases; a row above `ir-prepost-baseline.txt` reds (a plan reads legacy's state).
-run "ir prepost"               "$VL" run scripts/silent-sweep/distilled/ir-prepost.vl --compiler "$SEED" -- --seed "$SEED"
 
 # THE OOM WATCH. A kill the kernel made during the run fails the gate, whatever the rows read:
 # a test that expected a failure, or a grader that reads a refusal, takes a killed child for one.

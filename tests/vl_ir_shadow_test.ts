@@ -1534,6 +1534,8 @@ Deno.test({
       "width-retag-noted-leading": 0,
       "width-retag-field-not-leading": 2,
       "width-retag-pair-unnoted": 2,
+      "hand-pick-of-i32": 2,
+      "hand-pick-record-into-i32": 2,
       "retag-closures-of-differing-arity": 2,
       "retag-field-alike-records-two-heaps": 2,
       "global-read-off-store-type": 2,
@@ -1546,6 +1548,7 @@ Deno.test({
       "atomic-value-off-plan": 2,
       "memory-store-value-off-plan": 2,
       "simd-operand-off-plan": 2,
+      "call-write-back-not-a-capture": 2,
       "coal-str-default-off-rep": 2,
       "coal-atom-str-default-off-rep": 2,
     };
