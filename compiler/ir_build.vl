@@ -2289,6 +2289,8 @@ function memberUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
   return irBMiss("member hook not installed")
 }
 
+function openMemberNone(_ix: i32): i32 { return -1 }
+
 function inPlaceNone(_ix: i32, _fnIx: i32): i32 { return 0 }
 
 function unionEqNone(_ix: i32, _fnIx: i32): boolean { return false }
@@ -2306,6 +2308,7 @@ function strBinUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
 export let irVarRepOkHook: (r: i32, ty: i32) => boolean = refRepNone
 export let irIndexHook: (b: i32[], ix: i32, rep: i32) => Opnd = indexUnset
 export let irMemberHook: (b: i32[], ix: i32, rep: i32) => Opnd = memberUnset
+export let irOpenMemberRepHook: (ix: i32) => i32 = openMemberNone
 export let irStrBinHook: (b: i32[], ix: i32, rep: i32) => Opnd = strBinUnset
 export let irInPlaceHook: (ix: i32, fnIx: i32) => i32 = inPlaceNone
 export let irUnionEqHook: (ix: i32, fnIx: i32) => boolean = unionEqNone
@@ -2417,15 +2420,33 @@ function openCallValue(b: i32[], n: Call, ix: i32): Opnd {
   return irBLetTempTy(b, rhs, ix, r, repTyOf(r))
 }
 
-// The rep of the parameter variable read `ix` reads, when `ix` reads this frame's parameter and its
-// own type has no rep; -1 otherwise.
-function openLocalReadRep(ix: i32): i32 {
+// The rep of the type legacy builds array literal `ix` at (`arrLitBuiltTyOf`), or -1.
+function openArrLitRep(ix: i32): i32 {
+  const bt = arrLitBuiltTyOf(ix, ibFnIx)
+  if bt >= 0 && !irTyOpen(bt) && valueRep(repNodeOfTy(bt), bt) {
+    return repNodeOfTy(bt)
+  }
+  // An open built type is the scalar list its builder arm writes (`arrLitArmOf`).
+  const arm = arrLitArmOf(ix, ibFnIx, arrLitListBuild(ix, ibFnIx))
+  const scalar = arm == "i32"
+    || arm == "i64"
+    || arm == "f32"
+    || arm == "f64"
+    || arm == "str"
+  const en = if arm == "str" { "string" } else { arm }
+  const lt = if scalar { repElemTyOfName(en + "[]") } else { -1 }
+  return if lt >= 0 { repNodeOfTy(lt) } else { -1 }
+}
+
+// The rep of the variable read `ix` reads, when `ix` reads this frame's parameter or a `let` the
+// build holds, and its own type has no rep; -1 otherwise.
+export function irBOpenLocalReadRep(ix: i32): i32 {
   if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return -1 }
   const d = identDeclOf(ix)
   if d < 0 || d >= P.nodes.length { return -1 }
   const dn = nodeAt(d)
   const w = if dn is Param { localIndexOf(ibFnIx, ix) } else { -1 }
-  const v = if w >= 0 { paramVarAt(w) } else { -1 }
+  const v = if w >= 0 { paramVarAt(w) } else if dn is LetDecl { ibDeclVar[d] ?? -1 } else { -1 }
   if v < 0 || v >= ib.irVars.length { return -1 }
   const r = ib.irVars[v].vRep
   return if valueRep(r, ib.irVars[v].vTy) { r } else { -1 }
@@ -10017,12 +10038,16 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   const nv = own < 0
     && (n is Call || n is BinExpr || n is Member || n is Unary)
     && exprTyOf(ix) == TY_NEVER
-  // A read of a parameter whose own type has no rep is at the rep its frame holds it at
-  // (`paramFrameTy`, legacy's declared kind).
-  const pr = if own < 0 && !nv { openLocalReadRep(ix) } else { -1 }
+  // A read of a parameter or `let` whose own type has no rep is at its variable's rep
+  // (`paramFrameTy`, legacy's declared kind, or the binding's built value).
+  const pr = if own < 0 && !nv { irBOpenLocalReadRep(ix) } else { -1 }
   // An arithmetic operator whose own type has no rep computes at legacy's width (`binNumWidth`).
   const br = if own < 0 && !nv && pr < 0 { openBinRep(ix) } else { -1 }
-  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else { own }
+  // An array literal whose own type has no rep is at the type legacy builds it at.
+  const ar = if own < 0 && n is ArrayLit { openArrLitRep(ix) } else { -1 }
+  // A shared field read off a hole receiver is at its arms' one storage type (`ir_build_ref`).
+  const mr = if own < 0 && !nv && n is Member { irOpenMemberRepHook(ix) } else { -1 }
+  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else { own }
   // A direct call whose own type has no rep is at its callee's result rep.
   if rep < 0 && n is Call && !nv { return openCallValue(b, n, ix) }
   if rep < 0 {
@@ -10103,8 +10128,12 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     // An atom operand of no atom compare (a `+`, or `==` against a plain string) is the string
     // op's, which decodes the atom to its member string, as legacy's dispatch routes it.
+    // An operand whose own type is open takes legacy's plan for the compare, as an atom one does.
     if (
-      (atomOperand(n.binLeft) || atomOperand(n.binRight))
+      (atomOperand(n.binLeft)
+        || atomOperand(n.binRight)
+        || irTyOpen(exprTyOf(n.binLeft))
+        || irTyOpen(exprTyOf(n.binRight)))
       && atomEqPlanOf(n, ibFnIx).aqArm != "none"
     ) {
       return atomCompare(b, n, ix, rep)
@@ -10278,14 +10307,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   if n is Member { return irMemberHook(b, ix, rep) }
   if n is StrLit { return strLit(ix, rep) }
   if n is ArrayLit {
-    return arrayLit(
-      b,
-      n,
-      ix,
-      rep,
-      arrLitListBuild(ix, ibFnIx),
-      arrLitBuiltTyOf(ix, ibFnIx),
-    )
+    // An open built type is the type of the rep it is built at (`openArrLitRep`).
+    const abt = arrLitBuiltTyOf(ix, ibFnIx)
+    const bt = if ar >= 0 && (abt < 0 || irTyOpen(abt)) { repTyOf(rep) } else { abt }
+    return arrayLit(b, n, ix, rep, arrLitListBuild(ix, ibFnIx), bt)
   }
   if n is CharLit {
     const cp = charLitCp(n)
