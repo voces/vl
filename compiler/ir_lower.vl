@@ -13,6 +13,14 @@ import { mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
 import {
+  emitOptLeafHead,
+  emitOptLeafTail,
+  emitOptLinkNullClose,
+  emitOptLinkNullOpen,
+  optLeafArmOf,
+} from "./wasmEmit"
+import { exprNullableRefNiche } from "./emit_classify"
+import {
   RAtom,
   RBox,
   RClosure,
@@ -129,6 +137,7 @@ import {
   RFnId,
   RGetField,
   RGlobalGet,
+  RHandPick,
   RJoinNull,
   RListCat,
   RListClear,
@@ -144,6 +153,7 @@ import {
   RListNewDefault,
   RListPop,
   RListPush,
+  RListPushMany,
   RListSlice,
   RListStage,
   RLitArms,
@@ -162,6 +172,7 @@ import {
   RMemOp,
   RNicheRead,
   RNulNicheEq,
+  RNulNoneBox,
   RNulTest,
   RNullOf,
   RNumCast,
@@ -170,6 +181,7 @@ import {
   RNumUnionBin,
   RNumUnionConvert,
   RNumWiden,
+  ROptRead,
   RPrimOp,
   RPrint,
   RRawOp,
@@ -272,6 +284,7 @@ import {
   fbRefEq,
   fbRefIsNull,
   fbRefNull,
+  fbRefNullNone,
   fbRefNullOfKind,
   fbRefNullStruct,
   fbRefTest,
@@ -326,6 +339,8 @@ import {
   atomicResultPrim,
   atomicTail,
   boxTagIsTail,
+  bundleHandMemberAt,
+  bundleMemberPickOf,
   bundlePickOf,
   bundleResultPickOf,
   callRefCallTail,
@@ -346,6 +361,7 @@ import {
   coalNulRefBranch,
   coalNulRefJoinOpen,
   coalNulRefJoinPresent,
+  coalNulRefJoinTag,
   coalNulRefOpen,
   coalNulRefPlanOf,
   emitArmUnboxAt,
@@ -464,6 +480,8 @@ import {
   nulNicheEqNullTail,
   nulNicheEqRightTail,
   nulNicheEqWhy,
+  nulNoneBoxHead,
+  nulNoneBoxTail,
   nulTestAtomTail,
   nulTestBoolTail,
   nulTestBoxTagTail,
@@ -559,7 +577,10 @@ import {
   unionEqTagTail,
   unionLetSinkClose,
   unionUnionBoxesTail,
+  urBindConst,
+  urDepth,
   urLocalRead,
+  urUnbind,
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
@@ -584,7 +605,12 @@ import {
   structFieldPlain,
   variantFieldPlain,
 } from "./emit_plan_union"
-import { CoalBoxArm, coalValBoxArm, nullRetPlanOf } from "./emit_plan_null"
+import {
+  CoalBoxArm,
+  coalNulRefArmOf,
+  coalValBoxArm,
+  nullRetPlanOf,
+} from "./emit_plan_null"
 import {
   NulTestArm,
   binNulTestOf,
@@ -648,7 +674,7 @@ import {
   objOrderStashSlot,
   unionLitIsStashSlot,
 } from "./emit_if_arm_values"
-import { allocLitChunk, forInLoopAt } from "./emit_plan_list"
+import { ArrLitArm, allocLitChunk, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -1064,6 +1090,7 @@ function rhs(r: Rhs, tail: boolean) {
       RListLen |
       RListPop |
       RListPush |
+      RListPushMany |
       RListSlice |
       RMapFilter |
       RStrOp => irLowerListHook(r)
@@ -1083,6 +1110,7 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.ncV)
       numCastTail(r.ncAt, lw.irAt)
     }
+    ROptRead => optRead(r)
     RToBox => boxOp(r)
     RAtomStr => {
       irLOpnd(r.sxV)
@@ -1100,6 +1128,18 @@ function rhs(r: Rhs, tail: boolean) {
     RRetag => irLOpnd(r.rgV)
     RStage => irLOpnd(r.sgV)
     RNulTest => nulTestOp(r)
+    RNulNoneBox => {
+      // Legacy's null tag, the payload (the call, else the bottom ref), then the box.
+      leaf()
+      nulNoneBoxHead()
+      if r.nnPay {
+        irLOpnd(r.nnV)
+      } else {
+        leaf()
+        fbRefNullNone()
+      }
+      nulNoneBoxTail()
+    }
     RNulNicheEq => nulNicheEq(r)
     RClosureEq => closureEq(r)
     RFieldNull => {
@@ -1177,6 +1217,7 @@ function rhs(r: Rhs, tail: boolean) {
     REnvDrop => irLMiss("env drop as a value")
     RBundlePick => bundlePick(r)
     RResultPick => resultPick(r)
+    RHandPick => handPick(r)
     RMakeList => makeList(r)
     RSpread => spreadList(r)
     RMapNew => {
@@ -1550,6 +1591,19 @@ function bundlePick(r: RBundlePick) {
   const pk = bundlePickOf(r.bpAt, lw.irAt)
   if pk.bpField < 0 { return irLMiss("bundle pick") }
   irLOpnd(r.bpV)
+  fbStructGet(pk.bpHeap, pk.bpField)
+  return 0
+}
+
+// `RHandPick`: the bundle record read, then the member legacy's `emitBundleMemberPick` picks.
+function handPick(r: RHandPick) {
+  const pk = bundleMemberPickOf(
+    r.hpArg,
+    bundleHandMemberAt(r.hpAt, r.hpI, r.hpArg, lw.irAt),
+    lw.irAt,
+  )
+  if pk.bpHeap < 0 { return irLMiss("hand pick") }
+  irLOpnd(r.hpV)
   fbStructGet(pk.bpHeap, pk.bpField)
   return 0
 }
@@ -2234,7 +2288,9 @@ function makeList(r: RMakeList) {
   // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
   // leaves its elements unwritten, so each must be an immediate.
   if arrLitIsForIter(r.mlAt) {
-    const g = arrLitHoistGlobal(r.mlAt, fnIx, arm)
+    // In the IR's full unroll a range variable is its copy's constant; legacy asks the hoist
+    // inside its copy, which reads the variable as that constant, so the copy is bound first.
+    const g = hoistInRangeCopy(r, fnIx, arm)
     if g == -2 { return -1 }
     if g >= 0 {
       for e in r.mlElems {
@@ -2251,6 +2307,9 @@ function makeList(r: RMakeList) {
     && arm != "str"
     && arrLitShortWhy(r.mlAt, fnIx, arm, r.mlElems.length) == "long"
   ) {
+    if r.mlAt < 0 || r.mlAt >= P.nodes.length {
+      return irLMiss("array long node")
+    }
     const a = nodeAt(r.mlAt)
     if !(a is ArrayLit) { return irLMiss("array long node") }
     for e in r.mlElems {
@@ -2295,6 +2354,58 @@ function makeList(r: RMakeList) {
   }
   if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
+}
+
+// Legacy's hoist of `for` iterable `r` (`arrLitHoistGlobal`), asked with each range variable its
+// elements read bound to its copy's constant; every binding is undone before it returns.
+function hoistInRangeCopy(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
+  const bound = bindRangeCopyElems(r, fnIx)
+  const g = arrLitHoistGlobal(r.mlAt, fnIx, arm)
+  let k = 0
+  while k < bound {
+    urUnbind()
+    k = k + 1
+  }
+  return g
+}
+
+// The unroll stack's depth change across `hoistInRangeCopy` of a literal node `at` (a miss where
+// it is no list literal), for the host test: 0, the bindings undone.
+export function irRangeCopyHoistSelfTest(at: i32): i32 {
+  const d = urDepth()
+  const r: RMakeList = {
+    mlElems: [],
+    mlKind: 0,
+    mlSlot: 0,
+    mlAt: at,
+    mlArm: "i32",
+  }
+  hoistInRangeCopy(r, -1, "i32")
+  return urDepth() - d
+}
+
+// Binds each element of literal `r` that reads a range loop's variable, held as an immediate, to
+// that constant on legacy's copy stack (`urBindConst`); returns how many it bound.
+function bindRangeCopyElems(r: RMakeList, fnIx: i32): i32 {
+  if r.mlAt < 0 || r.mlAt >= P.nodes.length { return 0 }
+  const a = nodeAt(r.mlAt)
+  if !(a is ArrayLit) || a.arrElems.length != r.mlElems.length { return 0 }
+  let n = 0
+  let k = 0
+  while k < a.arrElems.length {
+    const x = unwrapParen(a.arrElems[k])
+    const o = r.mlElems[k]
+    if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident && o is OImm {
+      const d = identDeclOf(x)
+      const w = localIndexOf(fnIx, x)
+      if d >= 0 && d < P.nodes.length && nodeAt(d) is ForRange && w >= 0 {
+        urBindConst(w, o.oiBits as% i32)
+        n = n + 1
+      }
+    }
+    k = k + 1
+  }
+  return n
 }
 
 // `RSpread`: legacy's prologue, the source, then the group stash and join `emitArrSpread`'s plain
@@ -3513,6 +3624,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       }
       if (
         r is RListPush
+        || r is RListPushMany
         || r is RListStage
         || r is RListPop
         || r is RListClear
@@ -3660,6 +3772,33 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     }
     SIntSwitch => intSwitch(n, pending, tail)
     SCellSet | SSwitch => irLMiss("statement outside I1")
+  }
+  return 0
+}
+
+// A standalone `?.` as `emitOptMemberValueGo` writes it over an unstaged base: the base's null test
+// and the leaf's head, then the base as non-null (its niche recovered) and the leaf's tail.
+function optRead(r: ROptRead) {
+  const arm = optLeafArmOf(r.orAt, lw.irAt)
+  if arm == "fail" { return irLMiss("optional read arm") }
+  if arm != "nonNull" {
+    irLOpnd(r.orV)
+    fbRefIsNull()
+    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r) }
+    emitOptLinkNullClose(r.orAt, lw.irAt)
+    emitOptLeafHead(r.orAt, lw.irAt)
+  }
+  optReadBase(r)
+  emitOptLeafTail(r.orAt, lw.irAt)
+  return 0
+}
+
+// The optional read's base as `emitOptChainValue` pushes an unstaged one: its niche recovered.
+function optReadBase(r: ROptRead) {
+  irLOpnd(r.orV)
+  const m = nodeAt(r.orAt)
+  if m is OptMember && exprNullableRefNiche(m.omObj, lw.irAt) {
+    fbRefAsNonNull()
   }
   return 0
 }
@@ -4000,6 +4139,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "optLeaf" => coalOptLeaf(n, e, pending)
     "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
+    "nulStr" => coalNulStr(n, e, pending)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
@@ -4050,7 +4190,7 @@ function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
 
 // `p?.f ?? d` over a nullable record's scalar or string field along `coalOptLeafPlanOf`, as
 // `emitCoalesceOptNulRecord` writes it: the receiver variable, its null test opening the leaf's
-// `if`, the default writing the slotless out, the else, the receiver again, and its field.
+// `if`, the default writing the slotless out, the else, the receiver read again, and its field.
 function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   const m = nodeAt(unwrapParen(e.binLeft))
   if (
@@ -4069,7 +4209,7 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   fbElse()
-  irLOpnd(n.cbL)
+  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
   lwFrames.pop()
   return coalOptLeafRead(lp)
 }
@@ -4108,7 +4248,7 @@ function coalBoxArm(
     "valBox" | "valScalar" => true
     "elem" | "callBox" | "callScalar" | "boolPop" | "valNoKind" | "callNoKind" | "next" => false
   }
-  if reread { irLOpnd(n.cbL) }
+  if reread && opndAgain(n.cbL, e.binLeft) < 0 { return -1 }
   lwFrames.pop()
   return coalBoxEnd(arm, e, lhsIx, n.cbAt, fnIx)
 }
@@ -4137,6 +4277,22 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.pop()
   fbEnd()
   return 0
+}
+
+// A `string | null` `??` whose default computes: the plain block at the string heap, nullable as
+// `coalesceNulStrStaysNullable`, the operand inside it, the branch out on non-null, then the tail.
+function coalNulStr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  // A join stages the operand ahead of its `if` and boxes it on the present path.
+  if coalNulRefArmOf(e, n.cbAt, lw.irAt) == "join" {
+    cond(n.cbL, pending)
+    coalNulRefJoinOpen()
+    return coalNulRefTail(n, coalNulRefJoinTag(e, sTy(), lw.irAt))
+  }
+  if pending.length > 0 { return irLMiss("coalesce string below a temp") }
+  coalNulRefOpen(sTy(), coalesceNulStrStaysNullable(n.cbAt, lw.irAt))
+  cond(n.cbL, body(n.cbLB, false, -1, true))
+  coalNulRefBranch()
+  return coalNulRefTail(n, -1)
 }
 
 // A nullable reference's `??` along its plan: the plain block (the operand inside it, the branch
