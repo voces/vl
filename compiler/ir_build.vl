@@ -318,7 +318,8 @@ import {
   holeBoxTyAt,
   hostCallNamed,
   hostCallPlanOf,
-  idxStorePlainWhy,
+  idxStoreOtherWhy,
+  idxStoreSiteBoxes,
   ifExprJoinVt,
   ifExprPlainWhy,
   ifExprShapeWhy,
@@ -4374,7 +4375,8 @@ function capLoopTyOf(fe: i32, name: string): i32 {
 
 // The parameter variable of the lifted function `fe` being built for its capture `name`, at
 // `capRepFor`'s rep for a first read at `readRep` (-1 for none), made at its first use; -1 when a
-// captured `for-in` variable has no rep yet.
+// captured `for-in` variable has no rep yet. One held at its read's rep, not its binding type's
+// (a shared cell), is typed at that rep.
 function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
   const w = 1 + captureSlotOf(name, ibFnIx)
   const known = paramVarAt(w)
@@ -4383,7 +4385,8 @@ function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
   const bty = capTyOf(fe, name)
   const ty = if readRep < 0 && bty < 0 { capLoopTyOf(fe, name) } else { bty }
   if ty < 0 && r < 0 { return -1 }
-  const v = irVarNew(ib, r, if ty >= 0 { ty } else { repTyOf(r) }, "param", w)
+  const vty = if ty >= 0 && (r < 0 || repNodeOfTy(ty) == r) { ty } else { repTyOf(r) }
+  const v = irVarNew(ib, r, vty, "param", w)
   ib.irParams.push(v)
   return v
 }
@@ -7312,8 +7315,8 @@ export function deliverStr(b: i32[], ix: i32): Opnd {
   return deliver(b, ix, repNodeOfTy(TY_STR), TY_STR)
 }
 
-// Element `e` of a union-row list literal, built for its box: a `null` literal has no value of its
-// own, so the box writer writes the null tag alone, as `deliver` hands it a `null`.
+// Value `e` a union list's element is built from for its box (a literal's element, a store's value):
+// a `null` literal has no value of its own, so the box writer writes the null tag alone.
 function unionElemValue(b: i32[], e: i32): Opnd {
   if nodeAt(unwrapParen(e)) is NullLit {
     const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
@@ -11354,8 +11357,9 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
   return 0
 }
 
-// `xs[i] = v` that legacy writes as the plain store (`idxStorePlainWhy`): receiver, index and
-// value in source order, then the store, whose guard runs after the value.
+// `xs[i] = v` that legacy writes as the plain store (`idxStoreOtherWhy`): receiver, index and
+// value in source order, then the store, whose guard runs after the value. A union list's value that
+// owes no box is boxed at the site's union (`idxStoreSiteBoxes`), as legacy's `emitUnionBoxArg`.
 function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   // Legacy writes a store through a box of list arms per arm before any other plan.
   if armIndexWriteArmsOf(t, ibFnIx).length > 0 {
@@ -11367,8 +11371,9 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   }
   const st = idxStorePlanOf(t, ibFnIx)
   if st == null { return skip("store plan") }
-  const why = idxStorePlainWhy(st, n.binRight, ibFnIx)
+  const why = idxStoreOtherWhy(st, n.binRight, ibFnIx)
   if why != "" { return skip(why) }
+  const site = idxStoreSiteBoxes(st, n.binRight, ibFnIx)
   const vat = b.length
   const v = irBExpr(b, t.idxArr)
   const at = b.length
@@ -11378,7 +11383,7 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   // A packed list's element is stored as a plain i32, which its backing truncates.
   const er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const xat = b.length
-  const x = deliver(b, n.binRight, er, -1)
+  const x = if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
   if ibMiss != "" { return 0 }
   if ifBelowLeadIn(b, at, xat, "store short-circuit operand") { return 0 }
   if repPrim(irBOpRep(i)) != "i32" || irBOpRep(x) != er {
