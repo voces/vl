@@ -1,7 +1,7 @@
 # IR-M1: record literals built at legacy's row (2026-11-23, lane IR-M1)
 
 The record-literal family the coordinator assigned covers `object layout`, `object field count` and
-the field-coercion remainder, in bodies, starts and const cells alike. It has five mechanisms, one
+the field-coercion remainder, in bodies, starts and const cells alike. It has four mechanisms, one
 commit each. Every row predicate either is legacy's or calls legacy's own answers.
 
 ## 1. Omitted fields
@@ -40,11 +40,9 @@ This is the variant twin of mechanism 2. `objLitVariantDropStashAt` (wasmEmit) a
 `emitVariantStruct` stashes on. `objLit` builds the literal at that arm's record, and the
 lowering's variant row lookup takes it (`variantStashRowAt`).
 
-## 5. A list twin, box list or noted record as a field value
-
-`fieldTakesAsIs` covers `listRetag`, `boxListRetag` and `recRetagNoted`, the retags the verifier's
-`RRetag` already admits. A field value in one of these forms is stored as it stands, retagged with
-no bytes written.
+A fifth commit taught a field value that is a list twin, box list or noted record to be stored as
+it stands. Master's `retagsAsStands` (#9693/#9694 era) is a superset of it, so the merge took
+master's and dropped this one.
 
 ## Tests
 

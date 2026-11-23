@@ -5,5 +5,4 @@
   - A struct literal whose row drops an effectful field goes through legacy's stash, so the dropped initialiser still runs once, in source order (D1696). The new predicate is `objLitDropStashRowAt`.
   - At a union arm, a constant extra field is skipped, as `emitVariantStruct` skips it (D5342).
   - At a union arm, an effectful dropped field takes the same drop stash (`objLitVariantDropStashAt`).
-- A field value that is a list twin, a box list or a noted record is stored as it stands.
 - `object field count` falls to 0, and `object layout` falls 18 → 1 in function and start bodies.
