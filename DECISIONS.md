@@ -13023,6 +13023,11 @@ rule 3 admits the temp's rep only where its checker type is `never` and its defi
 typed `never` still breaks rule 3. The never value at a bool consumer still breaks that consumer's
 rule 2.
 
+**Extended by the coordinator 2026-11-23** to a field read typed `never`. A field that is `never`
+in one instance never held a value, and its slot stores the default i32 (D15530). The read is built at
+that i32, and only where its record's row stores the field as i32 (`fieldStoresRead`). Rule 3 admits
+such a temp only where its rep is the row's field kid. A read at any other rep still breaks rule 3.
+
 **Why.** Past the `unreachable` the stack is polymorphic, so legacy's dead code after it is valid,
 and the IR has to write the same bytes to claim the function. An operand of another width is a
 named miss rather than a copy of legacy's conversion. An f64 one after the `unreachable` is
