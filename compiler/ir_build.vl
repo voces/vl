@@ -633,6 +633,7 @@ import {
   letNulMapReadUnionBox,
   localIndexOf,
   mapShapeOfExpr,
+  mfCallbackFe,
   memReadNarrowOp,
   memberBoxReadEnter,
   memberBoxReadLeave,
@@ -3755,16 +3756,14 @@ function retCloAt(b: i32[], retIx: i32): Opnd | null {
 }
 
 // The environment of capturing function `fe`, read at `ix`, as `emitClosureEnvOf` builds it: each
-// capture a parameter or binding of this frame, or this frame's own capture. A cached or shared
-// environment, a cell, or a global capture misses.
+// capture a parameter or binding of this frame, or this frame's own capture, read as a temp the
+// lowering writes at its use, inside a cached environment's slot test. A cell or a global misses.
 function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
   const out: Opnd[] = []
   if cloCellReaches(fe, ibFnIx) {
     irBMiss("closure env cell")
     return out
   }
-  // A cached environment is built inside the slot's test, so each capture is a variable read there.
-  const cached = irEnvCached(fe)
   const self = fnStmtsPosOf(ibFnIx)
   for name in captureNamesOf(fe) {
     const p = paramIndexOf(ibFnIx, name)
@@ -3797,10 +3796,6 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
     }
     if v < 0 || ib.irVars[v].vRep != r {
       irBMiss("closure env capture")
-      return out
-    }
-    if cached && ib.irVars[v].vKind == "temp" {
-      irBMiss("closure env cache copy")
       return out
     }
     const o: Opnd = { ov: v }
@@ -5490,8 +5485,9 @@ function mapHasRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
   return r
 }
 
-// `.map`/`.filter` on legacy's arm (`mapFilterWhy`): the receiver, then a function-typed binding as
-// the callback's value, or the `null` immediate for a capture-free function the lowering builds.
+// `.map`/`.filter` on legacy's arm (`mapFilterWhy`): the receiver, then a function-typed binding or
+// a capturing function's closure as the callback's value, or the `null` immediate for a capture-free
+// function the lowering builds.
 function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const why = mapFilterWhy(ix, ibFnIx)
   if why != "" { return missRhs(why) }
@@ -5502,7 +5498,15 @@ function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const cb = unwrapParen(c.callArgs[0])
   if cb < 0 || cb >= P.nodes.length { return missRhs("map callback") }
   let f: Opnd = { oiRep: ibNoValue, oiBits: 0 }
-  if !(nodeAt(cb) is FuncDecl || cbIdentNamesFn(c.callArgs[0], ibFnIx)) {
+  const fe = mfCallbackFe(c.callArgs[0], ibFnIx)
+  const named = nodeAt(cb) is FuncDecl || cbIdentNamesFn(c.callArgs[0], ibFnIx)
+  if named && fnEnvIdxOf(fe) >= 0 {
+    f = mapCallbackClo(b, fe, cb)
+    if ibMiss != "" { return missRhs(ibMiss) }
+    if ifBelowLead(b, at, "map short-circuit operand") {
+      return missRhs("map short-circuit operand")
+    }
+  } else if !named {
     f = irBExpr(b, cb)
     if ibMiss != "" { return missRhs("method operand") }
     if ifBelowLead(b, at, "map short-circuit operand") {
@@ -5511,6 +5515,17 @@ function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   }
   const r: Rhs = { hfV: v, hfC: f, hfAt: ix }
   return r
+}
+
+// Capturing callback `fe` at `cb` as `emitClosureValue` builds it: a fresh closure over its
+// environment as this frame holds it (`cloEnvOf`), at the callback's own closure rep.
+function mapCallbackClo(b: i32[], fe: i32, cb: i32): Opnd {
+  if closureValueWhy(fe) != "" { return irBMiss("map callback closure refused") }
+  const rep = exprRepOf(cb)
+  if !(repNodeAt(rep) is RClosure) { return irBMiss("map callback closure rep") }
+  const env = cloEnvOf(b, fe, cb)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  return irBLetTempTy(b, { mcFn: fe, mcEnv: env, mcAt: cb }, cb, rep, heldTy(exprTyOf(cb)))
 }
 
 // `m.keys()` or `m.values()` as legacy's writer takes it: the map variable as itself, since that
