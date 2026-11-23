@@ -8,6 +8,27 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-23-ir-map-cb-expr](2026-11-23-ir-map-cb-expr.md): IR: a `.map`/`.filter` callback yielded by a call (2026-11-23, lane IR-N1)
+- [2026-11-23-ir-c1-rep-unsup-1](2026-11-23-ir-c1-rep-unsup-1.md): `rep unsup`, batch 1: hole parameter reads, open operators, a call at its callee's result (IR-C1)
+- [2026-11-23-ir-n9-batch5](2026-11-23-ir-n9-batch5.md): IR coverage, batch 5: a field read off a receiver held at its storage row (2026-11-23, lane IR-N9)
+- [2026-11-23-ir-n7-capture](2026-11-23-ir-n7-capture.md): IR coverage: a captured call's coerced arguments, a captured walk variable, and an open capture binding (2026-11-23, lane IR-N7)
+- [2026-11-23-union-eq-atom-operand-once](2026-11-23-union-eq-atom-operand-once.md): D17066: a union `==` against a `K | null` operand that is no place (2026-11-23, lane IR-S1)
+- [2026-11-23-ir-return-rest](2026-11-23-ir-return-rest.md): IR: the rest of return coercion (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-eq-helper-body](2026-11-23-ir-eq-helper-body.md): IR builds the structural-eq helper bodies (2026-11-23, lane IR-N8)
+- [2026-11-23-ir-open-result-and-arm-cell](2026-11-23-ir-open-result-and-arm-cell.md): Open results at the declared descriptor, and nullable arm cells (2026-11-23, lane IR-N5)
+- [2026-11-23-union-eq-operand-once](2026-11-23-union-eq-operand-once.md): D17068: a union `==` reads an operand with effects once, in source order (2026-11-23, lane IR-S1)
+- [2026-11-23-ir-global-holder-member](2026-11-23-ir-global-holder-member.md): IR coverage: a module binding holding a returned bundle's member (2026-11-23, lane IR-N8)
+- [2026-11-23-ir-m1-row-field-storage](2026-11-23-ir-m1-row-field-storage.md): IR-M1: a bare-literal record field reps at its row's storage (2026-11-23, lane IR-M1)
+- [2026-11-23-ir-index-elem-coercion](2026-11-23-ir-index-elem-coercion.md): IR: ref-list element reads stored alike, and union-box list literals built per element (2026-11-23, lane IR-N1)
+- [2026-11-23-ir-span-compare](2026-11-23-ir-span-compare.md): IR: an element read's row after a staged operand, 2026-11-23
+- [2026-11-23-fix-unary-never](2026-11-23-fix-unary-never.md): Fix D17067: unary `-` and `~` take a `never` operand (IR-C1)
+- [2026-11-23-ir-coalesce-field-place](2026-11-23-ir-coalesce-field-place.md): IR coverage: a union-field `??` off a call, and a string `??` over an if-expression (2026-11-23, lane IR-N2)
+- [2026-11-23-ir-n7-closures](2026-11-23-ir-n7-closures.md): IR coverage, batch D: a cached closure environment's own captures (2026-11-23, lane IR-N7)
+- [2026-11-23-ir-n9-batch4](2026-11-23-ir-n9-batch4.md): IR coverage, batch 4: a value `if` boxed arm by arm, an empty list at a union, a retag-only box (2026-11-23, lane IR-N9)
+- [2026-11-23-ir-return-guarded](2026-11-23-ir-return-guarded.md): IR: guarded global reads and stored-alike returns (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-map-cb-delete](2026-11-23-ir-map-cb-delete.md): IR: a `.map`/`.filter` callback that captures (2026-11-23, lane IR-N1)
+- [2026-11-23-ir-m1-record-literals](2026-11-23-ir-m1-record-literals.md): IR-M1: record literals built at legacy's row (2026-11-23, lane IR-M1)
+- [2026-11-23-ir-c1-never-field](2026-11-23-ir-c1-never-field.md): `rep novalue`, step 8: a field read typed `never` (IR-C1)
 - [2026-11-23-ir-self-sweep](2026-11-23-ir-self-sweep.md): IR-S1: the self-compile builds wholly in the IR (2026-11-23, lane IR-S1)
 - [2026-11-23-fix-d17064](2026-11-23-fix-d17064.md): Fix D17064: an operator over a `never` operand works at its other operand's width (IR-C1)
 - [2026-11-23-ir-rowless-record-rep](2026-11-23-ir-rowless-record-rep.md): IR: a record type no struct row records, at the row legacy stores it in, 2026-11-23
