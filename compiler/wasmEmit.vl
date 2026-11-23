@@ -1415,6 +1415,7 @@ import {
   asExprNumSrcName,
   asExprNumTgtName,
   callRefNestSlot,
+  coalFieldRecvSlot,
   fcpSpillStashSlot,
   fnMvMapRefLocal,
   fnMvValStashLocal,
@@ -44318,13 +44319,14 @@ function emitCoalesceUnionField(
     // The box kept: the default coerced into the result's union, the present arm the field's
     // own box re-read (D801).
     "boxed" => {
-      if emitCoalArmRecv(lhs.memObj, p.cfCast, fnIx) < 0 { return -1 }
+      const st = coalFieldRecvStash(lhs.memObj, p)
+      if coalFieldRecvFirst(lhs.memObj, p, st, fnIx) < 0 { return -1 }
       coalFieldBoxOpen(p)
       if (emitUnionBoxOwed(p.cfCoerceN, p.cfCoerceTy, e.binRight, fnIx) < 0) {
         return -1 // d, its own box
       }
       fbElse() // 0x05 else — present → re-read the field
-      if emitCoalArmRecv(lhs.memObj, p.cfCast, fnIx) < 0 { return -1 }
+      if coalFieldRecvAgain(lhs.memObj, p, st, fnIx) < 0 { return -1 }
       coalFieldRead(p)
       fbEnd() // 0x0b end
       0
@@ -44332,17 +44334,49 @@ function emitCoalesceUnionField(
     // The scalar: the default at the result kind, the present arm the field's payload unboxed
     // and widened to it (D1699, D10060).
     "unbox" => {
-      if emitCoalArmRecv(lhs.memObj, p.cfCast, fnIx) < 0 { return -1 }
+      const st = coalFieldRecvStash(lhs.memObj, p)
+      if coalFieldRecvFirst(lhs.memObj, p, st, fnIx) < 0 { return -1 }
       coalFieldValOpen(p)
       if emitExprAsKind(e.binRight, p.cfRk, fnIx) < 0 { return -1 }
       fbElse() // 0x05 else — present → unbox
-      if emitCoalArmRecv(lhs.memObj, p.cfCast, fnIx) < 0 { return -1 }
+      if coalFieldRecvAgain(lhs.memObj, p, st, fnIx) < 0 { return -1 }
       if coalFieldUnbox(p) < 0 { return -1 }
       fbEnd() // 0x0b end
       0
     }
     "none" => emitCoalesceOptMember(e, lhsIx, exprIx, fnIx)
   }
+}
+
+// The stash of a union-field `??`'s receiver `recv` along plan `p`: -1 for a re-readable place,
+// which each arm writes again, else the slot one evaluation is kept in (D17059).
+function coalFieldRecvStash(recv: i32, p: CoalFieldPlan): i32 {
+  if unionEqOperandOk(recv) || p.cfHeap < 0 { return -1 }
+  return coalFieldRecvSlot(p.cfHeap)
+}
+
+// The receiver before the null test: written, and kept in stash `st` when there is one.
+function coalFieldRecvFirst(
+  recv: i32,
+  p: CoalFieldPlan,
+  st: i32,
+  fnIx: i32,
+): i32 {
+  if emitCoalArmRecv(recv, p.cfCast, fnIx) < 0 { return -1 }
+  if st >= 0 { fbLocalTee(st) }
+  return 0
+}
+
+// The receiver on the present arm: the stash's read, or the place written again.
+function coalFieldRecvAgain(
+  recv: i32,
+  p: CoalFieldPlan,
+  st: i32,
+  fnIx: i32,
+): i32 {
+  if st < 0 { return emitCoalArmRecv(recv, p.cfCast, fnIx) }
+  fbLocalGet(st)
+  return 0
 }
 
 // How `emitCoalesceUnionField` writes `o.v ?? d` over a value-union record field `lhsIx` (code 16,
