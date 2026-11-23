@@ -246,8 +246,9 @@ export type RTruncSat = {
 }
 // A memory-management intrinsic at call node `moAt` over its i32 operands (`memOpPlanOf`).
 export type RMemOp = { moArgs: Opnd[], moAt: i32 }
-// `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on.
-export type RListGet = { lgV: Opnd, lgIx: Opnd, lgAt: i32 }
+// `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on;
+// `lgStored` where the builder built it at its storage (`isStorageRead`).
+export type RListGet = { lgV: Opnd, lgIx: Opnd, lgAt: i32, lgStored: boolean }
 // `llAt`: the `.length` `Member` node, which legacy's hoist and view decisions key on.
 export type RListLen = { llV: Opnd, llAt: i32 }
 // `nwV`, of number kind `nwSrc`, widened to kind `nwDst` at delivery node `nwAt` (kinds as
@@ -263,6 +264,9 @@ export type RNumCast = { ncV: Opnd, ncAt: i32 }
 // records there, or a direct call's parameter union where it records none; `bxFree` whether
 // `bxAt` has no effect, so an immediate may stand for it.
 export type RToBox = { bxV: Opnd, bxAt: i32, bxTy: i32, bxFree: boolean }
+// `u as? N` over a type parameter boxing scalar `hxV` at cast node `hxAt` (`holeOptShapeOf`'s
+// "box"), whose tag legacy writes ahead of the operand (`holeOptBoxHead`, `holeOptBoxTail`).
+export type RHoleOptBox = { hxV: Opnd, hxAt: i32 }
 // Atom `rgV` as the `K | null` (discipline 3) that holds it: the same i32, so no bytes.
 export type RRetag = { rgV: Opnd }
 // Atom `sxV`, or its `K | null`, as the string, or `string | null`, legacy's atom decode writes
@@ -434,10 +438,10 @@ export type RMapGetOr = {
   mgForm: i32,
   mgDef: Opnd,
 }
-// A bare `m[k]` at Index node `mtAt`: map global `mtSym` read (recovered for `mtNonNull`), or where
-// it is -1 receiver operand `mtLoc`, and key `mtKey`, by legacy's arm (`mapGetArmOf`). A read the
-// box plan boxes (`mapScalar`) carries the value's atom kind `mtBox`, else -1. `mtRow` where legacy
-// banks the read's element-read row, which its union-valued binding arm does not.
+// A bare `m[k]` at Index node `mtAt`: global `mtSym` (recovered for `mtNonNull`) or, at -1, receiver
+// `mtLoc`, and key `mtKey`, by legacy's arm (`mapGetArmOf`). A box plan read carries its atom kind
+// `mtBox`, else -1; `mtRow` where legacy banks the element-read row (its union-valued binding arm
+// does not); `mtTrap` traps on a missing key, as `as!`'s read does (`emitAsMapProbeTrap`).
 export type RMapGet = {
   mtSym: i32,
   mtNonNull: boolean,
@@ -446,6 +450,7 @@ export type RMapGet = {
   mtAt: i32,
   mtBox: i32,
   mtRow: boolean,
+  mtTrap: boolean,
 }
 // `m.keys()` or, under `miVals`, `m.values()` at call `miAt` over map variable `miV`, which legacy's
 // writer reads three times (`mapListStep`): a fresh list of the live entries.
@@ -576,6 +581,7 @@ export type Rhs = RArmUnbox
   | RGetField
   | RGlobalGet
   | RHandPick
+  | RHoleOptBox
   | RInitProgress
   | RJoinNull
   | RListCat
@@ -783,6 +789,9 @@ export type MapProbe = {
 export type SBr = { brLabel: i32, brHas: boolean, brVal: Opnd }
 export type SReturn = { rtHas: boolean, rtV: Opnd }
 export type STrap = { tpWhy: i32 }
+// `tpWhy` of the trap behind a guard that ends its block (D932): nothing after it in that block
+// is built, as legacy cuts it.
+export const TRAP_BLOCK_CUT = 1
 // A value evaluated and discarded, as legacy writes a bare value statement. Migration only: it
 // goes, with every use, once bytes may move.
 export type SDrop = { dpV: Opnd }
@@ -1228,6 +1237,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RGetField |
       RGlobalGet |
       RHandPick |
+      RHoleOptBox |
       RInitProgress |
       RJoinNull |
       RListCat |
@@ -1601,6 +1611,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RCoalStr => [r.czL, r.czD]
     RCoalAtomStr => [r.zaL, r.zaD]
     RToBox => [r.bxV]
+    RHoleOptBox => [r.hxV]
     RRetag => [r.rgV]
     RAtomStr => [r.sxV]
     RNullOf => []
@@ -1706,6 +1717,7 @@ function rhsText(r: Rhs): string {
     ROptRead => "opt_read " + opndText(r.orV)
     RNumCast => "cast " + opndText(r.ncV)
     RToBox => "box " + opndText(r.bxV)
+    RHoleOptBox => "hole opt box " + opndText(r.hxV)
     RAtomStr => "atomstr " + opndText(r.sxV)
     RRetag => "retag " + opndText(r.rgV)
     RNullOf => "null"
@@ -2054,6 +2066,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RCoalAtomStr |
       RCoalStr |
       REqHelp |
+      RHoleOptBox |
       RJoinNull |
       RLitArms |
       RNulNicheEq |
