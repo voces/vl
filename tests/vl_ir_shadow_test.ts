@@ -164,6 +164,32 @@ Deno.test({
   },
 });
 
+// A record literal whose row drops an effectful field (D1696) is built through legacy's stash, the
+// dropped initialiser run for its effect in source order: at a struct row and at a union arm, a
+// partial literal at its destination's row, each matching legacy's bytes.
+Deno.test({
+  name: "ir shadow: a literal that drops or omits fields is built at its destination's row and matches",
+  ignore,
+  fn: () => {
+    const src = `type Plain = { legs: i64 }\ntype Shallow = { pet: Plain }\n` +
+      `type A = { k: i32, legs: i64 }\ntype B = { s: string }\ntype Pet = A | B\n` +
+      `type Cfg = { verbose: boolean | null, out: string | null }\n` +
+      `let n = 0\nfunction f() { n = n + 1\n  return true }\n` +
+      `function mk(): Shallow {\n  const sv = { pet: { legs: 4, purr: f() } }\n  return sv\n}\n` +
+      `function arm(): Pet {\n  const sv = { k: 1, legs: 4, purr: f() }\n  return sv\n}\n` +
+      `function cfg(): Cfg {\n  const c: Cfg = { out: "x" }\n  return c\n}\n` +
+      `print(mk().pet.legs)\nconst p = arm()\nif p is A { print(p.legs) }\nprint(cfg().out ?? "none")\nprint(n)\n`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
+    const unc = [...rows.keys()].filter((k) => k.startsWith("uncovered ") || k.startsWith("mismatch"));
+    if (unc.length > 0 || (rows.get("matched") ?? 0) < 4) {
+      throw new Error(`want mk, arm, cfg and f matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A closure thunk's IR lowering under the dual emit's control 3 must report a bytes mismatch;
 // unbroken, each thunk matches legacy's `emitCloThunkCode` (a valued and a void target).
 Deno.test({
@@ -1521,6 +1547,8 @@ Deno.test({
       "bounds-rule-uninstalled": 8,
       "box-immediate-for-call": 2,
       "box-at-union-type-into-i32": 2,
+      "if-at-box-writes-i32": 2,
+      "if-at-box-arm-delivers-i32": 2,
       "nul-none-box-of-i32": 2,
       "pop-or-of-i32": 2,
       "pop-or-bool-out": 2,
@@ -1570,6 +1598,9 @@ Deno.test({
       "retag-field-alike-records-two-heaps": 2,
       "push-many-of-i32": 2,
       "global-read-off-store-type": 2,
+      "return-not-stored-alike": 2,
+      "return-stored-alike": 0,
+      "return-stored-unlike": 2,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
       "atom-tower-i32-read": 2,
@@ -1593,6 +1624,8 @@ Deno.test({
       "never-call-value-at-consumer-rep": 0,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
+      "never-field-read-at-its-storage": 0,
+      "never-field-read-off-its-storage": 3,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
