@@ -373,6 +373,10 @@ export type RNumUnionBin = { nbArgs: Opnd[], nbAt: i32 }
 // Numeric union box `nuV` of node `nuAt` converted to number kind `nuTo` at the member it holds,
 // as legacy's `emitNumUnionConvert` writes it (`widenPlanOf`'s `convert`).
 export type RNumUnionConvert = { nuV: Opnd, nuTo: i32, nuAt: i32 }
+// A `null`-typed value of node `nnAt` boxed under the null tag, as legacy's box ladder's first
+// rung writes it (`emitNulNoneBoxPayload`): with `nnPay`, call `nnV` is the payload, else the
+// bottom ref is.
+export type RNulNoneBox = { nnV: Opnd, nnPay: boolean, nnAt: i32 }
 export type RNumIntr = { nxArgs: Opnd[], nxOp: i32, nxAt: i32 }
 // A SIMD intrinsic at call `sdAt`: its value operands, then its one instruction and any lane
 // immediates (`simdTail`). As the builder planned it, a load or store has `sdMemBase` operands (1
@@ -468,6 +472,9 @@ export type RBundlePick = { bpV: Opnd, bpAt: i32 }
 // The member closure direct call `rkAt` of `fnStmts` slot `rkFe` picks from the bundle record
 // `rkV` it returned, as `bundleResultPickOf` (legacy's `emitBundleResultPick`) names it.
 export type RResultPick = { rkV: Opnd, rkAt: i32, rkFe: i32 }
+// The member closure argument `hpI` (node `hpArg`) of direct call `hpAt` hands of the bundle record
+// `hpV` it reads, as `bundleMemberPickOf` (legacy's `emitBundleMemberPick`) names it.
+export type RHandPick = { hpV: Opnd, hpAt: i32, hpArg: i32, hpI: i32 }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
 // reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing. `tag64`
@@ -508,6 +515,7 @@ export type Rhs = RArmUnbox
   | RFnId
   | RGetField
   | RGlobalGet
+  | RHandPick
   | RJoinNull
   | RListCat
   | RListClear
@@ -541,6 +549,7 @@ export type Rhs = RArmUnbox
   | RMemOp
   | RNicheRead
   | RNulNicheEq
+  | RNulNoneBox
   | RNulTest
   | RNullOf
   | RNumCast
@@ -658,7 +667,7 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 // cell's `if` and a nullable reference's block read only that operand before they open.
 export function coalArmStagesLeads(a: CoalValArm): boolean {
   return match a {
-    "litUnion" | "nulBool" | "nulRef" => true
+    "litUnion" | "nulBool" | "nulRef" | "nulStr" => true
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "boxStash" | "boxFieldScalar" => false
   }
 }
@@ -1343,6 +1352,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RNumIntr => r.nxArgs
     RNumUnionBin => r.nbArgs
     RNumUnionConvert => [r.nuV]
+    RNulNoneBox => if r.nnPay { [r.nnV] } else { [] }
     RSimd => r.sdArgs
     RCoalStr => [r.czL, r.czD]
     RCoalAtomStr => [r.zaL, r.zaD]
@@ -1386,6 +1396,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     REnvDrop => []
     RBundlePick => [r.bpV]
     RResultPick => [r.rkV]
+    RHandPick => [r.hpV]
     RRawOp => r.rwArgs
     RRel => []
     RStage => [r.sgV]
@@ -1490,6 +1501,7 @@ function rhsText(r: Rhs): string {
     RNumIntr => "intrinsic " + i32ToStr(r.nxOp) + "(" + opndsText(r.nxArgs) + ")"
     RNumUnionBin => "num_union(" + opndsText(r.nbArgs) + ")"
     RNumUnionConvert => "num_union_convert " + opndText(r.nuV)
+    RNulNoneBox => "nul_none_box " + (if r.nnPay { opndText(r.nnV) } else { "bottom" })
     RSimd => "simd(" + opndsText(r.sdArgs) + ")"
     RMapGetOr => "map.get_or " + mapRecvText(r.mgSym, r.mgLoc) + "[" + opndText(r.mgKey) + "]"
     RMapGet => "map.get " + mapRecvText(r.mtSym, r.mtLoc) + "[" + opndText(r.mtKey) + "]"
@@ -1521,6 +1533,7 @@ function rhsText(r: Rhs): string {
     REnvDrop => "env drop f" + i32ToStr(r.edFn)
     RBundlePick => "bundle pick " + opndText(r.bpV)
     RResultPick => "result pick " + opndText(r.rkV)
+    RHandPick => "hand pick " + opndText(r.hpV)
     RGlobalGet => "global " + i32ToStr(r.ggSym) + (if r.ggNonNull { " nonnull" } else { "" })
   }
 }
@@ -1741,7 +1754,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
     SCoalBox => match n.cbArm {
       "popOr" => "list"
       "nulRef" | "boxStash" => "box"
-      "litUnion" | "nulBool" | "boxFieldScalar" => "box"
+      "litUnion" | "nulBool" | "boxFieldScalar" | "nulStr" => "box"
       "fieldBox" | "fieldVal" | "optLeaf" => "record"
       "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
@@ -1828,6 +1841,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RCallRef |
       REnvDrop |
       REnvGet |
+      RHandPick |
       RMakeClo |
       RResultPick => "closure"
     RAtomSole |
@@ -1835,6 +1849,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RCellGet |
       RCellNew |
       RFnId |
+      RNulNoneBox |
       RNumUnionConvert |
       RStrToAtom |
       RStrToAtomStaged |

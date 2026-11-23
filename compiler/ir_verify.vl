@@ -42,6 +42,7 @@ import {
   RFnId,
   RGetField,
   RGlobalGet,
+  RHandPick,
   RJoinNull,
   RListCat,
   RListClear,
@@ -75,6 +76,7 @@ import {
   RMemOp,
   RNicheRead,
   RNulNicheEq,
+  RNulNoneBox,
   RNulTest,
   RNullOf,
   RNumCast,
@@ -970,6 +972,22 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RNulNicheEq => nulNicheEqCheck(r, dst, at)
+    RNulNoneBox => {
+      if r.nnPay {
+        use(r.nnV, at)
+        if repPrim(opRep(r.nnV)) != "null" {
+          return fail(
+            2,
+            at,
+            "a null-typed box's payload is no null-typed value",
+          )
+        }
+      }
+      if !boxShaped(dst) {
+        return fail(2, at, "a null-typed box lands at no box")
+      }
+      0
+    }
     RClosureEq => closureEqCheck(r, dst, at)
     RNulTest => {
       use(r.ntV, at)
@@ -1216,7 +1234,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       ) {
         return fail(2, at, "an atom coalesce of a non-`K | null`")
       }
-      if !(r.zaD is OStr) || opRep(r.zaD) != vfStr || dst != vfStr {
+      if opRep(r.zaD) != vfStr || dst != vfStr {
         return fail(
           2,
           at,
@@ -1232,11 +1250,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if (!(l is RNullable) || l.rnDisc != 1 || repPrim(l.rnInner) != "str") {
         return fail(2, at, "a string coalesce of a non-string | null")
       }
-      if !(r.czD is OStr) {
+      // The default is written in the block in place: a literal, or a value at the result's rep.
+      if !(r.czD is OStr) && (dst < 0 || opRep(r.czD) != dst) {
         return fail(
           2,
           at,
-          "a string coalesce's default is not a string literal",
+          "a string coalesce's default is neither a string literal nor at its rep",
         )
       }
       if dst >= 0 && dst != l.rnInner && dst != opRep(r.czL) {
@@ -1484,6 +1503,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.bpV, at)
       if dst >= 0 && !(repNodeAt(dst) is RClosure) {
         return fail(2, at, "a bundle member of a non-closure rep")
+      }
+      0
+    }
+    RHandPick => {
+      use(r.hpV, at)
+      if !(repNodeAt(opRep(r.hpV)) is RRecord) {
+        return fail(2, at, "a hand pick of a non-record value")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RClosure) {
+        return fail(2, at, "a hand member of a non-closure rep")
       }
       0
     }
@@ -1781,6 +1810,26 @@ function coalNulRefWhy(n: SCoalBox): string {
   return ""
 }
 
+// Why a `string | null` `??` whose default computes is ill-formed, or "": it reads a nullable
+// string and yields that string or its non-null inner.
+function coalNulStrWhy(n: SCoalBox): string {
+  const lr = repNodeAt(opRep(n.cbL))
+  if !(lr is RNullable) || lr.rnDisc != 1 || repPrim(lr.rnInner) != "str" {
+    return "a string `??` reads no nullable string"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a string `??` writes no variable"
+  }
+  const or = vf.irVars[o].vRep
+  const on = repNodeAt(or)
+  const boxed = on is RBox || on is RNullable && on.rnDisc == 4
+  if !boxed && or != opRep(n.cbL) && or != lr.rnInner {
+    return "a string `??` yields neither the string, its inner, nor a box"
+  }
+  return ""
+}
+
 // Why a shared `scalar | null` field's `??` is ill-formed, or "": it reads a boxed nullable and
 // yields a scalar.
 function coalBoxFieldScalarWhy(n: SCoalBox): string {
@@ -1985,7 +2034,7 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
   if (n.cbMap != null) != mapArm {
     return fail(2, id, "a `??` holds a map probe off the map-read arm")
   }
-  if n.cbLB.length > 0 && n.cbArm != "nulRef" {
+  if n.cbLB.length > 0 && n.cbArm != "nulRef" && n.cbArm != "nulStr" {
     return fail(
       2,
       id,
@@ -2012,6 +2061,7 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
     "optLeaf" => coalOptLeafWhy(n)
     "boxStash" => coalBoxStashWhy(n)
     "boxFieldScalar" => coalBoxFieldScalarWhy(n)
+    "nulStr" => coalNulStrWhy(n)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
   }
   if why != "" { return fail(2, id, why) }
@@ -2555,6 +2605,7 @@ function rhsReadsList(r: Rhs): boolean {
       RFnId |
       RGetField |
       RGlobalGet |
+      RHandPick |
       RJoinNull |
       RListCat |
       RListClear |
@@ -2587,6 +2638,7 @@ function rhsReadsList(r: Rhs): boolean {
       RMemOp |
       RNicheRead |
       RNulNicheEq |
+      RNulNoneBox |
       RNulTest |
       RNullOf |
       RNumCast |
