@@ -7,7 +7,6 @@
 // emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
 // builder, and trap order (rule 9) with the first pass that moves a check. Until steps I2-I7
 // build them, the arms for records, lists, casts, tags, maps and closures have no input.
-import { NULL_OWN_BOX } from "./emit_plan_null"
 import {
   IrFn,
   IrNode,
@@ -16,31 +15,52 @@ import {
   OVar,
   Opnd,
   PStaged,
+  RArmUnbox,
+  RAsUnion,
   RAtomEq,
+  RAtomSole,
   RAtomStr,
+  RAtomWide,
+  RAtomic,
   RBoxField,
   RBoxNarrow,
+  RBundlePick,
   RCall,
   RCallHost,
   RCallRef,
   RCast,
   RCellGet,
   RCellNew,
+  RClosureEq,
   RCoalAtomStr,
   RCoalStr,
+  RCoerce,
+  REnvDrop,
+  REnvGet,
+  RFieldNull,
   RFnId,
   RGetField,
   RGlobalGet,
+  RHandPick,
+  RJoinNull,
+  RListCat,
   RListClear,
   RListCopy,
+  RListEmpty,
+  RListEmptyArms,
   RListEq,
+  RListFitIs,
   RListGet,
+  RListIsAcross,
   RListLen,
   RListNew,
+  RListNewDefault,
   RListPop,
   RListPush,
+  RListPushMany,
   RListSlice,
   RListStage,
+  RLitArms,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -48,31 +68,52 @@ import {
   RMapGet,
   RMapGetOr,
   RMapHas,
+  RMapIter,
   RMapNew,
   RMapOp,
   RMapSet,
+  RMemAccess,
+  RMemOp,
+  RNicheRead,
+  RNulNicheEq,
+  RNulNoneBox,
   RNulTest,
   RNullOf,
   RNumCast,
   RNumIntr,
+  RNumIs,
+  RNumUnionBin,
+  RNumUnionConvert,
   RNumWiden,
+  ROptRead,
   RPrimOp,
   RPrint,
   RRawOp,
+  RRecCopyPure,
   RRecover,
   RRel,
+  RResultPick,
   RRetNull,
   RRetag,
   RSharedRead,
+  RSimd,
   RSpread,
   RStage,
+  RStashSet,
   RStrOp,
+  RStrToAtom,
+  RStrToAtomStaged,
+  RStructEq,
   RTagIs,
   RTagOf,
   RTagStash,
   RTest,
   RToBox,
+  RTruncSat,
+  RUnionConcreteEq,
   RUnionEq,
+  RVariantChain,
+  RVariantDiscrim,
   Rhs,
   SAssign,
   SBlock,
@@ -85,19 +126,30 @@ import {
   SForIn,
   SGlobalSet,
   SIf,
+  SIntSwitch,
   SLet,
   SListSet,
   SLoop,
+  SRangeLoop,
   SRawOp,
   SReturn,
   SSetField,
   SSwitch,
   STrap,
   irBodyLeaves,
+  irCloFieldRetagAt,
+  irFactIntOf,
+  irFactKidTyOf,
+  irFactTyOf,
   irFnNew,
   irGlobalRepOf,
+  irGlobalStoreTyOf,
   irPushBodies,
   irSigOf,
+  mapBoxReadsAt,
+  mapNicheReadsAt,
+  repHeldAsI32,
+  repNullRefFits,
 } from "./ir"
 import {
   RAtom,
@@ -113,14 +165,27 @@ import {
   repNodeAt,
   repNodeKids,
   repNodeOfTy,
+  repTyOf,
 } from "./emit_rep"
-import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
+import {
+  boxListRetag,
+  cloHoleRetag,
+  irNodeEndsPath,
+  listRetag,
+  listRetagHole,
+  recRetag,
+  recSubRetag,
+  repBoolNiche,
+  repBoxCore,
+  repIsNoValue,
+  repIsScalar,
+  repPrim,
+  repWhat,
+  repsLowerAlike,
+} from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
-import { i32ToStr } from "./ast"
-import { exprEffectFree } from "./emit_base"
-import { nodeTyAt } from "./emit_capture_frames"
-import { tyOpenHeldAsIds } from "./emit_classify"
+import { AsExpr, Call, i32ToStr, nodeAt } from "./ast"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -136,6 +201,10 @@ let vfDefLog: i32[] = []
 // The `push` temps not yet consumed, in push order, and which temps are such pushes.
 let vfPushed: i32[] = []
 let vfPushes: {[i32]: boolean} = Map()
+// The `RStashSet`s not yet read by their record: its literal, the kid set, the value's rep.
+let vfSetAt: i32[] = []
+let vfSetK: i32[] = []
+let vfSetRep: i32[] = []
 // Whether the walk met a receiver stage, so the stage rule has a pairing to check.
 let vfStaged = false
 let vfLabels: i32[] = []
@@ -254,6 +323,43 @@ function opndVar(o: Opnd): i32 {
   }
 }
 
+// Rule 2 for an order-stashed record (`mrSet`): it reads exactly the sets of its own literal, made
+// in its source order, each at its kid's rep, and has no operands of its own.
+function stashedRec(r: RMakeRec, ks: i32[], at: i32) {
+  if r.mrFields.length != 0 || r.mrSrc.length != ks.length {
+    return fail(2, at, "a stash-set record's shape")
+  }
+  let j = 0
+  const keepAt: i32[] = []
+  const keepK: i32[] = []
+  const keepRep: i32[] = []
+  let i = 0
+  while i < vfSetAt.length {
+    if vfSetAt[i] == r.mrAt {
+      const k = vfSetK[i]
+      if j >= r.mrSrc.length || r.mrSrc[j] != k {
+        return fail(2, at, "a stash set out of its source order")
+      }
+      if k < 0 || k >= ks.length || vfSetRep[i] != ks[k] {
+        return fail(2, at, "a stash set's rep differs from its field's")
+      }
+      j = j + 1
+    } else {
+      keepAt.push(vfSetAt[i])
+      keepK.push(vfSetK[i])
+      keepRep.push(vfSetRep[i])
+    }
+    i = i + 1
+  }
+  if j != r.mrSrc.length {
+    return fail(2, at, "a stash-set record's field unset")
+  }
+  vfSetAt = keepAt
+  vfSetK = keepK
+  vfSetRep = keepRep
+  return 0
+}
+
 // Rule 2 for a primitive op: its operands' reps and its result rep `dst`.
 function primSig(r: RPrimOp, dst: i32, at: i32) {
   const a = r.poArgs
@@ -271,10 +377,15 @@ function primSig(r: RPrimOp, dst: i32, at: i32) {
     )
   }
   const ar = opRep(a[0])
-  if !unary && opRep(a[1]) != ar {
+  // eq/ne compares the i32 cells of a bool and a `boolean | null` niche; the null sentinel 2
+  // equals only null.
+  const niche = !unary
+    && (r.poOp == "eq" || r.poOp == "ne")
+    && nicheBoolPair(ar, opRep(a[1]))
+  if !unary && opRep(a[1]) != ar && !niche {
     return fail(2, at, r.poOp + "'s operands differ in rep")
   }
-  const k = repWhat(ar)
+  const k = if niche { "bool" } else { repWhat(ar) }
   const op = r.poOp
   const kindOk = match op {
     "add" | "sub" | "mul" | "div" | "rem" | "lt" | "le" | "gt" | "ge" | "neg" => isNum(k)
@@ -309,6 +420,15 @@ function primSig(r: RPrimOp, dst: i32, at: i32) {
   return 0
 }
 
+// Whether reps `x` and `y` are each `boolean` or its `boolean | null` niche, one of them a niche.
+function nicheBoolPair(x: i32, y: i32): boolean {
+  const xn = repBoolNiche(x)
+  const yn = repBoolNiche(y)
+  return (xn || repPrim(x) == "bool")
+    && (yn || repPrim(y) == "bool")
+    && (xn || yn)
+}
+
 // Rules 2 and 6 for a call of callee `fnPos` with `args` into a destination of rep `dst`
 // (-1 for an effect, which keeps no result).
 function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
@@ -330,7 +450,11 @@ function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
   }
   let i = 0
   while i < ps.length {
-    if opRep(args[i]) != ps[i] {
+    if (
+      opRep(args[i]) != ps[i]
+      && !repNullRefFits(opRep(args[i]), ps[i])
+      && !vfStoresAs(ps[i], opRep(args[i]))
+    ) {
       return fail(
         6,
         at,
@@ -339,7 +463,7 @@ function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
     }
     i = i + 1
   }
-  if dst >= 0 && dst != vf.irSigRet[si] {
+  if dst >= 0 && dst != vf.irSigRet[si] && !vfStoresAs(dst, vf.irSigRet[si]) {
     return fail(6, at, "the result rep is not the callee's")
   }
   return 0
@@ -378,6 +502,23 @@ function stageAt(id: i32): RListStage | null {
   return null
 }
 
+// Whether a read of global `sym` at node `at`, at rep `dst`, is at its checked type's rep or else at
+// the storage row the builder recorded taking it at (`irGlobalStoreTyOf`; D14434, D14426).
+// Whether retag node `at` of `o` into `dst` is a closure the builder noted at a plainly written
+// record field: every closure lowers to the one closure struct, whatever signature either names.
+function cloFieldRetag(o: Opnd, dst: i32, at: i32): boolean {
+  return irCloFieldRetagAt(vf, at)
+    && repNodeAt(opRep(o)) is RClosure
+    && repNodeAt(dst) is RClosure
+}
+
+function globalReadAtTyOrStorage(sym: i32, dst: i32, at: i32): boolean {
+  const src = vf.irNodeAt[at] ?? -1
+  if src < 0 || dst == repNodeOfTy(irFactTyOf(vf, at)) { return true }
+  const st = irGlobalStoreTyOf(vf, sym)
+  return st >= 0 && dst == repNodeOfTy(st)
+}
+
 function rhsCheck(r: Rhs, dst: i32, at: i32) {
   match r {
     RPrimOp => {
@@ -387,6 +528,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCall => {
       uses(r.caCaps, at)
       uses(r.caArgs, at)
+      // A capture handed back goes to a variable the call passed it from.
+      for w in r.caWb {
+        if !opndsHoldVar(r.caCaps, w) {
+          return fail(2, at, "a call's write-back is not a capture it passes")
+        }
+      }
       callSig(r.caCallee, r.caArgs, dst, at)
     }
     RCallRef => {
@@ -397,7 +544,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
-    RCallHost => uses(r.chArgs, at)
+    RCallHost => {
+      uses(r.chArgs, at)
+      if r.chVoid && dst >= 0 {
+        return fail(2, at, "a void host call has no value")
+      }
+      0
+    }
     RBoxField => {
       use(r.bfV, at)
       const bf = repNodeAt(opRep(r.bfV))
@@ -407,6 +560,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RSharedRead => {
+      // A global receiver is read again at each push; its recorded cell is the box, `srV` unread.
+      if r.srGlobal >= 0 {
+        if !boxShaped(irGlobalRepOf(vf, r.srGlobal)) {
+          return fail(2, at, "a shared read's global receiver is a box")
+        }
+        if !(r.srV is OImm) {
+          return fail(2, at, "a shared read's global receiver has no operand")
+        }
+        return 0
+      }
       use(r.srV, at)
       // Unstashed, every arm reads the receiver twice, and a temp is read once.
       if (
@@ -422,9 +585,33 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           "a shared read's receiver is a variable read more than once",
         )
       }
-      if !(repNodeAt(opRep(r.srV)) is RBox) {
+      // A boxed `U | null` (discipline 4) is held in the same box.
+      const sn = repNodeAt(opRep(r.srV))
+      if !(sn is RBox) && !(sn is RNullable && sn.rnDisc == 4) {
         return fail(2, at, "a shared read's receiver is a box")
       }
+      0
+    }
+    RArmUnbox => {
+      use(r.uaV, at)
+      if !boxShaped(opRep(r.uaV)) {
+        return fail(2, at, "an arm unbox's operand is a box")
+      }
+      const dn = repNodeAt(dst)
+      const rec = dn is RRecord
+        || dn is RNullable && repNodeAt(dn.rnInner) is RRecord
+      if !rec { return fail(2, at, "an arm unbox lands at a record") }
+      0
+    }
+    RNicheRead => {
+      use(r.nrV, at)
+      if !boxShaped(opRep(r.nrV)) {
+        return fail(2, at, "a niche read's operand is a box")
+      }
+      const dn = repNodeAt(dst)
+      const nulStr = dn is RNullable && dn.rnDisc == 1 && dn.rnInner == vfStr
+      const fits = if r.nrKind == 1 { repBoolNiche(dst) } else { r.nrKind == 2 && nulStr }
+      if !fits { return fail(2, at, "a niche read is at its niche's rep") }
       0
     }
     RBoxNarrow => {
@@ -433,9 +620,15 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const boxed = bn is RBox
         || bn is RNullable
         && bn.rnDisc == 4
-        && (r.bnAtom >= 0 || repNodeAt(dst) is RRecord)
+        && (r.bnAtom >= 0 || r.bnCon >= 0 || repNodeAt(dst) is RRecord)
       if !boxed {
         return fail(2, at, "a narrowed variant read's operand is a box")
+      }
+      0
+    }
+    RRecCopyPure => {
+      if dst >= 0 && !(repNodeAt(dst) is RRecord) {
+        return fail(2, at, "a record copy of a non-record rep")
       }
       0
     }
@@ -443,6 +636,30 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.rcV, at)
       if !(repNodeAt(opRep(r.rcV)) is RNullable) {
         return fail(2, at, "a recovered read's operand is nullable")
+      }
+      0
+    }
+    RVariantChain => {
+      use(r.vcV, at)
+      if dst != vfBool { return fail(2, at, "a variant chain test is a bool") }
+      if !(r.vcV is OVar) {
+        return fail(2, at, "a variant chain test re-reads a variable")
+      }
+      if !(repNodeAt(opRep(r.vcV)) is RBox) {
+        return fail(2, at, "a variant chain test's operand is a box")
+      }
+      0
+    }
+    RVariantDiscrim => {
+      use(r.vdV, at)
+      if dst != vfBool {
+        return fail(2, at, "a variant discriminant test is a bool")
+      }
+      if !(r.vdV is OVar) {
+        return fail(2, at, "a variant discriminant test re-reads a variable")
+      }
+      if !(repNodeAt(opRep(r.vdV)) is RBox) {
+        return fail(2, at, "a variant discriminant test's operand is a box")
       }
       0
     }
@@ -455,8 +672,24 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RAsUnion => {
+      use(r.auV, at)
+      // The tag test reads a box; what it yields is the cast's own rep, which the builder takes.
+      if !(repNodeAt(opRep(r.auV)) is RBox) {
+        return fail(2, at, "a union cast's operand is a box")
+      }
+      0
+    }
     RCast => {
       use(r.ctV, at)
+      // A trapping cast narrows a nullable reference to the reference it holds.
+      const on = repNodeAt(opRep(r.ctV))
+      if (
+        r.ctOnFail == "trap"
+        && !(on is RNullable && kidAt(opRep(r.ctV), 0) == r.ctTarget)
+      ) {
+        return fail(2, at, "a trapping cast's operand is its target's nullable")
+      }
       if dst < 0 { return 0 }
       const ok = if r.ctOnFail == "trap" { dst == r.ctTarget } else { repNodeAt(dst) is RNullable && kidAt(dst, 0) == r.ctTarget }
       if !ok { return fail(2, at, "a cast's result is not its target's rep") }
@@ -474,12 +707,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       uses(r.mrFields, at)
       if dst < 0 { return 0 }
       const ks = repNodeKids(dst)
+      if r.mrSet { return stashedRec(r, ks, at) }
       if !(repNodeAt(dst) is RRecord) || ks.length != r.mrFields.length {
         return fail(2, at, "a record's fields do not match its rep")
       }
       let i = 0
       while i < ks.length {
-        if opRep(r.mrFields[i]) != ks[i] {
+        if (
+          opRep(r.mrFields[i]) != ks[i]
+          && !vfOpenTakes(recKidSiteTy(r, i, at), ks[i], opRep(r.mrFields[i]))
+        ) {
           return fail(2, at, "field " + i32ToStr(i) + "'s rep differs")
         }
         i = i + 1
@@ -520,13 +757,20 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       // A union-box field's read unboxes to the read's own rep (`structUnionBoxTail`).
       const k = kidAt(v, r.gfIx)
+      // A literal-union member is boxed as its string, which the unbox `gfStr` names leaves.
+      const tr = repNodeOfTy(irFactTyOf(vf, at))
       const unboxed = repNodeAt(k) is RBox
-        && dst == repNodeOfTy(nodeTyAt(r.gfAt, vf.irAt))
+        && (dst == tr
+        || r.gfStr && dst == vfStr && repNodeAt(tr) is RAtom)
       // A nullable field the checker narrowed past its null reads at its inner rep.
       const kn = repNodeAt(k)
       const narrowed = kn is RNullable && kn.rnInner == dst
       if dst >= 0 && k != dst && !unboxed && !narrowed {
         return fail(2, at, "a field's rep is not its destination's")
+      }
+      // A shared template member's read is at its kid's own rep: it has no type to unbox to.
+      if r.gfShared && dst >= 0 && dst != k {
+        return fail(2, at, "a shared member read is not at its field's rep")
       }
       // A read at its storage is the field's own box, unboxed nowhere.
       if r.gfStored && (!(repNodeAt(k) is RBox) || dst != k) {
@@ -554,13 +798,25 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RSpread => {
-      use(r.spSrc, at)
+      for s in r.spSrcs { use(s, at) }
       if dst < 0 { return 0 }
       if !(repNodeAt(dst) is RList) {
         return fail(2, at, "a spread literal of a non-list rep")
       }
-      if opRep(r.spSrc) != dst {
-        return fail(2, at, "a spread's source rep is not the literal's")
+      for s in r.spSrcs {
+        if opRep(s) != dst {
+          return fail(2, at, "a spread's source rep is not the literal's")
+        }
+      }
+      0
+    }
+    RListNewDefault => {
+      use(r.ldLen, at)
+      if opRep(r.ldLen) != vfI32 {
+        return fail(2, at, "a list length is an i32")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RList) {
+        return fail(2, at, "a zeroed list is a list")
       }
       0
     }
@@ -572,6 +828,26 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       if dst >= 0 && opRep(r.lnFill) != kidAt(dst, 0) {
         return fail(2, at, "the fill's rep is not the element's")
+      }
+      0
+    }
+    RMemAccess => memAccessCheck(r, dst, at)
+    RAtomic => atomicCheck(r, dst, at)
+    RTruncSat => truncSatCheck(r, dst, at)
+    RMemOp => {
+      for o in r.moArgs { use(o, at) }
+      for o in r.moArgs {
+        if opRep(o) != vfI32 {
+          return fail(2, at, "a memory op's operands are i32s")
+        }
+      }
+      const v = irFactIntOf(vf, at, 1) == 1
+      if dst >= 0 && (v || dst != vfI32) {
+        return fail(
+          2,
+          at,
+          "a memory op leaves an i32, or nothing for the bulk pair",
+        )
       }
       0
     }
@@ -608,7 +884,19 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       // A packed byte reads unsigned into an i32.
       const packed = repPrim(kidAt(l, 0)) == "u8" && dst == vfI32
-      if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed {
+      // A nullable element may read recovered at its inner rep.
+      const en = repNodeAt(kidAt(l, 0))
+      const recovered = en is RNullable && en.rnInner == dst
+      // A box element may read unboxed at the member its place narrows to.
+      const unboxed = en is RBox || en is RNullable && en.rnDisc == 4
+      if (
+        l != vfStr
+        && dst >= 0
+        && kidAt(l, 0) != dst
+        && !packed
+        && !recovered
+        && !unboxed
+      ) {
         return fail(2, at, "an element's rep is not its destination's")
       }
       0
@@ -617,14 +905,22 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.rgV, at)
       const d = repNodeAt(dst)
       if (
-        !(d is RNullable)
-        || !nicheRetag(d.rnDisc, d.rnInner)
-        || d.rnInner != opRep(r.rgV)
+        !listRetag(opRep(r.rgV), dst)
+        && !boxListRetag(opRep(r.rgV), dst)
+        && !listRetagHole(vf, opRep(r.rgV), dst)
+        && !cloHoleRetagAlike(opRep(r.rgV), dst)
+        && !recRetag(opRep(r.rgV), dst)
+        && !cloFieldRetag(r.rgV, dst, at)
+        && !plainRecordsLowerAlike(opRep(r.rgV), dst)
+        && !recSubRetag(opRep(r.rgV), dst, vf.irRecHeap, vf.irRecSub)
+        && (!(d is RNullable)
+          || !nicheRetag(d.rnDisc, d.rnInner)
+          || d.rnInner != opRep(r.rgV))
       ) {
         return fail(
           2,
           at,
-          "a retag is not of an atom or a string into its own nullable niche",
+          "a retag is not of an atom or a string into its own nullable niche, a ref list as itself or into its hole, a variant record as its struct twin, or a record as one whose fields, or leading fields, lower alike",
         )
       }
       0
@@ -648,17 +944,47 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RFieldNull => {
+      const d = repNodeAt(dst)
+      if !(d is RNullable) && !(d is RBox) {
+        return fail(
+          2,
+          at,
+          "a field's null is not delivered into a nullable or a box",
+        )
+      }
+      0
+    }
     RNullOf => {
       const d = repNodeAt(dst)
-      if r.nuOwn == NULL_OWN_BOX {
+      const own = irFactIntOf(vf, at, 2)
+      if own == 1 {
         if !(d is RBox) && !(d is RNullable && d.rnDisc == 4) {
           return fail(2, at, "a null box is not delivered into a union box")
         }
+      } else if own == 0 && repPrim(dst) == "null" {
+        // The `null` unit's one value is the bottom ref.
       } else if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
         return fail(
           2,
           at,
           "a null is not delivered into a K | null or a nullable reference",
+        )
+      }
+      0
+    }
+    RJoinNull => {
+      // A join's null is its nullable reference's, never a box's or a sentinel's.
+      const d = repNodeAt(dst)
+      if (
+        !(d is RNullable)
+        || d.rnDisc != 1
+        || !nicheRetag(d.rnDisc, d.rnInner)
+      ) {
+        return fail(
+          2,
+          at,
+          "a join null is not delivered into a nullable reference",
         )
       }
       0
@@ -675,22 +1001,60 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RNulNicheEq => nulNicheEqCheck(r, dst, at)
+    RNulNoneBox => {
+      if r.nnPay {
+        use(r.nnV, at)
+        if repPrim(opRep(r.nnV)) != "null" {
+          return fail(
+            2,
+            at,
+            "a null-typed box's payload is no null-typed value",
+          )
+        }
+      }
+      if !boxShaped(dst) {
+        return fail(2, at, "a null-typed box lands at no box")
+      }
+      0
+    }
+    RClosureEq => closureEqCheck(r, dst, at)
     RNulTest => {
       use(r.ntV, at)
       const d = repNodeAt(opRep(r.ntV))
-      if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
+      // A union box (discipline 4 included) answers by its null tag.
+      const box = d is RBox || d is RNullable && d.rnDisc == 4
+      if !box && (!(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner)) {
         return fail(
           2,
           at,
-          "a null test of neither a K | null nor a nullable reference",
+          "a null test of neither a K | null, a nullable reference nor a box",
         )
       }
       0
     }
     RAtomEq => {
       // A static side's immediate is unread; any other static operand is evaluated and dropped.
-      if !(r.aeStatic == 1 && r.aeL is OImm) { use(r.aeL, at) }
-      if !(r.aeStatic == 2 && r.aeR is OImm) { use(r.aeR, at) }
+      if !((r.aeStatic == 1 || r.aeStatic == 3) && r.aeL is OImm) {
+        use(r.aeL, at)
+      }
+      if !((r.aeStatic == 2 || r.aeStatic == 3) && r.aeR is OImm) {
+        use(r.aeR, at)
+      }
+      0
+    }
+    RUnionConcreteEq => {
+      use(r.ucBox, at)
+      use(r.ucOther, at)
+      const bv = r.ucBox
+      if (
+        !(bv is OVar)
+        || bv.ov < 0
+        || bv.ov >= vf.irVars.length
+        || vf.irVars[bv.ov].vKind == "temp"
+      ) {
+        return fail(2, at, "a union compare's box is not a re-read variable")
+      }
       0
     }
     RUnionEq => {
@@ -703,10 +1067,27 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.qeR, at)
       0
     }
+    RListCat => {
+      use(r.ljL, at)
+      use(r.ljR, at)
+      if (
+        opRep(r.ljL) != dst
+        || opRep(r.ljR) != dst
+        || !(repNodeAt(dst) is RList)
+      ) {
+        return fail(2, at, "a list concat's operands are not its list")
+      }
+      0
+    }
+    RCoerce => use(r.cvV, at)
     RToBox => {
       use(r.bxV, at)
+      // A box planned at a union lands at a box.
+      if r.bxTy >= 0 && !boxShaped(dst) {
+        return fail(2, at, "a box planned at a union lands at no box")
+      }
       // Legacy's box writer may leave an immediate unread, so one stands only for an effect-free node.
-      if (r.bxV is OImm || r.bxV is OStr) && !exprEffectFree(r.bxAt) {
+      if (r.bxV is OImm || r.bxV is OStr) && !r.bxFree {
         return fail(2, at, "a box's immediate stands for a node with an effect")
       }
       0
@@ -718,6 +1099,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         || dst >= 0 && numKindOf(dst) != r.nwDst
       ) {
         return fail(2, at, "a widening's reps are not its kinds")
+      }
+      0
+    }
+    ROptRead => {
+      use(r.orV, at)
+      if repIsScalar(opRep(r.orV)) {
+        return fail(2, at, "an optional read's base is no reference")
       }
       0
     }
@@ -742,6 +1130,18 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const want = if repPrim(ln.rlsElem) == "u8" { vfI32 } else { ln.rlsElem }
       if opRep(r.lpX) != want {
         return fail(2, at, "a push of a non-element onto a non-list")
+      }
+      if dst >= 0 && dst != vfI32 {
+        return fail(2, at, "a push yields its i32 length")
+      }
+      0
+    }
+    RListPushMany => {
+      use(r.pmV, at)
+      use(r.pmL, at)
+      const vn = repNodeAt(opRep(r.pmV))
+      if !(vn is RList) || !(repNodeAt(opRep(r.pmL)) is RList) {
+        return fail(2, at, "a variadic push of a non-list onto a non-list")
       }
       if dst >= 0 && dst != vfI32 {
         return fail(2, at, "a push yields its i32 length")
@@ -810,6 +1210,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RStashSet => {
+      use(r.ssV, at)
+      vfSetAt.push(r.ssAt)
+      vfSetK.push(r.ssK)
+      vfSetRep.push(opRep(r.ssV))
+      0
+    }
     RTagStash => {
       use(r.tgsV, at)
       if opRep(r.tgsV) != vfI32 {
@@ -818,6 +1225,52 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RTagIs => if dst != vfBool { fail(2, at, "a tag test is a bool") } else { 0 }
+    RListEmpty => {
+      use(r.leV, at)
+      if dst != vfBool { return fail(2, at, "a list emptiness test is a bool") }
+      if !(repNodeAt(opRep(r.leV)) is RList) {
+        return fail(2, at, "a list emptiness test's operand is a list")
+      }
+      0
+    }
+    RListEmptyArms => {
+      use(r.lfV, at)
+      if dst != vfBool {
+        return fail(2, at, "a list arms' emptiness test is a bool")
+      }
+      // The lowering reads the receiver once per arm read, so it is a variable, not a temp.
+      if !(r.lfV is OVar) || !(repNodeAt(opRep(r.lfV)) is RBox) {
+        return fail(2, at, "a list arms' emptiness test reads a box variable")
+      }
+      0
+    }
+    RListIsAcross => {
+      use(r.laV, at)
+      if dst != vfBool { return fail(2, at, "a list is-across test is a bool") }
+      0
+    }
+    RListFitIs => {
+      use(r.lsV, at)
+      if dst != vfBool { return fail(2, at, "a list fit test is a bool") }
+      0
+    }
+    RLitArms => {
+      use(r.liV, at)
+      if dst != vfBool { return fail(2, at, "a literal arms test is a bool") }
+      // An operand legacy reads more than once (`litArmsReadsOf`) is a variable.
+      const reads = irFactIntOf(vf, at, 2)
+      if reads > 1 && !(r.liV is OVar) {
+        return fail(2, at, "a literal arms test re-reads a variable")
+      }
+      0
+    }
+    RNumIs => {
+      use(r.niV, at)
+      if dst != vfBool {
+        return fail(2, at, "a numeric literal test is a bool")
+      }
+      0
+    }
     RCoalAtomStr => {
       use(r.zaL, at)
       use(r.zaD, at)
@@ -829,7 +1282,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       ) {
         return fail(2, at, "an atom coalesce of a non-`K | null`")
       }
-      if !(r.zaD is OStr) || opRep(r.zaD) != vfStr || dst != vfStr {
+      if opRep(r.zaD) != vfStr || dst != vfStr {
         return fail(
           2,
           at,
@@ -845,11 +1298,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if (!(l is RNullable) || l.rnDisc != 1 || repPrim(l.rnInner) != "str") {
         return fail(2, at, "a string coalesce of a non-string | null")
       }
-      if !(r.czD is OStr) {
+      // The default is written in the block in place: a literal, or a value at the result's rep.
+      if !(r.czD is OStr) && (dst < 0 || opRep(r.czD) != dst) {
         return fail(
           2,
           at,
-          "a string coalesce's default is not a string literal",
+          "a string coalesce's default is neither a string literal nor at its rep",
         )
       }
       if dst >= 0 && dst != l.rnInner && dst != opRep(r.czL) {
@@ -863,8 +1317,29 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RNumCast => {
       use(r.ncV, at)
-      if !repIsScalar(opRep(r.ncV)) || dst >= 0 && !repIsScalar(dst) {
+      // An exact `as?` yields the value-union box of its target, or its null: a box, or the
+      // boxed `T | null`.
+      const nc = nodeAt(r.ncAt)
+      const dn = repNodeAt(dst)
+      const boxed = nc is AsExpr
+        && nc.asMode == "null"
+        && (dn is RBox || dn is RNullable && dn.rnDisc == 4)
+      if !repIsScalar(opRep(r.ncV)) || dst >= 0 && !repIsScalar(dst) && !boxed {
         return fail(2, at, "a numeric cast is between scalars")
+      }
+      0
+    }
+    RNumUnionBin => {
+      uses(r.nbArgs, at)
+      0
+    }
+    RNumUnionConvert => {
+      use(r.nuV, at)
+      if dst >= 0 && numKindOf(dst) != r.nuTo {
+        return fail(2, at, "a numeric union conversion is at its kind")
+      }
+      if !(repNodeAt(opRep(r.nuV)) is RBox) {
+        return fail(2, at, "a numeric union conversion reads a box")
       }
       0
     }
@@ -875,6 +1350,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RSimd => simdCheck(r, dst, at)
     RPrint => {
       use(r.pnV, at)
       if dst >= 0 { return fail(2, at, "a print statement has no value") }
@@ -908,12 +1384,40 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(2, at, "a map get of a receiver that is no map")
       }
       const m = repNodeAt(mapRecvRep(r.mtSym, r.mtLoc))
-      if dst >= 0 && m is RMap && !mapGetDstOk(m.rmVal, dst) {
+      // A union value's narrowed read is unboxed to its member's scalar (`narrowedMapReadOf`).
+      const unboxed = irFactIntOf(vf, at, 0) == 1 && repPrim(dst) != null
+      // A union value's read is its box, `null` one more tag of it.
+      const sameBox = m is RMap
+        && repNodeAt(repBoxCore(dst)) is RBox
+        && repBoxCore(dst) == repBoxCore(m.rmVal)
+      // A scalar value's read the box plan boxes (`mtBox`) is a box of the union it delivers to.
+      const scalarBox = r.mtBox >= 0
+        && m is RMap
+        && repPrim(m.rmVal) != null
+        && repNodeAt(repBoxCore(dst)) is RBox
+      if (
+        dst >= 0
+        && m is RMap
+        && !mapGetDstOk(m.rmVal, dst)
+        && !unboxed
+        && !sameBox
+        && !scalarBox
+      ) {
         return fail(
           2,
           at,
           "a map get yields its value, or that value's nullable",
         )
+      }
+      0
+    }
+    RMapIter => {
+      use(r.miV, at)
+      if !(repNodeAt(opRep(r.miV)) is RMap) {
+        return fail(2, at, "a map's keys or values are read off a map")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RList) {
+        return fail(2, at, "a map's keys or values are a list")
       }
       0
     }
@@ -936,9 +1440,37 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 && r.mgForm == 0 && dst != vfI32 {
         return fail(2, at, "a map read through a helper is an i32")
       }
-      // The miss arm's default is the read's value, so it is at the read's rep.
-      if dst >= 0 && r.mgForm > 0 && opRep(r.mgDef) != dst {
+      // The miss arm's default is the read's value, so it is at the read's rep; a union box's
+      // default is boxed into the map's value, whose box the read is (`mapBoxReadsAt`).
+      const mgRep = if r.mgSym >= 0 { irGlobalRepOf(vf, r.mgSym) } else { opRep(r.mgLoc) }
+      const dw = if r.mgForm == 5 { mapValOf(mgRep) } else { dst }
+      if r.mgForm == 5 && dst >= 0 && !mapBoxReadsAt(mgRep, dst) {
+        return fail(2, at, "a map read's union box yields no value of its map")
+      }
+      if dst >= 0 && r.mgForm > 0 && opRep(r.mgDef) != dw {
         return fail(2, at, "a map read's default is not at its rep")
+      }
+      0
+    }
+    RStructEq => {
+      uses([r.seL, r.seR], at)
+      uses(r.seLIx, at)
+      uses(r.seRIx, at)
+      if repIsScalar(opRep(r.seL)) || repIsScalar(opRep(r.seR)) {
+        return fail(2, at, "a record compare's operands are references")
+      }
+      for ixs in [r.seLIx, r.seRIx] {
+        for o in ixs {
+          if repPrim(opRep(o)) != "i32" {
+            return fail(2, at, "a record compare's element index is an i32")
+          }
+        }
+      }
+      if r.seLIx.length > 1 || r.seRIx.length > 1 {
+        return fail(2, at, "a record compare's element read has one index")
+      }
+      if dst >= 0 && repPrim(dst) != "bool" {
+        return fail(2, at, "a record compare's answer is a bool")
       }
       0
     }
@@ -983,13 +1515,91 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RFnId => if dst >= 0 && dst != vfI32 { fail(2, at, "a function id is an i32") } else { 0 }
+    RAtomSole => if dst >= 0 && !(repNodeAt(dst) is RAtom) { fail(2, at, "a sole atom is an atom") } else { 0 }
+    RAtomWide => {
+      use(r.awV, at)
+      if dst >= 0 && !(repNodeAt(dst) is RAtom) {
+        return fail(2, at, "a wide literal's atom is an atom")
+      }
+      0
+    }
+    RStrToAtomStaged => {
+      use(r.zsV, at)
+      if repPrim(opRep(r.zsV)) != "str" {
+        return fail(2, at, "a staged atom narrowing parks a string")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RAtom) {
+        return fail(2, at, "a staged atom narrowing is an atom")
+      }
+      0
+    }
+    RStrToAtom => {
+      uses(r.saReads, at)
+      for o in r.saReads {
+        if repPrim(opRep(o)) != "str" {
+          return fail(2, at, "an atom tower tests string reads")
+        }
+      }
+      if r.saReads.length == 0 {
+        return fail(2, at, "an atom tower tests at least one member")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RAtom) {
+        return fail(2, at, "an atom tower is an atom")
+      }
+      0
+    }
     RCellNew => use(r.cnInit, at)
     RCellGet => use(r.cgCell, at)
+    REnvGet => 0
+    REnvDrop => 0
+    RBundlePick => {
+      use(r.bpV, at)
+      if dst >= 0 && !(repNodeAt(dst) is RClosure) {
+        return fail(2, at, "a bundle member of a non-closure rep")
+      }
+      0
+    }
+    RHandPick => {
+      use(r.hpV, at)
+      if !(repNodeAt(opRep(r.hpV)) is RRecord) {
+        return fail(2, at, "a hand pick of a non-record value")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RClosure) {
+        return fail(2, at, "a hand member of a non-closure rep")
+      }
+      0
+    }
+    RResultPick => {
+      use(r.rkV, at)
+      if !(repNodeAt(opRep(r.rkV)) is RRecord) {
+        return fail(2, at, "a result pick of a non-record value")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RClosure) {
+        return fail(2, at, "a result member of a non-closure rep")
+      }
+      0
+    }
     RGlobalGet => {
       const g = irGlobalRepOf(vf, r.ggSym)
       if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
-      if dst >= 0 && dst != g {
+      const gn = repNodeAt(g)
+      const narrowed = r.ggNn >= 0 && gn is RNullable && gn.rnInner == dst
+      if dst >= 0 && dst != g && !narrowed && !vfStoresAs(dst, g) {
         return fail(2, at, "a global's rep is not its destination's")
+      }
+      // A global the builder noted as holding a record whole is read at that record (`irGlobalHeld`).
+      const held = vf.irGlobalHeld[r.ggSym] ?? false
+      if (
+        dst >= 0
+        && !narrowed
+        && !held
+        && !globalReadAtTyOrStorage(r.ggSym, dst, at)
+      ) {
+        return fail(
+          2,
+          at,
+          "a global read off its type's rep is not at its storage row",
+        )
       }
       0
     }
@@ -1006,9 +1616,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RStage => {
       use(r.sgV, at)
       // A literal stages only at its own string rep; the box-view escape is for a variable.
-      const view = !(r.sgV is OStr)
-        && repNodeAt(dst) is RBox
-        && repNodeAt(opRep(r.sgV)) is RBox
+      const view = !(r.sgV is OStr) && boxShaped(dst) && boxShaped(opRep(r.sgV))
       if dst >= 0 && dst != opRep(r.sgV) && !view {
         return fail(2, at, "a staged operand is a value at its own rep")
       }
@@ -1016,6 +1624,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
   }
   return 0
+}
+
+// Whether rep `r` is the union box: a union's own, or a boxed `T | null` (disc 4).
+function boxShaped(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RBox || n is RNullable && n.rnDisc == 4
 }
 
 // Whether rep `r` is raw, at heap `heap` unless that is -1.
@@ -1079,6 +1693,24 @@ function rawEff(e: SRawOp, at: i32) {
   if e.srOp == "reserve.open" || e.srOp == "reserve.close" {
     return if e.srArgs.length == 0 { 0 } else { fail(10, at, e.srOp + " takes no operand") }
   }
+  // A binding sink's pair writes: a box in, the null in, or the box out to a box variable.
+  if e.srOp == "sink.put" || e.srOp == "sink.null" || e.srOp == "sink.close" {
+    uses(e.srArgs, at)
+    const n0 = if e.srOp == "sink.put" { 1 } else { 0 }
+    const v = e.srImm
+    const varOk = e.srOp == "sink.null"
+      || v >= 0
+      && v < vf.irVars.length
+      && sinkBoxRep(vf.irVars[v].vRep)
+    if (
+      e.srArgs.length != n0
+      || !varOk
+      || n0 == 1 && !sinkBoxRep(opRep(e.srArgs[0]))
+    ) {
+      return fail(10, at, e.srOp + " is not a union box into the sink pair")
+    }
+    return 0
+  }
   if !vf.irHelper { return fail(10, at, "a raw op outside a runtime helper") }
   // Every outstanding push is this effect's leading operands, in push order.
   let k = 0
@@ -1105,7 +1737,7 @@ function rawEff(e: SRawOp, at: i32) {
     "array.copy" => n == 5 && ref0 && rawAt(opRep(a[2]), e.srImm)
     "array.init_data" | "array.fill" => n == 4 && ref0
     "call" => true
-    "reserve.open" | "reserve.close" => false
+    "reserve.open" | "reserve.close" | "sink.put" | "sink.null" | "sink.close" => false
   }
   if !ok {
     return fail(10, at, e.srOp + " is not over heap type " + i32ToStr(e.srHeap))
@@ -1113,11 +1745,17 @@ function rawEff(e: SRawOp, at: i32) {
   return 0
 }
 
-// Whether node `id` leaves its body: a branch, a return or a trap.
+// Whether rep `r` is a union box, or a nullable one held as the same `{tag, payload}`.
+function sinkBoxRep(r: i32): boolean {
+  const d = repNodeAt(r)
+  return d is RBox || d is RNullable && d.rnDisc == 4
+}
+
+// Whether node `id` leaves its body: a branch, a return, a trap or a call that never returns.
 function exits(id: i32): boolean {
   if id < 0 || id >= vf.irNodes.length { return false }
   const n = vf.irNodes[id]
-  return n is SBr || n is SReturn || n is STrap
+  return n is SBr || n is SReturn || irNodeEndsPath(n)
 }
 
 // Rule 5's fall-through: a body with out-variable `out` ends by writing it, or by leaving.
@@ -1144,6 +1782,80 @@ function coalBoxWhy(n: SCoalBox): string {
 
 // Why a nullable reference's `??` is ill-formed, or "": it reads a nullable reference, and its out
 // is that reference, its non-null inner, or a join's box.
+// A niche cell's `??` reads its niche (an atom's, or `boolean | null`'s) and writes the niche or
+// its present value.
+function coalNicheWhy(n: SCoalBox): string {
+  const lr = opRep(n.cbL)
+  const ln = repNodeAt(lr)
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a niche cell's `??` writes no variable"
+  }
+  const or = vf.irVars[o].vRep
+  if n.cbArm == "litUnion" {
+    if !(ln is RNullable) || ln.rnDisc != 3 {
+      return "an atom niche's `??` reads no atom niche"
+    }
+    if or != lr && or != ln.rnInner {
+      return "an atom niche's `??` yields neither the niche nor its atom"
+    }
+    return ""
+  }
+  if !repBoolNiche(lr) {
+    return "a `boolean | null` `??` reads no boolean niche"
+  }
+  if or != lr && repPrim(or) != "bool" {
+    return "a `boolean | null` `??` yields neither the niche nor a boolean"
+  }
+  return ""
+}
+
+// A `p?.f ?? d` over a nullable record re-reads its receiver, a variable, and yields a scalar.
+function coalOptLeafWhy(n: SCoalBox): string {
+  if !(n.cbL is OVar) { return "an optional field `??` re-reads no variable" }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "an optional field `??` writes no variable"
+  }
+  if repPrim(vf.irVars[o].vRep) == null {
+    return "an optional field `??` yields no scalar"
+  }
+  return ""
+}
+
+// A `boolean | null` niche's join `??` reads the niche and yields the union's box.
+function coalNulBoolJoinWhy(n: SCoalBox): string {
+  if !repBoolNiche(opRep(n.cbL)) {
+    return "a boolean join `??` reads no boolean niche"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a boolean join `??` writes no variable"
+  }
+  const on = repNodeAt(vf.irVars[o].vRep)
+  const box = on is RBox || on is RNullable && on.rnDisc == 4
+  return if box { "" } else { "a boolean join `??` yields no box" }
+}
+
+// A record field's `??` re-reads its record, a variable, and yields the field's box or its scalar.
+function coalFieldWhy(n: SCoalBox): string {
+  if !(n.cbL is OVar) { return "a field `??` re-reads no variable" }
+  // The record, or a box or nullable record the lowering unwraps to it.
+  const lr = repNodeAt(opRep(n.cbL))
+  const recv = lr is RRecord
+    || lr is RBox
+    || lr is RNullable
+    && (lr.rnDisc == 4 || repNodeAt(lr.rnInner) is RRecord)
+  if !recv { return "a field `??` reads no record" }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length { return "a field `??` writes no variable" }
+  const or = vf.irVars[o].vRep
+  if n.cbArm == "fieldBox" {
+    return if repNodeAt(or) is RBox { "" } else { "a field `??` keeps no box" }
+  }
+  return if repPrim(or) != null { "" } else { "a field `??` unboxes to no scalar" }
+}
+
 function coalNulRefWhy(n: SCoalBox): string {
   const lr = repNodeAt(opRep(n.cbL))
   if !(lr is RNullable) || lr.rnDisc == 4 || lr.rnInner < 0 {
@@ -1156,24 +1868,67 @@ function coalNulRefWhy(n: SCoalBox): string {
   const or = vf.irVars[o].vRep
   const on = repNodeAt(or)
   const boxed = on is RBox || on is RNullable && on.rnDisc == 4
-  if !boxed && or != opRep(n.cbL) && or != lr.rnInner {
-    return "a nullable-reference `??` yields neither the reference, its inner, nor a box"
+  // A nullable map's `??` may yield its default's wider map, stored alike (D15050).
+  const ir = repNodeAt(lr.rnInner)
+  const wv = if on is RMap { repNodeAt(on.rmVal) } else { null }
+  const maps = on is RMap
+    && ir is RMap
+    && (on.rmVal == ir.rmVal
+    || wv is RNullable && wv.rnInner == ir.rmVal)
+  if !boxed && !maps && or != opRep(n.cbL) && or != lr.rnInner {
+    return "a nullable-reference `??` yields neither the reference, its inner, a map whose value widens the inner's, nor a box"
   }
   return ""
 }
 
-// Why a fused `pop ?? d` is ill-formed, or "": it pops a list of a scalar element, and its out is
-// at that element's rep.
+// Why a `string | null` `??` whose default computes is ill-formed, or "": it reads a nullable
+// string and yields that string or its non-null inner.
+function coalNulStrWhy(n: SCoalBox): string {
+  const lr = repNodeAt(opRep(n.cbL))
+  if !(lr is RNullable) || lr.rnDisc != 1 || repPrim(lr.rnInner) != "str" {
+    return "a string `??` reads no nullable string"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a string `??` writes no variable"
+  }
+  const or = vf.irVars[o].vRep
+  const on = repNodeAt(or)
+  const boxed = on is RBox || on is RNullable && on.rnDisc == 4
+  if !boxed && or != opRep(n.cbL) && or != lr.rnInner {
+    return "a string `??` yields neither the string, its inner, nor a box"
+  }
+  return ""
+}
+
+// Why a shared `scalar | null` field's `??` is ill-formed, or "": it reads a boxed nullable and
+// yields a scalar.
+function coalBoxFieldScalarWhy(n: SCoalBox): string {
+  const ln = repNodeAt(opRep(n.cbL))
+  if !(ln is RNullable) || ln.rnDisc != 4 {
+    return "a box field's `??` reads no boxed nullable"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length || repPrim(vf.irVars[o].vRep) == null {
+    return "a box field's `??` yields no scalar"
+  }
+  return ""
+}
+
+// Why a fused `pop ?? d` is ill-formed, or "": it pops a list of a scalar or atom element, and its
+// out is at that element's rep.
 function coalPopOrWhy(n: SCoalBox): string {
   const lr = repNodeAt(opRep(n.cbL))
   if !(lr is RList) { return "a `pop ?? d` pops no list" }
   const p = repPrim(lr.rlsElem)
+  // A literal-union list holds its atoms' i32 ids, and legacy pops it as a scalar list.
   const scalar = p != null
     && (p == "i32"
     || p == "i64"
     || p == "f64"
     || p == "f32"
     || p == "bool")
+    || repNodeAt(lr.rlsElem) is RAtom
   if !scalar { return "a `pop ?? d` pops a list of no scalar element" }
   const o = n.cbOut
   if o < 0 || o >= vf.irVars.length || vf.irVars[o].vRep != lr.rlsElem {
@@ -1182,8 +1937,15 @@ function coalPopOrWhy(n: SCoalBox): string {
   return ""
 }
 
+// The value rep of map rep `mrep`, or -1 for no map.
+function mapValOf(mrep: i32): i32 {
+  const mr = repNodeAt(mrep)
+  return if mr is RMap { mr.rmVal } else { -1 }
+}
+
 // Why a fused map read whose default computes is ill-formed, or "": it probes a map receiver by a
-// key along an inline form, `i32` (1) or mv (2), into an out of the read's own rep.
+// key along an inline form, `i32` (1), mv (2), a scalar union value's (3), a ref niche's (4) or a union box's (5), into an out of the read's
+// own rep.
 function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   const mp = n.cbMap
   if mp == null { return "a fused map read holds no probe" }
@@ -1191,7 +1953,7 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   if !mapRecvOk(mp.prSym, n.cbL, id) {
     return "a map read of a receiver that is no map"
   }
-  if mp.prForm != 1 && mp.prForm != 2 {
+  if mp.prForm < 1 || mp.prForm > 6 {
     return "a fused map read writes its default in no miss arm"
   }
   const o = n.cbOut
@@ -1199,7 +1961,7 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
     return "a fused map read writes no variable"
   }
   const p = repPrim(vf.irVars[o].vRep)
-  if mp.prForm == 1 && p != "i32" && p != "bool" {
+  if (mp.prForm == 1 || mp.prForm == 6) && !repHeldAsI32(vf.irVars[o].vRep) {
     return "a map read's plain probe yields no i32"
   }
   // The mv slot's read is the map's value as itself, so its out is at that value's rep.
@@ -1209,12 +1971,40 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   if mp.prForm == 2 && (!(mr is RMap) || mr.rmVal != vf.irVars[o].vRep) {
     return "a map read's mv slot yields no value of its map"
   }
+  // A boxed nullable union's read is its box.
+  if (
+    mp.prForm == 5
+    && !mapBoxReadsAt(
+      if mp.prSym >= 0 { irGlobalRepOf(vf, mp.prSym) } else { opRep(n.cbL) },
+      vf.irVars[o].vRep,
+    )
+  ) {
+    return "a map read's union box yields no value of its map"
+  }
+  // A ref niche's read is its non-null value.
+  if (
+    mp.prForm == 4
+    && !mapNicheReadsAt(
+      if mp.prSym >= 0 { irGlobalRepOf(vf, mp.prSym) } else { opRep(n.cbL) },
+      vf.irVars[o].vRep,
+    )
+  ) {
+    return "a map read's niche yields no value of its map"
+  }
+  // A union value's read peels to its scalar.
+  if mp.prForm == 3 && (!(mr is RMap) || p == null) {
+    return "a map read's union value peels to no scalar"
+  }
   return ""
 }
 
 function nested(body: i32[]) {
   const nDefs = vfDefLog.length
-  for id in body { stmt(id) }
+  let prev = -1
+  for id in body {
+    stmt(id, prev)
+    prev = id
+  }
   while vfDefLog.length > nDefs {
     const d = vfDefLog.pop() ?? -1
     if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
@@ -1264,7 +2054,7 @@ function ifSpine(id0: i32) {
         nodeRepClosed(c)
         next = c
       } else {
-        stmt(c)
+        stmt(c, if pos[top] > 1 { ln.siElse[pos[top] - 2] } else { -1 })
       }
     } else {
       while vfDefLog.length > defs[top] {
@@ -1280,6 +2070,14 @@ function ifSpine(id0: i32) {
   }
 }
 
+// Whether `v` is a declared binding, the one a loop value's frame carries out through.
+function declaredVar(v: i32): boolean {
+  return v >= 0
+    && v < vf.irVars.length
+    && vf.irVars[v].vKind != "temp"
+    && vf.irVars[v].vSlot >= 0
+}
+
 function labelled(label: i32, out: i32, body: i32[]) {
   vfLabels.push(label)
   vfLabelOut.push(out)
@@ -1289,7 +2087,67 @@ function labelled(label: i32, out: i32, body: i32[]) {
   return 0
 }
 
-function stmt(id: i32) {
+// Why a box stash `??` is malformed, or "": its operand is the box the shared slot holds, a null
+// one's null its tag.
+function coalBoxStashWhy(n: SCoalBox): string {
+  const r = repNodeAt(opRep(n.cbL))
+  if !(r is RBox) && !(r is RNullable && r.rnDisc == 4) {
+    return "a box stash `??` reads a box"
+  }
+  return ""
+}
+
+// A `??`'s checks: its operand block, operand, out, arm and default. Its own frame, so `stmt`'s
+// per-level frame stays as small as its other arms need.
+function coalBoxCheck(n: SCoalBox, id: i32) {
+  // A fused map read's receiver is read by its probe, which may name a global instead.
+  const mapArm = n.cbArm == "mapIndexGetOr"
+  if (n.cbMap != null) != mapArm {
+    return fail(2, id, "a `??` holds a map probe off the map-read arm")
+  }
+  if n.cbLB.length > 0 && n.cbArm != "nulRef" && n.cbArm != "nulStr" {
+    return fail(
+      2,
+      id,
+      "a `??` builds its operand inside off the nullable-reference arm",
+    )
+  }
+  // The operand block's definitions are seen by the operand, then dropped with the node.
+  const nDefs = vfDefLog.length
+  let lbPrev = -1
+  for lid in n.cbLB {
+    stmt(lid, lbPrev)
+    lbPrev = lid
+  }
+  if !mapArm { use(n.cbL, id) }
+  if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
+    return fail(4, id, "a boxed `??` writes no variable")
+  }
+  const why = match n.cbArm {
+    "popOr" => coalPopOrWhy(n)
+    "mapIndexGetOr" => coalMapGetOrWhy(n, id)
+    "nulRef" => coalNulRefWhy(n)
+    "litUnion" | "nulBool" => coalNicheWhy(n)
+    "fieldBox" | "fieldVal" => coalFieldWhy(n)
+    "optLeaf" => coalOptLeafWhy(n)
+    "nulBoolJoin" => coalNulBoolJoinWhy(n)
+    "boxStash" => coalBoxStashWhy(n)
+    "boxFieldScalar" => coalBoxFieldScalarWhy(n)
+    "nulStr" => coalNulStrWhy(n)
+    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
+  }
+  if why != "" { return fail(2, id, why) }
+  nested(n.cbNull)
+  endsWriting(n.cbNull, n.cbOut, id)
+  while vfDefLog.length > nDefs {
+    const d = vfDefLog.pop() ?? -1
+    if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
+  }
+  return 0
+}
+
+// Checks node `id`, the node before it in its body `prev` (-1 for the first).
+function stmt(id: i32, prev: i32) {
   if vfRule != 0 { return 0 }
   if id < 0 || id >= vf.irNodes.length {
     return fail(5, id, "a body names no node")
@@ -1363,7 +2221,12 @@ function stmt(id: i32) {
       use(n.gsSrc, id)
       const g = irGlobalRepOf(vf, n.gsSym)
       if g < 0 { return fail(2, id, "writes a global with no recorded rep") }
-      if opRep(n.gsSrc) != g {
+      // A source that stores as the cell's valtype (`vfStoresAs`) needs no coercion.
+      if (
+        opRep(n.gsSrc) != g
+        && !repNullRefFits(opRep(n.gsSrc), g)
+        && !vfStoresAs(g, opRep(n.gsSrc))
+      ) {
         return fail(2, id, "a global store needs a coercion")
       }
       0
@@ -1375,7 +2238,7 @@ function stmt(id: i32) {
     }
     SEffect => rhsCheck(n.efRhs, -1, id)
     SBlock => {
-      if n.bkOut >= 0 && !vf.irHelper {
+      if n.bkOut >= 0 && !vf.irHelper && !declaredVar(n.bkOut) {
         return fail(10, id, "a valued block outside a runtime helper")
       }
       labelled(n.bkLabel, n.bkOut, n.bkBody)
@@ -1388,9 +2251,12 @@ function stmt(id: i32) {
       if n.xfMap < 0 { use(n.xfList, id) }
       const ln = repNodeAt(opRep(n.xfList))
       const recvMap = n.xfMap < 0 && mapRepOrNullable(opRep(n.xfList))
-      // A list walks its elements, a string its code points, each an i32.
+      // A list walks its elements, a packed byte read unsigned into an i32; a string its code
+      // points, each an i32.
       let er = -1
-      if ln is RList { er = ln.rlsElem }
+      if ln is RList {
+        er = if repPrim(ln.rlsElem) == "u8" { vfI32 } else { ln.rlsElem }
+      }
       if opRep(n.xfList) == vfStr { er = vfI32 }
       // A map walks its keys or values, each an i32 or a string.
       if (
@@ -1421,30 +2287,48 @@ function stmt(id: i32) {
       vfLabels.pop()
       vfLabelOut.pop()
     }
-    SIf => ifSpine(id)
-    SCoalBox => {
-      // A fused map read's receiver is read by its probe, which may name a global instead.
-      const mapArm = n.cbArm == "mapIndexGetOr"
-      if (n.cbMap != null) != mapArm {
-        return fail(2, id, "a `??` holds a map probe off the map-read arm")
+    SRangeLoop => {
+      const v = n.rlVar
+      if (
+        v < 0
+        || v >= vf.irVars.length
+        || vf.irVars[v].vKind != "local"
+        || vf.irVars[v].vRep != vfI32
+      ) {
+        return fail(2, id, "a range loop's variable is not an i32 local")
       }
-      if !mapArm { use(n.cbL, id) }
-      if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
-        return fail(4, id, "a boxed `??` writes no variable")
+      // The lowering checks the copy count against legacy's plan; here each copy has its label.
+      if (
+        n.rlConts.length != n.rlCopies.length
+        || !n.rlPartial && n.rlCopies.length > 0
+      ) {
+        return fail(2, id, "a range loop's copies do not match its labels")
       }
-      const why = match n.cbArm {
-        "popOr" => coalPopOrWhy(n)
-        "mapIndexGetOr" => coalMapGetOrWhy(n, id)
-        "nulRef" => coalNulRefWhy(n)
-        "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
+      let k = 0
+      while k < n.rlCopies.length {
+        vfLabels.push(n.rlBrk)
+        vfLabelOut.push(-1)
+        labelled(n.rlConts[k], -1, n.rlCopies[k])
+        vfLabels.pop()
+        vfLabelOut.pop()
+        k = k + 1
       }
-      if why != "" { return fail(2, id, why) }
-      nested(n.cbNull)
-      endsWriting(n.cbNull, n.cbOut, id)
+      vfLabels.push(n.rlTailBrk)
+      vfLabelOut.push(-1)
+      labelled(n.rlTailCont, -1, n.rlTail)
+      vfLabels.pop()
+      vfLabelOut.pop()
     }
+    SIf => ifSpine(id)
+    SCoalBox => coalBoxCheck(n, id)
     SSwitch => switchCheck(n, id)
+    SIntSwitch => intSwitchCheck(n, id)
     SBr => {
-      if n.brHas && !vf.irHelper {
+      if (
+        n.brHas
+        && !vf.irHelper
+        && !(n.brVal is OVar && declaredVar(n.brVal.ov))
+      ) {
         return fail(10, id, "a valued branch outside a runtime helper")
       }
       let i = vfLabels.length - 1
@@ -1479,7 +2363,10 @@ function stmt(id: i32) {
     }
     SReturn => {
       const none = repIsNoValue(vf.irRetRep)
-      if n.rtHas == none {
+      // A return right after a trap or a call that never returns is dead, so it carries no value
+      // whatever the result.
+      const dead = !n.rtHas && prev >= 0 && irNodeEndsPath(vf.irNodes[prev])
+      if n.rtHas == none && !dead {
         return fail(
           5,
           id,
@@ -1488,7 +2375,10 @@ function stmt(id: i32) {
       }
       if n.rtHas {
         use(n.rtV, id)
-        if opRep(n.rtV) != vf.irRetRep {
+        if (
+          opRep(n.rtV) != vf.irRetRep
+          && !vfOpenTakes(vf.irRetTy, vf.irRetRep, opRep(n.rtV))
+        ) {
           return fail(2, id, "a return's rep is not the result's")
         }
       }
@@ -1498,6 +2388,35 @@ function stmt(id: i32) {
     SDrop => use(n.dpV, id)
     SRawOp => rawEff(n, id)
   }
+  return 0
+}
+
+// Rule 7: an integer switch reads a 32-bit integer, or a 64-bit one when wide, and every table
+// entry names an arm or the else.
+function intSwitchCheck(n: SIntSwitch, id: i32) {
+  use(n.isOn, id)
+  const p = repPrim(opRep(n.isOn))
+  if p == null { return fail(7, id, "an integer switch over a non-scalar") }
+  const w = match p {
+    "i32" | "u8" => 1
+    "i64" => 2
+    "bool" | "f64" | "f32" | "str" | "null" | "v128" => 0
+  }
+  if w == 0 { return fail(7, id, "an integer switch over a non-integer") }
+  if (w == 2) != n.isWide {
+    return fail(7, id, "an integer switch's width is not its scrutinee's")
+  }
+  for t in n.isTable {
+    if t < 0 || t > n.isArms.length {
+      return fail(7, id, "a table entry names no arm")
+    }
+  }
+  for a in n.isArms {
+    nested(a)
+    endsWriting(a, n.isOut, id)
+  }
+  nested(n.isElse)
+  endsWriting(n.isElse, n.isOut, id)
   return 0
 }
 
@@ -1569,14 +2488,268 @@ function touchesList(n: IrNode): boolean {
     SListSet | SBoundsCheck => true
     SLet => rhsReadsList(n.lRhs)
     SEffect => rhsReadsList(n.efRhs)
-    SAssign | SSetField | SCellSet | SGlobalSet | SBlock | SLoop | SForIn | SIf | SSwitch | SCoalBox | SBr | SReturn | STrap | SDrop | SRawOp => false
+    SAssign |
+      SBlock |
+      SBr |
+      SCellSet |
+      SCoalBox |
+      SDrop |
+      SForIn |
+      SGlobalSet |
+      SIf |
+      SIntSwitch |
+      SLoop |
+      SRangeLoop |
+      SRawOp |
+      SReturn |
+      SSetField |
+      SSwitch |
+      STrap => false
   }
+}
+
+// A SIMD load's address at i32 and its result at v128; a store's address and vector, and no value.
+function simdMemCheck(r: RSimd, dst: i32, at: i32, base: i32) {
+  const a = r.sdArgs
+  if a.length != base || repPrim(opRep(a[0])) != "i32" {
+    return fail(2, at, "a SIMD access's address is an i32")
+  }
+  if base == 2 && repPrim(opRep(a[1])) != "v128" {
+    return fail(2, at, "a SIMD store's value is a v128")
+  }
+  if dst >= 0 && (base == 2 || repPrim(dst) != "v128") {
+    return fail(2, at, "a SIMD load is a v128 and a store has no value")
+  }
+  return 0
+}
+
+// A memory access's address at i32, a store's value at its width's prim (`memAccessPlanOf`), and a
+// load's result at that prim; a store has no value.
+function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
+  uses(r.mmArgs, at)
+  const a = r.mmArgs
+  if r.mmBase < 1 || a.length != r.mmBase || opRep(a[0]) != vfI32 {
+    return fail(2, at, "a memory access's address is an i32")
+  }
+  if r.mmBase == 2 && repPrim(opRep(a[1])) != r.mmPrim {
+    return fail(2, at, "a memory store's value is at its width's prim")
+  }
+  if dst >= 0 && (r.mmBase == 2 || repPrim(dst) != r.mmPrim) {
+    return fail(
+      2,
+      at,
+      "a memory load is at its width's prim and a store has no value",
+    )
+  }
+  return 0
+}
+
+// A function-value compare's two operands at closure reps, and its 0/1 answer a bool.
+function closureEqCheck(r: RClosureEq, dst: i32, at: i32) {
+  use(r.cqL, at)
+  use(r.cqR, at)
+  if (
+    !(repNodeAt(opRep(r.cqL)) is RClosure)
+    || !(repNodeAt(opRep(r.cqR)) is RClosure)
+  ) {
+    return fail(2, at, "a function-value compare's operands are closures")
+  }
+  if dst >= 0 && repPrim(dst) != "bool" {
+    return fail(2, at, "a function-value compare is a bool")
+  }
+  return 0
+}
+
+// A guarded nullable compare's two operands at reference reps, and its 0/1 answer a bool.
+function nulNicheEqCheck(r: RNulNicheEq, dst: i32, at: i32) {
+  use(r.neL, at)
+  use(r.neR, at)
+  use(r.neR2, at)
+  if repIsScalar(opRep(r.neL)) || repIsScalar(opRep(r.neR)) {
+    return fail(2, at, "a guarded nullable compare's operands are references")
+  }
+  if opRep(r.neR2) != opRep(r.neR) {
+    return fail(
+      2,
+      at,
+      "a guarded nullable compare writes its right operand twice at one rep",
+    )
+  }
+  if dst >= 0 && repPrim(dst) != "bool" {
+    return fail(2, at, "a guarded nullable compare is a bool")
+  }
+  return 0
+}
+
+// An atomic's address at i32, each value at `atomicValPrim`, and its result at `atomicResultPrim`
+// (a store and a fence have no value).
+function atomicCheck(r: RAtomic, dst: i32, at: i32) {
+  uses(r.amArgs, at)
+  const a = r.amArgs
+  if r.amBase < 0 || a.length != r.amBase || r.amValPrims.length < a.length {
+    return fail(2, at, "an atomic takes its plan's operands")
+  }
+  if a.length > 0 && opRep(a[0]) != vfI32 {
+    return fail(2, at, "an atomic's address is an i32")
+  }
+  let k = 1
+  while k < a.length {
+    if repPrim(opRep(a[k])) != r.amValPrims[k] {
+      return fail(2, at, "an atomic's value is at its row's prim")
+    }
+    k = k + 1
+  }
+  const res = r.amResPrim
+  if dst >= 0 && (res == "" || repPrim(dst) != res) {
+    return fail(2, at, "an atomic's result is at its row's prim")
+  }
+  return 0
+}
+
+// A saturating truncation's operand at its float prim and its result at its integer prim.
+function truncSatCheck(r: RTruncSat, dst: i32, at: i32) {
+  use(r.tsV, at)
+  const c = nodeAt(r.tsAt)
+  if !(c is Call) { return fail(2, at, "a saturating truncation is a call") }
+  if r.tsOp < 0 || repPrim(opRep(r.tsV)) != r.tsFrom {
+    return fail(2, at, "a saturating truncation's operand is at its float prim")
+  }
+  if dst >= 0 && repPrim(dst) != r.tsTo {
+    return fail(
+      2,
+      at,
+      "a saturating truncation's result is at its integer prim",
+    )
+  }
+  return 0
+}
+
+// A SIMD op's operands and result at the prims the builder planned from its row (`sdPrims`,
+// `sdResPrim`), a lane or shuffle index being an immediate and no operand.
+function simdCheck(r: RSimd, dst: i32, at: i32) {
+  uses(r.sdArgs, at)
+  if r.sdMemBase > 0 { return simdMemCheck(r, dst, at, r.sdMemBase) }
+  if r.sdPrims.length != r.sdArgs.length {
+    return fail(2, at, "a SIMD op's operands are at its row's prims")
+  }
+  let k = 0
+  while k < r.sdArgs.length {
+    if repPrim(opRep(r.sdArgs[k])) != r.sdPrims[k] {
+      return fail(2, at, "a SIMD op's operands are at its row's prims")
+    }
+    k = k + 1
+  }
+  const rp = r.sdResPrim
+  if (
+    dst >= 0
+    && (rp == "" || repPrim(dst) != rp && !(rp == "i32" && repPrim(dst) == "bool"))
+  ) {
+    return fail(2, at, "a SIMD op's result is at its row's prim")
+  }
+  return 0
 }
 
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListCopy | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapGet | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
+    RArmUnbox |
+      RAsUnion |
+      RAtomEq |
+      RAtomSole |
+      RAtomStr |
+      RAtomWide |
+      RAtomic |
+      RBoxField |
+      RBoxNarrow |
+      RBundlePick |
+      RCall |
+      RCallHost |
+      RCallRef |
+      RCast |
+      RCellGet |
+      RCellNew |
+      RClosureEq |
+      RCoalAtomStr |
+      RCoalStr |
+      RCoerce |
+      REnvDrop |
+      REnvGet |
+      RFieldNull |
+      RFnId |
+      RGetField |
+      RGlobalGet |
+      RHandPick |
+      RJoinNull |
+      RListCat |
+      RListClear |
+      RListCopy |
+      RListEmpty |
+      RListEmptyArms |
+      RListEq |
+      RListFitIs |
+      RListIsAcross |
+      RListLen |
+      RListNew |
+      RListNewDefault |
+      RListPop |
+      RListPush |
+      RListPushMany |
+      RListSlice |
+      RListStage |
+      RLitArms |
+      RMakeClo |
+      RMakeList |
+      RMakeRec |
+      RMapFilter |
+      RMapGet |
+      RMapGetOr |
+      RMapHas |
+      RMapIter |
+      RMapNew |
+      RMapOp |
+      RMapSet |
+      RMemAccess |
+      RMemOp |
+      RNicheRead |
+      RNulNicheEq |
+      RNulNoneBox |
+      RNulTest |
+      RNullOf |
+      RNumCast |
+      RNumIntr |
+      RNumIs |
+      RNumUnionBin |
+      RNumUnionConvert |
+      RNumWiden |
+      ROptRead |
+      RPrimOp |
+      RPrint |
+      RRawOp |
+      RRecCopyPure |
+      RRecover |
+      RRel |
+      RResultPick |
+      RRetNull |
+      RRetag |
+      RSharedRead |
+      RSimd |
+      RSpread |
+      RStage |
+      RStashSet |
+      RStrOp |
+      RStrToAtom |
+      RStrToAtomStaged |
+      RStructEq |
+      RTagIs |
+      RTagOf |
+      RTagStash |
+      RTest |
+      RToBox |
+      RTruncSat |
+      RUnionConcreteEq |
+      RUnionEq |
+      RVariantChain |
+      RVariantDiscrim => false
   }
 }
 
@@ -1640,7 +2813,10 @@ function stagePairsWhy(f: IrFn): string {
 function mapGetDstOk(val: i32, dst: i32): boolean {
   if dst == val { return true }
   const n = repNodeAt(dst)
+  // Narrowed, a value that is itself a ref niche reads as the record inside it.
+  const v = repNodeAt(val)
   return n is RNullable && n.rnInner == val
+    || v is RNullable && v.rnDisc == 1 && v.rnInner == dst
 }
 
 export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
@@ -1649,10 +2825,55 @@ export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
 // parameter. The builder asks it first, so such a function is uncovered rather than refused.
 export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
 
-// Whether a variable of type `ty` at rep `rep` is open (rule 1): a type whose every open part is
-// a tagged set's function, held at the set's `i32` id, is not (`tyOpenHeldAsIds`).
-export function irTyHeldOpen(ty: i32, rep: i32): boolean {
-  return irTyOpen(ty) && !tyOpenHeldAsIds(ty, rep, [])
+// Whether variable `i` of `vf` is open (rule 1): of an open type whose open parts the builder did
+// not find held at a rep no instance changes (`irVarHeldIds`), and no untyped closure.
+function vfHeldOpen(i: i32, ty: i32, rep: i32): boolean {
+  if irUntypedClosure(ty, rep) { return false }
+  return irTyOpen(ty) && !(vf.irVarHeldIds[i] ?? false)
+}
+
+// Whether a variable is a closure no arena type spells (a generic's instance, built by
+// `repClosureOfReps`): typed -1 at an interned closure rep of no type, which its calls are checked
+// against, as a function held at a closure rep is (`tyOpenHeldAsIds`).
+export function irUntypedClosure(ty: i32, rep: i32): boolean {
+  return ty < 0 && repNodeAt(rep) is RClosure && repTyOf(rep) < 0
+}
+
+// Whether a destination of open type `ty` at rep `rep` takes a value of rep `v` as it stands: both
+// are stored at the same valtype, as the builder noted them (`irRepValtype`).
+function vfOpenTakes(ty: i32, rep: i32, v: i32): boolean {
+  return irTyOpen(ty) && vfStoresAs(rep, v)
+}
+
+// Whether a value of rep `src` stands where rep `dst` is asked: both are stored at the valtype the
+// builder noted for them (`irRepValtype`).
+function vfStoresAs(dst: i32, src: i32): boolean {
+  const a = vf.irRepValtype[dst] ?? []
+  return a.length > 0 && u8sSame(a, vf.irRepValtype[src] ?? [])
+}
+
+// Whether record `r` is built at a variant's row, as `makeRec` lowers it.
+export function recIsVariant(r: RMakeRec): boolean { return r.mrVariant }
+
+// The site type kid `k` of record `r` at node `at` is delivered at, as the builder noted it per
+// layout position (`irFactKidTy`), or -1.
+function recKidSiteTy(r: RMakeRec, k: i32, at: i32): i32 {
+  if r.mrBuiltRow < 0 { return -1 }
+  let fi = 0
+  while fi < r.mrLayout.length && r.mrLayout[fi] != k { fi = fi + 1 }
+  const tys = irFactKidTyOf(vf, at)
+  return if fi < tys.length { tys[fi] } else { -1 }
+}
+
+// Whether byte lists `a` and `b` are equal.
+export function u8sSame(a: u8[], b: u8[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return true
 }
 
 // Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
@@ -1671,11 +2892,15 @@ export function irVerify(f: IrFn): IrVerdict {
   vfPushed = []
   vfPushes = Map()
   vfStaged = false
+  vfSetAt = []
+  vfSetK = []
+  vfSetRep = []
   let i = 0
   while i < f.irVars.length {
     const v = f.irVars[i]
     vfDefined.push(false)
-    if rawAt(v.vRep, -1) || v.vTy < 0 {
+    const untyped = irUntypedClosure(v.vTy, v.vRep)
+    if (rawAt(v.vRep, -1) || v.vTy < 0) && !untyped {
       // A raw variable has no VL type, and only a helper holds one. One whose heap is not
       // tracked is a temp, on the stack between its read and its one use.
       if !f.irHelper || v.vTy >= 0 || !rawAt(v.vRep, -1) {
@@ -1697,9 +2922,9 @@ export function irVerify(f: IrFn): IrVerdict {
         -1,
         "v" + i32ToStr(i) + "'s rep is " + repWhat(v.vRep) + ", not a closed rep",
       )
-    } else if irTyHeldOpen(v.vTy, v.vRep) {
+    } else if vfHeldOpen(i, v.vTy, v.vRep) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
-    } else if repNodeOfTy(v.vTy) != v.vRep {
+    } else if !untyped && repNodeOfTy(v.vTy) != v.vRep {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
     }
     i = i + 1
@@ -1711,7 +2936,11 @@ export function irVerify(f: IrFn): IrVerdict {
       "the result's rep is " + repWhat(f.irRetRep) + ", not a closed rep",
     )
   }
-  for id in f.irBody { stmt(id) }
+  let prev = -1
+  for id in f.irBody {
+    stmt(id, prev)
+    prev = id
+  }
   // Rule 8, the bounds checks, is the list builder's (`ir_verify_bounds.vl`).
   if vfRule == 0 {
     const b = irBoundsRuleHook(f)
@@ -1721,11 +2950,19 @@ export function irVerify(f: IrFn): IrVerdict {
     const sp = stagePairsWhy(f)
     if sp != "" { fail(10, -1, sp) }
   }
+  if vfRule == 0 && vfSetAt.length > 0 {
+    fail(2, -1, "a stash set no record reads")
+  }
   if vfRule == 0 && vfPushed.length > 0 {
     fail(10, -1, "a push no store consumes")
   }
-  // Rule 5 at the end: a function with a result leaves its body on every path.
-  if !repIsNoValue(f.irRetRep) && !irBodyLeaves(f, f.irBody) {
+  // Rule 5 at the end: a function with a result leaves its body on every path, or falls into
+  // the `null` or `unreachable` the lowering pads its end with, as legacy does.
+  if (
+    !repIsNoValue(f.irRetRep)
+    && !irBodyLeaves(f, f.irBody)
+    && f.irEndPad == ""
+  ) {
     fail(5, -1, "a valued function falls off its end")
   }
   const v: IrVerdict = { vfRule: vfRule, vfNode: vfAt, vfMsg: vfMsg }
@@ -1750,4 +2987,37 @@ function mapRepOrNullable(r: i32): boolean {
   const n = repNodeAt(r)
   if n is RMap { return true }
   return n is RNullable && repNodeAt(n.rnInner) is RMap
+}
+
+// Whether rep `a` is rep `b` apart only in closure openness (`cloHoleRetag`), and, for two
+// records, whose fields also lower alike over the noted heaps (`repsLowerAlike`), as one heap
+// alone does not show for a field whose rep disagrees with its storage.
+function cloHoleRetagAlike(a: i32, b: i32): boolean {
+  if !cloHoleRetag(vf, a, b) { return false }
+  const x = repNodeAt(a)
+  const y = repNodeAt(b)
+  return !(x is RRecord)
+    || !(y is RRecord)
+    || repsLowerAlike(a, b, vf.irRecHeap)
+}
+
+// Whether reps `a` and `b` are plain records on one struct heap the builder noted (`irRecHeap`)
+// whose fields lower alike by name (`repsLowerAlike`), so one stands for the other with no bytes.
+// Any two closures pass: a signature mismatch inside the retag is ruled out by that heap alone.
+function plainRecordsLowerAlike(a: i32, b: i32): boolean {
+  const x = repNodeAt(a)
+  const y = repNodeAt(b)
+  return x is RRecord
+    && y is RRecord
+    && !x.rrVariant
+    && !y.rrVariant
+    && repsLowerAlike(a, b, vf.irRecHeap)
+}
+
+// Whether operands `os` read variable `v`.
+function opndsHoldVar(os: Opnd[], v: i32): boolean {
+  for o in os {
+    if o is OVar && o.ov == v { return true }
+  }
+  return false
 }

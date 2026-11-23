@@ -44,7 +44,9 @@ const LOCAL: Record<string, string> = {
   "distilled corpus":
     "ci-distilled runs its runs-lost check; on master gate.sh adds --verify-fresh",
   "ir shadow": "no ci.yml job runs the IR shadow over the distilled corpus",
-  "ir claims": "no ci.yml job runs the shipped IR claim over the distilled corpus",
+  "ir shadow cases": "no ci.yml job runs the IR shadow over tests/cases",
+  "ir claims":
+    "no ci.yml job runs the shipped IR claim over the distilled corpus",
 };
 
 // What ci.yml must run for each covered row: fragments of the same command, on the seed.
@@ -81,7 +83,7 @@ const CI_RUNS: Record<string, string[]> = {
     "check --budget scripts/render-parse-budget-baseline.json --findings",
   ],
   "scaling shape": [
-    "run: deno test -A --no-check tests/vl_scaling_shape_test.ts",
+    "run: deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_scaling_shape_test.ts",
   ],
   "deno lint": ["run: deno lint\n"],
   "inventory refs": [],

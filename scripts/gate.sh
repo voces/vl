@@ -141,7 +141,8 @@ row_mem() {
     "distilled corpus") echo 1700 ;;
     "rep-fuzz") echo 1600 ;;
     "deno task test"|"plumb-shape cost") echo 1400 ;;
-    "ir shadow") echo 1300 ;;
+    "ir shadow"|"ir shadow cases") echo 1300 ;;
+    "ir shadow suite") echo 600 ;;
     "lsp suites (ci list)") echo 1100 ;;
     "scaling shape") echo 900 ;;
     "capability probes"|"kind-ladder sets") echo 800 ;;
@@ -251,11 +252,14 @@ ORACLE=$(ls tests/cases_wasm_*_test.ts | paste -sd, -)
 if [[ "$CI_PROVEN" == *"|corpus oracle|"* ]]; then GATE_V8_CORPUS=0; CI_SKIPPED+=("corpus oracle"); fi
 [ "${GATE_V8_CORPUS:-1}" = 1 ] && ROW1_IGNORE="$DEDUPE" || ROW1_IGNORE="$DEDUPE,$ORACLE"
 # shellcheck disable=SC2086
-run "deno task test"           deno test -A --no-check --parallel --ignore="$ROW1_IGNORE" tests/
+run "deno task test"           deno test --preload tests/support/signal_guard.ts -A --no-check --parallel --ignore="$ROW1_IGNORE" tests/
 # shellcheck disable=SC2086
-run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel $CI_NATIVE
+run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check --parallel $CI_NATIVE
 # shellcheck disable=SC2086
-run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel $LSP_CI
+run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check --parallel $LSP_CI
+# The IR shadow suite on this tree's seed. The full gate runs it inside `ci-native`; `--fast`
+# skips that row, so here it runs alone, and a stale miss expectation reds before the queue.
+[ "$FAST" = 1 ] && run "ir shadow suite"   env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_ir_shadow_test.ts tests/vl_ir_prepost_test.ts
 # Root deno.json excludes lsp/ and every suite runs --no-check, so a type error
 # in lsp/src/*.ts is invisible to all the other gates (esbuild strips types
 # without checking). Mirrors ci.yml's "Type-check (lsp)" step.
@@ -351,7 +355,7 @@ run "render-parse budget"      render_parse_budget
 # THE SHAPE FAMILY: pairs of the same work, one axis reshaped, graded on the ratio of
 # the compiler's guest FUEL (a count, so load cannot move it; the runtime pairs on CPU).
 # ~40 s, and it reds on the pre-#2419 compiler.
-run "scaling shape"            deno test -A --no-check tests/vl_scaling_shape_test.ts
+run "scaling shape"            deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_scaling_shape_test.ts
 run "deno lint"                deno lint
 run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh
 # THE DIRECTORY, not the monolith: the inventory is one file per row
@@ -375,14 +379,14 @@ run "filed witnesses"          bash -c "\"$VL\" run scripts/check-filed-witnesse
 # the instruments above all read the rows that are there. ~0.2s, and it also runs inside
 # `deno task test` and the ci-native `vl_*_test.ts` glob; its own row here so the table
 # names it rather than burying it in a suite of hundreds.
-run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_test.ts
+run "inventory refs"           deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_inventory_refs_test.ts
 # THE PROBES' BEHAVIOURAL HALF. `tests/vl_live_sites_test.ts` checks the list's STRUCTURE
 # and says the compiling half is `capability-probes.vl --live-sites`, which no gate ran: on 2026-09-24 four
 # of its rows had moved (one a compiler trap, one invalid wasm) and nothing was red (D2301).
 # `--floor` holds every probe to clause 1; a refusal passes, a trap or bad module does not.
 # Both run on `scripts/capability-probes.vl`.
 run "capability probes"        bash -c "\"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --live-sites --compiler \"$SEED\" && \"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --floor --compiler \"$SEED\""
-run "conflict markers"        deno test -A --no-check tests/vl_no_conflict_markers_test.ts
+run "conflict markers"        deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_no_conflict_markers_test.ts
 run "splice scan"              bash -c "\"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\""
 # ON MASTER the same run also requires the committed baseline to describe the committed seed
 # exactly (`--verify-fresh`: exit 1 when any cell moved, after the runs-lost check). A branch
@@ -399,10 +403,18 @@ fi
 # The IR shadow over the same corpus: every covered function's lowering must match legacy's
 # bytes and spans, and any verifier failure or mismatch class above
 # `ir-shadow-baseline.txt` reds. The shadow is the check behind every IR claim.
-run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED"
+run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --prepost
+# The same shadow over every tests/cases program, against its own baseline; a byte difference
+# reds in either population, since a claimable function ships its bytes unmatched.
+run "ir shadow cases"          "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --cases --prepost
 # The shipped claim, disarmed: a claimed function emits the IR's bytes, so any fallback reds.
 run "ir claims"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --claims
 
+# THE OOM WATCH. A kill the kernel made during the run fails the gate, whatever the rows read:
+# a test that expected a failure, or a grader that reads a refusal, takes a killed child for one.
+. scripts/lib/oom-kills.sh
+OOM0=$(oom_kills)
+[ -n "$OOM0" ] || echo "gate.sh: no OOM counter is readable here (/proc/vmstat, memory.events); an OOM kill would go unseen"
 echo "== $((${#CMDS[@]})) rows, at most $([ "$GATE_MAX_PAR" = 0 ] && echo all || echo "$GATE_MAX_PAR") at once, memory budget $([ "$GATE_MEM_BUDGET_MB" = 0 ] && echo none || echo "${GATE_MEM_BUDGET_MB} MiB") =="
 dispatch
 
@@ -427,8 +439,18 @@ for i in "${!PIDS[@]}"; do
   cpu=$(cpusec $(tail -1 "$LOGS/$i.cpu" 2>/dev/null))
   [ -n "$cpu" ] || cpu=0
   if [ $rc -eq 0 ]; then printf '%-22s %7.1fs %7.1fs  ok\n' "${NAMES[$i]}" "$el" "$cpu"
-  else FAIL=1; printf '%-22s %7.1fs %7.1fs  FAILED rc=%d   %s\n' "${NAMES[$i]}" "$el" "$cpu" "$rc" "$LOGS/$i.log"; fi
+  else
+    FAIL=1; printf '%-22s %7.1fs %7.1fs  FAILED rc=%d   %s\n' "${NAMES[$i]}" "$el" "$cpu" "$rc" "$LOGS/$i.log"
+    [ "$rc" -ge 128 ] && echo "                       ^ rc $rc is a death by signal (the OOM killer, earlyoom or a KILL): not a reading"
+  fi
 done
+OOM1=$(oom_kills)
+if [ -n "$OOM0" ] && [ -n "$OOM1" ] && [ "$OOM1" -gt "$OOM0" ]; then
+  FAIL=1
+  echo "OOM KILL: the kernel killed $((OOM1 - OOM0)) process(es) for memory during this run, so no row's"
+  echo "  result is a reading (an expected failure, or a refusal a grader looked for, can be a killed"
+  echo "  child). Rerun with a lower GATE_MAX_PAR or GATE_MEM_BUDGET_MB, or on a quieter box."
+fi
 for r in "${CI_SKIPPED[@]+"${CI_SKIPPED[@]}"}"; do printf '%-22s %8s %8s  ci (proven)\n' "$r" - -; done
 [ -z "$CI_PROOF_RUN" ] || echo "${CI_PROOF_RUN#ci-proof: }"
 

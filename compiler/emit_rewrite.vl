@@ -1715,7 +1715,7 @@ function drwOptGuard(
     gElse = mkBlock(gElseStmts, pos)
   }
   const gIf = mkIf(
-    mkBinary("!=", drwRecvClone(recvIx), mkNull("null", pos), pos),
+    mkNullTestNe(drwRecvClone(recvIx), pos),
     mkBlock(gThen, pos),
     gElse,
     pos,
@@ -1889,6 +1889,13 @@ function drwRecvFieldIsFn(recv: i32, name: string): boolean {
   return ft >= 0 && tyAt(ft) is TyFunc
 }
 
+// The callee `recv.name` of an operator call through a closure field, typed at that field's type.
+function drwFieldCallee(recv: i32, name: string): i32 {
+  const m = mkMember(recv, name, -1)
+  nodeTyRecord(m, tyFieldTyOf(nodeTyIxOf(recv), name))
+  return m
+}
+
 // `drwWalk`'s index arm for `n` at `ix`: walks both operands, then answers a free `"[]"`
 // operator's call, a `"[]"` closure field's call on a struct receiver, or `ix` itself.
 function drwWalkIndex(ix: i32, n: Index, ctx: i32): i32 {
@@ -1907,7 +1914,7 @@ function drwWalkIndex(ix: i32, n: Index, ctx: i32): i32 {
   if drwRecvFieldIsFn(n.idxArr, "[]") {
     const targs: i32[] = []
     targs.push(n.idxIndex)
-    return drwOpCall(mkCall(mkMember(n.idxArr, "[]", -1), targs, -1), ix)
+    return drwOpCall(mkCall(drwFieldCallee(n.idxArr, "[]"), targs, -1), ix)
   }
   return ix
 }
@@ -2222,7 +2229,10 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
         const wargs: i32[] = []
         wargs.push(tgt.idxIndex)
         wargs.push(n.binRight)
-        return drwOpCall(mkCall(mkMember(tgt.idxArr, "[]=", -1), wargs, -1), ix)
+        return drwOpCall(
+          mkCall(drwFieldCallee(tgt.idxArr, "[]="), wargs, -1),
+          ix,
+        )
       }
       return ix
     }
@@ -2315,7 +2325,7 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
         const mdElse: i32[] = []
         mdElse.push(n.binRight)
         const mdIf = mkIf(
-          mkBinary("!=", n.binLeft, mkNull("null", n.pos), n.pos),
+          mkNullTestNe(n.binLeft, n.pos),
           mkBlock(mdThen, n.pos),
           mkBlock(mdElse, n.pos),
           n.pos,
@@ -2340,7 +2350,7 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
         const dsElse: i32[] = []
         dsElse.push(n.binRight)
         const dsIf = mkIf(
-          mkBinary("!=", n.binLeft, mkNull("null", n.pos), n.pos),
+          mkNullTestNe(n.binLeft, n.pos),
           mkBlock(dsThen, n.pos),
           mkBlock(dsElse, n.pos),
           n.pos,
@@ -2368,7 +2378,10 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
     if drwRecvFieldIsFn(n.binLeft, n.binOp) {
       const fargs: i32[] = []
       fargs.push(n.binRight)
-      return drwOpCall(mkCall(mkMember(n.binLeft, n.binOp, -1), fargs, -1), ix)
+      return drwOpCall(
+        mkCall(drwFieldCallee(n.binLeft, n.binOp), fargs, -1),
+        ix,
+      )
     }
   }
   return ix
@@ -2425,7 +2438,7 @@ function recUnionGuard(
   const rElse: i32[] = []
   rElse.push(other)
   return mkIf(
-    mkBinary("!=", recv, mkNull("null", pos), pos),
+    mkNullTestNe(recv, pos),
     mkBlock(rThen, pos),
     mkBlock(rElse, pos),
     pos,
@@ -4769,7 +4782,7 @@ function cboxWalkIdent(ix: i32, n: Ident, boxed: i32[]): i32 {
     const rty = nodeTyIxOf(ix)
     if (cboxVecCells[bd] ?? 0) == 1 {
       if cboxStoreTarget { return rd }
-      nodeTyRecord(rd, tyArrayElemIx(cellTy))
+      nodeTyRecord(rd, cboxElemTyOfCell(cellTy))
       const un = mkAsExpr(rd, "v128", "trap", -1)
       if rty >= 0 { nodeTyRecord(un, rty) }
       nodeSrcNote(un, ix)
@@ -4803,6 +4816,11 @@ function cboxWalkIdent(ix: i32, n: Ident, boxed: i32[]): i32 {
     return rd
   }
   return ix
+}
+
+// The type a read `c[0]` of capture cell `c`, of recorded type `cellTy`, holds: the cell's element.
+export function cboxElemTyOfCell(cellTy: i32): i32 {
+  return if cellTy >= 0 { tyArrayElemIx(cellTy) } else { -1 }
 }
 
 // `cboxWalk`'s binary operator: renames its join rows, walks both operands with the left
@@ -6141,4 +6159,12 @@ function icraFieldValue(ol: ObjLit, name: string): i32 {
     if fi is FieldInit && fi.fiName == name { return fi.fiValue }
   }
   return -1
+}
+
+// The desugared null test `l != null` at `pos`, typed `boolean` as the checker types a comparison:
+// the rewrite's node has no check of its own to record it.
+export function mkNullTestNe(l: i32, pos: i32): i32 {
+  const t = mkBinary("!=", l, mkNull("null", pos), pos)
+  nodeTyRecord(t, TY_BOOL)
+  return t
 }

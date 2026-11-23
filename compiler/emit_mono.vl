@@ -17988,9 +17988,17 @@ function monoRecordPinnedRecv(recv: i32, t: i32, wf: i32, depth: i32) {
   const d = nodeAt(dl)
   if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return 0 }
   if !monoTyOpen(nodeTyIxOf(dl)) { return 0 }
-  monoRecordOpen(x, t, wf)
-  if x != recv { monoRecordOpen(recv, t, wf) }
-  monoRecordOpen(dl, t, wf)
+  // Each node takes the pin nullable where its own open type admits `null`, so a binding read
+  // narrowed further along keeps its declared `| null`.
+  const ys = if x != recv { [x, recv, dl] } else { [x, dl] }
+  for y in ys {
+    const own = nodeTyIxOf(y)
+    const keepsNull = own >= 0
+      && own < T.tys.length
+      && tyAt(own) is TyNullable
+      && !(tyAt(t) is TyNullable)
+    monoRecordOpen(y, if keepsNull { mkNullableTy(t) } else { t }, wf)
+  }
   return monoRecordPinnedRecv(d.letInit, t, wf, depth + 1)
 }
 
@@ -26780,11 +26788,22 @@ function monoBindingAdoptInit(i: i32, k: i32) {
 }
 
 // The type initializer `init` holds: its recorded type, or for a read of a binding this pass already
-// closed where the checker left the read open, that binding's type, recorded on the read.
+// closed where the checker left the read open, that binding's type, recorded on the read. A `??`
+// over such a read holds the read's type, without its null unless the `??` may still be null.
 function monoInitHeldTy(init: i32): i32 {
   const it = nodeTyIxOf(init)
   if it < 0 || !tyHasTyVar(it) { return it }
   const x = unwrapParen(init)
+  const xn = if x >= 0 { nodeAt(x) } else { null }
+  if xn is BinExpr && xn.binOp == "??" {
+    const lt = monoInitHeldTy(xn.binLeft)
+    const open = lt < 0 || tyHasTyVar(lt)
+    const nt = if open { -1 } else if tyAt(it) is TyNullable { lt } else { nonNullTy(lt) }
+    if nt < 0 || !monoSameTyCtor(it, nt) { return it }
+    nodeTyRecord(x, nt)
+    if x != init { nodeTyRecord(init, nt) }
+    return nt
+  }
   if x < 0 || !(nodeAt(x) is Ident) { return it }
   const dl = identDeclOf(x)
   if dl < 0 || dl >= P.nodes.length || !(nodeAt(dl) is LetDecl) { return it }

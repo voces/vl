@@ -370,6 +370,7 @@ import {
   elabDeclFnOf,
   elabFnReturnsRecordAt,
   elabHasHolderMemberTy,
+  elabHasHolderRecords,
   elabHasResultFact,
   elabHasResultTy,
   elabHasRetRecords,
@@ -379,6 +380,7 @@ import {
   elabHoleFnClosed,
   elabKeyAtPos,
   elabListFnElemTy,
+  elabMakesHeldClosureRecords,
   elabNarrowedFromAt,
   elabNodeTyAt,
   elabPlaceRecordAt,
@@ -614,6 +616,7 @@ import {
   tyKindOf,
 } from "./emit_ref_list_kinds"
 import {
+  RClosure,
   RList,
   RMap,
   RNullable,
@@ -1221,7 +1224,7 @@ export function cloRetValSlot(fe: i32): i32 {
 export function cloRetKeySuffix(fe: i32): string {
   if fe < 0 || fe >= fnStmts.length { return "" }
   const rt = cloRetResultTy(fe)
-  if rt >= 0 && repOfTy(rt).rdKind == "closure" {
+  if fnRetHeldAsBundle(fe, rt) {
     const br = fnBundleRetRow(fe)
     if br == -2 { return "" }
     if br >= 0 { return ">" + repSigSlotTokOfKind("struct", br) }
@@ -2873,19 +2876,32 @@ export function bundleRecordRowOfSigs(sigs: i32[]): i32 {
 // the record of members its value's call returns, else its handed-back bundle parameter's; -2
 // where mono minted no row for it, -1 where the result is no bundle.
 export function fnBundleRetRow(fe: i32): i32 {
-  const fx = fnStmts[fe]
-  const rec = calleeReturnsRecord(fx)
-  if rec.length >= 2 {
-    const row = bundleRecordRowOfSigs(rec)
-    return if row >= 0 { row } else { -2 }
-  }
-  const bp = bundleRetParamOf(fx)
-  const fn = nodeAt(fx)
-  if bp < 0 || !(fn is FuncDecl) || bp >= fn.fnParams.length { return -1 }
-  const sigs = bundleSigsOfParam(fn.fnParams[bp])
-  if sigs.length < 2 { return -1 }
+  const sigs = fnBundleRetSigs(fe)
+  if sigs.length == 0 { return -1 }
   const row = bundleRecordRowOfSigs(sigs)
   return if row >= 0 { row } else { -2 }
+}
+
+// Whether result type `r` of emitted function `fe` is held as its bundle's record: a closure-kind
+// result mono lowered as the record its call returns or its bundle parameter hands back.
+export function fnRetHeldAsBundle(fe: i32, r: i32): boolean {
+  return r >= 0
+    && repOfTy(r).rdKind == "closure"
+    && fnBundleRetSigs(fe).length > 0
+}
+
+// The signatures of the bundle record emitted function `fe` returns: the members its value's call
+// returns, else its handed-back bundle parameter's, two or more; none where the result is no bundle.
+export function fnBundleRetSigs(fe: i32): i32[] {
+  const none: i32[] = []
+  const fx = fnStmts[fe]
+  const rec = calleeReturnsRecord(fx)
+  if rec.length >= 2 { return rec }
+  const bp = bundleRetParamOf(fx)
+  const fn = nodeAt(fx)
+  if bp < 0 || !(fn is FuncDecl) || bp >= fn.fnParams.length { return none }
+  const sigs = bundleSigsOfParam(fn.fnParams[bp])
+  return if sigs.length >= 2 { sigs } else { none }
 }
 
 // The struct row bundle record type `bt` is stored at, or -1: its own, else the row it shares
@@ -2899,7 +2915,14 @@ export function bundleRecordRowOfTy(bt: i32): i32 {
 // The record signatures `const` binding `d` holds whole in function `fnIx`, from the
 // elaboration's holder fact (D15144); none for any other binding.
 export function holderRecordSigs(d: i32, fnIx: i32): i32[] {
-  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return [] }
+  if (
+    !elabHasHolderRecords()
+    || d < 0
+    || d >= P.nodes.length
+    || !(nodeAt(d) is LetDecl)
+  ) {
+    return []
+  }
   // Asked of every binding, so the instance is resolved only for one that holds a record.
   const td = nodeSrc[d] ?? d
   if !elabHoldsRecordAnywhere(td) { return [] }
@@ -2915,6 +2938,12 @@ function holderOrResultMemberTy(d: i32, cfx: i32, fnIx: i32): i32 {
     return elabHolderMemberTy(td, elabKeyOfFn(fnIx))
   }
   return callResultMemberTy(cfx, fnIx)
+}
+
+// The one member type of a returned record that `const` binding `d` holds in function `fnIx`
+// (it is called at one signature), or -1.
+export function holderMemberTy(d: i32, fnIx: i32): i32 {
+  return holderOrResultMemberTy(d, -1, fnIx)
 }
 
 // The member type call `c`'s value is, as one member of a returned record, in function `fnIx`;
@@ -2934,9 +2963,15 @@ export function callResultMember(c: i32, fnIx: i32): i32 {
   return elabCallResultMember(tc, elabKeyOfFn(fnIx))
 }
 
+// The record type binding `d` holds whole in function `fnIx`, as mono minted it, or -1.
+export function holderRecordTy(d: i32, fnIx: i32): i32 {
+  const sigs = holderRecordSigs(d, fnIx)
+  return if sigs.length > 0 { elabBundleRecordOf(sigs) } else { -1 }
+}
+
 // The struct row of the record binding `d` holds whole in function `fnIx`, or -1.
 export function holderRecordRow(d: i32, fnIx: i32): i32 {
-  return bundleRecordRowOfSigs(holderRecordSigs(d, fnIx))
+  return bundleRecordRowOfTy(holderRecordTy(d, fnIx))
 }
 
 // The member of its holder's record call `callIx` through the holder takes in `fnIx`, or -1.
@@ -6735,6 +6770,14 @@ export function globalCellKind(letIx: i32): VKind {
     if gckStale() { gckDrop() }
   }
   return k
+}
+
+// The struct heap legacy declares module global `letIx`'s cell at, a `struct` cell's row
+// (`globalCellStructIdx`); -1 for any other cell.
+export function globalCellHeap(letIx: i32): i32 {
+  if globalCellKind(letIx) != "struct" { return -1 }
+  const si = globalCellStructIdx(letIx)
+  return if si >= 0 && si < sHeapIdx.length { sHeapIdx[si] } else { -1 }
 }
 
 // The struct table index for a global cell of kind 1 (struct ref), else -1. When the
@@ -15912,9 +15955,9 @@ function readMapValTyAt(e: Index, fnIx: i32): i32 {
   return tyMapValOf(rt)
 }
 
-// Whether every open part of type `ty` is held at rep `rep` as a tagged set's id: a function type
-// at an `i32` (or its nullable), each record field, list element and map value at its own kid. A
-// closed part holds at any rep. `path` is the walk's open parts: a revisit adds nothing.
+// Whether every open part of type `ty` is held at rep `rep`: a function type at a tagged set's
+// `i32` id or the closure (`closureHeld`), or either nullable; each record field, list element
+// and map value at its own kid. A closed part holds at any rep. `path` is the walk's open parts.
 export function tyOpenHeldAsIds(ty: i32, rep: i32, path: i32[]): boolean {
   if ty < 0 { return false }
   if !tyHasTyVar(ty) || i32ListHas(path, ty) { return true }
@@ -15928,7 +15971,7 @@ function tyOpenHeldAt(ty: i32, rep: i32, path: i32[]): boolean {
   const t = tyAt(ty)
   const n = repNodeAt(rep)
   return match t {
-    TyFunc => repIsI32(rep) || n is RNullable && repIsI32(n.rnInner)
+    TyFunc => repIsI32(rep) || n is RNullable && repIsI32(n.rnInner) || closureHeld(rep)
     TyNullable => {
       if n is RNullable { return tyOpenHeldAsIds(t.nInner, n.rnInner, path) }
       tyOpenHeldAsIds(t.nInner, rep, path)
@@ -15952,8 +15995,20 @@ function tyOpenHeldAt(ty: i32, rep: i32, path: i32[]): boolean {
   }
 }
 
+// Whether an open function type is held at rep `r`: the uniform closure, or it nullable, which no
+// instance changes, in a build that holds or returns no record of closures. A bundle parameter is
+// one per instance, so the builder refuses its read but at a member pick.
+export function closureHeld(r: i32): boolean {
+  const n = repNodeAt(r)
+  const c = n is RClosure || n is RNullable && repNodeAt(n.rnInner) is RClosure
+  return c && !elabMakesHeldClosureRecords()
+}
+
 // Whether rep `r` is the plain `i32` a tagged set's id is held at.
 function repIsI32(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RPrim && n.rpK == "i32"
 }
+
+// Whether the checker recorded its map deliveries' re-tags, so a recorded one can be read.
+export function mapDeliveriesRecorded(): boolean { return mapDeliveryRecorded }

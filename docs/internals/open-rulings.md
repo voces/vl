@@ -1,6 +1,7 @@
-# Open owner rulings — the verified index
+# Open rulings — the verified index
 
-**This file is the single place a pending owner decision is recorded.** It exists because the
+**This file is the single place a pending decision is recorded.** The coordinator rules on each
+entry (CLAUDE.md §Rulings); none waits on the owner, who may overrule. It exists because the
 alternative failed measurably: a sweep of every design doc on 2026-08-03 turned up **54 candidate
 "pending owner rulings", of which only 14 were real**. The other 22 (after de-duplication) were
 already answered — several *in the same file as the filing*, one 350 lines further down, one in

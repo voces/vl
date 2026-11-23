@@ -4,25 +4,52 @@
 // over the same operands; the lowering takes its scratch slots from the shared lazy list frame.
 // Every other element or member read is a named miss. `irRefInstall` sets the hooks.
 
-import { BinExpr, Index, Member, nodeAt } from "./ast"
-import { OStr, OVar, Opnd, StrOp, repPrim, repWhat } from "./ir"
+import { BinExpr, Ident, Index, LetDecl, Member, P, nodeAt } from "./ast"
+import {
+  IrFn,
+  OImm,
+  OStr,
+  OVar,
+  Opnd,
+  RTagStash,
+  Rhs,
+  SCoalBox,
+  SEffect,
+  SIf,
+  StrOp,
+  repPrim,
+  repWhat,
+} from "./ir"
+import { unwrapParen } from "./emit_base"
+import { letBindIsAtom, letBindIsNulAtom, localIndexOf } from "./emit_classify"
 import { isStorageRead } from "./emit_elab"
+import { identDeclOf } from "./symbols"
 import {
   atomNullable,
+  declRowReadTy,
   deliverStr,
+  holeCloTy,
+  ifBelowLeadOf,
   irBAtomKindRep,
   irBBoxLocal,
   irBExpr,
+  irBFn,
   irBFnIx,
+  irBGlobalBoxRecovers,
+  irBGlobalBoxRecv,
+  irBLetStrTemp,
   irBLetTemp,
+  irBLetTempTy,
   irBMiss,
   irBNoValue,
   irBNode,
   irBNoteFieldReread,
   irBOpRep,
   irBStageLeads,
+  irBUnboxKindRep,
   irInPlaceHook,
   irIndexHook,
+  irListCatHook,
   irListEqHook,
   irMemberHook,
   irNodeInShadow,
@@ -30,6 +57,7 @@ import {
   irUnionEqHook,
   irVarRepOkHook,
   mapGetBare,
+  storedReadOf,
 } from "./ir_build"
 import {
   irLoopCloseHook,
@@ -40,6 +68,7 @@ import {
   irLowerListSetHook,
 } from "./ir_lower"
 import { irBoundsRuleHook } from "./ir_verify"
+import { openRepTakes, undeclaredRepTakes } from "./ir_verify_facts"
 import {
   irLowerRefBounds,
   irLowerRefEffect,
@@ -53,6 +82,7 @@ import { irBoundsRule } from "./ir_verify_bounds"
 import {
   RAtom,
   RBox,
+  RClosure,
   RList,
   RMap,
   RNullable,
@@ -61,14 +91,21 @@ import {
   repNodeKids,
   repNodeOfTy,
   repRecordKidOf,
+  repTyOf,
 } from "./emit_rep"
 import { nodeTyAt } from "./emit_capture_frames"
 import {
+  REF_READ_CONTAINER,
   SRT_NARROW,
+  eqRouteOf,
   idxArmOf,
   irNodeInShadowHook,
+  listCatRouteOf,
+  listElemStaysNullable,
   listEqRouteOf,
+  listReadProvedNonNull,
   mapLengthPlain,
+  refListReadUnboxOf,
   sharedReadPlainOf,
   sharedReadPlanOf,
   sharedReadStashes,
@@ -76,14 +113,23 @@ import {
   strCatPartsOf,
   strEqFirstOf,
   strEqLitOf,
-  strInPlaceMode,
+  strInPlaceModeAsked,
+  strListReadsNonNull,
   strOrderSwaps,
-  strSiteOfRhs,
+  strSiteOfRhsAsked,
+  unionFieldNarrowUnboxOf,
+  unionFieldUnboxKindOf,
+  unionUnionEqArmOf,
 } from "./wasmEmit"
-import { memFieldUnionBox } from "./emit_plan_union"
+import {
+  memFieldUnionBox,
+  memberLengthArmOf,
+  narrowedFieldIsUnionBox,
+} from "./emit_plan_union"
 import {
   narrowedFieldPlain,
   structFieldPlain,
+  unionEqNameless,
   unionUnionEqStagedOf,
   variantFieldPlain,
 } from "./emit_plan_union"
@@ -109,6 +155,37 @@ function refRepOk(r: i32, _ty: i32): boolean {
 
 function missed(o: Opnd): boolean { return o is OVar && o.ov < 0 }
 
+// Whether a tagged call's stash is among the receiver nodes `b` holds from `at`: legacy writes the
+// callee, of any expression, and its stash inside the element read it receives.
+function tagStashLeads(f: IrFn, b: i32[], at: i32): boolean {
+  let j = at
+  while j < b.length {
+    const n = f.irNodes[b[j]]
+    if n is SEffect && n.efRhs is RTagStash { return true }
+    j = j + 1
+  }
+  return false
+}
+
+// Legacy's row spans a whole element read `ix`, a receiver a fused coalesce, a valued `if` or a
+// tagged call's stash (`tagStashLeads`) writes as a statement from `b[at]` included: notes that
+// statement as its start.
+function idxRowOpenNote(b: i32[], at: i32, ix: i32) {
+  if b.length <= at { return 0 }
+  const f = irBFn()
+  const lead = f.irNodes[b[at]]
+  if (
+    lead is SCoalBox
+    || lead is SIf && lead.siOut >= 0
+    || tagStashLeads(f, b, at)
+  ) {
+    f.irIdxRowAt[ix] = b[at]
+    f.irRowOpens[b[at]] = true
+    f.irHasRowOpens = true
+  }
+  return 0
+}
+
 function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
   const n = nodeAt(ix)
   if !(n is Index) { return irBMiss("expression") }
@@ -116,9 +193,16 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
   if exprMap(n.idxArr, fnIx) { return mapGetBare(b, ix, rep) }
   const why = listIdxPlainWhy(ix, fnIx)
   if why != "" { return irBMiss(why) }
+  const at = b.length
   const v = irBExpr(b, n.idxArr)
+  idxRowOpenNote(b, at, ix)
+  const ia = b.length
   const i = irBExpr(b, n.idxIndex)
   if missed(v) || missed(i) { return irBMiss("index operand") }
+  // A receiver legacy writes ahead of a valued `if` in the index, and not a temp, is a named miss.
+  if ifBelowLeadOf(b, ia, "index valued-if operand", [v]) {
+    return irBMiss("index valued-if operand")
+  }
   // A string literal receiver is legacy's literal writer at its use, as any string operand is.
   const lit = v is OStr && idxArmOf(n, fnIx) == "string"
   if !(v is OVar) && !lit { return irBMiss("index receiver") }
@@ -128,7 +212,43 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
   const packed = vr is RList
     && repPrim(vr.rlsElem) == "u8"
     && repPrim(rep) == "i32"
-  if vr is RList && vr.rlsElem != rep && !packed {
+  // A `(string | null)` element the checker types non-null is read recovered, at a string.
+  const en = if vr is RList { repNodeAt(vr.rlsElem) } else { null }
+  const recovered = en is RNullable
+    && en.rnInner == rep
+    && repPrim(rep) == "str"
+    && idxArmOf(n, fnIx) == "nulstr"
+    && strListReadsNonNull(ix, true)
+  // A `K | null` or `boolean | null` element the checker narrowed past its null is the i32 its
+  // niche holds, which `emitIndexScalarList` reads alike at either type.
+  const nicheNarrowed = en is RNullable
+    && en.rnInner == rep
+    && (en.rnDisc == 3 || en.rnDisc == 2)
+    && idxArmOf(n, fnIx) == "scalar"
+  // A nullable ref element the place narrows non-null is read recovered (`refListGetTail`).
+  const refRecovered = en is RNullable
+    && en.rnInner == rep
+    && idxArmOf(n, fnIx) == "ref"
+    && listElemStaysNullable(n.idxArr, fnIx)
+    && listReadProvedNonNull(ix)
+  // An element read at an open type takes the element as it is stored (`openRepTakes`), or, of
+  // a list read at its declared storage (`storedReadOf`), as that wrapper's array holds it.
+  const ety = nodeTyAt(ix, fnIx)
+  const declared = v is OVar && storedReadOf(n.idxArr) == v.ov
+  const stored = vr is RList
+    && vr.rlsElem != rep
+    && (openRepTakes(ety, rep, vr.rlsElem)
+    || declared && undeclaredRepTakes(ety, rep, vr.rlsElem))
+  if (
+    vr is RList
+    && vr.rlsElem != rep
+    && !packed
+    && !recovered
+    && !nicheNarrowed
+    && !refRecovered
+    && !stored
+    && !refUnboxedAt(n, ix, fnIx, rep)
+  ) {
     return irBMiss("index element coercion")
   }
   const ixTy = nodeTyAt(n.idxIndex, fnIx)
@@ -136,7 +256,82 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
   if refCorrupt != CORRUPT_DROP_BOUNDS {
     irBNode(b, { bcV: v, bcIx: i }, -1, irBNoValue(), ix)
   }
-  return irBLetTemp(b, { lgV: v, lgIx: i, lgAt: ix }, ix, rep)
+  const r: Rhs = { lgV: v, lgIx: i, lgAt: ix }
+  // A read over a variable and an immediate or variable index can be written again as built; a
+  // stored element's read is the same read, at the element's storage rep.
+  if readsAgain(v) && readsAgain(i) { irBFn().irReadElem[ix] = r }
+  if stored && vr is RList {
+    return irBLetTempTy(b, r, ix, vr.rlsElem, repTyOf(vr.rlsElem))
+  }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// Whether operand `o` reads the same where it is written again: an immediate, or a variable's read.
+function readsAgain(o: Opnd): boolean {
+  if o is OImm { return true }
+  return o is OVar && o.ov >= 0 && irBFn().irVars[o.ov].vKind != "temp"
+}
+
+// Whether ref list read `ix` leaves rep `rep` by the unbox legacy's tail writes after the element
+// (`refListReadUnboxOf`): its narrowed container, or the scalar of an atom kind.
+function refUnboxedAt(n: Index, ix: i32, fnIx: i32, rep: i32): boolean {
+  if idxArmOf(n, fnIx) != "ref" || listElemStaysNullable(n.idxArr, fnIx) {
+    return false
+  }
+  const u = refListReadUnboxOf(ix, fnIx)
+  if u == REF_READ_CONTAINER {
+    const rn = repNodeAt(rep)
+    return rn is RList || rn is RMap
+  }
+  return u >= 0 && irBAtomKindRep(u, rep)
+}
+
+// Whether a union-box field read `ix` leaves rep `rep` by the unbox legacy writes after it
+// (`unionFieldNarrowUnboxOf`): the box itself, or the atom it unboxes to. A container is a miss.
+function narrowUnboxRepIs(ix: i32, rep: i32): boolean {
+  return match unionFieldNarrowUnboxOf(ix, irBFnIx()) {
+    "container" => false
+    "atom" | "unbox" => irBAtomKindRep(unionFieldUnboxKindOf(ix, irBFnIx()), rep)
+    "none" => repNodeAt(rep) is RBox
+  }
+}
+
+// Whether a narrowed variant field `n` of record rep `r` reads at `rep` as its tail writes it: the
+// field's kid rep, or a nullable kid's inner where the tail recovers it non-null.
+function fieldReadsAt(r: i32, n: Member, rep: i32): boolean {
+  const k = repRecordKidOf(r, nodeTyAt(n.memObj, irBFnIx()), n.memProp)
+  const ks = repNodeKids(r)
+  if k < 0 || k >= ks.length { return false }
+  const kn = repNodeAt(ks[k])
+  return ks[k] == rep || kn is RNullable && kn.rnInner == rep
+}
+
+// The read of closure field `k` of member `n` (at `ix`) whose recorded type is a hole function's:
+// at the kid rep of the record the receiver is built at, typed as that rep.
+function holeCloFieldRead(b: i32[], n: Member, ix: i32, k: i32): Opnd {
+  const rv = irBExpr(b, n.memObj)
+  if missed(rv) { return rv }
+  const bks = repNodeKids(irBOpRep(rv))
+  if !(repNodeAt(irBOpRep(rv)) is RRecord) || k >= bks.length {
+    return irBMiss("hole closure field receiver")
+  }
+  const bk = bks[k]
+  if !(repNodeAt(bk) is RClosure) { return irBMiss("hole closure field rep") }
+  irBNoteFieldReread(ix, k)
+  return irBLetTempTy(
+    b,
+    {
+      gfV: rv,
+      gfIx: k,
+      gfAt: ix,
+      gfStored: isStorageRead(ix),
+      gfStr: false,
+      gfShared: false,
+    },
+    ix,
+    bk,
+    repTyOf(bk),
+  )
 }
 
 // A member read, routed by its receiver's rep: a record's own `length` field never reaches a
@@ -144,7 +339,10 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
 function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   const n = nodeAt(ix)
   if !(n is Member) { return irBMiss("expression") }
-  const r = repNodeOfTy(nodeTyAt(n.memObj, irBFnIx()))
+  // A receiver held at legacy's declared row (`declRowReadTy`) is read at that row.
+  const dt = declRowReadTy(n.memObj)
+  const ot = if dt >= 0 { dt } else { nodeTyAt(n.memObj, irBFnIx()) }
+  const r = repNodeOfTy(ot)
   if repNodeAt(r) is RList {
     if n.memProp != "length" { return irBMiss("list member") }
     if !refRepOk(r, -1) { return irBMiss("list length rep") }
@@ -169,12 +367,16 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   const plain = variantFieldPlain(ix, fnIx) >= 0
     || structFieldPlain(ix, fnIx) >= 0
   if repNodeAt(r) is RRecord && plain {
-    const k = repRecordKidOf(r, nodeTyAt(n.memObj, fnIx), n.memProp)
+    const k = repRecordKidOf(r, ot, n.memProp)
     if k < 0 { return irBMiss("field kid") }
     // A union-box field's tail unboxes it to the read's own rep.
     const own = memFieldUnionBox(ix, fnIx)
       && rep == repNodeOfTy(nodeTyAt(ix, fnIx))
     const kr = repNodeKids(r)[k]
+    // A hole function's field reads at the closure rep the built record holds (`holeCloTy`).
+    if holeCloTy(nodeTyAt(ix, fnIx)) && repNodeAt(kr) is RClosure {
+      return holeCloFieldRead(b, n, ix, k)
+    }
     // A nullable field the checker narrowed past its null reads at its inner rep: legacy's field
     // tail writes the read's recover (`readOwesNonNullRecover`), as for any member read.
     const kn = repNodeAt(kr)
@@ -182,18 +384,32 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     if kr != rep && !own && !narrowed { return irBMiss("field read coercion") }
     const rv = irBExpr(b, n.memObj)
     if missed(rv) { return rv }
+    // A receiver held at its storage row (D14426) lays its fields out as that row does.
+    if irBOpRep(rv) != r { return irBMiss("field read of a stored row") }
     irBNoteFieldReread(ix, k)
-    return irBLetTemp(
-      b,
-      { gfV: rv, gfIx: k, gfAt: ix, gfStored: isStorageRead(ix) },
-      ix,
-      rep,
-    )
+    const ur = if own { irBUnboxKindRep(unionFieldUnboxKindOf(ix, fnIx), rep) } else { rep }
+    const gf: Rhs = {
+      gfV: rv,
+      gfIx: k,
+      gfAt: ix,
+      gfStored: isStorageRead(ix),
+      gfStr: ur != rep,
+      gfShared: false,
+    }
+    if ur != rep { return irBLetStrTemp(b, gf, ix) }
+    return irBLetTemp(b, gf, ix, rep)
   }
   // A field read off a box local narrowed to one variant.
   const idx = narrowedFieldPlain(ix, irBFnIx())
   if repNodeAt(r) is RRecord && idx >= 0 {
-    const bv = irBBoxLocal(n.memObj)
+    if narrowedFieldIsUnionBox(ix, irBFnIx()) {
+      if !narrowUnboxRepIs(ix, rep) {
+        return irBMiss("narrowed field unbox rep")
+      }
+    } else if !fieldReadsAt(r, n, rep) {
+      return irBMiss("narrowed field read coercion")
+    }
+    const bv = irBBoxLocal(b, n.memObj)
     if missed(bv) { return bv }
     return irBLetTemp(b, { bfV: bv, bfAt: ix }, ix, rep)
   }
@@ -212,14 +428,54 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
       return irBMiss("shared read tail rep")
     }
     const stash = sharedReadStashes(ix)
-    const sv = if stash { irBExpr(b, n.memObj) } else { irBBoxLocal(n.memObj) }
+    // Unstashed, legacy pushes the receiver's box once per arm: a global's is its read again.
+    if !stash && localIndexOf(irBFnIx(), n.memObj) < 0 {
+      const g = irBGlobalBoxRecv(n.memObj)
+      if g < 0 { return irBMiss("shared read global receiver") }
+      const none: Opnd = { oiRep: irBNoValue(), oiBits: 0 }
+      const gr: Rhs = {
+        srV: none,
+        srAt: ix,
+        srStash: false,
+        srGlobal: g,
+        srGlobalNonNull: irBGlobalBoxRecovers(n.memObj),
+      }
+      return irBLetTemp(b, gr, ix, rep)
+    }
+    const sv = if stash { irBExpr(b, n.memObj) } else { irBBoxLocal(b, n.memObj) }
     if missed(sv) { return sv }
     if stash && !(repNodeAt(irBOpRep(sv)) is RBox) {
       return irBMiss("shared read receiver rep")
     }
-    return irBLetTemp(b, { srV: sv, srAt: ix, srStash: stash }, ix, rep)
+    const sr: Rhs = {
+      srV: sv,
+      srAt: ix,
+      srStash: stash,
+      srGlobal: -1,
+      srGlobalNonNull: false,
+    }
+    return irBLetTemp(b, sr, ix, rep)
+  }
+  // A grow candidate's arm turns on legacy's emit-time stash read, which the IR never asks.
+  if (
+    n.memProp == "length"
+    && memberLengthArmOf(n, ix, irBFnIx()) == "growCandidate"
+  ) {
+    return irBMiss("member length grow candidate")
   }
   return irBMiss("member " + repWhat(r))
+}
+
+// Whether part `ix` is a read of a binding whose cell legacy holds as the atom, not its `K | null`
+// niche (`letBindIsAtom`): a read narrowed past the cell's members, decoded off the cell.
+function partReadsAtomCell(ix: i32, fnIx: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is Ident) { return false }
+  const d = identDeclOf(u)
+  return d >= 0
+    && nodeAt(d) is LetDecl
+    && letBindIsAtom(d, fnIx)
+    && !letBindIsNulAtom(d, fnIx)
 }
 
 // A string `+` chain, `==`/`!=` or ordering, its operands built in legacy's push order: an
@@ -234,7 +490,7 @@ function buildStrBin(b: i32[], ix: i32, rep: i32): Opnd {
   if exprIsStrConcat(ix, fnIx) {
     parts = strCatPartsOf(ix, fnIx)
     // An armed site's right side joins in place; its node is keyed by the assignment.
-    const site = strSiteOfRhs(ix, fnIx)
+    const site = strSiteOfRhsAsked(ix, fnIx)
     if site >= 0 {
       op = "site"
       at = site
@@ -261,10 +517,11 @@ function buildStrBin(b: i32[], ix: i32, rep: i32): Opnd {
     const from = b.length
     // A literal-union atom part decodes to its member string, as legacy's `emitStrValue` widens
     // it (`exprIsLitAtom`), through the delivery's atom decode, which names a `K | null` part's
-    // miss; its rep must agree.
+    // miss; its rep must agree, except a read of an atom cell narrowed past its members.
     const litAtom = exprIsLitAtom(p, fnIx)
     const pr = repNodeOfTy(nodeTyAt(p, fnIx))
-    if litAtom != (repNodeAt(pr) is RAtom || atomNullable(pr)) {
+    const atomRep = repNodeAt(pr) is RAtom || atomNullable(pr)
+    if litAtom != atomRep && !(litAtom && partReadsAtomCell(p, fnIx)) {
       return irBMiss("string atom part route")
     }
     const a = if litAtom { deliverStr(b, p) } else { irBExpr(b, p) }
@@ -282,14 +539,31 @@ function buildStrBin(b: i32[], ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { soOp: op, soArgs: args, soAt: at }, ix, rep)
 }
 
+// Whether compare `ix` is legacy's union compare over two boxes: its staged compare, or on
+// `eqRouteOf`'s `unionUnion` over two named operands, the struct union arm of `unionUnionEqArmOf`.
 function unionEqOf(ix: i32, fnIx: i32): boolean {
   const n = nodeAt(ix)
-  return n is BinExpr && unionUnionEqStagedOf(n, fnIx)
+  if !(n is BinExpr) { return false }
+  if unionUnionEqStagedOf(n, fnIx) { return true }
+  if eqRouteOf(n, ix, fnIx) != "unionUnion" { return false }
+  if unionEqNameless(n.binLeft, fnIx) || unionEqNameless(n.binRight, fnIx) {
+    return false
+  }
+  const arms: i32[] = []
+  const vis: i32[] = []
+  const aks: i32[] = []
+  return unionUnionEqArmOf(n.binLeft, n.binRight, fnIx, arms, vis, aks)
+    == "struct"
 }
 
 function listEqOf(ix: i32, fnIx: i32): boolean {
   const n = nodeAt(ix)
   return n is BinExpr && listEqRouteOf(n, ix, fnIx)
+}
+
+function listCatOf(ix: i32, fnIx: i32): string {
+  const n = nodeAt(ix)
+  return if n is BinExpr { listCatRouteOf(n, ix, fnIx) } else { "none" }
 }
 
 // Installs the list builder, lowering and rule 8; run once before emit.
@@ -298,9 +572,10 @@ export function irRefInstall() {
   irIndexHook = buildIndex
   irMemberHook = buildMember
   irStrBinHook = buildStrBin
-  irInPlaceHook = strInPlaceMode
+  irInPlaceHook = strInPlaceModeAsked
   irUnionEqHook = unionEqOf
   irListEqHook = listEqOf
+  irListCatHook = listCatOf
   irLowerListHook = irLowerRefList
   irLowerEffectHook = irLowerRefEffect
   irNodeInShadowHook = irNodeInShadow

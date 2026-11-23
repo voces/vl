@@ -12942,3 +12942,71 @@ neither keeps nor writes the list (ROADMAP).
 carriers) and B (a generic as a value) resume after their pause. A stage may add lines when it moves
 late rows or unlocks programs, provided it advances toward B3.6 (deleting the late decider). Each
 stage still reports its net lines and the late rows it moves.
+
+## A module global's cell takes its storage rep, and a read takes legacy's rep carrier (2026-11-21, coordinator ruling) — D14426, D14434
+
+**Ruled by the coordinator 2026-11-21, option 1 of `refactor-notes/2026-11-21-ir-global-cell-rep-pair.md`.**
+In the IR, a module global's cell is at its storage type's rep (`letBindTy`). A read of it takes its
+rep from the rep fact legacy already computed and stored for that node, never from its checked type.
+This is D14426's shape for parameters, and there is no second rep channel.
+
+**Why.** Neither type alone matches legacy. At the binding rep the initializer misses, and at the
+storage rep every read the checker typed at the binding misses (`refactor-notes/2026-11-21-ir-global-cell-rep-pair.md`).
+A rep pair on the global (option 2) is a second rep channel. Leaving it to the elaboration
+(option 3) parks 116 functions behind work that is not scheduled.
+
+**Conditions.**
+- The step is monotone. A global whose initializer would be claimed but whose reads would newly
+  miss stays wholly on its current path until the carrier read lands, so the initializer and the
+  carrier read land together.
+- The carrier is a stored table legacy filled, named in the PR, not a re-derivation from the type.
+- Carrier = D14434 binding storage column (coordinator ruling): `letBindTy`, the column legacy
+  lays `letCellSlot` out from. A build stores the cell at that row only where its initializer
+  builds it, and the global's reads in that build take it as it is. The verifier holds a global
+  read off its type's rep to the column's rep (`globalReadAtTyOrStorage`). A local's twin retypes
+  the variable to the column's type, so rule 3 holds it.
+
+## The IR verifier checks facts the builder recorded, never legacy's answers (2026-11-22, coordinator ruling) — D17049
+
+**Ruled by the coordinator 2026-11-22**, endorsing the merge queue's position on two PRs (IR-M1's
+RRowRetag design and ir-m1-bundle). The verifier adds no call into emit or checker-emit helpers.
+A fact it needs, such as a global's held rep, is recorded on the IR by the builder (`irGlobalNote`,
+read by `irGlobalRepOf`; `IrFn.irGlobalHeld`) and checked there.
+
+**Why.** At I8 legacy codegen is deleted, and a verifier that asks it has nothing to ask. A check
+that re-asks the builder's own source cannot catch the builder's error. The existing verifier→emit
+edges (30 imports, D17049) are debt to retire before I8, owner IR-D1.
+
+**Applied.** A byte-free record retag between two reps of one legacy row (RRowRetag) is deferred.
+A sound one needs both reps' kids checked against the row's field valtypes by name, and reps carry
+no field names (D622's spelling-versus-layout order). A rep that differs from its row's storage is
+filed or fixed upstream, never retagged.
+
+## When the IR cannot reproduce a legacy accident, legacy changes, not the IR (2026-11-22, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-22**, on IR-N2's print-slot question. Legacy's union print and
+`??` box-field rung take `sharedFieldRecvSlot` before lowering their operand. The IR lowers an in-place
+operand first, so its locals are declared in another order. Legacy is changed, in its own
+behaviour-preserving PR, to take the slot after the operand. No IR node exists only to mimic legacy's
+order, and a case refused "until I8" is not an answer, because I8 needs every function claimed.
+
+**Why.** An IR node that only reproduces a legacy accident is deleted with legacy at I8, and so is
+dual-path cost with no lasting value. A lookahead in the lowering would be coupling the verifier
+cannot see. Changing legacy's local-declaration order moves only local indices, which the queue
+grades by run outputs plus an exact list of moved programs (merge-queue.md Q15).
+
+## A byte-free record retag requires struct identity (2026-11-22, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-22.** A byte-free RRetag from one record rep to another is
+admitted only when the two are the same struct. Wasm struct types are nominal in VL's output, so
+that means the same heap, or, for a width retag, the declared sub chain. The verifier reads the
+heap from an IR-side note the builder records (`IrFn.irRecHeap`), never from an emit query
+(merge-queue.md Q20).
+
+**Why.** Two records whose fields agree are still two wasm types when their heaps differ, and a
+retag between them with no bytes ships an ill-typed value. Field-by-field comparison is also
+unbounded on recursive types: `repFillsHole`'s record arm recursed forever on recursive record
+twins (`type L1 = {n: L1|null}` beside an L2 twin), a compiler stack overflow caught by
+`tests/cases/structs/structural-twin-heap-dedup.vl`, and it was seen to admit field-alike records
+on different heaps. Identity is one compare and is what the target checks. Recording the heap on
+the IR keeps the verifier independent of emit (the ruling of the same day above, D17049).

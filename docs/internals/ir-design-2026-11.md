@@ -38,9 +38,10 @@ owner's 2026-11-15 ruling that exports freeze at the module boundary.
   IR passes, and the `wasm-opt` driver (about 900) stays.
 - **Migration (§5) uses two seams.** At the **op seam**, a legacy call site calls the total
   `lower(op × rep)` in place of its own ladder, and that site is byte-identical. At the
-  **function seam**, `emitFuncCode` hands a function to the IR path only when a dual emit of that
-  function has produced identical bytes. Legacy code deletes per construct, when its last claimant
-  goes. After I1b, cutover proceeds family by family at both seams (§10).
+  **function seam**, `emitFuncCode` hands a function to the IR path once the IR builds, verifies
+  and lowers it. Identity with legacy's bytes is enforced at gate time, not per build (§5.2's
+  claim rule). Legacy code deletes per construct, when its last claimant goes. After I1b, cutover
+  proceeds family by family at both seams (§10).
 - **Refusals (§6).** Two refusal literals are live (`live-sites.json`), and 4 of 247 capability
   probes still refuse. The IR closes both live literals and all four probes. The fourth is D16396,
   a checker refusal of a program the field-pair rule makes legal (§6.1). Of the 850 sites, 443 are by message a table miss or a kind
@@ -58,7 +59,7 @@ owner's 2026-11-15 ruling that exports freeze at the module boundary.
 | CFG form | structured: `Block`/`Loop`/`If`/`Br`/`Switch`/`Return`, as wasm has it | VL's control flow is structured (no `goto`). Lowering stays one node to one wasm construct, which is what makes byte identity reachable during migration. |
 | value form | ANF: each operand is a `Var` or an immediate constant | temporaries become explicit, and an operand is never re-read (§1.4) |
 | SSA | **no**. A `Var` is a wasm local, and `Assign` writes it | SSA needs out-of-SSA plus coalescing, which renumbers locals and moves every function's bytes. The optimizations L1 names (LICM, BCE, SROA, inlining, unrolling) only need def-use chains, and a pass can build those over a structured, non-SSA body. SSA can be added later as an analysis view. |
-| monomorphic | yes. An `IrFn` belongs to one instance (`InstId`, Q §2.1), and no `Var` has an open `TyId` | the verifier refuses an open type (§2) |
+| monomorphic | yes. An `IrFn` belongs to one instance (`InstId`, Q §2.1), and no `Var` has an open `TyId` except where each open part is a function type held at a rep no instance changes: a tagged set's `i32` id, or the uniform closure in a build that makes no record of closures (`tyOpenHeldAsIds`; coordinator ruling, 2026-11-21) | the verifier refuses any other open type (§2). A node whose lowering reads the open part (a call signature, an arm tag, a set id) takes it from legacy's plan at that node or stays a named miss, so a held open part is never lowered from the type. |
 | node encoding | distinct record types in one union, matched by `match` on the record type, with no `_` arm | VL has no payload variants yet (L4). This is the `Ty` arena's and lane E's `RepNode` pattern. Each variant needs its own field-name prefix (the `ast.vl:6` convention). |
 | storage | one arena per `IrFn`: `nodes: IrNode[]` and `vars: IrVar[]`. Ids are `i32`, newtyped as `IrNodeId`/`IrVarId` | an IR function can be built, verified and lowered in isolation. Q's `Lowered` holds one per `InstId`. |
 | operand ids | `TyId` = `tyCanonSet` (H), `RepId` = H's arm-aware layout id over E's arena (E), `Coercion` (M3), callee (an `fnStmts` position until Q step 6, then `InstId`) | session ids, so IR can outlive the program that built it (Q §2.1) |
@@ -121,6 +122,13 @@ The common case is a void function's tail `0`, which becomes `i32.const 0; drop`
 pure, so the IR needs nothing for it, but phase A must reproduce the bytes. `SDrop` holds the
 operand, and the verifier checks only its use. Once bytes may move, a dead-code pass deletes every
 `SDrop` and then the node itself: that is a named mover at I10, or at I8 if I8 renumbers anyway.
+
+**`SRangeLoop` is a migration node** (coordinator ruling, 2026-11-21). It holds a range loop that
+legacy writes through its own helpers: the partial 4x main loop and the rolled loop's wrap exit.
+Those allocate scratch locals mid-emit (`strI32Slot`), at an index that only legacy's emit order
+fixes. So the node's lowering drives legacy's split-out helpers around IR bodies, as `SForIn`'s
+does, and no `IrVar` carries a slot bound late. The copy count is legacy's plan
+(`rangePartialCopies`). It retires at I8 with `SForIn`.
 
 **Signedness lives on the op, not the rep.** `u32` and `u64` share their valtype, and so their
 rep, with `i32` and `i64` (`unsigned-types-design.md`). So `PrimOp` carries signedness: `div`/`divu`,
@@ -453,6 +461,17 @@ A step's PR turns claiming on for its construct set only at **zero dual-emit mis
 self-compile and the distilled corpus. After that the IR path mints for itself, and the seed `cmp`
 proves the mint order held.
 
+**The claim rule (2026-11-21).** As shipped, a function is claimed when the IR builds, verifies and
+lowers it. No per-build check compares its bytes with legacy's: that would run legacy beside every
+claim, which measured +18.5% L2 self-compile fuel and +12% to +14% on ordinary builds (the armed
+shadow's cost, `refactor-notes/2026-11-21-ir-claimless-gate.md`). Identity is enforced at gate
+time instead, by building each population under the shipped compiler and under the same tree with
+`CLAIMED` empty, comparing wasm and exit code. `ir-identity.sh --cases` does this for `tests/cases`
+and the probes, and `--claimless` for the distilled cells and the inventory witnesses filed `runs`.
+Any differ is a veto. This sees what the armed shadow cannot: legacy runs first under the shadow,
+so a plan the claim asks before legacy, or a mint it skips, shows only in the shipped bytes
+(the block-tail statement claim of 2026-11-21 shipped this way).
+
 **Op seam.** `lower(op × rep)` is a plain function. So a legacy call site can call it in place of
 its own ladder before any function is claimed, for example:
 - `emitCoerced`'s `match ck` becomes `lowerCoerce(adapter(ck, ix))`;
@@ -737,9 +756,16 @@ accepted with a rebaseline (ledger #8947). The follow-up that pays it back build
 cheap pre-scan says could claim. Deletions follow as the claimed share
 grows: once every function that reaches a legacy driver is claimed, that driver deletes. The
 armed shadow still checks the unclaimed functions. The blocking unarmed `ir claims` gate row
-(`ir-shadow.vl -- --claims`, `$VL_IR_SHADOW=5`) asserts zero `claim fell back`, with a verifier
-fallback counted as a hard failure, so a lowering regression cannot hide behind legacy's bytes.
+(`ir-shadow.vl -- --claims`, `$VL_IR_SHADOW=5`) asserts zero `claim fell back` in the corpus, and
+no more than `claims-fallbacks.txt` holds in the programs it names and in every inventory witness
+filed `runs`, with a verifier fallback counted as a hard failure, so a lowering regression cannot
+hide behind legacy's bytes.
 A coverage step now widens what ships; it quotes the claimed counts beside its coverage.
+The shadow always builds after legacy, so a builder or plan that reads state legacy fills while
+emitting (the address fold's table, once) answers it right there and wrong under a claim. The
+`ir shadow` rows run as `$VL_IR_SHADOW=6` (`ir-shadow.vl -- --prepost`): every function is also
+built, unarmed, where a claim builds it, and a function whose IR or lowering depends on the
+order reds, as does a program that compiles only without that early build.
 Op-seam slices still delete legacy ladders, starting with C1, the shared scalar opcode table.
 The IR's builder, verifier and lowering loop along an `if`'s `siElse` spine and the value-`if`
 spine, as legacy's passes do (D1990), so a chain's length costs no stack and the builder has no
@@ -873,6 +899,12 @@ Whole-function IR assumes legacy's lowering context is at rest, and asks the sha
 accordingly: `atomStrPlanOf(…, held: false)` (#9127), `fnValueArmOf(…, stubRhs: -1)`. Inside a legacy
 body that assumption can be false, and a plan the IR asks as "fresh delivery" can then disagree
 with what legacy decides at the same node.
+
+**A door that ships gates on `claimable()` (coordinator ruling, 2026-11-21).** A fragment that
+writes shipped bytes (`probe` false) does so only when every node is in a claimed family, as a
+function or start body claims, so a `CLAIMED`-empty compiler writes legacy's bytes there and
+`ir-identity.sh --claimless` compares them. The one shipping door today, I8a's const cell
+(`irClaimConstCell`), does.
 
 **Before the first non-shadow caller of `irLowerNodeIn`, the door must miss ("legacy context
 live") unless each of these is at its resting value:**

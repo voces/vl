@@ -39,12 +39,17 @@ import { recordRowClassOf, recordRowsRun } from "./record_rows"
 import { fvaMakerCallRows } from "./check_assignable"
 import { boxDstShadowArmed, boxDstShadowBegin } from "./box_dst_shadow"
 import {
+  irClaimConstCell,
   irClaimFn,
   irClaimStart,
+  irClaimThunk,
+  irConstCellShadow,
+  irPreBuild,
   irShadowArmed,
   irShadowBegin,
   irShadowFn,
   irShadowStart,
+  irShadowThunk,
   irStartClaimOn,
 } from "./ir_build"
 import { irStartPrologueHook } from "./ir_lower"
@@ -252,6 +257,7 @@ import {
 import {
   blockScratchMisses,
   constFoldOfLet,
+  constFoldWidthOk,
   exprScratchMisses,
   fnScratchMisses,
   globalCellIsImmutable,
@@ -480,6 +486,7 @@ import {
   gInitReaders,
   gInitStartOrd,
   gInitialMemPages,
+  gLitSegAt,
   gLowMemUnused,
   gMapDeletes,
   gMapGetShape,
@@ -935,6 +942,8 @@ import {
   StartInitArm,
   TEST_EMIT_REFUSAL_MSG,
   capCacheBuild,
+  coalChainsPrime,
+  coalChainsReset,
   emitAtomToStr,
   emitClosureValueCore,
   emitExpr,
@@ -1361,12 +1370,13 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     fbBeginFunc(fn.fnParams.length + envSlotShift(fnIx), nLocals)
     // Both the IR's lowering and legacy's start from empty scope and loop frames.
     emitResetScopeFrames()
+    // The order check (shadow mode 6) builds the function here, where a claim builds it.
+    irPreBuild(fnIx, fnPos)
     // A function the IR claims has its code entry written by the lowering, in the frame laid out
-    // above, and legacy's body lowering does not run. A lifted function's extra results, and every
-    // function under the test refusal hook or the box-dst shadow (both instrument legacy), stay legacy's.
+    // above, and legacy's body lowering does not run. A function under the test refusal hook or
+    // the box-dst shadow (both instrument legacy) stays legacy's.
     if (
-      fbRetExtra.length == 0
-      && gTestEmitRefusal == 0
+      gTestEmitRefusal == 0
       && !boxDstShadowArmed()
       && irClaimFn(fnIx, fnPos, out)
     ) {
@@ -1430,7 +1440,6 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     fbPushRetExtra()
     fbRetExtra = []
     fbEnd() // 0x0b end
-    fbEndFunc()
     wTarget(endPrev)
     // Stream the size-prefixed code entry onto `out` (this entry's own buffer, which
     // `placeCodeEntry` joins to the code payload). Bind the writer at `out` explicitly:
@@ -1443,10 +1452,12 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     rebaseStmtSpans(stmtSpanBase, bodyInOut, exprInBody)
     wBytes(body)
     wTarget(outPrev)
-    // The IR shadow reads this function's frame after its lowering; it writes no byte.
+    // The IR shadow reads this function's frame after its lowering; it writes no byte. The frame
+    // closes after it, so the shadow's reads see the declared locals the claim path sees.
     if irShadowArmed() {
       irShadowFn(fnIx, fnPos, out, irOutStart, stmtSpanBase)
     }
+    fbEndFunc()
     return 0
   }
   return emitFail("emitProgram: not a function declaration")
@@ -3868,6 +3879,7 @@ function collectStrPool() {
   gStrDataStart = []
   gStrDataLen = []
   gStrDataParts = []
+  gLitSegAt = Map()
   gStrFillOff = []
   gStrFillSeg = -1
   linkIsReset()
@@ -4112,6 +4124,15 @@ function emitModule(_stmts: i32[]) {
     len: 0,
     seekChunk: 0,
     seekBase: 0,
+  }
+  // The bodies read every `??` chain's links minted, from claim time on, each in its own frame.
+  coalChainsReset()
+  let cpi = 0
+  while cpi < n && cpi < fnStmts.length {
+    const was = nodeTyInstEnter(fnStmts[cpi])
+    coalChainsPrime(fnStmts[cpi])
+    nodeTyInstEnter(was)
+    cpi = cpi + 1
   }
   const built = buildCodePayload(codePayload, n, hasStart, memFn, nHelpers)
   dfeOn = false
@@ -7364,6 +7385,11 @@ function frameFunctionSection(
 // A thunk body: drop the env, forward the declared params, tail-call the target, so a
 // recursion through a function value stays in constant stack.
 function emitCloThunkCode(out: u8[], fe: i32) {
+  // The IR writes a thunk it claims; under the test refusal hook or the box-dst shadow (both
+  // instrument legacy) the thunk stays legacy's.
+  const own = gTestEmitRefusal == 0 && !boxDstShadowArmed()
+  if own && irClaimThunk(fe, out) { return 0 }
+  const from = out.length
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(0) // no local runs
@@ -7379,6 +7405,8 @@ function emitCloThunkCode(out: u8[], fe: i32) {
   fbEnd()
   wTarget(prev)
   helpFrameBody(out, body)
+  if own { irShadowThunk(fe, out, from) }
+  return 0
 }
 
 // What `emitGlobalSection` leaves for `frameGlobalSection`: its entry count and bytes, and the
@@ -7604,18 +7632,34 @@ function emitConstCellInit(buf: u8[], gi: i32): i32 {
     const ceSaved = gConstExprEmit
     gConstExprEmit = true
     if letInitFoldsExpr(g) {
-      rc = emitConstFoldValue(buf, gck, g.letInit, constFoldOfLet(g).cfV)
+      if !constCellClaimed(gi) {
+        const from = wLen()
+        rc = emitConstFoldValue(buf, gck, g.letInit, constFoldOfLet(g).cfV)
+        if rc >= 0 {
+          irConstCellShadow(gi, globalStmts[gi], g.letInit, from, "folded")
+        }
+      }
     } else if gunBox {
       // The union is the one the checker records the init delivered into where it names a
       // registry row (`unRowOfRecordTy`), else the binding's own.
       const rec = boxDstTyAt(g.letInit, -1)
       const own = rec >= 0 && unRowOfRecordTy(rec) >= 0
       const gunTy = if own { rec } else { letBindingUnionTy(globalStmts[gi], -1) }
-      rc = emitUnionBoxOwed("", gunTy, g.letInit, -1)
+      if !constCellClaimed(gi) {
+        const from = wLen()
+        rc = emitUnionBoxOwed("", gunTy, g.letInit, -1)
+        if rc >= 0 {
+          irConstCellShadow(gi, globalStmts[gi], g.letInit, from, "union")
+        }
+      }
     } else if gAliasFe >= 0 {
       rc = emitClosureValueCore(gAliasFe, -1)
-    } else {
+    } else if !constCellClaimed(gi) {
+      const from = wLen()
       rc = emitExpr(g.letInit, -1)
+      if rc >= 0 {
+        irConstCellShadow(gi, globalStmts[gi], g.letInit, from, "plain")
+      }
     }
     gConstExprEmit = ceSaved
     // The snapshot restored, rather than a chosen list of seeds cleared: one this function
@@ -7626,17 +7670,24 @@ function emitConstCellInit(buf: u8[], gi: i32): i32 {
   return emitFail("emitProgram: a module global cell that is not a binding")
 }
 
+// Whether the IR wrote global `gi`'s constant initializer, so legacy's writer does not run. Under
+// the test refusal hook or the box-dst shadow (both instrument legacy) it stays legacy's.
+function constCellClaimed(gi: i32): boolean {
+  return gTestEmitRefusal == 0
+    && !boxDstShadowArmed()
+    && irClaimConstCell(gi, globalStmts[gi])
+}
+
 // Writes the folded value `v` of the integer constant expression `init` into `buf` as the
 // one `*.const` of a cell of kind `gck`, which must be the init's own width.
 function emitConstFoldValue(buf: u8[], gck: VKind, init: i32, v: i64): i32 {
-  const wide = nodeTyPrimName(init) == "i64"
-  if wide != (gck == "i64") || (!wide && gck != "i32") {
+  if !constFoldWidthOk(gck, init) {
     return emitFail(
       "emitProgram: a folded constant's cell is not its own integer width",
     )
   }
   const prev = wTarget(buf)
-  if wide {
+  if gck == "i64" {
     fbI64Const((v >> (32 as i64)) as% i32, v as% i32)
   } else {
     fbI32Const(v as% i32)

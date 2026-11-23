@@ -3109,6 +3109,33 @@ function identityNullTestVisit(n: BinExpr) {
   return 0
 }
 
+// A call the checker repointed to the function a record field always holds (`r.f(3)` becomes
+// `twice(3)`, a minted callee the parse bank may since have dropped) still reads the receiver
+// its own tokens name, `r . f ( … )`: the binding and its field are marked read (D17043). Any
+// other token shape marks nothing.
+function repointedReceiverRead(call: i32) {
+  if call < 0 || call >= nodeToks.length { return 0 }
+  let t = nodeToks[call]
+  if t < 3 || t >= P.toks.length || P.toks[t].text != ")" { return 0 }
+  let depth = 0
+  while t >= 0 {
+    const x = P.toks[t].text
+    if x == ")" { depth = depth + 1 }
+    if x == "(" { depth = depth - 1 }
+    if depth == 0 { break }
+    t = t - 1
+  }
+  if t < 3 || P.toks[t - 1].kind != "IDENT" || P.toks[t - 2].text != "." {
+    return 0
+  }
+  if P.toks[t - 3].kind != "IDENT" { return 0 }
+  // As a `x.m(…)` callee reads them: the receiver read and passed on, the property read.
+  const nid = lnFind(P.toks[t - 3].text)
+  bindMarkId(nid, 0)
+  nuRead[P.toks[t - 1].text] = true
+  return nuNoteIdent(-1, nid)
+}
+
 // Record the node-local names — the callee `Ident` of a `Call`, any bare `Ident` value
 // reference, and operator-method dispatch — into the name map, and resolve `Ident`
 // occurrences to their binding.
@@ -3119,10 +3146,12 @@ function nameVisit(ix: i32) {
     // native parser does not desugar at parse time, so `x.m(…)` stays
     // `Call { callFn: Member(x, "m") }` and the property is the UFCS method name the
     // call dispatches to.
+    if n.callFn >= P.nodes.length { repointedReceiverRead(ix) }
     if n.callFn >= 0 && n.callFn < P.nodes.length {
       const fn = nodeAt(n.callFn)
       if fn is Ident {
         refNamesAdd(fn.identName)
+        if fn.pos < 0 { repointedReceiverRead(ix) }
       } else if fn is Member {
         nuNoteCallee(n.callFn, fn)
         refNamesAdd(fn.memProp)
@@ -5451,60 +5480,259 @@ const klEmitPass = [
 ]
 
 // `Opnd`, `VarKind`, `MapOp`, `StrOp`, `IrNode`, `PrimOp`, `Rhs` — compiler/ir.vl
-const klOpnd = ["OVar", "OImm", "OStr"]
-const klPushRecv = ["OVar", "OImm", "OStr", "PStaged"]
-const klVarKind = ["param", "local", "temp"]
-const klMapOp = ["has", "set", "delete", "keys", "size"]
+const klOpnd = [
+  "OVar",
+  "OImm",
+  "OStr",
+]
+const klPushRecv = [
+  "OVar",
+  "OImm",
+  "OStr",
+  "PStaged",
+]
+const klVarKind = [
+  "param",
+  "local",
+  "temp",
+]
+const klMapOp = [
+  "has",
+  "set",
+  "delete",
+  "keys",
+  "size",
+]
 const klStrOp = [
-  "concat", "site", "acc", "len", "at", "slice", "eq", "lt", "cplen", "fromcp",
-  "fromcps", "frombytes", "indexof", "includes", "charcode",
+  "concat",
+  "site",
+  "acc",
+  "len",
+  "at",
+  "slice",
+  "eq",
+  "lt",
+  "cplen",
+  "fromcp",
+  "fromcps",
+  "frombytes",
+  "indexof",
+  "includes",
+  "charcode",
 ]
 const klIrNode = [
-  "SLet", "SAssign", "SSetField", "SListSet", "SCellSet", "SGlobalSet",
-  "SBoundsCheck", "SEffect", "SBlock", "SLoop", "SForIn", "SIf", "SSwitch",
-  "SCoalBox", "SBr", "SReturn", "STrap", "SDrop", "SRawOp",
+  "SAssign",
+  "SBlock",
+  "SBoundsCheck",
+  "SBr",
+  "SCellSet",
+  "SCoalBox",
+  "SDrop",
+  "SEffect",
+  "SForIn",
+  "SGlobalSet",
+  "SIf",
+  "SIntSwitch",
+  "SLet",
+  "SListSet",
+  "SLoop",
+  "SRangeLoop",
+  "SRawOp",
+  "SReturn",
+  "SSetField",
+  "SSwitch",
+  "STrap",
 ]
 const klPrimOp = [
-  "add", "sub", "mul", "div", "divu", "rem", "remu", "and", "or", "xor", "shl",
-  "shr", "shru", "eq", "ne", "lt", "ltu", "le", "leu", "gt", "gtu", "ge", "geu",
-  "neg", "not",
+  "add",
+  "sub",
+  "mul",
+  "div",
+  "divu",
+  "rem",
+  "remu",
+  "and",
+  "or",
+  "xor",
+  "shl",
+  "shr",
+  "shru",
+  "eq",
+  "ne",
+  "lt",
+  "ltu",
+  "le",
+  "leu",
+  "gt",
+  "gtu",
+  "ge",
+  "geu",
+  "neg",
+  "not",
 ]
 const klRhs = [
-  "RPrimOp", "RCall", "RCallRef", "RCallHost", "RTest", "RBoxField",
-  "RSharedRead", "RBoxNarrow", "RRecover", "RCast", "RTagOf", "RMakeRec",
-  "RGetField", "RMakeList", "RSpread", "RListNew", "RListCopy", "RListGet",
-  "RListLen", "RListPush", "RListStage", "RListPop", "RListClear", "RMapFilter",
-  "RListSlice", "RMapOp", "RMapNew", "RMapSet", "RMapGetOr", "RMapGet",
-  "RMapHas", "RPrint", "RStrOp", "RNumWiden", "RNumCast", "RNumIntr",
-  "RCoalStr", "RCoalAtomStr", "RToBox", "RRetag", "RAtomStr", "RNullOf",
-  "RRetNull", "RNulTest", "RAtomEq", "RTagStash", "RTagIs", "RUnionEq",
-  "RListEq", "RMakeClo", "RFnId", "RCellNew", "RCellGet", "RGlobalGet",
-  "RRawOp", "RRel", "RStage",
+  "RArmUnbox",
+  "RAsUnion",
+  "RAtomEq",
+  "RAtomSole",
+  "RAtomStr",
+  "RAtomWide",
+  "RAtomic",
+  "RBoxField",
+  "RBoxNarrow",
+  "RBundlePick",
+  "RCall",
+  "RCallHost",
+  "RCallRef",
+  "RCast",
+  "RCellGet",
+  "RCellNew",
+  "RClosureEq",
+  "RCoalAtomStr",
+  "RCoalStr",
+  "RCoerce",
+  "REnvDrop",
+  "REnvGet",
+  "RFieldNull",
+  "RFnId",
+  "RGetField",
+  "RGlobalGet",
+  "RHandPick",
+  "RJoinNull",
+  "RListCat",
+  "RListClear",
+  "RListCopy",
+  "RListEmpty",
+  "RListEmptyArms",
+  "RListEq",
+  "RListFitIs",
+  "RListGet",
+  "RListIsAcross",
+  "RListLen",
+  "RListNew",
+  "RListNewDefault",
+  "RListPop",
+  "RListPush",
+  "RListPushMany",
+  "RListSlice",
+  "RListStage",
+  "RLitArms",
+  "RMakeClo",
+  "RMakeList",
+  "RMakeRec",
+  "RMapFilter",
+  "RMapGet",
+  "RMapGetOr",
+  "RMapHas",
+  "RMapIter",
+  "RMapNew",
+  "RMapOp",
+  "RMapSet",
+  "RMemAccess",
+  "RMemOp",
+  "RNicheRead",
+  "RNulNicheEq",
+  "RNulNoneBox",
+  "RNulTest",
+  "RNullOf",
+  "RNumCast",
+  "RNumIntr",
+  "RNumIs",
+  "RNumUnionBin",
+  "RNumUnionConvert",
+  "RNumWiden",
+  "ROptRead",
+  "RPrimOp",
+  "RPrint",
+  "RRawOp",
+  "RRecCopyPure",
+  "RRecover",
+  "RRel",
+  "RResultPick",
+  "RRetNull",
+  "RRetag",
+  "RSharedRead",
+  "RSimd",
+  "RSpread",
+  "RStage",
+  "RStashSet",
+  "RStrOp",
+  "RStrToAtom",
+  "RStrToAtomStaged",
+  "RStructEq",
+  "RTagIs",
+  "RTagOf",
+  "RTagStash",
+  "RTest",
+  "RToBox",
+  "RTruncSat",
+  "RUnionConcreteEq",
+  "RUnionEq",
+  "RVariantChain",
+  "RVariantDiscrim",
 ]
+// `ListCatRoute` — compiler/wasmEmit.vl
+const klListCatRoute = ["none", "refused", "plain", "widen"]
 // `GlobalReadClass`, `GlobalWriteClass` — compiler/wasmEmit.vl
 const klGlobalReadClass = ["fold", "promo", "guard", "plain"]
 const klGlobalWriteClass = ["promo", "immutable", "guard", "plain"]
 // `IrFamily` — compiler/ir.vl
 const klIrFamily = [
-  "scalar", "control", "call", "global", "list", "map", "box", "record",
-  "closure", "start", "raw", "other",
+  "scalar",
+  "control",
+  "call",
+  "global",
+  "list",
+  "map",
+  "box",
+  "record",
+  "closure",
+  "start",
+  "raw",
+  "mem",
+  "other",
 ]
 // `RawOp`, `RawEff` — compiler/ir.vl
 const klRawOp = [
-  "struct.get", "struct.new", "array.get", "array.new_default", "array.len",
-  "ref.eq", "ref.cast", "ref.as_non_null", "ref.null", "ref.is_null", "call",
-  "tee", "test", "load", "tag64", "ref.test", "select", "push",
+  "struct.get",
+  "struct.new",
+  "array.get",
+  "array.new_default",
+  "array.len",
+  "ref.eq",
+  "ref.cast",
+  "ref.as_non_null",
+  "ref.null",
+  "ref.is_null",
+  "call",
+  "tee",
+  "test",
+  "load",
+  "tag64",
+  "ref.test",
+  "select",
+  "push",
 ]
 const klRawEff = [
-  "struct.set", "array.set", "array.copy", "array.init_data", "array.fill",
-  "call", "reserve.open", "reserve.close",
+  "struct.set",
+  "array.set",
+  "array.copy",
+  "array.init_data",
+  "array.fill",
+  "call",
+  "reserve.open",
+  "reserve.close",
+  "sink.put",
+  "sink.null",
+  "sink.close",
 ]
 // `NarrowUnboxArm` — compiler/wasmEmit.vl
 const klNarrowUnboxArm = ["container", "atom", "unbox", "none"]
 // `HoleBoxArm` — compiler/wasmEmit.vl
 const klHoleBoxArm = [
-  "null", "pass", "memberBox", "atom", "lit", "atomStr", "rec", "obj",
-  "refList", "ladder",
+  "null", "pass", "memberBox", "atom", "atomList", "lit", "atomStr",
+  "atomAsStr", "nulNiche", "nulBool", "rec", "obj", "refList", "mapScalar",
+  "map", "clo", "ladder",
 ]
 // `AsgValueArm` — compiler/wasmEmit.vl
 const klAsgValueArm = [
@@ -5513,6 +5741,11 @@ const klAsgValueArm = [
 ]
 // `CoalNulRefArm` — compiler/emit_plan_null.vl
 const klCoalNulRefArm = ["join", "noBox", "listClash", "litAtom", "plain"]
+// `CoalNulRefsArm` — compiler/wasmEmit.vl
+const klCoalNulRefsArm = [
+  "heap", "boxStash", "pinnedCellIf", "mapHeap", "atomJoinIf", "numJoinIf",
+  "armIf", "boxFieldScalar", "cellIf", "none",
+]
 // `IdxArm` — compiler/wasmEmit.vl
 const klIdxArm = [
   "twolists", "nulscalar", "ref", "nulstr", "str", "scalar", "string", "none",
@@ -5521,8 +5754,21 @@ const klIdxArm = [
 const klWidenArm = [
   "instLit", "floatLit", "asgLit", "radix", "convert", "plain",
 ]
+// `AtomHookArm` — compiler/wasmEmit.vl
+const klAtomHookArm = ["wideLit", "strToAtom", "perArmJoin", "litJoin"]
 // `AtomEqArm` — compiler/wasmEmit.vl
 const klAtomEqArm = ["fold", "static", "ids", "none"]
+// `EqRoute` — compiler/wasmEmit.vl
+const klEqRootKind = ["expr", "local", "elem"]
+const klStrToAtomArm = ["sole", "chain", "staged"]
+const klEqRoute = [
+  "identMixed", "identRef", "numUnion", "deadNull", "nullNull", "scalarMap",
+  "unionUnion", "unionLeft", "unionRight", "atomFold", "atomStatic", "atomIds",
+  "nulNone", "noLowering", "gRepUnresolved", "xrep", "nulNiche", "str", "list",
+  "nulTest", "variantEq", "structEq", "recordRefused", "closure", "numeric",
+]
+// `ScalarMapEqArm` — compiler/wasmEmit.vl
+const klScalarMapEqArm = ["none", "pair", "read", "box"]
 // `NulTestArm` — compiler/wasmEmit.vl
 const klNulTestArm = [
   "nnfold", "nulfold", "nullty", "bool", "atom", "optChain", "mapHas", "boxTag",
@@ -5532,6 +5778,8 @@ const klNulTestArm = [
 const klMapKeyArm = ["i64Str", "i32Str", "notStr", "atom", "i64", "plain"]
 // `WideArm` — compiler/wasmEmit.vl
 const klWideArm = ["f32", "f64", "i64"]
+// `LongRoute` — compiler/wasmEmit.vl
+const klLongRoute = ["dataConst", "dataComputed", "chunk"]
 // `ArrLitArm` — compiler/wasmEmit.vl
 const klArrLitArm = [
   "notLit", "spread", "clash", "emptyHole", "v128", "u8", "f32", "f64", "i64",
@@ -5546,6 +5794,18 @@ const klCoalNicheArm = [
 const klCoalValArm = [
   "boolPop", "valBox", "valScalar", "valNoKind", "elem", "callBox",
   "callScalar", "callNoKind", "next", "popOr", "mapIndexGetOr", "nulRef",
+  "litUnion", "nulBool", "fieldBox", "fieldVal", "optLeaf", "nulBoolJoin",
+  "boxStash", "boxFieldScalar", "nulStr",
+]
+// `CoalFieldArm` — compiler/wasmEmit.vl
+const klCoalFieldArm = [
+  "none", "ambiguous", "narrowed", "noKind", "boxed", "unbox",
+]
+// `CoalNextArm` — compiler/wasmEmit.vl
+const klCoalNextArm = ["nulRefs", "callBool", "callStr", "field", "opt"]
+// `CoalOptArm` — compiler/wasmEmit.vl
+const klCoalOptArm = [
+  "mapField", "nulRecord", "nulVariant", "deep", "badCall", "listGet", "next",
 ]
 // `CoalBoxArm` — compiler/emit_plan_null.vl
 const klCoalBoxArm = [
@@ -5557,6 +5817,12 @@ const klLitIsArm = [
   "mapNull", "mapHas", "nicheNever", "nicheTest", "nicheRaw", "atomNotNul", "atomTrue",
   "atomEq", "boxLits", "numBox", "memberTrue", "memberNoRecv", "memberEq", "none",
 ]
+// `LitMemberEqArm` — compiler/wasmEmit.vl
+const klLitMemberEqArm = ["union", "nulStr", "str", "num"]
+// `UnionLitIsArm` — compiler/wasmEmit.vl
+const klUnionLitIsArm = ["noSet", "noArm", "never", "tag"]
+// `NarrowedMapReadArm` — compiler/wasmEmit.vl
+const klNarrowedMapReadArm = ["none", "unbox", "container", "nonNull"]
 // `IdentReadArm` — compiler/wasmEmit.vl
 const klIdentReadArm = [
   "nulnone", "nullread", "defglobal", "unbox", "niche", "reflist", "map",
@@ -5567,12 +5833,27 @@ const klTagIsArm = [
   "boxLitSet", "softTwin", "lacks", "strTag", "tagAbsent", "identBox",
   "memNarrow", "memStruct", "memVariant", "optField", "box", "none",
 ]
+// `EmptyFitArm` — compiler/wasmEmit.vl
+const klEmptyFitArm = ["decline", "captured", "union", "shadow", "loop"]
 // `IsArm` — compiler/wasmEmit.vl
 const klIsArm = [
   "optNull", "nullInst", "never", "floatLits", "recordFit", "listFit",
   "listAcross", "pinNever", "litArms", "emptyFit", "armTag", "numLit",
   "litMember", "nulTest", "noMembership", "static", "nulClosure", "noUnion",
   "variant", "notIs",
+]
+// `VariantIsArm` — compiler/wasmEmit.vl
+const klVariantIsArm = ["row", "recordTrue", "tagChain", "pinFalse", "noArm"]
+// `VariantRowArm` — compiler/wasmEmit.vl
+const klVariantRowArm = [
+  "lost",
+  "foldTrue",
+  "foldFalse",
+  "neverFits",
+  "notUnion",
+  "plainTag",
+  "discrim",
+  "chain",
 ]
 // `NumIntrArm` — compiler/wasmEmit.vl
 const klNumIntrArm = [
@@ -5583,6 +5864,24 @@ const klAsCastArm = [
   "zextLoad", "v128", "wrap", "instMiss", "litAtom", "numLitScalar", "numUnion",
   "mapProbeTrap", "mapOptBox", "mapOptRead", "holeMiss", "holeExact", "holeOpt",
   "exact", "union", "plain", "notCast",
+]
+// `IdentCallArm` — compiler/wasmEmit.vl
+const klIdentCallArm = [
+  "strFromBytes",
+  "fromCodePoints",
+  "fromCodePoint",
+  "print",
+  "memAccess",
+  "memOp",
+  "simd",
+  "atomic",
+  "truncSat",
+  "log",
+  "host",
+  "trap",
+  "arrNew",
+  "arrCopy",
+  "userFn",
 ]
 // `IdentListOverride` — compiler/wasmEmit.vl
 const klIdentListOverride = ["luOv", "fitShadow", "none"]
@@ -5615,6 +5914,11 @@ const klMapSetValArm = [
   "scalar", "union", "variant", "atomNull", "boolNull", "boolNulNone",
   "atomStr", "plain",
 ]
+// `FieldStoreValArm` — compiler/wasmEmit.vl
+const klFieldStoreValArm = [
+  "noKind", "plain", "box", "atomToStr", "strValue", "f64", "i64", "f32",
+  "nulnone", "armDelivery", "unencodable",
+]
 // `FnValueArm` — compiler/wasmEmit.vl
 const klFnValueArm = ["twin", "unfixed", "inert", "aliasCore", "checked"]
 // `ObjLitArm` — compiler/wasmEmit.vl
@@ -5634,11 +5938,18 @@ const klRefIfArm = [
   "plain", "recover", "unbox", "null", "atomStr", "recordCopy", "nestedIf",
   "noValue",
 ]
+// `ArmUnboxPlan` — compiler/wasmEmit.vl
+const klArmUnboxPlan = ["asIs", "unbox", "crossTag"]
 // `CallRefArgArm` — compiler/wasmEmit.vl
 const klCallRefArgArm = [
   "widenI64", "widenF64", "widenF32", "wideIntoI32", "heapIntoI32",
   "boxUnrecorded", "armNotBuilt", "armUnbox", "nulArm", "box", "atomToStr",
   "scalarList", "general", "atom",
+]
+// `CapturedArgArm` — compiler/wasmEmit.vl
+const klCapturedArgArm = [
+  "boxTable", "boxFloor", "widenI64", "widenF64", "widenF32", "lit", "atomStr",
+  "unbox", "plain",
 ]
 // `CoalArm` — compiler/wasmEmit.vl
 const klCoalArm = [
@@ -5648,8 +5959,28 @@ const klCoalArm = [
   "listGetOr", "popOr", "niche",
 ]
 
+// `MemAddrArm` — compiler/wasmEmit.vl
+const klMemAddrArm = ["bad", "lma", "const", "fold", "wide", "rest"]
+// `MemOpArm` — compiler/wasmEmit.vl
+const klMemberLengthArm = [
+  "field",
+  "growCandidate",
+  "armSite",
+  "atomStr",
+  "list",
+  "map",
+  "mem",
+]
+const klMemOpArm = [
+  "size", "grow", "fill", "copy", "heapBase", "heapLimit", "shared",
+]
 // `MemReadArm` — compiler/emit_plan_union.vl
 const klMemReadArm = ["narrowed", "variant", "nulVariant", "shared"]
+// `OptLeafArm` — compiler/wasmEmit.vl
+const klOptLeafArm = [
+  "record", "ref", "map", "closure", "sentinel", "boxUnion", "boxScalar",
+  "nulstr", "nonNull", "fail",
+]
 // `VariantCoerceArm` — compiler/emit_plan_union.vl
 const klVariantCoerceArm = [
   "none", "never", "ifValue", "struct", "bare", "box", "crossTag", "pass",
@@ -5658,6 +5989,14 @@ const klVariantCoerceArm = [
 const klIsPreArm = [
   "storage", "tautology", "covers", "fits", "prim", "pin", "test",
 ]
+// `BoxNarrowArm` — compiler/ir_build.vl
+const klBoxNarrowArm = ["none", "variant", "atom", "container", "box"]
+// `BundleArgArm` — compiler/wasmEmit.vl
+const klBundleArgArm = [
+  "lambda", "member", "holder", "fnRead", "choice", "none",
+]
+// `NullNarrowArm` — compiler/ir_build.vl
+const klNullNarrowArm = ["none", "plain", "held", "miss"]
 // `IfJoinArm` — compiler/emit_plan_if_join.vl
 const klIfJoinArm = ["null", "atom", "union", "ref", "scalar"]
 // One closed set: its name, 1 when its members are type names (`x is TyObj`) and 0 when string
@@ -5667,6 +6006,11 @@ type KlSet = { ksName: string, ksType: i32, ksMembers: string[] }
 // Every closed set, one row each, ordered by name (scripts/ladder-sets.vl): a new set is one row
 // at its name's place, and no row moves when a set grows. `klSetOf` picks the smallest itself.
 const klSets: KlSet[] = [
+  {
+    ksName: "ArmUnboxPlan",
+    ksType: 0,
+    ksMembers: klArmUnboxPlan,
+  },
   {
     ksName: "ArrLitArm",
     ksType: 0,
@@ -5698,11 +6042,31 @@ const klSets: KlSet[] = [
     ksType: 0,
     ksMembers: klAtomEqArm,
   },
+  {
+    ksName: "AtomHookArm",
+    ksType: 0,
+    ksMembers: klAtomHookArm,
+  },
+  {
+    ksName: "BoxNarrowArm",
+    ksType: 0,
+    ksMembers: klBoxNarrowArm,
+  },
   { ksName: "BtKind", ksType: 0, ksMembers: klBtKind },
+  {
+    ksName: "BundleArgArm",
+    ksType: 0,
+    ksMembers: klBundleArgArm,
+  },
   {
     ksName: "CallRefArgArm",
     ksType: 0,
     ksMembers: klCallRefArgArm,
+  },
+  {
+    ksName: "CapturedArgArm",
+    ksType: 0,
+    ksMembers: klCapturedArgArm,
   },
   {
     ksName: "CliImportScope",
@@ -5721,6 +6085,16 @@ const klSets: KlSet[] = [
     ksMembers: klCoalBoxArm,
   },
   {
+    ksName: "CoalFieldArm",
+    ksType: 0,
+    ksMembers: klCoalFieldArm,
+  },
+  {
+    ksName: "CoalNextArm",
+    ksType: 0,
+    ksMembers: klCoalNextArm,
+  },
+  {
     ksName: "CoalNicheArm",
     ksType: 0,
     ksMembers: klCoalNicheArm,
@@ -5729,6 +6103,16 @@ const klSets: KlSet[] = [
     ksName: "CoalNulRefArm",
     ksType: 0,
     ksMembers: klCoalNulRefArm,
+  },
+  {
+    ksName: "CoalNulRefsArm",
+    ksType: 0,
+    ksMembers: klCoalNulRefsArm,
+  },
+  {
+    ksName: "CoalOptArm",
+    ksType: 0,
+    ksMembers: klCoalOptArm,
   },
   {
     ksName: "CoalValArm",
@@ -5747,11 +6131,22 @@ const klSets: KlSet[] = [
     ksMembers: klEmitPhase,
   },
   {
+    ksName: "EmptyFitArm",
+    ksType: 0,
+    ksMembers: klEmptyFitArm,
+  },
+  {
     ksName: "EqCmpKind",
     ksType: 0,
     ksMembers: klEqCmpKind,
   },
   { ksName: "EqCore", ksType: 0, ksMembers: klEqCore },
+  {
+    ksName: "EqRootKind",
+    ksType: 0,
+    ksMembers: klEqRootKind,
+  },
+  { ksName: "EqRoute", ksType: 0, ksMembers: klEqRoute },
   {
     ksName: "EqgElemClass",
     ksType: 0,
@@ -5766,6 +6161,11 @@ const klSets: KlSet[] = [
     ksName: "FieldStoreArm",
     ksType: 0,
     ksMembers: klFieldStoreArm,
+  },
+  {
+    ksName: "FieldStoreValArm",
+    ksType: 0,
+    ksMembers: klFieldStoreValArm,
   },
   {
     ksName: "FnValueArm",
@@ -5788,6 +6188,11 @@ const klSets: KlSet[] = [
     ksMembers: klHoleBoxArm,
   },
   {
+    ksName: "IdentCallArm",
+    ksType: 0,
+    ksMembers: klIdentCallArm,
+  },
+  {
     ksName: "IdentListOverride",
     ksType: 0,
     ksMembers: klIdentListOverride,
@@ -5807,8 +6212,23 @@ const klSets: KlSet[] = [
   { ksName: "IrNode", ksType: 1, ksMembers: klIrNode },
   { ksName: "IsArm", ksType: 0, ksMembers: klIsArm },
   { ksName: "IsPreArm", ksType: 0, ksMembers: klIsPreArm },
+  {
+    ksName: "ListCatRoute",
+    ksType: 0,
+    ksMembers: klListCatRoute,
+  },
   { ksName: "ListKind", ksType: 0, ksMembers: klListKind },
   { ksName: "LitIsArm", ksType: 0, ksMembers: klLitIsArm },
+  {
+    ksName: "LitMemberEqArm",
+    ksType: 0,
+    ksMembers: klLitMemberEqArm,
+  },
+  {
+    ksName: "LongRoute",
+    ksType: 0,
+    ksMembers: klLongRoute,
+  },
   {
     ksName: "MapGetArm",
     ksType: 0,
@@ -5831,20 +6251,41 @@ const klSets: KlSet[] = [
     ksMembers: klMapSetValArm,
   },
   {
+    ksName: "MemAddrArm",
+    ksType: 0,
+    ksMembers: klMemAddrArm,
+  },
+  { ksName: "MemOpArm", ksType: 0, ksMembers: klMemOpArm },
+  {
     ksName: "MemReadArm",
     ksType: 0,
     ksMembers: klMemReadArm,
+  },
+  {
+    ksName: "MemberLengthArm",
+    ksType: 0,
+    ksMembers: klMemberLengthArm,
   },
   {
     ksName: "NarrowUnboxArm",
     ksType: 0,
     ksMembers: klNarrowUnboxArm,
   },
+  {
+    ksName: "NarrowedMapReadArm",
+    ksType: 0,
+    ksMembers: klNarrowedMapReadArm,
+  },
   { ksName: "Node", ksType: 1, ksMembers: klNode },
   {
     ksName: "NulTestArm",
     ksType: 0,
     ksMembers: klNulTestArm,
+  },
+  {
+    ksName: "NullNarrowArm",
+    ksType: 0,
+    ksMembers: klNullNarrowArm,
   },
   {
     ksName: "NumIntrArm",
@@ -5857,6 +6298,11 @@ const klSets: KlSet[] = [
     ksMembers: klObjLitArm,
   },
   { ksName: "Opnd", ksType: 1, ksMembers: klOpnd },
+  {
+    ksName: "OptLeafArm",
+    ksType: 0,
+    ksMembers: klOptLeafArm,
+  },
   { ksName: "PinPhase", ksType: 0, ksMembers: klPinPhase },
   {
     ksName: "PinSolver",
@@ -5881,6 +6327,11 @@ const klSets: KlSet[] = [
   { ksName: "Rhs", ksType: 1, ksMembers: klRhs },
   { ksName: "RpPrim", ksType: 0, ksMembers: klRpPrim },
   {
+    ksName: "ScalarMapEqArm",
+    ksType: 0,
+    ksMembers: klScalarMapEqArm,
+  },
+  {
     ksName: "StartInitArm",
     ksType: 0,
     ksMembers: klStartInitArm,
@@ -5892,6 +6343,11 @@ const klSets: KlSet[] = [
   },
   { ksName: "StrOp", ksType: 0, ksMembers: klStrOp },
   {
+    ksName: "StrToAtomArm",
+    ksType: 0,
+    ksMembers: klStrToAtomArm,
+  },
+  {
     ksName: "StructFieldArm",
     ksType: 0,
     ksMembers: klStructFieldArm,
@@ -5899,6 +6355,11 @@ const klSets: KlSet[] = [
   { ksName: "TagIsArm", ksType: 0, ksMembers: klTagIsArm },
   { ksName: "TokKind", ksType: 0, ksMembers: klTokKind },
   { ksName: "Ty", ksType: 1, ksMembers: klTy },
+  {
+    ksName: "UnionLitIsArm",
+    ksType: 0,
+    ksMembers: klUnionLitIsArm,
+  },
   { ksName: "VKind", ksType: 0, ksMembers: klVKind },
   { ksName: "VarKind", ksType: 0, ksMembers: klVarKind },
   {
@@ -5910,6 +6371,16 @@ const klSets: KlSet[] = [
     ksName: "VariantFieldArm",
     ksType: 0,
     ksMembers: klVariantFieldArm,
+  },
+  {
+    ksName: "VariantIsArm",
+    ksType: 0,
+    ksMembers: klVariantIsArm,
+  },
+  {
+    ksName: "VariantRowArm",
+    ksType: 0,
+    ksMembers: klVariantRowArm,
   },
   { ksName: "WideArm", ksType: 0, ksMembers: klWideArm },
   { ksName: "WidenArm", ksType: 0, ksMembers: klWidenArm },
@@ -6414,13 +6885,17 @@ type KlField = { kfName: string, kfSet: string }
 const klFields: KlField[] = [
   { kfName: "aeL", kfSet: "Opnd" },
   { kfName: "aeR", kfSet: "Opnd" },
+  { kfName: "amArgs", kfSet: "Opnd" },
   { kfName: "aqArm", kfSet: "AtomEqArm" },
   { kfName: "asMode", kfSet: "AsMode" },
   { kfName: "asSrc", kfSet: "Opnd" },
+  { kfName: "auV", kfSet: "Opnd" },
+  { kfName: "awV", kfSet: "Opnd" },
   { kfName: "bcIx", kfSet: "Opnd" },
   { kfName: "bcV", kfSet: "Opnd" },
   { kfName: "bfV", kfSet: "Opnd" },
   { kfName: "bnV", kfSet: "Opnd" },
+  { kfName: "bpV", kfSet: "Opnd" },
   { kfName: "brVal", kfSet: "Opnd" },
   { kfName: "bxV", kfSet: "Opnd" },
   { kfName: "cArgParamKind", kfSet: "VKind" },
@@ -6430,35 +6905,57 @@ const klFields: KlField[] = [
   { kfName: "caCaps", kfSet: "Opnd" },
   { kfName: "cbArm", kfSet: "CoalValArm" },
   { kfName: "cbL", kfSet: "Opnd" },
+  { kfName: "cfArm", kfSet: "CoalFieldArm" },
   { kfName: "cgCell", kfSet: "Opnd" },
   { kfName: "chArgs", kfSet: "Opnd" },
   { kfName: "cnInit", kfSet: "Opnd" },
+  { kfName: "cqL", kfSet: "Opnd" },
+  { kfName: "cqR", kfSet: "Opnd" },
   { kfName: "crArgs", kfSet: "Opnd" },
   { kfName: "crFn", kfSet: "Opnd" },
   { kfName: "csCell", kfSet: "Opnd" },
   { kfName: "csSrc", kfSet: "Opnd" },
   { kfName: "ctV", kfSet: "Opnd" },
+  { kfName: "cvV", kfSet: "Opnd" },
   { kfName: "czD", kfSet: "Opnd" },
   { kfName: "czL", kfSet: "Opnd" },
   { kfName: "destKind", kfSet: "VKind" },
   { kfName: "dpV", kfSet: "Opnd" },
   { kfName: "eFrom", kfSet: "VKind" },
+  { kfName: "efArm", kfSet: "EmptyFitArm" },
+  { kfName: "efKind", kfSet: "ListKind" },
   { kfName: "efRhs", kfSet: "Rhs" },
   { kfName: "ek", kfSet: "VKind" },
+  { kfName: "epKind", kfSet: "EqRootKind" },
+  { kfName: "erKind", kfSet: "ListKind" },
   { kfName: "gfV", kfSet: "Opnd" },
   { kfName: "gsSrc", kfSet: "Opnd" },
   { kfName: "hKind", kfSet: "ListKind" },
   { kfName: "hbArm", kfSet: "HoleBoxArm" },
   { kfName: "hfC", kfSet: "Opnd" },
   { kfName: "hfV", kfSet: "Opnd" },
+  { kfName: "hpV", kfSet: "Opnd" },
+  { kfName: "idArm", kfSet: "IsPreArm" },
   { kfName: "ijArm", kfSet: "IfJoinArm" },
   { kfName: "irNodes", kfSet: "IrNode" },
+  { kfName: "isOn", kfSet: "Opnd" },
+  { kfName: "jnKind", kfSet: "VKind" },
   { kfName: "kind", kfSet: "TokKind" },
   { kfName: "lRhs", kfSet: "Rhs" },
+  { kfName: "laV", kfSet: "Opnd" },
   { kfName: "lcArgs", kfSet: "Opnd" },
+  { kfName: "ldLen", kfSet: "Opnd" },
+  { kfName: "leV", kfSet: "Opnd" },
+  { kfName: "lfField", kfSet: "VKind" },
+  { kfName: "lfKinds", kfSet: "ListKind" },
   { kfName: "lfTempRhs", kfSet: "Rhs" },
+  { kfName: "lfV", kfSet: "Opnd" },
   { kfName: "lgIx", kfSet: "Opnd" },
   { kfName: "lgV", kfSet: "Opnd" },
+  { kfName: "liArm", kfSet: "LitIsArm" },
+  { kfName: "liV", kfSet: "Opnd" },
+  { kfName: "ljL", kfSet: "Opnd" },
+  { kfName: "ljR", kfSet: "Opnd" },
   { kfName: "lkV", kfSet: "Opnd" },
   { kfName: "llV", kfSet: "Opnd" },
   { kfName: "lnFill", kfSet: "Opnd" },
@@ -6469,6 +6966,7 @@ const klFields: KlField[] = [
   { kfName: "lsIx", kfSet: "Opnd" },
   { kfName: "lsSrc", kfSet: "Opnd" },
   { kfName: "lsV", kfSet: "Opnd" },
+  { kfName: "maArm", kfSet: "MemAddrArm" },
   { kfName: "mcEnv", kfSet: "Opnd" },
   { kfName: "mfKind", kfSet: "ListKind" },
   { kfName: "mfResK", kfSet: "ListKind" },
@@ -6477,9 +6975,14 @@ const klFields: KlField[] = [
   { kfName: "mgLoc", kfSet: "Opnd" },
   { kfName: "mhKey", kfSet: "Opnd" },
   { kfName: "mhLoc", kfSet: "Opnd" },
+  { kfName: "miV", kfSet: "Opnd" },
   { kfName: "mkKey", kfSet: "Opnd" },
   { kfName: "mkLoc", kfSet: "Opnd" },
+  { kfName: "mlArm", kfSet: "ArrLitArm" },
   { kfName: "mlElems", kfSet: "Opnd" },
+  { kfName: "mmArgs", kfSet: "Opnd" },
+  { kfName: "moArgs", kfSet: "Opnd" },
+  { kfName: "moArm", kfSet: "MemOpArm" },
   { kfName: "mpArgs", kfSet: "Opnd" },
   { kfName: "mpOp", kfSet: "MapOp" },
   { kfName: "mrFields", kfSet: "Opnd" },
@@ -6489,17 +6992,31 @@ const klFields: KlField[] = [
   { kfName: "msVal", kfSet: "Opnd" },
   { kfName: "mtKey", kfSet: "Opnd" },
   { kfName: "mtLoc", kfSet: "Opnd" },
+  { kfName: "nbArgs", kfSet: "Opnd" },
   { kfName: "ncV", kfSet: "Opnd" },
+  { kfName: "neL", kfSet: "Opnd" },
+  { kfName: "neR", kfSet: "Opnd" },
+  { kfName: "neR2", kfSet: "Opnd" },
   { kfName: "needs", kfSet: "EmitPass" },
   { kfName: "next", kfSet: "Node" },
   { kfName: "niArm", kfSet: "NumIntrArm" },
+  { kfName: "niV", kfSet: "Opnd" },
+  { kfName: "nmArm", kfSet: "NarrowedMapReadArm" },
+  { kfName: "nnV", kfSet: "Opnd" },
   { kfName: "nodes", kfSet: "Node" },
   { kfName: "nrArm", kfSet: "CoalNulRefArm" },
+  { kfName: "nrV", kfSet: "Opnd" },
   { kfName: "ntV", kfSet: "Opnd" },
+  { kfName: "nuV", kfSet: "Opnd" },
   { kfName: "nwV", kfSet: "Opnd" },
   { kfName: "nxArgs", kfSet: "Opnd" },
+  { kfName: "olLeaf", kfSet: "VKind" },
+  { kfName: "olRep", kfSet: "VKind" },
+  { kfName: "orV", kfSet: "Opnd" },
   { kfName: "pairEk", kfSet: "VKind" },
   { kfName: "pass", kfSet: "EmitPass" },
+  { kfName: "pmL", kfSet: "Opnd" },
+  { kfName: "pmV", kfSet: "Opnd" },
   { kfName: "pnV", kfSet: "Opnd" },
   { kfName: "poArgs", kfSet: "Opnd" },
   { kfName: "poEk", kfSet: "VKind" },
@@ -6513,6 +7030,7 @@ const klFields: KlField[] = [
   { kfName: "rdKind", kfSet: "VKind" },
   { kfName: "rgV", kfSet: "Opnd" },
   { kfName: "rjKind", kfSet: "VKind" },
+  { kfName: "rkV", kfSet: "Opnd" },
   { kfName: "rpK", kfSet: "RpPrim" },
   { kfName: "rrKind", kfSet: "VKind" },
   { kfName: "rsKind", kfSet: "VKind" },
@@ -6520,33 +7038,49 @@ const klFields: KlField[] = [
   { kfName: "rtV", kfSet: "Opnd" },
   { kfName: "rwArgs", kfSet: "Opnd" },
   { kfName: "rwOp", kfSet: "RawOp" },
+  { kfName: "saReads", kfSet: "Opnd" },
   { kfName: "scArgs", kfSet: "Opnd" },
   { kfName: "scV", kfSet: "Opnd" },
+  { kfName: "sdArgs", kfSet: "Opnd" },
+  { kfName: "seL", kfSet: "Opnd" },
+  { kfName: "seLIx", kfSet: "Opnd" },
+  { kfName: "seR", kfSet: "Opnd" },
+  { kfName: "seRIx", kfSet: "Opnd" },
   { kfName: "sfSrc", kfSet: "Opnd" },
   { kfName: "sfV", kfSet: "Opnd" },
   { kfName: "sgV", kfSet: "Opnd" },
   { kfName: "siCond", kfSet: "Opnd" },
   { kfName: "sk", kfSet: "VKind" },
+  { kfName: "smArm", kfSet: "ScalarMapEqArm" },
   { kfName: "soArgs", kfSet: "Opnd" },
   { kfName: "soOp", kfSet: "StrOp" },
   { kfName: "spKind", kfSet: "ListKind" },
-  { kfName: "spSrc", kfSet: "Opnd" },
   { kfName: "spSrcKinds", kfSet: "ListKind" },
+  { kfName: "spSrcs", kfSet: "Opnd" },
   { kfName: "srArgs", kfSet: "Opnd" },
   { kfName: "srOp", kfSet: "RawEff" },
   { kfName: "srV", kfSet: "Opnd" },
+  { kfName: "ssV", kfSet: "Opnd" },
   { kfName: "sxV", kfSet: "Opnd" },
   { kfName: "teV", kfSet: "Opnd" },
   { kfName: "tgV", kfSet: "Opnd" },
   { kfName: "tgsV", kfSet: "Opnd" },
+  { kfName: "tsV", kfSet: "Opnd" },
   { kfName: "tys", kfSet: "Ty" },
+  { kfName: "uaV", kfSet: "Opnd" },
+  { kfName: "ucBox", kfSet: "Opnd" },
+  { kfName: "ucOther", kfSet: "Opnd" },
   { kfName: "ueL", kfSet: "Opnd" },
   { kfName: "ueR", kfSet: "Opnd" },
+  { kfName: "ulArm", kfSet: "UnionLitIsArm" },
   { kfName: "vKind", kfSet: "VarKind" },
+  { kfName: "vcV", kfSet: "Opnd" },
+  { kfName: "vdV", kfSet: "Opnd" },
   { kfName: "wpArm", kfSet: "WidenArm" },
   { kfName: "xfList", kfSet: "Opnd" },
   { kfName: "zaD", kfSet: "Opnd" },
   { kfName: "zaL", kfSet: "Opnd" },
+  { kfName: "zsV", kfSet: "Opnd" },
 ]
 
 // The closed set the field-read subject `subj` (`t.primName`) names, or -1: the segment after

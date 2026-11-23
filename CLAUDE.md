@@ -11,6 +11,15 @@ notes into architecture-target's Status and the notes index.** That way lanes ne
 Likewise **a PR never edits `CHANGELOG.md`: it adds one `changelog.d/<branch>.md`** (`changelog.d/README.md`);
 the orchestrator folds them with `scripts/changelog-fold.vl`.
 
+## Rulings — nothing waits on the owner
+
+* **The coordinator rules** on every process and design question: gates, baselines, open
+  questions, `open-rulings.md` entries. A doc that says something waits on the owner means it
+  waits on the coordinator. Record a design ruling in `DECISIONS.md` and a process ruling where the
+  rule lives, with the reasoning and **who ruled**.
+* **Never record a ruling as the owner's** (or "under the owner's delegation") unless the owner
+  made it. The owner may overrule any ruling.
+
 ## `std:*` changes get a second pass — required
 
 * **Any change that adds or alters an export in `std/*.vl` MUST be reviewed by the
@@ -65,6 +74,9 @@ Why: [evidence](docs/internals/working-rules-evidence.md#disk).
 * What earns a place in the gate: `docs/internals/testing-strategy.md` — a check stays while it
   catches a breakage nothing else catches (kill matrix, `scripts/kill-matrix/`); a redundant one is
   deleted with its intent folded into a survivor.
+* **`scripts/gate.sh --fast` runs `tests/vl_ir_shadow_test.ts` on the tree's seed** (the full gate
+  runs it in `ci-native`), so a stale IR shadow expectation reds before the queue; no lane runs it
+  by hand.
 * **`scripts/gate.sh` runs the whole ladder and is the thing to run.** The full gate refuses inside
   `.claude/worktrees/` (override `GATE_IN_WORKTREE=1`) because the merge queue gates every PR;
   `--fast` runs anywhere. Fan-out caps: `GATE_MAX_PAR`, `GATE_MEM_BUDGET_MB`; WALL >> CPU in its
@@ -112,11 +124,13 @@ The parts:
   **+5%**, peak RSS **+10%**; `-- --write-baseline` on a quiet box
   (profiling-the-compiler.md §Guards).
 * **Self-compile fuel is gated per PR:** `scripts/self-compile-time.sh` reds on an L2 rise past
-  **+1%** of `scripts/self-compile-baseline.json` (and past 1.5×). Accept a rise with
-  `--write-baseline` from a fixpoint seed plus one line in `scripts/self-compile-ledger.txt` (fuel,
-  commit, PR, mechanism); a baseline the ledger's last line does not name reds. A coordinator drift
-  refresh also gives the cumulative rise since the last owner-ruled baseline; past **+3%**
-  cumulative it needs an owner ruling, named in the line (`merge-queue.md` §Fuel drift).
+  **+1% of the base master's own L2** (merge-base with `origin/master`, measured from its fixpoint
+  and cached; coordinator ruling 2026-11-21), and past 1.5× `scripts/self-compile-baseline.json`.
+  The rise on that baseline is the reported cumulative line, not a per-PR verdict. Accept a rise a
+  PR owns with `--write-baseline` from a fixpoint seed plus one line in
+  `scripts/self-compile-ledger.txt` (fuel, commit, PR, mechanism); a baseline the ledger's last line
+  does not name reds. The coordinator rules on a drift refresh; past **+3%** cumulative it first
+  attributes the rise to PRs by measurement and names that in the line (`merge-queue.md` §Fuel drift).
 * **Late demands are gated:** `vl run scripts/late-demands.vl -- --check` against
   `scripts/late-demands-baseline.txt`. A rise fails; a fall passes and is named, and the PR that
   earned it runs `--write-baseline`, **written from a FIXPOINT seed** (refresh until a second

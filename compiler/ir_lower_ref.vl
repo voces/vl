@@ -7,17 +7,21 @@ import { mfCallbackLocal } from "./emit_union_casts"
 // slots come from the shared lazy list frame, and a loop opens legacy's header hoists.
 
 import { fbRefAsNonNull } from "./emit_bytes"
-import { BinExpr, Call, Index, Member, P, WhileStmt, nodeAt } from "./ast"
+import { unwrapParen } from "./emit_base"
+import { BinExpr, Call, Index, Member, Node, P, WhileStmt, nodeAt } from "./ast"
 import { fbDrop } from "./emit_bytes"
 import {
   OImm,
   PStaged,
+  RCoerce,
+  RListCat,
   RListClear,
   RListEq,
   RListGet,
   RListLen,
   RListPop,
   RListPush,
+  RListPushMany,
   RListSlice,
   RListStage,
   RMapFilter,
@@ -29,9 +33,11 @@ import {
 import {
   irLAt,
   irLFn,
+  irLIndexFrom,
   irLIndexRow,
   irLMiss,
   irLOpnd,
+  irLReadAgain,
   irLSkip,
   irLoopHoistOpen,
 } from "./ir_lower"
@@ -42,6 +48,7 @@ import {
   arrSliceTail,
   clearLenTail,
   clearPlanOf,
+  coerceTail,
   emitArrLenHeld,
   emitClosureValue,
   emitEqNonNullCore,
@@ -52,7 +59,8 @@ import {
   idxCellReadIsNull,
   idxStoreHoistOf,
   idxStoreTail,
-  listElemStaysNullable,
+  listCatOperandTail,
+  listCatTail,
   listEqOperandTail,
   listEqTail,
   listOpRecvHeld,
@@ -65,6 +73,10 @@ import {
   popRefTail,
   popScalarTail,
   pushAppendTail,
+  pushManyOpen,
+  pushManyRecvOf,
+  pushManyRecvTail,
+  pushManyTail,
   pushPlainWhy,
   pushValueTail,
   rawStrGetTail,
@@ -90,32 +102,30 @@ import {
   strIndexOfTail,
   strListGetTail,
   strListHoistOf,
+  strListReadsNonNull,
   strOrderTail,
   strSiteCatTail,
   strSliceTail,
-  svDstOfKind,
 } from "./wasmEmit"
 import { eqOperandRecovers } from "./emit_plan_union"
 import { idxStorePlanOf, pushPlanOf } from "./emit_plan_list"
 import { scalarListElemKind } from "./emit_value_sites"
 import { exprNullableRefArray, refListSlotOfExpr } from "./emit_classify"
-import { rvMayView } from "./emit_rep"
 import { rlRowsMinted } from "./emit_state"
 
 // Why the IR does not lower list read `idxIx`, or "" when it does: legacy's own arm decision
-// (`idxArmOf`) took a scalar list, collected and not a view, or a ref list whose read keeps no
-// nullable niche and reads no view.
+// (`idxArmOf`) took a scalar list, collected and not a view, a string or `(string | null)` list,
+// or a ref list whose read keeps no nullable niche and reads no view.
 export function listIdxPlainWhy(idxIx: i32, fnIx: i32): string {
   const nd = nodeAt(idxIx)
   if !(nd is Index) { return "index node" }
   if idxCellReadIsNull(idxIx, fnIx) { return "index cell null" }
   const arm = idxArmOf(nd, fnIx)
   if arm == "ref" { return refReadWhy(nd, fnIx) }
-  if arm == "string" || arm == "str" { return "" }
+  if arm == "string" || arm == "str" || arm == "nulstr" { return "" }
   if arm != "scalar" { return "index " + arm }
   const ek = scalarListElemKind(nd.idxArr, fnIx)
   if ek == null || !scalarListUsed(ek) { return "index uncollected list" }
-  if svDstOfKind(ek) >= 0 { return "index view" }
   return ""
 }
 
@@ -123,11 +133,7 @@ function refReadWhy(nd: Index, fnIx: i32): string {
   if !rlRowsMinted() || exprNullableRefArray(nd.idxArr, fnIx) {
     return "index ref receiver"
   }
-  if listElemStaysNullable(nd.idxArr, fnIx) {
-    return "index ref nullable element"
-  }
-  const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
-  if rslot < 0 || rvMayView(rslot) { return "index ref view" }
+  if refListSlotOfExpr(nd.idxArr, fnIx) < 0 { return "index ref slot" }
   return ""
 }
 
@@ -137,12 +143,18 @@ function lowerList(r: Rhs): i32 {
   if r is RListLen { return lowerLen(r) }
   if r is RStrOp { return lowerStr(r) }
   if r is RListEq { return lowerListEq(r) }
+  if r is RListCat { return lowerListCat(r) }
+  if r is RCoerce {
+    irLOpnd(r.cvV)
+    return coerceTail(r.cvAt, irLFn().irAt)
+  }
   if r is RListPush { return lowerPush(r, true) }
+  if r is RListPushMany { return lowerPushMany(r, true) }
   if r is RListPop { return lowerPop(r, true) }
   if r is RMapFilter { return lowerMapFilter(r) }
   if r is RListSlice { return lowerListSlice(r) }
   if !(r is RListGet) { return irLMiss("list rhs") }
-  const from = irLAt()
+  const from = irLIndexFrom(r.lgAt, irLAt())
   const got = lowerGet(r)
   irLIndexRow(r.lgAt, from)
   return got
@@ -160,11 +172,12 @@ function lowerGet(r: RListGet): i32 {
     irLOpnd(r.lgIx)
     return rawStrGetTail(sz)
   }
-  if arm == "str" {
+  // A `(string | null)` element is recovered non-null only where the checker types it so.
+  if arm == "str" || arm == "nulstr" {
     const lz = strListHoistOf(nd)
     if lz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
     irLOpnd(r.lgIx)
-    return strListGetTail(nd, lz, true)
+    return strListGetTail(nd, lz, strListReadsNonNull(r.lgAt, arm == "nulstr"))
   }
   if arm == "ref" {
     const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
@@ -203,6 +216,20 @@ function lowerPush(r: RListPush, want: boolean): i32 {
   irLOpnd(r.lpX)
   pushValueTail(pp, fnIx)
   return pushAppendTail(r.lpAt, pp, lIdx, want)
+}
+
+// `RListPushMany`: legacy's plan asked before the receiver (`pushManyOpen`), the receiver and its
+// stage, the run, then legacy's bulk append (`pushManyTail`). `want` leaves the new length.
+function lowerPushMany(r: RListPushMany, want: boolean): i32 {
+  const fnIx = irLFn().irAt
+  const recv = pushManyRecvOf(r.pmAt)
+  if recv < 0 { return irLMiss("push many node") }
+  const p = pushManyOpen(r.pmAt, fnIx)
+  if p == null { return -1 }
+  irLOpnd(r.pmV)
+  pushManyRecvTail(p, recv, fnIx)
+  irLOpnd(r.pmL)
+  return pushManyTail(p, want)
 }
 
 // `RListStage`: the receiver of push `rsgAt` read and staged as legacy stages it, ahead of the
@@ -282,6 +309,7 @@ function lowerClear(r: RListClear): i32 {
 // A list op in statement position.
 export function irLowerRefEffect(r: Rhs): i32 {
   if r is RListPush { return lowerPush(r, false) }
+  if r is RListPushMany { return lowerPushMany(r, false) }
   if r is RListStage { return lowerListStage(r) }
   if r is RListPop { return lowerPop(r, false) }
   if r is RListClear { return lowerClear(r) }
@@ -325,6 +353,23 @@ function lowerListEq(r: RListEq): i32 {
   irLOpnd(r.qeR)
   listEqOperandTail(e.binRight, fnIx)
   return listEqTail(e, r.qeAt, fnIx)
+}
+
+// The list argument node of `fromCodePoints` call `e`, or -1.
+function fcpArgOf(e: Node): i32 {
+  return if e is Call && e.callArgs.length == 1 { unwrapParen(e.callArgs[0]) } else { -1 }
+}
+
+// `RListCat`: each list and its own recovery, then legacy's concat.
+function lowerListCat(r: RListCat): i32 {
+  const e = nodeAt(r.ljAt)
+  if !(e is BinExpr) { return irLMiss("list concat node") }
+  const fnIx = irLFn().irAt
+  irLOpnd(r.ljL)
+  listCatOperandTail(e.binLeft, r.ljAt, fnIx)
+  irLOpnd(r.ljR)
+  listCatOperandTail(e.binRight, r.ljAt, fnIx)
+  return listCatTail(r.ljAt, fnIx)
 }
 
 // An append site's tail, at the mode the builder read; a site the scan does not arm is a miss.
@@ -386,7 +431,8 @@ function lowerStr(r: RStrOp): i32 {
     "frombytes" => strFromBytesTail()
     "fromcps" => {
       fcpBackingTail()
-      irLOpnd(r.soArgs[0])
+      // The list's second read: a global's read written again, a local's variable read again.
+      if !irLReadAgain(fcpArgOf(e)) { irLOpnd(r.soArgs[0]) }
       fcpLenTail()
     }
     "charcode" => {
@@ -418,7 +464,8 @@ function lowerLen(r: RListLen): i32 {
 function loopOpen(at: i32): i32 {
   if at < 0 { return 0 }
   const s = nodeAt(at)
-  if !(s is WhileStmt) { return 0 }
+  // A labelled block opens no loop, so it hoists nothing (`emitLabelBlock`).
+  if !(s is WhileStmt) || s.whileBlk != 0 { return 0 }
   return irLoopHoistOpen(s.whileCond, s.whileBody, -1, -1)
 }
 // A bounds check is fused into the `RListGet` after it, which writes the guard; its operand
