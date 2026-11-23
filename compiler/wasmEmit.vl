@@ -847,6 +847,7 @@ import {
   lbCnt,
   lbEnd,
   lbList,
+  lbPlanned,
   lbPush,
   lbPushOf,
   lbWrap,
@@ -1630,6 +1631,7 @@ import {
   ArrLitArm,
   ForInLoop,
   IdxStore,
+  ListReserve,
   PopPlan,
   PushPlan,
   PushSlot,
@@ -35912,19 +35914,13 @@ export function listReserveOpen(
   slot: i32,
   fnIx: i32,
 ) {
-  const want = reserveListKindOfSlot(localIsRef[slot])
-  if want == null { return 0 }
-  const r = listReserveScan(s, stmts, pos, fnIx)
-  if r == null { return 0 }
-  const recv = listPushRecv(r.lrPushes[0])
-  if mfRecvKindOf(recv, fnIx) != want { return 0 }
-  let row = 0
-  if want == "reflist" { row = refListSlotOfExpr(recv, fnIx) }
-  if want == "u8list" { row = exprPackedRow(recv, fnIx) }
-  if row < 0 { return 0 }
-  const wrap = spreadWrapIdx(want, row)
-  const back = spreadBackIdx(want, row)
-  if wrap < 0 || back < 0 { return 0 }
+  const p = listReserveSizedOf(s, stmts, pos, slot, fnIx)
+  if p == null { return 0 }
+  const r = p.rzR
+  const want = p.rzWant
+  const row = p.rzRow
+  const wrap = p.rzWrap
+  const back = p.rzBack
   fbLocalGet(idx)
   fbI32Const(r.lrCount)
   fbArrayNewDefault(back)
@@ -35959,6 +35955,56 @@ export function listReserveOpen(
     k = k + 1
   }
   return 0
+}
+
+// A reserve `listReserveOpen` sizes: its scan, the list kind and row its pushes lower at, and the
+// list's wrap and backing types.
+type ReserveSized = {
+  rzR: ListReserve,
+  rzWant: ListKind,
+  rzRow: i32,
+  rzWrap: i32,
+  rzBack: i32,
+}
+
+// The reserve after `let` `s` (statement `pos` of `stmts`, declared slot `slot`) when
+// `listReserveOpen` sizes its backing, else null.
+function listReserveSizedOf(
+  s: LetDecl,
+  stmts: i32[],
+  pos: i32,
+  slot: i32,
+  fnIx: i32,
+): ReserveSized | null {
+  const want = reserveListKindOfSlot(localIsRef[slot])
+  if want == null { return null }
+  const r = listReserveScan(s, stmts, pos, fnIx)
+  if r == null { return null }
+  const recv = listPushRecv(r.lrPushes[0])
+  if mfRecvKindOf(recv, fnIx) != want { return null }
+  let row = 0
+  if want == "reflist" { row = refListSlotOfExpr(recv, fnIx) }
+  if want == "u8list" { row = exprPackedRow(recv, fnIx) }
+  if row < 0 { return null }
+  const wrap = spreadWrapIdx(want, row)
+  const back = spreadBackIdx(want, row)
+  if wrap < 0 || back < 0 { return null }
+  return { rzR: r, rzWant: want, rzRow: row, rzWrap: wrap, rzBack: back }
+}
+
+// The pushes `listReserveOpen` counts in the build region it opens after `let` `s`, or none
+// where it opens none: the plan the IR builds a region's range loops against.
+export function listReserveRegionPushes(
+  s: LetDecl,
+  stmts: i32[],
+  pos: i32,
+  slot: i32,
+  fnIx: i32,
+): i32[] {
+  const none: i32[] = []
+  const p = listReserveSizedOf(s, stmts, pos, slot, fnIx)
+  if p == null || p.rzR.lrLast >= stmts.length - 1 { return none }
+  return p.rzR.lrPushes
 }
 
 // The receiver node of the `push` call at `callIx`.
@@ -37687,8 +37733,11 @@ function unrollCost(ix: i32, fnIx: i32, cap: i32): i32 {
   if n is FuncDecl { return -1 }
   let cnt = 1
   if n is Call {
-    if listBuildRegionOf(ix) >= 0 { cnt = cnt + UNROLL_PUSH_NODES }
-    else if !hoistSafeMemCall(ix, fnIx) { return -1 }
+    if listBuildRegionOf(ix) >= 0 || i32ListHas(lbPlanned, ix) {
+      cnt = cnt + UNROLL_PUSH_NODES
+    } else if !hoistSafeMemCall(ix, fnIx) {
+      return -1
+    }
   }
   if n is ForRange {
     const inner = rangeStaticTrips(n, fnIx)
