@@ -10790,6 +10790,95 @@ export function unionEqCmpTail(qp: UnionEqPlan, isNe: boolean, fnIx: i32): i32 {
   return 0
 }
 
+// A union `==` on the re-reading arms whose operand holds `null` (D17065), both sides places:
+// the plain plan, the operand's leg (2 a `boolean | null`, 3 a `string | null`, 0 none), and
+// whether the union holds `null`. The IR writes it through the same tails as legacy.
+export type UnionEqNulPlan = {
+  unPlan: UnionEqPlan,
+  unLeg: i32,
+  unBoxNul: boolean,
+}
+
+// The null-leg plan of box `boxIx` against `otherIx`; `unLeg` 0 where another arm writes it.
+export function unionEqNulPlanOf(
+  boxIx: i32,
+  otherIx: i32,
+  fnIx: i32,
+): UnionEqNulPlan {
+  const none: UnionEqPlan = { uqKind: -1, uqTag: -1 }
+  const no: UnionEqNulPlan = { unPlan: none, unLeg: 0, unBoxNul: false }
+  if !unionEqOperandOk(boxIx) || !unionEqOperandOk(otherIx) { return no }
+  const unr: i32[] = []
+  const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
+  const usid = msSetOfUnionBox(boxIx, fnIx)
+  const bty = unionBoxTyOfRead(boxIx, fnIx)
+  const eak = unionEqAtomKindOf(otherIx, usid, bty, fnIx)
+  if eak < 0 || uname == "" { return no }
+  let hasArm = unionEqArmPresent(usid, valueAtomNameOfKind(eak), eak)
+  if !hasArm && eak == 2 && msSetTakesAtomAsStr(usid) { hasArm = true }
+  if !hasArm { return no }
+  const nul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+  const boxNul = unionSetHasNullTy(uname, bty)
+  let leg = 0
+  if eak == 2 && nul && !exprNulLitUnion(otherIx, fnIx) { leg = 3 }
+  if eak == 1 && nul && boxNul { leg = 2 }
+  if leg == 0 { return no }
+  const tag = unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], fnIx))
+  const p: UnionEqPlan = { uqKind: eak, uqTag: tag }
+  return { unPlan: p, unLeg: leg, unBoxNul: boxNul }
+}
+
+// After a null-leg operand: its null test at leg `leg` (1 a `K | null` id, 2 the `boolean | null`
+// niche, 3 a nullable ref), opening the leg's `if`.
+export function unionEqNulTestTail(leg: i32): i32 {
+  if leg == 1 {
+    fbI32Const(-1)
+    fbI32Bin(70)
+  } else if leg == 2 {
+    fbI32Const(2)
+    fbI32Bin(70)
+  } else {
+    fbRefIsNull()
+  }
+  fbIf(127)
+  return 0
+}
+
+// The null leg's answer after the box's read: whether the box holds `null`.
+export function unionEqNullTagTail(): i32 {
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Bin(70)
+  return 0
+}
+
+// The null leg's answer for a union with no `null` arm, then the leg's `else`.
+export function unionEqNoNullTail(): i32 {
+  fbI32Const(0)
+  return 0
+}
+
+// Between the null leg and the plain arm.
+export function unionEqNulElse(): i32 {
+  fbElse()
+  return 0
+}
+
+// After the plain arm's operand under a null leg: its non-null assertion where `nonNull`, the
+// compare, the leg's end, and `!=`'s negation.
+export function unionEqNulEndTail(
+  qp: UnionEqPlan,
+  nonNull: boolean,
+  isNe: boolean,
+  fnIx: i32,
+): i32 {
+  if nonNull { fbRefAsNonNull() }
+  if unionEqCmpTail(qp, false, fnIx) < 0 { return -1 }
+  fbEnd()
+  if isNe { fbI32Eqz() }
+  return 0
+}
+
 // Union against a concrete value, in either operand order: the box's tag must select the arm
 // whose rep matches the other side, then the unboxed payload value-compares it. A rep with no
 // arm is statically unequal, `==` 0 and `!=` 1, with both operands still evaluated for side
@@ -10957,30 +11046,25 @@ function emitUnionConcreteEq(
     if opFirst { fbLocalGet(unionEqOperandSlot(lvl + 1)) }
     else if emitExpr(otherIx, fnIx) < 0 { return -1 }
     if atomStage && !opFirst { fbLocalTee(unionEqOperandSlot(lvl + 1)) }
-    fbI32Const(-1)
-    fbI32Bin(70)
-    fbIf(127)
+    unionEqNulTestTail(1)
     if unionEqNullLeg(boxIx, boxNul, staged, bs, fnIx) < 0 { return -1 }
-    fbElse()
+    unionEqNulElse()
   }
   if nulBoolOther {
     if opFirst { fbLocalGet(unionEqOperandSlot(lvl + 1)) }
     else if emitExpr(otherIx, fnIx) < 0 { return -1 }
     if boolStage && !opFirst { fbLocalTee(unionEqOperandSlot(lvl + 1)) }
-    fbI32Const(2)
-    fbI32Bin(70)
-    fbIf(127)
+    unionEqNulTestTail(2)
     if unionEqNullLeg(boxIx, boxNul, staged, bs, fnIx) < 0 { return -1 }
-    fbElse()
+    unionEqNulElse()
   }
   if nulStrOther {
     if opFirst { fbLocalGet(unionEqOperandSlot(lvl)) }
     else if emitExpr(otherIx, fnIx) < 0 { return -1 }
     if opStage && !opFirst { fbLocalTee(unionEqOperandSlot(lvl)) }
-    fbRefIsNull()
-    fbIf(127)
+    unionEqNulTestTail(3)
     if unionEqNullLeg(boxIx, boxNul, staged, bs, fnIx) < 0 { return -1 }
-    fbElse()
+    unionEqNulElse()
   }
   // The plain arm's tails, around a stashed box and the operand's null legs. The tag is the
   // concrete operand's own arm type's, as the box site composes it (`cloBoxOwnFnTy`).
@@ -11010,15 +11094,16 @@ function emitUnionConcreteEq(
     return -1
   }
   // The null took the other branch, so a nullable operand is the non-null ref here.
-  if (
-    nulOther
-    || nulStrOther && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
-  ) {
-    fbRefAsNonNull()
+  const nonNull = nulOther
+    || nulStrOther
+    && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+  if nulOther || nulStrOther || nulBoolOther {
+    if unionEqNulEndTail(qt, nonNull, isNe, fnIx) < 0 { return -1 }
+  } else {
+    if nonNull { fbRefAsNonNull() }
+    if unionEqCmpTail(qt, false, fnIx) < 0 { return -1 }
+    if isNe { fbI32Eqz() }
   }
-  if unionEqCmpTail(qt, false, fnIx) < 0 { return -1 }
-  if nulOther || nulStrOther || nulBoolOther { fbEnd() }
-  if isNe { fbI32Eqz() }
   unionEqStageDepth = unionEqStageDepth - 1
   return 0
 }
@@ -11088,16 +11173,10 @@ function unionEqNullLeg(
   stash: i32,
   fnIx: i32,
 ): i32 {
-  if !boxNul {
-    fbI32Const(0)
-    return 0
-  }
+  if !boxNul { return unionEqNoNullTail() }
   if staged { fbLocalGet(stash) }
   else if emitExpr(boxIx, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, nullBoxTag())
-  fbI32Bin(70)
-  return 0
+  return unionEqNullTagTail()
 }
 
 // D1098 — the box tag of one arm of a union `==`, which is `scalarTagOfKind` for every atom
@@ -23627,13 +23706,11 @@ function ifShapeWhyOf(ifIx: i32, fnIx: i32, needElse: boolean): string {
     return "arm prelude unwalked"
   }
   if optGuardCallOf(ifIx, fnIx) >= 0 { return "optional guard" }
-  // An integer `match` over a plain place whose `br_table` plan declines is written as the plain
-  // chain; one over anything else stays refused.
+  // An integer `match` whose `br_table` plan has an `else` is the table; one with no plan is written
+  // as the plain chain (`emitIntSwitch` declines), whatever its scrutinee.
   if intMatchHeadAt(ifIx) {
     const p = intSwitchPlanOf(ifIx, fnIx)
     if p != null && p.ispElse >= 0 { return "int match" }
-    const sc = switchScrutOf(n.ifCond)
-    if sc < 0 || !(nodeAt(sc) is Ident) { return "int match" }
   }
   return ""
 }
