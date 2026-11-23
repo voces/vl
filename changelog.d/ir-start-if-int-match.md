@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: a value `match` with no `br_table` plan is the plain chain, whatever its scrutinee.** `ifShapeWhyOf` refused an integer `match` whose scrutinee is not a plain name (`match 1`, a member), though legacy writes every planless `match` as the plain chain (`emitIntSwitch` declines). Of tests/cases' 19 `start: expression if int match` programs, 17 start bodies are now covered and matched. Integer `-x` over a valued `if` is now a named miss: legacy writes the zero of `0 - x` before the `if`, which the IR's lowering could not, and a function holding one was a claimable function that did not match.
