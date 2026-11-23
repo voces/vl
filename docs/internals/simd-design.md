@@ -656,8 +656,10 @@ The smallest slices, in dependency order (the `buffer-design.md` §F discipline)
   need — the first thing that lets veldt measure the 4×.
 - **S4 — the integer + narrow shapes** (`I32x4`, `I16x8`, `U8x16`, widening loads, `dot`, `swizzle`).
   This is the voxel-pass need and the `flat`-record interop (§D5). **Tier 1 shipped (§G1):** the
-  raw intrinsics for every integer instruction. Tier 2, the typed `std:simd` surface, awaits the
-  owner's ruling.
+  raw intrinsics for every integer instruction. **Tier 2's first slice shipped (#9678):**
+  `U8x16`, `U16x8`, `I16x8`, `I32x4` with their masks — load/store/splat, wrapping and
+  saturating add/sub, min/max, compares, select, bitwise, mask reductions, widen and narrow
+  (`std-notes.md` §`std:simd`). Lane access, shifts, `*`, `dot` and `swizzle` remain.
 - **S5 — relaxed SIMD (gated).** `-mrelaxed-simd`, FMA + relaxed dot, strict fallback (O6).
 - **Later, separable:** a checked `v128view`, aligned loads (O5), a `@simd`-loop hint (axis 2). A
   general static `shuffle<…>` stays unplanned rather than merely deferred — O10 rules the fixed
