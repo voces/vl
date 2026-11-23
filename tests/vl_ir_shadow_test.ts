@@ -1571,6 +1571,8 @@ Deno.test({
       "record-arms-unbox-at-its-record": 0,
       "record-arms-unbox-at-another-record": 2,
       "box-list-retag-into-i32-list": 2,
+      "list-of-lists-retag-into-nullable-lists": 0,
+      "list-of-lists-retag-into-other-lists": 2,
       "box-list-retag-into-niche-record-list": 2,
       "num-union-conversion-of-non-box": 2,
       "num-union-conversion-off-result-kind": 2,
