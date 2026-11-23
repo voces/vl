@@ -13010,3 +13010,16 @@ twins (`type L1 = {n: L1|null}` beside an L2 twin), a compiler stack overflow ca
 `tests/cases/structs/structural-twin-heap-dedup.vl`, and it was seen to admit field-alike records
 on different heaps. Identity is one compare and is what the target checks. Recording the heap on
 the IR keeps the verifier independent of emit (the ruling of the same day above, D17049).
+
+## A narrowed module `let` pays one program-wide writer analysis; a `const` pays none (2026-11-23) — D17063
+
+**Decided by the checker-fix lane that closed D17063 (2026-11-23), for the coordinator to confirm
+or overrule**, on the checker cost cliff IR-N1 found. A module `let`'s initializer narrows it
+(`let g: U = { a: 0 }; print(g.a)` checks), so each later call must ask whether it may write the
+cell, and that needs the writer analysis of the whole module. A `const` holding a list is never
+narrowed and never asks. The analysis is linear and stays; the quadratic
+closure inside it was the defect and is gone.
+
+**Why.** Dropping the initializer's narrowing would reject programs the language accepts today.
+Keeping the analysis but caching the module root's walk across functions does not pay: the checker
+edits the arena in place between the asks, so a kept walk is stale (measured: no fuel moved).
