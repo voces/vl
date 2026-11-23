@@ -8,6 +8,33 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-23-ir-method-f](2026-11-23-ir-method-f.md): IR coverage: `method f`, a field call off a receiver that is not a plain record (2026-11-23, lane IR-N8)
+- [2026-11-23-ir-capture-box-narrowed](2026-11-23-ir-capture-box-narrowed.md): IR: a narrowed union-box capture, 2026-11-23
+- [2026-11-23-ir-n7-narrowed-field](2026-11-23-ir-n7-narrowed-field.md): IR coverage: a narrowed field's boxed-nullable storage, an intersection's field kid (2026-11-23, lane IR-N7)
+- [2026-11-23-ir-holefn-container-return](2026-11-23-ir-holefn-container-return.md): IR: a returned container of hole-function closures (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-n9-batch7](2026-11-23-ir-n9-batch7.md): IR coverage, batch 7: a `null` member read out of a union-box field is that box (2026-11-23, lane IR-N9)
+- [2026-11-23-ir-nullty-operand](2026-11-23-ir-nullty-operand.md): IR: a `nullty` null test's operand, as legacy reads and drops it, 2026-11-23
+- [2026-11-23-ir-is-family2](2026-11-23-ir-is-family2.md): IR: `is` at its storage, the remaining box arm tags, and the cut behind a written guard (2026-11-23, lane IR-N1)
+- [2026-11-23-ir-m1-lone-literal-atom](2026-11-23-ir-m1-lone-literal-atom.md): IR-M1: a lone literal's atom passes verifier rule 3 (2026-11-23, lane IR-M1)
+- [2026-11-23-ir-start-if-int-match](2026-11-23-ir-start-if-int-match.md): IR coverage: `start: expression if int match` (2026-11-23, lane IR-N8)
+- [2026-11-23-ir-union-compare-null-legs](2026-11-23-ir-union-compare-null-legs.md): IR: a union compare's null leg, a box or operand read again, and the number and list arms (2026-11-23, lane S1)
+- [2026-11-23-ir-forin-pair-rep](2026-11-23-ir-forin-pair-rep.md): IR: a map walk's value at any rep, 2026-11-23
+- [2026-11-23-ir-c1-rep-unsup-3](2026-11-23-ir-c1-rep-unsup-3.md): `rep unsup`, batch 3: open capture reads and nullable-box hole receivers (IR-C1)
+- [2026-11-23-ir-ref-if-chain-null-inward](2026-11-23-ir-ref-if-chain-null-inward.md): A reference join's inner link opens at the chain's nullable type (2026-11-23, lane IR-N5)
+- [2026-11-23-ir-union-if-static-and-nested-arm](2026-11-23-ir-union-if-static-and-nested-arm.md): IR coverage: a union join's literal-true condition and its nested-`if` arms (2026-11-23, lane IR-N2)
+- [2026-11-23-ir-for-range-reserve](2026-11-23-ir-for-range-reserve.md): IR: range loops inside a list reserve region (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-n3-global-read](2026-11-23-ir-n3-global-read.md): IR-N3: `start: global read coercion`, atom globals at a string (2026-11-23, lane IR-N3)
+- [2026-11-23-ir-is-family](2026-11-23-ir-is-family.md): IR: `is` over a stored box, `is` against a map the box lacks, and the decided guard's block cut (2026-11-23, lane IR-N1)
+- [2026-11-23-ir-m1-tagged-open-row](2026-11-23-ir-m1-tagged-open-row.md): IR-M1: a record literal at a row open only in a tagged function set (2026-11-23, lane IR-M1)
+- [2026-11-23-ir-start-global-init](2026-11-23-ir-start-global-init.md): IR coverage: `start: global initializer coercion`, a function value at an annotated global (2026-11-23, lane IR-N8)
+- [2026-11-23-ir-n7-call-result](2026-11-23-ir-n7-call-result.md): IR coverage: a direct call typed past its callee's result (2026-11-23, lane IR-N7)
+- [2026-11-23-ir-n9-batch6](2026-11-23-ir-n9-batch6.md): IR coverage, batch 6: an `is` test on a boxed-nullable field, read at its storage (2026-11-23, lane IR-N9)
+- [2026-11-23-ir-record-compare-place](2026-11-23-ir-record-compare-place.md): IR: a record compare operand at its place, 2026-11-23
+- [2026-11-23-ir-c1-rep-unsup-2](2026-11-23-ir-c1-rep-unsup-2.md): `rep unsup`, batch 2: empty literals, shared reads through a hole receiver, open `let` reads and their `==` (IR-C1)
+- [2026-11-23-ir-expression-as-arms](2026-11-23-ir-expression-as-arms.md): IR: the `expression as` arms left after #9679 (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-start-global-read](2026-11-23-ir-start-global-read.md): IR coverage: `start: global read coercion`, a union-box global narrowed to a smaller union (2026-11-23, lane IR-N8)
+- [2026-11-23-ir-global-narrowed-arm-read](2026-11-23-ir-global-narrowed-arm-read.md): A module global's narrowed union read unboxes to its record arm (2026-11-23, lane IR-N5)
+- [2026-11-23-ir-coalesce-hole-map-join-box](2026-11-23-ir-coalesce-hole-map-join-box.md): IR coverage: `??` over hole map reads joined into a union box (2026-11-23, lane IR-N2)
 - [2026-11-23-ir-map-cb-expr](2026-11-23-ir-map-cb-expr.md): IR: a `.map`/`.filter` callback yielded by a call (2026-11-23, lane IR-N1)
 - [2026-11-23-ir-c1-rep-unsup-1](2026-11-23-ir-c1-rep-unsup-1.md): `rep unsup`, batch 1: hole parameter reads, open operators, a call at its callee's result (IR-C1)
 - [2026-11-23-ir-n9-batch5](2026-11-23-ir-n9-batch5.md): IR coverage, batch 5: a field read off a receiver held at its storage row (2026-11-23, lane IR-N9)
