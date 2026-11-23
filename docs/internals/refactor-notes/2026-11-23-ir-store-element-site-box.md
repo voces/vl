@@ -26,10 +26,17 @@ value already of a union at its own, and otherwise boxes at the site's union (`e
 New test cases:
 - `closures/shared-scalar-let-cell-written-and-read-by-two-closures.vl`
 - `simd/shared-vector-let-cell-written-and-read-by-two-closures.vl`
-- `closures/shared-nullable-let-cell-written-null-after-a-number.vl` (arm N, a named miss)
+- `closures/shared-nullable-let-cell-written-null-after-a-number.vl` (arm N)
+
+- Arm N: `idxStoreOtherWhy` no longer refuses a nested list's literal; it builds as the inner list,
+  as legacy's nested-row store does (`emitExpr` after the row plan). A literal holding a record
+  literal stays refused by name (`store element record literal`, `listLitHoldsObjLit`): legacy banks
+  that store's element-read row from its receiver, the lowering from the record's own read, so the
+  rows disagree though the bytes match (`shared-let-read-early-traps-nullable.vl`).
+- `liftCapVar`'s retype reaches 11 functions, every one a capture parameter of a `v128` shared
+  `let` (9 lambdas of `simd/captured-reassigned-vector-cell.vl`, 2 of the new `v128` witness); none
+  in the distilled corpus or the self-compile.
 
 ## Not in this change
 
-Arm N: dropping its refusal builds two of the three programs byte-identically; the third
-(`shared-let-read-early-traps-nullable.vl`) is byte-identical with a `spans: read index` mismatch.
-It is not a list-literal seeding mechanism.
+The two simd writer lambdas stop next at `union cast operand rep`, which is free.
