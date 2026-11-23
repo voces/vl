@@ -1590,6 +1590,9 @@ Deno.test({
       "pop-or-default-returning-call": 5,
       "pop-or-default-never-call": 0,
       "dead-return-after-never-call": 0,
+      "never-call-value-at-consumer-rep": 0,
+      "returning-call-temp-typed-never": 3,
+      "never-call-value-into-bool": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {

@@ -19,7 +19,7 @@ import {
   emitOptLinkNullOpen,
   optLeafArmOf,
 } from "./wasmEmit"
-import { exprNullableRefNiche } from "./emit_classify"
+import { capCellTargetOf, exprNullableRefNiche } from "./emit_classify"
 import {
   RAtom,
   RBox,
@@ -316,7 +316,6 @@ import {
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
-  SHARED_NULL_NONE,
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
@@ -354,6 +353,7 @@ import {
   callRefCallTail,
   callRefEnvOpen,
   callRefStash,
+  cloCellReaches,
   closureEqTail,
   coalAtomStrClose,
   coalAtomStrOpen,
@@ -376,6 +376,7 @@ import {
   emitArmUnboxAt,
   emitAsUnionTagged,
   emitCapturedRead,
+  emitCloCellRef,
   emitClosureIds,
   emitClosureValueCore,
   emitEnvCacheClose,
@@ -540,13 +541,10 @@ import {
   recCopyPureEmit,
   refArrayUnionUnboxTail,
   sFieldStorageSlot,
-  sharedArmBoxBody,
-  sharedArmBoxHead,
-  sharedArmIsBox,
-  sharedArmIsPlain,
-  sharedArmNullOf,
-  sharedArmNullTail,
-  sharedArmPlainTail,
+  sharedArmHead,
+  sharedArmModeOf,
+  sharedArmModeReads,
+  sharedArmTail,
   sharedArmTestTail,
   sharedReadPlainOf,
   sharedReadPlanOf,
@@ -738,6 +736,7 @@ import {
   uBoxIdx,
   uBoxNewEnd,
   uFieldCount,
+  uVarRow,
   unionSinkBase,
 } from "./emit_state"
 import { ListBuild } from "./emit_ref_list_kinds"
@@ -1606,14 +1605,25 @@ function stashSlotOf(at: i32, fi: i32): i32 {
 // `RMakeClo`: legacy's closure writer for a capture-free function, then a name read's recovery,
 // as `emitExpr` writes a function literal or a function name.
 function makeClo(r: RMakeClo) {
-  if r.mcEnv.length > 0 {
-    // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure.
+  if fnEnvIdxOf(r.mcFn) >= 0 && !cloCellReaches(r.mcFn, lw.irAt) {
+    // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure. A
+    // function-value cell capture has no operand: it is legacy's read of the cell this frame reaches.
     const envIdx = fnEnvIdxOf(r.mcFn)
-    if envIdx < 0 { return irLMiss("closure env") }
     // An environment this frame caches is built at its first read in an activation (D7480).
     const ck = envCacheSlotOfFe(r.mcFn)
     if ck >= 0 { emitEnvCacheOpen(ck) }
-    for o in r.mcEnv { irLOpnd(o) }
+    let k = 0
+    for name in captureNamesOf(r.mcFn) {
+      const cell = capCellTargetOf(name)
+      if cell >= 0 {
+        if emitCloCellRef(cell, lw.irAt) < 0 { return -1 }
+      } else {
+        if k >= r.mcEnv.length { return irLMiss("closure env") }
+        irLOpnd(r.mcEnv[k])
+        k = k + 1
+      }
+    }
+    if k != r.mcEnv.length { return irLMiss("closure env") }
     fbStructNew(envIdx)
     if ck >= 0 { emitEnvCacheClose(ck) }
     emitClosureIds(r.mcFn)
@@ -2107,7 +2117,8 @@ function sharedRead(r: RSharedRead) {
   return 0
 }
 
-// One member's arm of shared read `r`, in the form legacy writes it: the plain read, or its box.
+// One member's arm of shared read `r`, in its form (`sharedArmModeOf`) as legacy writes it: the
+// head, the receiver where the form reads it, then the tail.
 function sharedReadArm(
   r: RSharedRead,
   slot: i32,
@@ -2115,19 +2126,12 @@ function sharedReadArm(
   vi: i32,
   fi: i32,
 ): i32 {
-  // A `null` member's arm is legacy's constant, its receiver unread.
-  const nk = sharedArmNullOf(code, vi, fi)
-  if nk != SHARED_NULL_NONE { return sharedArmNullTail(nk) }
-  if sharedArmIsPlain(code, vi, fi) {
-    sharedReadRecv(r, slot)
-    return sharedArmPlainTail(code, vi, fi)
-  }
-  if !sharedArmIsBox(code, vi, fi, r.srAt, lw.irAt) {
-    return irLMiss("shared read arm")
-  }
-  sharedArmBoxHead(vi, fi, r.srAt, lw.irAt)
+  if vi < 0 || vi >= uVarRow.length { return irLMiss("shared read arm row") }
+  const mode = sharedArmModeOf(code, vi, fi)
+  if sharedArmHead(mode, code, vi, fi, r.srAt, lw.irAt) < 0 { return -1 }
+  if !sharedArmModeReads(mode) { return 0 }
   sharedReadRecv(r, slot)
-  return sharedArmBoxBody(vi, fi)
+  return sharedArmTail(mode, code, vi, fi, r.srAt, lw.irAt)
 }
 
 // One receiver push of shared read `r`: its stash slot's box, its global's, else its box local.
@@ -2559,7 +2563,8 @@ function bindRangeCopyElems(r: RMakeList, fnIx: i32): i32 {
 }
 
 // `RSpread`: legacy's prologue, the source, then the group stash and join `emitArrSpread`'s plain
-// arm writes, read off the same plan, so its slots are the literal's recorded ones.
+// arm writes, read off the same plan. A minted literal no walk recorded (a variadic push's run)
+// keys its slots by the emission sequence, read here at the point legacy's arm reads it.
 function spreadList(r: RSpread) {
   const fnIx = lw.irAt
   const lb: ListBuild = { lbKind: r.spKind, lbSlot: r.spSlot }
