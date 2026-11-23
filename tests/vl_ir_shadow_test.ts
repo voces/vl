@@ -1586,6 +1586,9 @@ Deno.test({
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
     // A fit tail that misses leaves legacy's receiver read in place (`fitRecvReadHook`).
     if (exp.irFitTailSelfTest() !== 1) throw new Error("want the fit hook restored after a miss");
+    // Each kind legacy's descriptor names alone maps to a type that describes back at that kind.
+    const rd = exp.repDescSelfTest();
+    if (rd !== 0) throw new Error(`want every descriptor kind to round-trip, got kind ${rd} off`);
   },
 });
 
