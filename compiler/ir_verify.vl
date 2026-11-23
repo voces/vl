@@ -435,7 +435,7 @@ function nicheBoolPair(x: i32, y: i32): boolean {
 
 // Rules 2 and 6 for a call of callee `fnPos` with `args` into a destination of rep `dst`
 // (-1 for an effect, which keeps no result).
-function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
+function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32, never: boolean) {
   const si = irSigOf(vf, fnPos)
   if si < 0 {
     return fail(6, at, "calls f" + i32ToStr(fnPos) + ", which has no signature")
@@ -467,7 +467,14 @@ function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
     }
     i = i + 1
   }
-  if dst >= 0 && dst != vf.irSigRet[si] && !vfStoresAs(dst, vf.irSigRet[si]) {
+  // A callee that never returns has no result: its call takes its consumer's rep.
+  const noRet = never && repIsNoValue(vf.irSigRet[si])
+  if (
+    dst >= 0
+    && dst != vf.irSigRet[si]
+    && !vfStoresAs(dst, vf.irSigRet[si])
+    && !noRet
+  ) {
     return fail(6, at, "the result rep is not the callee's")
   }
   return 0
@@ -538,7 +545,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           return fail(2, at, "a call's write-back is not a capture it passes")
         }
       }
-      callSig(r.caCallee, r.caArgs, dst, at)
+      callSig(r.caCallee, r.caArgs, dst, at, r.caNever)
     }
     RCallRef => {
       use(r.crFn, at)
@@ -2976,7 +2983,7 @@ export function irVerify(f: IrFn): IrVerdict {
       )
     } else if vfHeldOpen(i, v.vTy, v.vRep) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
-    } else if !untyped && repNodeOfTy(v.vTy) != v.vRep {
+    } else if !untyped && repNodeOfTy(v.vTy) != v.vRep && !neverCallTemp(f, i) {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
     }
     i = i + 1
@@ -3070,6 +3077,22 @@ function plainRecordsLowerAlike(a: i32, b: i32): boolean {
 function opndsHoldVar(os: Opnd[], v: i32): boolean {
   for o in os {
     if o is OVar && o.ov == v { return true }
+  }
+  return false
+}
+
+// Whether variable `i` of `f` is a temp whose checker type has no value, defined by a call that
+// never returns: no value reaches it, so it takes the rep of the consumer legacy writes after it.
+function neverCallTemp(f: IrFn, i: i32): boolean {
+  const v = f.irVars[i]
+  if v.vKind != "temp" || v.vTy < 0 || !repIsNoValue(repNodeOfTy(v.vTy)) {
+    return false
+  }
+  for n in f.irNodes {
+    if n is SLet && n.lDst == i {
+      const r = n.lRhs
+      return r is RCall && r.caNever
+    }
   }
   return false
 }

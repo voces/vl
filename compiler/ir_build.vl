@@ -6398,6 +6398,15 @@ function nicheBoolEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
 }
 
+function binIsCompare(op: string): boolean {
+  return op == "=="
+    || op == "!="
+    || op == "<"
+    || op == "<="
+    || op == ">"
+    || op == ">="
+}
+
 // Why operand `ix` is outside the set, or "": it must be typed at a numeric primitive or
 // `boolean`, whose signedness picks the op (`opUnsigned`).
 function operandWhy(ix: i32): string {
@@ -9326,7 +9335,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     return t
   }
-  const rep = exprRepOf(ix)
+  const own = exprRepOf(ix)
+  // A `never` call or operator is legacy's i32: its consumer widens it as any i32.
+  const nv = own < 0 && (n is Call || n is BinExpr) && exprTyOf(ix) == TY_NEVER
+  const rep = if nv { repNodeOfTy(TY_I32) } else { own }
   if rep < 0 {
     return irBMiss("rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
   }
@@ -9458,10 +9470,22 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       const fold = shiftMaskFoldOf(n, ix, fb, ibFnIx)
       if fold.length > 0 { return shiftMaskFold(b, fold, fb, ix, rep) }
     }
-    const lw = operandWhy(n.binLeft)
+    // An operand typed `never` is built at the other's rep, which picks the op (D14420).
+    const nl = exprTyOf(n.binLeft) == TY_NEVER
+    const nr = exprTyOf(n.binRight) == TY_NEVER
+    if nl && nr { return irBMiss("operator over two never operands") }
+    const lw = operandWhy(if nl { n.binRight } else { n.binLeft })
     if lw != "" { return irBMiss(lw) }
-    const rw = operandWhy(n.binRight)
+    const rw = operandWhy(if nr { n.binLeft } else { n.binRight })
     if rw != "" { return irBMiss(rw) }
+    const never = nl || nr
+    const sib = if nl { n.binRight } else { n.binLeft }
+    // Legacy writes the op at i32, an operand of another width converted or not (D17064).
+    const i32r = repNodeOfTy(TY_I32)
+    if never && exprRepOf(sib) != i32r {
+      return irBMiss("never operator over a non-i32 operand")
+    }
+    const orep = if !never { rep } else if binIsCompare(n.binOp) { ibBool } else { i32r }
     // Mixed numeric widths meet at the operator's width, each operand widened before the next
     // is built, as legacy builds them (`emitBinOperandAs`); a literal there is legacy's to write.
     const dst = binWidthRep(n)
@@ -9496,6 +9520,15 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     const sl = lead[0]
     if irBOpRep(sl) != irBOpRep(r) { return irBMiss("operand coercion") }
+    if never {
+      return irBLetTempTy(
+        b,
+        { poOp: p, poArgs: [sl, r] },
+        ix,
+        orep,
+        repTyOf(orep),
+      )
+    }
     return irBLetTemp(b, { poOp: p, poArgs: [sl, r] }, ix, rep)
   }
   if n is Call {
@@ -9513,6 +9546,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return irBMiss("call") }
+    if rhs is RCall && rhs.caNever { return irBLetTemp(b, rhs, ix, rep) }
     // A call typed past its callee's result (a joined result legacy widens) is legacy's.
     if rhs is RCall {
       const si = irSigOf(ib, rhs.caCallee)
