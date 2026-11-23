@@ -1,4 +1,4 @@
-# `rep novalue`, steps 3 and 4: a returned never call and a never `??` default (IR-C1)
+# `rep novalue`, steps 3 to 5: a returned never call, a never `??` default and a union join's never arm (IR-C1)
 
 **Step 3, return.** Legacy writes `call; unreachable; return` for `return fail()`, and the IR
 already wrote that dead bare return after a returned `__trap__`. The case now takes any call
@@ -14,6 +14,11 @@ miss `coalesce never default widened`. A later legacy-only change that drops the
 the shape that closes it. Rule 5's `exits()` counts a never call as leaving, which an arm left
 unwritten needs.
 
+**Step 5, a union join's arm.** `unionIfArm` builds a never-call arm as its statement, as legacy's
+`emitUnionIfArm` writes it through `emitUnionBoxOwed`, with no box and no store. These are the
+narrowed `is` chains of a generic `T0[] | T1[]` read, whose last `else` is `__trap__()`
+(`tests/cases/generics/type-param-list-join-storage-apart.vl` and three like it).
+
 **Shared query.** `irNodeEndsPath` (ir.vl) is an `STrap`, or the effect of an `RCall` with
 `caNever` or an `RCallHost` with `chNever`, both set from legacy's `callEndsNever`. It is an
 exhaustive match over `Rhs`. Verifier self-test cases 25 to 28 pin it: a returning call's effect
@@ -26,6 +31,7 @@ leaves neither a dead return (25) nor an unwritten `??` out (26) valid, and a ne
 | --- | ---: | ---: |
 | return position (step 3) | `rep novalue` 33, covered = matched 560 | `rep novalue` 28, covered = matched 564 |
 | `??` default (step 4) | `rep novalue` 28, covered = matched 564 | `rep novalue` 14, covered = matched 574, plus 1 `coalesce never default widened` |
+| union join arm (step 5, `unionIfArm`) | `rep novalue` 14, covered = matched 574 | `rep novalue` 7, covered = matched 579 |
 
 ## Readings (base 26e961da = #9606's head, fixpoint seeds on both sides, head 5002c817)
 
