@@ -43,6 +43,7 @@ import {
   RGetField,
   RGlobalGet,
   RHandPick,
+  RInitProgress,
   RJoinNull,
   RListCat,
   RListClear,
@@ -435,7 +436,7 @@ function nicheBoolPair(x: i32, y: i32): boolean {
 
 // Rules 2 and 6 for a call of callee `fnPos` with `args` into a destination of rep `dst`
 // (-1 for an effect, which keeps no result).
-function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
+function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32, never: boolean) {
   const si = irSigOf(vf, fnPos)
   if si < 0 {
     return fail(6, at, "calls f" + i32ToStr(fnPos) + ", which has no signature")
@@ -467,7 +468,14 @@ function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
     }
     i = i + 1
   }
-  if dst >= 0 && dst != vf.irSigRet[si] && !vfStoresAs(dst, vf.irSigRet[si]) {
+  // A callee that never returns has no result: its call takes its consumer's rep.
+  const noRet = never && repIsNoValue(vf.irSigRet[si])
+  if (
+    dst >= 0
+    && dst != vf.irSigRet[si]
+    && !vfStoresAs(dst, vf.irSigRet[si])
+    && !noRet
+  ) {
     return fail(6, at, "the result rep is not the callee's")
   }
   return 0
@@ -538,7 +546,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           return fail(2, at, "a call's write-back is not a capture it passes")
         }
       }
-      callSig(r.caCallee, r.caArgs, dst, at)
+      callSig(r.caCallee, r.caArgs, dst, at, r.caNever)
     }
     RCallRef => {
       use(r.crFn, at)
@@ -1599,6 +1607,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCellGet => use(r.cgCell, at)
     REnvGet => 0
     REnvDrop => 0
+    // The progress store is a statement's effect: it yields nothing.
+    RInitProgress => if dst >= 0 { fail(2, at, "an init progress store yields no value") } else { 0 }
     RBundlePick => {
       use(r.bpV, at)
       if dst >= 0 && !(repNodeAt(dst) is RClosure) {
@@ -2742,6 +2752,7 @@ function rhsReadsList(r: Rhs): boolean {
       RGetField |
       RGlobalGet |
       RHandPick |
+      RInitProgress |
       RJoinNull |
       RListCat |
       RListClear |
@@ -2990,7 +3001,7 @@ export function irVerify(f: IrFn): IrVerdict {
       )
     } else if vfHeldOpen(i, v.vTy, v.vRep) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
-    } else if !untyped && repNodeOfTy(v.vTy) != v.vRep {
+    } else if !untyped && repNodeOfTy(v.vTy) != v.vRep && !neverCallTemp(f, i) {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
     }
     i = i + 1
@@ -3022,6 +3033,11 @@ export function irVerify(f: IrFn): IrVerdict {
   if vfRule == 0 && vfPushed.length > 0 {
     fail(10, -1, "a push no store consumes")
   }
+  // Rule 1 for a result typed by its rep (`irRetFromRep`): only a faithful thunk may carry one.
+  if vfRule == 0 && f.irRetFromRep {
+    const tw = thunkForwardWhy(f)
+    if tw != "" { fail(1, -1, tw) }
+  }
   // Rule 5 at the end: a function with a result leaves its body on every path, or falls into
   // the `null` or `unreachable` the lowering pads its end with, as legacy does.
   if (
@@ -3033,6 +3049,52 @@ export function irVerify(f: IrFn): IrVerdict {
   }
   const v: IrVerdict = { vfRule: vfRule, vfNode: vfAt, vfMsg: vfMsg }
   return v
+}
+
+// Why function `f`, whose result type is its rep's own, is no faithful thunk, or "": one call of the
+// callee its signature notes, on each parameter after the env at that signature's rep, in order,
+// its value at the signature's result rep returned as it stands.
+function thunkForwardWhy(f: IrFn): string {
+  if !f.irThunk { return "a result typed by its rep outside a thunk" }
+  if f.irBody.length != 2 {
+    return "a rep-typed thunk is not one call and its return"
+  }
+  const n0 = f.irNodes[f.irBody[0]]
+  const n1 = f.irNodes[f.irBody[1]]
+  if !(n0 is SLet) || !(n1 is SReturn) {
+    return "a rep-typed thunk is not one call and its return"
+  }
+  const c = n0.lRhs
+  if !(c is RCall) || !n1.rtHas {
+    return "a rep-typed thunk is not one call and its return"
+  }
+  const rv = n1.rtV
+  if !(rv is OVar) || rv.ov != n0.lDst {
+    return "a rep-typed thunk returns no call's value"
+  }
+  const si = irSigOf(f, c.caCallee)
+  if si < 0 { return "a rep-typed thunk's callee has no signature" }
+  const ps = f.irSigParams[si]
+  if c.caArgs.length != ps.length || f.irParams.length != ps.length + 1 {
+    return "a rep-typed thunk does not forward every parameter"
+  }
+  let i = 0
+  while i < ps.length {
+    const a = c.caArgs[i]
+    if (
+      !(a is OVar)
+      || a.ov != f.irParams[i + 1]
+      || f.irVars[a.ov].vRep != ps[i]
+    ) {
+      return "a rep-typed thunk does not forward its parameters in order at the callee's reps"
+    }
+    i = i + 1
+  }
+  const r = f.irSigRet[si]
+  if f.irVars[n0.lDst].vRep != r || f.irRetRep != r {
+    return "a rep-typed thunk's result is not its callee's"
+  }
+  return ""
 }
 
 // Whether a nullable of discipline `disc` over rep `inner` is a niche that holds its inner value
@@ -3084,6 +3146,22 @@ function plainRecordsLowerAlike(a: i32, b: i32): boolean {
 function opndsHoldVar(os: Opnd[], v: i32): boolean {
   for o in os {
     if o is OVar && o.ov == v { return true }
+  }
+  return false
+}
+
+// Whether variable `i` of `f` is a temp whose checker type has no value, defined by a call that
+// never returns: no value reaches it, so it takes the rep of the consumer legacy writes after it.
+function neverCallTemp(f: IrFn, i: i32): boolean {
+  const v = f.irVars[i]
+  if v.vKind != "temp" || v.vTy < 0 || !repIsNoValue(repNodeOfTy(v.vTy)) {
+    return false
+  }
+  for n in f.irNodes {
+    if n is SLet && n.lDst == i {
+      const r = n.lRhs
+      return r is RCall && r.caNever
+    }
   }
   return false
 }

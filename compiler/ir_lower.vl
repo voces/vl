@@ -19,7 +19,7 @@ import {
   emitOptLinkNullOpen,
   optLeafArmOf,
 } from "./wasmEmit"
-import { exprNullableRefNiche } from "./emit_classify"
+import { capCellTargetOf, exprNullableRefNiche } from "./emit_classify"
 import {
   RAtom,
   RBox,
@@ -140,6 +140,7 @@ import {
   RGetField,
   RGlobalGet,
   RHandPick,
+  RInitProgress,
   RJoinNull,
   RListCat,
   RListClear,
@@ -316,7 +317,6 @@ import {
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
-  SHARED_NULL_NONE,
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
@@ -354,6 +354,7 @@ import {
   callRefCallTail,
   callRefEnvOpen,
   callRefStash,
+  cloCellReaches,
   closureEqTail,
   coalAtomStrClose,
   coalAtomStrOpen,
@@ -376,6 +377,7 @@ import {
   emitArmUnboxAt,
   emitAsUnionTagged,
   emitCapturedRead,
+  emitCloCellRef,
   emitClosureIds,
   emitClosureValueCore,
   emitEnvCacheClose,
@@ -543,13 +545,10 @@ import {
   scalarMapEqPlanOf,
   scalarMapEqReadTail,
   scalarMapEqTail,
-  sharedArmBoxBody,
-  sharedArmBoxHead,
-  sharedArmIsBox,
-  sharedArmIsPlain,
-  sharedArmNullOf,
-  sharedArmNullTail,
-  sharedArmPlainTail,
+  sharedArmHead,
+  sharedArmModeOf,
+  sharedArmModeReads,
+  sharedArmTail,
   sharedArmTestTail,
   sharedReadPlainOf,
   sharedReadPlanOf,
@@ -743,6 +742,7 @@ import {
   uBoxIdx,
   uBoxNewEnd,
   uFieldCount,
+  uVarRow,
   unionSinkBase,
 } from "./emit_state"
 import { ListBuild } from "./emit_ref_list_kinds"
@@ -1263,6 +1263,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMakeClo => makeClo(r)
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
+    RInitProgress => irLMiss("init progress as a value")
     RBundlePick => bundlePick(r)
     RResultPick => resultPick(r)
     RHandPick => handPick(r)
@@ -1611,14 +1612,25 @@ function stashSlotOf(at: i32, fi: i32): i32 {
 // `RMakeClo`: legacy's closure writer for a capture-free function, then a name read's recovery,
 // as `emitExpr` writes a function literal or a function name.
 function makeClo(r: RMakeClo) {
-  if r.mcEnv.length > 0 {
-    // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure.
+  if fnEnvIdxOf(r.mcFn) >= 0 && !cloCellReaches(r.mcFn, lw.irAt) {
+    // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure. A
+    // function-value cell capture has no operand: it is legacy's read of the cell this frame reaches.
     const envIdx = fnEnvIdxOf(r.mcFn)
-    if envIdx < 0 { return irLMiss("closure env") }
     // An environment this frame caches is built at its first read in an activation (D7480).
     const ck = envCacheSlotOfFe(r.mcFn)
     if ck >= 0 { emitEnvCacheOpen(ck) }
-    for o in r.mcEnv { irLOpnd(o) }
+    let k = 0
+    for name in captureNamesOf(r.mcFn) {
+      const cell = capCellTargetOf(name)
+      if cell >= 0 {
+        if emitCloCellRef(cell, lw.irAt) < 0 { return -1 }
+      } else {
+        if k >= r.mcEnv.length { return irLMiss("closure env") }
+        irLOpnd(r.mcEnv[k])
+        k = k + 1
+      }
+    }
+    if k != r.mcEnv.length { return irLMiss("closure env") }
     fbStructNew(envIdx)
     if ck >= 0 { emitEnvCacheClose(ck) }
     emitClosureIds(r.mcFn)
@@ -2112,7 +2124,8 @@ function sharedRead(r: RSharedRead) {
   return 0
 }
 
-// One member's arm of shared read `r`, in the form legacy writes it: the plain read, or its box.
+// One member's arm of shared read `r`, in its form (`sharedArmModeOf`) as legacy writes it: the
+// head, the receiver where the form reads it, then the tail.
 function sharedReadArm(
   r: RSharedRead,
   slot: i32,
@@ -2120,19 +2133,12 @@ function sharedReadArm(
   vi: i32,
   fi: i32,
 ): i32 {
-  // A `null` member's arm is legacy's constant, its receiver unread.
-  const nk = sharedArmNullOf(code, vi, fi)
-  if nk != SHARED_NULL_NONE { return sharedArmNullTail(nk) }
-  if sharedArmIsPlain(code, vi, fi) {
-    sharedReadRecv(r, slot)
-    return sharedArmPlainTail(code, vi, fi)
-  }
-  if !sharedArmIsBox(code, vi, fi, r.srAt, lw.irAt) {
-    return irLMiss("shared read arm")
-  }
-  sharedArmBoxHead(vi, fi, r.srAt, lw.irAt)
+  if vi < 0 || vi >= uVarRow.length { return irLMiss("shared read arm row") }
+  const mode = sharedArmModeOf(code, vi, fi)
+  if sharedArmHead(mode, code, vi, fi, r.srAt, lw.irAt) < 0 { return -1 }
+  if !sharedArmModeReads(mode) { return 0 }
   sharedReadRecv(r, slot)
-  return sharedArmBoxBody(vi, fi)
+  return sharedArmTail(mode, code, vi, fi, r.srAt, lw.irAt)
 }
 
 // One receiver push of shared read `r`: its stash slot's box, its global's, else its box local.
@@ -2564,7 +2570,8 @@ function bindRangeCopyElems(r: RMakeList, fnIx: i32): i32 {
 }
 
 // `RSpread`: legacy's prologue, the source, then the group stash and join `emitArrSpread`'s plain
-// arm writes, read off the same plan, so its slots are the literal's recorded ones.
+// arm writes, read off the same plan. A minted literal no walk recorded (a variadic push's run)
+// keys its slots by the emission sequence, read here at the point legacy's arm reads it.
 function spreadList(r: RSpread) {
   const fnIx = lw.irAt
   const lb: ListBuild = { lbKind: r.spKind, lbSlot: r.spSlot }
@@ -2718,6 +2725,8 @@ function rangeLoop(n: SRangeLoop, pending: i32[]) {
   if rt.vIdx < 0 || rt.vIdx != varSlot(n.rlVar) { return irLMiss("range slot") }
   const wraps = rangeMayWrap(s, rt)
   irLSettle(pending)
+  const hoists = irLoopOpenHook(n.rlAt)
+  if hoists.loHoists < 0 { return irLMiss("loop hoist prologue") }
   scopeBind(s.frVar, declaredSlotOfDecl(n.rlAt))
   let kb = 0
   if n.rlPartial {
@@ -2754,6 +2763,7 @@ function rangeLoop(n: SRangeLoop, pending: i32[]) {
     framesPop(kb)
     rangePartialOuterClose()
   }
+  irLoopCloseHook(hoists)
   scopeUnbind()
   return 0
 }
@@ -3903,6 +3913,10 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         if v == 0 { fbDrop() }
         return 0
       }
+      if r is RInitProgress {
+        irInitProgressHook(r.ipOrd)
+        return 0
+      }
       if r is REnvDrop {
         emitEnvCacheDrop(r.edFn)
         irLSettle(pending)
@@ -3928,7 +3942,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       irLSettle(pending)
       // A loop's list-header hoists open before its block, as legacy's do.
       const hoists = irLoopOpenHook(lw.irNodeAt[id])
-      if hoists < 0 { return irLMiss("loop hoist prologue") }
+      if hoists.loHoists < 0 { return irLMiss("loop hoist prologue") }
       fbBlock(64)
       lwFrames.push(n.bkLabel)
       body(n.bkBody, false, -1, false)
@@ -4622,7 +4636,7 @@ function loopValueBlock(n: SBlock, pending: i32[], id: i32) {
   }
   irLSettle(pending)
   const hoists = irLoopOpenHook(lw.irNodeAt[id])
-  if hoists < 0 { return irLMiss("loop hoist prologue") }
+  if hoists.loHoists < 0 { return irLMiss("loop hoist prologue") }
   if vt >= 0 {
     fbBlock(vt)
   } else {
@@ -5540,9 +5554,15 @@ function boundsUnset(_n: SBoundsCheck, _p: i32[]): i32 {
   return irLMiss("bounds hook not installed")
 }
 
-function loopOpenNone(_at: i32): i32 { return 0 }
+// What a loop's prologue opened: its list-header hoists (-1 on a failed prologue) and its range
+// proofs, each closed by `irLoopCloseHook`.
+export type LoopOpened = { loHoists: i32, loProofs: i32 }
 
-function loopCloseNone(_n: i32): i32 { return 0 }
+function loopOpenNone(_at: i32): LoopOpened {
+  return { loHoists: 0, loProofs: 0 }
+}
+
+function loopCloseNone(_n: LoopOpened): i32 { return 0 }
 
 // The list lowering's hooks (`ir_lower_ref.vl`), installed before emit; the defaults leave list
 // reads and bounds checks unlowered.
@@ -5550,12 +5570,15 @@ export let irLowerListHook: (r: Rhs) => i32 = listUnset
 // The start function's prologue (`emitStrFillCalls`), set by the emitter that owns it.
 export let irStartPrologueHook: () => i32 = noPrologue
 function noPrologue(): i32 { return irLMiss("start prologue unset") }
+// The start body's progress store after a top-level position (`emitInitProgressAt`), set likewise.
+export let irInitProgressHook: (ord: i32) => i32 = noProgress
+function noProgress(_ord: i32): i32 { return irLMiss("init progress unset") }
 // An element store, given its assignment node.
 export let irLowerListSetHook: (n: SListSet, at: i32) => i32 = listSetUnset
 // A list op in statement position, whose value is not wanted.
 export let irLowerEffectHook: (r: Rhs) => i32 = listUnset
 export let irLowerBoundsHook: (n: SBoundsCheck, pending: i32[]) => i32 = boundsUnset
-// Opens the list-header hoists of the loop statement at AST node `at` (how many, or -1 on a failed
-// prologue), and closes that many; the defaults open none.
-export let irLoopOpenHook: (at: i32) => i32 = loopOpenNone
-export let irLoopCloseHook: (n: i32) => i32 = loopCloseNone
+// Opens the list-header hoists and range proof of the loop statement at AST node `at`, and closes
+// what it opened; the defaults open none.
+export let irLoopOpenHook: (at: i32) => LoopOpened = loopOpenNone
+export let irLoopCloseHook: (n: LoopOpened) => i32 = loopCloseNone

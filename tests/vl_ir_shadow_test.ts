@@ -183,6 +183,26 @@ Deno.test({
   },
 });
 
+// A thunk whose target's result type is open is typed by its rep's own type where that is closed
+// and round-trips to the rep (`thunkRetTy`), and matches; where it does not, it stays uncovered.
+Deno.test({
+  name: "ir shadow: a thunk's open result type stands as its rep's own only where that round-trips",
+  ignore,
+  fn: () => {
+    const fits = `export function id<T>(x: T): T { return x }\nconst k = () => id\nprint(k()(9))\n`;
+    const ok = run(fits, true);
+    if (ok.rows.get("thunk fns") !== 1 || ok.rows.get("thunk matched") !== 1) {
+      throw new Error(`want the thunk matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const open = `function inc(x) { return x + 1 }\nfunction run(f) { return f()(41) }\n` +
+      `print(run(() => inc) + run(() => inc))\n`;
+    const { rows } = run(open, true);
+    if (rows.get("thunk uncovered thunk open result type") !== 2) {
+      throw new Error(`want two thunks uncovered on their open result type, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A folded constant's cell is its folded value, the one `*.const` legacy's `emitConstFoldValue`
 // writes, at both integer widths; under the dual emit's control 3 each is a bytes mismatch.
 Deno.test({
@@ -1536,6 +1556,11 @@ Deno.test({
       "width-retag-pair-unnoted": 2,
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
+      "rep-typed-thunk-forwards": 0,
+      "rep-typed-thunk-forwards-env": 1,
+      "rep-typed-result-not-thunk": 1,
+      "init-progress-as-value": 2,
+      "init-progress-effect": 0,
       "literal-cast-of-record": 2,
       "literal-cast-of-i32": 0,
       "retag-closures-of-differing-arity": 2,
@@ -1565,6 +1590,9 @@ Deno.test({
       "pop-or-default-returning-call": 5,
       "pop-or-default-never-call": 0,
       "dead-return-after-never-call": 0,
+      "never-call-value-at-consumer-rep": 0,
+      "returning-call-temp-typed-never": 3,
+      "never-call-value-into-bool": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
