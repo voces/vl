@@ -92,7 +92,21 @@ Measured on master ff34a69e / 9c7453e6:
      `closure_capture_unann` reads a global and is now clean.
    - Without the row-match guard, overload-pick-reads-only-delivery's global (stored on a row
      that boxes `x`, read with `x` plain) gave a rule-2 FAIL in `@init`.
-4. Next: the six D1 cells that read the value from a local, a capture or a map. Each read moves
+4. The heap answer is recorded (N6's review): `recHeapOf` asks `askRecordHeap`, whose slot
+   `recordHeapFn` (installed by `emitProgram` as the type's own heap, else its storage row's) is
+   re-asked from `rowFieldAsksHold`. Only a heap it names is recorded: -1 admits no retag, so a
+   later heap where none stood is no change. Control: a seed whose heap hold always disagrees
+   fails `vl run` of the d15214 witness with "internal: a record's field storage changed after
+   its rep was built (rowFieldStorage)"; the head prints `4`.
+
+Trusts and order:
+- The verifier trusts the builder's heap notes (`irRecHeap`): `recFieldsWiden` and the cell
+  note are not re-derived from a struct cell, as `recSubRetag`'s notes are not.
+- A cell note met after a retag that rested on the first answer leaves the rep at -2, and the
+  verifier refuses that retag (loud, an `ir claims` fallback). No function in tests/cases or the
+  named cells shows a rule-2 retag fail (quick A/B after step 3).
+
+5. Next (batch 2): the six D1 cells that read the value from a local, a capture or a map. Each read moves
    the value from its storage rep (a minted `J$m…` on row 0) to a heapless `{f: null}` rep.
 
 Quick A/B (mode 1, tests/cases plus the named cells) against N6's 194193920, after step 3:
