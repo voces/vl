@@ -376,6 +376,7 @@ import {
   cpsToUtf8,
   decodeStr,
   directArgsBad,
+  exprEffectFree,
   inferNicheNullByName,
   isRecvStagedIx,
   isRecvStagedNonNull,
@@ -10731,10 +10732,19 @@ function emitUnionConcreteEq(
   boxIx: i32,
   otherIx: i32,
   isNe: boolean,
+  boxLeft: boolean,
   fnIx: i32,
 ) {
   // The plain arm: the box read twice, the operand once, through the plan the IR writes too.
   const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
+  // An operand with effects runs whatever the box holds: both sides are read once, in source
+  // order, ahead of the tag test (D17068). The IR claims only an operand it reads in place.
+  if !exprEffectFree(unwrapParen(otherIx)) {
+    const pp = if qp.uqKind >= 0 { qp } else { unionEqStashPlanOf(boxIx, otherIx, fnIx) }
+    if pp.uqKind >= 0 {
+      return emitUnionEqStaged(boxIx, otherIx, pp, isNe, boxLeft, fnIx)
+    }
+  }
   if qp.uqKind >= 0 {
     unionEqHead()
     if emitExpr(boxIx, fnIx) < 0 { return -1 }
@@ -10836,7 +10846,6 @@ function emitUnionConcreteEq(
   // A string or atom operand holding `null` is tested first, with or without the union's `null`
   // arm (D17065); a box that is no place is read once, into the stash, ahead of it.
   const boxNul = unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
-  const eqStash = unionEqStashSlot()
   const eqOnce = !unionEqOperandOk(boxIx)
   // A `K | null` operand equals the box's null when it is `-1`, and is a member string
   // otherwise, where the widened operand is non-null (D3347).
@@ -10875,33 +10884,45 @@ function emitUnionConcreteEq(
       "emitProgram: internal: a union compare reached its re-reading arms with a box that is no place and no null leg (unionEqStashPlanOf takes every such box)",
     )
   }
+  // The slots of this nesting level, so a compare inside a staged side takes its own (D17068).
+  const lvl = unionEqStageDepth * 100000
+  const bs = if staged { unionEqOperandSlot(lvl + 6) } else { -1 }
+  unionEqStageDepth = unionEqStageDepth + 1
+  // An operand left of a staged box is read first, into its slot (D17068).
+  const opFirst = !boxLeft && staged && (opStage || boolStage)
+  if opFirst {
+    if emitExpr(otherIx, fnIx) < 0 { return -1 }
+    fbLocalSet(unionEqOperandSlot(lvl + (if opStage { 0 } else { 1 })))
+  }
   if staged {
     if emitExpr(boxIx, fnIx) < 0 { return -1 }
-    fbLocalSet(eqStash)
+    fbLocalSet(bs)
   }
   if nulOther {
     if emitExpr(otherIx, fnIx) < 0 { return -1 }
     fbI32Const(-1)
     fbI32Bin(70)
     fbIf(127)
-    if unionEqNullLeg(boxIx, boxNul, staged, eqStash, fnIx) < 0 { return -1 }
+    if unionEqNullLeg(boxIx, boxNul, staged, bs, fnIx) < 0 { return -1 }
     fbElse()
   }
   if nulBoolOther {
-    if emitExpr(otherIx, fnIx) < 0 { return -1 }
-    if boolStage { fbLocalTee(unionEqOperandSlot(1)) }
+    if opFirst { fbLocalGet(unionEqOperandSlot(lvl + 1)) }
+    else if emitExpr(otherIx, fnIx) < 0 { return -1 }
+    if boolStage && !opFirst { fbLocalTee(unionEqOperandSlot(lvl + 1)) }
     fbI32Const(2)
     fbI32Bin(70)
     fbIf(127)
-    if unionEqNullLeg(boxIx, boxNul, staged, eqStash, fnIx) < 0 { return -1 }
+    if unionEqNullLeg(boxIx, boxNul, staged, bs, fnIx) < 0 { return -1 }
     fbElse()
   }
   if nulStrOther {
-    if emitExpr(otherIx, fnIx) < 0 { return -1 }
-    if opStage { fbLocalTee(unionEqOperandSlot(0)) }
+    if opFirst { fbLocalGet(unionEqOperandSlot(lvl)) }
+    else if emitExpr(otherIx, fnIx) < 0 { return -1 }
+    if opStage && !opFirst { fbLocalTee(unionEqOperandSlot(lvl)) }
     fbRefIsNull()
     fbIf(127)
-    if unionEqNullLeg(boxIx, boxNul, staged, eqStash, fnIx) < 0 { return -1 }
+    if unionEqNullLeg(boxIx, boxNul, staged, bs, fnIx) < 0 { return -1 }
     fbElse()
   }
   // The plain arm's tails, around a stashed box and the operand's null legs. The tag is the
@@ -10913,14 +10934,14 @@ function emitUnionConcreteEq(
       cloBoxEqArmTy(otherIx, unr[0], fnIx),
     ),
   }
-  if staged { fbLocalGet(eqStash) }
+  if staged { fbLocalGet(bs) }
   else if emitExpr(boxIx, fnIx) < 0 { return -1 }
   unionEqTagTail(qt)
-  if staged { fbLocalGet(eqStash) }
+  if staged { fbLocalGet(bs) }
   else if emitExpr(boxIx, fnIx) < 0 { return -1 }
   if unionEqPayloadTail(qt) < 0 { return -1 }
-  if opStage { fbLocalGet(unionEqOperandSlot(0)) }
-  else if boolStage { fbLocalGet(unionEqOperandSlot(1)) }
+  if opStage { fbLocalGet(unionEqOperandSlot(lvl)) }
+  else if boolStage { fbLocalGet(unionEqOperandSlot(lvl + 1)) }
   else if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
   // The null took the other branch, so a nullable operand is the non-null ref here.
   if (
@@ -10932,7 +10953,64 @@ function emitUnionConcreteEq(
   if unionEqCmpTail(qt, false, fnIx) < 0 { return -1 }
   if nulOther || nulStrOther || nulBoolOther { fbEnd() }
   if isNe { fbI32Eqz() }
+  unionEqStageDepth = unionEqStageDepth - 1
   return 0
+}
+
+let unionEqStageDepth = 0
+
+// A union `==` on plan `qp` whose operand has effects: the box and the operand each read once into
+// a slot of this nesting level, `boxLeft` first where the box is the left side, then the plan's tails.
+function emitUnionEqStaged(
+  boxIx: i32,
+  otherIx: i32,
+  qp: UnionEqPlan,
+  isNe: boolean,
+  boxLeft: boolean,
+  fnIx: i32,
+): i32 {
+  const lvl = unionEqStageDepth * 100000
+  const os = unionEqStagedOperandSlot(qp.uqKind, lvl)
+  if os < 0 { return -1 }
+  const bs = unionEqOperandSlot(lvl + 6)
+  unionEqStageDepth = unionEqStageDepth + 1
+  let rc = 0
+  if boxLeft {
+    rc = emitExpr(boxIx, fnIx)
+    if rc >= 0 { fbLocalSet(bs) }
+  }
+  if rc >= 0 { rc = emitUnionEqOther(otherIx, qp.uqKind, fnIx) }
+  if rc >= 0 { fbLocalSet(os) }
+  if rc >= 0 && !boxLeft {
+    rc = emitExpr(boxIx, fnIx)
+    if rc >= 0 { fbLocalSet(bs) }
+  }
+  unionEqStageDepth = unionEqStageDepth - 1
+  if rc < 0 { return -1 }
+  fbLocalGet(bs)
+  unionEqTagTail(qp)
+  fbLocalGet(bs)
+  if unionEqPayloadTail(qp) < 0 { return -1 }
+  fbLocalGet(os)
+  // A ref kind's slot is nullable; the value read into it never is.
+  if qp.uqKind == 2 || qp.uqKind == 11 || listWrapHeapOfKind(qp.uqKind) >= 0 {
+    fbRefAsNonNull()
+  }
+  return unionEqCmpTail(qp, isNe, fnIx)
+}
+
+// The slot a staged operand at arm kind `k` is read into, at level `lvl`: the kinds
+// `emitUnionPayloadUnbox` unboxes, a string, a closure, a list wrapper and the five scalars.
+function unionEqStagedOperandSlot(k: i32, lvl: i32): i32 {
+  if k == 2 { return unionEqOperandSlot(lvl) }
+  if k == 0 || k == 1 { return unionEqOperandSlot(lvl + 1) }
+  if k == 3 { return unionEqOperandSlot(lvl + 2) }
+  if k == 4 { return unionEqOperandSlot(lvl + 3) }
+  if k == 5 { return unionEqOperandSlot(lvl + 4) }
+  if k == 11 { return unionEqOperandSlot(lvl + 5) }
+  const lw = listWrapHeapOfKind(k)
+  if lw >= 0 { return unionEqOperandSlot(lvl + 100 + lw) }
+  return emitFail("emitProgram: union `==` atom has no value box")
 }
 
 // A union `==`'s answer where its operand is `null`: the box's own null tag, read again or off
@@ -39437,6 +39515,7 @@ export function wasmEmitStateReset() {
   armServed = -1
   atomSeat = -1
   arrNewFillDepth = 0
+  unionEqStageDepth = 0
   eqStashL = -1
   eqStashR = -1
   forIterLits = Map()
@@ -42592,8 +42671,8 @@ function emitEqRoute(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     "nullNull" => if ne { fbI32Const(0) } else { fbI32Const(1) }
     "scalarMap" => emitScalarMapReadEq(e, scalarMapEqPlanOf(e, fnIx), fnIx)
     "unionUnion" => emitUnionUnionEq(l, r, ne, fnIx)
-    "unionLeft" => emitUnionConcreteEq(l, r, ne, fnIx)
-    "unionRight" => emitUnionConcreteEq(r, l, ne, fnIx)
+    "unionLeft" => emitUnionConcreteEq(l, r, ne, true, fnIx)
+    "unionRight" => emitUnionConcreteEq(r, l, ne, false, fnIx)
     "atomFold" | "atomStatic" | "atomIds" => emitAtomEqByPlan(e, fnIx)
     "nulNone" => emitNulNoneEq(e, fnIx)
     "noLowering" => emitFail("emitProgram: `" + e.binOp + "` over this operand rep has no lowering")
