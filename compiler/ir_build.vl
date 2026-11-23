@@ -367,6 +367,7 @@ import {
   rangeMayWrap,
   rangePartialCopies,
   recCopyReReads,
+  recordFitPlanOf,
   recvReadsListPayload,
   refIfArmOf,
   refListReadPlain,
@@ -1183,6 +1184,26 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   }
   if arm == "numLit" { return isNumLit(b, n, ix, rep) }
   if arm == "listAcross" { return isListAcross(b, n, ix, rep) }
+  if arm == "recordFit" {
+    const p = recordFitPlanOf(ix, ibFnIx)
+    if p == 0 {
+      return isRung(
+        b,
+        n,
+        ix,
+        rep,
+        isArmOf(ix, ibFnIx, isArmRank(arm) + 1, false),
+      )
+    }
+    if p < 0 { return irBMiss("is record fit refused") }
+    if p == 2 { return irBMiss("is record fit staged") }
+    if rep != ibBool { return irBMiss("is result rep") }
+    const v = irBExpr(b, n.isObj)
+    if ibMiss != "" { return v }
+    // Legacy's field tests re-read it, so a variable (`fitRecvReadHook`).
+    if !(v is OVar) { return irBMiss("is record fit receiver") }
+    return irBLetTemp(b, { rfV: v, rfAt: ix }, ix, rep)
+  }
   if arm == "listFit" {
     const p = listFitIsPlanOf(ix, ibFnIx)
     if p.lftOk == 0 {
@@ -3634,13 +3655,20 @@ function capCellListSame(fe: i32, name: string, cr: i32, rep: i32): boolean {
 function capRepOf(fe: i32, name: string): i32 { return capRepFor(fe, name, -1) }
 
 // `capRepOf`, where a captured loop variable (`captureLoopNodeOf`), whose declaration records no
-// type, takes read rep `readRep` when legacy's capture valtype for it (`captureValKind`) agrees,
-// else -1.
+// type, takes read rep `readRep`, or with no read its loop's type (`capLoopTyOf`), when legacy's
+// capture valtype for it (`captureValKind`) agrees, else -1.
 function capRepFor(fe: i32, name: string, readRep: i32): i32 {
   let ty = capTyOf(fe, name)
   if ty < 0 && readRep >= 0 && captureLoopNodeOf(fe, name) >= 0 {
     ty = repTyOf(readRep)
   }
+  if ty < 0 && readRep < 0 { ty = capLoopTyOf(fe, name) }
+  return capRepAtTy(fe, name, ty)
+}
+
+// The rep of capture `name` of `fe` held at type `ty`; -1 when `ty` is -1, no value, open, or not
+// the valtype legacy gives the capture (`captureValKind`).
+function capRepAtTy(fe: i32, name: string, ty: i32): i32 {
   if ty < 0 { return -1 }
   const r = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r) { return -1 }
@@ -3675,6 +3703,18 @@ function capTyOf(fe: i32, name: string): i32 {
   return if ht >= 0 { ht } else { ty }
 }
 
+// The type of captured loop variable `name` of `fe` with no read to type it: a `for-in`'s element
+// in the frame that owns the loop (`forInElemTyOf`), a range's i32 counter; -1 for a `for-in`'s
+// second name or no loop.
+function capLoopTyOf(fe: i32, name: string): i32 {
+  const lp = captureLoopNodeOf(fe, name)
+  if lp < 0 { return -1 }
+  const ln = nodeAt(lp)
+  if ln is ForRange { return TY_I32 }
+  if !(ln is ForIn) || ln.fiVar2 == name { return -1 }
+  return forInElemTyOf(ln.fiIter, parentBindingFrameArenaOf(fe, name))
+}
+
 // The parameter variable of the lifted function `fe` being built for its capture `name`, at
 // `capRepFor`'s rep for a first read at `readRep` (-1 for none), made at its first use; -1 when a
 // captured `for-in` variable has no rep yet.
@@ -3683,7 +3723,7 @@ function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
   const known = paramVarAt(w)
   if known >= 0 { return known }
   const r = capRepFor(fe, name, readRep)
-  const ty = capTyOf(fe, name)
+  const ty = if readRep < 0 && capTyOf(fe, name) < 0 { capLoopTyOf(fe, name) } else { capTyOf(fe, name) }
   if ty < 0 && r < 0 { return -1 }
   const v = irVarNew(ib, r, if ty >= 0 { ty } else { repTyOf(r) }, "param", w)
   ib.irParams.push(v)
@@ -3728,7 +3768,11 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
   for name in captureNamesOf(fe) {
     const p = paramIndexOf(ibFnIx, name)
     const lv = if p < 0 { loopCapVar(fe, name) } else { -1 }
-    const r = if lv >= 0 { capRepFor(fe, name, ib.irVars[lv].vRep) } else { capRepOf(fe, name) }
+    const r0 = if lv >= 0 { capRepFor(fe, name, ib.irVars[lv].vRep) } else { capRepOf(fe, name) }
+    // A capture of this frame's own parameter whose binding frame is not found (an instance's
+    // closure) is held at that parameter's type.
+    const pv = if r0 < 0 && p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else { -1 }
+    const r = if pv >= 0 { capRepAtTy(fe, name, ib.irVars[pv].vTy) } else { r0 }
     if r < 0 || capCellTargetOf(name) >= 0 {
       irBMiss("closure env capture")
       return out
@@ -4851,6 +4895,15 @@ function sharedFieldCallee(b: i32[], m: Member, at: i32): Opnd {
     gfShared: true,
   }
   return irBLetTempTy(b, g, at, repNodeKids(r)[k], ft)
+}
+
+// Whether reps `a` and `b` are both records, lists or boxes. A map pair has no claimed witness yet.
+function sameRefKind(a: i32, b: i32): boolean {
+  const x = repNodeAt(a)
+  const y = repNodeAt(b)
+  return x is RRecord && y is RRecord
+    || x is RList && y is RList
+    || x is RBox && y is RBox
 }
 
 // Armed, legacy has written call `ix` already, and must have taken the plain path at `key`.
@@ -9362,11 +9415,12 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
         // A result legacy stores as the destination's valtype (`repStoresAs`: a held closure, a
         // ref-element list) is left as it stands, as at an argument or a global.
         if repStoresAs(rep, sr) { return irBLetTemp(b, rhs, ix, rep) }
-        // A record call whose type keys the row its callee returns is built at the callee's rep.
-        if (
-          !(repNodeAt(sr) is RRecord)
-          || !callAtCalleeResultRow(ix, rhs.caCallee)
-        ) {
+        // A record, list or box call is built at the callee's rep: with no coercion keyed at the
+        // node, legacy writes the reference the callee returns as it stands.
+        // So is a record call whose own type keys the row its callee returns.
+        const keyed = repNodeAt(sr) is RRecord
+          && callAtCalleeResultRow(ix, rhs.caCallee)
+        if !sameRefKind(sr, rep) && !keyed {
           return irBMiss("call result coercion")
         }
         return irBLetTempTy(b, rhs, ix, sr, repTyOf(sr))
