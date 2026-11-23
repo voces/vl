@@ -31,6 +31,7 @@ import {
   holeOptShapeOf,
   listReserveRegionPushes,
   optLeafArmOf,
+  recordArmsUnboxOwedAt,
 } from "./wasmEmit"
 import {
   bundleAnyNoted,
@@ -2141,7 +2142,12 @@ function fieldPlainWhy(
     return nulNoneFieldWhy("object field nulnone", valIx, dst)
   }
   if !fieldArmDelivers(fa) { return "object field " + fa }
-  if fa == "armDelivery" && narrowedArmNeedsUnbox(valIx, ibFnIx) {
+  // A union of records stored at the field's record heap is cast there by `deliver` (D16321).
+  if (
+    fa == "armDelivery"
+    && narrowedArmNeedsUnbox(valIx, ibFnIx)
+    && !recordArmsUnboxOwed(valIx, dst)
+  ) {
     return "object field arm unbox"
   }
   if !fieldArmRepFits(fa, dst) { return "object field row rep" }
@@ -7385,6 +7391,11 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   if ibMiss == "" && armUnboxOwed(ix, dst) {
     return armUnboxTemp(b, ix, dst, dstTy, false)
   }
+  // A union whose every arm is a record stored at a record destination's heap (D16321): the box,
+  // then the table's cast to that heap.
+  if ibMiss == "" && recordArmsUnboxOwed(ix, dst) {
+    return recordArmsUnboxTemp(b, ix, dst, dstTy)
+  }
   // A box local narrowed to a record arm, delivered as it stands: legacy reads the box itself,
   // not the record its narrowing unboxes to at a record destination.
   const bx = unwrapParen(ix)
@@ -10402,6 +10413,31 @@ function armUnboxOwed(ix: i32, dst: i32): boolean {
     && narrowedArmTyAt(au, ibFnIx) >= 0
 }
 
+// Whether `ix` is a union of records each stored at record destination `dst`'s heap, which the
+// table delivers there unboxed (`recordArmsUnboxOwedAt`).
+function recordArmsUnboxOwed(ix: i32, dst: i32): boolean {
+  if dst < 0 || !(repNodeAt(dst) is RRecord) { return false }
+  const h = recHeapOf(dst)
+  return h >= 0 && recordArmsUnboxOwedAt(h, ix, ibFnIx)
+}
+
+// `recordArmsUnboxOwed`'s `ix` built as its box, then cast to `dst`'s heap (`RArmUnbox.uaDst`).
+function recordArmsUnboxTemp(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
+  const v = irBExpr(b, ix)
+  if ibMiss != "" { return v }
+  if !(repNodeAt(irBOpRep(v)) is RBox) {
+    return irBMiss("record arms unbox operand")
+  }
+  const ut = if dstTy >= 0 && repNodeOfTy(dstTy) == dst { dstTy } else { repTyOf(dst) }
+  return irBLetTempTy(
+    b,
+    { uaV: v, uaAt: unwrapParen(ix), uaCellNul: false, uaDst: dst },
+    ix,
+    dst,
+    ut,
+  )
+}
+
 // The box of `armUnboxOwed`'s `ix`, then the table's unbox to its arm's record, typed at the
 // destination, whose record the arm's may only fit. `cellNul`: a nullable arm cell's binding.
 function armUnboxTemp(
@@ -10415,7 +10451,13 @@ function armUnboxTemp(
   const bo = irBBoxLocal(b, au)
   if ibMiss != "" { return bo }
   const ut = if dstTy >= 0 && primRepOfTy(dstTy) == dst { dstTy } else { repTyOf(dst) }
-  return irBLetTempTy(b, { uaV: bo, uaAt: au, uaCellNul: cellNul }, ix, dst, ut)
+  return irBLetTempTy(
+    b,
+    { uaV: bo, uaAt: au, uaCellNul: cellNul, uaDst: -1 },
+    ix,
+    dst,
+    ut,
+  )
 }
 
 // `exprAt` past the pre-path, whose answer for `ix` is `pre`.
