@@ -895,6 +895,7 @@ import {
   relSkew,
 } from "./emit_reloc"
 import {
+  fieldRowIsNulAtom,
   fieldRowIsNulNone,
   fieldRowIsPlainI32,
   fieldRowIsRecordRef,
@@ -4556,7 +4557,8 @@ function emitFieldLitEq(r: i32, lex: string, fnIx: i32) {
   if fieldRowIsStr(r, false) || fieldRowIsStr(r, true) {
     return emitStrEqLit(mkStr(lex, -1), fnIx)
   }
-  if nk == 0 {
+  // A `null` niche never equals a member, so a nullable `i32` row compares as a plain one.
+  if nk == 0 || fieldRowIsNulAtom(r) {
     // The i32 slot serves both the interned string ATOM and a small numeric literal; the
     // quotes are what part them, exactly as they do in `emitLitMemberEq`.
     if nameIsQuotedLeaf(lex) {
@@ -7395,6 +7397,22 @@ function emitCrossTagFits(
   return 0
 }
 
+// The lexemes of literal set `yTy`'s non-null members that fit field type `xTy`, in declaration
+// order: the values of a literal-set field a wider field admits (D17074).
+function litMembersFitting(yTy: i32, xTy: i32): string[] {
+  const out: string[] = []
+  const nn = nonNullTy(yTy)
+  if nn < 0 || xTy < 0 { return out }
+  const t = tyAt(nn)
+  const ms: i32[] = if t is TyUnion { t.uMembers } else { [nn] }
+  for m in ms {
+    if tyAt(m) is TyLit && tyFitKind(m, xTy) == 1 {
+      for lx in tyLitSetMemberLexes(m) { out.push(lx) }
+    }
+  }
+  return out
+}
+
 // Leaves 1 when the payload of arm `yi` (arena `yTy`) fits record `xTy` field by field, given that
 // its tag already matched. A field only some values fit is either a scalar tested against the
 // literal set `xTy` narrows it to, or a box whose every member fits or does not, answered by its
@@ -7430,6 +7448,39 @@ function emitArmFieldsFit(
     const lexes = tyLitSetMemberLexes(
       if nulStr { nonNullTy(fxSet) } else { fxSet },
     )
+    // A field whose own type is a literal set, tested against a wider field: the members that
+    // fit it, compared one by one; its `null`, where the other field admits none, fits nothing.
+    const ylex = litMembersFitting(fys[i], fxs[i])
+    if (
+      fi >= 0
+      && !fieldRowIsUnionBox(uFieldStart[yi] + fi)
+      && lexes.length == 0
+      && nnKind == 2
+      && tyLitSetMemberLexes(nonNullTy(fys[i])).length > 0
+      && !nulStr
+      && (nonNullTy(fys[i]) == fys[i] || nonNullTy(fxs[i]) == fxs[i])
+    ) {
+      let yi2 = 0
+      while yi2 < ylex.length {
+        if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
+        fbStructGet(uBoxIdx, 1)
+        fbRefCast(variantHeap(yi))
+        fbStructGet(variantHeap(yi), fi)
+        if emitFieldLitEq(uFieldStart[yi] + fi, ylex[yi2], fnIx) < 0 {
+          return -1
+        }
+        if yi2 > 0 {
+          fbI32Bin(114) // i32.or
+        }
+        yi2 = yi2 + 1
+      }
+      if ylex.length == 0 { fbI32Const(0) }
+      if i > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      i = i + 1
+      continue
+    }
     if (
       fi >= 0
       && !fieldRowIsUnionBox(uFieldStart[yi] + fi)
@@ -7510,7 +7561,18 @@ function emitArmFieldsFit(
       const fk = tyFitKind(mm, fxs[i])
       const tags: i32[] = []
       const vis: i32[] = []
-      if !unionArmTagsOfTy(mm, -1, tags, vis) || tags.length != 1 {
+      let tagged = unionArmTagsOfTy(mm, -1, tags, vis) && tags.length == 1
+      // A numeric literal member rides the box under its scalar's tag (D17074).
+      const mt = tyAt(mm)
+      if !tagged && mt is TyLit && mt.litKind != "str" {
+        const lk = scalarArmKindOfTy(mm)
+        if lk >= 0 {
+          tags.clear()
+          tags.push(scalarTagOfKind(lk))
+          tagged = true
+        }
+      }
+      if !tagged {
         return emitFail(
           "emitProgram: `is` across record arms whose shared field's box holds a member with no one tag",
         )
