@@ -25,12 +25,15 @@ import {
   TY_I32,
   TY_NEVER,
   TY_NULL,
+  TY_STR,
   mkArrayTy,
+  mkLitTy,
   mkMapTy,
   mkNullableTy,
   mkObjTy,
 } from "./check_types"
 import { CoalValArm } from "./emit_plan_null"
+import { mkUnionTy } from "./check_union_mint"
 import { Call, StrLit, addNode } from "./ast"
 import { irBoundsRule } from "./ir_verify_bounds"
 
@@ -64,6 +67,7 @@ const selfTestIds: string[] = [
   "bounds-rule-uninstalled",
   "box-immediate-for-call",
   "box-at-union-type-into-i32",
+  "nul-none-box-of-i32",
   "pop-or-of-i32",
   "pop-or-bool-out",
   "pop-or-out-unwritten",
@@ -96,8 +100,11 @@ const selfTestIds: string[] = [
   "width-retag-noted-leading",
   "width-retag-field-not-leading",
   "width-retag-pair-unnoted",
+  "hand-pick-of-i32",
+  "hand-pick-record-into-i32",
   "retag-closures-of-differing-arity",
   "retag-field-alike-records-two-heaps",
+  "push-many-of-i32",
   "global-read-off-store-type",
   "valued-block-temp-out",
   "atom-sole-into-i32",
@@ -112,6 +119,9 @@ const selfTestIds: string[] = [
   "memory-store-value-off-plan",
   "simd-operand-off-plan",
   "call-write-back-not-a-capture",
+  "coal-str-default-off-rep",
+  "coal-atom-str-default-off-rep",
+  "opt-read-of-i32",
 ]
 
 // `f(p: i32): i32 { t = p + 1; return t }`, broken the way case `id` names ("holds": not broken).
@@ -176,6 +186,18 @@ function caseFn(id: string): IrFn {
     const g = irVarNew(f, i32r, TY_I32, "temp", -1)
     f.irBody.push(
       node(f, { lDst: g, lRhs: { rkV: from, rkAt: -1, rkFe: -1 } }, i32r),
+    )
+  }
+  // Rule 2: a hand pick (`RHandPick`) reads a member of a bundle record into a closure; one of an
+  // i32, or of a record into an i32, is refused.
+  if id == "hand-pick-of-i32" || id == "hand-pick-record-into-i32" {
+    const ot = mkObjTy(["c0", "c1"], [TY_I32, TY_I32])
+    const orep = repNodeOfTy(ot)
+    const rec = irVarNew(f, orep, ot, "local", 1)
+    const from = if id == "hand-pick-of-i32" { v(p) } else { v(rec) }
+    const g = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(
+      node(f, { lDst: g, lRhs: { hpV: from, hpAt: -1, hpArg: -1, hpI: 0 } }, i32r),
     )
   }
   // Rule 2: a record retag (`RRetag`) stands one plain record for another on one struct heap the
@@ -301,6 +323,13 @@ function caseFn(id: string): IrFn {
         },
         i32r,
       ),
+    )
+  }
+  // Rule 2 again: a null-typed box whose payload is an i32, landing at an i32.
+  if id == "nul-none-box-of-i32" {
+    const sn = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(
+      node(f, { lDst: sn, lRhs: { nnV: v(p), nnPay: true, nnAt: -1 } }, i32r),
     )
   }
   // Rule 2 again: a box planned at a union type that lands at an i32.
@@ -575,6 +604,10 @@ function caseFn(id: string): IrFn {
     const sn = irVarNew(f, repNodeOfTy(lb), lb, "temp", -1)
     f.irBody.push(node(f, { lDst: sn, lRhs: { rgV: v(l) } }, repNodeOfTy(lb)))
   }
+  // Rule 2 again: a variadic push of an i32 onto an i32, neither a list.
+  if id == "push-many-of-i32" {
+    f.irBody.push(node(f, { efRhs: { pmV: v(p), pmL: v(p), pmAt: -1 } }, none))
+  }
   // Rule 2 again: an arm unbox whose operand is an i32, not a box.
   if id == "arm-unbox-of-i32" {
     const sn = irVarNew(f, i32r, TY_I32, "temp", -1)
@@ -659,6 +692,24 @@ function caseFn(id: string): IrFn {
       caWb: [p],
     }
     f.irBody.push(node(f, { efRhs: c }, none))
+  }
+  // A string coalesce, and an atom one, whose default is an `i32`, at neither a literal nor the
+  // result's string rep.
+  if id == "coal-str-default-off-rep" || id == "coal-atom-str-default-off-rep" {
+    const at = id == "coal-atom-str-default-off-rep"
+    const lt = if at { mkUnionTy([mkLitTy("str", "a"), mkLitTy("str", "b")]) } else { TY_STR }
+    const nt = mkNullableTy(lt)
+    const l = irVarNew(f, repNodeOfTy(nt), nt, "param", 1)
+    f.irParams.push(l)
+    const sr = repNodeOfTy(TY_STR)
+    const cz = irVarNew(f, sr, TY_STR, "temp", -1)
+    const r: Rhs = if at { { zaL: v(l), zaD: v(p), zaAt: -1 } } else { { czL: v(l), czD: v(p), czAt: -1 } }
+    f.irBody.push(node(f, { lDst: cz, lRhs: r }, sr))
+  }
+  // Rule 2: a standalone `?.` read off a scalar base, which holds no record to test.
+  if id == "opt-read-of-i32" {
+    const ov = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(node(f, { lDst: ov, lRhs: { orV: v(p), orAt: -1 } }, i32r))
   }
   f.irBody.push(node(f, { rtHas: true, rtV: v(t) }, none))
   return f
