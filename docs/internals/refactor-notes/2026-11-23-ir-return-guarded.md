@@ -27,11 +27,24 @@ A closure the result stores alike (`repStoresAs`) is returned as it stands, as a
 verifier's return rule accepts the pair through `vfStoresAs`, and the facts pass notes it at
 every return whose reps differ.
 
-The null-fit arm was tried and dropped. It exposed
-`generics/hole-identity-null-into-nullable-record.vl::ret`, whose argument `hid(nn)` reads the
-null-unit const `nn` as a `global.get` where legacy writes `ref.null none`. The armed shadow caught
-the byte mismatch. That is a separate defect in the IR's null-unit global read, reported to the
-coordinator.
+A null that fits the nullable result's ref (`repNullRefFits`) is returned as it stands too, as
+at an argument and a global; the verifier's return rule accepts the same. Admitting it at first
+exposed `generics/hole-identity-null-into-nullable-record.vl::ret`. Its argument `hid(nn)` read the
+never-filled null-unit const `nn` as a `global.get`, where legacy writes `ref.null none`, and the
+armed shadow caught the byte mismatch. The IR's global read now asks the same fold fact the local
+read already did (`identReadArmOf` → `nulnone`, built as `RNullOf` at `nullOwnAt`). The shadow
+row `tests/ir-shadow-rows/null-unit-global-read-as-returned-argument.vl` pins it: it reds on a
+control build without the fold and passes with it.
+
+## Verifier self-tests (return rule)
+
+- `return-not-stored-alike` (an `i32[]` result returned a `boolean[]` parameter, no valtypes
+  noted): refused, rule 2.
+- `return-stored-alike` (both reps noted at one valtype): holds, rule 0.
+- `return-stored-unlike` (noted at two valtypes): refused, rule 2.
+- A wrong expectation in the map reds the test (checked by flipping `return-stored-alike` to 2).
+- The facts pass notes a differing pair's valtypes only from `refRepValtype`. A pair the facts
+  record as unlike is refused, as `return-stored-unlike` shows.
 
 ## Legacy tails the IR calls
 
