@@ -406,6 +406,7 @@ import {
   truncSatCallNamed,
   truncSatPlanOf,
   unionConcreteEqPlanOf,
+  unionIfAtDstWhy,
   userFnCallRoutesRef,
   userFnCallTarget,
   valueIfLitTrue,
@@ -2863,7 +2864,7 @@ function unionIfExpr(b: i32[], n: IfStmt, ix: i32, rep: i32): Opnd {
   if !heldAsBox(rep) { return irBMiss("union if rep") }
   const ty = nodeTyAt(ix, ibFnIx)
   if irTyOpen(ty) { return irBMiss("open temp type") }
-  return unionIfLink(b, n, ix, rep, ty, nodeTyInOf(ix, ibFnIx))
+  return unionIfLink(b, n, ix, rep, ty, nodeTyInOf(ix, ibFnIx), false)
 }
 
 // An else-less value `if` delivered into union `uty`'s box at rep `rep` (`elseLessUnionIfWhy`):
@@ -2900,10 +2901,12 @@ function unionIfLink(
   rep: i32,
   ty: i32,
   uty: i32,
+  atDst: boolean,
 ): Opnd {
-  // Legacy writes every link at the head's box; the lowering opens a link at its own join.
+  // Legacy writes every link at the head's box; the lowering opens a link at its own join, or,
+  // written into a box destination (`atDst`, `unionIfAtDstWhy`), at that box whatever its join.
   const pw = ifExprPlainWhy(ix, ibFnIx)
-  if pw != "union" {
+  if !atDst && pw != "union" {
     return irBMiss(
       if pw == "" { "union if chain join" } else { "union if " + pw },
     )
@@ -2930,11 +2933,11 @@ function unionIfLink(
   } else {
     const en = nodeAt(n.ifElse)
     if en is IfStmt && !ifJoinAdaptsScalar(n.ifElse, ibFnIx) {
-      const inner = unionIfLink(elseB, en, n.ifElse, rep, ty, uty)
+      const inner = unionIfLink(elseB, en, n.ifElse, rep, ty, uty, atDst)
       if ibMiss != "" { return inner }
       irBNode(elseB, { asDst: t, asSrc: inner }, -1, ibNoValue, n.ifElse)
     } else if en is IfStmt {
-      const x = deliver(elseB, n.ifElse, rep, uty)
+      const x = floorDeliver(elseB, n.ifElse, rep, uty)
       if ibMiss != "" { return x }
       if irBOpRep(x) != rep { return irBMiss("union if arm rep") }
       irBNode(elseB, { asDst: t, asSrc: x }, -1, ibNoValue, n.ifElse)
@@ -2945,9 +2948,26 @@ function unionIfLink(
     }
   }
   if ibMiss != "" { return irBMiss(ibMiss) }
-  irBNode(b, sIf(c, thenB, elseB, t, true), ty, rep, ix)
+  const s = sIf(c, thenB, elseB, t, true)
+  s.siAtDst = atDst
+  irBNode(b, s, ty, rep, ix)
   const o: Opnd = { ov: t }
   return o
+}
+
+// Value `ix` delivered into box rep `dst` of union `uty`, as `emitUnionBoxOwed` writes it: one
+// the checker records no box at is boxed at `uty` (the floor), a `null` literal as its null box.
+function floorDeliver(b: i32[], ix: i32, dst: i32, uty: i32): Opnd {
+  const owed = boxOwedAt(ix, ibFnIx)
+  if !owed && nodeAt(unwrapParen(ix)) is NullLit {
+    const nulV: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+    return boxTempIn(b, nulV, ix, dst, -1, uty)
+  }
+  const v = deliver(b, ix, dst, uty)
+  if ibMiss == "" && !owed && irBOpRep(v) != dst {
+    return boxTempIn(b, v, ix, dst, -1, uty)
+  }
+  return v
 }
 
 // One arm of `unionIfLink` (`emitUnionIfArm`): its prelude, then its tail value boxed into the
@@ -2970,7 +2990,7 @@ function unionIfArm(blockIx: i32, t: i32, rep: i32, uty: i32): i32[] {
     }
     return body
   }
-  const x = deliver(body, tv, rep, uty)
+  const x = floorDeliver(body, tv, rep, uty)
   if ibMiss == "" && irBOpRep(x) != rep { irBMiss("union if arm rep") }
   if ibMiss == "" {
     irBNode(body, { asDst: t, asSrc: x }, -1, ibNoValue, blockIx)
@@ -3041,6 +3061,7 @@ function refIfLink(
       siElseKw: true,
       siJoin: { rjKind: kind, rjSlot: slot },
       siJoinNul: nul,
+      siAtDst: false,
     },
     ty,
     rep,
@@ -4367,6 +4388,7 @@ function bundleChoiceRec(
       siElseKw: true,
       siJoin: { rjKind: "struct", rjSlot: si },
       siJoinNul: false,
+      siAtDst: false,
     },
     rty,
     rep,
@@ -6573,6 +6595,16 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     const en = nodeAt(unwrapParen(ix))
     if en is IfStmt && eu >= 0 && elseLessUnionIfWhy(ix, ibFnIx, eu) == "" {
       return elseLessUnionIf(b, en, unwrapParen(ix), dst, eu)
+    }
+    // One with an `else` is legacy's `emitUnionIfValue` at that union, each arm boxed there.
+    if (
+      en is IfStmt
+      && eu >= 0
+      && repNodeOfTy(eu) == dst
+      && unionIfAtDstWhy(ix, ibFnIx, eu) == ""
+      && holeBoxPlanOf(ix, eu, ibFnIx).hbArm == "ladder"
+    ) {
+      return unionIfLink(b, en, unwrapParen(ix), dst, eu, eu, true)
     }
   }
   // A literal the box plan boxes as another variant arm is built at that arm's row, as legacy's
