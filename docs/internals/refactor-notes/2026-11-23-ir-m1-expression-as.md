@@ -41,6 +41,19 @@ The verifier refuses any other operand under rule 2. Its self-tests are `literal
 - `litFold`: an integer literal is `emitNumWrapLit`, the low word `parseI64Pair` denotes, followed
   by `and 255` at the `u8` domain.
 
+## Readings
+
+The tests/cases census, master 084c9e87 → head, on fixpoint seeds:
+
+| reading | master → head |
+| --- | --- |
+| `expression as` | 55 → 23 |
+| `start: expression as` | 10 → 4 |
+| programs fully IR-only, of 7,109 | 5,193 → 5,206 |
+
+35 functions are newly claimed and none newly missed. Three reach a later miss: one each in
+`box of a valued if`, `for range hoisted` and `start: pre-path atom hook`.
+
 ## Legacy tails the IR calls
 
 - `numExactCastTail`, through `numCastTail`, for the exact cast's bare `as`.
