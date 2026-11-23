@@ -604,12 +604,16 @@ import {
   uBoxSinkToPair,
   unionBoxToPairTail,
   unionConcreteEqPlanOf,
+  unionEqAtomOperandTail,
   unionEqCmpTail,
   unionEqHead,
   unionEqNoNullTail,
+  unionEqNulBoxSlot,
   unionEqNulElse,
   unionEqNulEndTail,
+  unionEqNulOpSlot,
   unionEqNulPlanOf,
+  unionEqNulStageOpen,
   unionEqNulTestTail,
   unionEqNullTagTail,
   unionEqPayloadTail,
@@ -3433,31 +3437,52 @@ function boxAgain(r: RUnionConcreteEq, boxIx: i32): i32 {
 }
 
 // `RUnionConcreteEq` on legacy's null leg: the operand's null test, the box's null tag (or 0), then
-// the plain arm under the leg's `else`, through the tails legacy writes.
+// the plain arm under the leg's `else`, through the tails legacy writes. A side `ucStage` names as
+// parked is read from its slot (`unionStageEffect`'s ops 4 to 6).
 function unionNulEq(r: RUnionConcreteEq, boxIx: i32, otherIx: i32): i32 {
   const np = unionEqNulPlanOf(boxIx, otherIx, lw.irAt)
   if np.unLeg == 0 { return irLMiss("union compare null plan") }
   const qp = np.unPlan
-  unionEqHead()
-  irLOpnd(r.ucOther)
-  unionEqNulTestTail(np.unLeg)
+  const leg = np.unLeg
+  const boxSt = (r.ucStage & 1) != 0
+  const opSt = (r.ucStage & 2) != 0
+  const opFirst = (r.ucStage & 4) != 0
+  if r.ucStage == 0 { unionEqHead() }
+  if opFirst {
+    fbLocalGet(unionEqNulOpSlot(leg))
+  } else {
+    irLOpnd(r.ucOther)
+    if opSt { fbLocalTee(unionEqNulOpSlot(leg)) }
+  }
+  unionEqNulTestTail(leg)
   // The box's first read is its own; each later one its read written again (`ucAgain`).
   let first = true
   if np.unBoxNul {
-    irLOpnd(r.ucBox)
+    if boxSt { fbLocalGet(unionEqNulBoxSlot()) } else { irLOpnd(r.ucBox) }
     first = false
     unionEqNullTagTail()
   } else {
     unionEqNoNullTail()
   }
   unionEqNulElse()
-  if first { irLOpnd(r.ucBox) }
+  if boxSt { fbLocalGet(unionEqNulBoxSlot()) }
+  else if first { irLOpnd(r.ucBox) }
   else if boxAgain(r, boxIx) < 0 { return -1 }
   unionEqTagTail(qp)
-  if boxAgain(r, boxIx) < 0 { return -1 }
+  if boxSt { fbLocalGet(unionEqNulBoxSlot()) }
+  else if boxAgain(r, boxIx) < 0 { return -1 }
   unionEqPayloadTail(qp)
-  irLOpnd(r.ucOther)
-  return unionEqNulEndTail(qp, np.unLeg == 3, r.ucNe, lw.irAt)
+  if opSt {
+    fbLocalGet(unionEqNulOpSlot(leg))
+    if leg == 1 && unionEqAtomOperandTail(otherIx, lw.irAt) < 0 { return -1 }
+  } else {
+    irLOpnd(r.ucOther)
+  }
+  if unionEqNulEndTail(qp, leg == 1 || leg == 3, r.ucNe, lw.irAt) < 0 {
+    return -1
+  }
+  if r.ucStage != 0 { unionEqStageClose() }
+  return 0
 }
 
 // `RUnionEq`: both boxes, then legacy's compare over them (`unionUnionBoxesTail`).
@@ -4082,16 +4107,20 @@ function unionStageEffect(r: RUnionStage, pending: i32[]) {
     unionEqStageClose()
     return 0
   }
+  if r.usOp == 4 {
+    unionEqHead()
+    unionEqNulStageOpen(r.usKind == 1)
+    return 0
+  }
   const roots = stageLead(r.usV, pending)
   if lwMiss != "" { return 0 }
   lwFloors.push(lwFloor)
   lwFloor = lwLive.length - liveCountIn(pending)
   irLOpnd(r.usV)
-  if r.usOp == 1 {
-    unionEqStageSetBox()
-  } else {
-    unionEqStageSetOther(r.usKind)
-  }
+  if r.usOp == 1 { unionEqStageSetBox() }
+  else if r.usOp == 2 { unionEqStageSetOther(r.usKind) }
+  else if r.usOp == 5 { fbLocalSet(unionEqNulOpSlot(r.usKind)) }
+  else { fbLocalSet(unionEqNulBoxSlot()) }
   liveNeutral()
   irLSettle(pending)
   lwFloor = lwFloors.pop() ?? 0
