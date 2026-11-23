@@ -6206,9 +6206,8 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
   if !(nd is IsExpr) { return 0 }
   const p = listIsAcrossPlanOf(isIx, nd, fnIx)
   if !p.lpOk { return 0 }
-  const slot = sharedFieldRecvSlot()
   if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-  return listIsAcrossTail(nd, slot, p, fnIx)
+  return listIsAcrossTail(nd, sharedFieldRecvSlot(), p, fnIx)
 }
 
 // `listIsAcrossRepsPlan`'s answer for `is` test `isIx`: the tested list type, per tag how it is
@@ -12186,12 +12185,22 @@ export function unionFieldNarrowUnboxOf(memIx: i32, fnIx: i32): NarrowUnboxArm {
   return if memReadUnboxAtomKind(memIx, fnIx) >= 0 { "unbox" } else { "none" }
 }
 
+// The value-atom kind union-box field read `memIx`'s unbox leaves, or -1 where it leaves the box or
+// a container (`unionFieldNarrowUnboxOf`).
+export function unionFieldUnboxKindOf(memIx: i32, fnIx: i32): i32 {
+  return match unionFieldNarrowUnboxOf(memIx, fnIx) {
+    "atom" => memNarrowAtomKind(memIx, fnIx)
+    "unbox" => memReadUnboxAtomKind(memIx, fnIx)
+    "container" | "none" => -1
+  }
+}
+
 function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
   return match unionFieldNarrowUnboxOf(memIx, fnIx) {
     "container" => emitPlaceNarrowContainerUnbox(memIx, fnIx) - 1
     // The narrowed atom's ABI code decides both arms, as at the variant-field twin of this read
     // (`emitNarrowedMem`).
-    "atom" => emitUnionUnboxTail(memNarrowAtomKind(memIx, fnIx))
+    "atom" => emitUnionUnboxTail(unionFieldUnboxKindOf(memIx, fnIx))
     "unbox" => emitUnionFieldStoredUnbox(memIx, fnIx)
     "none" => 0
   }
@@ -12201,7 +12210,7 @@ function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
 // there and narrowed back (a declared `i64 | null` member widens `7` into `$vbI64`); a `??`-merged
 // box holding two dispatches on its tag, only where every arm reaches the read's atom.
 function emitUnionFieldStoredUnbox(memIx: i32, fnIx: i32) {
-  const ck = memReadUnboxAtomKind(memIx, fnIx)
+  const ck = unionFieldUnboxKindOf(memIx, fnIx)
   const bk = memReadBoxedAtomKind(memIx, fnIx)
   const bks: i32[] = []
   if memReadBoxedAtomKinds(memIx, fnIx, bks) {
@@ -45258,20 +45267,26 @@ function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
   }
 }
 
-// D960's stash: the box once into the shared slot, its tag tested, the box or the default boxed
-// into the result's union.
-function emitCoalesceBoxStash(e: BinExpr, exprIx: i32, fnIx: i32) {
-  const coNm = boxTyName(nodeTyIxOf(exprIx))
-  const coSlot = sharedFieldRecvSlot()
-  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-  fbLocalSet(coSlot)
-  fbLocalGet(coSlot)
+// After `??`'s operand box: it into `slot`, its tag tested present opening the box-typed `if`, and
+// the stashed box as that arm's value.
+export function coalBoxStashOpen(slot: i32) {
+  fbLocalSet(slot)
+  fbLocalGet(slot)
   fbStructGet(uBoxIdx, 0) // field 0: tag
   fbI32Rel(RS_TAG, nullBoxTag())
   fbI32Bin(71) // 0x47 i32.ne  -> present?
   fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
-  fbLocalGet(coSlot)
+  fbLocalGet(slot)
   fbRefAsNonNull() // the stash cell is nullable, the block type is not
+}
+
+// D960's stash: the box once into the shared slot, its tag tested, the box or the default boxed
+// into the result's union.
+function emitCoalesceBoxStash(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const coNm = boxTyName(nodeTyIxOf(exprIx))
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  const coSlot = sharedFieldRecvSlot()
+  coalBoxStashOpen(coSlot)
   fbElse()
   if (emitUnionBoxOwed(coNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
     return -1
