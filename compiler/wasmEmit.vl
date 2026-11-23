@@ -1649,6 +1649,7 @@ import {
   arrRefSlotPlain,
   forInElemRecovers,
   forInLoopAt,
+  forInPairSlotOf,
   identReadIsList,
   idxStorePlanOf,
   listFitElemKind,
@@ -15920,7 +15921,16 @@ function emitMapClear(recvIx: i32, fnIx: i32) {
 // refs so the payload can be collected, decrements `size`, and pushes 1. A delete never moves an
 // entry, so a walk over the same map stays in step; storage is reclaimed on insert (D2315).
 function emitMapDelete(recvIx: i32, keyIx: i32, fnIx: i32) {
-  if emitMapPrepFor(recvIx, keyIx, fnIx, true) < 0 { return -1 }
+  if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
+  return mapDeleteTail()
+}
+
+// After a map delete's receiver, key and op context: the probe to the entry's slot, then the
+// tombstone and the 0 or 1 `emitMapDelete` writes.
+export function mapDeleteTail(): i32 {
+  fbLocalSet(cmKeyLocal()) // the target key
+  setMapRef()
+  if emitMapProbe(false, true) < 0 { return -1 }
   const mslot = cmSlot
   // if entry == 0 { 0 } else { tombstone ; drop refs ; size-- ; 1 }
   pushMapScr(5) // entry
@@ -37466,15 +37476,13 @@ function forInElemPlain(ek: VKind): boolean {
 }
 
 // Why `for` statement `s` at `stmtIx` is not the plain walk, or "": a list of a `forInElemPlain`
-// kind, a string's code points or a map's keys or values, read once; no second name or
-// node-pinned slot; a body that may reallocate a list, so the header is re-read each step and
+// kind, a string's code points or a map's keys or values, read once; no node-pinned slot; a body that may reallocate a list, so the header is re-read each step and
 // nothing is hoisted or unrolled ("hoisted" where it is). A literal iterable is a list literal.
 export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
   if luForUnionIter(s.fiIter, fnIx) { return "list union" }
   const ek = forInElemKind(s.fiIter, fnIx)
   if ek == null { return "iterable" }
   if !forInElemPlain(ek) { return "element " + ek }
-  if s.fiVar2 != "" { return "pair" }
   if listFitShadowIsRef(s.fiIter, fnIx) { return "shadow" }
   if declSlotPinned(stmtIx) >= 0 { return "pinned slot" }
   if hoistSafeBlock(s.fiBody, fnIx) { return "hoisted" }
@@ -37514,9 +37522,7 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
   const lp = forInLoopAt(s, fnIx, vSlot, ek, strSrc, u8Src)
   if lp == null { return -1 }
   const mapRecv = lp.mapRecv
-  const pairIsVal = lp.pairIsVal
-  const pIdx = lp.pIdx
-  const pSlot = vSlot + 3
+  const pSlot = forInPairSlotOf(vSlot)
   if mapRecv >= 0 {
     if emitForInMapStash(fnIx, lp) < 0 { return -1 }
   }
@@ -37525,17 +37531,7 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
   forInListStore(s.fiIter, fnIx, lp)
   forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
-  // A body that writes the index gets a hidden counter, and the index is a fresh copy of it
-  // each iteration, so the write never moves the walk (D2342).
-  if hasPair && !pairIsVal && stmtAssignsName(s.fiBody, pairName) {
-    lp.pCtr = strI32Slot()
-  }
-  if hasPair && !pairIsVal {
-    // A dense counter of body executions: the cursor is a backing offset for a string and
-    // skips tombstones for a set, so it is not the index at two of the three sequences.
-    fbI32Const(0)
-    if lp.pCtr >= 0 { fbLocalSet(lp.pCtr) } else { fbLocalSet(pIdx) }
-  }
+  forInPairInit(s, lp)
   // The body's own index receivers, as `while` and a range loop hoist theirs.
   const fiHoist = loopHoistOpen(-1, s.fiBody, fnIx, s.fiDecl1, s.fiDecl2)
   if fiHoist < 0 { return -1 }
@@ -37546,6 +37542,17 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
   // The loop variables' scope is the loop (see `scopeUnbind`) — one release per name.
   if hasPair { scopeUnbind() }
   scopeUnbind()
+  return 0
+}
+
+// After a walk's cursor: an index pair's counter at 0. A body that writes the index gets a hidden
+// counter, and the index is a fresh copy of it each iteration, so the write never moves the walk
+// (D2342); the counter is dense, since a string's cursor is a backing offset and a set's skips.
+export function forInPairInit(s: ForIn, lp: ForInLoop): i32 {
+  if !lp.hasPair || lp.pairIsVal { return 0 }
+  if stmtAssignsName(s.fiBody, s.fiVar2) { lp.pCtr = strI32Slot() }
+  fbI32Const(0)
+  if lp.pCtr >= 0 { fbLocalSet(lp.pCtr) } else { fbLocalSet(lp.pIdx) }
   return 0
 }
 
@@ -38226,7 +38233,7 @@ function emitListUnionForArm(
   fbI32Bin(106) // 0x6a i32.add
   fbLocalSet(iIdx)
   scopeBind(s.fiVar, vSlot)
-  if hasPair { scopeBind(s.fiVar2, vSlot + 3) }
+  if hasPair { scopeBind(s.fiVar2, forInPairSlotOf(vSlot)) }
   if emitStmts(s.fiBody, fnIx) < 0 { return -1 }
   if hasPair { scopeUnbind() }
   scopeUnbind()
@@ -39344,25 +39351,37 @@ function emitPrintNulRefNiche(argIx: i32, fnIx: i32) {
 // silently printed true without this arm. A `br_table` on the niche value itself is already
 // the arm index (0 false, 1 true, 2 null), evaluating the argument once with no scratch needed.
 function emitPrintNulBool(argIx: i32, fnIx: i32) {
+  printNulBoolOpen()
+  if emitExpr(argIx, fnIx) < 0 { return -1 }
+  return printNulBoolTail()
+}
+
+// Before a `print` of a `boolean | null`: the `$out`, `$null`, `$true` and `$false` blocks.
+export function printNulBoolOpen(): i32 {
   fbBlock(64) // $out
   fbBlock(64) // $null
   fbBlock(64) // $true
   fbBlock(64) // $false
-  if emitExpr(argIx, fnIx) < 0 { return -1 }
-  wU8(14)     // 0x0e br_table
-  wULEB(3)    // three indexed targets, then the default
-  wULEB(0)    // 0 → $false (depth 0 from here)
-  wULEB(1)    // 1 → $true
-  wULEB(2)    // 2 → $null
-  wULEB(2)    // default → $null (unreachable: the niche is 0/1/2)
+  return 0
+}
+
+// After a `print` argument's `boolean | null` niche: the `br_table` on it, then each arm's print,
+// all three leaving through `$out`.
+export function printNulBoolTail(): i32 {
+  wU8(14)   // 0x0e br_table
+  wULEB(3)  // three indexed targets, then the default
+  wULEB(0)  // 0 → $false (depth 0 from here)
+  wULEB(1)  // 1 → $true
+  wULEB(2)  // 2 → $null
+  wULEB(2)  // default → $null (unreachable: the niche is 0/1/2)
   fbEnd()
   fbI32Const(0)
-  fbCall(1)   // __print_bool__ → "false"
-  fbBr(2)     // → $out
+  fbCall(1) // __print_bool__ → "false"
+  fbBr(2)   // → $out
   fbEnd()
   fbI32Const(1)
-  fbCall(1)   // __print_bool__ → "true"
-  fbBr(1)     // → $out
+  fbCall(1) // __print_bool__ → "true"
+  fbBr(1)   // → $out
   fbEnd()
   emitPrintNullWord()
   fbEnd()

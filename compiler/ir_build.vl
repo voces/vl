@@ -84,6 +84,7 @@ import {
   RListSlice,
   RListStage,
   RMakeRec,
+  RMapDelete,
   RStashSet,
   RStrOp,
   RToBox,
@@ -530,7 +531,7 @@ import {
   unionBoxArgReadsMapBox,
   unionLitIsPlanOf,
 } from "./wasmEmit"
-import { nodeTyInOf } from "./emit_ty_canon"
+import { nodeTyInOf, readContainerTyAt } from "./emit_ty_canon"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -740,7 +741,8 @@ import {
   parseI32,
   parseI64Pair,
 } from "./emit_bignum"
-import { isVoidTy } from "./tyquery"
+import { isVoidTy, tyMapValOf } from "./tyquery"
+import { forInBindTy } from "./check_leaf_steps"
 import { optChainStagesRecv, structIndexOfTy } from "./emit_atom_kinds"
 import { recordHeapOfTy } from "./emit_shape_intern"
 import { callAtCalleeResultRow } from "./emit_nullable_rets"
@@ -748,6 +750,7 @@ import { RC_MAP, RC_REF_LIST, letBindingUnionTy } from "./emit_start_block"
 import {
   TY_BOOL,
   TY_I32,
+  TY_I64,
   TY_NEVER,
   TY_NUL_STR,
   TY_STR,
@@ -5476,8 +5479,8 @@ function mapHasRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
   const sh = mapRecvShapeOf(recvIx, ibFnIx)
   if sh == -3 { return missRhs("map has value type") }
   const ka = mapKeyArmOf(recvIx, keyIx, ibFnIx, sh)
-  if ka != "plain" { return missRhs("map key " + ka) }
-  const rk = mapRecvKeyOf(b, recvIx, keyIx, "map has receiver")
+  if ka != "plain" && ka != "i64" { return missRhs("map key " + ka) }
+  const rk = mapRecvKeyOf(b, recvIx, keyIx, "map has receiver", ka == "i64")
   if rk == null { return missRhs(ibMiss) }
   const r: Rhs = {
     mhSym: rk.mkSym,
@@ -5486,6 +5489,25 @@ function mapHasRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
     mhRecv: recvIx,
     mhKey: rk.mkKey,
     mhAt: ix,
+  }
+  return r
+}
+
+// `m.delete(k)` on legacy's arm: its receiver and key as `m.has(k)` takes them.
+function mapDeleteRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
+  const sh = mapRecvShapeOf(recvIx, ibFnIx)
+  if sh == -3 { return missRhs("map delete value type") }
+  const ka = mapKeyArmOf(recvIx, keyIx, ibFnIx, sh)
+  if ka != "plain" && ka != "i64" { return missRhs("map key " + ka) }
+  const rk = mapRecvKeyOf(b, recvIx, keyIx, "map delete receiver", ka == "i64")
+  if rk == null { return missRhs(ibMiss) }
+  const r: Rhs = {
+    mdSym: rk.mkSym,
+    mdNonNull: rk.mkNonNull,
+    mdLoc: rk.mkLoc,
+    mdRecv: recvIx,
+    mdKey: rk.mkKey,
+    mdAt: ix,
   }
   return r
 }
@@ -5572,6 +5594,13 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if m.memProp == "has" && c.callArgs.length == 1 && exprMap(m.memObj, ibFnIx) {
     return mapHasRhs(b, m.memObj, c.callArgs[0], ix)
   }
+  if (
+    m.memProp == "delete"
+    && c.callArgs.length == 1
+    && exprMap(m.memObj, ibFnIx)
+  ) {
+    return mapDeleteRhs(b, m.memObj, c.callArgs[0], ix)
+  }
   if m.memProp == "map" || m.memProp == "filter" {
     return mapFilterRhs(b, c, m, ix)
   }
@@ -5656,15 +5685,19 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   const from = b.length
   const v = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return 0 }
-  // Legacy opens a nullable string's print blocks before its operand, so a valued `if` in it
-  // would sit above them.
+  // Legacy opens a nullable string's or boolean's print blocks before its operand, so a valued
+  // `if` in it would sit above them.
   if want == "nulStr" && ifBelowLead(b, from, "print nulStr of a valued if") {
+    return 0
+  }
+  if want == "nulBool" && ifBelowLead(b, from, "print nulBool of a valued if") {
     return 0
   }
   const vr = irBOpRep(v)
   const p = repPrim(vr)
   let ok = p != null && p == want
   if want == "nulStr" { ok = strNullable(vr) }
+  if want == "nulBool" { ok = boolNullable(vr) }
   if want == "atom" { ok = repNodeAt(vr) is RAtom }
   // The `K | null` tail reads an i32 id and tests it for `-1`; an operand already narrowed or
   // coalesced to a plain atom is that id, which the test never matches (`printAtomTail`).
@@ -5706,10 +5739,11 @@ function printArmRep(arm: PrintArm): string {
     "bool" => "bool"
     "i32" => "i32"
     "nulStr" => "nulStr"
+    "nulBool" => "nulBool"
     "atom" => "atom"
     "nulAtom" => "nulAtom"
     "union" => "union"
-    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "nulBool" | "unrenderable" => ""
+    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "unrenderable" => ""
   }
 }
 
@@ -5735,7 +5769,7 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
   const sh = mapRecvShapeOf(recv, ibFnIx)
   if sh == -3 { return skip("map store value type") }
   const ka = mapKeyArmOf(recv, key, ibFnIx, sh)
-  if ka != "plain" { return skip("map key " + ka) }
+  if ka != "plain" && ka != "i64" { return skip("map key " + ka) }
   let valArm: MapSetValArm = "plain"
   if val >= 0 {
     if mapSetRefIntoMono(recv, val, ibFnIx) {
@@ -5770,7 +5804,7 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
     return skip("map add of a non-set")
   }
   const at = b.length
-  const k = irBExpr(b, key)
+  const k = mapKeyAt(b, key, ka == "i64")
   if ibMiss != "" { return 0 }
   const one: Opnd = { oiRep: ibBool, oiBits: 1 }
   const vAt = b.length
@@ -8553,7 +8587,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     ibFnIx,
     mapRecvShapeOf(rd.idxArr, ibFnIx),
   )
-  if ka != "plain" { return irBMiss("map key " + ka) }
+  if ka != "plain" && ka != "i64" { return irBMiss("map key " + ka) }
   const rp = repPrim(rep)
   const uk = if uq != null { uq.muWide } else { -1 }
   const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32"
@@ -8565,7 +8599,13 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !repOk { return irBMiss("map read rep") }
   // A default the miss arm writes as a body leaves the read's value on the stack from here.
   const clear = !endsInTemp(b)
-  const rcv = mapRecvKeyOf(b, rd.idxArr, rd.idxIndex, "map read receiver")
+  const rcv = mapRecvKeyOf(
+    b,
+    rd.idxArr,
+    rd.idxIndex,
+    "map read receiver",
+    ka == "i64",
+  )
   if rcv == null { return irBMiss(ibMiss) }
   // The default is written in the miss arm: in place there, or as the body a fused read's arm holds.
   const db: i32[] = []
@@ -8635,8 +8675,14 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
   const arm = mapGetArmOf(ix, ibFnIx)
   const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
   const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
-  if ka != "plain" { return irBMiss("map key " + ka) }
-  const rk = mapRecvKeyOf(b, rd.idxArr, rd.idxIndex, "map get receiver")
+  if ka != "plain" && ka != "i64" { return irBMiss("map key " + ka) }
+  const rk = mapRecvKeyOf(
+    b,
+    rd.idxArr,
+    rd.idxIndex,
+    "map get receiver",
+    ka == "i64",
+  )
   if rk == null { return irBMiss(ibMiss) }
   const mr = if rk.mkSym >= 0 { irGlobalRepOf(ib, rk.mkSym) } else { irBOpRep(rk.mkLoc) }
   const m = repNodeAt(mr)
@@ -8654,9 +8700,14 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
       "container" | "nonNull" => false
     }
     if box >= 0 || !repOk { return irBMiss("map get union box rep") }
-  } else if box < 0 && !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) {
-    return irBMiss("map get rep")
   }
+  // A read the instance types without the null its map's value holds is the helper's value at
+  // that niche, as legacy reads it: a miss and a stored null are both its sentinel.
+  const plain = arm == "unionBox"
+    || box >= 0
+    || mapGetRepOk(sh, m.rmVal, rep, rd.idxArr)
+  const nt = if plain { -1 } else { mapReadNicheTy(sh, m.rmVal, rep, rd.idxArr) }
+  if !plain && nt < 0 { return irBMiss("map get rep") }
   const r: Rhs = {
     mtSym: rk.mkSym,
     mtNonNull: rk.mkNonNull,
@@ -8666,11 +8717,25 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
     mtBox: box,
     mtRow: row,
   }
+  if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
   if box < 0 { return irBLetTemp(b, r, ix, rep) }
   // The box is the union's own, typed at it where a narrowed re-read's node is the member's.
   const bt = holeBoxTyAt(ix, ibFnIx)
   if bt < 0 || repNodeOfTy(bt) != rep { return irBMiss("map get box type") }
   return irBLetTempTy(b, r, ix, rep, heldTy(bt))
+}
+
+// The value type of map `recvIx` where a read the instance types at rep `rep` is held at the
+// map's value rep `val`, the `boolean | null` niche of `rep`; -1 for any other read.
+function mapReadNicheTy(sh: i32, val: i32, rep: i32, recvIx: i32): i32 {
+  if sh >= 0 { return -1 }
+  const vn = repNodeAt(val)
+  if (!(vn is RNullable) || vn.rnInner != rep || !boolNullable(val)) {
+    return -1
+  }
+  const vt = tyMapValOf(nodeTyAt(recvIx, ibFnIx))
+  if vt < 0 || repNodeOfTy(vt) != val { return -1 }
+  return vt
 }
 
 // Whether a bare map read of `recvIx` (value rep `val`, shape `sh`) leaves rep `rep`: an mv
@@ -8757,12 +8822,13 @@ function mapRecvKeyOf(
   recvIx: i32,
   keyIx: i32,
   why: string,
+  wide: boolean,
 ): MapRecvKey | null {
   const g = mapGlobalOf(recvIx)
   const loc = mapRecvLoc(b, recvIx, g, why)
   if ibMiss != "" { return null }
   const at = b.length
-  const k = irBExpr(b, keyIx)
+  const k = mapKeyAt(b, keyIx, wide)
   if ibMiss != "" { return null }
   if mapRecvReassigned(b, at, loc) {
     irBMiss("map receiver reassigned")
@@ -8771,6 +8837,13 @@ function mapRecvKeyOf(
   const nonNull = g >= 0
     && globalReadRecovers(sidOfNode(recvIx), recvIx, ibFnIx)
   return { mkSym: g, mkNonNull: nonNull, mkLoc: loc, mkKey: k }
+}
+
+// Map key `keyIx` as legacy writes it: at the `i64` an `i64`-keyed map holds where `wide`
+// (`emitScalarValue`), else as itself.
+function mapKeyAt(b: i32[], keyIx: i32, wide: boolean): Opnd {
+  if wide { return deliver(b, keyIx, repNodeOfTy(TY_I64), TY_I64) }
+  return irBExpr(b, keyIx)
 }
 
 // A map operation's receiver other than global `g`: any expression read as a map, in place (a
@@ -8815,7 +8888,7 @@ function nodeAssigns(ni: i32, v: i32): boolean {
     SCoalBox => coalBoxAssigns(n, v)
     SBlock => bodyAssigns(n.bkBody, v)
     SLoop => bodyAssigns(n.lpBody, v)
-    SForIn => n.xfVar == v || bodyAssigns(n.xfBody, v)
+    SForIn => n.xfVar == v || n.xfVar2 == v || bodyAssigns(n.xfBody, v)
     SRangeLoop => {
       if n.rlVar == v || bodyAssigns(n.rlTail, v) { return true }
       for c in n.rlCopies {
@@ -10070,6 +10143,20 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   }
   const v = irBLoopVar(n.fiDecl1, er, repTyOf(er))
   if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
+  // A second name binds a sequence's index or a map's value (`forInBindTy`), an i32 or a string.
+  let v2 = -1
+  if n.fiVar2 != "" {
+    const pr = repNodeOfTy(
+      forInBindTy(readContainerTyAt(n.fiIter, ibFnIx), true),
+    )
+    if pr != repNodeOfTy(TY_I32) && pr != repNodeOfTy(TY_STR) {
+      return skip("for in pair rep")
+    }
+    v2 = irBLoopVar(n.fiDecl2, pr, repTyOf(pr))
+    if v2 < 0 || ib.irVars[v2].vRep != pr {
+      return skip("for in pair variable rep")
+    }
+  }
   const brk = labelNew()
   const cont = labelNew()
   ibLoopName.push(n.fiLabel)
@@ -10091,6 +10178,7 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
     {
       xfList: l,
       xfVar: v,
+      xfVar2: v2,
       xfBody: fb,
       xfAt: ix,
       xfBrk: brk,
@@ -10875,8 +10963,8 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return 0 }
-    // A discarded slice is a value legacy evaluates and drops.
-    if rhs is RListSlice {
+    // A discarded slice or map delete is a value legacy evaluates and drops.
+    if rhs is RListSlice || rhs is RMapDelete {
       const sr = exprRepOf(ix)
       if sr < 0 { return skip("slice statement rep") }
       const v = irBLetTemp(b, rhs, ix, sr)
