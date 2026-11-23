@@ -130,7 +130,8 @@ Each consumer keeps its own list. Re-run an ask before scheduling it.
 - **plumb:** `~/plumb/docs/vl-issues.md`. Queued: std wrappers over the shared-memory and atomics
   intrinsics, and raw integer SIMD intrinsics, each through std-api-reviewer.
 - **veldt and sunsuz:** these are on ask only.
-  - SIMD S4: integer and byte shapes (`I32x4`, `U8x16`, ...) in `std:simd`.
+  - SIMD S4: integer and byte shapes in `std:simd`. The first slice shipped for aillu (#9678);
+    lane access, shifts, `*`, `dot` and `swizzle` remain, on ask.
   - `flat` sub-byte fields and newtypes over byte widths (flat-records-design.md §11.3).
 - **sunpa:** `~/sunpa/docs/vl-issues.md`. Two asks, both std API changes (std-api-reviewer, owner
   first), which may fall outside sunpa's scope directive:
