@@ -33,12 +33,13 @@ as legacy's does.
 
 ## Left in the class
 
-The coordinator has ruled these out of S1's claim; they are free, small items.
-
-- **Null-leg call operands** (legacy's null-leg arms stage the operand and box at a level):
+- **Null-leg call operands** (S1's next step) (legacy's null-leg arms stage the operand and box at a level):
   `union-eq-nullable-atom-call-operand`, `union-eq-nullable-bool-call-operand`,
   `union-eq-nullable-string-atom-bool-operand`, and the start body of
-  `union-compare-operand-runs-once`. This is S1's next step.
+  `union-compare-operand-runs-once`.
+
+The coordinator rules the rest out of S1's claim, as free, small items, one list per mechanism:
+
 - **Operand rep:** `union-eq-narrowed-let-operand`, `union-closure-arm-equality` (a closure
   operand).
 - **Box shapes:** `opt-chain-scalar-unbound-box` (an optional chain), `wide-union-forty-arms`,
