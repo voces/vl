@@ -71,13 +71,15 @@ export type CastFail = "trap" | "null"
 export type RPrimOp = { poOp: PrimOp, poArgs: Opnd[] }
 // `caNever`: the callee never returns, so the call is followed by `unreachable` (`callEndsNever`).
 // `caEnv`: the callee takes a hidden environment parameter, passed null before the arguments;
-// `caCaps`: a lifted callee's captures, passed after it.
+// `caCaps`: a lifted callee's captures, passed after it; `caWb`: the variables the captures it
+// assigns go back to after the call, in its result order, the last set first (D3664).
 export type RCall = {
   caCallee: i32,
   caArgs: Opnd[],
   caNever: boolean,
   caEnv: boolean,
   caCaps: Opnd[],
+  caWb: i32[],
 }
 // `crSig`: the `$fnsig` type index; `crVoid`: the key returns nothing; `crDrop`: a call statement
 // drops its result, as legacy decides (`callRefPlainVoid`).
@@ -167,8 +169,15 @@ export type RStashSet = {
   ssK: i32,
 }
 // A field read at node `gfAt`, kid `gfIx` of `gfV`'s record; `gfStored` where the builder built it
-// at its storage (an `is` receiver's), so it is lowered under the same mark.
-export type RGetField = { gfV: Opnd, gfIx: i32, gfAt: i32, gfStored: boolean }
+// at its storage (an `is` receiver's), so it is lowered under the same mark; `gfStr` where a
+// union-box field's unbox leaves the string a literal-union member is boxed as.
+export type RGetField = {
+  gfV: Opnd,
+  gfIx: i32,
+  gfAt: i32,
+  gfStored: boolean,
+  gfStr: boolean,
+}
 // A list literal at node `mlAt` of elements `mlElems`, built under the list build (`mlKind`,
 // `mlSlot`) its delivery threaded, by legacy's short tail at the arm the builder asked (`mlArm`).
 export type RMakeList = {
@@ -228,7 +237,7 @@ export type RListGet = { lgV: Opnd, lgIx: Opnd, lgAt: i32 }
 // `llAt`: the `.length` `Member` node, which legacy's hoist and view decisions key on.
 export type RListLen = { llV: Opnd, llAt: i32 }
 // `nwV`, of number kind `nwSrc`, widened to kind `nwDst` at delivery node `nwAt` (kinds as
-// `widenPlanOf` names them: 1 i32, 3 i64, 4 f64, 5 f32).
+// `widenPlanOf` names them: 1 i32, 3 i64, 4 f64, 5 f32); 3 to 1 is a shift-mask fold's wrap.
 export type RNumWiden = { nwV: Opnd, nwSrc: i32, nwDst: i32, nwAt: i32 }
 // A numeric `as` at cast node `ncAt` over operand `ncV`, built at the kind `numCastKindOf`
 // names; legacy's `numCastTail` writes the conversion, and an `as!`'s test and trap.
@@ -659,9 +668,11 @@ export function coalArmStagesLeads(a: CoalValArm): boolean {
 }
 // An integer `match` chain written as one `br_table` (`IntSwitchPlan`): operand `isOn` less
 // `isLo`, read again under the range test when `isWide`; `isTable[d]` the arm index `d` takes,
-// `isArms.length` the else, whose body is `isElse`. A tail chain's (`isTail`) arms return.
+// `isArms.length` the else, whose body is `isElse`. A tail chain's (`isTail`) arms return; a
+// valued one's write out `isOut` (-1 for none), which its frame carries.
 export type SIntSwitch = {
   isTail: boolean,
+  isOut: i32,
   isOn: Opnd,
   isWide: boolean,
   isLo: i32,
@@ -764,6 +775,9 @@ export type IrFn = {
   // A closure thunk: one call forwarding its parameters, in tail form whatever the callee
   // returns, as `emitCloThunkCode` writes it.
   irThunk: boolean,
+  // A lifted function's assigned captures, the parameter variables every exit hands back after
+  // its result (D3664), in legacy's order (`fbSeedRetExtra`).
+  irRetExtra: i32[],
   irSigFn: i32[],
   irSigParams: i32[][],
   irSigRet: i32[],
@@ -861,6 +875,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irHelper: false,
     irFragment: false,
     irThunk: false,
+    irRetExtra: [],
     irSigFn: [],
     irSigParams: [],
     irSigRet: [],
@@ -1653,7 +1668,12 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
       s
     }
     SIntSwitch => {
-      let s = p + "intswitch " + opndText(n.isOn) + " lo " + i32ToStr(n.isLo)
+      let s = p
+        + "intswitch "
+        + opndText(n.isOn)
+        + outText(n.isOut)
+        + " lo "
+        + i32ToStr(n.isLo)
       if n.isWide { s = s + " wide" }
       s = s + " table"
       for t in n.isTable { s = s + " " + i32ToStr(t) }
