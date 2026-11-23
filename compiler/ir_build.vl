@@ -364,6 +364,7 @@ import {
   recvReadsListPayload,
   refIfArmOf,
   refListReadPlain,
+  retUnionTyOf,
   shiftMaskFoldOf,
   simdCallNamed,
   simdCallRow,
@@ -497,7 +498,9 @@ import {
   coalBoxFieldScalarPlanOf,
   coalDeadJoinIfOf,
   coalFieldPlanOf,
+  coalHoleMapIfOf,
   coalNextArmOf,
+  coalNulBoolJoinWhy,
   coalNullTestIf,
   coalOptArmOf,
   coalOptLeafPlanOf,
@@ -2251,7 +2254,13 @@ function capturedClosureTy(ix: i32): i32 {
 // variable for it, or the module cell of a global one, holds that record; -1 otherwise.
 function holderReadTy(ix: i32): i32 {
   if !elabHasHolderRecords() { return -1 }
-  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return -1 }
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = nodeAt(ix)
+  if !(n is Ident) { return -1 }
+  // A holder captured whole is read at the record its capture holds (`capTyOf`).
+  if identReadArmOf(n, ix, ibFnIx, false) == "capture" {
+    return capturedHolderTy(n.identName)
+  }
   const d = identDeclOf(ix)
   const ht = holderRecordTy(d, ibFnIx)
   if ht < 0 { return -1 }
@@ -2262,6 +2271,16 @@ function holderReadTy(ix: i32): i32 {
   if g < 0 { return -1 }
   const mt = holderRecordTy(d, -1)
   return if mt >= 0 && globalRep(g, d) == repNodeOfTy(mt) { mt } else { -1 }
+}
+
+// The record a capture `name` of this frame holds where its binding keeps a returned bundle whole
+// (`holderRecordTy` in the frame that owns it), else -1.
+function capturedHolderTy(name: string): i32 {
+  const fe = fnStmtsPosOf(ibFnIx)
+  const d = parentBindingOf(fe, name)
+  if d < 0 || !(nodeAt(d) is LetDecl) { return -1 }
+  const ht = holderRecordTy(d, parentBindingFrameArenaOf(fe, name))
+  return if ht >= 0 && capTyOf(fe, name) == ht { ht } else { -1 }
 }
 
 // `boundVarOf(ix)` for read `ix` of open type `t`, where the IR holds it closed and legacy stores
@@ -4347,7 +4366,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       const fl = if heldAsBox(pr) && !boxOwedAt(c.callArgs[i], ibFnIx) { directArgUnionTyOf(pos, i) } else { -1 }
       const fu = if fl >= 0 && repNodeOfTy(fl) == pr { fl } else { -1 }
       // A struct literal legacy builds at a row of its parameter's row's heap (`paramStructIdxOf`)
-      // is built at the parameter's rep.
+      // is built at the parameter's rep; a `null` literal at the floor is its union's null box.
       const lt = if repNodeAt(pr) is RRecord { objLitTwinTyAtRow(c.callArgs[i], pr, pt, paramStructIdxOf(callee.fnParams[i])) } else { -1 }
       const a = if lt >= 0 { objLitAt(
         b,
@@ -4356,7 +4375,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         lt,
         objLitLayoutRowOf(unwrapParen(c.callArgs[i]), ibFnIx),
         false,
-      ) } else { deliver(b, c.callArgs[i], pr, fu) }
+      ) } else if fu >= 0 && nodeAt(unwrapParen(c.callArgs[i])) is NullLit { boxTempIn(b, { oiRep: ibNoValue, oiBits: 0 }, c.callArgs[i], pr, -1, fu) } else { deliver(b, c.callArgs[i], pr, fu) }
       if ibMiss != "" { return missRhs("argument") }
       if i > 0 && !irBStageLeads(b, at, starts, args, c.callArgs) {
         return missRhs("short-circuit argument after another")
@@ -4671,6 +4690,13 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   return closureCallAt(b, c, ix, key, f)
 }
 
+// Whether callee `fx` is a name this frame reads through its capture (`identReadArmOf`).
+function calleeIsCapture(fx: i32): boolean {
+  if fx < 0 || fx >= P.nodes.length { return false }
+  const n = nodeAt(fx)
+  return n is Ident && identReadArmOf(n, fx, ibFnIx, false) == "capture"
+}
+
 // Bundle callee `fx` read through a capture of this frame, at the record its capture holds; else a
 // named miss.
 function bundleCaptureRead(b: i32[], fx: i32): Opnd {
@@ -4762,7 +4788,8 @@ function holderCallRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("closure call plan disagrees")
   }
   const pk = holderPickOf(ix, ibFnIx)
-  const v = irBExpr(b, c.callFn)
+  // A holder captured whole is read at the record its capture holds (`capTyOf`).
+  const v = if calleeIsCapture(c.callFn) { bundleCaptureRead(b, c.callFn) } else { irBExpr(b, c.callFn) }
   if ibMiss != "" { return missRhs("holder callee") }
   const crep = repNodeOfTy(pk.bpTy)
   if !(repNodeAt(crep) is RClosure) { return missRhs("holder member rep") }
@@ -6415,6 +6442,10 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
       )
     }
   }
+  // A hole's map read `l ?? d` into a box is legacy's null-test `if` (`coalHoleMapIfOf`), each
+  // arm delivered into the box.
+  const hm = if ibMiss == "" && dst >= 0 && heldAsBox(dst) { holeMapIfAt(ix) } else { -1 }
+  if hm >= 0 { return deliver(b, hm, dst, dstTy) }
   const at = b.length
   // A union map read boxed at its record (`emitCoerced`), or at the destination's union where none
   // is owed, is the box ladder's own read.
@@ -6431,6 +6462,18 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     ifBelowLead(b, at, "box of a valued if")
   }
   return v
+}
+
+// The null-test `if` of `??` node `ix` along the `holeMap` arm, or -1.
+function holeMapIfAt(ix: i32): i32 {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return -1 }
+  const n = nodeAt(u)
+  if !(n is BinExpr) || n.binOp != "??" || n.binCompound.length != 0 {
+    return -1
+  }
+  if coalArmOf(n, u, ibFnIx) != "holeMap" { return -1 }
+  return coalHoleMapIfOf(n, u, ibFnIx)
 }
 
 // The type a struct literal `ix` is built at for record destination `dst` (`dstTy`, else the
@@ -7535,6 +7578,13 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     if ibMiss != "" { return e }
     return coalAsBuilt(b, n.binRight, rep, arm)
   }
+  // A hole's map read is legacy's null-test `if` too (`coalHoleMapIfOf`).
+  if arm == "holeMap" {
+    const v = irBExpr(b, coalHoleMapIfOf(n, ix, ibFnIx))
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != rep { return irBMiss("coalesce holeMap rep") }
+    return v
+  }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
 }
@@ -7650,6 +7700,7 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if na == "coll" || na == "clo" { return coalNulRef(b, n, lhsIx, ix, rep) }
   if na == "litUnion" { return coalNicheCell(b, n, lhsIx, ix, rep, "litUnion") }
   if na == "nulBool" { return coalNicheCell(b, n, lhsIx, ix, rep, "nulBool") }
+  if na == "nulBoolJoin" { return coalNulBoolJoin(b, n, ix, rep) }
   if na != "str" { return irBMiss("coalesce niche " + na) }
   const sa = coalNulRefArmOf(n, ix, ibFnIx)
   if sa == "join" { return coalNulStrJoin(b, n, ix, rep) }
@@ -7871,13 +7922,13 @@ function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 
 // `o.v ?? d` over a value-union record field past the boxed arms, along `coalFieldPlanOf` as
 // `emitCoalesceUnionField` writes it: the record, a variable it re-reads, then the shared null
-// test's `if`, the default built into its null arm. A receiver it unwraps is a named miss.
+// test's `if`, the default built into its null arm. A receiver it unwraps (`cfCast`) is unwrapped
+// after each read.
 function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   const p = coalFieldPlanOf(n, lhsIx, ix, ibFnIx)
   if p.cfArm != "boxed" && p.cfArm != "unbox" {
     return irBMiss("coalesce field " + p.cfArm)
   }
-  if p.cfCast != -1 { return irBMiss("coalesce field cast") }
   const boxed = p.cfArm == "boxed"
   const repOk = if boxed { repNodeAt(rep) is RBox } else { repPrim(rep) != null }
   if !repOk { return irBMiss("coalesce field result rep") }
@@ -7887,16 +7938,18 @@ function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   if irTyOpen(ty) { return irBMiss("open temp type") }
   // Its value stays on the stack from here, so no temp an operand before it built may wait.
   if endsInTemp(b) { return irBMiss("coalesce field after an operand") }
-  const r = irBExpr(b, m.memObj)
+  // A box legacy unwraps itself is read at its storage, not narrowed.
+  const r = if p.cfCast >= 0 { storageReadOf(b, m.memObj) } else { irBExpr(b, m.memObj) }
   if ibMiss != "" { return r }
   // A receiver legacy re-emits is read again as the builder read it (`irHoistRecv`).
   if !(r is OVar) || r.ov < 0 { return irBMiss("coalesce field place") }
   if ib.irVars[r.ov].vKind == "temp" && !recvReadsAgain(unwrapParen(m.memObj)) {
     return irBMiss("coalesce field place")
   }
-  if !(repNodeAt(irBOpRep(r)) is RRecord) {
-    return irBMiss("coalesce field receiver rep")
-  }
+  // The receiver is the record, or a box or a nullable record legacy unwraps (`cfCast`).
+  const rr = repNodeAt(irBOpRep(r))
+  const recvOk = if p.cfCast >= 0 { heldAsBox(irBOpRep(r)) } else if p.cfCast == -2 { rr is RNullable && repNodeAt(rr.rnInner) is RRecord } else { rr is RRecord }
+  if !recvOk { return irBMiss("coalesce field receiver rep") }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
   if !coalNeverDefault(nb, n.binRight, rep) {
@@ -7916,6 +7969,21 @@ function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   )
   const o: Opnd = { ov: t }
   return o
+}
+
+// A local's or parameter's read at node `ix` at its own variable's rep, past any narrowing; any
+// other node is built as itself.
+function storageReadOf(b: i32[], ix: i32): Opnd {
+  const u = unwrapParen(ix)
+  const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if !(n is Ident) { return irBExpr(b, ix) }
+  const d = identDeclOf(u)
+  const w = localIndexOf(ibFnIx, u)
+  if d < 0 || w < 0 { return irBExpr(b, ix) }
+  const dn = nodeAt(d)
+  const v = if dn is Param { paramVarAt(w) } else if dn is LetDecl { readDeclVar(d) } else { -1 }
+  if v < 0 || captureSlotOf(n.identName, ibFnIx) >= 0 { return irBExpr(b, ix) }
+  return identRead(b, n, u, ib.irVars[v].vRep, false)
 }
 
 // Whether the read built at node `ix` can be written again as built (`irHoistRecv`): a variable's
@@ -8177,6 +8245,40 @@ function coalNeverDefault(nb: i32[], dIx: i32, rep: i32): boolean {
     irBMiss("coalesce never default")
   }
   return true
+}
+
+// `l ?? d` over the `boolean | null` niche joining a union box (`emitCoalesceNulBoolJoin`): the
+// operand once into its slot, its null the default delivered into the box, a present 0/1 boxed
+// under the boolean arm.
+function coalNulBoolJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const why = coalNulBoolJoinWhy(n, ibFnIx)
+  if why != "" { return irBMiss("coalesce nulBoolJoin plan") }
+  if !heldAsBox(rep) { return irBMiss("coalesce nulBoolJoin result rep") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce nulBoolJoin after an operand") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !repBoolNiche(irBOpRep(l)) {
+    return irBMiss("coalesce nulBoolJoin operand rep")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep, -1)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce nulBoolJoin default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  const arm: CoalValArm = "nulBoolJoin"
+  irBNode(
+    b,
+    { cbL: l, cbLB: [], cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // `l ?? d` over a `K | null` at a `string` (legacy's `emitCoalesceNulAtomStr`), its default a
@@ -9210,6 +9312,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
             pk.bpTy,
           )
         }
+        // A result legacy stores as the destination's valtype (`repStoresAs`: a held closure, a
+        // ref-element list) is left as it stands, as at an argument or a global.
+        if repStoresAs(rep, sr) { return irBLetTemp(b, rhs, ix, rep) }
         // A record call whose type keys the row its callee returns is built at the callee's rep.
         if (
           !(repNodeAt(sr) is RRecord)
@@ -10571,7 +10676,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       irBNode(b, { tpWhy: 0 }, -1, ibNoValue, ix)
       return 0
     }
-    const built = retCloAt(b, n.retArg) ?? deliver(b, n.retArg, ib.irRetRep, -1)
+    const built = retCloAt(b, n.retArg) ?? retDelivered(b, n.retArg)
     // A list returned at its result's storage is the same list where no coercion is recorded: a
     // record-or-null twin, a result whose type holds a hole the value fills, or a variant record
     // returned as its struct twin.
@@ -10711,11 +10816,29 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   }
   const n0 = b.length
   if retRefusedWhy(last, ibFnIx) != "" { return skip("return refused") }
-  const v = deliver(b, last, ib.irRetRep, -1)
+  const v = retDelivered(b, last)
   if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])
   return 0
+}
+
+// Returned value `arg` delivered at the result's rep. One the checker records no box at is boxed
+// at the return's own union, legacy's return floor (`retUnionTyOf`); a `null` literal there is
+// that union's null box.
+function retDelivered(b: i32[], arg: i32): Opnd {
+  const r = ib.irRetRep
+  const ru = if heldAsBox(r) && !boxOwedAt(arg, ibFnIx) { retUnionTyOf(ibFnIx, ibFnPos) } else { -1 }
+  const fu = if ru >= 0 && repNodeOfTy(ru) == r { ru } else { -1 }
+  if fu >= 0 && nodeAt(unwrapParen(arg)) is NullLit {
+    const nulV: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+    return boxTempIn(b, nulV, arg, r, -1, fu)
+  }
+  const v = deliver(b, arg, r, fu)
+  if ibMiss == "" && fu >= 0 && irBOpRep(v) != r {
+    return boxTempIn(b, v, arg, r, -1, fu)
+  }
+  return v
 }
 
 // A value `if` in tail position (legacy's `emitIfTail`): the statement `if` with each arm's last

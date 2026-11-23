@@ -463,7 +463,7 @@ function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
     }
     i = i + 1
   }
-  if dst >= 0 && dst != vf.irSigRet[si] {
+  if dst >= 0 && dst != vf.irSigRet[si] && !vfStoresAs(dst, vf.irSigRet[si]) {
     return fail(6, at, "the result rep is not the callee's")
   }
   return 0
@@ -1379,12 +1379,18 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const sameBox = m is RMap
         && repNodeAt(repBoxCore(dst)) is RBox
         && repBoxCore(dst) == repBoxCore(m.rmVal)
+      // A scalar value's read the box plan boxes (`mtBox`) is a box of the union it delivers to.
+      const scalarBox = r.mtBox >= 0
+        && m is RMap
+        && repPrim(m.rmVal) != null
+        && repNodeAt(repBoxCore(dst)) is RBox
       if (
         dst >= 0
         && m is RMap
         && !mapGetDstOk(m.rmVal, dst)
         && !unboxed
         && !sameBox
+        && !scalarBox
       ) {
         return fail(
           2,
@@ -1816,12 +1822,30 @@ function coalOptLeafWhy(n: SCoalBox): string {
   return ""
 }
 
+// A `boolean | null` niche's join `??` reads the niche and yields the union's box.
+function coalNulBoolJoinWhy(n: SCoalBox): string {
+  if !repBoolNiche(opRep(n.cbL)) {
+    return "a boolean join `??` reads no boolean niche"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a boolean join `??` writes no variable"
+  }
+  const on = repNodeAt(vf.irVars[o].vRep)
+  const box = on is RBox || on is RNullable && on.rnDisc == 4
+  return if box { "" } else { "a boolean join `??` yields no box" }
+}
+
 // A record field's `??` re-reads its record, a variable, and yields the field's box or its scalar.
 function coalFieldWhy(n: SCoalBox): string {
   if !(n.cbL is OVar) { return "a field `??` re-reads no variable" }
-  if !(repNodeAt(opRep(n.cbL)) is RRecord) {
-    return "a field `??` reads no record"
-  }
+  // The record, or a box or nullable record the lowering unwraps to it.
+  const lr = repNodeAt(opRep(n.cbL))
+  const recv = lr is RRecord
+    || lr is RBox
+    || lr is RNullable
+    && (lr.rnDisc == 4 || repNodeAt(lr.rnInner) is RRecord)
+  if !recv { return "a field `??` reads no record" }
   const o = n.cbOut
   if o < 0 || o >= vf.irVars.length { return "a field `??` writes no variable" }
   const or = vf.irVars[o].vRep
@@ -2105,6 +2129,7 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
     "litUnion" | "nulBool" => coalNicheWhy(n)
     "fieldBox" | "fieldVal" => coalFieldWhy(n)
     "optLeaf" => coalOptLeafWhy(n)
+    "nulBoolJoin" => coalNulBoolJoinWhy(n)
     "boxStash" => coalBoxStashWhy(n)
     "boxFieldScalar" => coalBoxFieldScalarWhy(n)
     "nulStr" => coalNulStrWhy(n)
