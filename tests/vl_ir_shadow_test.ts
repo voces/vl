@@ -3028,6 +3028,10 @@ Deno.test({
       if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
       const misses = [...rows.keys()].filter((k) => !TAGGED_OPEN_ROW_FULL.has(k) && !k.endsWith(": matched"));
       if (misses.length > 0) throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+    }
+  },
+});
+
 // A lone-literal field filled from a binding of that literal, built at a parameter's row that
 // keeps the field as its atom: the binding's member id (`atom_sole`) is an atom typed at the
 // literal, which rule 3 admits (`loneLitAtom`). The callee's own row read stays a named miss.
