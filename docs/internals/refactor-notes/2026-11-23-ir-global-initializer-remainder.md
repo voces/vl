@@ -24,6 +24,10 @@ The first three are not specific to globals: the same value at a local is `decla
   boxes are one map. It is admitted by the verifier's retag, a local's binding and a global's.
 - **Declared list cells.** A global whose open type has no valtype is noted at the value's rep where
   the global section declares the cell at that rep's valtype (`cellDeclStores`).
+- **`mapBox`.** A bare top-level `const t = m[k]` over a union-valued map is the box read at the
+  cell (`mapGetAt`, no element-read row), as a local's binding arm is. N2 confirmed no overlap with
+  its map-index cells. Of the 16 tests/cases programs that stopped there, 7 start bodies now match;
+  the other 9 stop at other lanes' classes.
 - **Holder nulls.** A holder global legacy declares nullable takes its record or null, so its cell
   is noted at the nullable record (`holderCellTakesNull`).
 
@@ -42,4 +46,6 @@ New test cases:
 
 - The holder globals' reads: the null test reads the nullable record cell at the closure's
   `F | null`. That is `start: global read coercion`, now the start blocker of both bundle programs.
-- `maps/union-valued-maps-share-one-struct.vl` stops next at `start: global initializer mapBox`.
+- `maps/union-valued-maps-share-one-struct.vl` stops next at `start: argument coercion`.
+- Reducing a bundle witness hit a legacy refusal: a module-level map of closure bundles read inside
+  a function is refused ("unsupported map value type"). It is not filed yet.
