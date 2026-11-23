@@ -434,19 +434,19 @@ Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // An `as?` over a type parameter at a pin where it cannot fail, which legacy boxes after the
-    // tag, is outside the set too.
+    // An `as!` over a type parameter pinned at no number, which legacy writes as the operand and a
+    // trap inside the expression, is outside the set too.
     const src = `function greet(c: boolean): i32 {
   const x = null
   return (if c { x } else { x }) ?? 0
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv<T>(u: T): i32 | null {
-  return u as? i32
+function cv<T>(u: T): i32 {
+  return u as! i32
 }
 print(greet(true))
 print(ap((x: i32) => x + 1))
-print(cv(3))
+print(cv("s"))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
@@ -1555,6 +1555,8 @@ Deno.test({
       "pop-or-bool-out": 2,
       "pop-or-out-unwritten": 5,
       "record-field-read-twice": 2,
+      "stored-read-of-i32-field": 2,
+      "stored-read-of-boxed-nullable-field": 0,
       "map-read-probe-of-i32": 2,
       "map-read-on-pop-arm": 2,
       "map-read-out-unwritten": 5,
@@ -1595,6 +1597,8 @@ Deno.test({
       "init-progress-effect": 0,
       "literal-cast-of-record": 2,
       "literal-cast-of-i32": 0,
+      "hole-opt-box-of-record": 2,
+      "hole-opt-box-of-i32": 0,
       "retag-closures-of-differing-arity": 2,
       "retag-closures-of-differing-arity-noted": 0,
       "map-delete-of-map": 0,
@@ -3003,6 +3007,27 @@ Deno.test({
   },
 });
 
+// A record literal whose storage row holds a tagged set of generic functions is built at that row:
+// the set's i32 id, though the row's type is open in the set's members. A global written whole, a
+// second field beside it, a nested record and a conditional write.
+const TAGGED_OPEN_ROW: string[] = [
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nlet r = { f: id1 }\nr = { f: id2 }\nprint(r.f(2))\nprint(r.f(2.5))\n",
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nfunction id3(a) { return a }\nlet s = { f: id1, n: 1 }\ns = { f: id2, n: 2 }\ns = { f: id3, n: 3 }\nprint(s.f(4))\nprint(s.f(4.5))\nprint(s.n)\n",
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nlet t = { g: { f: id1 } }\nt = { g: { f: id2 } }\nprint(t.g.f(5))\nprint(t.g.f(\"x\"))\n",
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nlet n = 1\nlet u = { f: id1 }\nif n > 0 { u = { f: id2 } }\nprint(u.f(6))\nprint(u.f(6.5))\n",
+];
+const TAGGED_OPEN_ROW_FULL = new Set(["fns", "covered", "verified", "matched", "start fns", "start covered", "start verified", "start matched"]);
+Deno.test({
+  name: "ir shadow: a literal at a row open only in a tagged function set is built there and matches",
+  ignore,
+  fn: () => {
+    for (const src of TAGGED_OPEN_ROW) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+      const misses = [...rows.keys()].filter((k) => !TAGGED_OPEN_ROW_FULL.has(k) && !k.endsWith(": matched"));
+      if (misses.length > 0) throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
 // A lone-literal field filled from a binding of that literal, built at a parameter's row that
 // keeps the field as its atom: the binding's member id (`atom_sole`) is an atom typed at the
 // literal, which rule 3 admits (`loneLitAtom`). The callee's own row read stays a named miss.
