@@ -32,4 +32,21 @@ capture's binding type, did not. The capture's type stayed open, `capRepAtTy` ga
 function, a nested closure and twice. Master leaves four functions on `capture binding` and one on
 `callee captures`; this branch matches all 21 and the start, with the same output and bytes.
 
-READINGS
+Fixpoint seeds on both sides, master b03c57be against this branch, `VL_STD` the tree's:
+
+- tests/cases: `capture binding` functions 7 → 6; matched 79053 → 79054; 0 fail or mismatch rows
+  on both.
+- Self-compile: 20378 covered, matched and claimed on both; modes 1, 3 and 5 build the plain bytes,
+  the same as master's.
+- `ir-identity --names`: differ 0, self-compile identical. `--claimless`: identical 14047, differ 0.
+  `--cases`: identical 7722, fail under both 68, differ 0; witnesses same 61, differ 0.
+- tests/cases legacy A/B: identical 7435, fail under both 67, differ 0; nothing moved.
+- Order check (mode 6): 0 order rows over the distilled corpus and over tests/cases.
+- `self-ir-misses`: 0 missed. Deep nesting: 8 passed; the labelled-loop margin passes at 910 KB and
+  fails at 900, as master's seed does.
+- Fuel: L2 121639512648 on both.
+
+After merging master with #9764 (the narrowed box capture, the same function): the merge was clean.
+On the merged fixpoint, both rows match (21 and 9 functions and their starts), `scripts/gate.sh
+--fast` passes, `--cases` reads identical 7747 and differ 0, `self-ir-misses` reads 0, deep nesting
+passes 8, and the margin is master's.
