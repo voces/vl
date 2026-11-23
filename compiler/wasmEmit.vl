@@ -4487,10 +4487,40 @@ function emitDiscrimFieldEq(
     )
   }
   if emitExpr(recvIx, fnIx) < 0 { return -1 }
+  return discrimFieldEqTail(vi, fi, lex, fnIx)
+}
+
+// `emitDiscrimFieldEq` past its receiver read: the box on the stack, field `fi` of arm `vi`
+// compared with `lex`.
+export function discrimFieldEqTail(vi: i32, fi: i32, lex: string, fnIx: i32) {
   fbStructGet(uBoxIdx, 1)
   fbRefCast(variantHeap(vi))
   fbStructGet(variantHeap(vi), fi)
   return emitFieldLitEq(uFieldStart[vi] + fi, lex, fnIx)
+}
+
+// Whether `emitFieldLitEq` has a compare for a field stored at flat row `r`.
+function fieldLitEqOk(r: i32): boolean {
+  if fieldRowIsStr(r, false) || fieldRowIsStr(r, true) { return true }
+  const nk = fieldRowNumKind(r)
+  return nk == 0 || nk == 3 || nk == 4
+}
+
+// Whether `emitVariantDiscrimTest` writes arm `vi`'s discriminant fields without a refusal:
+// its spans laid out, and every needed field holding literals its storage can compare.
+function variantDiscrimPlanOk(vi: i32): boolean {
+  if vi < 0 || vi >= uFieldCount.length || !variantFieldSpanOk(vi) {
+    return false
+  }
+  let fi = 0
+  while fi < uFieldCount[vi] {
+    if variantDiscrimFieldNeeded(vi, fi) {
+      if variantFieldLitLexes(vi, fi).length == 0 { return false }
+      if !fieldLitEqOk(uFieldStart[vi] + fi) { return false }
+    }
+    fi = fi + 1
+  }
+  return true
 }
 
 // Compares the field value on the stack, stored at flat field row `r`, with the literal `lex`.
@@ -6939,14 +6969,25 @@ function emitIsTestVariant(isIx: i32, nd: IsExpr, fnIx: i32) {
   }
 }
 
-// The variant rung at `V`'s tested row `vi` (`variantIsArmOf`'s `row`): a static row fold where
-// the row is the answer, else the box tag and discriminant test. 0 once on the stack, -1 failed.
-function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
-  if vi < 0 || vi >= uVarTyIx.length {
-    return emitFail(
-      "emitProgram: internal: the variant rung lost its tested row",
-    )
-  }
+// How `emitIsTestVariantRow` answers `recv is V` at tested row `vi`: lost, a static fold (the
+// receiver unread), a closed record that never fits (evaluated, dropped), no union value, the tag
+// alone, the tag and its discriminant over a re-readable receiver, or the full `chain`.
+export type VariantRowArm = "lost"
+  | "foldTrue"
+  | "foldFalse"
+  | "neverFits"
+  | "notUnion"
+  | "plainTag"
+  | "discrim"
+  | "chain"
+
+export function variantRowArmOf(
+  isIx: i32,
+  nd: IsExpr,
+  fnIx: i32,
+  vi: i32,
+): VariantRowArm {
+  if vi < 0 || vi >= uVarTyIx.length { return "lost" }
   // A row holding several members answers from the value's fields after its tag (D5157).
   const shared = armRowSharedAtRecv(nd.isObj, vi)
   const rvi = exprVariantIndex(nd.isObj, fnIx)
@@ -6964,10 +7005,7 @@ function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
       || (!variantHasDiscrimField(rvi)
       && !variantHasDiscrimField(vi)
       && !isFitsAcrossTagRows(vi, isVarTyIxOf(isIx), nd.isObj, fnIx))
-    if foldOk {
-      if rvi == vi { fbI32Const(1) } else { fbI32Const(0) }
-      return 0
-    }
+    if foldOk { return if rvi == vi { "foldTrue" } else { "foldFalse" } }
   }
   if !exprUnion(nd.isObj, fnIx) {
     // An instance's closed record receiver answers by value fit: a record whose fields can
@@ -6975,13 +7013,48 @@ function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
     if (
       recNeverFitsArm(isVarTyIxOf(isIx), nodeTyAt(unwrapParen(nd.isObj), fnIx))
     ) {
-      if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-      fbDrop()
-      fbI32Const(0)
-      return 0
+      return "neverFits"
     }
+    return "notUnion"
+  }
+  const rows: i32[] = []
+  const kinds: i32[] = []
+  crossTagFitRows(vi, isVarTyIxOf(isIx), nd.isObj, rows, kinds, fnIx)
+  if (
+    shared
+    || rows.length > 0
+    || isFitsAcrossTagRows(vi, isVarTyIxOf(isIx), nd.isObj, fnIx)
+  ) {
+    return "chain"
+  }
+  if !variantNeedsDiscrim(vi) { return "plainTag" }
+  if unionEqOperandOk(nd.isObj) && variantDiscrimPlanOk(vi) { return "discrim" }
+  return "chain"
+}
+
+// The variant rung at `V`'s tested row `vi` (`variantIsArmOf`'s `row`): a static row fold where
+// the row is the answer, else the box tag and discriminant test. 0 once on the stack, -1 failed.
+function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
+  const arm = variantRowArmOf(isIx, nd, fnIx, vi)
+  if arm == "lost" || vi < 0 || vi >= uVarTyIx.length {
+    return emitFail(
+      "emitProgram: internal: the variant rung lost its tested row",
+    )
+  }
+  if arm == "foldTrue" || arm == "foldFalse" {
+    fbI32Const(if arm == "foldTrue" { 1 } else { 0 })
+    return 0
+  }
+  if arm == "neverFits" {
+    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+    fbDrop()
+    fbI32Const(0)
+    return 0
+  }
+  if arm == "notUnion" {
     return emitFail("emitProgram: `is` receiver is not a union value")
   }
+  const shared = armRowSharedAtRecv(nd.isObj, vi)
   // A receiver the cross-arm terms re-read is evaluated once when it is not a place.
   let ctSlot = -1
   if (
