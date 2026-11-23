@@ -3884,6 +3884,18 @@ function callTargetIs(pos: i32, d: i32): boolean {
   return false
 }
 
+// Render call `c`'s template hole that this instance pins to a string or atom, as that hole's
+// string: `emitCallCore` writes it before any call route (`emitStrValue`).
+function tplHoleStr(b: i32[], c: Call): Opnd {
+  const h = tplStrHoleOf(c, ibFnIx)
+  const v = if exprIsLitAtom(h, ibFnIx) { deliverStr(b, h) } else { irBExpr(b, h) }
+  if ibMiss != "" { return v }
+  if repPrim(irBOpRep(v)) != "str" {
+    return irBMiss("template hole pinned rep")
+  }
+  return v
+}
+
 // A direct call `ix` of a declared, capture-free function by name; its arguments by position.
 function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callFn < 0 || hasNamedArgs(c.callArgNames) {
@@ -8601,6 +8613,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       return irBLetTemp(b, { mnAt: ix }, ix, rep)
     }
     if arrNewCallNamed(n, ibFnIx) { return arrNew(b, n, ix, rep) }
+    if tplStrHoleOf(n, ibFnIx) >= 0 {
+      const hv = tplHoleStr(b, n)
+      if ibMiss == "" && irBOpRep(hv) != rep {
+        return irBMiss("template hole pinned rep")
+      }
+      return hv
+    }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return irBMiss("call") }
     // A call typed past its callee's result (a joined result legacy widens) is legacy's.
@@ -8748,9 +8767,8 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 
 // Legacy's strength-reduced masked shift (`shiftMaskFoldOf`'s [x, k, narrow, m, j]): x at the
 // fold's width, then the shift netting `k` against `j` and the mask `m << j`, both constants, as
-// `emitShiftMaskFold` writes them. The narrowing form's wrap is legacy's.
+// `emitShiftMaskFold` writes them.
 function shiftMaskFold(b: i32[], f: i64[], w: i32, ix: i32, rep: i32): Opnd {
-  if f[4] < 0 { return irBMiss("shift-mask fold narrowing") }
   const ir = repNodeOfTy(if w == 64 { numCastKindTy(3) } else { TY_I32 })
   if rep != ir { return irBMiss("shift-mask fold rep") }
   const x = f[0] as% i32
@@ -8764,10 +8782,30 @@ function shiftMaskFold(b: i32[], f: i64[], w: i32, ix: i32, rep: i32): Opnd {
     v = widenTo(b, v, x, ir, -1)
     if ibMiss != "" { return v }
   }
-  // A narrowing source (an i64 read at width 32) takes legacy's `i32.wrap_i64`.
+  // A narrowing source (an i64 read at width 32) is legacy's `srPushSource`: the source at i64,
+  // then `i32.wrap_i64`.
+  if f[2] == 1 && irBOpRep(v) != ir {
+    const w64 = repNodeOfTy(numCastKindTy(3))
+    const p = widenPlanOf(x, 3, ibFnIx)
+    if p.wpArm != "plain" { return irBMiss("widen " + p.wpArm) }
+    const v64 = widenTo(b, v, x, w64, -1)
+    if ibMiss != "" { return v64 }
+    if irBOpRep(v64) != w64 {
+      return irBMiss("shift-mask fold narrowing source")
+    }
+    v = irBLetTempTy(
+      b,
+      { nwV: v64, nwSrc: 3, nwDst: 1, nwAt: x },
+      x,
+      ir,
+      TY_I32,
+    )
+    if ibMiss != "" { return v }
+  }
   if irBOpRep(v) != ir { return irBMiss("shift-mask fold narrowing source") }
   const k = f[1]
-  const j = f[4]
+  // The narrowing form `(y >>> k) as% i32 & m` has no outer shift: `srEmitNarrowed`'s j of 0.
+  const j = if f[4] < 0 { 0 } else { f[4] }
   let s = v
   if k != j {
     const by: Opnd = { oiRep: ir, oiBits: if k > j { k - j } else { j - k } }
@@ -9962,6 +10000,12 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       const v = tagDispatchAt(b, ix, false)
       if ibMiss != "" { return 0 }
       irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+      return 0
+    }
+    if tplStrHoleOf(n, ibFnIx) >= 0 {
+      const hv = tplHoleStr(b, n)
+      if ibMiss != "" { return 0 }
+      irBNode(b, { dpV: hv }, -1, ibNoValue, ix)
       return 0
     }
     const rhs = callRhs(b, n, ix)
