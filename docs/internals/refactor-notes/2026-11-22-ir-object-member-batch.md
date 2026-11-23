@@ -23,6 +23,8 @@ atom by `deliverStr`, a string as itself. A plain copy (`RRetag`) was tried firs
 rule 2 refuses a `str` → `str` retag, so the hole is returned as the operand.
 
 New test cases: `bitwise/shift-mask-fold-wrapped-i64-source-at-i32.vl` and
-`templates/hole-pinned-string-as-statement-and-value.vl`.
+`templates/hole-pinned-string-as-statement-and-value.vl`. The shadow row `shift-mask-fold.vl` now
+expects its narrowing source covered. A template needs std, which the shadow suite's single-source
+compile does not load, so the pinned hole has no shadow row.
 
 The measurements are in the PR body.
