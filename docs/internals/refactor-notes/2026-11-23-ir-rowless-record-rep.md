@@ -39,6 +39,12 @@ disagreed with the cell. The place half is that decision made for the place itse
   of the value type and the program's row table, not of the site. The same 9 also need the
   `nullty` read of a field, so they stay unclaimed here (they fall back to legacy).
 - IR-M1's start rows (3 argument coercion and object field row rep, 7 open temp type) do not move.
+- The price: `tests/cases/generics/annotated-written-let-of-generic-read-as-itself.vl::a` (one
+  instance) now misses at `local slot shared across reps`. Its annotated record of a closure field,
+  `const r: {f: (t: T) => void}`, is a `let` the place half moves to its slot row, a slot another
+  instance holds at another rep. The next batch wins it back by giving that slot one rep.
+- The `nullty` arm's refusal, `null test nullty operand`: an operand that is not a bare name, which
+  legacy reads at its storage row and drops. Shadow row `rowless-nullty-operand-refused.vl` shows it.
 
 ## Legacy tails the IR calls
 
