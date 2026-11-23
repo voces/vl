@@ -366,6 +366,7 @@ import {
   structFieldBoxTy,
   tagArmLambdaCallee,
   tagDispatchArms,
+  tagDispatchBoxes,
   tagDispatchIds,
   tagDispatchTy,
   tagDispatchTyIsVoid,
@@ -1487,7 +1488,11 @@ function objLitAt(
     const v = if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own }, valIx, ks[k]) } else if typed { repTemp(b, { fnRow: row, fnFi: fi }, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
     if ibMiss != "" { return v }
     const vr = irBOpRep(v)
-    if vr != ks[k] && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr) {
+    if (
+      vr != ks[k]
+      && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr)
+      && !repStoresAs(ks[k], vr)
+    ) {
       return irBMiss("object field coercion")
     }
     layout[fi] = k
@@ -5075,12 +5080,9 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   if arm == "nulAtom" && narrowedNulLitPinBoxKey(c.callArgs[0], ibFnIx) != "" {
     return skip("print nulAtom from a box")
   }
-  // Legacy coerces an `if` argument into the box (`emitPrintValueUnion`).
-  if arm == "union" && nodeAt(unwrapParen(c.callArgs[0])) is IfStmt {
-    return skip("print union if")
-  }
+  const unionIf = arm == "union" && nodeAt(unwrapParen(c.callArgs[0])) is IfStmt
   const from = b.length
-  const v = irBExpr(b, c.callArgs[0])
+  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else { irBExpr(b, c.callArgs[0]) }
   if ibMiss != "" { return 0 }
   // Legacy opens a nullable string's print blocks before its operand, so a valued `if` in it
   // would sit above them.
@@ -5099,6 +5101,18 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   if !ok { return skip("print operand rep") }
   irBNode(b, { efRhs: { pnV: v, pnAt: ix } }, -1, ibNoValue, ix)
   return 0
+}
+
+// A `print`'s `if` argument at the union arm, delivered into its box as legacy's
+// `emitPrintValueUnion` writes it through `emitUnionBoxOwed`: boxed at its own union where the
+// checker records no box.
+function printUnionIf(b: i32[], arg: i32): Opnd {
+  const ty = instTyOrSelf(exprTyOf(arg), ibFnIx)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const rep = repNodeOfTy(ty)
+  if !heldAsBox(rep) { return irBExpr(b, arg) }
+  const fu = if boxOwedAt(arg, ibFnIx) { -1 } else { ty }
+  return deliver(b, arg, rep, fu)
 }
 
 // `__trap__(msg?)`: its message streamed as a string `print` streams one, then `unreachable`, as
@@ -8137,8 +8151,11 @@ function lambdaArmFe(a: i32): i32 {
 }
 
 // Dispatch arm call `a`, delivered at the call's rep `rep` (type `ty`) into body `b`. A lambda arm
-// is a direct call of its instance, at that rep as it stands.
+// is a direct call of its instance. Under a union result an arm the checker records no box at is
+// boxed at the call's union, legacy's `emitUnionBoxOwed` floor.
 function tagArm(b: i32[], a: i32, rep: i32, ty: i32): Opnd {
+  const kind = repSigKindOfTy(ty)
+  const fu = if kind != null && tagDispatchBoxes(kind) && !boxOwedAt(a, ibFnIx) { ty } else { -1 }
   const fe = lambdaArmFe(a)
   const ac = nodeAt(a)
   if fe >= 0 && ac is Call {
@@ -8146,16 +8163,26 @@ function tagArm(b: i32[], a: i32, rep: i32, ty: i32): Opnd {
     if ibMiss != "" { return irBMiss(ibMiss) }
     if !(r is RCall) { return irBMiss("tag dispatch lambda arm call") }
     const si = irSigOf(ib, r.caCallee)
-    if si < 0 || ib.irSigRet[si] != rep {
-      return irBMiss("tag dispatch arm coercion")
-    }
-    return irBLetTempTy(b, r, a, rep, ty)
+    if si < 0 { return irBMiss("tag dispatch arm coercion") }
+    const sr = ib.irSigRet[si]
+    if sr == rep { return irBLetTempTy(b, r, a, rep, ty) }
+    if fu < 0 { return irBMiss("tag dispatch arm coercion") }
+    const lv = irBLetTempTy(b, r, a, sr, instTyOrSelf(exprTyOf(a), ibFnIx))
+    return tagArmBoxed(b, lv, a, rep, fu)
   }
-  const v = deliver(b, a, rep, -1)
-  if ibMiss == "" && irBOpRep(v) != rep {
+  const v = deliver(b, a, rep, fu)
+  if ibMiss != "" || irBOpRep(v) == rep { return v }
+  if fu < 0 { return irBMiss("tag dispatch arm coercion") }
+  return tagArmBoxed(b, v, a, rep, fu)
+}
+
+// Arm value `v` of arm `a` boxed into union `uTy` at rep `rep`.
+function tagArmBoxed(b: i32[], v: Opnd, a: i32, rep: i32, uTy: i32): Opnd {
+  const bv = boxTempIn(b, v, a, rep, -1, uTy)
+  if ibMiss == "" && irBOpRep(bv) != rep {
     return irBMiss("tag dispatch arm coercion")
   }
-  return v
+  return bv
 }
 
 export function irBExpr(b: i32[], ix: i32): Opnd { return exprAt(b, ix, false) }
