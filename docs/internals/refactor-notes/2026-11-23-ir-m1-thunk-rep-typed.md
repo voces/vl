@@ -33,12 +33,15 @@ bytes depend only on the target's signature, never on a VL type.
 
 ## Readings
 
-On the 25 programs with an uncovered thunk, the thunks matched go 96 → 115 of 147, and claimless
-is identical.
+- On the 25 programs with an uncovered thunk, the thunks matched go 96 → 115 of 147. Claimless is
+  identical.
+- Census, master e4642aa0 → head: `legacy module: closure thunk` goes from **25 to 16 programs**.
+  The self-compile still has none.
 
 ## Left
 
-The coordinator ruled these out of this batch. They need open-type support of their own:
+The coordinator ruled these out of this batch, and they now belong to lane IR-N5. They need
+open-type support of their own:
 
 - 20 thunks whose rep's own type is open too;
 - 12 whose parameter rep is `unsup`.
