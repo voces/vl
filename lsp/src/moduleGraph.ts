@@ -421,17 +421,18 @@ type CanonicalExport = {
 
 /**
  * Resolve the symbol named `name` (used in the document at `entryKey`) to its
- * canonical export, off the SELF-HOSTED checker, or `undefined`. Two cases:
+ * canonical export, off the SELF-HOSTED checker, or `undefined`. With `at`, the
+ * checker's site-resolved declaration under that cursor decides: declared in another
+ * module → that module's declaration; declared here → this module's export of it, if
+ * exported. Only that answer tells apart two same-named `self`-functions a method call
+ * picks between. Without `at`, or off any binding the checker tracks (an import
+ * specifier), the name decides:
  *   - `name` is IMPORTED here → the sibling's `(key, exportedName, decl pos)`,
- *     recovered directly from `importedNameSources` (which now carries the
- *     exported name + the sibling's decl-name position).
+ *     recovered directly from `importedNameSources`.
  *   - `name` is a local binding declared+EXPORTED here → `(entryKey, name, decl
  *     pos)` from the entry's own `moduleSurface` export entry.
  * A purely-local (non-exported) binding has no cross-module identity → undefined
  * (the caller reports only same-file references for it).
- *
- * Async because the imported case reads the entry's import sources through the
- * wasm checker (which commits the sibling graph via the workspace reader).
  */
 const canonicalExportOf = async (
   name: string,
@@ -439,11 +440,33 @@ const canonicalExportOf = async (
   entryKey: string,
   read: ModuleReader,
   wasmChecker: WasmChecker,
+  at?: { line: number; character: number },
 ): Promise<CanonicalExport | undefined> => {
+  const site = at === undefined || wasmChecker.definitionSiteAt === undefined
+    ? undefined
+    : await wasmChecker.definitionSiteAt(entrySource, entryKey, read, at.line, at.character);
+  if (site !== undefined && site.key !== entryKey) {
+    return {
+      key: site.key,
+      exportedName: site.name,
+      declLine: site.line,
+      declCol: site.range.start.character,
+    };
+  }
+  const exports = () => wasmChecker.moduleSurface(entrySource, entryKey).exports;
+  if (site !== undefined) {
+    const exp = exports().find((e) =>
+      e.name === site.name && e.declLine === site.line &&
+      e.declCol === site.range.start.character
+    );
+    if (exp === undefined) return undefined;
+    return { key: entryKey, exportedName: exp.name, declLine: exp.declLine, declCol: exp.declCol };
+  }
+
   // Imported here? `importedNameSources` keys by the LOCAL alias and carries the
   // sibling key, the EXPORTED name, and the export's decl-name position.
   const sources = await wasmChecker.importedNameSources(entrySource, entryKey, read);
-  const src = sources[name];
+  const src = Object.hasOwn(sources, name) ? sources[name] : undefined;
   if (src !== undefined) {
     return {
       key: src.key,
@@ -455,8 +478,7 @@ const canonicalExportOf = async (
 
   // Locally declared AND exported here? The entry's own surface lists its
   // exports with their decl-name positions.
-  const surface = wasmChecker.moduleSurface(entrySource, entryKey);
-  const exp = surface.exports.find((e) => e.name === name);
+  const exp = exports().find((e) => e.name === name);
   if (exp !== undefined) {
     return {
       key: entryKey,
@@ -485,7 +507,8 @@ const canonicalExportOf = async (
  * or not — it's de-duplicated by key); `diskFiles` is the pre-enumerated list of
  * on-disk `.vl` paths (from {@link enumerateWorkspaceFiles} or an injected list in
  * tests — empty for single-file / no-crawl callers); `includeDeclaration` mirrors
- * the LSP flag.
+ * the LSP flag; `at` is the cursor in `entrySource`, which resolves the symbol by the
+ * checker's answer at that site rather than by `name` (see `canonicalExportOf`).
  *
  * De-duplication: a file that appears in BOTH `openDocs` and `diskFiles` is
  * searched exactly once (the open-buffer text wins, so the user's unsaved edits
@@ -500,6 +523,7 @@ export const crossFileReferences = async (
   wasmChecker: WasmChecker,
   includeDeclaration = true,
   diskFiles: string[] = [],
+  at?: { line: number; character: number },
 ): Promise<CrossFileReference[] | undefined> => {
   const target = await canonicalExportOf(
     name,
@@ -507,6 +531,7 @@ export const crossFileReferences = async (
     entryKey,
     read,
     wasmChecker,
+    at,
   );
   if (target === undefined) return undefined;
 

@@ -98,7 +98,13 @@ import {
 import { builtinMethodClaims } from "./check_callee"
 import { mkDerivedHole } from "./check_coal"
 import { spreadElemTy } from "./check_container_lits"
-import { checkNodeHook, efLeaf } from "./check_core_state"
+import {
+  checkNodeHook,
+  efLeaf,
+  pendRetCallNote,
+  selfCallPendFn,
+  selfCallPendIx,
+} from "./check_core_state"
 import {
   cstrOwnerTop,
   memCalleeMark,
@@ -246,7 +252,7 @@ import {
 } from "./check_relate_core"
 import { identFnDeclOf, moduleNameTyOf } from "./check_scopes"
 import { noteArrayWriteDemand } from "./check_subst"
-import { symMemMethod } from "./check_sym_occ"
+import { symMemMethod, symMethodCallNote } from "./check_sym_occ"
 import { tpGradualView } from "./check_tp_join"
 import {
   RET_PENDING,
@@ -605,8 +611,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   if !ufcsInferCallee(callee.name, callee.top, fnTy) { return -1 }
   const ft = tyAt(fnTy)
   if ft is TyFunc {
-    let retTy = ft.fnRet
-    if retTy == -2 { retTy = TY_ERR }
+    let retTy = ufcsPendRet(ft.fnRet, callee.decl, ix)
     const params = ft.fnParamTypes
     let args = n.callArgs
     // The arity range the direct spelling takes: the receiver fills `self` and the defaults fill
@@ -702,6 +707,21 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     return retTy
   }
   return -1
+}
+
+// The result member call `ix` takes from a callee `decl` whose return is still pending (-2) or is
+// the `TY_ERR` a recursion group's break left: `TY_ERR` now, and the call is queued to be
+// re-recorded at the callee's published return, as the direct spelling's is (D17073).
+function ufcsPendRet(ret: i32, decl: i32, ix: i32): i32 {
+  if ret != -2 && ret != TY_ERR { return ret }
+  if ret == -2 { pendRetCallNote() }
+  if inferQuiet || decl < 0 { return TY_ERR }
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) || dn.fnRet >= 0 { return TY_ERR }
+  if ret == TY_ERR { pendRetCallNote() }
+  selfCallPendIx.push(ix)
+  selfCallPendFn.push(decl)
+  return TY_ERR
 }
 
 // A member call's callee: the declaration it dispatches to (-1 none), that declaration's name and
@@ -1003,6 +1023,7 @@ export function checkMemberCallNode(
   // A member-access callee is always function-typed for semantic tokens; the builtin arms
   // below type it directly and never revisit the member-read arm, so its name is recorded here (a struct field holding a function falls through to `checkNode` and overwrites it for hover).
   symMemMethod(n.callFn)
+  symMethodCallNote(ix)
   memCalleeMark(n.callFn)
   // An optional call hands the receiver's type in already non-null: `p?.f(…)` resolves the
   // callee against the value its guard admits, not against the `| null` the guard strips.
