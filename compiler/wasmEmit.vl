@@ -1807,6 +1807,7 @@ import {
   monoStaticIsResult,
   msSetOfUnionBox,
   narrowBoxWideArmOf,
+  neverBinWidth,
   njDispatches,
   njKindOfTy,
   njLitBasesOf,
@@ -8492,8 +8493,9 @@ export function refArrayUnionUnboxTail(exprIx: i32, fnIx: i32) {
 let listCastForPush = false
 
 // Whether reading receiver `recvIx` unboxes a list arm, the read `listPayloadCastTail` casts and
-// `listCastForPush` makes strict: a narrowed binding, field or element. Any other shape answers
-// true, so a caller that cannot hold the flag misses rather than casting leniently.
+// `listCastForPush` makes strict: a narrowed binding, field or element, at the receiver or inside
+// it (a call's callee receiver or argument, an operand, an element). Any other shape answers true,
+// so a caller that cannot hold the flag misses rather than casting leniently.
 export function recvReadsListPayload(recvIx: i32, fnIx: i32): boolean {
   const rx = unwrapParen(recvIx)
   if rx < 0 || rx >= P.nodes.length { return true }
@@ -8508,14 +8510,41 @@ export function recvReadsListPayload(recvIx: i32, fnIx: i32): boolean {
       const k = memNarrowAtomKind(rx, fnIx)
       placeReadContainerAt(rx, fnIx) == RC_REF_LIST
         || k >= 0 && listWrapHeapOfKind(k) >= 0
+        || recvReadsListPayload(e.memObj, fnIx)
     }
     Index => {
       const k = if indexElemUnionName(rx, fnIx) != "" { idxNarrowAtomKind(rx, fnIx) } else { -1 }
       placeReadContainerAt(rx, fnIx) == RC_REF_LIST
         || k >= 0 && listWrapHeapOfKind(k) >= 0
+        || recvReadsListPayload(e.idxArr, fnIx)
+        || recvReadsListPayload(e.idxIndex, fnIx)
     }
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => true
+    NumLit | StrLit | CharLit | BoolLit | NullLit => false
+    Call => callReadsListPayload(e, fnIx)
+    BinExpr => recvReadsListPayload(e.binLeft, fnIx) || recvReadsListPayload(e.binRight, fnIx)
+    Unary => recvReadsListPayload(e.unArg, fnIx)
+    ArrayLit => {
+      let any = false
+      for x in e.arrElems { any = any || recvReadsListPayload(x, fnIx) }
+      any
+    }
+    OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => true
   }
+}
+
+// `recvReadsListPayload` of call `c`: a function named by a plain name or a method's receiver,
+// then each argument.
+function callReadsListPayload(c: Call, fnIx: i32): boolean {
+  const f = if c.callFn >= 0 { nodeAt(c.callFn) } else { null }
+  if f is Member {
+    if recvReadsListPayload(f.memObj, fnIx) { return true }
+  } else if !(f is Ident) {
+    return true
+  }
+  for a in c.callArgs {
+    if recvReadsListPayload(a, fnIx) { return true }
+  }
+  return false
 }
 
 // The box's `anyref` payload on the stack, as the list wrapper `wrap` a narrowed read expects.
@@ -10595,6 +10624,46 @@ export function unionConcreteEqPlanOf(
   return p
 }
 
+// The plan of a union `==` whose box is no place (`unionEqOperandOk`), legacy's stashed arm: the
+// box carries the operand's arm, read once into the stash. `uqKind` -1 where another arm writes it.
+export function unionEqStashPlanOf(
+  boxIx: i32,
+  otherIx: i32,
+  fnIx: i32,
+): UnionEqPlan {
+  const no: UnionEqPlan = { uqKind: -1, uqTag: -1 }
+  if unionEqOperandOk(boxIx) { return no }
+  const unr: i32[] = []
+  const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
+  const usid = msSetOfUnionBox(boxIx, fnIx)
+  const eak = unionEqAtomKindOf(
+    otherIx,
+    usid,
+    unionBoxTyOfRead(boxIx, fnIx),
+    fnIx,
+  )
+  if eak < 0 || uname == "" { return no }
+  let hasArm = unionEqArmPresent(usid, valueAtomNameOfKind(eak), eak)
+  if !hasArm && eak == 2 && msSetTakesAtomAsStr(usid) { hasArm = true }
+  if !hasArm { return no }
+  const p: UnionEqPlan = {
+    uqKind: eak,
+    uqTag: unionEqTagOfArmTy(
+      eak,
+      cloBoxEqArmTy(otherIx, unr[0], fnIx),
+    ),
+  }
+  return p
+}
+
+// After the stashed arm's one box read: the stash, the tag tail, and the stash read back.
+export function unionEqStashTail(qp: UnionEqPlan): i32 {
+  fbLocalTee(unionEqStashSlot())
+  unionEqTagTail(qp)
+  fbLocalGet(unionEqStashSlot())
+  return 0
+}
+
 // What a union `==` takes before its first box read: its stash slot, which the frame holds.
 export function unionEqHead(): i32 {
   unionEqStashSlot()
@@ -10647,16 +10716,18 @@ function emitUnionConcreteEq(
     if emitUnionEqOther(otherIx, qp.uqKind, fnIx) < 0 { return -1 }
     return unionEqCmpTail(qp, isNe, fnIx)
   }
-  // D972 — a non-re-readable operand is stashed at its first read, not refused. This compare
-  // reads the box up to three times — the no-arm fold, the tag, and the payload inside the
-  // tag-matched arm — which is the whole content of `unionEqOperandOk` (Ident, NumLit, StrLit,
-  // Member, Index). A call operand is not re-readable.
-
-  // Teed at the first read rather than pre-emitted at the top: the operand must be evaluated
-  // where the original code evaluated it, so any context the surrounding lowering seeds is still
-  // in force. Pre-emitting it ahead of the gates traps.
-  const eqStash = unionEqStashSlot()
-  const eqOnce = !unionEqOperandOk(boxIx)
+  const sp = unionEqStashPlanOf(boxIx, otherIx, fnIx)
+  if sp.uqKind >= 0 {
+    unionEqHead()
+    if emitExpr(boxIx, fnIx) < 0 { return -1 }
+    unionEqStashTail(sp)
+    if unionEqPayloadTail(sp) < 0 { return -1 }
+    if emitUnionEqOther(otherIx, sp.uqKind, fnIx) < 0 { return -1 }
+    return unionEqCmpTail(sp, isNe, fnIx)
+  }
+  // D972 — a non-re-readable box (`unionEqOperandOk`) whose operand has an arm took the stashed
+  // arm above; the arms below read it once each. The stash slot is still reserved here.
+  unionEqHead()
   const unr: i32[] = []
   const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
   // D-VALUNION / D-SETONCE: the union's interned member set, resolved ONCE — the
@@ -10734,12 +10805,17 @@ function emitUnionConcreteEq(
     if isNe { fbI32Const(1) } else { fbI32Const(0) }
     return 0
   }
+  // The arms below read the box more than once: a box that is no place left through the stash.
+  if !unionEqOperandOk(boxIx) {
+    return emitFail(
+      "emitProgram: internal: a union compare reached its re-reading arms with a box that is no place (unionEqStashPlanOf takes every such box)",
+    )
+  }
   // A `K | null` operand equals the box's null when it is `-1`, and is a member string
   // otherwise, where the widened operand is non-null (D3347).
   const nulOther = eak == 2
     && exprNulLitUnion(otherIx, fnIx)
     && unionEqOperandOk(otherIx)
-    && !eqOnce
     && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   if nulOther {
     if emitExpr(otherIx, fnIx) < 0 { return -1 }
@@ -10758,13 +10834,11 @@ function emitUnionConcreteEq(
     && !nulOther
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
     && unionEqOperandOk(otherIx)
-    && !eqOnce
     && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   // The `boolean | null` niche's null is the value 2 (D2260).
   const nulBoolOther = eak == 1
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
     && unionEqOperandOk(otherIx)
-    && !eqOnce
     && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   if nulBoolOther {
     if emitExpr(otherIx, fnIx) < 0 { return -1 }
@@ -10797,10 +10871,8 @@ function emitUnionConcreteEq(
     ),
   }
   if emitExpr(boxIx, fnIx) < 0 { return -1 }
-  if eqOnce { fbLocalTee(eqStash) }
   unionEqTagTail(qt)
-  if eqOnce { fbLocalGet(eqStash) }
-  else if emitExpr(boxIx, fnIx) < 0 { return -1 }
+  if emitExpr(boxIx, fnIx) < 0 { return -1 }
   if unionEqPayloadTail(qt) < 0 { return -1 }
   if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
   // The null took the other branch, so a nullable operand is the non-null ref here.
@@ -15610,18 +15682,31 @@ function emitScalarMapReadOtherEq(
 ): i32 {
   if readLeft {
     if emitMapPrep(rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
-    pushMapHitFlag()
-    if emitMapGetTail(rd.idxArr, fnIx) < 0 { return -1 }
+    if scalarMapEqReadTail(rd.idxArr, true, fnIx) < 0 { return -1 }
     if emitUnionEqOther(otherIx, k, fnIx) < 0 { return -1 }
-    fbI32Bin(atomEqOpcodeOfKind(k))
-    fbI32Bin(113) // 0x71 i32.and
-    return 0
+    return scalarMapEqTail(k, true)
   }
   if emitUnionEqOther(otherIx, k, fnIx) < 0 { return -1 }
   if emitMapPrep(rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
-  if emitMapGetTail(rd.idxArr, fnIx) < 0 { return -1 }
+  if scalarMapEqReadTail(rd.idxArr, false, fnIx) < 0 { return -1 }
+  return scalarMapEqTail(k, false)
+}
+
+// After a scalar map compare's probe: the hit flag where the read is the left operand, then the
+// read's value.
+export function scalarMapEqReadTail(
+  recvIx: i32,
+  readLeft: boolean,
+  fnIx: i32,
+): i32 {
+  if readLeft { pushMapHitFlag() }
+  return emitMapGetTail(recvIx, fnIx)
+}
+
+// After both operands of a scalar map compare of kind `k`: the value compare, anded with the hit.
+export function scalarMapEqTail(k: i32, readLeft: boolean): i32 {
   fbI32Bin(atomEqOpcodeOfKind(k))
-  pushMapHitFlag()
+  if !readLeft { pushMapHitFlag() }
   fbI32Bin(113) // 0x71 i32.and
   return 0
 }
@@ -18288,7 +18373,12 @@ function rangeTopLenOf(s: ForRange) {
 // positive step, `A` a non-negative literal, `v` never rebound in the body, and `xs` served by
 // a live hoist row — whose `len` cannot move while the row is live. `sIx` is the loop, the
 // declaration of `v`. Returns the count pushed.
-function rangeProofOpen(s: ForRange, sIx: i32, stepK: i32, dynStep: boolean) {
+export function rangeProofOpen(
+  s: ForRange,
+  sIx: i32,
+  stepK: i32,
+  dynStep: boolean,
+) {
   if dynStep || stepK <= 0 { return 0 }
   if !exprIsNonNegIntLit(s.frFrom) { return 0 }
   const recv = rangeTopLenOf(s)
@@ -18303,7 +18393,7 @@ function rangeProofOpen(s: ForRange, sIx: i32, stepK: i32, dynStep: boolean) {
   return 1
 }
 
-function rangeProofClose(n: i32) {
+export function rangeProofClose(n: i32) {
   let i = 0
   while i < n {
     rpDecl.pop()
@@ -22519,19 +22609,25 @@ function emitStrCpAt(callIx: i32, fnIx: i32) {
     if callee is Member {
       if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
       if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-      const hs = stashStrRecvIdx()
-      fbLocalGet(hs)
-      fbStrBack()
-      pushStrGuardedOff(hs)
-      pushStrHdrEnd(hs)
-      fbCall(helpUtf8DecFn())
-      fbI32Const(16777215) // 0x00ffffff — drop the width, keep the code point
-      fbI32Bin(113)        // 0x71 i32.and
-      return 0
+      return strCpAtTail()
     }
     return emitFail("emitProgram: string .cpAt receiver is not a member access")
   }
   return emitFail("emitProgram: expected a string cpAt call")
+}
+
+// After `s.cpAt(i)`'s receiver and offset: the receiver stashed, its guarded decode at the offset,
+// and the code point with the width dropped.
+export function strCpAtTail(): i32 {
+  const hs = stashStrRecvIdx()
+  fbLocalGet(hs)
+  fbStrBack()
+  pushStrGuardedOff(hs)
+  pushStrHdrEnd(hs)
+  fbCall(helpUtf8DecFn())
+  fbI32Const(16777215) // 0x00ffffff — drop the width, keep the code point
+  fbI32Bin(113)        // 0x71 i32.and
+  return 0
 }
 
 // Lower `s.cpLen()` — the code-point count, one call into `__utf8_cplen__`. O(n), and the
@@ -27946,14 +28042,20 @@ function emitCallCoreFromCodePoints(callIx: i32, c: Call, fnIx: i32) {
   // effects. `callSpillsFcpArg` is the same question the frame reserved on (D1640).
   if callSpillsFcpArg(callIx) {
     if emitExpr(fcpArg, fnIx) < 0 { return -1 }
-    fbLocalTee(fcpSpillStashSlot())
-    fcpBackingTail()
-    fbLocalGet(fcpSpillStashSlot())
-    return fcpLenTail()
+    return fcpSpillTail()
   }
   if emitExpr(fcpArg, fnIx) < 0 { return -1 }
   fcpBackingTail()
   if emitExpr(fcpArg, fnIx) < 0 { return -1 }
+  return fcpLenTail()
+}
+
+// After a code-point list read once: the spill slot, its backing, its second read off the slot,
+// and the length tail.
+export function fcpSpillTail() {
+  fbLocalTee(fcpSpillStashSlot())
+  fcpBackingTail()
+  fbLocalGet(fcpSpillStashSlot())
   return fcpLenTail()
 }
 
@@ -36739,9 +36841,9 @@ export function forRangeUnrollPlan(s: ForRange, stmtIx: i32, fnIx: i32): i32[] {
 }
 
 // What keeps a range loop of arm "rolled" or "unrolled" from the IR: a dynamic step, a wrap exit
-// (`rangeMayWrap`), or a hoist or range proof legacy may open. Those two read only the tree, not
-// the live rows `loopHoistOpen` and `rangeProofOpen` consult at emit time, since a claim is decided
-// before legacy writes the function; each answers yes wherever legacy might. "" for none.
+// (`rangeMayWrap`), then "proven" or "hoisted" for a range proof or header hoist the IR opens as
+// legacy does. Those two read only the tree, not the live rows `rangeProofOpen` and
+// `loopHoistOpen` consult at emit time; each answers yes wherever legacy might. "" for none.
 export function forRangeRolledBlock(
   s: ForRange,
   stmtIx: i32,
@@ -36750,16 +36852,6 @@ export function forRangeRolledBlock(
   if !forRangeStepIsConst(s.frStep) { return "dynamic step" }
   const k = forRangeStaticStep(s)
   if k == 0 { return "step" }
-  if loopHoistCands(-1, s.frBody, fnIx, stmtIx, -1).length > 0 {
-    return "hoisted"
-  }
-  if (
-    k > 0
-    && exprIsNonNegIntLit(s.frFrom)
-    && hoistPathDecl(rangeTopLenOf(s)) >= 0
-  ) {
-    return "proven"
-  }
   const bConst = rangeConstIs(s.frTo, fnIx)
   const rt: RangeTest = {
     vIdx: -1,
@@ -36772,6 +36864,16 @@ export function forRangeRolledBlock(
     excl: s.frExcl,
   }
   if rangeMayWrap(s, rt) { return "wrap exit" }
+  if (
+    k > 0
+    && exprIsNonNegIntLit(s.frFrom)
+    && hoistPathDecl(rangeTopLenOf(s)) >= 0
+  ) {
+    return "proven"
+  }
+  if loopHoistCands(-1, s.frBody, fnIx, stmtIx, -1).length > 0 {
+    return "hoisted"
+  }
   return ""
 }
 
@@ -37493,11 +37595,11 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
 }
 
 // The element kinds the IR's walk binds as legacy's does: an `i32`, a string, a value union's
-// box, a record, or an `i32`, string or byte list, each read whole into the loop variable.
+// box, a record, or an `i32`, string, byte or record list, each read whole into the loop variable.
 function forInElemPlain(ek: VKind): boolean {
   return match ek {
-    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "nulstr" | "variant" | "nulstruct" | "i64" | "f64" => true
-    "reflist" | "map" | "nulvariant" | "f64list" | "f32" | "closure" | "nullist" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
+    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "i64" | "f64" | "closure" => true
+    "map" | "nulvariant" | "f64list" | "f32" | "nullist" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
   }
 }
 
@@ -42642,6 +42744,9 @@ function binOperandScalarTy(ix: i32, fnIx: i32): i32 {
 // The width a scalar numeric operator works at: the checker's pair rule over its operands
 // (`numPairOpTy`), or `i32` when an operand has no scalar type.
 export function binNumWidth(e: BinExpr, fnIx: i32): string {
+  // A `never` operand holds no value, so the operator works at the other's width (D17064).
+  const nw = neverBinWidth(e, fnIx)
+  if nw != "" { return nw }
   const t = numPairOpTy(
     e,
     binOperandScalarTy(e.binLeft, fnIx),
