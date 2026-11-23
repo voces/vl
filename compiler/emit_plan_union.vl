@@ -197,7 +197,11 @@ import {
   readIsCallResult,
   twoListUseMsg,
 } from "./emit_fn_ret_kinds"
-import { capturedIsUnionBox, identSlotIsUnionBox } from "./emit_fn_scans"
+import {
+  capturedIsUnionBox,
+  identSlotIsUnionBox,
+  memberLenWidensAtom,
+} from "./emit_fn_scans"
 import { vkNonNullRefTwin } from "./emit_list_rep"
 import { nulAtomWidenTexts } from "./emit_lit_atoms"
 import { memNarrowVariantIndex, narrowedStructArmVi } from "./emit_local_scope"
@@ -233,7 +237,9 @@ import {
   arrLitBuild,
   arrLitTyAt,
   arrRefSlotPlain,
+  listFitElemKind,
   listFitGrowRow,
+  numListElemOf,
 } from "./emit_plan_list"
 import {
   isValueUnionOfSet,
@@ -289,6 +295,7 @@ import {
   capNamesFlat,
   capStartTbl,
   emitPhaseReached,
+  fitGrowTy,
   fl128Ty,
   fl32Ty,
   fl64Ty,
@@ -2121,9 +2128,11 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     const iv = recArmPlainOf(unionTy, exprIx, fnIx)
     return if iv >= 0 { holeBox("rec", iv, -1) } else { ladder }
   }
-  // `emitUnionBoxArgGo`'s map-get rung: a map read delivers its miss as the union's own box.
+  // `emitUnionBoxArgGo`'s map-get rung: a map read delivers its miss as the union's own box. A
+  // literal-union read that rung leaves to the ladder takes the atom rungs below, as legacy's does.
   if bare is Index && exprMap(bare.idxArr, fnIx) {
-    return mapReadBoxPlanOf(exprIx, unionTy, fnIx)
+    const mp = mapReadBoxPlanOf(exprIx, unionTy, fnIx)
+    if mp.hbArm != "ladder" || !exprIsLitAtom(exprIx, fnIx) { return mp }
   }
   // `emitUnionMapArmBox`: a map rides the box under its map arm's tag, which its writer reads.
   if (
@@ -3611,7 +3620,10 @@ export function nulRecvNeedsRecover(exprIx: i32, fnIx: i32) {
 function memberReadPlain(memIx: i32, fnIx: i32): boolean {
   const m = nodeAt(memIx)
   if !(m is Member) { return false }
-  if m.memProp == "length" && !lengthIsField(m, memIx, fnIx) { return false }
+  if m.memProp == "length" {
+    const la = memberLengthArmOf(m, memIx, fnIx)
+    if la != "field" && la != "mem" { return false }
+  }
   if readMayBeNulUnit(memIx) && exprIsNulNone(memIx, fnIx) { return false }
   if placeNicheAtomKind(memIx, fnIx) >= 0 { return false }
   // A field read's or a name's receiver recovers in its own read (`emitReadRecover`), in parens
@@ -3621,8 +3633,61 @@ function memberReadPlain(memIx: i32, fnIx: i32): boolean {
     && (o is Member || o is Ident || !readOwesNonNullRecover(m.memObj, fnIx))
 }
 
-// Whether `.length` read `m` at `memIx` is a record's own field, which `emitMemberNode` reads as
-// any field: a struct or variant receiver, with no list-fit grow row and no union-of-containers arm.
+// The arm `emitMemberNode` takes for `m.length`, in its order; a `growCandidate` may still be
+// declined by its emit-time stash read. It lives here because `memberReadPlain` asks it and this
+// module cannot import `wasmEmit`.
+export type MemberLengthArm = "field"
+  | "growCandidate"
+  | "armSite"
+  | "atomStr"
+  | "list"
+  | "map"
+  | "mem"
+
+export function memberLengthArmOf(
+  m: Member,
+  memIx: i32,
+  fnIx: i32,
+): MemberLengthArm {
+  if lengthIsField(m, memIx, fnIx) { return "field" }
+  if lengthGrowCandidate(m, fnIx) { return "growCandidate" }
+  return memberLengthArmPastGrow(m, memIx, fnIx)
+}
+
+// `memberLengthArmOf` past a grow candidate that `emitListFitGrowLen` declined.
+export function memberLengthArmPastGrow(
+  m: Member,
+  memIx: i32,
+  fnIx: i32,
+): MemberLengthArm {
+  const o = m.memObj
+  if armSiteReads(memIx, fnIx) { return "armSite" }
+  if memberLenWidensAtom(o, fnIx) { return "atomStr" }
+  if (
+    exprArray(o, fnIx)
+    || exprString(o, fnIx)
+    || exprRefArray(o, fnIx)
+    || exprStringArray(o, fnIx)
+    || numListElemOf(exprListRep(o, fnIx)) != null
+    || exprU8Array(o, fnIx)
+  ) {
+    return "list"
+  }
+  return if exprMap(o, fnIx) { "map" } else { "mem" }
+}
+
+// Whether `m.length` names a list-fit grow row `emitListFitGrowLen` writes, by the program alone:
+// a named receiver with a grow row whose `K[]` has a list kind.
+function lengthGrowCandidate(m: Member, fnIx: i32): boolean {
+  if !(nodeAt(m.memObj) is Ident) { return false }
+  const g = listFitGrowRow(m.memObj, -1, fnIx)
+  if g < 0 || g >= fitGrowTy.length { return false }
+  const kt = tyAt(fitGrowTy[g])
+  if !(kt is TyArray) { return false }
+  const heaps: i32[] = []
+  return listFitElemKind(tyElemOf(kt), heaps) != null
+}
+
 export function lengthIsField(m: Member, memIx: i32, fnIx: i32): boolean {
   const o = m.memObj
   if structIndexOfExpr(o, fnIx) < 0 && exprVariantIndex(o, fnIx) < 0 {
