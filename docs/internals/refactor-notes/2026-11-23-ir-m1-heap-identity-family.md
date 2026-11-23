@@ -29,6 +29,23 @@ Measured on master ff34a69e / 9c7453e6:
     recorded type (with `j` nullable), against a result whose `j` is non-null.
   - `const _k: K = mk()` then holds a rowless value whose heap the IR does not know.
 
+- **D17083 (#9757, from N8): 5 corpus cells**, `d15221_opt_dbl`, `_opt_half`, `_optb_dbl`,
+  `_optb_half` and `d15293_bound_returned`. All miss `return coercion`.
+  - Witness: `function mk() { return { r: { f: inc0 }, s: { f: dbl } } }`. Legacy builds `$2` =
+    `{ ref null $7, ref null $4 }`, where `$7` is `{ ref $5 }` (the closure struct) and `$4` is
+    `{ i32 }` (a function tag).
+  - So two sibling inner records of one VL type `{f: (i32) => i32}` sit on different heaps, under
+    one open result type.
+  - d15293 is the same pattern inside a list.
+  - The miss needs a returned literal with two siblings holding different hole functions. Bound to a
+    `const` first, as a module global, or with either sibling alone, it is covered and matched.
+  - Routes D1 tried, all failed:
+    - `cloHoleRetag` needs one noted heap for both sides, but the value has none.
+    - `objLitTwinTyAtRow` with `irTyHeldOpen` leaves the inner literals at `open temp type`.
+    - The same-heap retag is refused by rule 2 (`hole-fn-param-into-returned-record`, `mk2`/`mk5`).
+  - Relaxing the verifier was refused. The heap must ride on the rep as an IR note that tells the
+    two sibling records apart.
+
 ## The direction (pre-ruled)
 
 - `recHeapOf` takes legacy's storage row: `structRowOfRecordTy`, plus `globalCellStructIdx` for a
