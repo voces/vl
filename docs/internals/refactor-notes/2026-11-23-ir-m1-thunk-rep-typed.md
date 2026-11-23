@@ -23,7 +23,8 @@ bytes depend only on the target's signature, never on a VL type.
   - the temp, the function's result and the signature's result are one rep.
 - The signature note comes from the same builder (`irSigNote`, from the callee's frame reps).
   The check therefore catches a wrong local, a reorder or a different return, but not a wrong
-  note. That same note is what every call to the callee is checked against.
+  note. Every ordinary call to the callee is checked against that same note, so a wrong note
+  already shows there and in the byte identity (coordinator ruling).
 - Self-tests:
   - `rep-typed-thunk-forwards` holds;
   - `rep-typed-thunk-forwards-env` and `rep-typed-result-not-thunk` are refused, rule 1.
@@ -37,7 +38,7 @@ is identical.
 
 ## Left
 
-These need open-type support of their own:
+The coordinator ruled these out of this batch. They need open-type support of their own:
 
 - 20 thunks whose rep's own type is open too;
 - 12 whose parameter rep is `unsup`.
