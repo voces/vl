@@ -37,6 +37,10 @@ None.
 | armed shadow, corpus / `--claims` | 45442 covered = verified = matched; no fallback |
 | order check (`ir-shadow.vl --prepost`) | 0 order rows, base and head |
 | R7, margin | 429 ok; fail 903 KB / pass 906 KB on both |
+| `self ir misses` | ok, 0 missed (baseline 0) |
+| `tests/vl_deep_nesting_test.ts` (host linked) | 8 passed, 0 failed |
+| `lint-self.sh` | clean |
 | L2 self-compile fuel per PR | +0.00% on 120,978,365,067 |
+| legacy A/B (tests/cases + probes) | 0 moved programs |
 | tests/cases `rep unsup` (mode 4 blockers) | 18 → 9 functions |
 | tests/cases claimed | functions 78,985 → 78,988, starts 6,809 → 6,809 (0 lost) |
