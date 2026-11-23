@@ -38,4 +38,17 @@ the two never take one read twice.
 leaves four functions on `capture binding`; this branch matches all nine and the start, with the
 same output and bytes.
 
-READINGS
+Fixpoint seeds on both sides, master b03c57be against this branch, `VL_STD` the tree's:
+
+- tests/cases: `capture binding` functions 7 → 6; matched 79053 → 79054; 0 fail or mismatch rows
+  on both.
+- Self-compile: 20378 covered, matched and claimed on both; modes 1, 3 and 5 build the plain bytes,
+  the same as master's.
+- `ir-identity --names`: differ 0, self-compile identical. `--claimless`: identical 14047, differ 0.
+  `--cases`: identical 7722, fail under both 68, differ 0; witnesses same 61, differ 0.
+- tests/cases legacy A/B: identical 7435, fail under both 67, differ 0; nothing moved.
+- Order check (mode 6): 0 order rows over the distilled corpus and over tests/cases.
+- `self-ir-misses`: 0 missed. Deep nesting: 8 passed; the labelled-loop margin passes at 910 KB and
+  fails at 900, as master's seed does. `phase state` holds: the narrowing test reads
+  `readNarrowedTyAt`, which the builder already imports, not a checker symbol.
+- Fuel: L2 121646442087 on both.
