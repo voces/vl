@@ -288,6 +288,17 @@ For the queue:
   the upper squash needs a Q46 mechanical merge (#9717, #9720) (queue practice).
 - **Q52.** A verifier given VERIFY-only runs no gate when the queue box gated the same train; the
   queue box gates while a verifier proves (queue practice).
+- **Q53.** When a lower PR in a train stack needs a fix that touches only docs, each affected train
+  is rebuilt as `<train>2` = `<train>1` plus only that fix. The verifier's proof on `<train>1`
+  carries over and only the affected test is rerun on `<train>2`. When the fix touches code, the
+  verifier also reruns `gate.sh --fast`, the affected test and `ir-identity.sh --cases` on
+  `<train>2` (queue practice).
+- **Q54.** A READY whose natural stack position sits above a red train is branched from the last
+  green train instead. The squash check compares against master with that train's own base, so the
+  two branches merge in either order (queue practice).
+- **Q55.** Before a squash, `presq.sh` flags `changelog.d` entries the squash would resurrect
+  (already folded on master, still on a stale branch). The queue removes them in the mechanical
+  master merge and checks that the code tree equals the train's (queue practice).
 
 ### Squash artifacts and Q3 members
 

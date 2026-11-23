@@ -114,6 +114,7 @@ import {
   OStr,
   OVar,
   Opnd,
+  RArmSite,
   RArmUnbox,
   RAsTail,
   RAsUnion,
@@ -143,6 +144,7 @@ import {
   RGetField,
   RGlobalGet,
   RHandPick,
+  RHolderPick,
   RHoleOptBox,
   RInitProgress,
   RJoinNull,
@@ -218,6 +220,8 @@ import {
   RTruncSat,
   RUnionConcreteEq,
   RUnionEq,
+  RUnionNumCrossEq,
+  RUnionVariantEq,
   RVariantChain,
   RVariantDiscrim,
   Rhs,
@@ -315,12 +319,15 @@ import {
   wULEB,
 } from "./emit_bytes"
 import {
+  ARM_IDX_IMM,
+  ARM_IDX_STR,
   EQ_ROOT_EXPR,
   EqRootPlace,
   EqRootPlan,
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
+  armSiteWrite,
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
@@ -590,21 +597,36 @@ import {
   tagIsTail,
   tagStashTail,
   truncSatTail,
+  typedHolderMember,
   uBoxNewIsLast,
   uBoxSinkToPair,
   unionBoxToPairTail,
   unionConcreteEqPlanOf,
   unionEqCmpTail,
   unionEqHead,
+  unionEqNoNullTail,
+  unionEqNulElse,
+  unionEqNulEndTail,
+  unionEqNulPlanOf,
+  unionEqNulTestTail,
+  unionEqNullTagTail,
   unionEqPayloadTail,
   unionEqStashPlanOf,
   unionEqStashTail,
   unionEqTagTail,
+  unionEqVariantRowOf,
   unionLetSinkClose,
+  unionNumCrossBoxTail,
+  unionNumCrossHead,
+  unionNumCrossKindsOf,
+  unionNumCrossTail,
   unionUnionBoxesTail,
+  unionVariantEqHead,
+  unionVariantEqTail,
   urBindConst,
   urDepth,
   urLocalRead,
+  urSlotUnrolled,
   urUnbind,
   userGlobalIdx,
   userGlobalReadClass,
@@ -619,6 +641,7 @@ import {
   atomEqPlanOf,
   holeBoxPlanOf,
   isArmOf,
+  isPreArmOf,
   litIsArmOf,
   litIsMemberTexts,
   memRecvOwesNonNull,
@@ -628,6 +651,7 @@ import {
   narrowedVariantRepIs,
   numIsPlanOf,
   structFieldPlain,
+  tagIsArmOf,
   variantFieldPlain,
 } from "./emit_plan_union"
 import {
@@ -1192,6 +1216,8 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RUnionConcreteEq => unionConcreteEqOp(r)
     RUnionEq => unionEq(r)
+    RUnionVariantEq => unionVariantEq(r)
+    RUnionNumCrossEq => unionNumCrossEq(r)
     RRetag => irLOpnd(r.rgV)
     RStage => irLOpnd(r.sgV)
     RNulTest => nulTestOp(r)
@@ -1243,6 +1269,7 @@ function rhs(r: Rhs, tail: boolean) {
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
     RNicheRead => nicheRead(r)
+    RArmSite => armSite(r)
     RArmUnbox => armUnbox(r)
     RRecCopyPure => {
       leaf()
@@ -1289,6 +1316,7 @@ function rhs(r: Rhs, tail: boolean) {
     RBundlePick => bundlePick(r)
     RResultPick => resultPick(r)
     RHandPick => handPick(r)
+    RHolderPick => holderPick(r)
     RMakeList => makeList(r)
     RSpread => spreadList(r)
     RMapNew => {
@@ -1707,6 +1735,19 @@ function handPick(r: RHandPick) {
   return 0
 }
 
+// `RHolderPick`: the holder's record read, then the member legacy's `emitTypedHolderInit` picks.
+function holderPick(r: RHolderPick) {
+  const pk = bundleMemberPickOf(
+    r.hkArg,
+    typedHolderMember(r.hkAt, lw.irAt),
+    lw.irAt,
+  )
+  if pk.bpHeap < 0 { return irLMiss("holder pick") }
+  irLOpnd(r.hkV)
+  fbStructGet(pk.bpHeap, pk.bpField)
+  return 0
+}
+
 // `RResultPick`: the returned record, then the member legacy's `emitBundleResultPick` picks.
 function resultPick(r: RResultPick) {
   const pk = bundleResultPickOf(r.rkAt, r.rkFe, lw.irAt)
@@ -1830,6 +1871,9 @@ function listEmpty(r: RListEmpty) {
 // a `memberEq` the `litMember` rung writes as its one member's compare (`emitLitMemberEq`).
 function litArmsPlanHolds(r: RLitArms, n: IsExpr): boolean {
   if litIsArmOf(r.liAt, n, lw.irAt) == r.liArm { return true }
+  if r.liArm == "boxLits" && isArmOf(r.liAt, lw.irAt, 0, false) == "armTag" {
+    return tagIsArmOf(r.liAt, n, lw.irAt) == "boxLitSet"
+  }
   return r.liArm == "memberEq"
     && isArmOf(r.liAt, lw.irAt, 0, false) == "litMember"
 }
@@ -1837,6 +1881,18 @@ function litArmsPlanHolds(r: RLitArms, n: IsExpr): boolean {
 // `RLitArms`: the operand and its arm's tail, as `emitIsTestLitArms` writes it; `atomEq` reads the
 // operand once per member. Every other arm is the builder's miss.
 function litArms(r: RLitArms) {
+  // A test at its storage is planned and written under legacy's storage-read mark.
+  const n0 = nodeAt(r.liAt)
+  const stored = n0 is IsExpr && isPreArmOf(r.liAt, lw.irAt) == "storage"
+  const mark = storageReadEnter(
+    if stored && n0 is IsExpr { n0.isObj } else { -1 },
+  )
+  const rc = litArmsAt(r)
+  storageReadLeave(mark)
+  return rc
+}
+
+function litArmsAt(r: RLitArms) {
   lw.irLitReads = 0
   const n = nodeAt(r.liAt)
   if !(n is IsExpr) || !litArmsPlanHolds(r, n) {
@@ -2298,6 +2354,39 @@ function boxNarrow(r: RBoxNarrow) {
 function nicheRead(r: RNicheRead) {
   irLOpnd(r.nrV)
   return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
+}
+
+// `RArmSite`: legacy's tag chain (`armSiteWrite`) over the box variable's local, the index a
+// variable's local, an immediate or a string literal, its element-read row banked around it as legacy's is.
+function armSite(r: RArmSite) {
+  const bl = plainVarLocal(r.asV)
+  if bl < 0 { return irLMiss("arm site receiver") }
+  const ix = r.asIx
+  let il = ARM_IDX_IMM
+  let ii = 0
+  if ix is OImm && repPrim(ix.oiRep) == "i32" {
+    ii = ix.oiBits as% i32
+  } else if ix is OStr {
+    il = ARM_IDX_STR
+  } else {
+    il = plainVarLocal(ix)
+    if il < 0 { return irLMiss("arm site index") }
+  }
+  leaf()
+  const from = irLIndexFrom(r.asAt, lwBuf.length)
+  if armSiteWrite(r.asAt, bl, il, ii, lw.irAt) < 0 { return -1 }
+  irLIndexRow(r.asAt, from)
+  return 0
+}
+
+// The local a named variable `o` is read from with a plain `local.get`, or -1: a temp, a staged
+// value or a range loop copy is read otherwise.
+function plainVarLocal(o: Opnd): i32 {
+  if !(o is OVar) || isTemp(o.ov) { return -1 }
+  if o.ov < lwStackVal.length && lwStackVal[o.ov] { return -1 }
+  const s = varSlot(o.ov)
+  if s < 0 || urSlotUnrolled(s) { return -1 }
+  return s
 }
 
 // `RArmUnbox`: the box, then the table's cast to the read's arm record (`emitArmUnboxAtCell`).
@@ -3308,6 +3397,7 @@ function unionConcreteEqOp(r: RUnionConcreteEq) {
   if !(n is BinExpr) { return irLMiss("union compare node") }
   const boxIx = if r.ucSwap { n.binRight } else { n.binLeft }
   const otherIx = if r.ucSwap { n.binLeft } else { n.binRight }
+  if r.ucNul { return unionNulEq(r, boxIx, otherIx) }
   const qp = if r.ucStash { unionEqStashPlanOf(boxIx, otherIx, lw.irAt) } else { unionConcreteEqPlanOf(boxIx, otherIx, lw.irAt) }
   if qp.uqKind < 0 { return irLMiss("union compare plan") }
   unionEqHead()
@@ -3316,11 +3406,48 @@ function unionConcreteEqOp(r: RUnionConcreteEq) {
     unionEqStashTail(qp)
   } else {
     unionEqTagTail(qp)
-    irLOpnd(r.ucBox)
+    if boxAgain(r, boxIx) < 0 { return -1 }
   }
   unionEqPayloadTail(qp)
   irLOpnd(r.ucOther)
   return unionEqCmpTail(qp, r.ucNe, lw.irAt)
+}
+
+// A union compare's box read once more: its variable, or its read written again (`opndAgain`).
+function boxAgain(r: RUnionConcreteEq, boxIx: i32): i32 {
+  if !r.ucAgain {
+    irLOpnd(r.ucBox)
+    return 0
+  }
+  return opndAgain(r.ucBox, boxIx)
+}
+
+// `RUnionConcreteEq` on legacy's null leg: the operand's null test, the box's null tag (or 0), then
+// the plain arm under the leg's `else`, through the tails legacy writes.
+function unionNulEq(r: RUnionConcreteEq, boxIx: i32, otherIx: i32): i32 {
+  const np = unionEqNulPlanOf(boxIx, otherIx, lw.irAt)
+  if np.unLeg == 0 { return irLMiss("union compare null plan") }
+  const qp = np.unPlan
+  unionEqHead()
+  irLOpnd(r.ucOther)
+  unionEqNulTestTail(np.unLeg)
+  // The box's first read is its own; each later one its read written again (`ucAgain`).
+  let first = true
+  if np.unBoxNul {
+    irLOpnd(r.ucBox)
+    first = false
+    unionEqNullTagTail()
+  } else {
+    unionEqNoNullTail()
+  }
+  unionEqNulElse()
+  if first { irLOpnd(r.ucBox) }
+  else if boxAgain(r, boxIx) < 0 { return -1 }
+  unionEqTagTail(qp)
+  if boxAgain(r, boxIx) < 0 { return -1 }
+  unionEqPayloadTail(qp)
+  irLOpnd(r.ucOther)
+  return unionEqNulEndTail(qp, np.unLeg == 3, r.ucNe, lw.irAt)
 }
 
 // `RUnionEq`: both boxes, then legacy's compare over them (`unionUnionBoxesTail`).
@@ -3330,6 +3457,39 @@ function unionEq(r: RUnionEq) {
   irLOpnd(r.ueL)
   irLOpnd(r.ueR)
   return unionUnionBoxesTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
+}
+
+// `RUnionVariantEq`: legacy's variant door (`emitUnionConcreteVariantEq`): its slots, the box, the
+// record, then the arm's tag and fields (`unionVariantEqTail`).
+function unionVariantEq(r: RUnionVariantEq) {
+  const n = nodeAt(r.uvAt)
+  if !(n is BinExpr) { return irLMiss("union compare node") }
+  const boxIx = if r.uvSwap { n.binRight } else { n.binLeft }
+  const otherIx = if r.uvSwap { n.binLeft } else { n.binRight }
+  const vi = unionEqVariantRowOf(boxIx, otherIx, lw.irAt)
+  if vi < 0 { return irLMiss("union variant compare row") }
+  unionEqHead()
+  unionVariantEqHead(vi)
+  irLOpnd(r.uvBox)
+  irLOpnd(r.uvOther)
+  return unionVariantEqTail(vi, otherIx, r.uvNe, lw.irAt)
+}
+
+// `RUnionNumCrossEq`: legacy's cross-width door (`emitUnionConcreteNumCross`): its slots, the box
+// parked, the number, then each number arm compared at the wider kind (`unionNumCrossTail`).
+function unionNumCrossEq(r: RUnionNumCrossEq) {
+  const n = nodeAt(r.ncAt)
+  if !(n is BinExpr) { return irLMiss("union compare node") }
+  const boxIx = if r.ncSwap { n.binRight } else { n.binLeft }
+  const otherIx = if r.ncSwap { n.binLeft } else { n.binRight }
+  const kas = unionNumCrossKindsOf(boxIx, otherIx, lw.irAt)
+  if kas.length == 0 { return irLMiss("union cross-width compare arms") }
+  unionEqHead()
+  unionNumCrossHead(r.ncKind)
+  irLOpnd(r.ncBox)
+  unionNumCrossBoxTail()
+  irLOpnd(r.ncOther)
+  return unionNumCrossTail(kas, r.ncKind, r.ncNe)
 }
 
 // `RNumUnionBin`: legacy's `numUnion` dispatch in `emitNumUnionBin`'s order: each side's value

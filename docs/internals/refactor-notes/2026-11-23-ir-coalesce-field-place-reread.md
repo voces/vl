@@ -39,3 +39,10 @@ Four field-place functions remain, each with the receiver in another shape:
 - `coalesce-arm-nullable-field` (an anonymous arm record);
 - `mixed-union-list-nested-null-leaf` (a field of a narrowed field);
 - `map-binding-adopts-delivered-map-type::sink` (a narrowed local).
+
+## Also covered
+
+- `byElem` in `tests/ir-shadow-rows/union-eq-read-again-kinds.vl` (`gs[1] != "b"`, a union compare
+  over an element of a global list) was a pinned `uncovered union compare box`. The element re-read
+  covers it: its receiver's read is written again, so the element is registered in `irReadElem`
+  and written again for the compare's later read. The row now expects all 5 functions covered.
