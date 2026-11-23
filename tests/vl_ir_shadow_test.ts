@@ -2963,3 +2963,28 @@ Deno.test({
     }
   },
 });
+
+// A record literal whose storage row holds a tagged set of generic functions is built at that row:
+// the set's i32 id, though the row's type is open in the set's members. A global written whole, a
+// second field beside it, a nested record and a conditional write.
+const TAGGED_OPEN_ROW: string[] = [
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nlet r = { f: id1 }\nr = { f: id2 }\nprint(r.f(2))\nprint(r.f(2.5))\n",
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nfunction id3(a) { return a }\nlet s = { f: id1, n: 1 }\ns = { f: id2, n: 2 }\ns = { f: id3, n: 3 }\nprint(s.f(4))\nprint(s.f(4.5))\nprint(s.n)\n",
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nlet t = { g: { f: id1 } }\nt = { g: { f: id2 } }\nprint(t.g.f(5))\nprint(t.g.f(\"x\"))\n",
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nlet n = 1\nlet u = { f: id1 }\nif n > 0 { u = { f: id2 } }\nprint(u.f(6))\nprint(u.f(6.5))\n",
+];
+const TAGGED_OPEN_ROW_FULL = new Set(["fns", "covered", "verified", "matched", "start fns", "start covered", "start verified", "start matched"]);
+Deno.test({
+  name: "ir shadow: a literal at a row open only in a tagged function set is built there and matches",
+  ignore,
+  fn: () => {
+    for (const src of TAGGED_OPEN_ROW) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+      const misses = [...rows.keys()].filter((k) => !TAGGED_OPEN_ROW_FULL.has(k) && !k.endsWith(": matched"));
+      if (misses.length > 0) throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+    }
+  },
+});
