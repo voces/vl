@@ -2463,6 +2463,24 @@ output identical to the unoptimized run:
 
 The fenced `view` spelling now runs within 0.05 s of the hand-hoisted one.
 
+### M11. A view in a module global reloads its descriptor every access (2026-11-23, #9676)
+
+§M10 removed the reload for a view that travels through calls. A view held in a module-level
+`const` does not travel: the emitter stores it in a `(mut (ref null $View))` global set by the
+start function, and every inlined `"[]"` reads `global.get` then `struct.get` of `base` and
+`length`. Taking the views as parameters drops the `global.get` but keeps the `struct.get`s. On
+a three-column u8/u16 kernel at `-O3` that costs 2.18 (globals) and 1.75 (parameters) ns per
+element, against 0.82 for the hoisted `*At` spelling with the same fence and 0.77 raw
+(webcraft P1.4, third pass). No `call` survives in any of them.
+
+Binaryen cannot hoist the reads: its LICM moves only top-level loop statements, these sit in
+the loop condition and in the fence's `if`s, and a `struct.get` through a nullable reference may
+trap. No pass order tried moves them; `--traps-never-happen` would, and would remove the fence
+too. A std accessor cannot help, because the reload happens at each inlined call site. The
+codegen fix is recorded as post-IR-cutover work in
+`refactor-notes/2026-11-23-view-global-reload.md`; until then the multi-column kernel spelling
+is parameters or the hoisted `*At` accessors (§M8).
+
 ## N. The allocator over a shared memory (2026-09-24)
 
 `vl build --shared-memory=<pages>` (#3120) lets several instances — Web Workers — share one

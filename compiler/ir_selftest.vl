@@ -9,6 +9,7 @@ import {
   MapProbe,
   Opnd,
   Rhs,
+  irCloFieldRetagNote,
   irFnNew,
   irGlobalNote,
   irGlobalStoreNote,
@@ -102,8 +103,16 @@ const selfTestIds: string[] = [
   "width-retag-pair-unnoted",
   "hand-pick-of-i32",
   "hand-pick-record-into-i32",
+  "init-progress-as-value",
+  "init-progress-effect",
+  "literal-cast-of-record",
+  "literal-cast-of-i32",
   "retag-closures-of-differing-arity",
+  "retag-closures-of-differing-arity-noted",
+  "map-delete-of-map",
+  "map-delete-of-i32",
   "retag-field-alike-records-two-heaps",
+  "push-many-of-i32",
   "global-read-off-store-type",
   "valued-block-temp-out",
   "atom-sole-into-i32",
@@ -120,6 +129,14 @@ const selfTestIds: string[] = [
   "call-write-back-not-a-capture",
   "coal-str-default-off-rep",
   "coal-atom-str-default-off-rep",
+  "opt-read-of-i32",
+  "dead-return-after-returning-call",
+  "pop-or-default-returning-call",
+  "pop-or-default-never-call",
+  "dead-return-after-never-call",
+  "never-call-value-at-consumer-rep",
+  "returning-call-temp-typed-never",
+  "never-call-value-into-bool",
 ]
 
 // `f(p: i32): i32 { t = p + 1; return t }`, broken the way case `id` names ("holds": not broken).
@@ -197,6 +214,24 @@ function caseFn(id: string): IrFn {
     f.irBody.push(
       node(f, { lDst: g, lRhs: { hpV: from, hpAt: -1, hpArg: -1, hpI: 0 } }, i32r),
     )
+  }
+  // Rule 2: the start body's progress store (`RInitProgress`) is an effect; one bound to a value
+  // is refused, one in statement position holds.
+  if id == "init-progress-as-value" {
+    const g = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(node(f, { lDst: g, lRhs: { ipOrd: 0 } }, i32r))
+  }
+  if id == "init-progress-effect" {
+    f.irBody.push(node(f, { efRhs: { ipOrd: 0 } }, repNodeOfTy(TY_NEVER)))
+  }
+  // Rule 2: a literal cast (`RAsTail`) stages a scalar or an atom id; one of a record is refused,
+  // one of an i32 holds.
+  if id == "literal-cast-of-record" || id == "literal-cast-of-i32" {
+    const ot = mkObjTy(["c0", "c1"], [TY_I32, TY_I32])
+    const rec = irVarNew(f, repNodeOfTy(ot), ot, "local", 1)
+    const from = if id == "literal-cast-of-i32" { v(p) } else { v(rec) }
+    const g = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(node(f, { lDst: g, lRhs: { akV: from, akAt: -1 } }, i32r))
   }
   // Rule 2: a record retag (`RRetag`) stands one plain record for another on one struct heap the
   // builder noted, whose fields lower alike; one of an i32, into an i32, into a record whose field
@@ -343,6 +378,82 @@ function caseFn(id: string): IrFn {
         i32r,
       ),
     )
+  }
+  // A call's effect ends its path only when the call never returns: a bare return after a call
+  // that returns (rule 5) or never does, and a `pop ?? d` default that is a returning call, which
+  // leaves the out unwritten (rule 5), or a never-returning one.
+  if (
+    id == "dead-return-after-returning-call"
+    || id == "pop-or-default-returning-call"
+    || id == "pop-or-default-never-call"
+    || id == "dead-return-after-never-call"
+  ) {
+    irSigNote(f, 0, [i32r], i32r)
+    const c: Rhs = {
+      caCallee: 0,
+      caArgs: [v(p)],
+      caNever: id == "pop-or-default-never-call"
+        || id == "dead-return-after-never-call",
+      caEnv: false,
+      caCaps: [],
+      caWb: [],
+    }
+    if (
+      id == "dead-return-after-returning-call"
+      || id == "dead-return-after-never-call"
+    ) {
+      f.irBody.push(node(f, { efRhs: c }, none))
+      f.irBody.push(node(f, { rtHas: false, rtV: v(-1) }, none))
+      return f
+    }
+    const lt = mkArrayTy(TY_I32)
+    const l = irVarNew(f, repNodeOfTy(lt), lt, "local", 1)
+    const o = irVarNew(f, i32r, TY_I32, "local", 2)
+    const d: i32[] = [node(f, { efRhs: c }, none)]
+    f.irBody.push(
+      node(
+        f,
+        {
+          cbL: v(l),
+          cbLB: [],
+          cbArm: "popOr",
+          cbNull: d,
+          cbOut: o,
+          cbAt: -1,
+          cbMap: null,
+        },
+        i32r,
+      ),
+    )
+  }
+  // A never call's value at its consumer's rep holds; a returning call's temp typed `never` breaks
+  // rule 3, and the never value assigned into a bool breaks rule 2 at that consumer.
+  if (
+    id == "never-call-value-at-consumer-rep"
+    || id == "returning-call-temp-typed-never"
+    || id == "never-call-value-into-bool"
+  ) {
+    const nv = id != "returning-call-temp-typed-never"
+    irSigNote(f, 0, [i32r], if nv { none } else { i32r })
+    const g = irVarNew(f, i32r, TY_NEVER, "temp", -1)
+    const c: Rhs = {
+      caCallee: 0,
+      caArgs: [v(p)],
+      caNever: nv,
+      caEnv: false,
+      caCaps: [],
+      caWb: [],
+    }
+    f.irBody.push(node(f, { lDst: g, lRhs: c }, i32r))
+    if id == "never-call-value-into-bool" {
+      const bl = irVarNew(f, boolr, TY_BOOL, "local", 1)
+      f.irBody.push(node(f, { asDst: bl, asSrc: v(g) }, none))
+    } else {
+      const h = irVarNew(f, i32r, TY_I32, "temp", -1)
+      const add: Rhs = { poOp: "add", poArgs: [v(g), imm(i32r, 1)] }
+      f.irBody.push(node(f, { lDst: h, lRhs: add }, i32r))
+      f.irBody.push(node(f, { dpV: v(h) }, none))
+    }
   }
   // Rules for a fused `pop ?? d`: a pop of an i32, a bool out from an `i32[]`, and a default that
   // never writes the out.
@@ -582,6 +693,15 @@ function caseFn(id: string): IrFn {
     )
   }
   // A retag between closures whose closed parts differ, one parameter against two (rule 2).
+  // The same pair, noted as a closure stored at a plainly written record field, holds.
+  if id == "retag-closures-of-differing-arity-noted" {
+    const one = repClosureOfReps([i32r], i32r, false)
+    const two = repClosureOfReps([i32r, i32r], i32r, false)
+    const c1 = irVarNew(f, one, -1, "local", 1)
+    const c2 = irVarNew(f, two, -1, "temp", -1)
+    f.irBody.push(node(f, { lDst: c2, lRhs: { rgV: v(c1) } }, two))
+    irCloFieldRetagNote(f, f.irBody[f.irBody.length - 1])
+  }
   if id == "retag-closures-of-differing-arity" {
     const one = repClosureOfReps([i32r], i32r, false)
     const two = repClosureOfReps([i32r, i32r], i32r, false)
@@ -601,6 +721,35 @@ function caseFn(id: string): IrFn {
     const l = irVarNew(f, repNodeOfTy(la), la, "local", 1)
     const sn = irVarNew(f, repNodeOfTy(lb), lb, "temp", -1)
     f.irBody.push(node(f, { lDst: sn, lRhs: { rgV: v(l) } }, repNodeOfTy(lb)))
+  }
+  // A map delete whose receiver operand is a map holds; one whose receiver is an i32 is refused
+  // (rule 2).
+  if id == "map-delete-of-map" || id == "map-delete-of-i32" {
+    const mt = mkMapTy(TY_I32, TY_I32, 0)
+    const ml = irVarNew(f, repNodeOfTy(mt), mt, "local", 1)
+    const recv = if id == "map-delete-of-map" { v(ml) } else { v(p) }
+    const sd = irVarNew(f, boolr, TY_BOOL, "temp", -1)
+    f.irBody.push(
+      node(
+        f,
+        {
+          lDst: sd,
+          lRhs: {
+            mdSym: -1,
+            mdNonNull: false,
+            mdLoc: recv,
+            mdRecv: -1,
+            mdKey: v(p),
+            mdAt: -1,
+          },
+        },
+        boolr,
+      ),
+    )
+  }
+  // Rule 2 again: a variadic push of an i32 onto an i32, neither a list.
+  if id == "push-many-of-i32" {
+    f.irBody.push(node(f, { efRhs: { pmV: v(p), pmL: v(p), pmAt: -1 } }, none))
   }
   // Rule 2 again: an arm unbox whose operand is an i32, not a box.
   if id == "arm-unbox-of-i32" {
@@ -699,6 +848,11 @@ function caseFn(id: string): IrFn {
     const cz = irVarNew(f, sr, TY_STR, "temp", -1)
     const r: Rhs = if at { { zaL: v(l), zaD: v(p), zaAt: -1 } } else { { czL: v(l), czD: v(p), czAt: -1 } }
     f.irBody.push(node(f, { lDst: cz, lRhs: r }, sr))
+  }
+  // Rule 2: a standalone `?.` read off a scalar base, which holds no record to test.
+  if id == "opt-read-of-i32" {
+    const ov = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(node(f, { lDst: ov, lRhs: { orV: v(p), orAt: -1 } }, i32r))
   }
   f.irBody.push(node(f, { rtHas: true, rtV: v(t) }, none))
   return f

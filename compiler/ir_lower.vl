@@ -13,6 +13,14 @@ import { mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
 import {
+  emitOptLeafHead,
+  emitOptLeafTail,
+  emitOptLinkNullClose,
+  emitOptLinkNullOpen,
+  optLeafArmOf,
+} from "./wasmEmit"
+import { exprNullableRefNiche } from "./emit_classify"
+import {
   RAtom,
   RBox,
   RClosure,
@@ -65,6 +73,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  addNode,
   condLitTrue,
   i32ToStr,
   nodeAt,
@@ -96,7 +105,7 @@ import { elabSpreadNote, storageReadEnter, storageReadLeave } from "./emit_elab"
 import { forInStringSrc, forInU8Src } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
 import { RC_MAP } from "./emit_start_block"
-import { declaredSlotOfDecl } from "./emit_struct_order"
+import { declaredSlotOfDecl, sFieldIndex } from "./emit_struct_order"
 import {
   IrFn,
   OImm,
@@ -104,6 +113,7 @@ import {
   OVar,
   Opnd,
   RArmUnbox,
+  RAsTail,
   RAsUnion,
   RAtomEq,
   RAtomSole,
@@ -130,6 +140,7 @@ import {
   RGetField,
   RGlobalGet,
   RHandPick,
+  RInitProgress,
   RJoinNull,
   RListCat,
   RListClear,
@@ -145,12 +156,14 @@ import {
   RListNewDefault,
   RListPop,
   RListPush,
+  RListPushMany,
   RListSlice,
   RListStage,
   RLitArms,
   RMakeClo,
   RMakeList,
   RMakeRec,
+  RMapDelete,
   RMapFilter,
   RMapGet,
   RMapGetOr,
@@ -172,10 +185,12 @@ import {
   RNumUnionBin,
   RNumUnionConvert,
   RNumWiden,
+  ROptRead,
   RPrimOp,
   RPrint,
   RRawOp,
   RRecCopyPure,
+  RRecordFitIs,
   RRecover,
   RRel,
   RResultPick,
@@ -198,6 +213,8 @@ import {
   RTruncSat,
   RUnionConcreteEq,
   RUnionEq,
+  RVariantChain,
+  RVariantDiscrim,
   Rhs,
   SAssign,
   SBlock,
@@ -299,7 +316,6 @@ import {
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
-  SHARED_NULL_NONE,
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
@@ -320,6 +336,7 @@ import {
   arrNewLenStash,
   arrNewPlanOf,
   arrNewTail,
+  asLitTail,
   atomEqIsTail,
   atomEqTail,
   atomNotNulIsTail,
@@ -354,6 +371,7 @@ import {
   coalNulRefJoinTag,
   coalNulRefOpen,
   coalNulRefPlanOf,
+  elseLessUnionIfWhy,
   emitArmUnboxAt,
   emitAsUnionTagged,
   emitCapturedRead,
@@ -399,6 +417,7 @@ import {
   forInLoopClose,
   forInMapList,
   forInMapStash,
+  forInPairInit,
   forInRolledOpen,
   forRangeTestOf,
   hoistCandRow,
@@ -419,6 +438,7 @@ import {
   listReserveOpen,
   loopHoistCands,
   loopHoistClose,
+  mapDeleteTail,
   mapGetArmOf,
   mapGetHelperFnOf,
   mapGetMissOf,
@@ -500,6 +520,8 @@ import {
   popOrPlanOf,
   printArmOf,
   printAtomTail,
+  printNulBoolOpen,
+  printNulBoolTail,
   printNulStrOpen,
   printNulStrTail,
   printScalarTail,
@@ -517,13 +539,10 @@ import {
   recCopyPureEmit,
   refArrayUnionUnboxTail,
   sFieldStorageSlot,
-  sharedArmBoxBody,
-  sharedArmBoxHead,
-  sharedArmIsBox,
-  sharedArmIsPlain,
-  sharedArmNullOf,
-  sharedArmNullTail,
-  sharedArmPlainTail,
+  sharedArmHead,
+  sharedArmModeOf,
+  sharedArmModeReads,
+  sharedArmTail,
   sharedArmTestTail,
   sharedReadPlainOf,
   sharedReadPlanOf,
@@ -567,7 +586,10 @@ import {
   unionEqTagTail,
   unionLetSinkClose,
   unionUnionBoxesTail,
+  urBindConst,
+  urDepth,
   urLocalRead,
+  urUnbind,
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
@@ -613,6 +635,10 @@ import {
 } from "./emit_plan_list"
 import { emitFail, fbOpenIf, fbValtype } from "./emit_bytes"
 import {
+  variantDiscrimFieldNeeded,
+  variantFieldLitLexes,
+} from "./emit_map_twins"
+import {
   atomFoldSideTail,
   atomFoldTail,
   atomHookArmOf,
@@ -631,13 +657,17 @@ import {
   coalOptLeafOpen,
   coalOptLeafPlanOf,
   coalOptLeafRead,
+  discrimFieldEqTail,
   emitListEmptyLoop,
+  emitRecordFitIs,
   emptyFitArmBody,
   emptyFitArmHead,
   emptyFitArmsPlain,
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fbRefIfOpenType,
+  fitRecvLegacy,
+  fitRecvReadHook,
   listFitIsPlanOf,
   listFitTail,
   listIsAcrossPlanOf,
@@ -653,11 +683,14 @@ import {
   numLitOnceMember,
   numLitOnceStash,
   optRecvStagedAt,
+  recordFitPlanOf,
   strMemberEqTail,
   unionLitIsPlanOf,
   unionLitNeverTail,
   unionLitPayloadTail,
   unionLitTagHead,
+  variantRowChainTail,
+  variantTagTail,
 } from "./wasmEmit"
 import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
@@ -666,7 +699,12 @@ import {
   objOrderStashSlot,
   unionLitIsStashSlot,
 } from "./emit_if_arm_values"
-import { allocLitChunk, forInLoopAt } from "./emit_plan_list"
+import {
+  ArrLitArm,
+  allocLitChunk,
+  forInLoopAt,
+  forInPairSlotOf,
+} from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -696,6 +734,8 @@ import {
   shIdxTo,
   uBoxIdx,
   uBoxNewEnd,
+  uFieldCount,
+  uVarRow,
   unionSinkBase,
 } from "./emit_state"
 import { ListBuild } from "./emit_ref_list_kinds"
@@ -1031,6 +1071,7 @@ function rhs(r: Rhs, tail: boolean) {
       got
     }
     RMapHas => mapHas(r)
+    RMapDelete => mapDelete(r)
     RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
     RNumUnionBin => numUnionBin(r)
@@ -1082,6 +1123,7 @@ function rhs(r: Rhs, tail: boolean) {
       RListLen |
       RListPop |
       RListPush |
+      RListPushMany |
       RListSlice |
       RMapFilter |
       RStrOp => irLowerListHook(r)
@@ -1101,12 +1143,17 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.ncV)
       numCastTail(r.ncAt, lw.irAt)
     }
+    ROptRead => optRead(r)
     RToBox => boxOp(r)
     RAtomStr => {
       irLOpnd(r.sxV)
       atomStrTail(atomStrPlanOf(r.sxAt, lw.irAt, false))
     }
     RAtomEq => atomEq(r)
+    RAsTail => {
+      irLOpnd(r.akV)
+      if asLitTail(r.akAt, lw.irAt) < 0 { return irLMiss("literal cast tail") }
+    }
     RAsUnion => {
       irLOpnd(r.auV)
       if emitAsUnionTagged(r.auAt, lw.irAt) < 0 {
@@ -1159,6 +1206,9 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.teV)
       boxTagIsTail(r.teTag)
     }
+    RRecordFitIs => irFitTail(r.rfV, r.rfAt, -1, true)
+    RVariantChain => irFitTail(r.vcV, r.vcAt, r.vcVi, false)
+    RVariantDiscrim => variantDiscrim(r)
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
@@ -1205,6 +1255,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMakeClo => makeClo(r)
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
+    RInitProgress => irLMiss("init progress as a value")
     RBundlePick => bundlePick(r)
     RResultPick => resultPick(r)
     RHandPick => handPick(r)
@@ -1835,6 +1886,113 @@ function numIs(r: RNumIs): i32 {
   return 1
 }
 
+// The operands legacy fit writers' tails re-read through `fitRecvReadHook` while `irFitTail`
+// lowers them, innermost last, the receiver node the innermost stands for, and its reads so far.
+// A stack, not a `let` of `Opnd`: a mutable union-typed module cell is checked dearly (D17063).
+const fitRecvOs: Opnd[] = []
+let fitRecvIx = -1
+let fitRecvReads = 0
+
+// `fitRecvReadHook` under `irFitTail`: the operand the first time, then read again as the builder
+// read it. A receiver other than the one the IR holds misses.
+function irFitRecvRead(recvIx: i32, _fnIx: i32): i32 {
+  if unwrapParen(recvIx) != fitRecvIx {
+    return irLMiss("fit receiver other") - 1
+  }
+  const at = fitRecvOs.length - 1
+  if at < 0 { return irLMiss("fit receiver unset") - 1 }
+  const k = fitRecvReads
+  fitRecvReads = k + 1
+  if k == 0 {
+    irLOpnd(fitRecvOs[at])
+    return 0
+  }
+  return opndAgain(fitRecvOs[at], recvIx)
+}
+
+// Legacy's fit writer for `is` test `isIx` over operand `o`, `emitRecordFitIs` when `record`, else
+// the variant chain tail at arm `vi`: the hook set to read `o` and every piece of its state
+// restored at the one exit, whatever the writer answered.
+function irFitTail(o: Opnd, isIx: i32, vi: i32, record: boolean): i32 {
+  const svHook = fitRecvReadHook
+  const svIx = fitRecvIx
+  const svReads = fitRecvReads
+  fitRecvReadHook = irFitRecvRead
+  fitRecvOs.push(o)
+  fitRecvIx = -1
+  fitRecvReads = 0
+  let rc = -1
+  if isIx >= 0 && isIx < P.nodes.length {
+    const n = nodeAt(isIx)
+    if n is IsExpr {
+      fitRecvIx = unwrapParen(n.isObj)
+      rc = if !record { variantRowChainTail(isIx, n, lw.irAt, vi, -1) } else if recordFitPlanOf(isIx, lw.irAt) == 1 { emitRecordFitIs(isIx, lw.irAt) } else { irLMiss("record fit plan") - 1 }
+    }
+  }
+  if fitRecvIx < 0 { irLMiss("variant chain node") }
+  fitRecvReadHook = svHook
+  fitRecvOs.pop()
+  fitRecvIx = svIx
+  fitRecvReads = svReads
+  return rc
+}
+
+// `irFitTail` on each arm, missing: the chain over a node that is no `is` test, the record writer
+// over an `is` whose plan is no record fit. Each misses, and the hook is back at legacy's default.
+export function irFitTailSelfTest(): i32 {
+  const svMiss = lwMiss
+  const o: Opnd = { oiRep: -1, oiBits: 0 }
+  const rc = irFitTail(o, -1, -1, false)
+  const chainMissed = lwMiss != "" && fitRecvReadHook === fitRecvLegacy
+  lwMiss = ""
+  const s: StrLit = { strText: "s", pos: -1 }
+  const t: IsExpr = {
+    isObj: addNode(s),
+    isVariant: "",
+    pos: -1,
+    isNeg: 0,
+    isFit: -1,
+  }
+  const rr = irFitTail(o, addNode(t), -1, true)
+  const recordMissed = lwMiss != "" && fitRecvReadHook === fitRecvLegacy
+  lwMiss = svMiss
+  return if rc < 0 && rr < 0 && chainMissed && recordMissed { 1 } else { 0 }
+}
+
+// `RVariantDiscrim` as `emitIsTestVariantRow` writes a `discrim` row: the variable and the arm's
+// tag, then in an `if` each needed field's literals, or'd within a field and and'd across fields.
+function variantDiscrim(r: RVariantDiscrim): i32 {
+  const n = nodeAt(r.vdAt)
+  if !(n is IsExpr) { return irLMiss("variant discriminant node") }
+  if r.vdVi < 0 || r.vdVi >= uFieldCount.length {
+    return irLMiss("variant discriminant row")
+  }
+  irLOpnd(r.vdV)
+  variantTagTail(r.vdVi)
+  fbIf(127)
+  let first = true
+  let fi = 0
+  while fi < uFieldCount[r.vdVi] {
+    if variantDiscrimFieldNeeded(r.vdVi, fi) {
+      const lexes = variantFieldLitLexes(r.vdVi, fi)
+      let li = 0
+      while li < lexes.length {
+        if opndAgain(r.vdV, n.isObj) < 0 { return -1 }
+        if discrimFieldEqTail(r.vdVi, fi, lexes[li], lw.irAt) < 0 { return -1 }
+        if li > 0 { fbI32Bin(114) }
+        li = li + 1
+      }
+      if !first { fbI32Bin(113) }
+      first = false
+    }
+    fi = fi + 1
+  }
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  return 0
+}
+
 // `RLitArms`' receiver: its operand the first time, then read again as the builder read it.
 function litRecv(r: RLitArms): i32 {
   const n = nodeAt(r.liAt)
@@ -1947,7 +2105,8 @@ function sharedRead(r: RSharedRead) {
   return 0
 }
 
-// One member's arm of shared read `r`, in the form legacy writes it: the plain read, or its box.
+// One member's arm of shared read `r`, in its form (`sharedArmModeOf`) as legacy writes it: the
+// head, the receiver where the form reads it, then the tail.
 function sharedReadArm(
   r: RSharedRead,
   slot: i32,
@@ -1955,19 +2114,12 @@ function sharedReadArm(
   vi: i32,
   fi: i32,
 ): i32 {
-  // A `null` member's arm is legacy's constant, its receiver unread.
-  const nk = sharedArmNullOf(code, vi, fi)
-  if nk != SHARED_NULL_NONE { return sharedArmNullTail(nk) }
-  if sharedArmIsPlain(code, vi, fi) {
-    sharedReadRecv(r, slot)
-    return sharedArmPlainTail(code, vi, fi)
-  }
-  if !sharedArmIsBox(code, vi, fi, r.srAt, lw.irAt) {
-    return irLMiss("shared read arm")
-  }
-  sharedArmBoxHead(vi, fi, r.srAt, lw.irAt)
+  if vi < 0 || vi >= uVarRow.length { return irLMiss("shared read arm row") }
+  const mode = sharedArmModeOf(code, vi, fi)
+  if sharedArmHead(mode, code, vi, fi, r.srAt, lw.irAt) < 0 { return -1 }
+  if !sharedArmModeReads(mode) { return 0 }
   sharedReadRecv(r, slot)
-  return sharedArmBoxBody(vi, fi)
+  return sharedArmTail(mode, code, vi, fi, r.srAt, lw.irAt)
 }
 
 // One receiver push of shared read `r`: its stash slot's box, its global's, else its box local.
@@ -1996,6 +2148,7 @@ function setField(n: SSetField, at: i32) {
 function getField(r: RGetField) {
   const m = nodeAt(r.gfAt)
   if !(m is Member) { return irLMiss("field node") }
+  if r.gfShared { return sharedField(r, m) }
   if fieldIdxAt(r.gfAt, m) < 0 { return irLMiss("field shape") }
   irLOpnd(r.gfV)
   // A member record read the box plan passes as its field's box is lowered at its storage, as
@@ -2012,6 +2165,22 @@ function getField(r: RGetField) {
   const rs = fieldTail(r.gfAt, m)
   storageReadLeave(mark)
   return rs
+}
+
+// A shared template member's read (`gfShared`): the record, then the field at its storage, as
+// `emitMemStructRead` writes it for a node no instance typed.
+function sharedField(r: RGetField, m: Member) {
+  const fnIx = lw.irAt
+  const si = structIndexOfExpr(m.memObj, fnIx)
+  const idx = if si >= 0 { sFieldIndex(si, m.memProp) } else { -1 }
+  if idx < 0 { return irLMiss("shared field shape") }
+  irLOpnd(r.gfV)
+  if memRecvOwesNonNull(r.gfAt, fnIx) { fbRefAsNonNull() }
+  structFieldTail(si, idx, r.gfAt, fnIx)
+  if structUnionBoxTail(si, idx, r.gfAt, fnIx) < 0 {
+    return irLMiss("field unbox")
+  }
+  return 0
 }
 
 // The plain field index member read `at` reads, or -1.
@@ -2261,7 +2430,9 @@ function makeList(r: RMakeList) {
   // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
   // leaves its elements unwritten, so each must be an immediate.
   if arrLitIsForIter(r.mlAt) {
-    const g = arrLitHoistGlobal(r.mlAt, fnIx, arm)
+    // In the IR's full unroll a range variable is its copy's constant; legacy asks the hoist
+    // inside its copy, which reads the variable as that constant, so the copy is bound first.
+    const g = hoistInRangeCopy(r, fnIx, arm)
     if g == -2 { return -1 }
     if g >= 0 {
       for e in r.mlElems {
@@ -2278,6 +2449,9 @@ function makeList(r: RMakeList) {
     && arm != "str"
     && arrLitShortWhy(r.mlAt, fnIx, arm, r.mlElems.length) == "long"
   ) {
+    if r.mlAt < 0 || r.mlAt >= P.nodes.length {
+      return irLMiss("array long node")
+    }
     const a = nodeAt(r.mlAt)
     if !(a is ArrayLit) { return irLMiss("array long node") }
     for e in r.mlElems {
@@ -2322,6 +2496,58 @@ function makeList(r: RMakeList) {
   }
   if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
+}
+
+// Legacy's hoist of `for` iterable `r` (`arrLitHoistGlobal`), asked with each range variable its
+// elements read bound to its copy's constant; every binding is undone before it returns.
+function hoistInRangeCopy(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
+  const bound = bindRangeCopyElems(r, fnIx)
+  const g = arrLitHoistGlobal(r.mlAt, fnIx, arm)
+  let k = 0
+  while k < bound {
+    urUnbind()
+    k = k + 1
+  }
+  return g
+}
+
+// The unroll stack's depth change across `hoistInRangeCopy` of a literal node `at` (a miss where
+// it is no list literal), for the host test: 0, the bindings undone.
+export function irRangeCopyHoistSelfTest(at: i32): i32 {
+  const d = urDepth()
+  const r: RMakeList = {
+    mlElems: [],
+    mlKind: 0,
+    mlSlot: 0,
+    mlAt: at,
+    mlArm: "i32",
+  }
+  hoistInRangeCopy(r, -1, "i32")
+  return urDepth() - d
+}
+
+// Binds each element of literal `r` that reads a range loop's variable, held as an immediate, to
+// that constant on legacy's copy stack (`urBindConst`); returns how many it bound.
+function bindRangeCopyElems(r: RMakeList, fnIx: i32): i32 {
+  if r.mlAt < 0 || r.mlAt >= P.nodes.length { return 0 }
+  const a = nodeAt(r.mlAt)
+  if !(a is ArrayLit) || a.arrElems.length != r.mlElems.length { return 0 }
+  let n = 0
+  let k = 0
+  while k < a.arrElems.length {
+    const x = unwrapParen(a.arrElems[k])
+    const o = r.mlElems[k]
+    if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident && o is OImm {
+      const d = identDeclOf(x)
+      const w = localIndexOf(fnIx, x)
+      if d >= 0 && d < P.nodes.length && nodeAt(d) is ForRange && w >= 0 {
+        urBindConst(w, o.oiBits as% i32)
+        n = n + 1
+      }
+    }
+    k = k + 1
+  }
+  return n
 }
 
 // `RSpread`: legacy's prologue, the source, then the group stash and join `emitArrSpread`'s plain
@@ -2419,9 +2645,16 @@ function forIn(n: SForIn, pending: i32[]) {
   forInListStore(s.fiIter, fnIx, lp)
   forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
+  // A second name is the local legacy's walk binds it at (`forInPairSlotOf`).
+  const pair = s.fiVar2 != ""
+  if pair && (n.xfVar2 < 0 || varSlot(n.xfVar2) != lp.pIdx) {
+    return irLMiss("walk pair slot")
+  }
+  forInPairInit(s, lp)
   const h = irLoopHoistOpen(-1, s.fiBody, s.fiDecl1, s.fiDecl2)
   if h < 0 { return irLMiss("walk hoists") }
   scopeBind(s.fiVar, vSlot)
+  if pair { scopeBind(s.fiVar2, forInPairSlotOf(vSlot)) }
   let d0 = ctrlDepth
   forInBreakOpen(s)
   const kb = walkFrames(n, d0)
@@ -2456,6 +2689,7 @@ function forIn(n: SForIn, pending: i32[]) {
   framesPop(kb)
   forInLoopClose(s, lp, seq)
   loopHoistClose(h)
+  if pair { scopeUnbind() }
   scopeUnbind()
   return 0
 }
@@ -2580,6 +2814,11 @@ function printOp(r: RPrint) {
     printNulStrOpen()
     irLOpnd(r.pnV)
     return printNulStrTail()
+  }
+  if arm == "nulBool" {
+    printNulBoolOpen()
+    irLOpnd(r.pnV)
+    return printNulBoolTail()
   }
   if arm == "union" {
     // Legacy reads the plan, writes the box, then takes the stash slot.
@@ -2867,6 +3106,21 @@ function mapHas(r: RMapHas) {
   irLOpnd(r.mhKey)
   mapRecvKeyTail(sh)
   return mapHasTail()
+}
+
+// `RMapDelete`: the global, its recovery, the key and the op context, then legacy's probe and the
+// entry's tombstone.
+function mapDelete(r: RMapDelete) {
+  const fnIx = lw.irAt
+  if r.mdSym >= 0 && userGlobalReadClass(r.mdSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map delete of a global not read plainly")
+  }
+  const sh = mapRecvShapeOf(r.mdRecv, fnIx)
+  mapRecvRead(r.mdSym, r.mdNonNull, r.mdLoc)
+  mapRecvRefTail(r.mdRecv, fnIx)
+  irLOpnd(r.mdKey)
+  mapRecvKeyTail(sh)
+  return mapDeleteTail()
 }
 
 // `RMapSet`: the global, its recovery, the key and the op context, then the value and legacy's
@@ -3540,6 +3794,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       }
       if (
         r is RListPush
+        || r is RListPushMany
         || r is RListStage
         || r is RListPop
         || r is RListClear
@@ -3591,6 +3846,10 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         const v = memOp(r)
         irLSettle(pending)
         if v == 0 { fbDrop() }
+        return 0
+      }
+      if r is RInitProgress {
+        irInitProgressHook(r.ipOrd)
         return 0
       }
       if r is REnvDrop {
@@ -3687,6 +3946,33 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     }
     SIntSwitch => intSwitch(n, pending, tail)
     SCellSet | SSwitch => irLMiss("statement outside I1")
+  }
+  return 0
+}
+
+// A standalone `?.` as `emitOptMemberValueGo` writes it over an unstaged base: the base's null test
+// and the leaf's head, then the base as non-null (its niche recovered) and the leaf's tail.
+function optRead(r: ROptRead) {
+  const arm = optLeafArmOf(r.orAt, lw.irAt)
+  if arm == "fail" { return irLMiss("optional read arm") }
+  if arm != "nonNull" {
+    irLOpnd(r.orV)
+    fbRefIsNull()
+    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r) }
+    emitOptLinkNullClose(r.orAt, lw.irAt)
+    emitOptLeafHead(r.orAt, lw.irAt)
+  }
+  optReadBase(r)
+  emitOptLeafTail(r.orAt, lw.irAt)
+  return 0
+}
+
+// The optional read's base as `emitOptChainValue` pushes an unstaged one: its niche recovered.
+function optReadBase(r: ROptRead) {
+  irLOpnd(r.orV)
+  const m = nodeAt(r.orAt)
+  if m is OptMember && exprNullableRefNiche(m.omObj, lw.irAt) {
+    fbRefAsNonNull()
   }
   return 0
 }
@@ -3948,11 +4234,13 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     return IF_DONE
   }
   const vt = if atomJoin || atomOut { 127 } else { valtypeOf(lw.irVars[t].vRep) }
-  // A union join opens at the box's blocktype, as `emitUnionIfValueLink` does.
+  // A union join opens at the box's blocktype, as `emitUnionIfValueLink` does; so does an
+  // else-less one its destination's union coercion writes there.
   const boxOut = !lw.irHelper
     && (rr is RBox || rr is RNullable && rr.rnDisc == 4)
     && at >= 0
-    && ifJoinPlanOf(at, lw.irAt).ijArm == "union"
+    && (ifJoinPlanOf(at, lw.irAt).ijArm == "union"
+    || elseLessUnionIfWhy(at, lw.irAt, lw.irVars[t].vTy) == "")
   // A string or reference out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
   const strOut = (repPrim(lw.irVars[t].vRep) == "str"
     || rr is RRecord
@@ -5224,6 +5512,9 @@ export let irLowerListHook: (r: Rhs) => i32 = listUnset
 // The start function's prologue (`emitStrFillCalls`), set by the emitter that owns it.
 export let irStartPrologueHook: () => i32 = noPrologue
 function noPrologue(): i32 { return irLMiss("start prologue unset") }
+// The start body's progress store after a top-level position (`emitInitProgressAt`), set likewise.
+export let irInitProgressHook: (ord: i32) => i32 = noProgress
+function noProgress(_ord: i32): i32 { return irLMiss("init progress unset") }
 // An element store, given its assignment node.
 export let irLowerListSetHook: (n: SListSet, at: i32) => i32 = listSetUnset
 // A list op in statement position, whose value is not wanted.

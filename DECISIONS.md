@@ -13010,3 +13010,21 @@ twins (`type L1 = {n: L1|null}` beside an L2 twin), a compiler stack overflow ca
 `tests/cases/structs/structural-twin-heap-dedup.vl`, and it was seen to admit field-alike records
 on different heaps. Identity is one compare and is what the target checks. Recording the heap on
 the IR keeps the verifier independent of emit (the ruling of the same day above, D17049).
+
+## A call that never returns is built as a value at the rep legacy writes it (2026-11-23, coordinator ruling) — D17064
+
+**Ruled by the coordinator 2026-11-23**, on IR-C1's proposal. The `rep novalue` functions are
+not left legacy-owned, because I8 needs every function. A direct call whose checker type is `never`
+is built as a temp, lowered as `call; unreachable`, and the IR writes the consumer after it as
+legacy does. Its rep is i32, which is legacy's for `never`, or its operator sibling's i32. An operator
+over it is i32, or bool for a comparison, and the destination widens it as for any i32. Verifier
+rule 3 admits the temp's rep only where its checker type is `never` and its defining Rhs is a never
+`RCall`. Rule 6 admits the result rep only for a callee with no result. A returning call's temp
+typed `never` still breaks rule 3. The never value at a bool consumer still breaks that consumer's
+rule 2.
+
+**Why.** Past the `unreachable` the stack is polymorphic, so legacy's dead code after it is valid,
+and the IR has to write the same bytes to claim the function. An operand of another width is a
+named miss rather than a copy of legacy's conversion. An f64 one after the `unreachable` is
+legacy's own invalid module (D17064), and per the ruling of 2026-11-22 above, legacy changes and
+the IR does not reproduce it.
