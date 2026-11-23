@@ -1,0 +1,4 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: a union-box list bound at another union's list.** Every union row is one wasm list over one box heap, and legacy's plain `let` writes no convert, so the IR retags the list as it stands (`boxListRetag`). This covers the distilled corpus's `declaration coercion` d741/d853 family, 14 → 0 cells: 13 named and 1 tests/cases.
+- **IR coverage: a direct-call argument boxed at its parameter's union.** Legacy boxes an argument with no recorded box at its union-box parameter's own union. That decision is now `directArgUnionTyOf`, which both emitters ask, and the IR's box node carries the union its plan is made at. A generic instance's `T | i32` parameter given a scalar, string, atom, list or box now builds in the IR (21 programs fully covered, all matched). A box argument delivered at that union is asked about at the parameter's union, as legacy's plan is (`box into another union` 14 rows → 0 at those sites).
