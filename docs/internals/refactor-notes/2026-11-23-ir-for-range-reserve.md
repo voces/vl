@@ -1,7 +1,7 @@
 # IR: range loops inside a list reserve region (2026-11-23, lane IR-D1)
 
 `for range in a reserve region` was a blanket skip: the builder left every range loop inside a
-list reserve region (D3623) to legacy. Lifting it showed why one function in two differed.
+list reserve region (D3623) to legacy. Lifting it left 5 of the 10 reserve witnesses differing.
 Legacy's `unrollCost` weighs a counted push of an open build region (`listBuildRegionOf`) as
 inline, and refuses to unroll over any other call. That region opens only at emit time, in
 `listReserveOpen`. The builder, asking `forRangeArm` before then, saw a call, kept the loop rolled
