@@ -23,7 +23,7 @@ record, which no global is declared at.
 |---|---|---|---|
 | atom global re-read at `string` | 1 | 3 | 3 functions covered, matched; the start → `global initializer coercion` |
 | `K \| null` global re-read at `string` | 1 | — | → `assignment value re-read rep` (no decode into a non-null string; the local spelling misses too) |
-| rowless record global | 6 | — | 5 covered, matched; 1 → a later `global read coercion` arm |
+| rowless record global (and starts #9765 unmasked into the class) | 7 | — | covered, matched |
 
 Class totals: `start uncovered global read coercion` 18 → 9, `blockers global read coercion` 6 → 3;
 start covered and matched 7,238 → 7,245; functions with no blocker 73,328 → 73,331.
