@@ -52,5 +52,6 @@ with both operands overridden, so no user code is emitted from it.
 | shadow row `arm-site-element-read.vl` | 9 covered = matched (master: 4, 5 `index none`) |
 
 The first `gate.sh --fast` failed on `lint-self` (an unused local) and `kind-ladder sets` (the
-lint's closed `Rhs` copy lacked `RArmSite`). Both are fixed, and the post-merge fast tier and
-`--cases` ran on that change.
+lint's closed `Rhs` copy lacked `RArmSite`, then its field-set copy `asV` / `asIx`). All are fixed;
+after merging master (clean), fixpoint, `--cases` (identical 7741, differ 0), the fast tier,
+`self ir misses` (0) and deep nesting (8/8) ran on the final tree.
