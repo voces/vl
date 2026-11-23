@@ -22,7 +22,7 @@ global, so every compare in a start missed.
   reached `type T = { name: string, l: T | null, r: T | null }`, whose first null field's kid rep is
   a provisional nullable its type does not intern to, so the temp failed verifier rule 3. Master
   fails rule 3 on the same literal at a call argument; that is now the named miss too. The rep
-  layer's cause is the record-literal and field-storage lane's.
+  layer's cause is D17075, the record-literal and field-storage lane's.
 
 Every new piece is a helper, out of `node` and the object-literal loop, whose frames a nested
 lowering pays per level.
