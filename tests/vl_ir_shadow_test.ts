@@ -380,8 +380,8 @@ Deno.test({
   },
 });
 
-// Outside the set: a string coalesce whose default is no literal and a propagating `as`
-// conversion each leave their function uncovered, named. A closure parameter, its baked
+// Outside the set: a `??` over a `null`-typed if-expression and a propagating `as` conversion
+// each leave their function uncovered, named. A closure parameter, its baked
 // callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
@@ -389,13 +389,16 @@ Deno.test({
   fn: () => {
     // A conversion by a propagating `as`, which returns the function's null on a miss, is outside
     // the set too.
-    const src = `function greet(s: string | null, d: string): string { return s ?? d }
+    const src = `function greet(c: boolean): i32 {
+  const x = null
+  return (if c { x } else { x }) ?? 0
+}
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function cv(x: f64): i32 | null {
   const n = x as i32
   return n
 }
-print(greet("a", "!"))
+print(greet(true))
 print(ap((x: i32) => x + 1))
 print(cv(3.0))
 `;
