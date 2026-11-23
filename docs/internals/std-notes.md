@@ -1273,7 +1273,12 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
   plumb's queued ask need none. `atomicWaitI32` passes `-1` (no timeout), so the engine's
   third answer, 2 "timed out", cannot occur and the result is `"woken" | "not-equal"`.
 - **`atomicNotify` traps on a negative count** rather than reading it as unsigned (`-1` would
-  wake 2^32 − 1); a caller who means every waiter passes `2147483647`.
+  wake 2^32 − 1); its doc comment tells a caller who means every waiter to pass `2147483647`.
+- **`"woken"` is a deliberate rename of JS `Atomics.wait`'s `"ok"`** (`"not-equal"` is kept):
+  `"ok"` reads as a success flag beside the `T | E` model. A timeout form would be a new export
+  (`atomicWaitI32For(self, off, expected, timeoutNs: i64)`) adding `"timed-out"`.
+- **Admitted under D2's consumer-in-the-tree clause**: the `tests/fixtures/shared-bands/`
+  fixtures and the guide, on aillu's #9677 and plumb's queued ask. xor is left out for want of one.
 - The wrappers lower to the existing `__atomic_*__` intrinsics (`check_intrinsics.vl`
   `atomicTableBuild`); no compiler change. Pinned by `tests/cases/std/atomic-*.vl` and
   `tests/vl_shared_memory_bands_test.ts`; the multi-instance facts it relies on are measured in
