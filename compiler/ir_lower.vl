@@ -797,6 +797,8 @@ let lwRowTo: i32[] = []
 let lwRowKind: i32[] = []
 // Where each node an element read's row opens at began, in the buffer (`irRowOpens`).
 let lwRowOpenAt: {[i32]: i32} = Map()
+// The row-opening node a pending temp's definition is, by temp: its row opens where it is written.
+let lwRowOpenTemp: {[i32]: i32} = Map()
 
 export function irLMiss(why: string) {
   if lwMiss == "" { lwMiss = why }
@@ -867,6 +869,7 @@ export function irLOpnd(o: Opnd) {
       if isTemp(v) {
         if !tempDefined(v) { return irLMiss("temp used before its definition") }
         if !takeUse(v) { return irLMiss("non-stack temp: used twice") }
+        tempOpenNote(v)
         rhs(tempRhs(v), false)
         lwSeq.push(v)
         return 0
@@ -3747,6 +3750,9 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       if n.lDst >= lwTempRhs.length { return irLMiss("let of a non-temp") }
       lwTempRhs[n.lDst] = n.lRhs
       lwTempDef[n.lDst] = true
+      if lw.irHasRowOpens && lw.irRowOpens.has(id) {
+        lwRowOpenTemp[n.lDst] = id
+      }
       pending.push(n.lDst)
       // A push is consumed through `lwPushed`, not the pending order of the next node.
       const r = n.lRhs
@@ -4197,6 +4203,7 @@ function liveCountIn(vs: i32[]): i32 {
 function stageRoot(v: i32) {
   // It lands above the roots staged before it, as legacy writes the operands in turn.
   lwPushing = true
+  tempOpenNote(v)
   rhs(lwTempRhs[v], false)
   lwPushing = false
   return livePush(v)
@@ -4271,6 +4278,8 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
   }
   const roots = stageLead(n.siCond, pending)
   if lwMiss != "" { return IF_DONE }
+  // A row this `if` opens starts above the earlier operands staged below it (`emitIndexBanked`).
+  rowOpenNote(id)
   joinBoxHead(t, true)
   // The condition is written before the `if` opens and may read values already on the stack;
   // the `if` itself reads none of the values beneath it.
@@ -4804,6 +4813,14 @@ function rowOpenNote(id: i32) {
   return 0
 }
 
+// Re-notes the row a pending temp `v` opens where its definition is written, as legacy's row
+// starts at the receiver's first byte, after any earlier operand staged below it.
+function tempOpenNote(v: i32) {
+  const id = lwRowOpenTemp[v] ?? -1
+  if id >= 0 { lwRowOpenAt[id] = curLen() }
+  return 0
+}
+
 // Where element read `ix`'s row starts: where its receiver's opening statement began, else `from`.
 export function irLIndexFrom(ix: i32, from: i32): i32 {
   const id = lw.irIdxRowAt[ix] ?? -1
@@ -4976,6 +4993,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwRowTo = []
   lwRowKind = []
   lwRowOpenAt = Map()
+  lwRowOpenTemp = Map()
   lwBuf = buf
   lwSinkFired = 0
   lwPushed = []
@@ -5005,6 +5023,7 @@ type LwFrame = {
   lfRowTo: i32[],
   lfRowKind: i32[],
   lfRowOpenAt: {[i32]: i32},
+  lfRowOpenTemp: {[i32]: i32},
   lfBuf: u8[],
   lfSinkFired: i32,
   lfPushed: i32[],
@@ -5033,6 +5052,7 @@ function lwSave(): LwFrame {
     lfRowTo: lwRowTo,
     lfRowKind: lwRowKind,
     lfRowOpenAt: lwRowOpenAt,
+    lfRowOpenTemp: lwRowOpenTemp,
     lfBuf: lwBuf,
     lfSinkFired: lwSinkFired,
     lfPushed: lwPushed,
@@ -5062,6 +5082,7 @@ function lwRestore(f: LwFrame) {
   lwRowTo = f.lfRowTo
   lwRowKind = f.lfRowKind
   lwRowOpenAt = f.lfRowOpenAt
+  lwRowOpenTemp = f.lfRowOpenTemp
   lwBuf = f.lfBuf
   lwSinkFired = f.lfSinkFired
   lwPushed = f.lfPushed
