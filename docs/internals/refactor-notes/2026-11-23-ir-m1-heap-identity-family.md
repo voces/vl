@@ -102,6 +102,9 @@ Measured on master ff34a69e / 9c7453e6:
 Trusts and order:
 - The verifier trusts the builder's heap notes (`irRecHeap`): `recFieldsWiden` and the cell
   note are not re-derived from a struct cell, as `recSubRetag`'s notes are not.
+- `noteCellHeap` notes a cell's heap only where `recHeapOf(rep)` is -1, and -1 is not recorded:
+  a type that later gets a heap of its own, different from the cell's, leaves that note stale and
+  nothing re-asks it (N6's review). Batch 2 records the -1 where it gates a cell note.
 - A cell note met after a retag that rested on the first answer leaves the rep at -2, and the
   verifier refuses that retag (loud, an `ir claims` fallback). No function in tests/cases or the
   named cells shows a rule-2 retag fail (quick A/B after step 3).
