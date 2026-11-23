@@ -40,4 +40,39 @@ lowering pays per level.
 
 ## Witnesses
 
-READINGS
+`tests/ir-shadow-rows/record-compare-place-operand.vl`: globals, field chains two deep over a
+global, a parameter's field, a guarded nullable parameter, an assignment-narrowed local, and a call
+beside a place on either side. Master's seed leaves six of its eight functions and the start
+uncovered; this branch matches all eight and the start, with the same output and bytes.
+
+## Readings (tests/cases census, master 953e649b's fixpoint seed against this branch's)
+
+| class | master | branch |
+| --- | ---: | ---: |
+| start: record compare place operand | 23 | 0 |
+| record compare place operand (functions) | 2 | 0 |
+| starts covered and matched | 6789 | 6807 |
+| start: nullable record eq | 2 | 5 |
+| nullable record eq (functions) | 11 | 12 |
+| start: record compare element place | 2 | 4 |
+| start: record field null rep | 0 | 1 |
+
+The starts this class unblocked that still block name `nullable record eq` (legacy's `nulstruct`
+route), `record compare element place` and `record field null rep` (D17075).
+
+## Proof
+
+Fixpoint seeds on both sides, `VL_STD` the tree's:
+
+- `scripts/gate.sh --fast` passed.
+- Self-compile: 20332 covered, matched and claimed on both; modes 1, 3 and 5 build the plain bytes,
+  the same as master's.
+- `ir-identity --names`: identical 9037, fail under both 3267, differ 0; self-compile identical.
+  `--claimless`: identical 14043, differ 0. `--cases`: identical 7712, fail under both 68, differ 0;
+  witnesses same 62, differ 0.
+- tests/cases legacy A/B: identical 7425, fail under both 67, differ 0; nothing moved.
+- Order check (mode 6): 0 order rows over the distilled corpus and over tests/cases.
+- `self-ir-misses`: 0 missed. Deep nesting: 8 passed; the labelled-loop margin passes at 910 KB
+  and fails at 900, as master's seed does.
+- Fuel: L2 120194810539 against master's 120194527311.
+- Late demands 9 of 9, late tag rows 307 of 307.
