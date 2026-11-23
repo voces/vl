@@ -73,6 +73,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  addNode,
   condLitTrue,
   i32ToStr,
   nodeAt,
@@ -161,6 +162,7 @@ import {
   RMakeClo,
   RMakeList,
   RMakeRec,
+  RMapDelete,
   RMapEq,
   RMapFilter,
   RMapGet,
@@ -188,6 +190,7 @@ import {
   RPrint,
   RRawOp,
   RRecCopyPure,
+  RRecordFitIs,
   RRecover,
   RRel,
   RResultPick,
@@ -415,6 +418,7 @@ import {
   forInLoopClose,
   forInMapList,
   forInMapStash,
+  forInPairInit,
   forInRolledOpen,
   forRangeTestOf,
   hoistCandRow,
@@ -435,6 +439,7 @@ import {
   listReserveOpen,
   loopHoistCands,
   loopHoistClose,
+  mapDeleteTail,
   mapGetArmOf,
   mapGetHelperFnOf,
   mapGetMissOf,
@@ -516,6 +521,8 @@ import {
   popOrPlanOf,
   printArmOf,
   printAtomTail,
+  printNulBoolOpen,
+  printNulBoolTail,
   printNulStrOpen,
   printNulStrTail,
   printScalarTail,
@@ -660,6 +667,7 @@ import {
   coalOptLeafRead,
   discrimFieldEqTail,
   emitListEmptyLoop,
+  emitRecordFitIs,
   emptyFitArmBody,
   emptyFitArmHead,
   emptyFitArmsPlain,
@@ -683,6 +691,7 @@ import {
   numLitOnceMember,
   numLitOnceStash,
   optRecvStagedAt,
+  recordFitPlanOf,
   strMemberEqTail,
   unionLitIsPlanOf,
   unionLitNeverTail,
@@ -698,7 +707,12 @@ import {
   objOrderStashSlot,
   unionLitIsStashSlot,
 } from "./emit_if_arm_values"
-import { ArrLitArm, allocLitChunk, forInLoopAt } from "./emit_plan_list"
+import {
+  ArrLitArm,
+  allocLitChunk,
+  forInLoopAt,
+  forInPairSlotOf,
+} from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -1064,6 +1078,7 @@ function rhs(r: Rhs, tail: boolean) {
       got
     }
     RMapHas => mapHas(r)
+    RMapDelete => mapDelete(r)
     RMapEq => mapEq(r)
     RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
@@ -1199,7 +1214,8 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.teV)
       boxTagIsTail(r.teTag)
     }
-    RVariantChain => irFitTail(r.vcV, r.vcAt, r.vcVi)
+    RRecordFitIs => irFitTail(r.rfV, r.rfAt, -1, true)
+    RVariantChain => irFitTail(r.vcV, r.vcAt, r.vcVi, false)
     RVariantDiscrim => variantDiscrim(r)
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
@@ -1901,9 +1917,10 @@ function irFitRecvRead(recvIx: i32, _fnIx: i32): i32 {
   return opndAgain(fitRecvOs[at], recvIx)
 }
 
-// Legacy's variant chain tail for `is` test `isIx` at arm `vi` over operand `o`: the hook set to
-// read `o` and every piece of its state restored at the one exit, whatever the tail answered.
-function irFitTail(o: Opnd, isIx: i32, vi: i32): i32 {
+// Legacy's fit writer for `is` test `isIx` over operand `o`, `emitRecordFitIs` when `record`, else
+// the variant chain tail at arm `vi`: the hook set to read `o` and every piece of its state
+// restored at the one exit, whatever the writer answered.
+function irFitTail(o: Opnd, isIx: i32, vi: i32, record: boolean): i32 {
   const svHook = fitRecvReadHook
   const svIx = fitRecvIx
   const svReads = fitRecvReads
@@ -1916,7 +1933,7 @@ function irFitTail(o: Opnd, isIx: i32, vi: i32): i32 {
     const n = nodeAt(isIx)
     if n is IsExpr {
       fitRecvIx = unwrapParen(n.isObj)
-      rc = variantRowChainTail(isIx, n, lw.irAt, vi, -1)
+      rc = if !record { variantRowChainTail(isIx, n, lw.irAt, vi, -1) } else if recordFitPlanOf(isIx, lw.irAt) == 1 { emitRecordFitIs(isIx, lw.irAt) } else { irLMiss("record fit plan") - 1 }
     }
   }
   if fitRecvIx < 0 { irLMiss("variant chain node") }
@@ -1927,14 +1944,26 @@ function irFitTail(o: Opnd, isIx: i32, vi: i32): i32 {
   return rc
 }
 
-// `irFitTail` over a node that is no `is` test: it misses, and the hook is back at legacy's default.
+// `irFitTail` on each arm, missing: the chain over a node that is no `is` test, the record writer
+// over an `is` whose plan is no record fit. Each misses, and the hook is back at legacy's default.
 export function irFitTailSelfTest(): i32 {
   const svMiss = lwMiss
   const o: Opnd = { oiRep: -1, oiBits: 0 }
-  const rc = irFitTail(o, -1, -1)
-  const missed = lwMiss != ""
+  const rc = irFitTail(o, -1, -1, false)
+  const chainMissed = lwMiss != "" && fitRecvReadHook === fitRecvLegacy
+  lwMiss = ""
+  const s: StrLit = { strText: "s", pos: -1 }
+  const t: IsExpr = {
+    isObj: addNode(s),
+    isVariant: "",
+    pos: -1,
+    isNeg: 0,
+    isFit: -1,
+  }
+  const rr = irFitTail(o, addNode(t), -1, true)
+  const recordMissed = lwMiss != "" && fitRecvReadHook === fitRecvLegacy
   lwMiss = svMiss
-  return if rc < 0 && missed && fitRecvReadHook === fitRecvLegacy { 1 } else { 0 }
+  return if rc < 0 && rr < 0 && chainMissed && recordMissed { 1 } else { 0 }
 }
 
 // `RVariantDiscrim` as `emitIsTestVariantRow` writes a `discrim` row: the variable and the arm's
@@ -2629,9 +2658,16 @@ function forIn(n: SForIn, pending: i32[]) {
   forInListStore(s.fiIter, fnIx, lp)
   forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
+  // A second name is the local legacy's walk binds it at (`forInPairSlotOf`).
+  const pair = s.fiVar2 != ""
+  if pair && (n.xfVar2 < 0 || varSlot(n.xfVar2) != lp.pIdx) {
+    return irLMiss("walk pair slot")
+  }
+  forInPairInit(s, lp)
   const h = irLoopHoistOpen(-1, s.fiBody, s.fiDecl1, s.fiDecl2)
   if h < 0 { return irLMiss("walk hoists") }
   scopeBind(s.fiVar, vSlot)
+  if pair { scopeBind(s.fiVar2, forInPairSlotOf(vSlot)) }
   let d0 = ctrlDepth
   forInBreakOpen(s)
   const kb = walkFrames(n, d0)
@@ -2666,6 +2702,7 @@ function forIn(n: SForIn, pending: i32[]) {
   framesPop(kb)
   forInLoopClose(s, lp, seq)
   loopHoistClose(h)
+  if pair { scopeUnbind() }
   scopeUnbind()
   return 0
 }
@@ -2790,6 +2827,11 @@ function printOp(r: RPrint) {
     printNulStrOpen()
     irLOpnd(r.pnV)
     return printNulStrTail()
+  }
+  if arm == "nulBool" {
+    printNulBoolOpen()
+    irLOpnd(r.pnV)
+    return printNulBoolTail()
   }
   if arm == "union" {
     // Legacy reads the plan, writes the box, then takes the stash slot.
@@ -3100,6 +3142,21 @@ function mapHas(r: RMapHas) {
   irLOpnd(r.mhKey)
   mapRecvKeyTail(sh)
   return mapHasTail()
+}
+
+// `RMapDelete`: the global, its recovery, the key and the op context, then legacy's probe and the
+// entry's tombstone.
+function mapDelete(r: RMapDelete) {
+  const fnIx = lw.irAt
+  if r.mdSym >= 0 && userGlobalReadClass(r.mdSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map delete of a global not read plainly")
+  }
+  const sh = mapRecvShapeOf(r.mdRecv, fnIx)
+  mapRecvRead(r.mdSym, r.mdNonNull, r.mdLoc)
+  mapRecvRefTail(r.mdRecv, fnIx)
+  irLOpnd(r.mdKey)
+  mapRecvKeyTail(sh)
+  return mapDeleteTail()
 }
 
 // `RMapSet`: the global, its recovery, the key and the op context, then the value and legacy's

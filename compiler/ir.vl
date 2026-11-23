@@ -108,6 +108,9 @@ export type RVariantDiscrim = { vdV: Opnd, vdVi: i32, vdAt: i32 }
 // Box variable `vcV` at arm `vcVi`'s full variant chain at `is` test `vcAt`: legacy's tail
 // (`variantRowChainTail`) with each receiver read the variable (`fitRecvReadHook`): a bool.
 export type RVariantChain = { vcV: Opnd, vcVi: i32, vcAt: i32 }
+// Record variable `rfV` at `is` test `rfAt` along `recordFitPlanOf`: legacy's `emitRecordFitIs`,
+// each field test reading the variable (`fitRecvReadHook`): a bool.
+export type RRecordFitIs = { rfV: Opnd, rfAt: i32 }
 // A field read off a box local narrowed to one variant (`narrowedFieldPlain`); `bfAt` its member.
 export type RBoxField = { bfV: Opnd, bfAt: i32 }
 // A shared field read `srAt` over un-narrowed box `srV`, dispatched on its tag per member (legacy's
@@ -460,6 +463,17 @@ export type RMapHas = {
   mhKey: Opnd,
   mhAt: i32,
 }
+// `m.delete(k)` at call `mdAt` on map global `mdSym` (receiver node `mdRecv`, recovered for
+// `mdNonNull`), or with `mdSym` -1 receiver operand `mdLoc`, key `mdKey`: legacy's probe, the
+// entry's tombstone and an i32 0 or 1.
+export type RMapDelete = {
+  mdSym: i32,
+  mdNonNull: boolean,
+  mdLoc: Opnd,
+  mdRecv: i32,
+  mdKey: Opnd,
+  mdAt: i32,
+}
 // A `==`/`!=` at node `seAt` on legacy's field-wise record compare over eq row `seRow` (a struct's
 // or a variant's): an operand legacy stashes is lowered once; one it re-reads at every field is a
 // variable, or with `seLIx`/`seRIx` holding an index, a ref list element read over that variable.
@@ -569,6 +583,7 @@ export type Rhs = RArmUnbox
   | RMakeClo
   | RMakeList
   | RMakeRec
+  | RMapDelete
   | RMapEq
   | RMapFilter
   | RMapGet
@@ -596,6 +611,7 @@ export type Rhs = RArmUnbox
   | RPrint
   | RRawOp
   | RRecCopyPure
+  | RRecordFitIs
   | RRecover
   | RRel
   | RResultPick
@@ -659,6 +675,7 @@ export type SRangeLoop = {
 export type SForIn = {
   xfList: Opnd,
   xfVar: i32,
+  xfVar2: i32,
   xfBody: i32[],
   xfAt: i32,
   xfBrk: i32,
@@ -1208,6 +1225,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RMakeClo |
       RMakeList |
       RMakeRec |
+      RMapDelete |
       RMapEq |
       RMapFilter |
       RMapGet |
@@ -1235,6 +1253,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RPrint |
       RRawOp |
       RRecCopyPure |
+      RRecordFitIs |
       RRecover |
       RRel |
       RResultPick |
@@ -1501,6 +1520,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RCallRef => opndsCat([r.crFn], r.crArgs)
     RCallHost => r.chArgs
     RTest => [r.teV]
+    RRecordFitIs => [r.rfV]
     RVariantChain => [r.vcV]
     RVariantDiscrim => [r.vdV]
     RBoxField => [r.bfV]
@@ -1537,6 +1557,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMapGetOr => [r.mgLoc, r.mgKey, r.mgDef]
     RMapGet => [r.mtLoc, r.mtKey]
     RMapHas => [r.mhLoc, r.mhKey]
+    RMapDelete => [r.mdLoc, r.mdKey]
     RMapEq => [r.mqLoc, r.mqKey, r.mqOther]
     RMapIter => [r.miV]
     RPrint => [r.pnV]
@@ -1612,6 +1633,7 @@ function rhsText(r: Rhs): string {
     RCallRef => "call_ref " + opndText(r.crFn) + "(" + opndsText(r.crArgs) + ")"
     RCallHost => "call_host " + i32ToStr(r.chImport) + "(" + opndsText(r.chArgs) + ")"
     RTest => "is " + opndText(r.teV) + " tag " + i32ToStr(r.teTag)
+    RRecordFitIs => "record fit " + opndText(r.rfV)
     RVariantChain => "is " + opndText(r.vcV) + " variant " + i32ToStr(r.vcVi) + " chain"
     RVariantDiscrim => "is " + opndText(r.vdV) + " variant " + i32ToStr(r.vdVi) + " discrim"
     RBoxField => "box_field " + opndText(r.bfV) + " @" + i32ToStr(r.bfAt)
@@ -1712,6 +1734,7 @@ function rhsText(r: Rhs): string {
     RMapGetOr => "map.get_or " + mapRecvText(r.mgSym, r.mgLoc) + "[" + opndText(r.mgKey) + "]"
     RMapGet => "map.get " + mapRecvText(r.mtSym, r.mtLoc) + "[" + opndText(r.mtKey) + "]"
     RMapHas => "map.has " + mapRecvText(r.mhSym, r.mhLoc) + "[" + opndText(r.mhKey) + "]"
+    RMapDelete => "map.delete " + mapRecvText(r.mdSym, r.mdLoc) + "[" + opndText(r.mdKey) + "]"
     RMapEq => "map.eq "
       + mapRecvText(r.mqSym, r.mqLoc)
       + "["
@@ -1824,6 +1847,7 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
       p
         + "for v"
         + i32ToStr(n.xfVar)
+        + (if n.xfVar2 >= 0 { ", v" + i32ToStr(n.xfVar2) } else { "" })
         + " in "
         + opndText(n.xfList)
         + " L"
@@ -2036,6 +2060,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RMapFilter |
       RSpread |
       RStrOp => "list"
+    RMapDelete |
     RMapEq |
       RMapGet |
       RMapGetOr |
@@ -2053,6 +2078,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RNulNoneBox |
       RSharedRead |
       RTest => "box"
+    RRecordFitIs => "record"
     RVariantChain => "box"
     RVariantDiscrim => "box"
     RFieldNull |
