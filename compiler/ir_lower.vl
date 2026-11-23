@@ -137,6 +137,7 @@ import {
   RCoerce,
   REnvDrop,
   REnvGet,
+  REqHelp,
   RFieldNull,
   RFnId,
   RGetField,
@@ -401,6 +402,7 @@ import {
   emitUnionNullToPair,
   emitUnionUnboxTail,
   envCacheSlotOfFe,
+  eqHelpTail,
   f64RemCallTail,
   f64RemOperandTail,
   fieldStoreArmOf,
@@ -1139,6 +1141,7 @@ function rhs(r: Rhs, tail: boolean) {
       RMapFilter |
       RStrOp => irLowerListHook(r)
     RStructEq => structEq(r)
+    REqHelp => eqHelp(r)
     RListClear => irLMiss("clear value")
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
@@ -3409,6 +3412,21 @@ function structEq(r: RStructEq) {
   return 0
 }
 
+// `REqHelp`: `__eq_<row>__`'s compare, which reads its operands at their parameter slots.
+function eqHelp(r: REqHelp) {
+  if !paramAtSlot(r.ehL, 0) || !paramAtSlot(r.ehR, 1) {
+    return irLMiss("compare helper operands")
+  }
+  return eqHelpTail(r.ehRow)
+}
+
+// Whether `o` is the function's parameter at wasm slot `slot`.
+function paramAtSlot(o: Opnd, slot: i32): boolean {
+  if !(o is OVar) || o.ov < 0 || o.ov >= lw.irVars.length { return false }
+  const v = lw.irVars[o.ov]
+  return v.vKind == "param" && v.vSlot == slot
+}
+
 // Banks the element-read rows a record compare's `elem` roots wrote (node, from, to), ordered by
 // where each starts.
 function structEqRowsBank(lRows: i32[], rRows: i32[]) {
@@ -5296,6 +5314,37 @@ export function irLowerProbe(f: IrFn, ctx: GlobalCtx): u8[] {
   fbResetLazyFrame()
   if lwMiss != "" { return [] }
   return got
+}
+
+// Lowers the compare helper `f` onto `out` in the frame `eqHelpFnCode` opened, its locals vector
+// that frame's, as legacy's helper writes it. "" when written, else the miss, with nothing written
+// and the lazy frame left empty for legacy.
+export function irLowerEqHelper(f: IrFn, out: u8[]): string {
+  // The lazy frame grows from empty, as `fbBeginFunc` left it; the shadow's follows legacy's.
+  fbResetLazyFrame()
+  lowerBody(f, lwGlobalCtx)
+  if lwPushed.length > 0 { irLMiss("push never consumed") }
+  if lwMiss != "" {
+    fbResetLazyFrame()
+    return lwMiss
+  }
+  const locals: u8[] = []
+  fbEmitLocalsVec(locals, 0)
+  const p = wTarget(out)
+  wBytes(framed(locals))
+  wTarget(p)
+  return ""
+}
+
+// `irLowerEqHelper` for the shadow, before legacy writes the helper: the callees it notes are
+// taken back and the lazy frame is left empty again, so legacy writes from the state it would
+// have had unarmed.
+export function irShadowLowerEqHelper(f: IrFn, out: u8[]): string {
+  const callees0 = dfeCallee.length
+  const why = irLowerEqHelper(f, out)
+  while dfeCallee.length > callees0 { dfeCallee.pop() }
+  fbResetLazyFrame()
+  return why
 }
 
 // Lowers runtime helper `f` onto `out`: its locals are its `local` variables, one per slot after

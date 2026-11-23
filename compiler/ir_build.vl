@@ -183,10 +183,12 @@ import {
   irGlobalWriteMiss,
   irHexOf,
   irLowerClaim,
+  irLowerEqHelper,
   irLowerFragment,
   irLowerHelper,
   irLowerProbe,
   irLoweredEntry,
+  irShadowLowerEqHelper,
   irSlotRowTy,
   irSlotRunAgrees,
   irSlotValtype,
@@ -708,6 +710,7 @@ import {
   sFieldCount,
   sFieldNames,
   sFieldStart,
+  sHeapIdx,
   sTy,
   sTyIx,
   setIrShadowOn,
@@ -12528,6 +12531,98 @@ export function irShadowThunk(fe: i32, out: u8[], from: i32) {
     return count("mismatch bytes: thunk" + hex)
   }
   return count("thunk matched")
+}
+
+// The compare helper `__eq_<si>__`: its two parameters, references to struct row `si`, compared
+// field-wise, as `eqHelpFnBody` writes it. "" or the miss.
+function buildEqHelp(si: i32): string {
+  ib = irFnNew(-1, "@eq")
+  ib.irHelper = true
+  ibFnIx = -1
+  ibFnPos = -1
+  ibMiss = ""
+  ibNoValue = repNodeOfTy(TY_NEVER)
+  if si < 0 || si >= sHeapIdx.length { return "compare helper row" }
+  ib.irName = "@eq " + i32ToStr(si)
+  const pr = repRawOf(sHeapIdx[si], true)
+  const l = irVarNew(ib, pr, -1, "param", 0)
+  const r = irVarNew(ib, pr, -1, "param", 1)
+  ib.irParams.push(l)
+  ib.irParams.push(r)
+  const i32r = repNodeOfTy(TY_I32)
+  ib.irRetRep = i32r
+  ib.irRetTy = TY_I32
+  const t = irVarNew(ib, i32r, TY_I32, "temp", -1)
+  const cmp: Rhs = { ehL: { ov: l }, ehR: { ov: r }, ehRow: si }
+  const def = irNodeNew(ib, { lDst: t, lRhs: cmp }, TY_I32, i32r, -1)
+  const ret = irNodeNew(ib, { rtHas: true, rtV: { ov: t } }, -1, ibNoValue, -1)
+  ib.irBody = [def, ret]
+  return ""
+}
+
+// The claim seam for `__eq_<si>__`, in the frame `eqHelpFnCode` opened and before legacy writes
+// it: when it builds and every node is in a claimed family, its code entry goes onto `out`.
+export function irClaimEqHelp(si: i32, out: u8[]): boolean {
+  if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
+  if buildEqHelp(si) != "" || !claimable() { return false }
+  corrupt()
+  if irBVerify(ib).vfRule != 0 { return eqHelpFellBack("verifier") }
+  const why = irLowerEqHelper(ib, out)
+  if why != "" { return eqHelpFellBack(why) }
+  count("claimed eq helper")
+  return true
+}
+
+function eqHelpFellBack(why: string): boolean {
+  count("claim fell back: eq helper " + why)
+  return false
+}
+
+// Under the armed shadow, `__eq_<si>__`'s IR lowering, before legacy writes it from the same empty
+// lazy frame; empty when it does not build, verify or lower, with that row counted.
+export function irShadowEqHelp(si: i32): u8[] {
+  const got: u8[] = []
+  if !ibArmed { return got }
+  count("eq helper fns")
+  const why = buildEqHelp(si)
+  if why != "" {
+    count("eq helper uncovered " + why)
+    return got
+  }
+  corrupt()
+  const v = irBVerify(ib)
+  if v.vfRule != 0 {
+    count(
+      "fail rule "
+        + i32ToStr(v.vfRule)
+        + " in "
+        + ib.irName
+        + ": "
+        + v.vfMsg
+        + "\n"
+        + irFnText(ib),
+    )
+    return []
+  }
+  const lw = irShadowLowerEqHelper(ib, got)
+  if lw != "" {
+    count("mismatch eq helper " + lw)
+    return []
+  }
+  // The dual emit's control 3 adds a byte, which must turn a match into a differ.
+  if ibCorrupt == 3 { got.push(1) }
+  return got
+}
+
+// `irShadowEqHelp`'s lowering `got` against the helper legacy then wrote onto `out` from `from`:
+// `eq helper matched` or `mismatch bytes: eq helper`.
+export function irShadowEqHelpCheck(got: u8[], out: u8[], from: i32) {
+  if !ibArmed || got.length == 0 { return 0 }
+  if !bytesFrom(out, from, got) {
+    const hex = if ibDetail { " " + irHexOf(out.slice(from)) + "| " + irHexOf(got) } else { "" }
+    return count("mismatch bytes: eq helper" + hex)
+  }
+  return count("eq helper matched")
 }
 
 // Builds a start body: each top-level statement (`orderGi[i]` -1), or global `orderGi[i]`'s
