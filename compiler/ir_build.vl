@@ -152,6 +152,7 @@ import {
   repIsScalar,
   repPrim,
   repWhat,
+  repsLowerAlike,
 } from "./ir"
 import {
   IrVerdict,
@@ -614,6 +615,7 @@ import {
   fnRetHeldAsBundle,
   forInElemTyOf,
   forInMapRecv,
+  globalCellHeap,
   globalCellKind,
   holderMemberTy,
   holderRecordTy,
@@ -11828,10 +11830,17 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   if rep < 0 { return irBMiss("global initializer rep") }
   const d = deliver(b, init, rep, -1)
   if ibMiss != "" { return d }
-  // A record on the cell's own struct heap, or a declared subtype's, is stored retagged.
-  const v = if irBOpRep(d) != rep && recRetagNoted(irBOpRep(d), rep, init) { repTemp(b, { rgV: d }, init, rep) } else { d }
+  // A record on the cell's own struct heap, or a declared subtype's, is stored retagged; so is a
+  // list or closure the body lanes' retags take, unless legacy already stores it as it stands.
+  const dr = irBOpRep(d)
+  const v = if dr != rep
+    && (recRetagNoted(dr, rep, init)
+    || !cellTakesAsIs(gst, noted, dr, rep) && bodyRetagAt(dr, rep, init)) { repTemp(b, { rgV: d }, init, rep) } else { d }
   const vr = irBOpRep(v)
-  const stored = noted < 0 && vr != rep && vr == globalTyRep(letBindTy(gst, -1))
+  const stored = noted < 0
+    && vr != rep
+    && (vr == globalTyRep(letBindTy(gst, -1))
+    || cellHeapHolds(gst, vr))
   // A `null`-typed value is the bottom ref, already a value of a nullable reference cell.
   const bottom = repNullRefFits(vr, rep)
   // Legacy's `global.set` stores a reference the cell's valtype holds as it stands (`repStoresAs`):
@@ -11848,6 +11857,38 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     ib.irGlobalHeld[gi] = true
   }
   return v
+}
+
+// Whether global `gst`'s cell at rep `rep` takes a value at rep `vr` with no retag: the value's own
+// cell (`globalTyRep`, `cellHeapHolds`), the bottom ref, or a reference `repStoresAs` holds.
+function cellTakesAsIs(gst: i32, noted: i32, vr: i32, rep: i32): boolean {
+  if (
+    noted < 0
+    && (vr == globalTyRep(letBindTy(gst, -1)) || cellHeapHolds(gst, vr))
+  ) {
+    return true
+  }
+  return repNullRefFits(vr, rep) || repStoresAs(rep, vr)
+}
+
+// Whether a value at rep `src`, delivered from `at`, is the value at rep `dst` as it stands, as the
+// body lanes' retags take it: a list twin (`listRetag`), a box list (`boxListRetag`), or a closure
+// or list apart only in a hole (`holeRetagNoted`), with no coercion legacy records at `at`.
+function bodyRetagAt(src: i32, dst: i32, at: i32): boolean {
+  const list = repNodeAt(src) is RList
+    && (listRetag(src, dst) || boxListRetag(src, dst))
+  // Two records also lower alike field by field, as the verifier's hole retag asks.
+  const recs = repNodeAt(src) is RRecord && repNodeAt(dst) is RRecord
+  const hole = holeRetagNoted(src, dst, true)
+    && (!recs || repsLowerAlike(src, dst, ib.irRecHeap))
+  return (list || hole) && exprPrePathWhy(at, ibFnIx) == ""
+}
+
+// Whether global `gst`'s cell, a struct legacy declares at a heap (`globalCellHeap`), is the heap of
+// record value rep `vr`: legacy's `global.set` stores it as it stands.
+function cellHeapHolds(gst: i32, vr: i32): boolean {
+  const h = recHeapOf(vr)
+  return h >= 0 && repNodeAt(vr) is RRecord && h == globalCellHeap(gst)
 }
 
 // Global `gi`'s constant initializer `init`, at statement `gst`, as legacy's `emitConstCellInit`
