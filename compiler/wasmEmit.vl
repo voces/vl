@@ -4558,7 +4558,7 @@ function emitFieldLitEq(r: i32, lex: string, fnIx: i32) {
 // `r is B` over a single record `r: A` or `A | null` where every `B` is an `A` but not the
 // reverse: the value fits when it is not null and each field `B` narrows holds a member of its
 // literal set, or an arm of its type (D3885, D4058, D16325). 0 when the test is not that shape.
-function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
+export function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
   const recv = nd.isObj
@@ -4592,6 +4592,69 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   const src = if staged { optRecvSlot } else { -1 }
   return emitRecordFitCore(recv, src, si, vi, nullable, names, sets, fnIx)
+}
+
+// How `emitRecordFitIs` answers `is` test `isIx`: 0 not that shape, -1 refused before it writes,
+// 2 over a receiver it stages into the `?.` stash, 1 written over a re-readable receiver.
+export function recordFitPlanOf(isIx: i32, fnIx: i32): i32 {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) { return 0 }
+  const recv = nd.isObj
+  const objTy = nodeTyAt(recv, fnIx)
+  const names: string[] = []
+  const sets: i32[] = []
+  if recFitNarrowedFields(objTy, isVarTyIxOf(isIx), names, sets) < 0 {
+    return 0
+  }
+  if names.length == 0 { return -1 }
+  if !unionEqOperandOk(recv) { return 2 }
+  const si = structIndexOfExpr(recv, fnIx)
+  const vi = if si >= 0 { -1 } else { exprVariantIndex(recv, fnIx) }
+  const nullable = nodeTyIsNullable(recv) || tyAdmitsNull(objTy)
+  if nullable && !exprNullableRefNiche(recv, fnIx) { return -1 }
+  const rows: i32[] = []
+  let laidOut = false
+  if si >= 0 && si < sHeapIdx.length {
+    laidOut = true
+    for f in names {
+      const fi = sFieldIndex(si, f)
+      if fi < 0 { laidOut = false }
+      rows.push(if fi >= 0 { sFieldStart[si] + fi } else { -1 })
+    }
+  } else if vi >= 0 && vi < uVarRow.length {
+    laidOut = true
+    for f in names {
+      const fi = variantFieldIndex(vi, f)
+      if fi < 0 { laidOut = false }
+      rows.push(if fi >= 0 { uFieldStart[vi] + fi } else { -1 })
+    }
+  }
+  if !laidOut { return -1 }
+  let k = 0
+  while k < names.length {
+    const nested = fieldRowIsRecordRef(rows[k]) && tyAt(sets[k]) is TyObj
+    if !nested {
+      const nulStr = fieldRowIsStr(rows[k], true)
+      const lexes = tyLitSetMemberLexes(
+        if nulStr { nonNullTy(sets[k]) } else { sets[k] },
+      )
+      if tyLitSetMemberLexes(sets[k]).length == 0 {
+        const ft: i32[] = []
+        const vis: i32[] = []
+        if (
+          !fieldRowIsUnionBox(rows[k])
+          || !unionArmTagsOfTy(sets[k], -1, ft, vis)
+          || listNeedsDiscrim(vis)
+        ) {
+          return -1
+        }
+      } else if lexes.length > 0 && !fieldLitEqOk(rows[k]) {
+        return -1
+      }
+    }
+    k = k + 1
+  }
+  return 1
 }
 
 // `emitRecordFitIs`'s field tests over the record `recv` reads (or local `src`, when not -1),
@@ -5981,7 +6044,7 @@ function emitListFitElem(
 // One read of the record-fit receiver: local `src` cast back to `heap` (left uncast when `heap`
 // is -1, for the null test) when it is not -1, else the receiver expression itself.
 function emitRecordFitRecv(recv: i32, fnIx: i32, src: i32, heap: i32): i32 {
-  if src < 0 { return emitExpr(recv, fnIx) }
+  if src < 0 { return fitRecvRead(recv, fnIx) }
   fbLocalGet(src)
   if heap >= 0 { fbRefCast(heap) }
   return 0
