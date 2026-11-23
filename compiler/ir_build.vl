@@ -526,6 +526,7 @@ import {
   binNulTestOf,
   coalArmOf,
   coalBoxArmOf,
+  coalMapRecvOf,
   coalNicheArmOf,
   coalNulRefArmOf,
   coalResultKindOf,
@@ -538,6 +539,7 @@ import {
   nullOwnAt,
 } from "./emit_plan_null"
 import {
+  boxDstTyOf,
   boxOwedAt,
   boxTyNameAt,
   coerceKindAt,
@@ -572,6 +574,7 @@ import {
   litArmsReadsOf,
   litIsBoxLexes,
   litMemberEqArmOf,
+  mapScalarJoinBoxes,
   narrowedMapReadOf,
   retRefusedWhy,
   spreadRunLit,
@@ -580,6 +583,7 @@ import {
 } from "./wasmEmit"
 import {
   mapReadScalarBoxKindIn,
+  mapRecvScalarBoxKindIn,
   mapRecvTyIn,
   nodeTyInOf,
   readContainerTyAt,
@@ -8930,8 +8934,54 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     if irBOpRep(v) != rep { return irBMiss("coalesce holeMap rep") }
     return v
   }
+  if arm == "mapScalarJoin" { return coalMapScalarJoin(b, n, ix, rep) }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
+}
+
+// `m[k] ?? d` over a scalar-valued map joining a union, as `emitMapGetOrScalarJoin` writes it: the
+// probe, a hit's scalar boxed at its own arm, and `d` boxed into the union in the miss arm.
+function coalMapScalarJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const lhsIx = unwrapParen(n.binLeft)
+  if lhsIx < 0 { return irBMiss("map read") }
+  const rd = nodeAt(lhsIx)
+  if !(rd is Index) || coalMapRecvOf(n) != rd.idxArr {
+    return irBMiss("coalesce mapScalarJoin call")
+  }
+  const ak = mapRecvScalarBoxKindIn(rd.idxArr, ibFnIx)
+  if ak < 0 || !mapScalarJoinBoxes(n, ak, ibFnIx) {
+    return irBMiss("coalesce mapScalarJoin row")
+  }
+  if !heldAsBox(rep) { return irBMiss("coalesce mapScalarJoin rep") }
+  const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
+  const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
+  if ka != "plain" && ka != "i64" { return irBMiss("map key " + ka) }
+  const rcv = mapRecvKeyOf(
+    b,
+    rd.idxArr,
+    rd.idxIndex,
+    "map read receiver",
+    ka == "i64",
+  )
+  if rcv == null { return irBMiss(ibMiss) }
+  const db: i32[] = []
+  const dv = deliver(db, n.binRight, rep, boxDstTyOf(n.binRight, ibFnIx))
+  if ibMiss != "" { return dv }
+  if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
+  if !defaultSelfContained(db, 0, dv) {
+    return irBMiss("coalesce mapScalarJoin default computes")
+  }
+  for id in db { b.push(id) }
+  const r: Rhs = {
+    mgSym: rcv.mkSym,
+    mgNonNull: rcv.mkNonNull,
+    mgLoc: rcv.mkLoc,
+    mgKey: rcv.mkKey,
+    mgAt: ix,
+    mgForm: 7,
+    mgDef: dv,
+  }
+  return irBLetTemp(b, r, ix, rep)
 }
 
 // A `null`-typed operand `x` run for its effect, as legacy's `emitNulNoneForEffect` writes it:
