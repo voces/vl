@@ -26,5 +26,18 @@ compare box" (IR-only census: 20 fns, 20 programs, 18 sole). Both were measured 
 | IR-only `start: union compare box` | 21 programs | 7 still list it; 14 clear it, 10 of them wholly IR-only |
 | self-compile IR misses | 0 | 0 (20,298 fns) |
 
+The distilled reading above came from this branch's own seed, on a base without #9752–#9754. The
+same class has been read three ways, each with its own instrument and tree. They are not one number:
+
+| reading | instrument | tree | distilled "union compare plan" | IR-only `start: union compare box` |
+|---|---|---|---|---|
+| V3, train FJ1 | `ir-shadow.vl -- --seed S --blockers` over the distilled corpus | FJ1 (on FI1: #9751–#9754) | 0 | 0 |
+| S1, after merge | `VL_IR_SHADOW=4 vl check --codegen` over `cells/` and `named/` | master 0635326c | 2 cells | — |
+| S1, after merge | `ir-shadow.vl -- --seed S --blockers` | master 0635326c | 2 functions | — |
+
+The two cells on master are the variant compare (a nullable record operand,
+`d2915_recn_{5,s}_eq_annot`), which #9749 does not take. The doors PR that follows clears them
+(0 by both instruments). Mode 4 also counted a start body that went past a miss as covered until #9767.
+
 Still a miss: an element read of a global list as the box (`irReadElem` only covers a list held in
 a variable); the variant compare (a nullable record operand); the cross-width number compare.
