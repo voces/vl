@@ -1242,6 +1242,28 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
   -0.0), `f32x4-geometry.vl`, `f32x4-kernel-vs-scalar.vl` (bit-identical to scalar),
   `f32x4-positions.vl`, `f32x4-lanes.vl`, and the `error-*` refusals.
 
+- **Integer shapes (S4 tier 2, #9678).** `U8x16`, `U16x8`, `I16x8`, `I32x4` and the masks
+  `Mask8x16`/`Mask16x8` (`Mask32x4` is shared with `F32x4`) wrap tier-1 rows only, so the IR
+  lowers them through the same `simdTableBuild` rows as legacy and no compiler line changed.
+  Signedness belongs to the type, not the call: `minU16x8` is `min_u`, `minI16x8` is `min_s`,
+  which is why `U16x8` exists beyond the issue's three shapes (aillu's u16 owner column, and the
+  landing shape of u8 widening). Names are width-suffixed because a named function cannot be
+  declared once per receiver type (only operators can, #3003), so `min` for two shapes would be
+  `redeclared min`. The mask reductions take the bare shape (`bitmask8x16`, not
+  `bitmaskMask8x16`). `narrowSatU16x8ToU8x16` is `min_u` with 255 then `narrow_i16x8_u`, since the
+  wasm instruction reads its input as signed and would send 32768..65535 to 0.
+  `andNot` is wasm's `a & ~b`. Not built: integer lane access, shifts, integer `*`, `abs`/`neg`,
+  `avgr`, `popcnt`, an `I8x16`/`U32x4`; each is a tier-1 intrinsic already, so adding one is a
+  wrapper. Cost: a plain build links every function of an imported module, so every
+  `std:simd` importer's plain build grew about 1.4 KB; `-O` drops the functions and keeps a few
+  dead function types (6 to 13 bytes on 5 of 24 corpus programs).
+- **What grades the integer shapes.** `tests/cases/simd/int-std-arith.vl` (splat low bits,
+  wrap and saturation at 0/255, 0/65535, -32768/32767, signed vs unsigned min/max),
+  `int-std-compare.vl` (every compare's mask lanes and bitmask bits, mask logic, select,
+  bitwise), `int-std-widen-narrow.vl` (each widening and narrowing at its bounds) and
+  `int-std-cell-pass.vl` (a 4096-cell regrowth/depletion/owner-count/sum pass equal to a
+  scalar loop). The `simd/` directory runs on both V8 and wasmtime.
+
 ## `std:buffer` over a shared memory (2026-09-24)
 
 - The shared allocator is inline in `Buffer`, `bufferMark` and `bufferRelease` under
