@@ -44,6 +44,22 @@ A fifth commit taught a field value that is a list twin, box list or noted recor
 it stands. Master's `retagsAsStands` (#9693/#9694 era) is a superset of it, so the merge took
 master's and dropped this one.
 
+## Readings
+
+tests/cases census, master 8a807618 → head, on fixpoint seeds:
+
+| class | master → head |
+| --- | --- |
+| `object field count` | 3 → 0 |
+| `start: object field count` | 1 → 0 |
+| `object layout` | 14 → 1 |
+| `start: object layout` | 4 → 0 |
+| `legacy module: const cell plain` | 13 → 9 programs |
+| programs fully IR-only, of 7,135 | 5,445 → 5,453 |
+
+16 functions are newly claimed and none newly missed. Five functions now reach a later miss:
+`box ladder` gains 3, `box of a valued if` 1 and `unary p+` 1.
+
 ## Tests
 
 The shadow test "a literal that drops or omits fields is built at its destination's row and
@@ -59,7 +75,9 @@ storage row:
 - `str>atom`: a lone-literal field;
 - a few `list>list` and `record>record` shapes.
 
-That is IR-N6's rowless/storage-row rule, so this batch does not build it twice.
+That was left to IR-N6's rowless/storage-row rule. IR-N6 reports that its helper (#9702,
+`rowlessStoredTy`) moves the const cells 6 → 4 but reaches neither `i32>closure` nor `str>atom`, so
+those two groups have no owner yet.
 
 The remaining const-cell `object layout` misses are union-box const cells
 (`tagged-arm-nullable-field-literal`, `empty-object-all-nullable-runs`).
