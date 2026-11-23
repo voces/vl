@@ -766,7 +766,6 @@ import {
   TY_STR,
   tyScalarBasePrim,
 } from "./check_types"
-import { spreadSlotIdOf } from "./emit_collect"
 import { ListBuild } from "./emit_ref_list_kinds"
 
 let ibArmed = false
@@ -5598,15 +5597,15 @@ function listSliceRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
 // A string method legacy's call ladder takes by name (`exprIsStrMethod`): its receiver and
 // arguments, then legacy's own tail. Any other method is a miss that names it.
 function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  // A push onto a list; a record's function-valued field named `push` is the closure call below.
+  const listPush = m.memProp == "push"
+    && repNodeAt(repNodeOfTy(nodeTyAt(m.memObj, ibFnIx))) is RList
   // Several arguments, or a spread, append in bulk: legacy's `emitPushMany`.
-  if (
-    m.memProp == "push"
-    && (c.callArgs.length != 1 || nodeAt(c.callArgs[0]) is Spread)
-  ) {
+  if (listPush && (c.callArgs.length != 1 || nodeAt(c.callArgs[0]) is Spread)) {
     return pushManyRhs(b, m, ix)
   }
   if (
-    m.memProp == "push"
+    listPush
     && c.callArgs.length == 1
     && !(nodeAt(c.callArgs[0]) is Spread)
   ) {
@@ -6075,10 +6074,6 @@ function pushRecvHeldAtRest(recvIx: i32): boolean {
 // A one-argument `.push` legacy writes as the plain append (`pushPlainWhy`): its receiver, then
 // its value at the list's element rep.
 function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
-  // The checker typed the receiver: a record's function-valued field named `push` is a call.
-  if !(repNodeAt(repNodeOfTy(nodeTyAt(m.memObj, ibFnIx))) is RList) {
-    return missRhs("member call on a record field")
-  }
   const pp = pushPlanOf(ix, ibFnIx)
   if pp == null { return missRhs("push plan") }
   // Legacy reads a push receiver with a strict payload cast; the IR's receiver is read before
@@ -6117,9 +6112,6 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
 // A variadic push `ix` (`emitPushMany`): the receiver, then the run legacy builds of the
 // arguments (`pushManyRunLit`) at the receiver's list build, appended in bulk.
 function pushManyRhs(b: i32[], m: Member, ix: i32): Rhs {
-  if !(repNodeAt(repNodeOfTy(nodeTyAt(m.memObj, ibFnIx))) is RList) {
-    return missRhs("member call on a record field")
-  }
   // Legacy reads the receiver with a strict payload cast, which the IR's read does not take.
   if recvReadsListPayload(m.memObj, ibFnIx) {
     return missRhs("push receiver payload cast")
@@ -7561,7 +7553,7 @@ function arrayLit(
   bt: i32,
 ): Opnd {
   const arm = arrLitArmOf(ix, ibFnIx, lb)
-  if arm == "spread" { return spreadLit(b, n, ix, rep, lb) }
+  if arm == "spread" { return spreadLit(b, n, ix, rep, lb, bt) }
   // A ref list builds along `emitArrRef`'s short arms (`arrLitRefShortSlot`) or not at all: each
   // element as is, or each boxed by its record, which `deliver` writes at the box rep.
   // …or a non-null variant's, each element a literal built at the variant's row or a value of it.
@@ -7679,6 +7671,7 @@ function spreadLit(
   ix: i32,
   rep: i32,
   lb: ListBuild,
+  bt: i32,
 ): Opnd {
   if (
     spreadBoxDestRow(n.arrElems, ibFnIx, lb) >= 0
@@ -7686,7 +7679,6 @@ function spreadLit(
   ) {
     return irBMiss("array spread boxed")
   }
-  if spreadSlotIdOf(ix) < 0 { return irBMiss("array spread unrecorded") }
   // Legacy notes the literals the spread holds before its plan, so each is typed at its holder's
   // element; the plan asked without that note mints the literals' own lists. The note is idempotent.
   elabSpreadNote(ix)
@@ -7745,7 +7737,10 @@ function spreadLit(
     spSlot: lb.lbSlot,
     spAt: ix,
   }
-  return irBLetTemp(b, r, ix, rep)
+  // A minted literal (a variadic push's run) has no checker type; it holds its build's.
+  const own = heldTy(exprTyOf(ix))
+  const ty = if irTyHeldOpen(own, rep) && bt >= 0 { heldTy(bt) } else { own }
+  return irBLetTempTy(b, r, ix, rep, ty)
 }
 
 // Group `g`'s list `src` of literal `ix` (rep `rep`) built as `emitSpreadGroup` emits it: a list
