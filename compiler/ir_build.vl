@@ -19,7 +19,12 @@ import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleFe, monoBundleReadFe } from "./emit_mono"
 import { repElemTyOfName, slotRowTyOf } from "./emit_rep"
-import { optLeafArmOf } from "./wasmEmit"
+import {
+  asInstMissNullOwn,
+  holeOptBoxScalarTy,
+  holeOptShapeOf,
+  optLeafArmOf,
+} from "./wasmEmit"
 import {
   bundleAnyNoted,
   bundleParamOfRead,
@@ -547,7 +552,11 @@ import {
   unionBoxArgReadsMapBox,
   unionLitIsPlanOf,
 } from "./wasmEmit"
-import { nodeTyInOf, readContainerTyAt } from "./emit_ty_canon"
+import {
+  mapReadScalarBoxKindIn,
+  nodeTyInOf,
+  readContainerTyAt,
+} from "./emit_ty_canon"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -7153,7 +7162,7 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // A scalar map read the box plan boxes is the probe's own box.
   if ibMiss == "" && dst >= 0 && boxedNullable(dst) {
     const mk = mapReadBoxKindAt(ix)
-    if mk >= 0 { return mapGetAt(b, unwrapParen(ix), dst, mk, true) }
+    if mk >= 0 { return mapGetAt(b, unwrapParen(ix), dst, mk, true, -1, false) }
   }
   // A member record read the box plan passes as its field's box is built at its storage.
   if ibMiss == "" && dst >= 0 && heldAsBox(dst) && memberBoxReadAt(ix, ibFnIx) {
@@ -9322,12 +9331,21 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // A bare map read `m[k]` by legacy's arm (`mapGetArmOf`), its key written as itself: an mv slot's
 // ref value at its niche, or a mono-valued map read at the value's own rep.
 export function mapGetBare(b: i32[], ix: i32, rep: i32): Opnd {
-  return mapGetAt(b, ix, rep, -1, ix != ib.irUnbankedRead)
+  return mapGetAt(b, ix, rep, -1, ix != ib.irUnbankedRead, -1, false)
 }
 
 // `mapGetBare`, or under value-atom kind `box` (not -1) the read the box plan boxes into boxed
-// nullable `rep` (`mapScalar`), its miss the box's null.
-function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
+// nullable `rep` (`mapScalar`), its miss the box's null; under `trap` the read `as!` makes of a
+// scalar value, trapping on a miss. The temp is typed at `tempTy`, or where -1 the read's own.
+function mapGetAt(
+  b: i32[],
+  ix: i32,
+  rep: i32,
+  box: i32,
+  row: boolean,
+  tempTy: i32,
+  trap: boolean,
+): Opnd {
   const rd = nodeAt(ix)
   if !(rd is Index) { return irBMiss("map get") }
   const arm = mapGetArmOf(ix, ibFnIx)
@@ -9374,11 +9392,13 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
     mtAt: ix,
     mtBox: box,
     mtRow: row,
+    mtTrap: trap,
   }
   if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
+  if box < 0 && tempTy >= 0 { return irBLetTempTy(b, r, ix, rep, tempTy) }
   if box < 0 { return irBLetTemp(b, r, ix, rep) }
   // The box is the union's own, typed at it where a narrowed re-read's node is the member's.
-  const bt = holeBoxTyAt(ix, ibFnIx)
+  const bt = if tempTy >= 0 { tempTy } else { holeBoxTyAt(ix, ibFnIx) }
   if bt < 0 || repNodeOfTy(bt) != rep { return irBMiss("map get box type") }
   return irBLetTempTy(b, r, ix, rep, heldTy(bt))
 }
@@ -10285,6 +10305,18 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if arm == "litAtom" || arm == "numLitScalar" {
       return asLit(b, n, ix, rep, arm)
     }
+    if arm == "numUnion" { return asNumUnion(b, n, ix, rep) }
+    if arm == "mapOptBox" { return asMapOptBox(b, n, ix, rep) }
+    if arm == "mapProbeTrap" { return asMapProbeTrap(b, n, ix, rep) }
+    if arm == "instMiss" && n.asMode == "null" {
+      return asInstMissOpt(b, n, ix, rep)
+    }
+    if arm == "holeOpt" && holeOptShapeOf(ix, ibFnIx) == "null" {
+      return asHoleOptNull(b, ix, rep)
+    }
+    if arm == "holeOpt" && holeOptShapeOf(ix, ibFnIx) == "box" {
+      return asHoleOptBox(b, n, ix, rep)
+    }
     if arm == "wrap" {
       const wa = asWrapArmOf(ix, ibFnIx)
       if wa == "narrowMask" { return wrapNarrowed(b, ix, rep) }
@@ -10316,6 +10348,80 @@ function asUnion(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("union cast operand rep")
   }
   return irBLetTemp(b, { auV: v, auAt: ix }, ix, rep)
+}
+
+// An infallible `as` over a numeric union's box (`asCastArmOf`'s `numUnion`), as
+// `emitNumUnionConvert` writes it: the box, converted at the member it holds (`RNumUnionConvert`).
+function asNumUnion(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  const dk = numKindOf(rep)
+  if dk < 3 { return irBMiss("numeric union cast rep") }
+  if !numUnionSideBoxed(n.asObj, ibFnIx) {
+    return irBMiss("numeric union cast unboxed")
+  }
+  const v = irBExpr(b, n.asObj)
+  if ibMiss != "" { return v }
+  if !(repNodeAt(irBOpRep(v)) is RBox) {
+    return irBMiss("numeric union cast operand rep")
+  }
+  return irBLetTempTy(
+    b,
+    { nuV: v, nuTo: dk, nuAt: n.asObj },
+    ix,
+    rep,
+    repTyOf(rep),
+  )
+}
+
+// `m[k] as? V` over a scalar-valued map (`asCastArmOf`'s `mapOptBox`): the box plan's boxed read
+// (`emitMapGetScalarBox`), the value's box on a hit and its null on a miss.
+function asMapOptBox(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  const mk = mapReadScalarBoxKindIn(n.asObj, ibFnIx)
+  if mk < 0 || !boxedNullable(rep) { return irBMiss("map cast box rep") }
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  return mapGetAt(b, unwrapParen(n.asObj), rep, mk, true, ty, false)
+}
+
+// `m[k] as! V` over a scalar-valued map (`asCastArmOf`'s `mapProbeTrap`), as `emitAsMapProbeTrap`
+// writes it: the probe, a trap on a missing key, then the stored value at the map's value rep.
+function asMapProbeTrap(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  const rd = unwrapParen(n.asObj)
+  if rd < 0 || rd >= P.nodes.length || !(nodeAt(rd) is Index) {
+    return irBMiss("map cast trap read")
+  }
+  if repPrim(rep) == null { return irBMiss("map cast trap rep") }
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  return mapGetAt(b, rd, rep, -1, false, ty, true)
+}
+
+// `as?` at an instance whose operand it can never hit (`asCastArmOf`'s `instMiss`), as
+// `emitAsInstMiss` writes it: the operand evaluated and dropped, then the cast's null.
+function asInstMissOpt(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  const own = asInstMissNullOwn(ix)
+  if !nullOwnRepFits(own, rep) { return irBMiss("cast miss null rep") }
+  const v = irBExpr(b, n.asObj)
+  if ibMiss != "" { return v }
+  irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  return repTemp(b, { nuAt: ix, nuOwn: own }, ix, rep)
+}
+
+// `u as? N` over a type parameter pinned at no number or `boolean` (`holeOptShapeOf`'s "null"):
+// the null-tagged box, as `emitHoleNumAsOpt` writes it, the operand never read.
+function asHoleOptNull(b: i32[], ix: i32, rep: i32): Opnd {
+  if !nullOwnRepFits(NULL_OWN_BOX, rep) { return irBMiss("cast miss null rep") }
+  return repTemp(b, { nuAt: ix, nuOwn: NULL_OWN_BOX }, ix, rep)
+}
+
+// `u as? N` over a type parameter whose cast cannot fail at its pin (`holeOptShapeOf`'s "box"):
+// the plain cast (`numCast`), boxed under the tag legacy writes ahead of it (`RHoleOptBox`).
+function asHoleOptBox(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  if !nullOwnRepFits(NULL_OWN_BOX, rep) { return irBMiss("cast box rep") }
+  const st = holeOptBoxScalarTy(ix)
+  if st < 0 { return irBMiss("cast box scalar") }
+  const v = numCast(b, n, ix, repNodeOfTy(st), st)
+  if ibMiss != "" { return v }
+  return irBLetTemp(b, { hxV: v, hxAt: ix }, ix, rep)
 }
 
 // `((y >>> k) & m) as% i32` narrowed to i32 (`asWrapArmOf`'s `narrowMask`), as legacy's
@@ -10384,7 +10490,7 @@ function asNiche(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 // the operand alone (`asCastArmOf`'s `v128` arm, or its `plain` arm at a `new v128` target);
 // any other `as` is numeric.
 function asCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
-  if repPrim(rep) != "v128" { return numCast(b, n, ix, rep) }
+  if repPrim(rep) != "v128" { return numCast(b, n, ix, rep, -1) }
   const arm = asCastArmOf(ix, ibFnIx)
   if arm != "v128" && arm != "plain" { return irBMiss("vector as " + arm) }
   const v = irBExpr(b, n.asObj)
@@ -10395,7 +10501,7 @@ function asCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 
 // A numeric `as` whose arm legacy writes as its operand at one kind then a tail
 // (`numCastKindOf`): the operand is built and widened to that kind as `emitExprAsKind` builds it.
-function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32, ty: i32): Opnd {
   const k = numCastKindOf(ix, ibFnIx)
   if k < 0 { return irBMiss("expression as") }
   const ow = operandWhy(n.asObj)
@@ -10412,6 +10518,7 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
   if irBOpRep(o) != dst || !repIsScalar(dst) {
     return irBMiss("as operand coercion")
   }
+  if ty >= 0 { return irBLetTempTy(b, { ncV: o, ncAt: ix }, ix, rep, ty) }
   return irBLetTemp(b, { ncV: o, ncAt: ix }, ix, rep)
 }
 
@@ -11550,7 +11657,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if pa >= 0 { return letIfArms(b, n.letInit, v, pa) }
     // Legacy's own binding arm reads a union-valued map's box past `emitExpr`, banking no
     // element-read row (`letNulMapReadUnionBox`).
-    const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(b, unwrapParen(n.letInit), ib.irVars[v].vRep, -1, false) } else if letCellNulArmUnbox(ix, n.letInit, ib.irVars[v].vRep) { armUnboxTemp(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy, true) } else if letIsArmCell(ix) { variantCoerced(
+    const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(b, unwrapParen(n.letInit), ib.irVars[v].vRep, -1, false, -1, false) } else if letCellNulArmUnbox(ix, n.letInit, ib.irVars[v].vRep) { armUnboxTemp(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy, true) } else if letIsArmCell(ix) { variantCoerced(
       b,
       n.letInit,
       ib.irVars[v].vRep,

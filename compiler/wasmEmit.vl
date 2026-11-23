@@ -24848,14 +24848,15 @@ function emitAsInstMiss(e: AsExpr, exprIx: i32, fnIx: i32) {
     fbUnreachable()
     return 0
   }
+  return emitNullOwn(asInstMissNullOwn(exprIx))
+}
+
+// The null `as?` cast `exprIx` answers on an instance miss (`emitAsInstMiss`): a union result's
+// null-tagged box, else its type's own null (`nullOwnOfTy`).
+export function asInstMissNullOwn(exprIx: i32): i32 {
   const mt = nodeTyIxOf(exprIx)
-  if repOfTy(mt).rdKind == "union" {
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbRefNullNone()
-    fbStructNew(uBoxIdx)
-    return 0
-  }
-  return emitNullOwn(nullOwnOfTy(mt))
+  if repOfTy(mt).rdKind == "union" { return NULL_OWN_BOX }
+  return nullOwnOfTy(mt)
 }
 
 // The cast node `exprIx` copies, through a mono copy's source nodes (`nodeSrc`).
@@ -25203,6 +25204,11 @@ function nulNicheHeapOf(obj: i32, payload: i32, fnIx: i32): i32 {
 // key and reading the stored value otherwise. Returns 0 or -1.
 function emitAsMapProbeTrap(amRef: Index, fnIx: i32) {
   if emitMapPrep(amRef.idxArr, amRef.idxIndex, fnIx) < 0 { return -1 }
+  return asMapProbeTrapTail()
+}
+
+// `emitAsMapProbeTrap` after its probe: the trap on a missing key, then the stored value.
+export function asMapProbeTrapTail() {
   pushMapScr(5) // entry
   fbI32Eqz()
   fbIf(64) // void
@@ -26107,6 +26113,22 @@ function holeOptPinTy(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
   return -1
 }
 
+// How `emitHoleNumAsOpt` writes `u as? N` over a type-parameter operand at this instance's pin:
+// "null", the null-tagged box with the operand unread, at a pin no number or `boolean`; "exact",
+// the exact cast where it can fail (`holeOptExactSrc`); "box", the plain cast boxed; "none" with
+// no pin.
+export type HoleOptShape = "null" | "exact" | "box" | "none"
+export function holeOptShapeOf(exprIx: i32, fnIx: i32): HoleOptShape {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return "none" }
+  const ext = holeOptPinTy(e, exprIx, fnIx)
+  if ext < 0 { return "none" }
+  const src = primNameStr(primNameOf(ext))
+  const srcNum = src == "i32" || src == "i64" || src == "f32" || src == "f64"
+  if !srcNum && src != "boolean" { return "null" }
+  return if holeOptExactSrc(exprIx, fnIx) != "" { "exact" } else { "box" }
+}
+
 // The number `u as? N` over a type-parameter operand converts from when its cast can fail at
 // this pin, which `emitHoleNumAsOpt` writes as the exact cast; "" for every other pin.
 function holeOptExactSrc(exprIx: i32, fnIx: i32): string {
@@ -26143,9 +26165,7 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
         + "` over a type parameter needs the instance's exact pin",
     )
   }
-  const src = primNameStr(primNameOf(ext))
-  const srcNum = src == "i32" || src == "i64" || src == "f32" || src == "f64"
-  if !srcNum && src != "boolean" {
+  if holeOptShapeOf(exprIx, fnIx) == "null" {
     fbI32Rel(RS_TAG, nullBoxTag())
     fbRefNullNone()
     fbStructNew(uBoxIdx)
@@ -26153,9 +26173,24 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
   }
   const xs = holeOptExactSrc(exprIx, fnIx)
   if xs != "" { return emitNumExactCastFrom(e, exprIx, xs, fnIx) }
-  fbI32Rel(RS_TAG, scalarTagOfKind(nck))
+  holeOptBoxHead(exprIx)
   if emitNumPlainCast(e.asObj, tgt, fnIx) < 0 { return -1 }
-  fbStructNew(nvb)
+  return holeOptBoxTail(exprIx)
+}
+
+// The tag of `holeOptShapeOf`'s "box" at cast `exprIx`, written ahead of its operand.
+export function holeOptBoxHead(exprIx: i32) {
+  return fbI32Rel(RS_TAG, scalarTagOfKind(asExprNumTgtKind(exprIx)))
+}
+
+// The scalar type `holeOptShapeOf`'s "box" at cast `exprIx` boxes: its target's.
+export function holeOptBoxScalarTy(exprIx: i32): i32 {
+  return numPrimTyOfKind(asExprNumTgtKind(exprIx))
+}
+
+// After the box's operand: its value box, then the union box.
+export function holeOptBoxTail(exprIx: i32) {
+  fbStructNew(vbHeapIdxOfKind(asExprNumTgtKind(exprIx)))
   fbStructNew(uBoxIdx)
   return 0
 }
@@ -26174,7 +26209,16 @@ export function numCastKindOf(exprIx: i32, fnIx: i32): i32 {
     "holeExact" => numExactCastKind(asExprHolePinSrc(exprIx, fnIx))
     "holeOpt" => {
       const hs = holeOptExactSrc(exprIx, fnIx)
-      if hs != "" { numExactCastKind(hs) } else { -1 }
+      if hs != "" {
+        numExactCastKind(hs)
+      } else if holeOptShapeOf(exprIx, fnIx) == "box" {
+        numPlainCastKind(
+          numCastSrcRepOf(e.asObj, fnIx),
+          asExprNumTgtName(exprIx),
+        )
+      } else {
+        -1
+      }
     }
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => -1
     "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => -1
@@ -26203,7 +26247,7 @@ export function numCastTail(exprIx: i32, fnIx: i32): i32 {
     "exact" => numExactCastTail(exprIx, asExprNumSrcName(exprIx), fnIx)
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => numCastNoTail()
     "holeExact" => numExactCastTail(exprIx, asExprHolePinSrc(exprIx, fnIx), fnIx)
-    "holeOpt" => numExactCastTail(exprIx, holeOptExactSrc(exprIx, fnIx), fnIx)
+    "holeOpt" => if holeOptExactSrc(exprIx, fnIx) != "" { numExactCastTail(exprIx, holeOptExactSrc(exprIx, fnIx), fnIx) } else { numPlainCastTail(numCastSrcRepOf(e.asObj, fnIx), asExprNumTgtName(exprIx)) }
     "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => numCastNoTail()
     "union" | "notCast" => numCastNoTail()
   }
