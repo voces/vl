@@ -19,7 +19,12 @@ import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleFe, monoBundleReadFe } from "./emit_mono"
 import { slotRowTyOf } from "./emit_rep"
-import { asInstMissNullOwn, optLeafArmOf } from "./wasmEmit"
+import {
+  asInstMissNullOwn,
+  holeOptBoxScalarTy,
+  holeOptShapeOf,
+  optLeafArmOf,
+} from "./wasmEmit"
 import {
   bundleAnyNoted,
   bundleParamOfRead,
@@ -10107,6 +10112,12 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if arm == "instMiss" && n.asMode == "null" {
       return asInstMissOpt(b, n, ix, rep)
     }
+    if arm == "holeOpt" && holeOptShapeOf(ix, ibFnIx) == "null" {
+      return asHoleOptNull(b, ix, rep)
+    }
+    if arm == "holeOpt" && holeOptShapeOf(ix, ibFnIx) == "box" {
+      return asHoleOptBox(b, n, ix, rep)
+    }
     if arm == "wrap" {
       const wa = asWrapArmOf(ix, ibFnIx)
       if wa == "narrowMask" { return wrapNarrowed(b, ix, rep) }
@@ -10196,6 +10207,24 @@ function asInstMissOpt(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
   return repTemp(b, { nuAt: ix, nuOwn: own }, ix, rep)
 }
 
+// `u as? N` over a type parameter pinned at no number or `boolean` (`holeOptShapeOf`'s "null"):
+// the null-tagged box, as `emitHoleNumAsOpt` writes it, the operand never read.
+function asHoleOptNull(b: i32[], ix: i32, rep: i32): Opnd {
+  if !nullOwnRepFits(NULL_OWN_BOX, rep) { return irBMiss("cast miss null rep") }
+  return repTemp(b, { nuAt: ix, nuOwn: NULL_OWN_BOX }, ix, rep)
+}
+
+// `u as? N` over a type parameter whose cast cannot fail at its pin (`holeOptShapeOf`'s "box"):
+// the plain cast (`numCast`), boxed under the tag legacy writes ahead of it (`RHoleOptBox`).
+function asHoleOptBox(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  if !nullOwnRepFits(NULL_OWN_BOX, rep) { return irBMiss("cast box rep") }
+  const st = holeOptBoxScalarTy(ix)
+  if st < 0 { return irBMiss("cast box scalar") }
+  const v = numCast(b, n, ix, repNodeOfTy(st), st)
+  if ibMiss != "" { return v }
+  return irBLetTemp(b, { hxV: v, hxAt: ix }, ix, rep)
+}
+
 // `((y >>> k) & m) as% i32` narrowed to i32 (`asWrapArmOf`'s `narrowMask`), as legacy's
 // `srEmitNarrowed` writes `srWrappedMask`'s [y, k, 1, m]: `shiftMaskFold`'s form with no outer shift.
 function wrapNarrowed(b: i32[], ix: i32, rep: i32): Opnd {
@@ -10262,7 +10291,7 @@ function asNiche(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 // the operand alone (`asCastArmOf`'s `v128` arm, or its `plain` arm at a `new v128` target);
 // any other `as` is numeric.
 function asCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
-  if repPrim(rep) != "v128" { return numCast(b, n, ix, rep) }
+  if repPrim(rep) != "v128" { return numCast(b, n, ix, rep, -1) }
   const arm = asCastArmOf(ix, ibFnIx)
   if arm != "v128" && arm != "plain" { return irBMiss("vector as " + arm) }
   const v = irBExpr(b, n.asObj)
@@ -10273,7 +10302,7 @@ function asCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 
 // A numeric `as` whose arm legacy writes as its operand at one kind then a tail
 // (`numCastKindOf`): the operand is built and widened to that kind as `emitExprAsKind` builds it.
-function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32, ty: i32): Opnd {
   const k = numCastKindOf(ix, ibFnIx)
   if k < 0 { return irBMiss("expression as") }
   const ow = operandWhy(n.asObj)
@@ -10290,6 +10319,7 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
   if irBOpRep(o) != dst || !repIsScalar(dst) {
     return irBMiss("as operand coercion")
   }
+  if ty >= 0 { return irBLetTempTy(b, { ncV: o, ncAt: ix }, ix, rep, ty) }
   return irBLetTemp(b, { ncV: o, ncAt: ix }, ix, rep)
 }
 

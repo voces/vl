@@ -1591,6 +1591,8 @@ Deno.test({
       "init-progress-effect": 0,
       "literal-cast-of-record": 2,
       "literal-cast-of-i32": 0,
+      "hole-opt-box-of-record": 2,
+      "hole-opt-box-of-i32": 0,
       "retag-closures-of-differing-arity": 2,
       "retag-closures-of-differing-arity-noted": 0,
       "map-delete-of-map": 0,
