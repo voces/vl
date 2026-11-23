@@ -4486,7 +4486,7 @@ function emitDiscrimFieldEq(
         + " fields",
     )
   }
-  if emitExpr(recvIx, fnIx) < 0 { return -1 }
+  if fitRecvRead(recvIx, fnIx) < 0 { return -1 }
   return discrimFieldEqTail(vi, fi, lex, fnIx)
 }
 
@@ -4559,7 +4559,7 @@ function emitFieldLitEq(r: i32, lex: string, fnIx: i32) {
 // `r is B` over a single record `r: A` or `A | null` where every `B` is an `A` but not the
 // reverse: the value fits when it is not null and each field `B` narrows holds a member of its
 // literal set, or an arm of its type (D3885, D4058, D16325). 0 when the test is not that shape.
-function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
+export function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
   const recv = nd.isObj
@@ -4593,6 +4593,69 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   const src = if staged { optRecvSlot } else { -1 }
   return emitRecordFitCore(recv, src, si, vi, nullable, names, sets, fnIx)
+}
+
+// How `emitRecordFitIs` answers `is` test `isIx`: 0 not that shape, -1 refused before it writes,
+// 2 over a receiver it stages into the `?.` stash, 1 written over a re-readable receiver.
+export function recordFitPlanOf(isIx: i32, fnIx: i32): i32 {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) { return 0 }
+  const recv = nd.isObj
+  const objTy = nodeTyAt(recv, fnIx)
+  const names: string[] = []
+  const sets: i32[] = []
+  if recFitNarrowedFields(objTy, isVarTyIxOf(isIx), names, sets) < 0 {
+    return 0
+  }
+  if names.length == 0 { return -1 }
+  if !unionEqOperandOk(recv) { return 2 }
+  const si = structIndexOfExpr(recv, fnIx)
+  const vi = if si >= 0 { -1 } else { exprVariantIndex(recv, fnIx) }
+  const nullable = nodeTyIsNullable(recv) || tyAdmitsNull(objTy)
+  if nullable && !exprNullableRefNiche(recv, fnIx) { return -1 }
+  const rows: i32[] = []
+  let laidOut = false
+  if si >= 0 && si < sHeapIdx.length {
+    laidOut = true
+    for f in names {
+      const fi = sFieldIndex(si, f)
+      if fi < 0 { laidOut = false }
+      rows.push(if fi >= 0 { sFieldStart[si] + fi } else { -1 })
+    }
+  } else if vi >= 0 && vi < uVarRow.length {
+    laidOut = true
+    for f in names {
+      const fi = variantFieldIndex(vi, f)
+      if fi < 0 { laidOut = false }
+      rows.push(if fi >= 0 { uFieldStart[vi] + fi } else { -1 })
+    }
+  }
+  if !laidOut { return -1 }
+  let k = 0
+  while k < names.length {
+    const nested = fieldRowIsRecordRef(rows[k]) && tyAt(sets[k]) is TyObj
+    if !nested {
+      const nulStr = fieldRowIsStr(rows[k], true)
+      const lexes = tyLitSetMemberLexes(
+        if nulStr { nonNullTy(sets[k]) } else { sets[k] },
+      )
+      if tyLitSetMemberLexes(sets[k]).length == 0 {
+        const ft: i32[] = []
+        const vis: i32[] = []
+        if (
+          !fieldRowIsUnionBox(rows[k])
+          || !unionArmTagsOfTy(sets[k], -1, ft, vis)
+          || listNeedsDiscrim(vis)
+        ) {
+          return -1
+        }
+      } else if lexes.length > 0 && !fieldLitEqOk(rows[k]) {
+        return -1
+      }
+    }
+    k = k + 1
+  }
+  return 1
 }
 
 // `emitRecordFitIs`'s field tests over the record `recv` reads (or local `src`, when not -1),
@@ -5982,7 +6045,7 @@ function emitListFitElem(
 // One read of the record-fit receiver: local `src` cast back to `heap` (left uncast when `heap`
 // is -1, for the null test) when it is not -1, else the receiver expression itself.
 function emitRecordFitRecv(recv: i32, fnIx: i32, src: i32, heap: i32): i32 {
-  if src < 0 { return emitExpr(recv, fnIx) }
+  if src < 0 { return fitRecvRead(recv, fnIx) }
   fbLocalGet(src)
   if heap >= 0 { fbRefCast(heap) }
   return 0
@@ -7065,6 +7128,25 @@ function emitIsTestVariantRow(isIx: i32, nd: IsExpr, fnIx: i32, vi: i32) {
     if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
     fbLocalSet(ctSlot)
   }
+  return variantRowChainTail(isIx, nd, fnIx, vi, ctSlot)
+}
+
+// The `chain` and `discrim` rows of `emitIsTestVariantRow` past the receiver's staging: the tag,
+// the discriminant, the shared row's fits and the cross-row fits, each receiver read from `ctSlot`
+// or, at -1, through `fitRecvReadHook`.
+export function variantRowChainTail(
+  isIx: i32,
+  nd: IsExpr,
+  fnIx: i32,
+  vi: i32,
+  ctSlot: i32,
+): i32 {
+  if vi < 0 || vi >= uVarTyIx.length {
+    return emitFail(
+      "emitProgram: internal: the variant rung lost its tested row",
+    )
+  }
+  const shared = armRowSharedAtRecv(nd.isObj, vi)
   if emitSharedFieldRecv(nd.isObj, fnIx, ctSlot) < 0 { return -1 }
   variantTagTail(vi)
   if emitVariantDiscrimTest(nd.isObj, vi, fnIx) < 0 { return -1 }
@@ -12372,6 +12454,23 @@ function fbIfForSharedPlan(code: i32, vi: i32, fi: i32) {
 // One function so the tag test and the payload read cannot pick different halves.
 function emitSharedFieldRecv(recvIx: i32, fnIx: i32, slot: i32) {
   if slot >= 0 { return sharedRecvSlotGet(slot) }
+  return fitRecvRead(recvIx, fnIx)
+}
+
+// How a fit writer re-reads a receiver it holds in no slot: the IR lowering's read of its own
+// operand while it writes that writer's tail (`irFitTail`, which restores the default), else
+// `emitExpr`. The default reads nothing, so the cell needs no init-order guard.
+export let fitRecvReadHook: (recvIx: i32, fnIx: i32) => i32 = fitRecvLegacy
+
+const FIT_RECV_LEGACY = -2
+
+export function fitRecvLegacy(_recvIx: i32, _fnIx: i32): i32 {
+  return FIT_RECV_LEGACY
+}
+
+function fitRecvRead(recvIx: i32, fnIx: i32): i32 {
+  const r = fitRecvReadHook(recvIx, fnIx)
+  if r != FIT_RECV_LEGACY { return r }
   return emitExpr(recvIx, fnIx)
 }
 
@@ -25306,26 +25405,60 @@ function emitAsUnionTail(
 // and compared against each target member's; a miss traps, is handed back by `return`, or is the
 // `-1` null sentinel, by mode (D5286).
 function emitAsLitAtom(e: AsExpr, exprIx: i32, fnIx: i32) {
+  const why = asLitAtomWhy(exprIx, fnIx)
+  if why != "" { return emitFail(why) }
+  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
+  return asLitAtomTail(exprIx, fnIx)
+}
+
+// Why legacy refuses the literal-atom cast at `exprIx`, or "": a propagated miss leaves as the
+// id into a literal-union result, or as its member text into a `string` one, and no other way.
+export function asLitAtomWhy(exprIx: i32, fnIx: i32): string {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return asCastNotCastWhy() }
+  if e.asMode != "prop" || fnReturnsLitAtom(fnIx) { return "" }
+  const fd = nodeAt(fnIx)
+  let retStr = false
+  if fd is FuncDecl { retStr = fd.fnRet >= 0 && nodeTyIsStringPrim(fd.fnRet) }
+  if retStr && tyLitMemberTexts(nodeTyIxOf(e.asObj)).length > 0 { return "" }
+  return "emitProgram: `as "
+    + e.asTy
+    + "` over a literal-union atom propagates its miss, and this function returns neither a literal union nor a string — write `as!` or `as?`"
+}
+
+// The tail after a literal-union cast's operand, for the two arms whose operand is the cast's own
+// `emitExpr`: the atom id's (`asLitAtomTail`) and the numeric literal's (`asNumLitScalarTail`).
+export function asLitTail(exprIx: i32, fnIx: i32): i32 {
+  return match asCastArmOf(exprIx, fnIx) {
+    "litAtom" => asLitAtomTail(exprIx, fnIx)
+    "numLitScalar" => asNumLitScalarTail(exprIx, fnIx)
+    "zextLoad" | "v128" | "wrap" | "instMiss" | "numUnion" | "mapProbeTrap" => asLitTailMiss()
+    "mapOptBox" | "mapOptRead" | "holeMiss" | "holeExact" | "holeOpt" => asLitTailMiss()
+    "exact" | "union" | "plain" | "notCast" => asLitTailMiss()
+  }
+}
+
+function asLitTailMiss(): i32 {
+  return emitFail(
+    "emitProgram: a literal cast's tail was asked of a cast of another arm",
+  )
+}
+
+// The sentence for a cast's arm asked of a node that is no cast.
+function asCastNotCastWhy(): string {
+  return "emitProgram: a cast's arm was asked of a node that is no cast"
+}
+
+// After the literal-atom cast's operand (`asLitAtomWhy` ""): the staged id's member test, then
+// the hit, or by mode the trap, the propagated return, or the `-1` sentinel.
+export function asLitAtomTail(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return emitFail(asCastNotCastWhy()) }
   let tty = nodeTyIxOf(exprIx)
   if e.asMode == "null" { tty = tyPeelNul(tty) }
   const texts = tyLitMemberTexts(tty)
-  // A propagated miss leaves as the id into a literal-union result, or as its member text
-  // into a `string` one.
   const retAtom = e.asMode == "prop" && fnReturnsLitAtom(fnIx)
   const missTexts = tyLitMemberTexts(nodeTyIxOf(e.asObj))
-  if e.asMode == "prop" && !retAtom {
-    const fd = nodeAt(fnIx)
-    let retStr = false
-    if fd is FuncDecl { retStr = fd.fnRet >= 0 && nodeTyIsStringPrim(fd.fnRet) }
-    if !retStr || missTexts.length == 0 {
-      return emitFail(
-        "emitProgram: `as "
-          + e.asTy
-          + "` over a literal-union atom propagates its miss, and this function returns neither a literal union nor a string — write `as!` or `as?`",
-      )
-    }
-  }
-  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
   const s = litAtomCastSlot()
   fbLocalSet(s)
   // A lone literal target (`as! "a"`) yields that literal's string, not the id (D5289).
@@ -25377,45 +25510,61 @@ function emitAsLitAtom(e: AsExpr, exprIx: i32, fnIx: i32) {
 // scalar is staged once and compared against each target member. A hit is the scalar, or for `as?`
 // the base-tagged box; a miss traps, is handed back by `return`, or is the null box (D11221).
 function emitAsNumLitScalar(e: AsExpr, exprIx: i32, fnIx: i32) {
-  let tty = nodeTyIxOf(exprIx)
-  if e.asMode == "null" { tty = tyPeelNul(tty) }
-  const base = numLitUnionBaseTy(tty)
-  const texts = tyNumLitMemberTexts(tty)
-  const k = boxTagOfTy(base)
-  if texts.length == 0 || (k != 0 && k != 3) {
-    return emitFail(
-      "emitProgram: `as "
-        + e.asTy
-        + "` names a literal union with no members",
-    )
+  const why = asNumLitScalarWhy(exprIx, fnIx)
+  if why != "" { return emitFail(why) }
+  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
+  return asNumLitScalarTail(exprIx, fnIx)
+}
+
+// The numeric literal union the cast at `exprIx` targets, its `as?` null peeled.
+function numLitCastTargetTy(e: AsExpr, exprIx: i32): i32 {
+  const tty = nodeTyIxOf(exprIx)
+  return if e.asMode == "null" { tyPeelNul(tty) } else { tty }
+}
+
+// The value kind of function `fnIx`'s result, as a propagated numeric-literal miss leaves at it:
+// its annotation's, else the collected return kind; "" when neither is known.
+function numLitPropRetKind(fnIx: i32): string {
+  if fnIx < 0 || fnIx >= P.nodes.length { return "" }
+  const fd = nodeAt(fnIx)
+  if !(fd is FuncDecl) { return "" }
+  if fd.fnRet >= 0 { return vtKindOfType(fd.fnRet) }
+  const fp = fnStmtsPosOf(fnIx)
+  return if fp >= 0 && fp < fRetKind.length { fRetKind[fp] } else { "" }
+}
+
+// Why legacy refuses the numeric-literal cast at `exprIx`, or "": the target has members of an
+// i32 or i64 base, and a propagated miss leaves at that scalar or under its tag in a union box.
+export function asNumLitScalarWhy(exprIx: i32, fnIx: i32): string {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return asCastNotCastWhy() }
+  const tty = numLitCastTargetTy(e, exprIx)
+  const k = boxTagOfTy(numLitUnionBaseTy(tty))
+  if tyNumLitMemberTexts(tty).length == 0 || (k != 0 && k != 3) {
+    return "emitProgram: `as "
+      + e.asTy
+      + "` names a literal union with no members"
   }
+  if e.asMode != "prop" { return "" }
+  const rk = numLitPropRetKind(fnIx)
+  const sk: ListKind = if k == 3 { "i64list" } else { "list" }
+  if rk == "union" || rk == listKindElemKind(sk) { return "" }
+  return "emitProgram: `as "
+    + e.asTy
+    + "` over a numeric literal union propagates its miss, and this function returns neither that number type nor a union — write `as!` or `as?`"
+}
+
+// After the numeric-literal cast's operand (`asNumLitScalarWhy` ""): the staged scalar's member
+// test, then the scalar, or by mode the trap, the propagated return, or the `as?` box.
+export function asNumLitScalarTail(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return emitFail(asCastNotCastWhy()) }
+  const tty = numLitCastTargetTy(e, exprIx)
+  const texts = tyNumLitMemberTexts(tty)
+  const k = boxTagOfTy(numLitUnionBaseTy(tty))
   let sk: ListKind = "list"
   if k == 3 { sk = "i64list" }
-  // A propagated miss leaves at the result's rep: the scalar itself, or boxed under its base's tag.
-  let retBox = false
-  if e.asMode == "prop" {
-    let rk = ""
-    if fnIx >= 0 && fnIx < P.nodes.length {
-      const fd = nodeAt(fnIx)
-      if fd is FuncDecl {
-        if fd.fnRet >= 0 {
-          rk = vtKindOfType(fd.fnRet)
-        } else {
-          const fp = fnStmtsPosOf(fnIx)
-          if fp >= 0 && fp < fRetKind.length { rk = fRetKind[fp] }
-        }
-      }
-    }
-    retBox = rk == "union"
-    if !retBox && rk != listKindElemKind(sk) {
-      return emitFail(
-        "emitProgram: `as "
-          + e.asTy
-          + "` over a numeric literal union propagates its miss, and this function returns neither that number type nor a union — write `as!` or `as?`",
-      )
-    }
-  }
-  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
+  const retBox = e.asMode == "prop" && numLitPropRetKind(fnIx) == "union"
   const s = numLitCastSlot(sk)
   fbLocalSet(s)
   let i = 0
@@ -25642,16 +25791,16 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
 
 // The value kind the cast at `exprIx` builds its operand at, where its arm is an operand and a
 // tail (`numCastTail`): the plain conversion, the wrap that is neither a literal fold nor a
-// narrowed mask, the exact `as!` and `as?`, and a type-parameter operand's exact `as!` and
-// failing `as?` at its pin. -1 for every other arm, which writes its operand its own way.
+// narrowed mask, the exact cast in every mode (a bare `as` returns the function's null), and a
+// type-parameter operand's exact cast and failing `as?` at its pin. -1 for every other arm.
 export function numCastKindOf(exprIx: i32, fnIx: i32): i32 {
   const e = nodeAt(exprIx)
   if !(e is AsExpr) { return -1 }
   return match asCastArmOf(exprIx, fnIx) {
     "plain" => numPlainCastKind(numCastSrcRepOf(e.asObj, fnIx), e.asTy)
     "wrap" => if asWrapArmOf(exprIx, fnIx) == "plain" { numWrapCastKind(exprIx, fnIx) } else { -1 }
-    "exact" => if e.asMode == "trap" || e.asMode == "null" { numExactCastKind(asExprNumSrcName(exprIx)) } else { -1 }
-    "holeExact" => if e.asMode == "trap" { numExactCastKind(asExprHolePinSrc(exprIx, fnIx)) } else { -1 }
+    "exact" => numExactCastKind(asExprNumSrcName(exprIx))
+    "holeExact" => numExactCastKind(asExprHolePinSrc(exprIx, fnIx))
     "holeOpt" => {
       const hs = holeOptExactSrc(exprIx, fnIx)
       if hs != "" { numExactCastKind(hs) } else { -1 }
@@ -41684,7 +41833,7 @@ function srMaskedSource(ix: i32, w: i32, fnIx: i32): i64[] {
 }
 
 // `srMaskedSource` of an `as% i32` wrap over an i64 masked shift, else [].
-function srWrappedMask(x: i32, fnIx: i32): i64[] {
+export function srWrappedMask(x: i32, fnIx: i32): i64[] {
   const none: i64[] = []
   if x < 0 || x >= P.nodes.length { return none }
   const e = nodeAt(x)
