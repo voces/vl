@@ -19,3 +19,7 @@ Witness: `tests/ir-shadow-rows/capture-loop-forward-and-instance-param.vl` (7 â†
 
 In the family's tests/cases programs, 11 `closure env capture` misses remain. 7 are captures
 through a shared cell (`#cell:N`, `capCellTargetOf`) and 3 are the `null` instance (#9663).
+
+## Legacy tails the IR calls
+
+- `fbValtype` (under `wTarget` to a scratch buffer), in `capRepAtTy`: legacy's capture valtype, compared and discarded. This PR moves the existing call out of `capRepFor`; it adds no new one.
