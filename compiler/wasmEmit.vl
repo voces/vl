@@ -9042,6 +9042,28 @@ function emitCoerceAtomPayload(cak: i32, exprIx: i32, fnIx: i32) {
   return 0
 }
 
+// The arm `emitUnionCoerceUnder` writes the value `if` at `bareIx` on: `null` for a `null`-typed
+// one, `value` for `emitUnionIfValue`, "" when it is not that function's `IfStmt` arm.
+function unionCoerceIfArmOf(bareIx: i32, fnIx: i32): string {
+  if !(nodeAt(bareIx) is IfStmt) || ifJoinAdaptsScalar(bareIx, fnIx) {
+    return ""
+  }
+  return if nodeTyIsNullType(bareIx) { "null" } else { "value" }
+}
+
+// Why an else-less value `if` delivered into union `unionTy`'s box is not `emitUnionIfValue`'s
+// one link with the null box for its `else` (`emitUnionCoerceUnder`), or "".
+export function elseLessUnionIfWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
+  const ix = unwrapParen(ixIn)
+  if ix < 0 { return "node" }
+  const n = nodeAt(ix)
+  if !(n is IfStmt) || n.ifElse >= 0 { return "has else" }
+  if unionArmTagClash(unionTy) != "" { return "tag clash" }
+  if callIsNever(ix) { return "never" }
+  if unionCoerceIfArmOf(ix, fnIx) != "value" { return "not value arm" }
+  return ifShapeWhyOf(ix, fnIx, false)
+}
+
 // `emitUnionCoerce`'s body: the arms that thread a list or f32 context apply it and leave it
 // for the wrapper's exit to undo.
 function emitUnionCoerceUnder(
@@ -9074,9 +9096,10 @@ function emitUnionCoerceUnder(
   // if-expression that is already a union value hits the raw pass first and is emitted by
   // `emitExpr`, which picks the join's blocktype from the arms' scalar ladder. Only this arm
   // knows the blocktype has to be the box, so it must be asked first.
-  if bare is IfStmt && !ifJoinAdaptsScalar(bareIx, fnIx) {
+  const ifArm = unionCoerceIfArmOf(bareIx, fnIx)
+  if ifArm != "" {
     // A `null`-typed one is the null-tagged box after its arms run for effect (D3355).
-    if nodeTyIsNullType(bareIx) {
+    if ifArm == "null" {
       fbI32Rel(RS_TAG, nullBoxTag())
       if emitNulNoneBoxPayload(bareIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx)
@@ -23107,18 +23130,27 @@ export function ifExprJoinVt(ifIx: i32, fnIx: i32): i32 {
 // Why the value `if` at `ifIx` has no shape `emitIfExprAs` writes with one value per arm, or "": no
 // `else`, an arm with no lone value, an unwalked prelude, a guard call, or an integer switch.
 export function ifExprShapeWhy(ifIx: i32, fnIx: i32): string {
+  return ifShapeWhyOf(ifIx, fnIx, true)
+}
+
+// `ifExprShapeWhy`, an else-less `if` passing where `needElse` is false: its missing arm is then
+// the join's own null, which the union and reference rungs write (`emitUnionIfValueLink`,
+// `emitIfExprRefLink`).
+function ifShapeWhyOf(ifIx: i32, fnIx: i32, needElse: boolean): string {
   if ifIx < 0 || ifIx >= P.nodes.length { return "node" }
   const n = nodeAt(ifIx)
-  if !(n is IfStmt) || n.ifElse < 0 || n.ifCond < 0 { return "no else" }
+  if !(n is IfStmt) || n.ifCond < 0 { return "no else" }
+  const noElse = n.ifElse < 0
+  if noElse && needElse { return "no else" }
   // An `else if` is the chain's next link, which `emitIfExprAsLink` writes into this one's frame.
-  const elseLink = nodeAt(n.ifElse) is IfStmt
-  if !ifArmHasValue(n.ifThen) || !elseLink && !ifArmHasValue(n.ifElse) {
+  const elseArm = !noElse && !(nodeAt(n.ifElse) is IfStmt)
+  if !ifArmHasValue(n.ifThen) || elseArm && !ifArmHasValue(n.ifElse) {
     return "arm not lone"
   }
   // A prelude local the collect pass did not allocate is legacy's refusal (`emitIfArmOpen`).
   if (
     armPreludeUnwalkedDecl(n.ifThen) >= 0
-    || !elseLink && armPreludeUnwalkedDecl(n.ifElse) >= 0
+    || elseArm && armPreludeUnwalkedDecl(n.ifElse) >= 0
   ) {
     return "arm prelude unwalked"
   }
@@ -23138,12 +23170,19 @@ export function ifExprShapeWhy(ifIx: i32, fnIx: i32): string {
 // (`ifExprShapeWhy`), then its join rung (an atom join is plain), a static `is` or literal-true
 // condition, a prelude, or v128.
 export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
-  const sw = ifExprShapeWhy(ifIx, fnIx)
+  const sw = ifShapeWhyOf(ifIx, fnIx, false)
   if sw != "" { return sw }
   // Classified as `emitIfExpr` classifies it, with the arms' prelude locals bound.
   const scoped = armPreludeScopeOpen(ifIx)
   const p = ifJoinPlanOf(ifIx, fnIx)
   if scoped { scopePop() }
+  const h = nodeAt(ifIx)
+  // An else-less link is the null of the union box, the reference, or an i32 niche.
+  const nicheArm = p.ijArm == "atom" || p.ijArm == "scalar"
+  const ownNull = p.ijArm == "union"
+    || p.ijArm == "ref"
+    || nicheArm && ifNoElseNicheOf(ifIx) != 0
+  if h is IfStmt && h.ifElse < 0 && !ownNull { return "no else" }
   const rung = match p.ijArm {
     "null" => "null join"
     "atom" => ""
@@ -23561,6 +23600,14 @@ function emitIfExprAs(ifIx: i32, fnIx: i32, kind: i32) {
   return closeIfChainFrames(open, rc, false)
 }
 
+// The sentinel an else-less link of `emitIfExprAs` writes for its missing arm, the one a bare
+// `null` takes there: 2 at `boolean | null`, -1 at a nullable literal union, else 0, since a
+// bare number has no spare value.
+export function ifNoElseNicheOf(ifIx: i32): i32 {
+  if nodeTyIsNulBool(ifIx) { return 2 }
+  return if nodeTyIsNulLitUnion(ifIx) { 0 - 1 } else { 0 }
+}
+
 // One link of `emitIfExprAs`: 0 or -1 as that function returns, or 1 when the else is another `if`
 // and this link's frame is left open (its else restore target pushed onto `open`).
 // Whether the value `if` link at `ifIx` may be a valued `br_table` (`emitIntSwitch` mode 2): a
@@ -23583,10 +23630,9 @@ function emitIfExprAsLink(ifIx: i32, fnIx: i32, kind: i32, open: i32[]) {
     // 2 for `boolean | null`, -1 for a nullable literal union — the same values
     // `emitNullLitNode` writes for a bare `null` there; a bare numeric join has no such spare value, so it keeps the loud refusal rather than inventing a sentinel in an i32.
     const noElseNiche = s.ifElse < 0
-    if noElseNiche {
-      if !nodeTyIsNulBool(ifIx) && !nodeTyIsNulLitUnion(ifIx) {
-        return emitFail("emitProgram: if-expression requires an else arm")
-      }
+    const niche = if noElseNiche { ifNoElseNicheOf(ifIx) } else { 0 }
+    if noElseNiche && niche == 0 {
+      return emitFail("emitProgram: if-expression requires an else arm")
     }
     const condStart = wLen()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
@@ -23602,7 +23648,7 @@ function emitIfExprAsLink(ifIx: i32, fnIx: i32, kind: i32, open: i32[]) {
     fbElse() // 0x05 else
     let rc = 0
     if noElseNiche {
-      if nodeTyIsNulBool(ifIx) { fbI32Const(2) } else { fbI32Const(0 - 1) }
+      fbI32Const(niche)
     } else {
       const els = nodeAt(s.ifElse)
       if els is IfStmt {
