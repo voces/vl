@@ -212,9 +212,11 @@ import {
   arrCopyPlanOf,
   arrLitLongRouteOf,
   arrLitShortWhy,
+  arrLitUnionLongSlot,
   arrNewCallNamed,
   arrNewFillBoxTy,
   arrNewWhyOf,
+  arrRefUnionElemTy,
   asCastArmOf,
   asLitAtomWhy,
   asNicheCastWhy,
@@ -3766,7 +3768,13 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !stored
       && holeRetagNoted(cellRep, rep, true)
       && exprPrePathWhy(ix, ibFnIx) == ""
-    if cellRep != rep && !narrowed && !stored && !holed && !alike {
+    // A binding holding one closed member of a returned record, read where the read's type leaves
+    // a variable open, is that member's closure as its cell holds it (`globalHolderTy`).
+    const gh = if cellRep != rep && !narrowed && !stored && !holed && !alike { globalHolderTy(d) } else { -1 }
+    const member = gh >= 0
+      && repNodeOfTy(gh) == cellRep
+      && irTyHeldOpen(heldTy(exprTyOf(ix)), rep)
+    if cellRep != rep && !narrowed && !stored && !holed && !alike && !member {
       return irBMiss("global read coercion")
     }
     if stored { return globalStoredRead(b, g, d, ix, cellRep) }
@@ -3780,18 +3788,33 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     }
     ib.irReadAgain[ix] = gr
     if holed {
-      // The cell is read at its storage row, the binding's type.
-      const lt = heldTy(letBindTy(d, -1))
+      // The cell is read at its storage row, the binding's type, or the member a binding holding
+      // one of a returned record holds (`globalHolderTy`).
+      const bt = heldTy(letBindTy(d, -1))
+      const lt = if repNodeOfTy(bt) != cellRep && globalHolderTy(d) >= 0 { globalHolderTy(d) } else { bt }
       if repNodeOfTy(lt) != cellRep { return irBMiss("global read coercion") }
       const held = irBLetTempTy(b, gr, ix, cellRep, lt)
+      // Retagged to a rep whose type is open, the value would have no type; the member is read as
+      // the cell holds it.
+      if lt != bt && irTyHeldOpen(heldTy(exprTyOf(ix)), rep) { return held }
       return repTemp(b, { rgV: held }, ix, rep)
     }
-    return irBLetTemp(b, gr, ix, rep)
+    if member { return irBLetTempTy(b, gr, ix, cellRep, gh) }
+    return irBLetTempTy(b, gr, ix, rep, globalReadTy(d, ix, rep))
   }
   if dn is FuncDecl && repNodeAt(rep) is RClosure {
     return cloValue(b, ix, rep, heldTy(exprTyOf(ix)))
   }
   return irBMiss("read of " + n.identName)
+}
+
+// The type read `ix` of global `d` at rep `rep` is held at: the read's own, or the type the
+// binding holds where the read's leaves a variable open and the held type's rep is `rep`.
+function globalReadTy(d: i32, ix: i32, rep: i32): i32 {
+  const ty = heldTy(exprTyOf(ix))
+  if !irTyHeldOpen(ty, rep) { return ty }
+  const ht = globalHolderTy(d)
+  return if ht >= 0 && repNodeOfTy(ht) == rep { ht } else { ty }
 }
 
 // Read `ix` of global `g` (declaration `d`) as its cell stores it: rep `cellRep`, typed at the
@@ -4046,14 +4069,12 @@ function retCloAt(b: i32[], retIx: i32): Opnd | null {
 }
 
 // The environment of capturing function `fe`, read at `ix`, as `emitClosureEnvOf` builds it: each
-// capture a parameter or binding of this frame, or this frame's own capture; a function-value cell
-// has no operand. A value of `fe` through its cell has none at all: legacy fills the cell. A copy
-// into a cached environment, or a global capture, misses.
+// capture a parameter or binding of this frame, or this frame's own capture, read as a temp the
+// lowering writes at its use, inside a cached environment's slot test; a function-value cell has no
+// operand. A value of `fe` through its cell has none at all: legacy fills the cell. A global misses.
 function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
   const out: Opnd[] = []
   if cloCellReaches(fe, ibFnIx) { return out }
-  // A cached environment is built inside the slot's test, so each capture is a variable read there.
-  const cached = irEnvCached(fe)
   const self = fnStmtsPosOf(ibFnIx)
   for name in captureNamesOf(fe) {
     if capCellTargetOf(name) >= 0 { continue }
@@ -4090,10 +4111,6 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
     }
     if v < 0 || ib.irVars[v].vRep != r {
       irBMiss("closure env capture")
-      return out
-    }
-    if cached && ib.irVars[v].vKind == "temp" {
-      irBMiss("closure env cache copy")
       return out
     }
     const o: Opnd = { ov: v }
@@ -4391,7 +4408,7 @@ function nullNarrowArmOf(ix: i32, cellRep: i32, rep: i32): NullNarrowArm {
 function globalRep(g: i32, d: i32): i32 {
   const noted = irGlobalRepOf(ib, g)
   if noted >= 0 { return noted }
-  const ht = if elabHasHolderRecords() { holderRecordTy(d, -1) } else { -1 }
+  const ht = globalHolderTy(d)
   const r = globalTyRep(if ht >= 0 { ht } else { scopeTyAt(d, -1) })
   if r >= 0 {
     globalNoteAt(g, d, r)
@@ -4400,11 +4417,21 @@ function globalRep(g: i32, d: i32): i32 {
   return r
 }
 
-// The type global `d`'s cell holds: the record a holding binding holds whole (`holderRecordTy`, the
-// struct legacy's `letCellKindGo` gives its cell), else its own type.
+// The type global `d`'s cell holds: the record a holding binding holds whole, or the one member
+// of it a binding holds (`globalHolderTy`), else its own type.
 function globalHeldTy(d: i32): i32 {
-  const ht = if elabHasHolderRecords() { holderRecordTy(d, -1) } else { -1 }
+  const ht = globalHolderTy(d)
   return if ht >= 0 { ht } else { scopeTyAt(d, -1) }
+}
+
+// The type a module binding `d` holds a returned record at, as `irBDeclVar` holds a local's: the
+// record whole (`holderRecordTy`, the struct legacy's `letCellKindGo` gives its cell), or the one
+// closed member a binding holds (`holderMemberTy`); else -1.
+function globalHolderTy(d: i32): i32 {
+  const ht = if elabHasHolderRecords() { holderRecordTy(d, -1) } else { -1 }
+  if ht >= 0 { return ht }
+  const hm = if elabHasRetRecords() || bundleAnyNoted() { holderMemberTy(d, -1) } else { -1 }
+  return if hm >= 0 && !irTyOpen(hm) { hm } else { -1 }
 }
 
 // Notes global `g`'s rep `rep` in `ib`, with its declaration `d`'s storage-row type
@@ -8044,7 +8071,14 @@ function arrayLit(
   // element as is, or each boxed by its record, which `deliver` writes at the box rep.
   // …or a non-null variant's, each element a literal built at the variant's row or a value of it.
   const vslot = if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 { arrLitVariantSlot(ix, ibFnIx, lb) } else { -1 }
-  if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 && vslot < 0 {
+  // …or a union-box slot's per-element build, each element boxed into the slot's union.
+  const uslot = if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 && vslot < 0 { arrLitUnionLongSlot(ix, n.arrElems, ibFnIx, lb) } else { -1 }
+  if (
+    arm == "ref"
+    && arrLitRefShortSlot(ix, ibFnIx, lb) < 0
+    && vslot < 0
+    && uslot < 0
+  ) {
     return irBMiss("array ref")
   }
   if (
@@ -8080,7 +8114,7 @@ function arrayLit(
   // A union-box slot's elements are boxes: a list the instance reps at its bound member is not one.
   if (
     arm == "ref"
-    && arrLitUnionBoxSlot(ix, ibFnIx, lb) >= 0
+    && (arrLitUnionBoxSlot(ix, ibFnIx, lb) >= 0 || uslot >= 0)
     && !heldAsBox(ln.rlsElem)
   ) {
     return irBMiss("array union element rep")
@@ -8097,7 +8131,7 @@ function arrayLit(
   for e in n.arrElems {
     const at = b.length
     starts.push(at)
-    const v = if dataConst { longConstElem(e, er) } else if vslot >= 0 { variantElem(b, e, er, vslot) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else { deliver(b, e, er, -1) }
+    const v = if dataConst { longConstElem(e, er) } else if vslot >= 0 { variantElem(b, e, er, vslot) } else if uslot >= 0 { boxTempIn(b, irBExpr(b, e), e, er, -1, arrRefUnionElemTy(ix, uslot, ibFnIx)) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
     // An element written before a valued `if` is staged below it, as a call's argument is.
     if elems.length > 0 && !irBStageLeads(b, at, starts, elems, n.arrElems) {
@@ -8423,6 +8457,8 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if dIx < 0 || !(nodeAt(dIx) is StrLit) {
     return coalNulStr(b, n, ix, rep, false)
   }
+  // An if-expression operand is built inside the block, where legacy writes it (`nulStr`).
+  if nodeAt(lhsIx) is IfStmt { return coalNulStr(b, n, ix, rep, false) }
   const lat = b.length
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
@@ -8670,7 +8706,12 @@ function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   if ibMiss != "" { return r }
   // A receiver legacy re-emits is read again as the builder read it (`irHoistRecv`).
   if !(r is OVar) || r.ov < 0 { return irBMiss("coalesce field place") }
-  if ib.irVars[r.ov].vKind == "temp" && !recvReadsAgain(unwrapParen(m.memObj)) {
+  // One legacy keeps in its stash (`coalFieldRecvStash`, a call) is read back from there.
+  if (
+    ib.irVars[r.ov].vKind == "temp"
+    && !recvReadsAgain(unwrapParen(m.memObj))
+    && unionEqOperandOk(m.memObj)
+  ) {
     return irBMiss("coalesce field place")
   }
   // The receiver is the record, or a box or a nullable record legacy unwraps (`cfCast`).
@@ -9847,7 +9888,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   const own = exprRepOf(ix)
   // A `never` call, operator or field read is legacy's i32: its consumer widens it as any i32.
   const nv = own < 0
-    && (n is Call || n is BinExpr || n is Member)
+    && (n is Call || n is BinExpr || n is Member || n is Unary)
     && exprTyOf(ix) == TY_NEVER
   const rep = if nv { repNodeOfTy(TY_I32) } else { own }
   if rep < 0 {
@@ -9875,7 +9916,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     ) {
       return signedLitAt(ix, rep)
     }
-    const uw = operandWhy(n.unArg)
+    // `-` and `~` over a `never` operand are legacy's i32, at the operand's own i32 (D14420).
+    const unv = exprTyOf(n.unArg) == TY_NEVER
+    if unv && n.unOp == "!" { return irBMiss("not over a never operand") }
+    const uw = if unv { "" } else { operandWhy(n.unArg) }
     if uw != "" { return irBMiss(uw) }
     const aat = b.length
     const a = irBExpr(b, n.unArg)
@@ -9888,12 +9932,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       return o
     }
     // `~x` is legacy's `x ^ -1`, the all-ones mask at the operand's width.
+    const uty = if unv { repTyOf(rep) } else { heldTy(exprTyOf(ix)) }
     if n.unOp == "~" {
       const ones: Opnd = { oiRep: rep, oiBits: -1 }
-      return irBLetTemp(b, { poOp: "xor", poArgs: [a, ones] }, ix, rep)
+      return irBLetTempTy(b, { poOp: "xor", poArgs: [a, ones] }, ix, rep, uty)
     }
     const op: PrimOp = if n.unOp == "-" { "neg" } else { "not" }
-    return irBLetTemp(b, { poOp: op, poArgs: [a] }, ix, rep)
+    return irBLetTempTy(b, { poOp: op, poArgs: [a] }, ix, rep, uty)
   }
   if n is BinExpr {
     if n.binOp == "&&" || n.binOp == "||" { return shortCircuit(b, n, ix, rep) }
@@ -12730,7 +12775,7 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     return irBMiss("global initializer coercion")
   }
   globalNoteAt(gi, gst, if bottom { rep } else { vr })
-  if noted < 0 && vr == rep && holderRecordTy(gst, -1) >= 0 {
+  if noted < 0 && vr == rep && globalHolderTy(gst) >= 0 {
     ib.irGlobalHeld[gi] = true
   }
   return v
