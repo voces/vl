@@ -269,6 +269,25 @@ For the queue:
 - **Q47.** A lane's identity readings set `VL_STD=<tree>/std` on both arms. A stale shared std shows up
   as extra "fail under both" rows or a spurious differ (#9699's 72 against 68; #9702's D16943
   differ), which the lane must explain before READY (queue practice).
+- **Q48.** Every READY that touches `compiler/` quotes `self-ir-misses` = 0 and
+  `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check tests/vl_deep_nesting_test.ts` passing with all
+  8 tests run (the shared host linked; an isolated host skips 3). The queue refuses a READY without
+  both (coordinator ruling, 2026-11-23, after DX2 and DW1 red on trains).
+- **Q49.** The queue broadcasts the lane-claims list to every lane on each change. A lane reads the
+  latest broadcast before picking, announces its pick and waits for the queue's ack before writing
+  code; a collision is answered "taken by X", and a contested class goes to the coordinator
+  (coordinator ruling, 2026-11-23). The coordinator has split a class by mechanism, each lane
+  taking a named sub-cut, and has given a contested class to the lane whose own refusal and
+  in-flight cells depend on it.
+- **Q50.** A train's tree holds every file master holds. A train merge over the PR's master base
+  reads a docs-only commit that went straight to master as a train-side deletion and drops it; an
+  `inventory refs` red on a later citing PR is the symptom (IR-V3 on EM1, D17073). The queue's
+  merge restores any master file the merged train lacks unless the PR deleted it (queue practice).
+- **Q51.** A PR stacked on another queued PR merges into the train with the lower PR's head as merge
+  base, and the train's delta is checked to equal the PR's own diff. Once the lower PR squashes,
+  the upper squash needs a Q46 mechanical merge (#9717, #9720) (queue practice).
+- **Q52.** A verifier given VERIFY-only runs no gate when the queue box gated the same train; the
+  queue box gates while a verifier proves (queue practice).
 
 ### Squash artifacts and Q3 members
 
