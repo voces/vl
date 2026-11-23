@@ -76,6 +76,7 @@ import {
   PStaged,
   PrimOp,
   PushRecv,
+  RBoxNarrow,
   RCall,
   RListSlice,
   RListStage,
@@ -193,6 +194,7 @@ import {
   armIndexWriteArmsOf,
   arrCopyCallNamed,
   arrCopyPlanOf,
+  arrLitLongRouteOf,
   arrLitShortWhy,
   arrNewCallNamed,
   arrNewFillBoxTy,
@@ -368,7 +370,6 @@ import {
   structFieldBoxTy,
   tagArmLambdaCallee,
   tagDispatchArms,
-  tagDispatchBoxes,
   tagDispatchIds,
   tagDispatchTy,
   tagDispatchTyIsVoid,
@@ -418,6 +419,7 @@ import {
   isVariantTagPlain,
   litIsArmOf,
   litIsMemberTexts,
+  litMemberIsString,
   memberBoxReadAt,
   monoStaticIsResult,
   narrowedBoxVariantPlain,
@@ -1062,13 +1064,15 @@ function isNumLit(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { niV: v, niAt: ix }, ix, rep)
 }
 
+// `x is "lit"` on the `litMember` rung, as `emitLitMemberEq` writes it: the one string literal's
+// compare, which the literal arms' member test writes the same way. A number literal is a miss.
+function isLitMember(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  if !litMemberIsString(ix) { return irBMiss("is literal member number") }
+  return isLitArmsTest(b, n, ix, rep, "memberEq")
+}
+
 // `x is L` over a box of list arms on the `listAcross` rung, as `emitListIsAcrossReps` writes it.
-// Its shared slot is minted before the receiver is written, so the receiver is a variable read,
-// which mints nothing.
 function isListAcross(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
-  if !(nodeAt(unwrapParen(n.isObj)) is Ident) {
-    return irBMiss("is list across receiver")
-  }
   if rep != ibBool { return irBMiss("is result rep") }
   const v = irBExpr(b, n.isObj)
   if ibMiss != "" { return v }
@@ -1107,6 +1111,7 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   }
   if arm == "numLit" { return isNumLit(b, n, ix, rep) }
   if arm == "listAcross" { return isListAcross(b, n, ix, rep) }
+  if arm == "litMember" { return isLitMember(b, n, ix, rep) }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   // Each rung's own answer, asked once: the arm tag's `tagIsArmOf`, the variant's plain row.
   const ta: TagIsArm = if arm == "armTag" { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
@@ -3531,7 +3536,7 @@ function narrowedLocalRead(
   if ba == "atom" {
     const ak = identUnboxAtomOf(ix, ibFnIx)
     if ak < 0 { return irBMiss("narrowed read dead") }
-    return irBLetTemp(
+    return unboxAtomTemp(
       b,
       { bnV: o, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: -1 },
       ix,
@@ -3611,12 +3616,40 @@ function globalUnboxRead(
   if ba == "atom" && ak < 0 { return irBMiss("narrowed read dead") }
   const box = globalBoxAt(b, g, d, ix, cellRep)
   if ibMiss != "" { return box }
-  return irBLetTemp(
+  const r: RBoxNarrow = {
+    bnV: box,
+    bnAt: ix,
+    bnRep: rep,
+    bnAtom: ak,
+    bnCon: con,
+  }
+  if ak >= 0 { return unboxAtomTemp(b, r, ix, rep) }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// Box read `r` at `ix` unboxed to its atom kind, read at `rep` (`irBUnboxKindRep`).
+function unboxAtomTemp(b: i32[], r: RBoxNarrow, ix: i32, rep: i32): Opnd {
+  const ur = irBUnboxKindRep(r.bnAtom, rep)
+  if ur == rep { return irBLetTemp(b, r, ix, rep) }
+  return irBLetTempTy(
     b,
-    { bnV: box, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: con },
+    { bnV: r.bnV, bnAt: ix, bnRep: ur, bnAtom: r.bnAtom, bnCon: -1 },
     ix,
-    rep,
+    ur,
+    TY_STR,
   )
+}
+
+// A temp at `string` for read `ix`, holding `r`, whose node is typed at another type.
+export function irBLetStrTemp(b: i32[], r: Rhs, ix: i32): Opnd {
+  return irBLetTempTy(b, r, ix, repNodeOfTy(TY_STR), TY_STR)
+}
+
+// The rep an unbox to value-atom kind `k` leaves for a read at `rep`: a literal-union member is
+// boxed as its string, which the unbox leaves, so an atom `rep` reads at `string`.
+export function irBUnboxKindRep(k: i32, rep: i32): i32 {
+  if k == 2 && repNodeAt(rep) is RAtom { return repNodeOfTy(TY_STR) }
+  return rep
 }
 
 // Module global `g` (declared at `d`, cell rep `cellRep`) read at `ix` as the box
@@ -6894,7 +6927,16 @@ function arrayLit(
     return irBMiss("array " + arm)
   }
   const sw = if arm == "ref" { "" } else { arrLitShortWhy(ix, ibFnIx, arm, n.arrElems.length) }
-  if sw != "" { return irBMiss("array " + sw) }
+  // A string list past the operand cap is legacy's chunked build, of literal elements only here.
+  const strChunk = sw == "long" && arm == "str" && allStrLits(n.arrElems)
+  // A long literal of constants builds from one data segment (`arrLitLongRouteOf`); a computed
+  // element's store, or another arm's chunked build, is legacy's.
+  const route = if sw == "long" && !strChunk { arrLitLongRouteOf(n.arrElems, ibFnIx, arm, lb.lbSlot) } else { "chunk" }
+  const dataConst = sw == "long" && !strChunk && route == "dataConst"
+  if sw == "long" && !strChunk && !dataConst {
+    return irBMiss("array long " + route)
+  }
+  if sw != "" && sw != "long" { return irBMiss("array " + sw) }
   // Typed at the type legacy's build decision takes (`arrLitBuiltTyOf`): an instance's `[1.5]` at
   // `T[]` is an f32 list where its stamp says f64. Its own-shape route keeps the stamp. `bt` is the
   // type behind `lb`, the build the literal's delivery threaded.
@@ -6922,7 +6964,7 @@ function arrayLit(
   for e in n.arrElems {
     const at = b.length
     starts.push(at)
-    const v = if vslot >= 0 { variantElem(b, e, er, vslot) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else { deliver(b, e, er, -1) }
+    const v = if dataConst { longConstElem(e, er) } else if vslot >= 0 { variantElem(b, e, er, vslot) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
     // An element written before a valued `if` is staged below it, as a call's argument is.
     if elems.length > 0 && !irBStageLeads(b, at, starts, elems, n.arrElems) {
@@ -7236,6 +7278,43 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   return o
 }
 
+// `l ?? d` along legacy's `boxStash` rung (`emitCoalesceBoxStash`): the operand's box, then its tag
+// test's box-typed `if`, the default built into its absent arm.
+function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  if !heldAsBox(rep) { return irBMiss("coalesce box stash result rep") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  if endsInTemp(b) { return irBMiss("coalesce box after an operand") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !heldAsBox(irBOpRep(l)) {
+    return irBMiss("coalesce box stash operand rep")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep, -1)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce box stash default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    {
+      cbL: l,
+      cbLB: [],
+      cbArm: "boxStash",
+      cbNull: nb,
+      cbOut: t,
+      cbAt: ix,
+      cbMap: null,
+    },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
 // `o.v ?? d` over a value-union record field past the boxed arms, along `coalFieldPlanOf` as
 // `emitCoalesceUnionField` writes it: the record, a variable it re-reads, then the shared null
 // test's `if`, the default built into its null arm. A receiver it unwraps is a named miss.
@@ -7388,6 +7467,7 @@ function coalNulRef(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
     if irBOpRep(v) != rep { return irBMiss("coalesce nulRef " + ra + " rep") }
     return v
   }
+  if ra == "boxStash" { return coalBoxStash(b, n, ix, rep) }
   if ra == "boxFieldScalar" { return coalBoxFieldScalar(b, n, ix, rep) }
   if ra != "heap" && ra != "mapHeap" { return irBMiss("coalesce nulRef " + ra) }
   const p = coalNulRefPlanOf(n, lhsIx, ix, ibFnIx)
@@ -7987,7 +8067,6 @@ function tagDispatchAt(b: i32[], ix: i32, read: boolean): Opnd {
   // Legacy keys the dispatch on its result's kind: none has no rep, and a union boxes each arm.
   const kind = repSigKindOfTy(ty)
   if kind == null { return irBMiss("tag dispatch result") }
-  if tagDispatchBoxes(kind) { return irBMiss("tag dispatch result union") }
   const rep = repNodeOfTy(ty)
   if read && primRepOf(ix) != rep { return irBMiss("tag dispatch result rep") }
   const f = tagCallee(b, c.callFn)
@@ -10883,12 +10962,13 @@ function mapNewInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
 // The closure global `gi` starts as: a capture-free function literal, or a function name read as
 // a value on legacy's checked arm (`fnValueArmOf`), written by legacy's `emitClosureValue`.
 function cloInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
-  // Any other initializer, a call's result among them, is the value `emitExpr` writes.
-  if (
-    !(nodeAt(unwrapParen(init)) is FuncDecl || nodeAt(unwrapParen(init)) is Ident)
-  ) {
-    return globalInitValue(b, gi, gst, init)
-  }
+  // Any other initializer, a call's result or a global holding a closure among them, is the value
+  // `emitExpr` writes: a name is a function value only where `emitIdentNonLocalRead` finds one.
+  const iu = unwrapParen(init)
+  if iu < 0 || iu >= P.nodes.length { return globalInitValue(b, gi, gst, init) }
+  const iv = nodeAt(iu)
+  const fnName = iv is Ident && fnValueFeOf(iv, sidOfNode(iu), iu, ibFnIx) >= 0
+  if !(iv is FuncDecl || fnName) { return globalInitValue(b, gi, gst, init) }
   const rep = repNodeOfTy(scopeTyAt(gst, -1))
   if !(repNodeAt(rep) is RClosure) { return irBMiss("global initializer rep") }
   const ix = unwrapParen(init)
