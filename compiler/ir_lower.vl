@@ -299,12 +299,18 @@ import {
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
+  arrLitDataTry,
   arrLitHoistGlobal,
   arrLitIsForIter,
+  arrLitLongRouteOf,
   arrLitPackedShortTail,
   arrLitPrologue,
   arrLitRefShortTail,
   arrLitShortTail,
+  arrLitShortWhy,
+  arrLitStrChunkClose,
+  arrLitStrChunkOpen,
+  arrLitStrChunkStep,
   arrNewDefaultTail,
   arrNewFillStep,
   arrNewLenStash,
@@ -396,7 +402,6 @@ import {
   holeBoxHead,
   holeBoxLeads,
   holeBoxTail,
-  holeBoxTyAt,
   hostCallTail,
   identListOverrideOf,
   idxRowsOn,
@@ -597,7 +602,7 @@ import {
   spreadPlanOf,
   spreadWrapIdx,
 } from "./emit_plan_list"
-import { fbOpenIf, fbValtype } from "./emit_bytes"
+import { emitFail, fbOpenIf, fbValtype } from "./emit_bytes"
 import {
   atomFoldSideTail,
   atomFoldTail,
@@ -644,7 +649,7 @@ import {
   objOrderStashSlot,
   unionLitIsStashSlot,
 } from "./emit_if_arm_values"
-import { forInLoopAt } from "./emit_plan_list"
+import { allocLitChunk, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -716,6 +721,8 @@ let lwIfHeadAt: {[i32]: i32} = Map()
 let lwIfHeadBuilt = false
 // Each box by the out its value is (`stashIfBoxHead`), noted with `lwIfHeadAt`.
 let lwIfBoxAt: {[i32]: i32} = Map()
+// Each such box's union (`RToBox.bxTy`), by the same out.
+let lwIfBoxTy: {[i32]: i32} = Map()
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -1415,7 +1422,7 @@ function stashBoxHead(at: i32) {
     const r = n.lRhs
     if !(r is RToBox) || unwrapParen(r.bxAt) != at { continue }
     const bx = r.bxAt
-    const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+    const p = holeBoxPlanOf(bx, r.bxTy, lw.irAt)
     if p.hbArm == "rec" || p.hbArm == "obj" {
       leaf()
       holeBoxHead(p, bx, lw.irAt)
@@ -1446,7 +1453,7 @@ function joinBoxHead(out: i32, staged: boolean) {
   if !lwIfHeadBuilt { stashIfHeadsNote() }
   const bx = lwIfBoxAt.get(out) ?? -1
   if bx < 0 || i32ListHas(lwBoxHeadAt, unwrapParen(bx)) { return 0 }
-  const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+  const p = holeBoxPlanOf(bx, lwIfBoxTy.get(out) ?? -1, lw.irAt)
   if holeBoxLeads(p.hbArm) {
     if staged { lwPushing = true } else { leaf() }
     holeBoxHead(p, bx, lw.irAt)
@@ -1466,7 +1473,10 @@ function stashIfHeadsNote() {
       const mr = m.lRhs
       if mr is RToBox {
         const bv = mr.bxV
-        if bv is OVar { lwIfBoxAt.set(bv.ov, mr.bxAt) }
+        if bv is OVar {
+          lwIfBoxAt.set(bv.ov, mr.bxAt)
+          lwIfBoxTy.set(bv.ov, mr.bxTy)
+        }
       }
       if mr is RMakeRec && !mr.mrSet && mr.mrSrc.length > 0 {
         const k0 = mr.mrSrc[0]
@@ -2185,6 +2195,47 @@ function makeList(r: RMakeList) {
       for e in r.mlElems { irLSkip(e) }
       return fbGlobalGet(g)
     }
+  }
+  // A long literal of constants is legacy's data segment, built from the AST's own literals: the
+  // operands, immediates the builder held it to, are left unwritten.
+  if (
+    arm != "ref"
+    && arm != "str"
+    && arrLitShortWhy(r.mlAt, fnIx, arm, r.mlElems.length) == "long"
+  ) {
+    const a = nodeAt(r.mlAt)
+    if !(a is ArrayLit) { return irLMiss("array long node") }
+    for e in r.mlElems {
+      if !(e is OImm) { return irLMiss("array long element") }
+    }
+    if arrLitLongRouteOf(a.arrElems, fnIx, arm, lb.lbSlot) != "dataConst" {
+      return irLMiss("array long route")
+    }
+    for e in r.mlElems { irLSkip(e) }
+    const d = arrLitDataTry(a.arrElems, fnIx, arm, lb.lbSlot)
+    if d < 0 { return -1 }
+    if d == 0 {
+      return emitFail(
+        "emitProgram: internal: a constant long literal declined its data segment",
+      )
+    }
+    return 0
+  }
+  // A string list past the operand cap builds in chunks, as `emitArrStr` does: opened before its
+  // elements, each element then the chunk's flush.
+  if arm == "str" && r.mlElems.length > allocLitChunk() {
+    for e in r.mlElems {
+      if !(e is OImm || e is OStr) { return irLMiss("long list element") }
+    }
+    const dst = arrLitStrChunkOpen(r.mlElems.length)
+    let coff = 0
+    let i = 0
+    for e in r.mlElems {
+      irLOpnd(e)
+      i = i + 1
+      coff = arrLitStrChunkStep(dst, coff, i, r.mlElems.length)
+    }
+    return arrLitStrChunkClose(dst, r.mlElems.length)
   }
   for e in r.mlElems { irLOpnd(e) }
   if arm == "ref" {
@@ -3017,7 +3068,7 @@ function nulNicheEq(r: RNulNicheEq) {
 // unread), an atom box's widening, and the plan's tail.
 function boxOp(r: RToBox) {
   const fnIx = lw.irAt
-  const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, fnIx), fnIx)
+  const p = holeBoxPlanOf(r.bxAt, r.bxTy, fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
   // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
   if !i32ListHas(lwBoxHeadAt, unwrapParen(r.bxAt)) {
@@ -3188,7 +3239,7 @@ function retagOf(o: Opnd): i32 {
 function passBoxOf(t: i32): i32 {
   const r = tempRhs(t)
   if !(r is RToBox) { return -1 }
-  const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, lw.irAt), lw.irAt)
+  const p = holeBoxPlanOf(r.bxAt, r.bxTy, lw.irAt)
   return if p.hbArm == "pass" || p.hbArm == "memberBox" { t } else { -1 }
 }
 
@@ -4449,6 +4500,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwIfHeadAt = Map()
   lwIfHeadBuilt = false
   lwIfBoxAt = Map()
+  lwIfBoxTy = Map()
   lwStashFi = []
   lwStashSlots = []
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
