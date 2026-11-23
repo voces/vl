@@ -2977,6 +2977,11 @@ export function irVerify(f: IrFn): IrVerdict {
   if vfRule == 0 && vfPushed.length > 0 {
     fail(10, -1, "a push no store consumes")
   }
+  // Rule 1 for a result typed by its rep (`irRetFromRep`): only a faithful thunk may carry one.
+  if vfRule == 0 && f.irRetFromRep {
+    const tw = thunkForwardWhy(f)
+    if tw != "" { fail(1, -1, tw) }
+  }
   // Rule 5 at the end: a function with a result leaves its body on every path, or falls into
   // the `null` or `unreachable` the lowering pads its end with, as legacy does.
   if (
@@ -2988,6 +2993,52 @@ export function irVerify(f: IrFn): IrVerdict {
   }
   const v: IrVerdict = { vfRule: vfRule, vfNode: vfAt, vfMsg: vfMsg }
   return v
+}
+
+// Why function `f`, whose result type is its rep's own, is no faithful thunk, or "": one call of the
+// callee its signature notes, on each parameter after the env at that signature's rep, in order,
+// its value at the signature's result rep returned as it stands.
+function thunkForwardWhy(f: IrFn): string {
+  if !f.irThunk { return "a result typed by its rep outside a thunk" }
+  if f.irBody.length != 2 {
+    return "a rep-typed thunk is not one call and its return"
+  }
+  const n0 = f.irNodes[f.irBody[0]]
+  const n1 = f.irNodes[f.irBody[1]]
+  if !(n0 is SLet) || !(n1 is SReturn) {
+    return "a rep-typed thunk is not one call and its return"
+  }
+  const c = n0.lRhs
+  if !(c is RCall) || !n1.rtHas {
+    return "a rep-typed thunk is not one call and its return"
+  }
+  const rv = n1.rtV
+  if !(rv is OVar) || rv.ov != n0.lDst {
+    return "a rep-typed thunk returns no call's value"
+  }
+  const si = irSigOf(f, c.caCallee)
+  if si < 0 { return "a rep-typed thunk's callee has no signature" }
+  const ps = f.irSigParams[si]
+  if c.caArgs.length != ps.length || f.irParams.length != ps.length + 1 {
+    return "a rep-typed thunk does not forward every parameter"
+  }
+  let i = 0
+  while i < ps.length {
+    const a = c.caArgs[i]
+    if (
+      !(a is OVar)
+      || a.ov != f.irParams[i + 1]
+      || f.irVars[a.ov].vRep != ps[i]
+    ) {
+      return "a rep-typed thunk does not forward its parameters in order at the callee's reps"
+    }
+    i = i + 1
+  }
+  const r = f.irSigRet[si]
+  if f.irVars[n0.lDst].vRep != r || f.irRetRep != r {
+    return "a rep-typed thunk's result is not its callee's"
+  }
+  return ""
 }
 
 // Whether a nullable of discipline `disc` over rep `inner` is a niche that holds its inner value
