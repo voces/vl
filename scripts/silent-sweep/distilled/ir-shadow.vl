@@ -29,7 +29,7 @@ import { programArgs } from "std:args"
 import { Utf8Error } from "std:utf8"
 import { exit } from "std:process"
 import { parseI32, toString } from "std:fmt"
-import { endsWith, join, split, startsWith, trim } from "std:str"
+import { endsWith, join, lastIndexOf, split, startsWith, trim } from "std:str"
 import { concat, indexOf, sort } from "std:array"
 import { die, envOr, fanOutArgv, hasFlag } from "../../lib/common"
 import { cellsIn, makeTempDir, spawn, writeText } from "../../lib/corpus"
@@ -38,6 +38,8 @@ const HERE = "scripts/silent-sweep/distilled"
 const BASELINE = "scripts/silent-sweep/distilled/ir-shadow-baseline.txt"
 const CASES_BASELINE = "scripts/silent-sweep/distilled/ir-shadow-cases-baseline.txt"
 const FALLBACKS = "scripts/silent-sweep/distilled/claims-fallbacks.txt"
+const ORDER_BASELINE = "scripts/silent-sweep/distilled/ir-prepost-baseline.txt"
+const ORDER = "prepost"
 const PREFIX = "[ir] "
 const CHUNK = 200
 
@@ -83,10 +85,15 @@ function bytesClass(key: string): boolean { return key.indexOf("bytes") >= 0 }
 // One row class and its count summed over the corpus.
 type Row = { key: string, n: i32 }
 
-// What a run measured: the rows by class, the cells that printed any, and the chunks that
-// did not finish (a trap or a timeout, as `vl check`'s exit code says). A cell that fails the
-// check, or holds no function, prints no row.
-type Measured = { rows: Row[], cells: i32, broken: string[] }
+// What a run measured: the rows by class, the cells that printed any (and which), and the chunks
+// that did not finish (a trap or a timeout, as `vl check`'s exit code says). A cell that fails
+// the check, or holds no function, prints no row.
+type Measured = {
+  rows: Row[],
+  cells: i32,
+  seen: Map<string, boolean>,
+  broken: string[],
+}
 
 function bump(rows: Row[], key: string, n: i32) {
   for r in rows {
@@ -107,8 +114,8 @@ function countOf(rows: Row[], key: string): i32 {
 }
 
 // Which rows carry their program's path ahead of the class, and a tab: none, every row, or only
-// the fallback rows, so a large population keeps few distinct keys.
-type Keying = "none" | "every row" | "fallback rows"
+// the fallback rows or the order rows, so a large population keeps few distinct keys.
+type Keying = "none" | "every row" | "fallback rows" | "order rows"
 
 // Adds the `[ir] <path>: <n>\t<row>` lines of one chunk's stderr into `m`, keyed by `keying`. A
 // verifier failure's row carries its function's IR on the lines after it; only its first line is
@@ -125,12 +132,14 @@ function addRows(m: Measured, text: string, keying: Keying) {
     if n == null { continue }
     if path != last {
       m.cells = m.cells + 1
+      m.seen[path] = true
       last = path
     }
     const row = line.slice(t + 1, line.length)
     const keyed = keying == "every row"
       || keying == "fallback rows"
       && startsWith(row, "claim fell back")
+      || keying == "order rows" && startsWith(row, ORDER)
     bump(m.rows, if keyed { path + "\t" + row } else { row }, n ?? 0)
   }
   return 0
@@ -165,7 +174,7 @@ function measure(
     "sh",
     fanOutArgv(root + "/chunks", jobs, ["sh", "-c", sh, vl, seed]),
   )
-  const m: Measured = { rows: [], cells: 0, broken: [] }
+  const m: Measured = { rows: [], cells: 0, seen: Map(), broken: [] }
   if x.code != 0 {
     spawn("rm", ["-rf", root])
     die("ir-shadow: the chunk fan-out failed (rc=\{x.code})\n\{x.err}", 2)
@@ -437,6 +446,127 @@ function reportClaims(
   return 0
 }
 
+// The order baseline's rows, `<n>\t<path>\t<row>` each, as `<path>\t<row>` keys.
+function loadOrderBaseline(): Row[] {
+  const rows: Row[] = []
+  const text = readTextFile(ORDER_BASELINE)
+  if text is IoError { return rows }
+  for line in split(text, "\n") {
+    if line == "" || startsWith(line, "#") { continue }
+    const t = line.indexOf("\t")
+    const n = if t < 0 { null } else { parseI32(line.slice(0, t)) }
+    if n == null {
+      die("ir-shadow: \{ORDER_BASELINE}: no count in `\{line}`", 2)
+    }
+    rows.push({ key: line.slice(t + 1, line.length), n: n ?? 0 })
+  }
+  return rows
+}
+
+// Whether order-baseline key `key` is a `tests/cases` program's, else a corpus cell's.
+function isCasesKey(key: string): boolean {
+  return startsWith(key, "tests/cases/")
+}
+
+// Whether an early-build failure row names the program's own refusal: the plain shadow
+// (`$VL_IR_SHADOW=1`) fails `path` with an error line that is exactly the row's message, so the
+// order did not cause it. A message that only contains or prefixes it does not count.
+function ownRefusal(path: string, row: string, seed: string): boolean {
+  const head = "prepost differs: the early build failed the compile ("
+  const end = row.lastIndexOf(") in ")
+  if !startsWith(row, head) || end < head.length { return false }
+  const want = "[ERROR]: " + row.slice(head.length, end)
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  const sh = "VL_IR_SHADOW=1 \"$0\" check --codegen --compiler \"$1\" \"$2\" 2>&1 > /dev/null"
+  const x = spawn("sh", ["-c", sh, vl, seed, path])
+  if x.code == 0 { return false }
+  for line in split(x.out, "\n") {
+    if line == want { return true }
+  }
+  return false
+}
+
+// The order check over what mode 6 measured: a row above the order baseline reds, and so does a
+// program that prints rows under the plain shadow but none under the order check, since that one
+// failed to compile only there. With `rewrite`, this population's rows replace its baseline rows.
+
+function orderCheck(
+  m: Measured,
+  paths: string[],
+  seed: string,
+  cases: boolean,
+  rewrite: boolean,
+): boolean {
+  const rows: Row[] = []
+  for r in m.rows {
+    const t = r.key.indexOf("\t")
+    if t < 0 || !startsWith(r.key.slice(t + 1, r.key.length), ORDER) {
+      continue
+    }
+    if ownRefusal(r.key.slice(0, t), r.key.slice(t + 1, r.key.length), seed) {
+      print("ir-shadow: the program's own refusal, not an order row: \{r.key}")
+      continue
+    }
+    rows.push(r)
+  }
+  sort(rows, (a: Row, b: Row) => a.key < b.key)
+  const rowless: string[] = []
+  for p in paths {
+    if !(m.seen[p] ?? false) { rowless.push(p) }
+  }
+  const plain = measure(rowless, seed, envOr("JOBS", "4"), "1", "none")
+  for b in plain.broken { print("ir-shadow: chunk did not finish: \{b}") }
+  let red = plain.broken.length > 0
+  let lost = 0
+  for p in rowless {
+    if plain.seen[p] ?? false {
+      print("ir-shadow: fails only under the order check: \{p}")
+      lost = lost + 1
+      red = true
+    }
+  }
+  const base = loadOrderBaseline()
+  if rewrite {
+    let text = "# IR order-check rows over the distilled corpus and tests/cases, which `ir-shadow.vl -- --prepost`\n"
+      + "# holds at these counts. A row leaves as its fix lands. Rewrite: -- --prepost --write-order-baseline\n"
+    const keep: Row[] = []
+    for b in base {
+      if isCasesKey(b.key) != cases { keep.push(b) }
+    }
+    const all = keep.concat(rows)
+    sort(all, (a: Row, b: Row) => a.key < b.key)
+    for r in all { text = text + "\{r.n}\t\{r.key}\n" }
+    const w = writeTextFile(ORDER_BASELINE, text)
+    if w != null {
+      die("ir-shadow: cannot write \{ORDER_BASELINE} (\{w.msg})", 2)
+    }
+    print("wrote \{ORDER_BASELINE}: \{all.length} rows")
+    return red
+  }
+  for r in rows {
+    const was = countOf(base, r.key)
+    if r.n > was {
+      print(
+        "ir-shadow: a function depends on the build order: \{r.key}: \{was} -> \{r.n}",
+      )
+      red = true
+    }
+  }
+  for b in base {
+    if isCasesKey(b.key) != cases { continue }
+    const now = countOf(rows, b.key)
+    if now < b.n {
+      print(
+        "ir-shadow: \{b.key} fell: \{b.n} -> \{now} (re-run with --prepost --write-order-baseline)",
+      )
+    }
+  }
+  print(
+    "ir order check: \{rows.length} order rows; \{rowless.length} programs print none, \{lost} of them only under it",
+  )
+  return red
+}
+
 function main(args: readonly string[]) {
   const seed = argOr(args, "--seed", "build/vl-compiler.wasm")
   const cases = hasFlag(args, "--cases")
@@ -444,8 +574,15 @@ function main(args: readonly string[]) {
   if paths.length == 0 { die("ir-shadow: no programs to build", 2) }
   const census = hasFlag(args, "--blockers")
   const claims = hasFlag(args, "--claims")
-  const mode = if census { "4" } else if claims { "5" } else { "1" }
-  const m = measure(paths, seed, envOr("JOBS", "4"), mode, "none")
+  const prepost = hasFlag(args, "--prepost")
+  const mode = if census { "4" } else if claims { "5" } else if prepost { "6" } else { "1" }
+  const m = measure(
+    paths,
+    seed,
+    envOr("JOBS", "4"),
+    mode,
+    if prepost { "order rows" } else { "none" },
+  )
   for b in m.broken { print("ir-shadow: chunk did not finish: \{b}") }
   if claims {
     const want = loadFallbacks()
@@ -491,6 +628,17 @@ function main(args: readonly string[]) {
   for r in mm { print("  \{r.n}\t\{r.key}") }
   for r in fails { print("  \{r.n}\t\{r.key}") }
   if m.broken.length > 0 { exit(2) }
+  const orderRed = prepost
+    && orderCheck(
+    m,
+    paths,
+    seed,
+    cases,
+    hasFlag(args, "--write-order-baseline"),
+  )
+  if hasFlag(args, "--write-order-baseline") {
+    return if orderRed { exit(1) } else { 0 }
+  }
   // The corpus admits no verifier failure; `tests/cases` baselines its own, which may only fall.
   const tracked: Row[] = if cases { mm.concat(fails) } else { mm }
   if hasFlag(args, "--write-baseline") {
@@ -513,7 +661,7 @@ function main(args: readonly string[]) {
     return 0
   }
   const base = loadBaseline(if cases { CASES_BASELINE } else { BASELINE })
-  let red = !cases && fails.length > 0
+  let red = orderRed || !cases && fails.length > 0
   for r in tracked {
     if bytesClass(r.key) {
       print("ir-shadow: a byte difference: \{r.n}\t\{r.key}")
