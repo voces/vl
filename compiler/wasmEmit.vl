@@ -565,6 +565,7 @@ import {
   gInitRank,
   gInitReaders,
   gInitStartOrd,
+  gLitSegAt,
   gLowMemUnused,
   gMapDeletes,
   gMapSetFn,
@@ -4754,6 +4755,37 @@ function emitListFitAt(
   stash: i32,
   fnIx: i32,
 ): i32 {
+  const p = listFitPlanOf(recv, chk, fnIx)
+  if p.lftOk == 0 { return 0 }
+  if p.lftOk < 0 { return emitFailAt(p.lftWhy, anchor) }
+  if stash >= 0 { fbLocalGet(stash) }
+  else if emitExpr(recv, fnIx) < 0 { return -1 }
+  return listFitTail(p, fnIx)
+}
+
+// How `emitListFitAt` walks list `recv` against `chk`. `lftOk`: 0 not that shape, -1 refused
+// for `lftWhy`, 1 walked over ref-list `lftSlots` to `lftScalar` elements compared as `lftLeaf`
+// with `lftLexes`; `lftNullable`, a null list is false.
+export type ListFitPlan = {
+  lftOk: i32,
+  lftWhy: string,
+  lftSlots: i32[],
+  lftNullable: boolean,
+  lftScalar: string,
+  lftLeaf: string,
+  lftLexes: string[],
+}
+
+function listFitPlanOf(recv: i32, chk: i32, fnIx: i32): ListFitPlan {
+  const no: ListFitPlan = {
+    lftOk: 0,
+    lftWhy: "",
+    lftSlots: [],
+    lftNullable: false,
+    lftScalar: "",
+    lftLeaf: "",
+    lftLexes: [],
+  }
   // A generic receiver tests its instance's type, or only its rep where the instance names no
   // type; a nullable one is false on null.
   const instTy = listIsRecvTyOf(recv, fnIx)
@@ -4761,7 +4793,7 @@ function emitListFitAt(
   const recvTy = if nullable { nonNullTy(instTy) } else { instTy }
   const layers: i32[] = []
   const lit = listFitLitLeafOf(chk, recvTy, layers)
-  if lit < 0 { return 0 }
+  if lit < 0 { return no }
   const rep = exprListRep(recv, fnIx)
   if (
     recvTy < 0
@@ -4770,14 +4802,16 @@ function emitListFitAt(
     && rep != "strlist"
     && rep != "reflist"
   ) {
-    return 0
+    return no
   }
   const depth = layers.length - 1
   const slots: i32[] = []
-  const scalar = listFitScalarOf(recv, rep, layers, slots, anchor, fnIx)
-  if scalar == "" { return -1 }
-  const scalarKind: ListKind = if scalar == "str" { "strlist" } else if scalar == "i64" { "i64list" } else { "list" }
-  const scalarV: VKind = if scalar == "str" { "str" } else if scalar == "i64" { "i64" } else { "i32" }
+  const scalar = listFitScalarOf(recv, rep, layers, slots, fnIx)
+  if scalar == "" {
+    no.lftOk = -1
+    no.lftWhy = LIST_FIT_REP_MSG
+    return no
+  }
   // How an element compares with a member of `L`: at its integer base, `i64w` for an `i32`
   // widened to `i64`, as a string, or as an atom.
   const numBase = numLitUnionBaseName(lit)
@@ -4801,22 +4835,54 @@ function emitListFitAt(
     if leaf < 0 || tyLitMemberTexts(leaf).length > 0 { leafKind = "atom" }
   }
   if leafKind == "" || lexes.length == 0 {
-    return emitFailAt(
-      "emitProgram: `is` over a list tests its elements against a literal set this element type has no compare for",
-      anchor,
-    )
+    no.lftOk = -1
+    no.lftWhy = "emitProgram: `is` over a list tests its elements against a literal set this element type has no compare for"
+    return no
   }
-  if stash >= 0 { fbLocalGet(stash) }
-  else if emitExpr(recv, fnIx) < 0 { return -1 }
+  const p: ListFitPlan = {
+    lftOk: 1,
+    lftWhy: "",
+    lftSlots: slots,
+    lftNullable: nullable,
+    lftScalar: scalar,
+    lftLeaf: leafKind,
+    lftLexes: lexes,
+  }
+  return p
+}
+
+// `listFitPlanOf` for `is` test `isIx`'s receiver against its tested type.
+export function listFitIsPlanOf(isIx: i32, fnIx: i32): ListFitPlan {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) {
+    const no: ListFitPlan = {
+      lftOk: 0,
+      lftWhy: "",
+      lftSlots: [],
+      lftNullable: false,
+      lftScalar: "",
+      lftLeaf: "",
+      lftLexes: [],
+    }
+    return no
+  }
+  return listFitPlanOf(nd.isObj, isVarTyIxOf(isIx), fnIx)
+}
+
+// The walk of an `lftOk` plan over the list on the stack, leaving 1 or 0; -1 when refused.
+export function listFitTail(p: ListFitPlan, fnIx: i32): i32 {
+  const scalar = p.lftScalar
+  const scalarKind: ListKind = if scalar == "str" { "strlist" } else if scalar == "i64" { "i64list" } else { "list" }
+  const scalarV: VKind = if scalar == "str" { "str" } else if scalar == "i64" { "i64" } else { "i32" }
   if (
     emitListFitLoop(
-      slots,
+      p.lftSlots,
       0,
-      nullable,
+      p.lftNullable,
       scalarKind,
       scalarV,
-      leafKind,
-      lexes,
+      p.lftLeaf,
+      p.lftLexes,
       fnIx,
     )
     < 0
@@ -4828,14 +4894,12 @@ function emitListFitAt(
 
 // The innermost list's element rep — `i32`, `i64` or `str` — of list `recv` (rep `rep`) nested
 // as deep as `layers` says, pushing each enclosing ref list's slot onto `slots`, outermost
-// first; "" after a refusal at `isIx` when the rep does not nest that way or disagrees with a
-// known type in `layers`.
+// first; "" when the rep does not nest that way or disagrees with a known type in `layers`.
 function listFitScalarOf(
   recv: i32,
   rep: VKind | null,
   layers: i32[],
   slots: i32[],
-  isIx: i32,
   fnIx: i32,
 ): string {
   const depth = layers.length - 1
@@ -4843,43 +4907,34 @@ function listFitScalarOf(
     if rep == "list" { return "i32" }
     if rep == "i64list" { return "i64" }
     if rep == "strlist" { return "str" }
-    emitFailAt(LIST_FIT_REP_MSG, isIx)
     return ""
   }
-  if rep != "reflist" { return listFitRepMiss(isIx) }
+  if rep != "reflist" { return "" }
   let s = refListSlotOfExpr(recv, fnIx)
   let k = 1
   while k < depth {
     if s < 0 || s >= rlElemTyIx.length || s >= rlElemNullable.length {
-      return listFitRepMiss(isIx)
+      return ""
     }
-    if rlElemNullable[s] != 0 { return listFitRepMiss(isIx) }
-    if layers[k] >= 0 && rlSlotOfTy(layers[k]) != s {
-      return listFitRepMiss(isIx)
-    }
+    if rlElemNullable[s] != 0 { return "" }
+    if layers[k] >= 0 && rlSlotOfTy(layers[k]) != s { return "" }
     slots.push(s)
     const ek = rlElemKindAt(s)
     if k < depth - 1 {
-      if ek != RLK_REF_LIST { return listFitRepMiss(isIx) }
+      if ek != RLK_REF_LIST { return "" }
       s = rlElemInnerSlot(s)
     } else {
       if ek == RLK_I32_LIST { return "i32" }
       if ek == RLK_I64_LIST { return "i64" }
       if ek == RLK_STR_LIST { return "str" }
-      return listFitRepMiss(isIx)
+      return ""
     }
     k = k + 1
   }
-  return listFitRepMiss(isIx)
+  return ""
 }
 
 const LIST_FIT_REP_MSG = "emitProgram: `is` over a list tests its elements, and this list's rep is not the one its type names"
-
-// Refuses the fit test at `isIx` for a list rep it cannot walk, answering "".
-function listFitRepMiss(isIx: i32): string {
-  emitFailAt(LIST_FIT_REP_MSG, isIx)
-  return ""
-}
 
 // `xs is K[]` where, at some list depth, the elements of `xs` and of `K[]` can never meet: true
 // exactly when every list at that depth is empty (D4910, by the D4771 ruling). A region the
@@ -6205,9 +6260,8 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
   if !(nd is IsExpr) { return 0 }
   const p = listIsAcrossPlanOf(isIx, nd, fnIx)
   if !p.lpOk { return 0 }
-  const slot = sharedFieldRecvSlot()
   if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-  return listIsAcrossTail(nd, slot, p, fnIx)
+  return listIsAcrossTail(nd, sharedFieldRecvSlot(), p, fnIx)
 }
 
 // `listIsAcrossRepsPlan`'s answer for `is` test `isIx`: the tested list type, per tag how it is
@@ -12185,12 +12239,22 @@ export function unionFieldNarrowUnboxOf(memIx: i32, fnIx: i32): NarrowUnboxArm {
   return if memReadUnboxAtomKind(memIx, fnIx) >= 0 { "unbox" } else { "none" }
 }
 
+// The value-atom kind union-box field read `memIx`'s unbox leaves, or -1 where it leaves the box or
+// a container (`unionFieldNarrowUnboxOf`).
+export function unionFieldUnboxKindOf(memIx: i32, fnIx: i32): i32 {
+  return match unionFieldNarrowUnboxOf(memIx, fnIx) {
+    "atom" => memNarrowAtomKind(memIx, fnIx)
+    "unbox" => memReadUnboxAtomKind(memIx, fnIx)
+    "container" | "none" => -1
+  }
+}
+
 function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
   return match unionFieldNarrowUnboxOf(memIx, fnIx) {
     "container" => emitPlaceNarrowContainerUnbox(memIx, fnIx) - 1
     // The narrowed atom's ABI code decides both arms, as at the variant-field twin of this read
     // (`emitNarrowedMem`).
-    "atom" => emitUnionUnboxTail(memNarrowAtomKind(memIx, fnIx))
+    "atom" => emitUnionUnboxTail(unionFieldUnboxKindOf(memIx, fnIx))
     "unbox" => emitUnionFieldStoredUnbox(memIx, fnIx)
     "none" => 0
   }
@@ -12200,7 +12264,7 @@ function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
 // there and narrowed back (a declared `i64 | null` member widens `7` into `$vbI64`); a `??`-merged
 // box holding two dispatches on its tag, only where every arm reaches the read's atom.
 function emitUnionFieldStoredUnbox(memIx: i32, fnIx: i32) {
-  const ck = memReadUnboxAtomKind(memIx, fnIx)
+  const ck = unionFieldUnboxKindOf(memIx, fnIx)
   const bk = memReadBoxedAtomKind(memIx, fnIx)
   const bks: i32[] = []
   if memReadBoxedAtomKinds(memIx, fnIx, bks) {
@@ -13063,10 +13127,8 @@ function emitArrU8(elems: i32[], fnIx: i32, row: i32) {
   let dstU8 = -1
   let coffU8 = 0
   if elems.length > NEW_FIXED_MAX {
-    const dForm = if row == PK_U16 || row == PK_I16 { ALD_U16 } else { ALD_U8 }
-    const dU8 = arrLitDataBuild(elems, fnIx, dForm, pkBackAt(row))
-    if dU8 < 0 { return -1 }
-    if dU8 == 1 { return arrLitWrap(elems.length, pkWrapAt(row)) }
+    const dU8 = arrLitDataTry(elems, fnIx, "u8", row)
+    if dU8 != 0 { return if dU8 < 0 { -1 } else { 0 } }
     dstU8 = arrLitChunkStart("u8list", row, pkBackAt(row), elems.length, false)
   }
   let iu8 = 0
@@ -13173,9 +13235,8 @@ function emitArrWide(arrIx: i32, elems: i32[], fnIx: i32, w: WideArm) {
   let dst = -1
   let coff = 0
   if elems.length > NEW_FIXED_MAX {
-    const d = arrLitDataBuild(elems, fnIx, pl.wpForm, back)
-    if d < 0 { return -1 }
-    if d == 1 { return arrLitWrap(elems.length, wrap) }
+    const d = arrLitDataTry(elems, fnIx, w, 0)
+    if d != 0 { return if d < 0 { -1 } else { 0 } }
     dst = wideChunkStart(w, back, elems.length)
   }
   let i = 0
@@ -13204,11 +13265,8 @@ function emitArrStr(arrIx: i32, elems: i32[], fnIx: i32) {
     fbGlobalGet(hStr)
     return 0
   }
-  let dstStr = -1
+  const dstStr = arrLitStrChunkOpen(elems.length)
   let coffStr = 0
-  if elems.length > allocLitChunk() {
-    dstStr = arrLitChunkStart("strlist", 0, mkArrTy(), elems.length, false)
-  }
   let i = 0
   while i < elems.length {
     // A literal-union atom element widens to its member string. The backing is
@@ -13221,23 +13279,33 @@ function emitArrStr(arrIx: i32, elems: i32[], fnIx: i32) {
     // falls through to the first element's type only when no context rule fires.
     if emitStrValue(elems[i], fnIx) < 0 { return -1 }
     i = i + 1
-    if dstStr >= 0 {
-      coffStr = arrLitChunkFlushAt(
-        dstStr,
-        mkArrTy(),
-        coffStr,
-        i,
-        elems.length,
-        allocLitChunk(),
-      )
-    }
+    coffStr = arrLitStrChunkStep(dstStr, coffStr, i, elems.length)
   }
-  if dstStr >= 0 {
-    fbLocalGet(dstStr)
-    fbRefAsNonNull() // the chunk-built backing
-    return arrLitLenCap(elems.length, mkListTy())
-  }
+  if dstStr >= 0 { return arrLitStrChunkClose(dstStr, elems.length) }
   return arrLitShortTail("str", elems.length)
+}
+
+// A string-list literal of `n` elements past the operand cap (`allocLitChunk`) opens its chunked
+// build here, before its first element, and returns the destination slot; -1, writing nothing,
+// for a literal short enough for one `array.new_fixed`.
+export function arrLitStrChunkOpen(n: i32): i32 {
+  if n <= allocLitChunk() { return -1 }
+  return arrLitChunkStart("strlist", 0, mkArrTy(), n, false)
+}
+
+// After element `i` of `n` of an open string-list chunk at `dst` (`coff` the chunk's first
+// element): the chunk closed and the next opened where it is full. Returns the new start; a `dst`
+// of -1 writes nothing.
+export function arrLitStrChunkStep(dst: i32, coff: i32, i: i32, n: i32): i32 {
+  if dst < 0 { return coff }
+  return arrLitChunkFlushAt(dst, mkArrTy(), coff, i, n, allocLitChunk())
+}
+
+// The chunk-built string list at `dst` of `n` elements, wrapped.
+export function arrLitStrChunkClose(dst: i32, n: i32): i32 {
+  fbLocalGet(dst)
+  fbRefAsNonNull() // the chunk-built backing
+  return arrLitLenCap(n, mkListTy())
 }
 
 // The ref-list arm of `emitArrUnder`: the element slot comes from a threaded annotation, else
@@ -13438,11 +13506,8 @@ function emitArrI32(arrIx: i32, elems: i32[], fnIx: i32, lbKind: i32) {
   let dstI32 = -1
   let coffI32 = 0
   if elems.length > NEW_FIXED_MAX {
-    const dI32 = arrLitDataBuild(elems, fnIx, ALD_I32, aTy())
-    if dI32 != 0 {
-      if dI32 < 0 { return -1 }
-      return arrLitWrap(elems.length, lTy())
-    }
+    const dI32 = arrLitDataTry(elems, fnIx, "i32", 0)
+    if dI32 != 0 { return if dI32 < 0 { -1 } else { 0 } }
     dstI32 = arrLitChunkStart("list", 0, aTy(), elems.length, false)
   }
   let i = 0
@@ -16382,6 +16447,85 @@ const ALD_F64 = 3
 const ALD_U8 = 4
 const ALD_U16 = 5
 
+// How a list literal past the operand cap builds at arm `arm` (packed row `row` for `u8`): one
+// data segment of constant elements, a segment with its computed elements stored after, or chunks.
+// A pure reading of what `arrLitDataBuild` partitions its elements by.
+export type LongRoute = "dataConst" | "dataComputed" | "chunk"
+
+export function arrLitLongRouteOf(
+  elems: i32[],
+  fnIx: i32,
+  arm: ArrLitArm,
+  row: i32,
+): LongRoute {
+  const form = arrLitDataFormOf(arm, row)
+  if form < 0 { return "chunk" }
+  let computed = false
+  for e in elems {
+    if !arrLitElemIsConst(e) {
+      if !arrLitDataStores(e, fnIx, form) { return "chunk" }
+      computed = true
+    }
+  }
+  return if computed { "dataComputed" } else { "dataConst" }
+}
+
+// Arm `arm`'s element form for a data segment (`ALD_*`), or -1 for an arm with none.
+function arrLitDataFormOf(arm: ArrLitArm, row: i32): i32 {
+  return match arm {
+    "i32" => ALD_I32
+    "f64" => ALD_F64
+    "f32" => ALD_F32
+    "i64" => ALD_I64
+    "u8" => if row == PK_U16 || row == PK_I16 { ALD_U16 } else { ALD_U8 }
+    "notLit" | "spread" | "clash" | "emptyHole" | "v128" | "str" | "ref" => -1
+  }
+}
+
+// Arm `arm`'s backing heap type for a data segment.
+function arrLitDataBackOf(arm: ArrLitArm, row: i32): i32 {
+  return match arm {
+    "i32" => aTy()
+    "f64" => fa64Ty()
+    "f32" => fa32Ty()
+    "i64" => ia64Ty()
+    "u8" => pkBackAt(row)
+    "notLit" | "spread" | "clash" | "emptyHole" | "v128" | "str" | "ref" => -1
+  }
+}
+
+// Arm `arm`'s list wrapper heap type for a data segment.
+function arrLitDataWrapOf(arm: ArrLitArm, row: i32): i32 {
+  return match arm {
+    "i32" => lTy()
+    "f64" => fl64Ty()
+    "f32" => fl32Ty()
+    "i64" => il64Ty()
+    "u8" => pkWrapAt(row)
+    "notLit" | "spread" | "clash" | "emptyHole" | "v128" | "str" | "ref" => -1
+  }
+}
+
+// Long literal `elems` of arm `arm` built from a data segment and wrapped, where its route takes
+// one: 1 once the list is on the stack, 0 for a chunked build (nothing written), -1 on failure.
+export function arrLitDataTry(
+  elems: i32[],
+  fnIx: i32,
+  arm: ArrLitArm,
+  row: i32,
+): i32 {
+  if arrLitLongRouteOf(elems, fnIx, arm, row) == "chunk" { return 0 }
+  const d = arrLitDataBuild(
+    elems,
+    fnIx,
+    arrLitDataFormOf(arm, row),
+    arrLitDataBackOf(arm, row),
+  )
+  if d <= 0 { return d }
+  arrLitWrap(elems.length, arrLitDataWrapOf(arm, row))
+  return 1
+}
+
 // Build the `backTy` backing of a literal past the `array.new_fixed` cap of number or boolean
 // literals as one passive data segment read by `array.new_data`, so its code is a few bytes
 // whatever its length (D3417). Returns 1 when the backing is on the stack, 0 when some element
@@ -16418,14 +16562,7 @@ function arrLitDataBuild(elems: i32[], fnIx: i32, form: i32, backTy: i32): i32 {
     }
     i = i + 1
   }
-  const seg = gStrDataLen.length
-  gStrDataStart.push(gStrDataParts.length)
-  gStrDataLen.push(n)
-  let k = 0
-  while k < parts.length {
-    gStrDataParts.push(parts[k])
-    k = k + 1
-  }
+  const seg = litSegOf(parts, n)
   fbI32Const(0)            // segment offset
   fbI32Const(elems.length) // element count
   fbArrayNewData(backTy, seg)
@@ -16446,6 +16583,45 @@ function arrLitDataBuild(elems: i32[], fnIx: i32, form: i32, backTy: i32): i32 {
   fbLocalGet(dst)
   fbRefAsNonNull()
   return 1
+}
+
+// The data segment holding the `n` bytes of `parts`: the one a literal of the same bytes already
+// registered, else a new one. Bytes are compared whole, a hash only finding the candidates; a
+// segment is raw bytes `array.new_data` reads at its array's type, so any element type shares it.
+function litSegOf(parts: { b: u8[] }[], n: i32): i32 {
+  let h = n
+  for p in parts {
+    for x in p.b { h = (h ^ (x as i32)) * 16777619 }
+  }
+  const cands = gLitSegAt.get(h) ?? []
+  for c in cands {
+    if gStrDataLen[c] == n && litSegBytesAre(c, parts) { return c }
+  }
+  const seg = gStrDataLen.length
+  gStrDataStart.push(gStrDataParts.length)
+  gStrDataLen.push(n)
+  for p in parts { gStrDataParts.push(p) }
+  cands.push(seg)
+  gLitSegAt.set(h, cands)
+  return seg
+}
+
+// Whether segment `seg`'s bytes begin with `parts`' bytes, byte for byte (its length is the caller's).
+function litSegBytesAre(seg: i32, parts: { b: u8[] }[]): boolean {
+  const end = if seg + 1 < gStrDataStart.length { gStrDataStart[seg + 1] } else { gStrDataParts.length }
+  let pi = gStrDataStart[seg]
+  let j = 0
+  for p in parts {
+    for x in p.b {
+      while pi < end && j >= gStrDataParts[pi].b.length {
+        pi = pi + 1
+        j = 0
+      }
+      if pi >= end || gStrDataParts[pi].b[j] != x { return false }
+      j = j + 1
+    }
+  }
+  return true
 }
 
 // Whether a non-constant element `ix` of a literal built in data form `form` may be stored into
@@ -22803,7 +22979,14 @@ export function ifExprShapeWhy(ifIx: i32, fnIx: i32): string {
     return "arm prelude unwalked"
   }
   if optGuardCallOf(ifIx, fnIx) >= 0 { return "optional guard" }
-  if intMatchHeadAt(ifIx) { return "int match" }
+  // An integer `match` over a plain place whose `br_table` plan declines is written as the plain
+  // chain; one over anything else stays refused.
+  if intMatchHeadAt(ifIx) {
+    const p = intSwitchPlanOf(ifIx, fnIx)
+    if p != null && p.ispElse >= 0 { return "int match" }
+    const sc = switchScrutOf(n.ifCond)
+    if sc < 0 || !(nodeAt(sc) is Ident) { return "int match" }
+  }
   return ""
 }
 
@@ -23236,8 +23419,14 @@ function emitIfExprAs(ifIx: i32, fnIx: i32, kind: i32) {
 
 // One link of `emitIfExprAs`: 0 or -1 as that function returns, or 1 when the else is another `if`
 // and this link's frame is left open (its else restore target pushed onto `open`).
+// Whether the value `if` link at `ifIx` may be a valued `br_table` (`emitIntSwitch` mode 2): a
+// nullable one's arms are not all the blocktype's value.
+export function ifExprSwitchMay(ifIx: i32): boolean {
+  return !nodeTyIsNullable(ifIx)
+}
+
 function emitIfExprAsLink(ifIx: i32, fnIx: i32, kind: i32, open: i32[]) {
-  if !nodeTyIsNullable(ifIx) {
+  if ifExprSwitchMay(ifIx) {
     const sw = emitIntSwitch(ifIx, fnIx, 2, kind, "i32", -1)
     if sw < 0 { return -1 }
     if sw > 0 { return 0 }
@@ -45039,20 +45228,26 @@ function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
   }
 }
 
-// D960's stash: the box once into the shared slot, its tag tested, the box or the default boxed
-// into the result's union.
-function emitCoalesceBoxStash(e: BinExpr, exprIx: i32, fnIx: i32) {
-  const coNm = boxTyName(nodeTyIxOf(exprIx))
-  const coSlot = sharedFieldRecvSlot()
-  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-  fbLocalSet(coSlot)
-  fbLocalGet(coSlot)
+// After `??`'s operand box: it into `slot`, its tag tested present opening the box-typed `if`, and
+// the stashed box as that arm's value.
+export function coalBoxStashOpen(slot: i32) {
+  fbLocalSet(slot)
+  fbLocalGet(slot)
   fbStructGet(uBoxIdx, 0) // field 0: tag
   fbI32Rel(RS_TAG, nullBoxTag())
   fbI32Bin(71) // 0x47 i32.ne  -> present?
   fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
-  fbLocalGet(coSlot)
+  fbLocalGet(slot)
   fbRefAsNonNull() // the stash cell is nullable, the block type is not
+}
+
+// D960's stash: the box once into the shared slot, its tag tested, the box or the default boxed
+// into the result's union.
+function emitCoalesceBoxStash(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const coNm = boxTyName(nodeTyIxOf(exprIx))
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  const coSlot = sharedFieldRecvSlot()
+  coalBoxStashOpen(coSlot)
   fbElse()
   if (emitUnionBoxOwed(coNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
     return -1
