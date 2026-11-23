@@ -41,6 +41,29 @@ did not fire. That is correct, not a blind guard. Those re-lays move literal-SET
 (`K = "circle" | "round"`), which the tree answers through the union path (`URC_ATOM`), so this
 predicate is never asked about them and no recorded answer can change.
 
+The check compares the decision (the string or not), not the raw code. A row appearing where none
+stood moves an answer from -1 to 1 and keeps the atom; comparing raw codes failed five union-arm
+programs in tests/cases on exactly that.
+
+Union arms are asked too. A variant record's `structRowOfRecordTy` is its struct twin row, which the
+arm stage's demote updates in step. The arm spelling `A = { kind: "circle" }` beside
+`B = { kind: string }` goes from three misses to covered and matched.
+
 ## Readings
 
-PENDING
+Fixpoint seeds, head on master 389732ab, base master 389732ab.
+
+| check | result |
+| --- | --- |
+| `$VL_IR_SHADOW=6` | distilled corpus 82,098 rows, 0 `prepost differs`; tests/cases 66,579 rows, 0 not the program's own refusal |
+| `rep-fuzz-check.sh` | exact, 0 baselined failures |
+| `ir-identity.sh --cases` | identical 7707, fail under both 68, differ 0 |
+| `ir-identity.sh --claimless` | identical 14039, fail under both 3267, differ 0 |
+| `ir-identity.sh --names` | identical 9037, differ 0; self-compile identical |
+| L2 self-compile fuel per PR | +0.01% on 119,699,156,044 |
+| same-tree pair | 119,699,877,296 vs 119,700,158,856, +0.0002%, byte-identical output |
+| armed shadow A/B | covered 76,184 → 76,185, start covered 6,675 → 6,676, mismatch and fail 3 → 3 |
+| census | fully IR-only 5,582 → 5,583 of 7,138; `object field coercion` 8 → 7, `start: object field coercion` 16 → 15 (`record-lit-lone-literal-field.vl` `mk` and `@start`) |
+
+The shadow test's eight position programs, each missing on base, are covered and matched on head.
+The argument position fails verifier rule 3 on base and head alike; it is D17070.
