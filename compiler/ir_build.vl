@@ -76,6 +76,7 @@ import {
   PStaged,
   PrimOp,
   PushRecv,
+  RBoxNarrow,
   RCall,
   RListSlice,
   RListStage,
@@ -3161,6 +3162,12 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !narrowed
       && rep == globalTyRep(scopeTyAt(d, -1))
       && cellRep == globalTyRep(letBindTy(d, -1))
+    // A reference the cell holds at a rep that stores as the read's (`repStoresAs`) is legacy's
+    // plain `global.get`, read at the read's rep.
+    const alike = cellRep != rep
+      && !narrowed
+      && !stored
+      && repStoresAs(rep, cellRep)
     // A closure cell read where its type leaves a closure part open or fills one is the same
     // closure struct, retagged.
     const holed = cellRep != rep
@@ -3168,7 +3175,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !stored
       && holeRetagNoted(cellRep, rep, true)
       && exprPrePathWhy(ix, ibFnIx) == ""
-    if cellRep != rep && !narrowed && !stored && !holed {
+    if cellRep != rep && !narrowed && !stored && !holed && !alike {
       return irBMiss("global read coercion")
     }
     if stored { return globalStoredRead(b, g, d, ix, cellRep) }
@@ -3502,7 +3509,7 @@ function narrowedLocalRead(
   if ba == "atom" {
     const ak = identUnboxAtomOf(ix, ibFnIx)
     if ak < 0 { return irBMiss("narrowed read dead") }
-    return irBLetTemp(
+    return unboxAtomTemp(
       b,
       { bnV: o, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: -1 },
       ix,
@@ -3582,12 +3589,40 @@ function globalUnboxRead(
   if ba == "atom" && ak < 0 { return irBMiss("narrowed read dead") }
   const box = globalBoxAt(b, g, d, ix, cellRep)
   if ibMiss != "" { return box }
-  return irBLetTemp(
+  const r: RBoxNarrow = {
+    bnV: box,
+    bnAt: ix,
+    bnRep: rep,
+    bnAtom: ak,
+    bnCon: con,
+  }
+  if ak >= 0 { return unboxAtomTemp(b, r, ix, rep) }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// Box read `r` at `ix` unboxed to its atom kind, read at `rep` (`irBUnboxKindRep`).
+function unboxAtomTemp(b: i32[], r: RBoxNarrow, ix: i32, rep: i32): Opnd {
+  const ur = irBUnboxKindRep(r.bnAtom, rep)
+  if ur == rep { return irBLetTemp(b, r, ix, rep) }
+  return irBLetTempTy(
     b,
-    { bnV: box, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: con },
+    { bnV: r.bnV, bnAt: ix, bnRep: ur, bnAtom: r.bnAtom, bnCon: -1 },
     ix,
-    rep,
+    ur,
+    TY_STR,
   )
+}
+
+// A temp at `string` for read `ix`, holding `r`, whose node is typed at another type.
+export function irBLetStrTemp(b: i32[], r: Rhs, ix: i32): Opnd {
+  return irBLetTempTy(b, r, ix, repNodeOfTy(TY_STR), TY_STR)
+}
+
+// The rep an unbox to value-atom kind `k` leaves for a read at `rep`: a literal-union member is
+// boxed as its string, which the unbox leaves, so an atom `rep` reads at `string`.
+export function irBUnboxKindRep(k: i32, rep: i32): i32 {
+  if k == 2 && repNodeAt(rep) is RAtom { return repNodeOfTy(TY_STR) }
+  return rep
 }
 
 // Module global `g` (declared at `d`, cell rep `cellRep`) read at `ix` as the box
@@ -4099,9 +4134,15 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         || holeRetagNoted(irBOpRep(a), pr, true)
         || recRetag(irBOpRep(a), pr))
         && exprPrePathWhy(c.callArgs[i], ibFnIx) == "") { repTemp(b, { rgV: a }, c.callArgs[i], pr) } else if irBOpRep(a) != pr && recRetagAt(irBOpRep(a), pr, c.callArgs[i]) { repTemp(b, { rgV: a }, c.callArgs[i], pr) } else { a }
+      // A union parameter boxes the argument as legacy's `emitUnionBoxOwed` does (the floor); a
+      // reference its parameter's valtype holds as it stands is passed as is (`repStoresAs`).
       const fa = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, c.callArgs[i], pr, -1, fu) } else { ra }
       if ibMiss != "" { return missRhs(ibMiss) }
-      if irBOpRep(fa) != pr && !repNullRefFits(irBOpRep(fa), pr) {
+      if (
+        irBOpRep(fa) != pr
+        && !repNullRefFits(irBOpRep(fa), pr)
+        && !repStoresAs(pr, irBOpRep(fa))
+      ) {
         return missRhs("argument coercion")
       }
       args.push(fa)
@@ -10785,6 +10826,12 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   const stored = noted < 0 && vr != rep && vr == globalTyRep(letBindTy(gst, -1))
   // A `null`-typed value is the bottom ref, already a value of a nullable reference cell.
   const bottom = repNullRefFits(vr, rep)
+  // Legacy's `global.set` stores a reference the cell's valtype holds as it stands (`repStoresAs`):
+  // a closure of another closure rep, both the uniform closure.
+  if vr != rep && !stored && !bottom && repStoresAs(rep, vr) {
+    globalNoteAt(gi, gst, rep)
+    return v
+  }
   if vr != rep && !stored && !bottom {
     return irBMiss("global initializer coercion")
   }
