@@ -112,6 +112,7 @@ import {
   RTruncSat,
   RUnionConcreteEq,
   RUnionEq,
+  RVariantDiscrim,
   Rhs,
   SAssign,
   SBlock,
@@ -135,6 +136,7 @@ import {
   SSwitch,
   STrap,
   irBodyLeaves,
+  irCloFieldRetagAt,
   irFactIntOf,
   irFactKidTyOf,
   irFactTyOf,
@@ -167,6 +169,7 @@ import {
 import {
   boxListRetag,
   cloHoleRetag,
+  irNodeEndsPath,
   listRetag,
   listRetagHole,
   recRetag,
@@ -500,6 +503,14 @@ function stageAt(id: i32): RListStage | null {
 
 // Whether a read of global `sym` at node `at`, at rep `dst`, is at its checked type's rep or else at
 // the storage row the builder recorded taking it at (`irGlobalStoreTyOf`; D14434, D14426).
+// Whether retag node `at` of `o` into `dst` is a closure the builder noted at a plainly written
+// record field: every closure lowers to the one closure struct, whatever signature either names.
+function cloFieldRetag(o: Opnd, dst: i32, at: i32): boolean {
+  return irCloFieldRetagAt(vf, at)
+    && repNodeAt(opRep(o)) is RClosure
+    && repNodeAt(dst) is RClosure
+}
+
 function globalReadAtTyOrStorage(sym: i32, dst: i32, at: i32): boolean {
   const src = vf.irNodeAt[at] ?? -1
   if src < 0 || dst == repNodeOfTy(irFactTyOf(vf, at)) { return true }
@@ -624,6 +635,19 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.rcV, at)
       if !(repNodeAt(opRep(r.rcV)) is RNullable) {
         return fail(2, at, "a recovered read's operand is nullable")
+      }
+      0
+    }
+    RVariantDiscrim => {
+      use(r.vdV, at)
+      if dst != vfBool {
+        return fail(2, at, "a variant discriminant test is a bool")
+      }
+      if !(r.vdV is OVar) {
+        return fail(2, at, "a variant discriminant test re-reads a variable")
+      }
+      if !(repNodeAt(opRep(r.vdV)) is RBox) {
+        return fail(2, at, "a variant discriminant test's operand is a box")
       }
       0
     }
@@ -874,6 +898,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         && !listRetagHole(vf, opRep(r.rgV), dst)
         && !cloHoleRetagAlike(opRep(r.rgV), dst)
         && !recRetag(opRep(r.rgV), dst)
+        && !cloFieldRetag(r.rgV, dst, at)
         && !plainRecordsLowerAlike(opRep(r.rgV), dst)
         && !recSubRetag(opRep(r.rgV), dst, vf.irRecHeap, vf.irRecSub)
         && (!(d is RNullable)
@@ -1353,12 +1378,18 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const sameBox = m is RMap
         && repNodeAt(repBoxCore(dst)) is RBox
         && repBoxCore(dst) == repBoxCore(m.rmVal)
+      // A scalar value's read the box plan boxes (`mtBox`) is a box of the union it delivers to.
+      const scalarBox = r.mtBox >= 0
+        && m is RMap
+        && repPrim(m.rmVal) != null
+        && repNodeAt(repBoxCore(dst)) is RBox
       if (
         dst >= 0
         && m is RMap
         && !mapGetDstOk(m.rmVal, dst)
         && !unboxed
         && !sameBox
+        && !scalarBox
       ) {
         return fail(
           2,
@@ -1708,11 +1739,11 @@ function sinkBoxRep(r: i32): boolean {
   return d is RBox || d is RNullable && d.rnDisc == 4
 }
 
-// Whether node `id` leaves its body: a branch, a return or a trap.
+// Whether node `id` leaves its body: a branch, a return, a trap or a call that never returns.
 function exits(id: i32): boolean {
   if id < 0 || id >= vf.irNodes.length { return false }
   const n = vf.irNodes[id]
-  return n is SBr || n is SReturn || n is STrap
+  return n is SBr || n is SReturn || irNodeEndsPath(n)
 }
 
 // Rule 5's fall-through: a body with out-variable `out` ends by writing it, or by leaving.
@@ -1780,12 +1811,30 @@ function coalOptLeafWhy(n: SCoalBox): string {
   return ""
 }
 
+// A `boolean | null` niche's join `??` reads the niche and yields the union's box.
+function coalNulBoolJoinWhy(n: SCoalBox): string {
+  if !repBoolNiche(opRep(n.cbL)) {
+    return "a boolean join `??` reads no boolean niche"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a boolean join `??` writes no variable"
+  }
+  const on = repNodeAt(vf.irVars[o].vRep)
+  const box = on is RBox || on is RNullable && on.rnDisc == 4
+  return if box { "" } else { "a boolean join `??` yields no box" }
+}
+
 // A record field's `??` re-reads its record, a variable, and yields the field's box or its scalar.
 function coalFieldWhy(n: SCoalBox): string {
   if !(n.cbL is OVar) { return "a field `??` re-reads no variable" }
-  if !(repNodeAt(opRep(n.cbL)) is RRecord) {
-    return "a field `??` reads no record"
-  }
+  // The record, or a box or nullable record the lowering unwraps to it.
+  const lr = repNodeAt(opRep(n.cbL))
+  const recv = lr is RRecord
+    || lr is RBox
+    || lr is RNullable
+    && (lr.rnDisc == 4 || repNodeAt(lr.rnInner) is RRecord)
+  if !recv { return "a field `??` reads no record" }
   const o = n.cbOut
   if o < 0 || o >= vf.irVars.length { return "a field `??` writes no variable" }
   const or = vf.irVars[o].vRep
@@ -2069,6 +2118,7 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
     "litUnion" | "nulBool" => coalNicheWhy(n)
     "fieldBox" | "fieldVal" => coalFieldWhy(n)
     "optLeaf" => coalOptLeafWhy(n)
+    "nulBoolJoin" => coalNulBoolJoinWhy(n)
     "boxStash" => coalBoxStashWhy(n)
     "boxFieldScalar" => coalBoxFieldScalarWhy(n)
     "nulStr" => coalNulStrWhy(n)
@@ -2301,8 +2351,9 @@ function stmt(id: i32, prev: i32) {
     }
     SReturn => {
       const none = repIsNoValue(vf.irRetRep)
-      // A return right after a trap is dead, so it carries no value whatever the result.
-      const dead = !n.rtHas && prev >= 0 && vf.irNodes[prev] is STrap
+      // A return right after a trap or a call that never returns is dead, so it carries no value
+      // whatever the result.
+      const dead = !n.rtHas && prev >= 0 && irNodeEndsPath(vf.irNodes[prev])
       if n.rtHas == none && !dead {
         return fail(
           5,
@@ -2684,7 +2735,8 @@ function rhsReadsList(r: Rhs): boolean {
       RToBox |
       RTruncSat |
       RUnionConcreteEq |
-      RUnionEq => false
+      RUnionEq |
+      RVariantDiscrim => false
   }
 }
 

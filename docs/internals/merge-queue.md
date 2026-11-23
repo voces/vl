@@ -229,7 +229,7 @@ For the queue:
   named in the PR body (#9650) (coordinator ruling, 2026-11-23).
 - **Q35.** A shadow mismatch row may rise with a filed row when claimed bytes equal claimless
   bytes for the affected programs; the row need not be "unclaimed". The case is the
-  `ir-closure-record-family` lane's row (unfiled: D17060) (coordinator ruling, 2026-11-23).
+  `ir-closure-record-family` lane's row D17060 (coordinator ruling, 2026-11-23).
 - **Q36.** Before every squash, check whether it would re-add a `changelog.d` entry that
   `CHANGELOG.md` already holds; if so, delete the entry on the branch first, in a docs-only
   commit. #9640 and #9647 each had to drop entries a squash re-added after #9636's fold (queue

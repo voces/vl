@@ -208,6 +208,7 @@ import {
   RTruncSat,
   RUnionConcreteEq,
   RUnionEq,
+  RVariantDiscrim,
   Rhs,
   SAssign,
   SBlock,
@@ -626,19 +627,28 @@ import {
 } from "./emit_plan_list"
 import { emitFail, fbOpenIf, fbValtype } from "./emit_bytes"
 import {
+  variantDiscrimFieldNeeded,
+  variantFieldLitLexes,
+} from "./emit_map_twins"
+import {
   atomFoldSideTail,
   atomFoldTail,
   atomHookArmOf,
+  coalArmRecvCast,
   coalBoxStashOpen,
   coalFieldBoxOpen,
   coalFieldPlanOf,
   coalFieldRead,
   coalFieldUnbox,
   coalFieldValOpen,
+  coalNulBoolJoinOpen,
+  coalNulBoolJoinPresent,
+  coalNulBoolJoinReserve,
   coalOptArmOf,
   coalOptLeafOpen,
   coalOptLeafPlanOf,
   coalOptLeafRead,
+  discrimFieldEqTail,
   emitListEmptyLoop,
   emptyFitArmBody,
   emptyFitArmHead,
@@ -666,6 +676,7 @@ import {
   unionLitNeverTail,
   unionLitPayloadTail,
   unionLitTagHead,
+  variantTagTail,
 } from "./wasmEmit"
 import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
@@ -704,6 +715,7 @@ import {
   shIdxTo,
   uBoxIdx,
   uBoxNewEnd,
+  uFieldCount,
   unionSinkBase,
 } from "./emit_state"
 import { ListBuild } from "./emit_ref_list_kinds"
@@ -1169,6 +1181,7 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.teV)
       boxTagIsTail(r.teTag)
     }
+    RVariantDiscrim => variantDiscrim(r)
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
@@ -1843,6 +1856,40 @@ function numIs(r: RNumIs): i32 {
     i = i + 1
   }
   return 1
+}
+
+// `RVariantDiscrim` as `emitIsTestVariantRow` writes a `discrim` row: the variable and the arm's
+// tag, then in an `if` each needed field's literals, or'd within a field and and'd across fields.
+function variantDiscrim(r: RVariantDiscrim): i32 {
+  const n = nodeAt(r.vdAt)
+  if !(n is IsExpr) { return irLMiss("variant discriminant node") }
+  if r.vdVi < 0 || r.vdVi >= uFieldCount.length {
+    return irLMiss("variant discriminant row")
+  }
+  irLOpnd(r.vdV)
+  variantTagTail(r.vdVi)
+  fbIf(127)
+  let first = true
+  let fi = 0
+  while fi < uFieldCount[r.vdVi] {
+    if variantDiscrimFieldNeeded(r.vdVi, fi) {
+      const lexes = variantFieldLitLexes(r.vdVi, fi)
+      let li = 0
+      while li < lexes.length {
+        if opndAgain(r.vdV, n.isObj) < 0 { return -1 }
+        if discrimFieldEqTail(r.vdVi, fi, lexes[li], lw.irAt) < 0 { return -1 }
+        if li > 0 { fbI32Bin(114) }
+        li = li + 1
+      }
+      if !first { fbI32Bin(113) }
+      first = false
+    }
+    fi = fi + 1
+  }
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  return 0
 }
 
 // `RLitArms`' receiver: its operand the first time, then read again as the builder read it.
@@ -4137,6 +4184,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "nulBool" => coalNicheCell(n, e, 2, pending)
     "fieldBox" | "fieldVal" => coalUnionField(n, e, pending)
     "optLeaf" => coalOptLeaf(n, e, pending)
+    "nulBoolJoin" => coalNulBoolJoin(n, pending)
     "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
     "nulStr" => coalNulStr(n, e, pending)
@@ -4172,15 +4220,17 @@ function coalBoxStash(n: SCoalBox, _e: BinExpr, pending: i32[]): i32 {
 function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   const p = coalFieldPlanOf(e, unwrapParen(e.binLeft), n.cbAt, lw.irAt)
   const boxed = n.cbArm == "fieldBox"
-  if p.cfCast != -1 || p.cfArm != (if boxed { "boxed" } else { "unbox" }) {
+  if p.cfArm != (if boxed { "boxed" } else { "unbox" }) {
     return irLMiss("coalesce field plan")
   }
   cond(n.cbL, pending)
+  coalArmRecvCast(p.cfCast)
   if boxed { coalFieldBoxOpen(p) } else { coalFieldValOpen(p) }
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   fbElse()
   if recvAgain(n.cbL, e.binLeft) < 0 { return -1 }
+  coalArmRecvCast(p.cfCast)
   if boxed { coalFieldRead(p) }
   else if coalFieldUnbox(p) < 0 { return -1 }
   lwFrames.pop()
@@ -4212,6 +4262,18 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
   lwFrames.pop()
   return coalOptLeafRead(lp)
+}
+
+// A `boolean | null` niche joining a box, as `emitCoalesceNulBoolJoin` writes it: the slot taken,
+// the operand kept in it, the null test's box `if` the default fills, then the present arm.
+function coalNulBoolJoin(n: SCoalBox, pending: i32[]): i32 {
+  coalNulBoolJoinReserve()
+  cond(n.cbL, pending)
+  coalNulBoolJoinOpen()
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  return coalNulBoolJoinPresent()
 }
 
 // A shared `scalar | null` field's `??` along its plan: the box, the stash and tag test whose

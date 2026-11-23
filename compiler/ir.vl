@@ -101,6 +101,9 @@ export type RCallHost = {
 // `teTag`: the tag a box test compares, a variant row's (`isVariantTagPlain`) or an arm's
 // (`isArmTagOf`).
 export type RTest = { teV: Opnd, teTag: i32 }
+// Box variable `vdV` at arm `vdVi`'s tag, then, when it holds, each discriminant field's literal
+// set at `is` test `vdAt`, the variable read once per literal (`emitVariantDiscrimTest`): a bool.
+export type RVariantDiscrim = { vdV: Opnd, vdVi: i32, vdAt: i32 }
 // A field read off a box local narrowed to one variant (`narrowedFieldPlain`); `bfAt` its member.
 export type RBoxField = { bfV: Opnd, bfAt: i32 }
 // A shared field read `srAt` over un-narrowed box `srV`, dispatched on its tag per member (legacy's
@@ -594,6 +597,7 @@ export type Rhs = RArmUnbox
   | RTruncSat
   | RUnionConcreteEq
   | RUnionEq
+  | RVariantDiscrim
 
 // A `match` arm: union arm `swArm` (-1 for the default, which names what it excludes in
 // `swWhy`), and its body.
@@ -677,7 +681,7 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 // cell's `if` and a nullable reference's block read only that operand before they open.
 export function coalArmStagesLeads(a: CoalValArm): boolean {
   return match a {
-    "litUnion" | "nulBool" | "nulRef" | "nulStr" => true
+    "litUnion" | "nulBool" | "nulRef" | "nulStr" | "nulBoolJoin" => true
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "boxStash" | "boxFieldScalar" => false
   }
 }
@@ -801,6 +805,9 @@ export type IrFn = {
   irGlobalAt: {[i32]: i32},
   // The heap the builder noted for each record rep a hole retag compares (`irRecHeapNote`).
   irRecHeap: {[i32]: i32},
+  // The retag nodes the builder noted as a closure stored at a record field legacy writes plainly,
+  // whose closure kid another row on the same heap typed (`irCloFieldRetagNote`).
+  irCloFieldRetag: {[i32]: boolean},
   // The storage-row type (`letBindTy`) of each global the builder reads or stores at that row.
   irGlobalStoreTy: {[i32]: i32},
   // Facts the builder notes for the verifier by node (`irNoteVerifyFacts`): the checked type of a
@@ -908,6 +915,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irGlobalRep: [],
     irGlobalAt: Map(),
     irRecHeap: Map(),
+    irCloFieldRetag: Map(),
     irGlobalStoreTy: Map(),
     irFactTy: Map(),
     irFactInt: Map(),
@@ -1018,6 +1026,17 @@ export function irRecHeapOf(f: IrFn, r: i32): i32 {
   return f.irRecHeap[r] ?? -1
 }
 
+// Whether `f` noted retag node `id` as a closure stored at a plainly written record field.
+export function irCloFieldRetagAt(f: IrFn, id: i32): boolean {
+  return f.irCloFieldRetag[id] ?? false
+}
+
+// Notes retag node `id` as a closure stored at a plainly written record field.
+export function irCloFieldRetagNote(f: IrFn, id: i32) {
+  f.irCloFieldRetag[id] = true
+  return 0
+}
+
 // Notes record rep `r` stored at heap `h`, once.
 export function irRecHeapNote(f: IrFn, r: i32, h: i32) {
   if (f.irRecHeap[r] ?? -1) < 0 { f.irRecHeap[r] = h }
@@ -1108,6 +1127,113 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
         return false
       }
     }
+  }
+}
+
+// Whether node `n` ends its path: a trap, or the effect of a call that never returns.
+export function irNodeEndsPath(n: IrNode): boolean {
+  if n is STrap { return true }
+  if !(n is SEffect) { return false }
+  const r = n.efRhs
+  return match r {
+    RCall => r.caNever
+    RCallHost => r.chNever
+    RArmUnbox |
+      RAsUnion |
+      RAtomEq |
+      RAtomSole |
+      RAtomStr |
+      RAtomWide |
+      RAtomic |
+      RBoxField |
+      RBoxNarrow |
+      RBundlePick |
+      RCallRef |
+      RCast |
+      RCellGet |
+      RCellNew |
+      RClosureEq |
+      RCoalAtomStr |
+      RCoalStr |
+      RCoerce |
+      REnvDrop |
+      REnvGet |
+      RFieldNull |
+      RFnId |
+      RGetField |
+      RGlobalGet |
+      RHandPick |
+      RJoinNull |
+      RListCat |
+      RListClear |
+      RListCopy |
+      RListEmpty |
+      RListEmptyArms |
+      RListEq |
+      RListFitIs |
+      RListGet |
+      RListIsAcross |
+      RListLen |
+      RListNew |
+      RListNewDefault |
+      RListPop |
+      RListPush |
+      RListPushMany |
+      RListSlice |
+      RListStage |
+      RLitArms |
+      RMakeClo |
+      RMakeList |
+      RMakeRec |
+      RMapFilter |
+      RMapGet |
+      RMapGetOr |
+      RMapHas |
+      RMapIter |
+      RMapNew |
+      RMapOp |
+      RMapSet |
+      RMemAccess |
+      RMemOp |
+      RNicheRead |
+      RNulNicheEq |
+      RNulNoneBox |
+      RNulTest |
+      RNullOf |
+      RNumCast |
+      RNumIntr |
+      RNumIs |
+      RNumUnionBin |
+      RNumUnionConvert |
+      RNumWiden |
+      ROptRead |
+      RPrimOp |
+      RPrint |
+      RRawOp |
+      RRecCopyPure |
+      RRecover |
+      RRel |
+      RResultPick |
+      RRetNull |
+      RRetag |
+      RSharedRead |
+      RSimd |
+      RSpread |
+      RStage |
+      RStashSet |
+      RStrOp |
+      RStrToAtom |
+      RStrToAtomStaged |
+      RStructEq |
+      RTagIs |
+      RTagOf |
+      RTagStash |
+      RTest |
+      RToBox |
+      RTruncSat |
+      RUnionConcreteEq |
+      RUnionEq |
+      RVariantDiscrim => false
   }
 }
 
@@ -1350,6 +1476,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RCallRef => opndsCat([r.crFn], r.crArgs)
     RCallHost => r.chArgs
     RTest => [r.teV]
+    RVariantDiscrim => [r.vdV]
     RBoxField => [r.bfV]
     RSharedRead => [r.srV]
     RBoxNarrow => [r.bnV]
@@ -1457,6 +1584,7 @@ function rhsText(r: Rhs): string {
     RCallRef => "call_ref " + opndText(r.crFn) + "(" + opndsText(r.crArgs) + ")"
     RCallHost => "call_host " + i32ToStr(r.chImport) + "(" + opndsText(r.chArgs) + ")"
     RTest => "is " + opndText(r.teV) + " tag " + i32ToStr(r.teTag)
+    RVariantDiscrim => "is " + opndText(r.vdV) + " variant " + i32ToStr(r.vdVi) + " discrim"
     RBoxField => "box_field " + opndText(r.bfV) + " @" + i32ToStr(r.bfAt)
     RSharedRead => "shared_read "
       + opndText(r.srV)
@@ -1798,7 +1926,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
     SCoalBox => match n.cbArm {
       "popOr" => "list"
       "nulRef" | "boxStash" => "box"
-      "litUnion" | "nulBool" | "boxFieldScalar" | "nulStr" => "box"
+      "litUnion" | "nulBool" | "boxFieldScalar" | "nulStr" | "nulBoolJoin" => "box"
       "fieldBox" | "fieldVal" | "optLeaf" => "record"
       "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
@@ -1814,7 +1942,9 @@ export function irNodeFamily(n: IrNode): IrFamily {
 export function irRhsFamily(r: Rhs): IrFamily {
   return match r {
     RAtomEq |
+      RAtomSole |
       RAtomStr |
+      RAtomWide |
       RClosureEq |
       RCoalAtomStr |
       RCoalStr |
@@ -1833,6 +1963,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RRecover |
       RRetNull |
       RRetag |
+      RStrToAtom |
+      RStrToAtomStaged |
       RStructEq |
       RTagIs |
       RTagStash |
@@ -1879,6 +2011,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RNulNoneBox |
       RSharedRead |
       RTest => "box"
+    RVariantDiscrim => "box"
     RFieldNull |
       RGetField |
       RMakeRec |
@@ -1892,13 +2025,9 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RHandPick |
       RMakeClo |
       RResultPick => "closure"
-    RAtomSole |
-      RAtomWide |
-      RCellGet |
+    RCellGet |
       RCellNew |
       RFnId |
-      RStrToAtom |
-      RStrToAtomStaged |
       RTagOf => "other"
     RAtomic |
       RMemAccess |
