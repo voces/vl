@@ -44,6 +44,8 @@ mechanical (lists, imports) and so proved by `scripts/gate.sh --fast` plus
    seed, once per batch. It compares the distilled cells and the inventory witnesses filed `runs`
    under the shipped compiler and a `CLAIMED`-empty one. Any differ is a veto: a claim shipped bytes
    legacy would not have written (ir-design §5.2, the claim rule).
+   Since Q18 the verifier runs `--cases` and `--claimless` on the merged tree instead; the queue
+   runs the gate.
 4. **Squash-merge** each PR with `expectedHeadSha` set to the full head sha that was gated, so a
    push after the gate cannot ride on it.
 
@@ -71,11 +73,27 @@ For lanes:
   and `gate.sh --fast` does not run that file). Since #9456, `gate.sh --fast` runs it.
 - **R8.** A READY lists each new IR admission or route predicate and the legacy function whose
   answer it calls (coordinator ruling, 2026-11-22, after three parallel-mirror vetoes).
+- **R9.** Propose and proceed. A lane with a design question sends it to the coordinator and starts
+  building its recommended option in the same turn. The coordinator replies only to redirect; if no
+  redirect has arrived when the build is ready for its full proof, the recommendation stands. An
+  ownership question (R5) names the lane's guess and starts on it (coordinator ruling, 2026-11-22).
+- **R10.** A change that adds an IR admission predicate, a node kind or a builder query is sent as
+  `PRE-REVIEW <branch> <sha>`, with its R8 list, before its full proof. The queue reviews the diff
+  for mirror, dead-export and claim-time-mint vetoes and answers OK or names the veto, ideally
+  within 15 minutes, ahead of building the next train (coordinator ruling, 2026-11-22). Since Q17
+  (2) it is non-blocking: the lane proves in parallel and redoes the work on an objection.
+- **R11.** A PR that re-files an inventory row (fixed, closed, regraded) runs
+  `vl run scripts/check-filed-witnesses.vl -- --strict docs/internals/inventory docs/internals/inventory-2`
+  and quotes 0 MOVED: `gate.sh --fast` does not run the filed-witnesses row, and a status line whose
+  only outcome phrase is a `was:` clause still grades as the old outcome (#9491, D17044; queue
+  practice, not a ruling).
+- **R12.** A PR that removes an import checks the symbol it stops importing: an export no other
+  module reads is a new dead export (#9490, `svDstOfKind`; queue practice, not a ruling).
 
 For the queue:
 
 - **Q1.** A candidate is batched when its merge-tree builds cleanly (step 2).
-- **Q2.** A train departs at 6 to 8 READY PRs, or when the gate has been idle 15 minutes with at
+- **Q2.** (Train size superseded by Q17 (3).) A train departs at 6 to 8 READY PRs, or when the gate has been idle 15 minutes with at
   least one READY. The next candidate is assembled while the current one is in verify. When the
   queue is empty a train departs at one or two READY PRs, and a candidate not yet gating takes
   each new READY that merges onto it (coordinator ruling, 2026-11-22: a batch costs about 35
@@ -85,6 +103,142 @@ For the queue:
   or declared order, or the whole single-line items of step 2. A hunk where one side edits a line
   and the other only adds lines beside it, so that no line is edited by both, is resolved the same
   way (coordinator ruling, 2026-11-21). Anything else goes back to the lane.
+- **Q5.** Every queue gate passes `SELF_COMPILE_BASE=<the train's base candidate>` and
+  `SELF_COMPILE_BASE_SEED=<its fixpoint seed>`, so a train is graded on its own rise, not on
+  master's drift (coordinator ruling, 2026-11-22, with #9507). A test that runs
+  `self-compile-time.sh` sets those variables itself rather than inheriting them.
+- **Q6.** A squash is simulated with `git merge-tree --write-tree`'s own exit code; piping it into
+  `head` first hides a conflict (queue practice: train AS3's #9482).
+- **Q7.** A PR that changes the `vl` host gates with the candidate's own host: built with an
+  isolated `--target-dir` and copied into that gate worktree's own `scripts/vl-host/target/release`,
+  never the shared target. After it merges, the queue rebuilds the shared binary
+  (`rm target/release/vl && touch src/main.rs`, then `cargo build`), checks it behaviourally, and
+  confirms to the coordinator in the same turn (coordinator delegation, 2026-11-22, #9508).
+- **Q8.** A detector row is never narrowed to the files where it has known rows: it exists to
+  catch a new case. Gate rows accepted on 2026-11-22 (coordinator rulings): `ir claims`'s
+  filed-witness half, about +90 CPU-s (#9496; revisit at I8), and `ir prepost`, about 170 CPU-s
+  (#9508), temporarily, until the armed-shadow row is folded into it (T12). Both retire at I8.
+- **Q9.** The deep-nesting stack margin (`tests/vl_deep_nesting_test.ts`, `MARGIN_KB` 940) is
+  not recalibrated while its erosion is unattributed. A PR whose head raises the failing KB by more
+  than 8 KB on its base is vetoed with the bisect. A smaller rise passes and is named in the PR.
+  A lane touching statement or expression recursion (`ir_build`, `ir_lower`, the emit ladders)
+  quotes the head-vs-base edge before READY, from the inner case
+  (`VL_DEEP_MARGIN_INNER=1 deno test -A --no-check --v8-flags=--stack-size=<KB>
+  tests/vl_deep_nesting_test.ts --filter "labelled while loop, checks"`, 10 KB steps). If one PR
+  accounts for 15 KB or more of the erosion, it returns to its lane. An erosion spread across PRs
+  is the dual-path period's price, and only the test's comment is updated to the measured numbers.
+  Headroom is expected back at I8 (coordinator ruling, 2026-11-22, after #9517 redded train BD10).
+- **Q10.** A lane that merges a `vl-queue/*` branch takes every member in it, including one later
+  pulled from its train. Before READY, check the branch carries no vetoed PR
+  (`git merge-base --is-ancestor <vetoed head> HEAD`). If it does, rebuild the branch from master
+  or the current train and open a new PR, since dropping commits would need a force-push (queue
+  practice: #9519 and #9528 merged BD3, which held #9517).
+- **Q11.** Seed-size drift is refreshed the way fuel drift is. The queue writes a scripts-only
+  refresh from a fixpoint seed at master. The body gives the cumulative rise, the commit range and
+  the mechanism (IR dual-path growth, expected to shrink at I8), plus a per-train size column that
+  names any single train at 1% or more (coordinator ruling, 2026-11-22; first instance #9560).
+- **Q12.** Before gating a candidate, check that every IR kind list is sorted
+  (`tests/ir_lists_layout_test.ts`), as well as every import block. Git's auto-merge unsorts both:
+  BJ1 (#9546 beside #9541) and BL2 (#9556 RNumIs after #9548 RNumUnionBin). A train built before a
+  master scripts-only change carries that file in its first step, so its gate grades against
+  master's current ratchets (queue practice).
+- **Q13.** Never edit a log in place while a job appends to it. `sed -i` swaps the inode, the job's
+  later output goes to the deleted copy, and the gate's reading is lost (BL3 had to be re-gated).
+  Give each train attempt its own log (queue practice).
+- **Q14.** A 0-differ `--claimless` covers only the shapes its cells hold. D17048, a claimed
+  narrowed box-field read shipping invalid wasm since #9259, never reached a cell. So a soundness
+  fix adds its witness as a tests/cases program that runs and prints, and the queue asks for a run
+  proof, not a byte argument, on any admission that reads a value at another rep without a
+  conversion (queue practice; the coordinator ordered a one-off claimed-vs-claimless discovery
+  sweep after the fix).
+- **Q15.** A coordinator-ruled, behaviour-preserving legacy byte change (here: legacy takes
+  `sharedFieldRecvSlot` after lowering its operand, so the IR's natural order matches) is graded
+  differently from an IR PR. Run outputs are unchanged across tests/cases and the corpus, and the PR
+  lists every program whose bytes moved. Its `--names`, `--cases` and `--claimless` differ set must
+  equal that list exactly, each a local-index-only change shown with `wasm-dis`. A differ outside
+  the list is a veto (coordinator ruling, 2026-11-22).
+- **Q16.** One-fix-per-PR does not apply to large refactors, this IR work included (owner ruling,
+  relayed by the coordinator, 2026-11-22). A lane batches freely: 30 or more functions, or a whole
+  class family, in one PR. The PR gives a before→after reading per class and keeps one commit per
+  mechanism, so a veto can split it. Two separations stay: a deliberate legacy byte change (Q15)
+  goes in its own PR first (relaxed by Q17 (1)), and a soundness fix may go small and alone to
+  jump the queue. The queue may ask a lane to split off a vetoed mechanism.
+- **Q17.** Velocity (owner ruling, relayed by the coordinator, 2026-11-22). (1) A legacy byte
+  change may ride with its IR side in one PR, if the PR lists the programs whose bytes moved
+  base→head and shows that claimed-vs-claimless at head differ 0. (2) R10 pre-review is
+  non-blocking: a lane proves in parallel and redoes the work if the queue objects. (3) A train
+  takes every READY PR, and is split only when a step fails (this replaces Q2's 6-to-8 size).
+- **Q18.** The queue no longer runs `ir-identity.sh --cases` or `--claimless` per train. The
+  verifier proves both on the merged tree, and the queue keeps the full gate. A second verifier
+  (IR-V2) takes alternate trains (coordinator ruling, 2026-11-22).
+- **Q19.** Verifier self-test cases are keyed by string id, not by position: positional `want`
+  numbers collided across five lanes in one afternoon (coordinator ruling, 2026-11-22). It landed
+  as #9597, owner IR-D1; Q29 handles the list ends where keyed ids still meet.
+- **Q20.** A byte-free RRetag between records requires struct identity. Wasm struct types are
+  nominal here, so that means the same heap, or for width the declared sub chain. The verifier
+  reads it from an IR-side note (`IrFn.irRecHeap`), never from an emit query (coordinator ruling,
+  2026-11-22; DECISIONS.md). Found when `repFillsHole`'s record arm recursed forever on recursive
+  record twins (`type L1 = {n: L1|null}` beside an L2 twin), a compiler stack overflow caught by
+  `tests/cases/structs/structural-twin-heap-dedup.vl`, and when it was seen to admit field-alike
+  records on different heaps.
+- **Q21.** A docs-only inventory-row PR skips ci-witnesses in CI, so before merging one the queue
+  quotes `vl run scripts/check-filed-witnesses.vl -- --strict docs/internals/inventory docs/internals/inventory-2`
+  on the row. D17052's row (#9595) carried a `// PRINTS` repro comment that the grader parsed
+  verbatim, and master's filed-witness step was red until #9616 (queue practice).
+- **Q22.** A train carries a docs-only overlay of master's `docs/internals/inventory`, so the
+  gate's inventory-refs row reads rows filed after the train's base (queue practice; narrowed by
+  Q28).
+- **Q23.** Never start a train's gate while an earlier run of that train still holds the same
+  worktree, and never run a heavy check beside a gate. Each cost a re-gate on 2026-11-22, the
+  second through an OOM kill (queue practice).
+- **Q24.** Stack-margin attribution (Q9), reported by the verifier: #9414 (IR-N7) accounted for
+  +35 KB of the deep-nesting edge (890 → 925 KB). Its fix, moving the RTagStash arm out of
+  `node()`'s frame (#9600), recovers the edge to 896 KB and has landed.
+- **Q25.** While trains are in flight, a lane merges the newest announced
+  `origin/vl-queue/<train>` tip, not `origin/master`. Master lags the trains, so merging it gave
+  cross-lineage conflicts that refused four PRs on 2026-11-22 (#9609, #9605, #9627, #9628) (queue
+  practice; replaced by Q31: a lane now merges `origin/master` only).
+- **Q26.** A Q15/Q17 moved-programs list covers `scripts/capability-probes` as well as tests/cases
+  and the distilled corpus. On 2026-11-22 #9599's list missed
+  `scripts/capability-probes/numeric-as-exact-trio.vl` and #9596's missed 33 tests/cases programs;
+  the verifier's union grading caught both before merge (queue practice).
+- **Q27.** A lane's READY quotes the "fail under both" counts of `ir-identity.sh --cases` (68) and
+  `--names` (3267) against master's. A rise means legacy itself broke, as IR-N9's
+  `directArgSeedsOf` split did (68 → 71) before its lane caught it (queue practice).
+- **Q28.** A train's docs overlay of master's `docs/internals/inventory` (Q22) adds only the rows
+  the train lacks. A full checkout of master's inventory reverted a member PR's own row closure
+  (D17053 in BW1) (queue practice).
+- **Q29.** Keyed self-test ids (Q19) still meet at list ends when several PRs add cases. The queue
+  resolves such hunks, those with an empty diff3 base in `compiler/ir_selftest.vl` and
+  `tests/vl_ir_shadow_test.ts`, as ours-then-theirs. A refused hunk with a non-empty base goes
+  back to the lane (queue practice).
+- **Q30.** The subset guard treats `scripts/vl-host/` as code, not docs, because #9615 changed
+  `scripts/vl-host/src/main.rs` (queue practice).
+- **Q31.** A lane merges `origin/master` only, never a `vl-queue` tip. The queue merges each
+  master-based PR into the in-flight train tip with `git merge-tree --merge-base=<master>`. That
+  is valid only while master's tree equals the last merged train's tree outside docs (the subset
+  guard). A real conflict goes back to the lane. This replaces Q25 (coordinator ruling,
+  2026-11-23).
+- **Q32.** A train that passes verification merges at once. A question about a PR's value goes to
+  its lane in parallel and never blocks a squash (coordinator ruling, 2026-11-23).
+- **Q33.** When the shadow's covered count holds flat, read the start-body line before
+  questioning a PR: a gain can be in start bodies only, as #9627's +20 starts were (coordinator
+  ruling, 2026-11-23).
+- **Q34.** The self-compile fuel attribution line is needed only past the +1% gate. A phase-state
+  rise from test-only constructors in a negative self-test is accepted with `--write-baseline` and
+  named in the PR body (#9650) (coordinator ruling, 2026-11-23).
+- **Q35.** A shadow mismatch row may rise with a filed row when claimed bytes equal claimless
+  bytes for the affected programs; the row need not be "unclaimed". The case is the
+  `ir-closure-record-family` lane's row (unfiled: D17060) (coordinator ruling, 2026-11-23).
+- **Q36.** Before every squash, check whether it would re-add a `changelog.d` entry that
+  `CHANGELOG.md` already holds; if so, delete the entry on the branch first, in a docs-only
+  commit. #9640 and #9647 each had to drop entries a squash re-added after #9636's fold (queue
+  practice).
+- **Q37.** A PR that fixes a filed inventory row closes that row's status line in the same PR.
+  #9641 fixed D17056 but left its row open, and master's ci-witnesses step was red until #9652
+  (queue practice).
+- **Q38.** A docs merge conflict on a squash reparent, such as an inventory add/add, takes the
+  train's version, which is the closed row. D17055 in #9639 was that case (queue practice).
 
 ### Squash artifacts and Q3 members
 
