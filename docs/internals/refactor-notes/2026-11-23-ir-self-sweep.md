@@ -1,9 +1,9 @@
 # IR-S1: the self-compile builds wholly in the IR (2026-11-23, lane IR-S1)
 
 The self-compile is I8's strictest population. On master 9852c3da it had 36 functions the IR
-missed, in 24 classes; at this branch's merge-base (eeac5bb6) 35. Every one now builds, verifies,
-matches and is claimed (base cf56aab0 had 35 in 24 classes). Each function was ablated to a witness (`tests/ir-shadow-rows/`, one file
-per shape), and the fixes are grouped by mechanism, one commit each.
+missed, in 24 classes; at this branch's measured base (cf56aab0), 35 in 24. Every one now builds,
+verifies, matches and is claimed. Each function was ablated to a witness (`tests/ir-shadow-rows/`,
+one file per shape), and the fixes are grouped by mechanism, one commit each.
 
 ## Mechanisms
 
