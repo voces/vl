@@ -43,6 +43,7 @@ import {
   RGetField,
   RGlobalGet,
   RHandPick,
+  RInitProgress,
   RJoinNull,
   RListCat,
   RListClear,
@@ -65,6 +66,7 @@ import {
   RMakeClo,
   RMakeList,
   RMakeRec,
+  RMapDelete,
   RMapFilter,
   RMapGet,
   RMapGetOr,
@@ -433,7 +435,7 @@ function nicheBoolPair(x: i32, y: i32): boolean {
 
 // Rules 2 and 6 for a call of callee `fnPos` with `args` into a destination of rep `dst`
 // (-1 for an effect, which keeps no result).
-function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
+function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32, never: boolean) {
   const si = irSigOf(vf, fnPos)
   if si < 0 {
     return fail(6, at, "calls f" + i32ToStr(fnPos) + ", which has no signature")
@@ -465,7 +467,14 @@ function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
     }
     i = i + 1
   }
-  if dst >= 0 && dst != vf.irSigRet[si] && !vfStoresAs(dst, vf.irSigRet[si]) {
+  // A callee that never returns has no result: its call takes its consumer's rep.
+  const noRet = never && repIsNoValue(vf.irSigRet[si])
+  if (
+    dst >= 0
+    && dst != vf.irSigRet[si]
+    && !vfStoresAs(dst, vf.irSigRet[si])
+    && !noRet
+  ) {
     return fail(6, at, "the result rep is not the callee's")
   }
   return 0
@@ -536,7 +545,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           return fail(2, at, "a call's write-back is not a capture it passes")
         }
       }
-      callSig(r.caCallee, r.caArgs, dst, at)
+      callSig(r.caCallee, r.caArgs, dst, at, r.caNever)
     }
     RCallRef => {
       use(r.crFn, at)
@@ -1450,6 +1459,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RMapDelete => {
+      use(r.mdKey, at)
+      if !mapRecvOk(r.mdSym, r.mdLoc, at) {
+        return fail(2, at, "a map delete of a receiver that is no map")
+      }
+      if dst >= 0 && dst != vfBool && dst != vfI32 {
+        return fail(2, at, "a map delete is a boolean")
+      }
+      0
+    }
     RMapGetOr => {
       use(r.mgKey, at)
       if r.mgForm > 0 { use(r.mgDef, at) }
@@ -1571,6 +1590,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCellGet => use(r.cgCell, at)
     REnvGet => 0
     REnvDrop => 0
+    // The progress store is a statement's effect: it yields nothing.
+    RInitProgress => if dst >= 0 { fail(2, at, "an init progress store yields no value") } else { 0 }
     RBundlePick => {
       use(r.bpV, at)
       if dst >= 0 && !(repNodeAt(dst) is RClosure) {
@@ -2300,6 +2321,21 @@ function stmt(id: i32, prev: i32) {
           "a walk's variable is not a local of its element rep",
         )
       }
+      // A second name is a local index, or a map walk's value at an i32 or a string.
+      const v2 = n.xfVar2
+      if v2 >= 0 && (v2 >= vf.irVars.length || vf.irVars[v2].vKind != "local") {
+        return fail(2, id, "a walk's second name is not a local")
+      }
+      if v2 >= 0 {
+        const pr = vf.irVars[v2].vRep
+        if pr != vfI32 && !((n.xfMap >= 0 || recvMap) && pr == vfStr) {
+          return fail(
+            2,
+            id,
+            "a walk's second name is not an index or a map's value",
+          )
+        }
+      }
       vfLabels.push(n.xfBrk)
       vfLabelOut.push(-1)
       labelled(n.xfCont, -1, n.xfBody)
@@ -2699,6 +2735,7 @@ function rhsReadsList(r: Rhs): boolean {
       RGetField |
       RGlobalGet |
       RHandPick |
+      RInitProgress |
       RJoinNull |
       RListCat |
       RListClear |
@@ -2720,6 +2757,7 @@ function rhsReadsList(r: Rhs): boolean {
       RMakeClo |
       RMakeList |
       RMakeRec |
+      RMapDelete |
       RMapFilter |
       RMapGet |
       RMapGetOr |
@@ -2945,7 +2983,7 @@ export function irVerify(f: IrFn): IrVerdict {
       )
     } else if vfHeldOpen(i, v.vTy, v.vRep) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
-    } else if !untyped && repNodeOfTy(v.vTy) != v.vRep {
+    } else if !untyped && repNodeOfTy(v.vTy) != v.vRep && !neverCallTemp(f, i) {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
     }
     i = i + 1
@@ -3039,6 +3077,22 @@ function plainRecordsLowerAlike(a: i32, b: i32): boolean {
 function opndsHoldVar(os: Opnd[], v: i32): boolean {
   for o in os {
     if o is OVar && o.ov == v { return true }
+  }
+  return false
+}
+
+// Whether variable `i` of `f` is a temp whose checker type has no value, defined by a call that
+// never returns: no value reaches it, so it takes the rep of the consumer legacy writes after it.
+function neverCallTemp(f: IrFn, i: i32): boolean {
+  const v = f.irVars[i]
+  if v.vKind != "temp" || v.vTy < 0 || !repIsNoValue(repNodeOfTy(v.vTy)) {
+    return false
+  }
+  for n in f.irNodes {
+    if n is SLet && n.lDst == i {
+      const r = n.lRhs
+      return r is RCall && r.caNever
+    }
   }
   return false
 }
