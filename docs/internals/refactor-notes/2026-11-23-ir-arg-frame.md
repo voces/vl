@@ -24,6 +24,18 @@ and 4 one-offs (covariant field, record pattern, a map of a wider record, `list<
 
 Row: `tests/ir-shadow-rows/arg-built-wider-at-frame-row.vl`.
 
+## Price
+
+One `start` leaves the IR: tests/cases/modules/overload-generic-fresh-binding-runs, filed D17087.
+Base `1 start covered` / `1 start matched`; head `1 start uncovered argument coercion`. The global
+cell of `const i` is noted at its checked type's rep while legacy stores it at its `letBindTy` row,
+`V`'s, which is now the delivery rep (probe: cell 7, scope 7, storage 6, delivery 6). Legacy's
+bytes do not move (A/B differ 0) and it runs. Neighbours: the local-binding spelling gains its
+function; the single-import spelling holds. Narrowing `calleeParamTy` to checked types with a struct
+row of their own keeps it but loses two of the seven wins. Covered-fell: tests/cases fell 1, rose 11;
+corpus fell 0, rose 6. Queue ruling 2026-11-23 23:32: accepted as this price; the close
+(`globalInitValue` storing a record cell at its storage row) is N8's next claim.
+
 ## Legacy tails the IR calls
 
 None new: `vtKindOfParam`, `paramStructIdxOf`, `repRowOfTyStruct` and `declRowTy`, which
