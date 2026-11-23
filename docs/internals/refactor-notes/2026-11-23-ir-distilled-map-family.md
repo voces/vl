@@ -1,55 +1,64 @@
-# IR: the distilled corpus's map family — a nullable-boolean print, i64 keys, delete, a walk's pair, 2026-11-23
+# IR: the distilled corpus's map family — a nullable-boolean print, i64 keys, delete, a walk's pair, a niche map read, 2026-11-23
 
 Lane IR-N6. The coordinator's brief: the distilled corpus had fallen behind tests/cases. This lane
 takes its map family as one batch.
 
 ## The rows, by what the census names and what ablation found
 
-| census row (distilled, master f3f248cd) | functions | what it is | taken here |
+| census row (distilled, master) | functions | what it is | taken here |
 | --- | ---: | --- | --- |
 | `print nulBool` | 11 | the IR's print has no `boolean \| null` arm | yes |
 | `map key i64` | 10 | `mapKeyArmOf`'s i64 arm: the key at its own width | yes |
 | `method delete` | 10 (exposed) | the IR has no map delete | yes |
 | `for in pair` | 13 (exposed) | a walk's second name | yes, at an i32 or a string |
-| `map get rep` | 20 | the hole instance types the read `boolean`/`AB`, and the map holds `\| null` | no: see below |
-| `map read default rep` | 12 | a `{r: null}` default and slot, two record reps, neither with a heap | no: IR-M1 |
+| `map get rep` | 20 | the hole instance types the read `boolean`/`AB`, and the map holds `\| null` | yes; next stop named below |
+| `map read default rep` | 12 | a record type with no struct row (`{r: null}`), stored in another row | no: its own follow-up |
 
-`map get rep` was prototyped in a scratch tree: the read held at the map's niche rep
-(`mapReadNicheTy`). It cleared all 20 cells, 210 functions covered = verified = matched. But the
-same functions then stopped one step later, in the `??` lowering: 10 at `box ladder`
-(`holeBoxPlanOf`'s "ladder", which the IR has no plan for) and 10 at `union if arm rep`. Alone it
-adds 0, so it stays out.
+`map get rep`'s next stops: 10 functions at `box ladder` (`holeBoxPlanOf`'s "ladder", which the IR
+has no plan for, sent to IR-N9) and 10 at `union if arm rep` (chained `a ?? b ?? c`, sent to IR-N2).
+
+`map read default rep`: in every cell the map slot's value type is the literal-inferred
+`{r: null}`, which has no struct row, yet the slot stores struct row 0 or 1 (`mvValStructIdxOf`).
+`objLit` builds the default at that row's type, so the default and the read are two record reps.
+Legacy keeps the value in that storage row through the binding and its field test, which is why all
+12 also carry `null test nullty`. The fix is a rep decision, a record type with no row repped as the
+row that stores it, so it goes in a follow-up of its own.
 
 ## The changes, one commit each
 
 1. **print nulBool.** `emitPrintNulBool` is now `printNulBoolOpen`, the operand, and then
    `printNulBoolTail`. The IR lowers its operand between the two. It refuses a valued `if` below
    the opened blocks, as `nulStr` does.
-2. **i64 keys.** `mapKeyAt` delivers the key at `repNodeOfTy(TY_I64)` under the i64 arm, as
-   `emitScalarValue(key, "i64")` widens it. This covers get, get-or, has and set.
+2. **i64 keys.** `mapKeyAt` delivers the key at `repNodeOfTy(TY_I64)` under `mapKeyArmOf`'s i64
+   arm, as `emitScalarValue(key, "i64")` widens it. This covers get, get-or, has and set.
 3. **map delete.** A new `RMapDelete`, keyed as `RMapHas` is. `emitMapDelete` is now
    `emitMapRecvKey` followed by the shared `mapDeleteTail`. A statement builds the value and drops
-   it, as legacy does.
+   it, as legacy does. Keyed self-tests: `map-delete-of-map` holds (0), and `map-delete-of-i32`
+   is refused (rule 2).
 4. **a walk's pair.** `SForIn.xfVar2` holds the second name's variable, at `forInBindTy`'s rep (an
-   i32 or a string only), in legacy's `pSlot`. Legacy's index-counter init is `forInPairInit`,
-   shared by both writers. The rolled helpers already bind and step the pair. The 9 distilled
-   pairs left over bind a map value at another rep: nullable 6, record 3, atom, list or map 1 each.
+   i32 or a string only). Its slot is legacy's `forInPairSlotOf`, the one function every writer
+   computes it with; the lowering checks the variable against the loop record's `pIdx`. Legacy's
+   index-counter init is `forInPairInit`, shared by both writers. The rolled helpers already bind
+   and step the pair.
+5. **a niche map read.** A read the instance types without its map value's null is held at the
+   map's value rep and typed at its value type (`mapReadNicheTy`), as legacy's helper returns that
+   niche.
 
-## Readings (base: a master f3f248cd fixpoint; fixpoint seeds on both sides)
+## Legacy tails the IR calls
 
-| class, any (distilled / tests/cases) | base | this change |
-| --- | ---: | ---: |
-| `print nulBool` | 11 / 28 | 2 / 2 |
-| `map key` | 10 / 20 | 0 / 4 |
-| `method delete` | 10 / 39 | 0 / 0 |
-| `for in pair` | 13 / 27 | 9 / 5 |
+- `printNulBoolOpen`, `printNulBoolTail` (`wasmEmit.vl`): a `boolean | null` print around its operand.
+- `mapDeleteTail` (`wasmEmit.vl`): a map delete's probe, tombstone and 0 or 1, after its receiver and key.
+- `forInPairInit` (`wasmEmit.vl`): a walk's index-pair counter at 0, or its hidden counter.
+- `forInPairSlotOf` (`emit_plan_list.vl`): a walk's second-name slot.
 
-| reading | base | this change |
-| --- | ---: | ---: |
-| distilled-corpus functions with no blocker | 45,373 | 45,396 |
-| tests/cases functions with no blocker | 71,527 | 71,594 |
+## Readings (fixpoint seeds on both sides)
 
-Per mechanism, distilled / tests/cases no-blocker: print +9 / +24, i64 key +8 / +11, delete +4 / +22,
-pair +2 / +10.
+READINGS
+
+Witnesses, one per mechanism, each printing the same under the base and the candidate seed:
+`tests/cases/null/print-nullable-boolean-of-map-has-and-field.vl`,
+`tests/cases/maps/i64-keyed-map-read-has-set-default.vl`,
+`tests/cases/maps/delete-as-statement-and-value.vl`,
+`tests/cases/loops/for-in-pair-index-and-map-value.vl`.
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
