@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage: a record compare whose operand is a place legacy re-reads at each field.** That is a global (every top-level record `==`), a narrowed nullable local, or a field chain over either or over a variable. The IR now consumes the operand's reads unwritten and leaves the place to legacy's compare roots. tests/cases: `start: record compare place operand` 23 starts and 2 functions → 0. A typed `null` field whose recursive record's kid rep its type does not intern to is now the named miss `record field null rep`, not a verifier failure. No legacy bytes moved.
