@@ -143,6 +143,7 @@ import {
   RGetField,
   RGlobalGet,
   RHandPick,
+  RHoleOptBox,
   RInitProgress,
   RJoinNull,
   RListCat,
@@ -341,6 +342,7 @@ import {
   arrNewPlanOf,
   arrNewTail,
   asLitTail,
+  asMapProbeTrapTail,
   atomEqIsTail,
   atomEqTail,
   atomNotNulIsTail,
@@ -434,6 +436,8 @@ import {
   holeBoxHead,
   holeBoxLeads,
   holeBoxTail,
+  holeOptBoxHead,
+  holeOptBoxTail,
   hostCallTail,
   identListOverrideOf,
   idxRowsOn,
@@ -1084,7 +1088,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMapGet => {
       const from = irLAt()
       const got = mapGet(r)
-      if r.mtBox < 0 && r.mtRow { irLIndexRow(r.mtAt, from) }
+      if r.mtBox < 0 && !r.mtTrap && r.mtRow { irLIndexRow(r.mtAt, from) }
       got
     }
     RMapHas => mapHas(r)
@@ -1164,6 +1168,13 @@ function rhs(r: Rhs, tail: boolean) {
     }
     ROptRead => optRead(r)
     RToBox => boxOp(r)
+    RHoleOptBox => {
+      // Legacy writes the box's tag, then the operand's plain cast, then the two boxes.
+      leaf()
+      holeOptBoxHead(r.hxAt)
+      irLOpnd(r.hxV)
+      holeOptBoxTail(r.hxAt)
+    }
     RAtomStr => {
       irLOpnd(r.sxV)
       atomStrTail(atomStrPlanOf(r.sxAt, lw.irAt, false))
@@ -2983,6 +2994,11 @@ function mapGet(r: RMapGet) {
   if r.mtSym >= 0 && userGlobalReadClass(r.mtSym, lwGlobalCtx) != "plain" {
     return irLMiss("map get of a global not read plainly")
   }
+  // `as!`'s read: the probe, then its trap on a miss and the stored value.
+  if r.mtTrap {
+    mapProbeHead(nd.idxArr, r.mtSym, r.mtNonNull, r.mtLoc, r.mtKey)
+    return asMapProbeTrapTail()
+  }
   // The box plan's scalar read: the probe, then the box of its hit or its null.
   if r.mtBox >= 0 {
     mapProbeHead(nd.idxArr, r.mtSym, r.mtNonNull, r.mtLoc, r.mtKey)
@@ -3397,9 +3413,11 @@ function structEq(r: RStructEq) {
   const rS = structEqStagesRight(n.binRight)
   const lE = r.seLIx.length > 0
   const rE = r.seRIx.length > 0
-  const lLoc = if lS || lE { -1 } else { structEqSideLocal(r.seL) }
-  const rLoc = if rS || rE { -1 } else { structEqSideLocal(r.seR) }
-  if !lS && !lE && lLoc < 0 || !rS && !rE && rLoc < 0 {
+  const lG = !lS && !lE && structEqPlaceSide(r.seL)
+  const rG = !rS && !rE && structEqPlaceSide(r.seR)
+  const lLoc = if lS || lE || lG { -1 } else { structEqSideLocal(r.seL) }
+  const rLoc = if rS || rE || rG { -1 } else { structEqSideLocal(r.seR) }
+  if !lS && !lE && !lG && lLoc < 0 || !rS && !rE && !rG && rLoc < 0 {
     return irLMiss("record compare place")
   }
   const plan: EqRootPlan = {
@@ -3412,6 +3430,7 @@ function structEq(r: RStructEq) {
   const saved = structEqEnter()
   if lS { irLOpnd(r.seL) }
   if rS { irLOpnd(r.seR) }
+  structEqPlaceSkip(lG, rG, r)
   const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
   if structEqTail(n, row, roots, saved, fnIx, plan) < 0 {
     return irLMiss("record compare fields")
@@ -3475,6 +3494,28 @@ function structEqSideLocal(o: Opnd): i32 {
   if !(o is OVar) || isTemp(o.ov) { return -1 }
   if o.ov < lwStackVal.length && lwStackVal[o.ov] { return -1 }
   return varSlot(o.ov)
+}
+
+// Whether record compare side `o` is a temp holding a place legacy re-reads at each field from
+// its expression (`structEqRoots` at the place): a global's read or a narrowed nullable
+// variable's, under field reads, or a variable's field reads.
+function structEqPlaceSide(o: Opnd): boolean {
+  if !(o is OVar) || !isTemp(o.ov) { return false }
+  if o.ov < lwStackVal.length && lwStackVal[o.ov] { return false }
+  const r = tempRhs(o.ov)
+  if r is RGlobalGet { return true }
+  if r is RRecover {
+    return r.rcV is OVar && !isTemp(r.rcV.ov) && varSlot(r.rcV.ov) >= 0
+  }
+  if !(r is RGetField) || !(r.gfV is OVar) { return false }
+  return !isTemp(r.gfV.ov) && varSlot(r.gfV.ov) >= 0 || structEqPlaceSide(r.gfV)
+}
+
+// Consumes the place sides' temps unwritten, left first, as legacy reads each from its place.
+function structEqPlaceSkip(lG: boolean, rG: boolean, r: RStructEq) {
+  if lG { irLSkip(r.seL) }
+  if rG { irLSkip(r.seR) }
+  return 0
 }
 
 // `RNulNicheEq`: legacy's `nulNiche` compare in `emitNulNicheEq`'s order: the guard's head, the
@@ -3848,6 +3889,15 @@ function stashSetEffect(r: RStashSet, pending: i32[]) {
   return 0
 }
 
+// A discarded `.map`/`.filter`: its list built as the value builds it, then dropped. Kept out of
+// `node`, whose frame each level of a nested lowering pays.
+function mapFilterDropped(r: RMapFilter, pending: i32[]): i32 {
+  if irLowerListHook(r) < 0 { return -1 }
+  irLSettle(pending)
+  fbDrop()
+  return 0
+}
+
 function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
   if id < 0 || id >= lw.irNodes.length { return irLMiss("no node") }
   const n = lw.irNodes[id]
@@ -3928,6 +3978,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
+      if r is RMapFilter { return mapFilterDropped(r, pending) }
       if r is RMapSet {
         mapSet(r)
         irLSettle(pending)
