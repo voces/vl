@@ -210,9 +210,10 @@ Deno.test({
 });
 
 // A thunk whose target's result type is open is typed by its rep's own type where that is closed
-// and round-trips to the rep (`thunkRetTy`), and matches; where it does not, it stays uncovered.
+// and round-trips to the rep (`thunkRetTy`); where it does not, by legacy's declared result
+// descriptor (`resultDescTy`). Each matches.
 Deno.test({
-  name: "ir shadow: a thunk's open result type stands as its rep's own only where that round-trips",
+  name: "ir shadow: a thunk's open result type stands as its rep's own where that round-trips, else at its declared result",
   ignore,
   fn: () => {
     const fits = `export function id<T>(x: T): T { return x }\nconst k = () => id\nprint(k()(9))\n`;
@@ -223,8 +224,8 @@ Deno.test({
     const open = `function inc(x) { return x + 1 }\nfunction run(f) { return f()(41) }\n` +
       `print(run(() => inc) + run(() => inc))\n`;
     const { rows } = run(open, true);
-    if (rows.get("thunk uncovered thunk open result type") !== 2) {
-      throw new Error(`want two thunks uncovered on their open result type, got ${JSON.stringify([...rows])}`);
+    if (rows.has("thunk uncovered thunk open result type") || (rows.get("thunk matched") ?? 0) < 2) {
+      throw new Error(`want both open-result thunks matched at the declared result, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1584,6 +1585,9 @@ Deno.test({
       "width-retag-pair-unnoted": 2,
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
+      "eq-helper-of-records": 0,
+      "eq-helper-of-i32": 2,
+      "eq-helper-into-bool": 2,
       "rep-typed-thunk-forwards": 0,
       "rep-typed-thunk-forwards-env": 1,
       "rep-typed-result-not-thunk": 1,
@@ -1601,6 +1605,8 @@ Deno.test({
       "return-not-stored-alike": 2,
       "return-stored-alike": 0,
       "return-stored-unlike": 2,
+      "niche-return-not-stored-alike": 2,
+      "niche-return-stored-alike": 0,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
       "atom-tower-i32-read": 2,
@@ -2960,6 +2966,39 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== (rows.get("fns") ?? -1) || (rows.get("start matched") ?? 0) !== 1) {
       throw new Error(`want every function and the start body covered, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A field typed by one bare string literal reps at the storage of the row its record is stored at
+// (`rowFieldStorage`): the string where an anonymous literal built from a binding keeps it, the
+// atom where a declared record's row does. One program per position the literal reaches (a read,
+// a binding, a return, a list element, a comparison, a module global) and a union-arm spelling.
+const ROW_FIELD_STORAGE_POSITIONS: string[] = [
+  "function h(x: \"a\") {\n  const w = { f: x, g: 1 }\n  print(w.f)\n}\nh(\"a\")\n",
+  "function h(x: \"a\") {\n  const w = { f: x, g: 1 }\n  const y = w.f\n  print(y)\n}\nh(\"a\")\n",
+  "function mk(x: \"a\") { return { f: x, g: 1 } }\nfunction h() {\n  const w = mk(\"a\")\n  print(w.f)\n}\nh()\n",
+  "function h(x: \"a\") {\n  const w = { f: x, g: 1 }\n  const v = w\n  print(v.f)\n}\nh(\"a\")\n",
+  "function h(x: \"a\") {\n  const ws = [{ f: x, g: 1 }]\n  print(ws[0].f)\n}\nh(\"a\")\n",
+  "function h(x: \"a\") {\n  const w = { f: x, g: 1 }\n  print(w.f == \"a\")\n}\nh(\"a\")\n",
+  "const x: \"a\" = \"a\"\nconst w = { f: x, g: 1 }\nprint(w.f)\n",
+  "type A = { kind: \"circle\", r: i32 }\ntype B = { kind: string, r: i32 }\nfunction f(n: i32): A | B {\n  if n == 0 {\n    const a: A = { kind: \"circle\", r: 1 }\n    return a\n  }\n  const b: B = { kind: \"round\", r: 3 }\n  return b\n}\nlet i = 0\nwhile i < 2 {\n  const x = f(i)\n  if x is A {\n    const y: A = { kind: x.kind, r: x.r }\n    print(y.kind)\n  } else {\n    print(\"B \" + x.kind)\n  }\n  i = i + 1\n}\nconst s: A = { kind: \"circle\", r: 4 }\nprint(\"a \" + s.kind)\n",
+];
+const ROW_FIELD_STORAGE_DECLARED =
+  `type R = { f: "a", g: i32 }\nfunction h(x: "a") {\n  const v: R = { f: "a", g: 1 }\n  const w = { f: x, g: 1 }\n  print(v.f)\n  print(w.f)\n  print(v.g + w.g)\n}\nh("a")\n`;
+const ROW_FIELD_STORAGE_FULL = new Set(["fns", "covered", "verified", "matched", "start fns", "start covered", "start verified", "start matched"]);
+Deno.test({
+  name: "ir shadow: a bare-literal field reps at its row's storage and matches",
+  ignore,
+  fn: () => {
+    for (const src of [...ROW_FIELD_STORAGE_POSITIONS, ROW_FIELD_STORAGE_DECLARED]) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+      if (src === ROW_FIELD_STORAGE_DECLARED) continue;
+      const misses = [...rows.keys()].filter((k) => !ROW_FIELD_STORAGE_FULL.has(k) && !k.endsWith(": matched"));
+      if (misses.length > 0) throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
     }
   },
 });
