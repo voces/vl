@@ -3353,10 +3353,15 @@ function capRepFor(fe: i32, name: string, readRep: i32): i32 {
 function capTyOf(fe: i32, name: string): i32 {
   const d = parentBindingOf(fe, name)
   if d < 0 { return -1 }
-  const ty = heldTy(scopeTyAt(d, parentBindingFrameArenaOf(fe, name)))
-  // A bundle parameter is held as its record of one closure per signature, captured or not.
-  if nodeAt(d) is Param && bundleSigsOfParam(d).length > 0 { return bundleHeldTy(d, ty) }
-  return ty
+  const frame = parentBindingFrameArenaOf(fe, name)
+  const ty = heldTy(scopeTyAt(d, frame))
+  // A bundle parameter, and a binding holding a returned bundle whole (`holderRecordTy`), are held
+  // as the record of one closure per signature, captured or not.
+  if nodeAt(d) is Param && bundleSigsOfParam(d).length > 0 {
+    return bundleHeldTy(d, ty)
+  }
+  const ht = if nodeAt(d) is LetDecl { holderRecordTy(d, frame) } else { -1 }
+  return if ht >= 0 { ht } else { ty }
 }
 
 // The parameter variable of the lifted function `fe` being built for its capture `name`, at
@@ -4347,6 +4352,20 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   return closureCallAt(b, c, ix, key, f)
 }
 
+// Bundle callee `fx` read through a capture of this frame, at the record its capture holds; else a
+// named miss.
+function bundleCaptureRead(b: i32[], fx: i32): Opnd {
+  const n = nodeAt(fx)
+  if !(n is Ident) || identReadArmOf(n, fx, ibFnIx, false) != "capture" {
+    return irBMiss("bundle callee")
+  }
+  const cr = capRepOf(fnStmtsPosOf(ibFnIx), n.identName)
+  if cr < 0 || !(repNodeAt(cr) is RRecord) {
+    return irBMiss("bundle callee capture rep")
+  }
+  return captureRead(b, n, fx, cr)
+}
+
 // Armed, legacy has written call `ix` already, and must have taken the plain path at `key`.
 function legacyPlainAgrees(ix: i32, key: string): boolean {
   if ibArmed && callRefLegacyPlainKey(ix) != key {
@@ -4367,12 +4386,12 @@ function bundleCallRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("closure call plan disagrees")
   }
   const pk = bundlePickOf(ix, ibFnIx)
-  // The parameter's local, read only here: a bundle reached through a capture stays legacy's.
+  // The parameter's local, or a captured bundle read at the record its capture holds (`capTyOf`).
   const cf = if c.callFn >= 0 && c.callFn < P.nodes.length { nodeAt(c.callFn) } else { null }
   const p = if cf is Ident { paramIndexOf(ibFnIx, cf.identName) } else { -1 }
   const pv = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else { -1 }
-  if pv < 0 { return missRhs("bundle callee") }
-  const v: Opnd = { ov: pv }
+  const v: Opnd = if pv >= 0 { { ov: pv } } else { bundleCaptureRead(b, c.callFn) }
+  if ibMiss != "" { return missRhs(ibMiss) }
   const crep = repNodeOfTy(pk.bpTy)
   if !(repNodeAt(crep) is RClosure) { return missRhs("bundle member rep") }
   const f = irBLetTempTy(b, { bpV: v, bpAt: ix }, c.callFn, crep, pk.bpTy)
