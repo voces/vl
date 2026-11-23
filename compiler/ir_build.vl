@@ -6266,18 +6266,6 @@ function recordRepOrNull(r: i32): boolean {
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
-  if (
-    dst >= 0
-    && ibNeverRep != dst
-    && unwrapParen(ix) >= 0
-    && exprTyOf(unwrapParen(ix)) == TY_NEVER
-  ) {
-    const was = ibNeverRep
-    ibNeverRep = dst
-    const v = deliver(b, ix, dst, dstTy)
-    ibNeverRep = was
-    return v
-  }
   // A read the checker narrowed to `null` is the destination's null where legacy's `nullread` arm
   // writes one (`nullReadDstOwnOf`), not its storage's.
   const nro = if ibMiss == "" && dst >= 0 { nullReadOwnAt(ix) } else { -1 }
@@ -9064,8 +9052,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     return t
   }
   const own = exprRepOf(ix)
-  // A `never` value is built at its consumer's rep: legacy writes the consumer after it.
-  const rep = if own < 0 && ibNeverRep >= 0 && exprTyOf(ix) == TY_NEVER { ibNeverRep } else { own }
+  // A `never` call or operator is legacy's i32, or its binary sibling's rep (`binOperand`).
+  const nv = own < 0 && (n is Call || n is BinExpr) && exprTyOf(ix) == TY_NEVER
+  const rep = if nv && ibNeverRep >= 0 { ibNeverRep } else if nv { repNodeOfTy(TY_I32) } else { own }
   if rep < 0 {
     return irBMiss("rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
   }
@@ -9206,13 +9195,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     const rw = operandWhy(if nr { n.binLeft } else { n.binRight })
     if rw != "" { return irBMiss(rw) }
     const never = nl || nr
-    if (
-      never
-      && !binIsCompare(n.binOp)
-      && exprRepOf(if nl { n.binRight } else { n.binLeft }) != rep
-    ) {
-      return irBMiss("never operator rep")
+    const sib = if nl { n.binRight } else { n.binLeft }
+    // Legacy writes the op at i32, an operand of another width converted or not (D17064).
+    const i32r = repNodeOfTy(TY_I32)
+    if never && exprRepOf(sib) != i32r {
+      return irBMiss("never operator over a non-i32 operand")
     }
+    const orep = if !never { rep } else if binIsCompare(n.binOp) { ibBool } else { i32r }
     // Mixed numeric widths meet at the operator's width, each operand widened before the next
     // is built, as legacy builds them (`emitBinOperandAs`); a literal there is legacy's to write.
     const dst = binWidthRep(n)
@@ -9264,8 +9253,8 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
         b,
         { poOp: p, poArgs: [sl, r] },
         ix,
-        rep,
-        repTyOf(rep),
+        orep,
+        repTyOf(orep),
       )
     }
     return irBLetTemp(b, { poOp: p, poArgs: [sl, r] }, ix, rep)
