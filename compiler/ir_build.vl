@@ -151,17 +151,21 @@ import {
   repWhat,
 } from "./ir"
 import {
-  irTyHeldOpen,
+  IrVerdict,
   irTyOpen,
   irUntypedClosure,
   irVerify,
   numKindOf,
+  u8sSame,
+} from "./ir_verify"
+import {
+  irNoteVerifyFacts,
+  irTyHeldOpen,
   openRepTakes,
   refRepValtype,
   repStoresAs,
-  u8sSame,
   undeclaredRepTakes,
-} from "./ir_verify"
+} from "./ir_verify_facts"
 import {
   irAstKind,
   irDualEmit,
@@ -611,11 +615,13 @@ import {
   letNulMapReadUnionBox,
   localIndexOf,
   mapShapeOfExpr,
+  memReadNarrowOp,
   memberBoxReadEnter,
   memberBoxReadLeave,
   nicheReadKindAt,
   nulLitAtomTexts,
   readOwesNonNullRecover,
+  sFieldIsUnionBox,
   sFieldStoreKind,
   spreadBoxingSource,
   stmtIsTailValue,
@@ -626,6 +632,7 @@ import {
   declaredSlotOf,
   declaredSlotOfDecl,
   rlElemTyIxAt,
+  sFieldIndex,
 } from "./emit_struct_order"
 import {
   binEqStructRow,
@@ -800,7 +807,7 @@ function preBuildUnarmed(fnIx: i32, fnPos: i32) {
   ibPreBuilt = true
   ibPreText = irFnText(ib)
   ibPreCode = []
-  if irVerify(ib).vfRule == 0 {
+  if irBVerify(ib).vfRule == 0 {
     ibPreCode = irLowerProbe(ib, globalCtxOf(fnPos))
   }
   return 0
@@ -904,7 +911,7 @@ export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
-  if irVerify(ib).vfRule != 0 {
+  if irBVerify(ib).vfRule != 0 {
     count("claim fell back: verifier")
     return false
   }
@@ -949,7 +956,7 @@ export function irClaimStart(
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
-  if irVerify(ib).vfRule != 0 {
+  if irBVerify(ib).vfRule != 0 {
     count("claim fell back: verifier")
     return false
   }
@@ -4571,7 +4578,8 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !legacyPlainAgrees(ix, key) {
     return missRhs("closure call plan disagrees")
   }
-  const f = irBExpr(b, c.callFn)
+  const cf = if c.callFn >= 0 && c.callFn < P.nodes.length { nodeAt(c.callFn) } else { null }
+  const f = if cf is Member && nodeTyAt(c.callFn, ibFnIx) < 0 { sharedFieldCallee(b, cf, c.callFn) } else { irBExpr(b, c.callFn) }
   if ibMiss != "" { return missRhs("closure callee") }
   if !(repNodeAt(irBOpRep(f)) is RClosure) {
     return missRhs("closure callee rep")
@@ -4591,6 +4599,41 @@ function bundleCaptureRead(b: i32[], fx: i32): Opnd {
     return irBMiss("bundle callee capture rep")
   }
   return captureRead(b, n, fx, cr)
+}
+
+// Callee `x.f` at node `at`, a generic's shared template member no instance typed (mono shares it
+// between instances that dispatch it differently, D1063): legacy reads the field at its storage
+// (`emitMemStructRead`), so the IR reads the receiver's record kid at its own type.
+function sharedFieldCallee(b: i32[], m: Member, at: i32): Opnd {
+  const ot = nodeTyAt(m.memObj, ibFnIx)
+  const r = if ot >= 0 { repNodeOfTy(ot) } else { -1 }
+  const si = structIndexOfExpr(m.memObj, ibFnIx)
+  const fi = if si >= 0 { sFieldIndex(si, m.memProp) } else { -1 }
+  if !(repNodeAt(r) is RRecord) || fi < 0 {
+    return irBMiss("shared member callee row")
+  }
+  // Legacy's narrowed and union-box tails read the node's own type, which it has none of.
+  if memReadNarrowOp(at, ibFnIx) >= 0 || sFieldIsUnionBox(si, fi) {
+    return irBMiss("shared member callee tail")
+  }
+  // The field is read at its kid's own type, which its record rep carries.
+  const k = repRecordKidOf(r, ot, m.memProp)
+  const ft = if k >= 0 { repTyOf(repNodeKids(r)[k]) } else { -1 }
+  if ft < 0 || irTyOpen(ft) || repNodeKids(r)[k] != repNodeOfTy(ft) {
+    return irBMiss("shared member callee kid")
+  }
+  const rv = irBExpr(b, m.memObj)
+  if ibMiss != "" { return rv }
+  if irBOpRep(rv) != r { return irBMiss("shared member callee receiver") }
+  const g: Rhs = {
+    gfV: rv,
+    gfIx: k,
+    gfAt: at,
+    gfStored: false,
+    gfStr: false,
+    gfShared: true,
+  }
+  return irBLetTempTy(b, g, at, repNodeKids(r)[k], ft)
 }
 
 // Armed, legacy has written call `ix` already, and must have taken the plain path at `key`.
@@ -10593,6 +10636,12 @@ function build(fnIx: i32, fnPos: i32): string {
   return ibMiss
 }
 
+// Verifies `f` once the facts its checks read are noted on it (`irNoteVerifyFacts`).
+function irBVerify(f: IrFn): IrVerdict {
+  irNoteVerifyFacts(f)
+  return irVerify(f)
+}
+
 // Starts building function `fnIx` (named `name`, at `fnStmts` slot `fnPos`) into a fresh `ib`.
 function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ib = irFnNew(fnIx, name)
@@ -10972,7 +11021,7 @@ function lowerNodeIn(
   const want = if cellSt >= 0 { globalRep(cellGi, cellSt) } else { repNodeOfTy(if ty >= 0 { ty } else { nodeTyAt(ix, fnIx) }) }
   if irBOpRep(out) != want { return "fragment rep" }
   if repNodeGen() != gen { return "rep epoch moved" }
-  const v = irVerify(ib)
+  const v = irBVerify(ib)
   if v.vfRule != 0 {
     return "verifier rule " + i32ToStr(v.vfRule) + ": " + v.vfMsg
   }
@@ -11134,7 +11183,7 @@ export function irShadowFn(
   }
   count("covered")
   corrupt()
-  const v = irVerify(ib)
+  const v = irBVerify(ib)
   // A tree rebuilt mid-build leaves node indices that name nothing; no verdict holds.
   if repNodeGen() != gen {
     count("rep epoch moved")
@@ -11184,7 +11233,7 @@ export function irShadowStart(
     return 0
   }
   count("start covered")
-  const v = irVerify(ib)
+  const v = irBVerify(ib)
   if v.vfRule != 0 {
     count(
       "fail rule "
@@ -11264,7 +11313,7 @@ export function irClaimThunk(fe: i32, out: u8[]): boolean {
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
   if buildThunk(fe) != "" || !claimable() { return false }
   corrupt()
-  if irVerify(ib).vfRule != 0 { return thunkFellBack("verifier") }
+  if irBVerify(ib).vfRule != 0 { return thunkFellBack("verifier") }
   const why = irLowerHelper(ib, out)
   if why != "" { return thunkFellBack(why) }
   count("claimed thunk")
@@ -11284,7 +11333,7 @@ export function irShadowThunk(fe: i32, out: u8[], from: i32) {
   const why = buildThunk(fe)
   if why != "" { return count("thunk uncovered " + why) }
   corrupt()
-  const v = irVerify(ib)
+  const v = irBVerify(ib)
   if v.vfRule != 0 {
     return count(
       "fail rule "
