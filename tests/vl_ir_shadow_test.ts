@@ -1536,6 +1536,8 @@ Deno.test({
       "width-retag-pair-unnoted": 2,
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
+      "init-progress-as-value": 2,
+      "init-progress-effect": 0,
       "literal-cast-of-record": 2,
       "literal-cast-of-i32": 0,
       "retag-closures-of-differing-arity": 2,
