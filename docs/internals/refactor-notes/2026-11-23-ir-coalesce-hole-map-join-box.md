@@ -30,7 +30,23 @@ map read that misses still boxes as `null`
 
 ## Measured
 
-To be filled in from the proof.
+Against master `d699cfc48` at its fixpoint seed, with `VL_STD` on both arms:
+- Census: `box ladder` 43 → 40, `start: box ladder` 19 → 17.
+- tests/cases: covered = verified 78,790 → 78,807, matched 78,789 → 78,806. No new fail or
+  differ row.
+- Handed-over d3127 cells and siblings: covered = matched 318 → 332.
+- The box-stored exclusion's price is 13 functions in 5 programs that the re-box would have
+  covered:
+  - `coalesce-map-read-joins-atom` 21 → 12;
+  - `d3127_r2_g1_F1_i32_ab_1_34` 4 → 3;
+  - `d3127_r4_gx_x0284` 3 → 2;
+  - `coalesce-hole-map-reads-joined-into-a-box` 6 → 5;
+  - `coalesce-map-read-wider-default` 2 → 1.
+- The tree-wide legacy A/B moved 0 programs. `--names`, `--cases` and `--claimless` differ 0.
+
+After the master merge (`floorDeliver`), an arm that is itself a `??` stays a named miss
+(`union if arm coalesce chain`). Built as a nested join, it had locals legacy's single chain does
+not have (2 d3127 cells).
 
 Open: 11 cells stop at `rep ?`, a minted node with no type in the hole instance. 4 stop at
 `coalesce mapScalarJoin`.
