@@ -104,6 +104,9 @@ export type RTest = { teV: Opnd, teTag: i32 }
 // Box variable `vdV` at arm `vdVi`'s tag, then, when it holds, each discriminant field's literal
 // set at `is` test `vdAt`, the variable read once per literal (`emitVariantDiscrimTest`): a bool.
 export type RVariantDiscrim = { vdV: Opnd, vdVi: i32, vdAt: i32 }
+// Box variable `vcV` at arm `vcVi`'s full variant chain at `is` test `vcAt`: legacy's tail
+// (`variantRowChainTail`) with each receiver read the variable (`fitRecvReadHook`): a bool.
+export type RVariantChain = { vcV: Opnd, vcVi: i32, vcAt: i32 }
 // A field read off a box local narrowed to one variant (`narrowedFieldPlain`); `bfAt` its member.
 export type RBoxField = { bfV: Opnd, bfAt: i32 }
 // A shared field read `srAt` over un-narrowed box `srV`, dispatched on its tag per member (legacy's
@@ -597,6 +600,7 @@ export type Rhs = RArmUnbox
   | RTruncSat
   | RUnionConcreteEq
   | RUnionEq
+  | RVariantChain
   | RVariantDiscrim
 
 // A `match` arm: union arm `swArm` (-1 for the default, which names what it excludes in
@@ -681,7 +685,7 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 // cell's `if` and a nullable reference's block read only that operand before they open.
 export function coalArmStagesLeads(a: CoalValArm): boolean {
   return match a {
-    "litUnion" | "nulBool" | "nulRef" | "nulStr" => true
+    "litUnion" | "nulBool" | "nulRef" | "nulStr" | "nulBoolJoin" => true
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "boxStash" | "boxFieldScalar" => false
   }
 }
@@ -1233,6 +1237,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RTruncSat |
       RUnionConcreteEq |
       RUnionEq |
+      RVariantChain |
       RVariantDiscrim => false
   }
 }
@@ -1476,6 +1481,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RCallRef => opndsCat([r.crFn], r.crArgs)
     RCallHost => r.chArgs
     RTest => [r.teV]
+    RVariantChain => [r.vcV]
     RVariantDiscrim => [r.vdV]
     RBoxField => [r.bfV]
     RSharedRead => [r.srV]
@@ -1584,6 +1590,7 @@ function rhsText(r: Rhs): string {
     RCallRef => "call_ref " + opndText(r.crFn) + "(" + opndsText(r.crArgs) + ")"
     RCallHost => "call_host " + i32ToStr(r.chImport) + "(" + opndsText(r.chArgs) + ")"
     RTest => "is " + opndText(r.teV) + " tag " + i32ToStr(r.teTag)
+    RVariantChain => "is " + opndText(r.vcV) + " variant " + i32ToStr(r.vcVi) + " chain"
     RVariantDiscrim => "is " + opndText(r.vdV) + " variant " + i32ToStr(r.vdVi) + " discrim"
     RBoxField => "box_field " + opndText(r.bfV) + " @" + i32ToStr(r.bfAt)
     RSharedRead => "shared_read "
@@ -1926,7 +1933,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
     SCoalBox => match n.cbArm {
       "popOr" => "list"
       "nulRef" | "boxStash" => "box"
-      "litUnion" | "nulBool" | "boxFieldScalar" | "nulStr" => "box"
+      "litUnion" | "nulBool" | "boxFieldScalar" | "nulStr" | "nulBoolJoin" => "box"
       "fieldBox" | "fieldVal" | "optLeaf" => "record"
       "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
@@ -1957,6 +1964,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RNumIntr |
       RNumIs |
       RNumUnionBin |
+      RNumUnionConvert |
       RNumWiden |
       RPrimOp |
       RRecover |
@@ -2007,8 +2015,10 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RBoxNarrow |
       RCast |
       RNicheRead |
+      RNulNoneBox |
       RSharedRead |
       RTest => "box"
+    RVariantChain => "box"
     RVariantDiscrim => "box"
     RFieldNull |
       RGetField |
@@ -2026,8 +2036,6 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RCellGet |
       RCellNew |
       RFnId |
-      RNulNoneBox |
-      RNumUnionConvert |
       RTagOf => "other"
     RAtomic |
       RMemAccess |

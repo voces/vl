@@ -1547,6 +1547,9 @@ Deno.test({
       "atom-tower-i32-read": 2,
       "atom-tower-zero-reads": 2,
       "atom-staged-of-i32": 2,
+      "map-get-boxed-scalar-into-bool": 2,
+      "field-coalesce-of-i32-receiver": 2,
+      "bool-join-coalesce-of-i32": 2,
       "trunc-sat-operand-off-plan": 2,
       "atomic-value-off-plan": 2,
       "memory-store-value-off-plan": 2,
@@ -1580,6 +1583,8 @@ Deno.test({
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
+    // A fit tail that misses leaves legacy's receiver read in place (`fitRecvReadHook`).
+    if (exp.irFitTailSelfTest() !== 1) throw new Error("want the fit hook restored after a miss");
   },
 });
 

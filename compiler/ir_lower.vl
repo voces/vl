@@ -208,6 +208,7 @@ import {
   RTruncSat,
   RUnionConcreteEq,
   RUnionEq,
+  RVariantChain,
   RVariantDiscrim,
   Rhs,
   SAssign,
@@ -365,6 +366,7 @@ import {
   coalNulRefJoinTag,
   coalNulRefOpen,
   coalNulRefPlanOf,
+  elseLessUnionIfWhy,
   emitArmUnboxAt,
   emitAsUnionTagged,
   emitCapturedRead,
@@ -634,12 +636,16 @@ import {
   atomFoldSideTail,
   atomFoldTail,
   atomHookArmOf,
+  coalArmRecvCast,
   coalBoxStashOpen,
   coalFieldBoxOpen,
   coalFieldPlanOf,
   coalFieldRead,
   coalFieldUnbox,
   coalFieldValOpen,
+  coalNulBoolJoinOpen,
+  coalNulBoolJoinPresent,
+  coalNulBoolJoinReserve,
   coalOptArmOf,
   coalOptLeafOpen,
   coalOptLeafPlanOf,
@@ -652,6 +658,8 @@ import {
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fbRefIfOpenType,
+  fitRecvLegacy,
+  fitRecvReadHook,
   listFitIsPlanOf,
   listFitTail,
   listIsAcrossPlanOf,
@@ -672,6 +680,7 @@ import {
   unionLitNeverTail,
   unionLitPayloadTail,
   unionLitTagHead,
+  variantRowChainTail,
   variantTagTail,
 } from "./wasmEmit"
 import { coalLhsStashes } from "./emit_query"
@@ -1177,6 +1186,7 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.teV)
       boxTagIsTail(r.teTag)
     }
+    RVariantChain => irFitTail(r.vcV, r.vcAt, r.vcVi)
     RVariantDiscrim => variantDiscrim(r)
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
@@ -1852,6 +1862,66 @@ function numIs(r: RNumIs): i32 {
     i = i + 1
   }
   return 1
+}
+
+// The operands legacy fit writers' tails re-read through `fitRecvReadHook` while `irFitTail`
+// lowers them, innermost last, the receiver node the innermost stands for, and its reads so far.
+// A stack, not a `let` of `Opnd`: a mutable union-typed module cell is checked dearly (D17063).
+const fitRecvOs: Opnd[] = []
+let fitRecvIx = -1
+let fitRecvReads = 0
+
+// `fitRecvReadHook` under `irFitTail`: the operand the first time, then read again as the builder
+// read it. A receiver other than the one the IR holds misses.
+function irFitRecvRead(recvIx: i32, _fnIx: i32): i32 {
+  if unwrapParen(recvIx) != fitRecvIx {
+    return irLMiss("fit receiver other") - 1
+  }
+  const at = fitRecvOs.length - 1
+  if at < 0 { return irLMiss("fit receiver unset") - 1 }
+  const k = fitRecvReads
+  fitRecvReads = k + 1
+  if k == 0 {
+    irLOpnd(fitRecvOs[at])
+    return 0
+  }
+  return opndAgain(fitRecvOs[at], recvIx)
+}
+
+// Legacy's variant chain tail for `is` test `isIx` at arm `vi` over operand `o`: the hook set to
+// read `o` and every piece of its state restored at the one exit, whatever the tail answered.
+function irFitTail(o: Opnd, isIx: i32, vi: i32): i32 {
+  const svHook = fitRecvReadHook
+  const svIx = fitRecvIx
+  const svReads = fitRecvReads
+  fitRecvReadHook = irFitRecvRead
+  fitRecvOs.push(o)
+  fitRecvIx = -1
+  fitRecvReads = 0
+  let rc = -1
+  if isIx >= 0 && isIx < P.nodes.length {
+    const n = nodeAt(isIx)
+    if n is IsExpr {
+      fitRecvIx = unwrapParen(n.isObj)
+      rc = variantRowChainTail(isIx, n, lw.irAt, vi, -1)
+    }
+  }
+  if fitRecvIx < 0 { irLMiss("variant chain node") }
+  fitRecvReadHook = svHook
+  fitRecvOs.pop()
+  fitRecvIx = svIx
+  fitRecvReads = svReads
+  return rc
+}
+
+// `irFitTail` over a node that is no `is` test: it misses, and the hook is back at legacy's default.
+export function irFitTailSelfTest(): i32 {
+  const svMiss = lwMiss
+  const o: Opnd = { oiRep: -1, oiBits: 0 }
+  const rc = irFitTail(o, -1, -1)
+  const missed = lwMiss != ""
+  lwMiss = svMiss
+  return if rc < 0 && missed && fitRecvReadHook === fitRecvLegacy { 1 } else { 0 }
 }
 
 // `RVariantDiscrim` as `emitIsTestVariantRow` writes a `discrim` row: the variable and the arm's
@@ -4103,11 +4173,13 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     return IF_DONE
   }
   const vt = if atomJoin || atomOut { 127 } else { valtypeOf(lw.irVars[t].vRep) }
-  // A union join opens at the box's blocktype, as `emitUnionIfValueLink` does.
+  // A union join opens at the box's blocktype, as `emitUnionIfValueLink` does; so does an
+  // else-less one its destination's union coercion writes there.
   const boxOut = !lw.irHelper
     && (rr is RBox || rr is RNullable && rr.rnDisc == 4)
     && at >= 0
-    && ifJoinPlanOf(at, lw.irAt).ijArm == "union"
+    && (ifJoinPlanOf(at, lw.irAt).ijArm == "union"
+    || elseLessUnionIfWhy(at, lw.irAt, lw.irVars[t].vTy) == "")
   // A string or reference out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
   const strOut = (repPrim(lw.irVars[t].vRep) == "str"
     || rr is RRecord
@@ -4180,6 +4252,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "nulBool" => coalNicheCell(n, e, 2, pending)
     "fieldBox" | "fieldVal" => coalUnionField(n, e, pending)
     "optLeaf" => coalOptLeaf(n, e, pending)
+    "nulBoolJoin" => coalNulBoolJoin(n, pending)
     "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
     "nulStr" => coalNulStr(n, e, pending)
@@ -4215,15 +4288,17 @@ function coalBoxStash(n: SCoalBox, _e: BinExpr, pending: i32[]): i32 {
 function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   const p = coalFieldPlanOf(e, unwrapParen(e.binLeft), n.cbAt, lw.irAt)
   const boxed = n.cbArm == "fieldBox"
-  if p.cfCast != -1 || p.cfArm != (if boxed { "boxed" } else { "unbox" }) {
+  if p.cfArm != (if boxed { "boxed" } else { "unbox" }) {
     return irLMiss("coalesce field plan")
   }
   cond(n.cbL, pending)
+  coalArmRecvCast(p.cfCast)
   if boxed { coalFieldBoxOpen(p) } else { coalFieldValOpen(p) }
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   fbElse()
   if recvAgain(n.cbL, e.binLeft) < 0 { return -1 }
+  coalArmRecvCast(p.cfCast)
   if boxed { coalFieldRead(p) }
   else if coalFieldUnbox(p) < 0 { return -1 }
   lwFrames.pop()
@@ -4255,6 +4330,18 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
   lwFrames.pop()
   return coalOptLeafRead(lp)
+}
+
+// A `boolean | null` niche joining a box, as `emitCoalesceNulBoolJoin` writes it: the slot taken,
+// the operand kept in it, the null test's box `if` the default fills, then the present arm.
+function coalNulBoolJoin(n: SCoalBox, pending: i32[]): i32 {
+  coalNulBoolJoinReserve()
+  cond(n.cbL, pending)
+  coalNulBoolJoinOpen()
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  return coalNulBoolJoinPresent()
 }
 
 // A shared `scalar | null` field's `??` along its plan: the box, the stash and tag test whose
