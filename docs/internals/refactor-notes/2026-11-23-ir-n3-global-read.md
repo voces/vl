@@ -15,3 +15,21 @@ rep is the cell's.
 ## Legacy tails the IR calls
 
 None new: the global's `global.get` and the delivery's existing atom decode.
+
+## Measured (fixpoint seeds on both sides)
+
+Full proof on base ed1817bb8; after merging master 4982aa4a+ (#9733, #9726), the mechanical
+rerun and the class count.
+
+| reading | result |
+|---|---|
+| legacy byte A/B | 20,087 programs, 0 moved, 0 rc-differ |
+| `ir-identity.sh --cases` | identical 7,699, differ 0; witnesses same 62 (after the merge: 7,704, differ 0; same 61) |
+| `ir-identity.sh --claimless` | identical 14,043, differ 0 |
+| `ir-identity.sh --names`, mode 3 self | identical |
+| corpus shadow, mode 6 | 45,441 matched; 0 order rows |
+| `start: global read coercion` (tests/cases, after the merge) | 14 → 13 starts; functions 6 → 6 |
+| tests/cases starts covered and matched (after the merge) | 7,037 → 7,038 |
+| L2 self-compile fuel per PR | +0.00% |
+| `self ir misses` | 0 |
+| `vl_deep_nesting_test.ts` (SELFHOST_NATIVE_ALIGN=1) | 8 passed |
