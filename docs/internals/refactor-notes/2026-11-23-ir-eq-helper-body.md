@@ -13,10 +13,14 @@ programs, none in the self-compile.
   parameters at slots 0 and 1, one `REqHelp` temp, and its return.
 - **The frame is legacy's.** The helper's locals are the scratch frames its compare stages in, so
   `irLowerEqHelper` lowers in the frame `eqHelpFnCode` opened (`fbBeginFunc(2, 0)`), from an
-  empty lazy frame, and writes `fbEmitLocalsVec(…, 0)` as legacy does. The shadow re-lowers after
-  legacy from a reset lazy frame, as `irDualEmit` does for a function.
-- **Seams:** `irClaimEqHelp` before legacy writes the helper, and `irShadowEqHelp` after:
-  `eq helper matched`, `eq helper uncovered <why>`, `mismatch bytes: eq helper`, control 3.
+  empty lazy frame, and writes `fbEmitLocalsVec(…, 0)` as legacy does.
+- **Seams:** `irClaimEqHelp` before legacy writes the helper. Under the shadow, `irShadowEqHelp`
+  lowers BEFORE legacy, then `irShadowLowerEqHelper` takes its noted callees back and empties the
+  lazy frame again, so legacy writes from exactly the state it has unarmed and nothing is left for
+  what emits next; `irShadowEqHelpCheck` compares after legacy: `eq helper matched`,
+  `eq helper uncovered <why>`, `mismatch bytes: eq helper`, control 3.
+- **Verifier self-tests:** `eq-helper-of-records` holds; `eq-helper-of-i32` and
+  `eq-helper-into-bool` are refused under rule 2.
 - `ir-only-census`'s probe row moves past the claim, so it counts only what legacy still writes.
 
 ## Measured
@@ -27,8 +31,8 @@ Shadow mode over every tests/cases program, master d6341e57's tree on the merged
 `VL_IR_SHADOW=3` each of those programs claims every helper and builds byte-identical.
 
 Row: `tests/ir-shadow-rows/eq-helper-body.vl`, 8 helpers, all matched. Its list leaves stage in
-a lazy slot; without the lazy-frame reset the shadow's second lowering grew the locals vector and
-missed.
+a lazy slot: a lowering that does not start from an empty lazy frame grows the locals vector and
+misses. The armed build of each of the 5 programs is byte-identical to the unarmed one.
 
 ## Legacy tails the IR calls
 
