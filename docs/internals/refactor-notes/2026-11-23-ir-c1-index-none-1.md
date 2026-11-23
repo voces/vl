@@ -30,8 +30,20 @@ The coordinator ruled option (b): one `RArmSite` with a shared writer, the `mapG
 
 ## Legacy tails the IR calls
 
-`armSiteWrite` (shared with legacy). Inside each arm it runs legacy's element read of the node
-with both operands overridden, so no user code is emitted from it.
+- `armSiteWrite(idxIx, slot, ixLocal, ixImm, fnIx)` (`wasmEmit.vl`), shared with legacy: the tag
+  chain `emitArmSiteAt`. The IR passes the box variable's local as `slot` and the index or key as
+  a local, an immediate or `ARM_IDX_STR`.
+- Inside each arm, the element read is legacy's `emitExpr(idxIx, fnIx)` (through
+  `emitUnionCoerce` for a boxed element) under this override set:
+  - `luOvEnter(recv, m)` and `luOvEnter(idxIx, e)`: the receiver typed at the arm and the read at
+    its element;
+  - `luOvLocalEnter(recv, loc)`: the receiver read from the arm's wrapper local;
+  - `armIdxNode` / `armIdxLocal` / `armIdxImm`: the index or key written from the writer's operand
+    (`emitIdxIndex`, `emitArmIdx`);
+  - `idxSpanNode = idxIx`: no inner element-read row.
+
+  Nothing user-written is emitted from it. Coordinator ruling (2026-11-23): an accepted legacy tail,
+  listed for the post-I8 tail list, where parameterising it down to the list and map tails belongs.
 
 ## Readings (base b03c57be9, fixpoint seeds on both sides)
 
