@@ -11252,30 +11252,70 @@ function emitUnionConcreteVariantEq(
   isNe: boolean,
   fnIx: i32,
 ) {
+  const vi = concreteVariantRowOf(otherIx, fnIx)
+  if vi < 0 { return -1 }
+  unionVariantEqHead(vi)
+  // Both operands ride the wasm stack until both are computed, and only then are they parked.
+  // The scratch slots are shared per function, so a union `==` nested inside `otherIx` re-uses
+  // them; a stack value cannot be reached that way, and no user code runs after the second.
+  if emitExpr(boxIx, fnIx) < 0 { return -1 }
+  if emitExpr(otherIx, fnIx) < 0 { return -1 }
+  return unionVariantEqTail(vi, otherIx, isNe, fnIx)
+}
+
+// The arm row a union `==` against the concrete record `otherIx` compares at, or -1 where its
+// tables do not cover it: a row they do not cover must decline, never read out of bounds.
+function concreteVariantRowOf(otherIx: i32, fnIx: i32): i32 {
   const vi = eqConcreteVariantRow(otherIx, fnIx)
   if vi < 0 { return -1 }
-  // The same four parallel-table bounds the struct union compare takes before it writes a byte,
-  // for the same reason: a variant row the emitter's tables do not cover must DECLINE, never
-  // read out of bounds (`emitFail does not halt`).
-  if vi >= uVarRow.length { return -1 }
-  if vi >= uTags.length { return -1 }
-  if vi >= uFieldStart.length { return -1 }
-  if vi >= uFieldCount.length { return -1 }
+  if vi >= uVarRow.length || vi >= uTags.length { return -1 }
+  if vi >= uFieldStart.length || vi >= uFieldCount.length { return -1 }
   if !variantFieldsComparable(vi) { return -1 }
+  return vi
+}
+
+// The arm row of a union `==` legacy writes on its variant door (`emitUnionConcreteVariantEq`):
+// an operand with no atom kind, or a union the value-union gate refuses; -1 for another arm.
+export function unionEqVariantRowOf(boxIx: i32, otherIx: i32, fnIx: i32): i32 {
+  const unr: i32[] = []
+  const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
+  const usid = msSetOfUnionBox(boxIx, fnIx)
+  const eak = unionEqAtomKindOf(
+    otherIx,
+    usid,
+    unionBoxTyOfRead(boxIx, fnIx),
+    fnIx,
+  )
+  if eak >= 0 {
+    let has = unionEqArmPresent(usid, valueAtomNameOfKind(eak), eak)
+    if !has && eak == 2 && msSetTakesAtomAsStr(usid) { has = true }
+    const gate = isValueUnionOfSet(usid, unr[1])
+      || unionCarriesLitUnionArmOfSet(usid, unr[1])
+      || has
+    if uname != "" && gate { return -1 }
+  }
+  return concreteVariantRowOf(otherIx, fnIx)
+}
+
+// Before a variant compare's operands: its stash and the arm row's operand slot, in legacy's order.
+export function unionVariantEqHead(vi: i32): i32 {
+  unionEqStashSlot()
+  unionEqArmSlot(vi + 1024)
+  return 0
+}
+
+// After the box and the record operand on the stack: both parked, a nullable operand's null
+// against the box's null tag, then the arm's tag and its fields compared (`emitVariantFieldsEq`).
+export function unionVariantEqTail(
+  vi: i32,
+  otherIx: i32,
+  isNe: boolean,
+  fnIx: i32,
+): i32 {
   const sl = unionEqStashSlot()
   const ar = unionEqArmSlot(vi + 1024)
-  // Both operands ride the wasm stack until both are computed, and only then are they parked.
-  // The three scratch slots here are shared per function, not per site, so a union `==` nested
-  // inside `otherIx` re-enters this function and re-uses the same slots. A stack value cannot be
-  // reached that way, and after the second operand lands no user code runs before the compare.
-  if emitExpr(boxIx, fnIx) < 0 { return -1 }
   // A nullable record at the instance is read raw, and its null equals the box's null arm.
   const otherNul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
-  if otherNul {
-    if emitExpr(otherIx, fnIx) < 0 { return -1 }
-  } else if emitExpr(otherIx, fnIx) < 0 {
-    return -1
-  }
   fbLocalSet(ar) // pops the concrete operand, leaving the box on top
   fbLocalSet(sl)
   if otherNul {
