@@ -407,6 +407,7 @@ import {
   truncSatCallNamed,
   truncSatPlanOf,
   unionConcreteEqPlanOf,
+  unionEqNulPlanOf,
   unionEqStashPlanOf,
   userFnCallRoutesRef,
   userFnCallTarget,
@@ -424,6 +425,7 @@ import {
   V128_ATOM_KIND,
   arrLitVariantSlot,
   identUnboxAtomOf,
+  listWrapHeapOfKind,
   nullInstanceIsResult,
   variantCoerceArmOf,
 } from "./emit_plan_union"
@@ -761,6 +763,8 @@ import { callAtCalleeResultRow } from "./emit_nullable_rets"
 import { RC_MAP, RC_REF_LIST, letBindingUnionTy } from "./emit_start_block"
 import {
   TY_BOOL,
+  TY_F32,
+  TY_F64,
   TY_I32,
   TY_I64,
   TY_NEVER,
@@ -7314,35 +7318,68 @@ function unionConcreteEq(
   const boxIx = if swap { n.binRight } else { n.binLeft }
   const otherIx = if swap { n.binLeft } else { n.binRight }
   const qp0 = unionConcreteEqPlanOf(boxIx, otherIx, ibFnIx)
-  // A box that is no place is read once into legacy's stash.
-  const stash = qp0.uqKind < 0
-  const qp = if stash { unionEqStashPlanOf(boxIx, otherIx, ibFnIx) } else { qp0 }
+  // An operand holding `null` takes legacy's null leg; a box that is no place, its stash.
+  const np = if qp0.uqKind < 0 { unionEqNulPlanOf(boxIx, otherIx, ibFnIx) } else { unionEqNulPlanOf(-1, -1, ibFnIx) }
+  const nul = np.unLeg > 0
+  const stash = qp0.uqKind < 0 && !nul
+  const qp = if nul { np.unPlan } else if stash { unionEqStashPlanOf(boxIx, otherIx, ibFnIx) } else { qp0 }
   if qp.uqKind < 0 { return irBMiss("union compare plan") }
   if rep != ibBool { return irBMiss("union compare rep") }
   const bx = irBExpr(b, boxIx)
   if ibMiss != "" { return bx }
   if stash && !heldAsBox(irBOpRep(bx)) { return irBMiss("union compare box") }
-  // Read twice, so a parameter or local, never a temp.
+  // Read twice, so a parameter or local, or a read the lowering writes again (`irHoistRecv`).
+  const again = bx is OVar
+    && bx.ov >= 0
+    && bx.ov < ib.irVars.length
+    && ib.irVars[bx.ov].vKind == "temp"
+    && recvReadsAgain(unwrapParen(boxIx))
   if (
     !stash
     && (!(bx is OVar)
       || bx.ov < 0
       || bx.ov >= ib.irVars.length
-      || ib.irVars[bx.ov].vKind == "temp"
+      || ib.irVars[bx.ov].vKind == "temp" && !again
       || !heldAsBox(irBOpRep(bx)))
   ) {
     return irBMiss("union compare box")
   }
   const k = qp.uqKind
-  if k != 0 && k != 1 && k != 2 { return irBMiss("union compare kind") }
+  // The scalar kinds, a closure and a list arm: the payload and compare tails are legacy's.
+  const lwh = listWrapHeapOfKind(k)
+  if !(k >= 0 && k <= 5 || k == 11 || lwh >= 0) {
+    return irBMiss("union compare kind")
+  }
+  // A number arm's operand is delivered widened to it, as `emitUnionEqOther` writes it.
+  const wt = if k == 3 { TY_I64 } else if k == 4 { TY_F64 } else if k == 5 { TY_F32 } else { -1 }
   const at = b.length
-  const o = if k == 2 { deliverStr(b, otherIx) } else { irBExpr(b, otherIx) }
+  const o = if k == 2 && !nul { deliverStr(b, otherIx) } else if wt >= 0 { deliver(b, otherIx, repNodeOfTy(wt), wt) } else { irBExpr(b, otherIx) }
   if ibMiss != "" { return o }
-  // The operand is written inside the tag's `if`, so it is one the lowering reads in place.
-  if b.length != at || !(o is OVar || o is OImm || o is OStr) {
+  // The operand is written inside the tag's `if`, so it is one the lowering reads in place, or a
+  // plain read the lowering writes at its use (`recvReadsAgain`).
+  const atUse = o is OVar
+    && o.ov >= 0
+    && o.ov < ib.irVars.length
+    && ib.irVars[o.ov].vKind == "temp"
+    && recvReadsAgain(unwrapParen(otherIx))
+  if (
+    (b.length != at || !(o is OVar || o is OImm || o is OStr))
+    && !(atUse && !nul)
+  ) {
     return irBMiss("union compare operand")
   }
-  const want = if k == 2 { repPrim(irBOpRep(o)) == "str" } else if k == 1 { irBOpRep(o) == ibBool } else { repPrim(irBOpRep(o)) == "i32" }
+  // A null leg reads its operand twice, so a parameter or local.
+  if (
+    nul
+    && (!(o is OVar)
+      || o.ov < 0
+      || o.ov >= ib.irVars.length
+      || ib.irVars[o.ov].vKind == "temp")
+  ) {
+    return irBMiss("union compare null operand")
+  }
+  const orn = repNodeAt(irBOpRep(o))
+  const want = if nul { if k == 2 { strNullable(irBOpRep(o)) } else { boolNullable(irBOpRep(o)) } } else if wt >= 0 { irBOpRep(o) == repNodeOfTy(wt) } else if k == 11 { orn is RClosure } else if lwh >= 0 { orn is RList } else if k == 2 { repPrim(irBOpRep(o)) == "str" } else if k == 1 { irBOpRep(o) == ibBool } else { repPrim(irBOpRep(o)) == "i32" }
   if !want { return irBMiss("union compare operand rep") }
   return irBLetTemp(
     b,
@@ -7352,6 +7389,8 @@ function unionConcreteEq(
       ucNe: n.binOp == "!=",
       ucSwap: swap,
       ucStash: stash,
+      ucNul: nul,
+      ucAgain: again && !stash,
       ucAt: ix,
     },
     ix,
