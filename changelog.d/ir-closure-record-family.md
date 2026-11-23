@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: a closure at a record field, and a returned record on its result's heap.** A function or lambda stored into a record field whose closure kid names another signature missed at `object field coercion`. That covers twin fieldsets on one struct heap, an instance's row, and a hole closure. Legacy writes the one closure struct whatever the signature, so the IR now retags it: across openness as #9632 does, and across a closed signature where the builder notes the plain field write (`irCloFieldRetag`). A returned record on its result's noted heap retags too. tests/cases `object field coercion` went from 38 functions to 10.

@@ -1372,10 +1372,10 @@ print(f(-1) ?? 5)
 });
 
 // Only a `null` literal boxes with its value unread. A `null`-typed call has an effect that must
-// run once, so a function returning one boxed stays uncovered (`box ladder`) rather than boxing
-// unread; the `null` unit function itself builds.
+// run once, so it is the box's payload (`RNulNoneBox`, legacy's ladder's first rung), and the
+// function returning it boxed builds and matches.
 Deno.test({
-  name: "ir shadow: a null-typed call delivered into a box is never left unread",
+  name: "ir shadow: a null-typed call delivered into a box is its payload, never left unread",
   ignore,
   fn: () => {
     const src = `function mk(): null {
@@ -1389,9 +1389,9 @@ function f(b: boolean): i32 | null {
 print(f(false) ?? 5)
 `;
     const { rows } = run(src, true);
-    const want = "uncovered box ladder";
-    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
-    if ((rows.get("covered") ?? 0) !== 1) throw new Error(`want only mk covered, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want mk and f covered and matched, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
@@ -1502,6 +1502,7 @@ Deno.test({
       "bounds-rule-uninstalled": 8,
       "box-immediate-for-call": 2,
       "box-at-union-type-into-i32": 2,
+      "nul-none-box-of-i32": 2,
       "pop-or-of-i32": 2,
       "pop-or-bool-out": 2,
       "pop-or-out-unwritten": 5,
@@ -1537,7 +1538,9 @@ Deno.test({
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
       "retag-closures-of-differing-arity": 2,
+      "retag-closures-of-differing-arity-noted": 0,
       "retag-field-alike-records-two-heaps": 2,
+      "push-many-of-i32": 2,
       "global-read-off-store-type": 2,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
@@ -1551,6 +1554,7 @@ Deno.test({
       "call-write-back-not-a-capture": 2,
       "coal-str-default-off-rep": 2,
       "coal-atom-str-default-off-rep": 2,
+      "opt-read-of-i32": 2,
       "dead-return-after-returning-call": 5,
       "pop-or-default-returning-call": 5,
       "pop-or-default-never-call": 0,
@@ -1571,6 +1575,8 @@ Deno.test({
       const got = exp.irVerifySelfTest(i);
       if (got !== want[ids[i]]) throw new Error(`case ${ids[i]}: want rule ${want[ids[i]]}, got rule ${got}`);
     }
+    // The hoist asked inside a range copy undoes every binding it made, whether it hoists or misses.
+    if (exp.irRangeCopyHoistSelfTest(-1) !== 0) throw new Error("want the unroll stack depth unchanged after a miss");
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
