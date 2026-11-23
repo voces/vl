@@ -1,36 +1,30 @@
-# IR coverage, batch D: closure list elements, capturing map callbacks, and a cached environment's own captures (2026-11-23, lane IR-N7)
+# IR coverage, batch D: a cached closure environment's own captures (2026-11-23, lane IR-N7)
 
 | Mechanism | Change | tests/cases blocker class, functions (any / alone), before → after |
 |---|---|---|
-| `for` over a list of closures | `forInElemPlain` takes `closure` as a plain element kind, so the builder walks it as `emitForInStmt` does and the lowering calls the same walk helpers | `for in element closure` 37 / 31 → 0 / 0 |
-| capturing `.map`/`.filter` callback | `mapFilterWhy` admits a capturing named callback; the builder makes its closure as `emitClosureValue` does (`mapCallbackClo`: `cloEnvOf` at the callback's closure rep, `RMakeClo`) and passes it as the callback operand | `map callback env` 28 / 28 → 0 / 0 |
 | cached environment's own capture | `cloEnvOf` reads this frame's own capture as a temp inside a cached environment's slot test, as `emitClosureEnvOf` does, instead of refusing it | `closure env cache copy` 24 / 24 → 0 / 0 |
 
-Moved on, not closed (alone): `for range in a reserve region` 14 → 19, `for in list union` 15 → 16,
-`for in map element` 8 → 9.
+The batch also held a closure element in a `for` walk, which #9682 landed first, and a capturing
+`.map`/`.filter` callback, which lane N1 carries (coordinator ruling). Both are master's or N1's.
 
 ## Measured
 
-Fixpoint seeds: master d6341e57c and the merged batch head.
-- tests/cases functions with no blocker: 78,635 → 78,717; covered = verified = matched (one
+Fixpoint seeds: master 53f48d792 and the batch head.
+- tests/cases functions with no blocker: 78,790 → 78,814; covered = verified = matched (one
   unmatched function is the same on both sides).
-- `ir-only-census`: programs fully IR-only, 5,445 → 5,491 of 7,135.
-- Before the merge, against master 693fd72cd: corpus 45,405 → 45,412 matched; self-compile
-  20,202 → 20,202.
+- `ir-only-census`: programs fully IR-only, 5,574 → 5,576 of 7,136.
+- L2 self-compile fuel: -0.00% on the base. Late demands 9 / 9; late tags 307 / 307.
 
 | Predicate the IR asks | Legacy writer it mirrors |
 |---|---|
-| `forInPlainWhy` / `forInElemPlain` (IR builder only) | `emitForInStmt` |
-| `mapFilterWhy` (IR builder only), `mfCallbackFe` (shared reader) | the `.map`/`.filter` arm's `emitClosureValue` |
-| `closureValueWhy` | `emitClosureValue`'s own refusal |
 | `cloEnvOf` | `emitClosureEnvOf` |
+| `irEnvCached` (unchanged, shared reader) | `emitEnvCacheOpen`'s slot test |
 
 ## Legacy tails the IR calls
 
-- `emitForInStmt`'s walk helpers, already called by `SForIn`, now at a closure element.
-- `emitEnvCacheOpen` / `emitEnvCacheClose` and `emitClosureIds`, already called by `makeClo`.
+None new. `emitEnvCacheOpen` / `emitEnvCacheClose` and `emitClosureIds` are already called by `makeClo`.
 
 ## Still open
 
-- `capture binding`, 19 functions alone, in seven shapes: next in the closures class.
+- `capture binding`, 19 functions alone, in seven shapes.
 - `captured call argument coercion`, 15 functions alone.

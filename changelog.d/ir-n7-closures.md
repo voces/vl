@@ -1,3 +1,3 @@
 ## Codegen, memory & runtime (Track B)
 
-- **IR coverage, closures:** a `for` over a list of closures, a `.map`/`.filter` whose callback captures, and a cached closure environment holding the frame's own capture now build through the IR, byte-identical to legacy. tests/cases +82 covered = matched; fully IR-only programs 5,445 → 5,491.
+- **IR coverage, cached closure environments:** a closure whose environment the frame caches, capturing the frame's own capture, now builds through the IR, byte-identical to legacy. tests/cases +24 covered = matched; fully IR-only programs 5,574 → 5,576.
