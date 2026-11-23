@@ -12,9 +12,9 @@ and a union global narrowed to its record arm. #9733 unmasked the second kind (2
   receiver and index were each a variable or an immediate. A global's read is a temp, so it was
   never registered. It now also takes a temp whose own read is written again (`recvReadsAgain`),
   for the receiver and for the index.
-  - On the second write, `irHoistRecv` sets `lwAgain`. `lowerGet` then reads its operands through
-    `irLRecvOpnd`, which writes such a temp's read again (`irHoistRecv` of its node) instead of
-    taking it a second time.
+  - The registered read is marked `lgAgain`, so no module state carries the mode. On the second
+    write, `lowerGet` reads its operands through `irLRecvOpnd`, which writes such a temp's read
+    again (`irHoistRecv` of its node) instead of taking it a second time.
   - The second write includes legacy's staging and bounds check, which are fused into the read's
     lowering. That is how legacy re-emits the element read.
 - **Narrowed global's box.** A field coalesce whose receiver legacy casts itself (`cfCast`) reads
