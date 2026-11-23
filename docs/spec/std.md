@@ -146,6 +146,7 @@ marked *(type)* is a type; *(re)* means the module re-exports it from the module
 | --- | --- | --- |
 | `std:args` | the program's command-line arguments | `programArgs`; `Utf8Error` *(re, std:utf8)* |
 | `std:array` | list helpers, generic in the element type | `filled`, `indexOf`, `lastIndexOf`, `includes`, `count`, `reduce`, `reverse`, `mapIndexed`, `extend`, `concat`, `sort`, `sorted` |
+| `std:atomic` | indivisible i32 reads, writes and waits on a `Buf`, for instances sharing one memory | `atomicLoadI32`, `atomicStoreI32`, `atomicAddI32`, `atomicSubI32`, `atomicAndI32`, `atomicOrI32`, `atomicExchangeI32`, `atomicCompareExchangeI32`, `atomicWaitI32`, `atomicNotify` |
 | `std:base64` | RFC 4648 base64, standard alphabet, padded | `Base64Error` *(type)*, `encodeBase64`, `decodeBase64` |
 | `std:buffer` | raw bytes in linear memory | `Buf`, `F32View`, `I32View`, `F32Base`, `I32Base` *(types)*; `Buffer`, `bufferMark`, `bufferRelease`; `loadI8`, `loadU8`, `loadI16`, `loadU16`, `loadI32`, `loadI64`, `loadF32`, `loadF64`; `store8`, `store16`, `storeI32`, `storeI64`, `storeF32`, `storeF64`; `fill`, `copyFrom`, `storeBytes`, `loadBytes`, `window`; `f32view`, `i32view`, `getF32`, `setF32`, `getI32`, `setI32`, `byteAddrF32`, `byteAddrI32`, `f32base`, `i32base`, `getF32At`, `setF32At`, `getI32At`, `setI32At` |
 | `std:bytes` | a zeroed `u8[]`, and integers read out of one | `zeroBytes`, `u16le`, `u16be`, `i16le`, `i16be`, `i32le`, `i32be`, `i64le`, `i64be` |
