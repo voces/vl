@@ -763,8 +763,9 @@ hide behind legacy's bytes.
 A coverage step now widens what ships; it quotes the claimed counts beside its coverage.
 The shadow always builds after legacy, so a builder or plan that reads state legacy fills while
 emitting (the address fold's table, once) answers it right there and wrong under a claim. The
-`ir prepost` gate row (`ir-prepost.vl`, `$VL_IR_SHADOW=6`) builds every function where a claim
-builds it too, and reds on a function whose IR or lowering depends on the order.
+`ir shadow` rows run as `$VL_IR_SHADOW=6` (`ir-shadow.vl -- --prepost`): every function is also
+built, unarmed, where a claim builds it, and a function whose IR or lowering depends on the
+order reds, as does a program that compiles only without that early build.
 Op-seam slices still delete legacy ladders, starting with C1, the shared scalar opcode table.
 The IR's builder, verifier and lowering loop along an `if`'s `siElse` spine and the value-`if`
 spine, as legacy's passes do (D1990), so a chain's length costs no stack and the builder has no
