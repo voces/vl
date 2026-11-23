@@ -8,7 +8,17 @@ import { mfCallbackLocal } from "./emit_union_casts"
 
 import { fbRefAsNonNull } from "./emit_bytes"
 import { unwrapParen } from "./emit_base"
-import { BinExpr, Call, ForRange, Index, Member, Node, P, WhileStmt, nodeAt } from "./ast"
+import {
+  BinExpr,
+  Call,
+  ForRange,
+  Index,
+  Member,
+  Node,
+  P,
+  WhileStmt,
+  nodeAt,
+} from "./ast"
 import { fbDrop } from "./emit_bytes"
 import {
   OImm,
@@ -54,6 +64,7 @@ import {
   emitEqNonNullCore,
   fcpBackingTail,
   fcpLenTail,
+  forRangeStaticStep,
   fromCpTail,
   idxArmOf,
   idxCellReadIsNull,
@@ -79,6 +90,8 @@ import {
   pushManyTail,
   pushPlainWhy,
   pushValueTail,
+  rangeProofClose,
+  rangeProofOpen,
   rawStrGetTail,
   rawStrHoistOf,
   refListGetTail,
@@ -460,15 +473,28 @@ function lowerLen(r: RListLen): i32 {
   return arrLenTail(m, irLFn().irAt)
 }
 
-// The list-header hoists of the loop statement at `at`, opened as legacy's loop opens them.
+// The list-header hoists of the loop statement at `at`, and a range loop's proof, opened as
+// legacy's loop opens them. Returns twice the hoist count plus the proofs opened (0 or 1), the
+// token `loopClose` takes, or -1 on a miss.
 function loopOpen(at: i32): i32 {
   if at < 0 { return 0 }
   const s = nodeAt(at)
-  // A range loop's hoists open after its bounds, owned by its statement (`emitForRangeStmt`).
-  if s is ForRange { return irLoopHoistOpen(-1, s.frBody, at, -1) }
+  // A range loop's hoists then its proof open after its bounds (`emitForRangeStmt`).
+  if s is ForRange {
+    const h = irLoopHoistOpen(-1, s.frBody, at, -1)
+    if h < 0 { return -1 }
+    return h * 2 + rangeProofOpen(s, at, forRangeStaticStep(s), false)
+  }
   // A labelled block opens no loop, so it hoists nothing (`emitLabelBlock`).
   if !(s is WhileStmt) || s.whileBlk != 0 { return 0 }
-  return irLoopHoistOpen(s.whileCond, s.whileBody, -1, -1)
+  const h = irLoopHoistOpen(s.whileCond, s.whileBody, -1, -1)
+  return if h < 0 { -1 } else { h * 2 }
+}
+
+// Closes what `loopOpen`'s token `n` names: its hoists, then its proof, as legacy closes them.
+function loopClose(n: i32): i32 {
+  loopHoistClose(n / 2)
+  return rangeProofClose(n % 2)
 }
 // A bounds check is fused into the `RListGet` after it, which writes the guard; its operand
 // reads consume nothing, so the temps it names stay pending for that read.
@@ -482,4 +508,4 @@ export function irLowerRefBounds(n: SBoundsCheck, pending: i32[]): i32 {
 
 export function irLowerRefLoopOpen(at: i32): i32 { return loopOpen(at) }
 
-export function irLowerRefLoopClose(n: i32): i32 { return loopHoistClose(n) }
+export function irLowerRefLoopClose(n: i32): i32 { return loopClose(n) }
