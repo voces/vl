@@ -571,6 +571,7 @@ import {
   arrLitVariantSlot,
   atomEqPlanOf,
   holeBoxPlanOf,
+  isArmOf,
   litIsArmOf,
   litIsMemberTexts,
   memRecvOwesNonNull,
@@ -601,6 +602,7 @@ import {
   atomFoldSideTail,
   atomFoldTail,
   atomHookArmOf,
+  coalBoxStashOpen,
   coalFieldBoxOpen,
   coalFieldPlanOf,
   coalFieldRead,
@@ -1644,12 +1646,20 @@ function listEmpty(r: RListEmpty) {
   return emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
 }
 
+// Whether `RLitArms` `r` over `is` node `n` is still the test legacy writes: its literal arm, or
+// a `memberEq` the `litMember` rung writes as its one member's compare (`emitLitMemberEq`).
+function litArmsPlanHolds(r: RLitArms, n: IsExpr): boolean {
+  if litIsArmOf(r.liAt, n, lw.irAt) == r.liArm { return true }
+  return r.liArm == "memberEq"
+    && isArmOf(r.liAt, lw.irAt, 0, false) == "litMember"
+}
+
 // `RLitArms`: the operand and its arm's tail, as `emitIsTestLitArms` writes it; `atomEq` reads the
 // operand once per member. Every other arm is the builder's miss.
 function litArms(r: RLitArms) {
   lw.irLitReads = 0
   const n = nodeAt(r.liAt)
-  if !(n is IsExpr) || litIsArmOf(r.liAt, n, lw.irAt) != r.liArm {
+  if !(n is IsExpr) || !litArmsPlanHolds(r, n) {
     return irLMiss("literal arms plan")
   }
   return match r.liArm {
@@ -1775,16 +1785,15 @@ function litRecv(r: RLitArms): i32 {
   return opndAgain(r.liV, n.isObj)
 }
 
-// `RListIsAcross` as `emitListIsAcrossReps` writes it: the plan, the shared slot, the receiver,
-// then legacy's tail over the slot.
+// `RListIsAcross` as `emitListIsAcrossReps` writes it: the plan, the receiver, then legacy's tail
+// over the shared slot.
 function listIsAcross(r: RListIsAcross): i32 {
   const n = nodeAt(r.laAt)
   if !(n is IsExpr) { return irLMiss("list is across node") }
   const p = listIsAcrossPlanOf(r.laAt, n, lw.irAt)
   if !p.lpOk { return irLMiss("list is across plan") }
-  const slot = sharedFieldRecvSlot()
   irLOpnd(r.laV)
-  return listIsAcrossTail(n, slot, p, lw.irAt)
+  return listIsAcrossTail(n, sharedFieldRecvSlot(), p, lw.irAt)
 }
 
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
@@ -3914,6 +3923,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "nulBool" => coalNicheCell(n, e, 2, pending)
     "fieldBox" | "fieldVal" => coalUnionField(n, e, pending)
     "optLeaf" => coalOptLeaf(n, e, pending)
+    "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
@@ -3924,6 +3934,20 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   for r in roots { pending.push(r) }
   livePush(t)
   pending.push(t)
+  return 0
+}
+
+// `l ?? d` along legacy's `boxStash` rung, as `emitCoalesceBoxStash` writes it: the operand box,
+// the shared slot, its tag tested present opening the box-typed `if`, the stash, the else, then
+// the default writing the slotless out.
+function coalBoxStash(n: SCoalBox, _e: BinExpr, pending: i32[]): i32 {
+  cond(n.cbL, pending)
+  coalBoxStashOpen(sharedFieldRecvSlot())
+  fbElse()
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  fbEnd()
   return 0
 }
 
