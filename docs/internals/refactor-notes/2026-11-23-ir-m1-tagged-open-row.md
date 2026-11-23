@@ -31,15 +31,19 @@ closure (their place keeps the closure) then built at the row and lost coverage 
 
 These are other mechanisms, not taken here:
 
-- 3 are list or record element reps (`built-record-*`, `same-elems-result-in-literal`, and the
-  hole list literal at two types). They belong to `index element coercion` / `array element
-  coercion`, N1.
+- 5 are list or record element reps, where the record's rep and the row's agree and the field's
+  value does not (`built-record-field-read-stored`, `built-record-join-binding-read`,
+  `built-record-stored-into-nullable-field`, `same-elems-result-in-literal`,
+  `hole-list-literal-in-record-field-at-two-types`). They belong to `index element coercion` /
+  `array element coercion`, N1.
 - 2 are D14752 literal-set relays (`layout-family-literal-set-beside-string`,
   `discriminant-set-beside-base-alias-arm`). They are lane IR-M1's next step on `rowFieldStorage`.
-- 2 are a record repointed at a subset of its function set, both types untagged
+- 1 is the reverse of this family: a tagged destination over an untagged row
+  (`record-pushed-onto-literal-records-of-wider-set-beside-returned-list`). Unowned.
+- 1 is a record repointed at a subset of its function set, both types untagged
   (`record-repointed-at-subset-of-its-fn-set`). Unowned.
 - 1 is a packed field (`flat-sub-word-storage`). Unowned.
-- 1 is a nullable field call through a hole (`hole-guarded-call-through-nullable-field`). Unowned.
+- 1 is a nullable field called through a hole (`hole-guarded-call-through-nullable-field`). Unowned.
 
 ## Readings
 
