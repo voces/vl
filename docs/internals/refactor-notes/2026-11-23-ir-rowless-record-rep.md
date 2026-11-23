@@ -50,10 +50,10 @@ disagreed with the cell. The place half is that decision made for the place itse
 
 None new.
 
-## Readings (fixpoint seeds on both sides, master e4642aa0)
+## Readings (fixpoint seeds on both sides, master 88df143e)
 
-Functions with no blocker, `VL_IR_SHADOW=4`: tests/cases 71,771 -> 71,781; distilled corpus
-45,405 -> 45,405.
+Functions with no blocker, `VL_IR_SHADOW=4`: tests/cases 78,599 -> 78,609; distilled corpus
+45,428 -> 45,428.
 
 | tests/cases program | gained | class it left |
 | --- | ---: | --- |
@@ -72,7 +72,17 @@ The one loss: a generic's annotated record of a closure field, `const r: {f: (t:
 whose `let` the place half moves to its slot row in one instance while the slot is shared at
 another rep. It falls back to legacy; it is the rule's price.
 
-Armed tests/cases: covered 71,781, matched 71,780, with no failure beyond master's own.
-`--cases` identical 7,683, differ 0, witnesses same 61.
+Armed tests/cases: covered 78,599 -> 78,609, matched 78,598 -> 78,608, with no failure beyond
+master's own. `--names` identical 9,037, differ 0; `--cases` identical 7,704, differ 0, witnesses
+same 61; `--claimless` identical 14,034, differ 0; mode 3 and armed self-compile identical; order
+rows 0. L2 self-compile fuel +0.19% on its base (the first cut asked `structIndexOfExpr` of every
+expression, +1.80%; `rowlessRecord` is asked first). `regress.vl`: no runs lost.
+
+IR-M1's `object field coercion` remainder, on the same pair: functions 9 -> 9, starts 15 -> 16,
+const cells 6 -> 4. The start that entered it, in
+`tests/cases/generics/hole-guarded-call-through-nullable-field.vl`, missed earlier at `global
+initializer coercion`; the two const cells that left it are in
+`tests/cases/generics/genalias-scalar-list-arg-control.vl`. The rule does not reach the remainder's
+`i32>closure` and `str>atom` shapes: those are field reps, not a rowless record's row.
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
