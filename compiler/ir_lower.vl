@@ -221,6 +221,8 @@ import {
   RUnionConcreteEq,
   RUnionEq,
   RUnionNumCrossEq,
+  RUnionStage,
+  RUnionStagedEq,
   RUnionVariantEq,
   RVariantChain,
   RVariantDiscrim,
@@ -611,6 +613,12 @@ import {
   unionEqNulTestTail,
   unionEqNullTagTail,
   unionEqPayloadTail,
+  unionEqStageClose,
+  unionEqStageOpen,
+  unionEqStageSetBox,
+  unionEqStageSetOther,
+  unionEqStagedPlanOf,
+  unionEqStagedTail,
   unionEqStashPlanOf,
   unionEqStashTail,
   unionEqTagTail,
@@ -1217,6 +1225,8 @@ function rhs(r: Rhs, tail: boolean) {
     RUnionConcreteEq => unionConcreteEqOp(r)
     RUnionEq => unionEq(r)
     RUnionVariantEq => unionVariantEq(r)
+    RUnionStagedEq => unionStagedEq(r)
+    RUnionStage => irLMiss("union stage as a value")
     RUnionNumCrossEq => unionNumCrossEq(r)
     RRetag => irLOpnd(r.rgV)
     RStage => irLOpnd(r.sgV)
@@ -3459,6 +3469,17 @@ function unionEq(r: RUnionEq) {
   return unionUnionBoxesTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
 }
 
+// `RUnionStagedEq`: a staged compare's tails over the sides its `RUnionStage` steps parked.
+function unionStagedEq(r: RUnionStagedEq) {
+  const n = nodeAt(r.uqsAt)
+  if !(n is BinExpr) { return irLMiss("union compare node") }
+  const boxIx = if r.uqsSwap { n.binRight } else { n.binLeft }
+  const otherIx = if r.uqsSwap { n.binLeft } else { n.binRight }
+  const qp = unionEqStagedPlanOf(boxIx, otherIx, lw.irAt)
+  if qp.uqKind < 0 { return irLMiss("union staged compare plan") }
+  return unionEqStagedTail(qp, r.uqsNe, lw.irAt)
+}
+
 // `RUnionVariantEq`: legacy's variant door (`emitUnionConcreteVariantEq`): its slots, the box, the
 // record, then the arm's tag and fields (`unionVariantEqTail`).
 function unionVariantEq(r: RUnionVariantEq) {
@@ -4050,6 +4071,34 @@ function tagStashEffect(r: RTagStash, pending: i32[]) {
   return 0
 }
 
+// A staged union compare's step: its level opened or closed, or a side parked in its slot, in
+// source order as `emitUnionEqStaged` writes it.
+function unionStageEffect(r: RUnionStage, pending: i32[]) {
+  if r.usOp == 0 {
+    if unionEqStageOpen(r.usKind) < 0 { return irLMiss("union stage slot") }
+    return 0
+  }
+  if r.usOp == 3 {
+    unionEqStageClose()
+    return 0
+  }
+  const roots = stageLead(r.usV, pending)
+  if lwMiss != "" { return 0 }
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length - liveCountIn(pending)
+  irLOpnd(r.usV)
+  if r.usOp == 1 {
+    unionEqStageSetBox()
+  } else {
+    unionEqStageSetOther(r.usKind)
+  }
+  liveNeutral()
+  irLSettle(pending)
+  lwFloor = lwFloors.pop() ?? 0
+  for v in roots { pending.push(v) }
+  return 0
+}
+
 // An order stash's field set. An operand the literal follows reaches the stack first, as legacy
 // writes it before the literal's fields; its roots wait below the set for their reader.
 function stashSetEffect(r: RStashSet, pending: i32[]) {
@@ -4210,6 +4259,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       }
       if r is RTagStash { return tagStashEffect(r, pending) }
       if r is RStashSet { return stashSetEffect(r, pending) }
+      if r is RUnionStage { return unionStageEffect(r, pending) }
       // A void import leaves nothing; any other host call's discarded value is dropped.
       if r is RCallHost {
         hostCall(r)
