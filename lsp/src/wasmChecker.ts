@@ -51,6 +51,20 @@ export type WasmRange = {
 };
 
 /**
+ * Where the binding under a cursor is declared, as the checker resolved it at that
+ * site: `key` is the declaring module (the entry's own key for a local binding),
+ * `range` the declaration name's span in that module, `line` its 1-based native line,
+ * and `name` the declared spelling. A method call answers the candidate its receiver
+ * picked, so two same-named `self`-functions are told apart.
+ */
+export type WasmDefinitionSite = {
+  key: string;
+  range: WasmRange;
+  line: number;
+  name: string;
+};
+
+/**
  * One occurrence from the cross-file references pass (kill-TS step 3-C Stage 3):
  * the occurrence's 0-based LSP span plus whether it is the binding's DECLARATION,
  * so the orchestrator can honor `includeDeclaration` (drop the decl when false).
@@ -434,6 +448,17 @@ export type WasmChecker = {
     line: number,
     character: number,
   ) => Promise<WasmRange | undefined>;
+  /**
+   * `definitionAt` with the declaring module: the site-resolved declaration of the
+   * binding under (`line`, `character`), or undefined off any tracked binding.
+   */
+  definitionSiteAt?: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<WasmDefinitionSite | undefined>;
   /**
    * Find-references (Stage 2): every occurrence span (declaration + uses) of the
    * binding under the cursor. `includeDeclaration` drops the declaration's own
@@ -1265,6 +1290,28 @@ export const createWasmChecker = (
     // Native lines are 1-based; the LSP cursor line is 0-based.
     const occ = exp.defAt(line + 1, seedCol(source, line, character));
     return occ >= 0 ? occRange(exp, occ, source) : undefined;
+  };
+
+  const definitionSiteAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<WasmDefinitionSite | undefined> => {
+    const exp = instantiate();
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp)) return undefined;
+    await ensurePrepared(exp, source, entryKey, read);
+    const occ = exp.defAt(line + 1, seedCol(source, line, character));
+    if (occ < 0) return undefined;
+    const m = hasModuleTags(exp) ? exp.symOccModuleAt(occ) : 0;
+    const key = m <= 0 || m >= exp.modKeyCount()
+      ? entryKey
+      : readString(exp.modKeyAtLen(m), (j) => exp.modKeyAtCharAt(m, j));
+    const range = occRange(exp, occ, source);
+    const declLine = (moduleText(exp, source, m) ?? "").split(/\r\n|\r|\n/)[range.start.line] ?? "";
+    const name = declLine.slice(range.start.character, range.end.character);
+    return { key, range, line: exp.symSpanStartLine(occ), name };
   };
 
   const referencesAt = async (
@@ -2535,6 +2582,7 @@ export const createWasmChecker = (
     setTestEmitRefusal,
     setOptimized,
     definitionAt,
+    definitionSiteAt,
     referencesAt,
     referencesInEntry,
     hoverTypeAt,
