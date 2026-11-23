@@ -29,6 +29,7 @@ import {
   asInstMissNullOwn,
   holeOptBoxScalarTy,
   holeOptShapeOf,
+  listFitCaptureStandIn,
   listReserveRegionPushes,
   objLitVariantOmitAt,
   omittedFieldNullNode,
@@ -772,7 +773,6 @@ import {
   charLitCp,
   exprEffectFree,
   isTestsNull,
-  listIsTestedIdent,
   objFieldSrcOrder,
   objFieldSrcPairs,
   objFieldVal,
@@ -4094,6 +4094,35 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   return irBMiss("read of " + n.identName)
 }
 
+// A `string | null` capture read where its type bears no null: its slot, then the `ref.as_non_null`
+// legacy writes for it (`emitCapturedReadRecover`), at the plain string.
+function capturedStrRecovered(
+  b: i32[],
+  fe: i32,
+  name: string,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  if repPrim(rep) != "str" { return irBMiss("capture recover rep") }
+  if cloLifted(fe) {
+    // A lifted function's capture is its own parameter, recovered as a local read is.
+    const v = liftCapVar(fe, name, -1)
+    if v < 0 || !strNullable(ib.irVars[v].vRep) {
+      return irBMiss("capture recover")
+    }
+    const o: Opnd = { ov: v }
+    return irBLetTempTy(
+      b,
+      { rcV: o, rcAt: ix, rcNn: 1 },
+      ix,
+      rep,
+      heldTy(exprTyOf(ix)),
+    )
+  }
+  const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
+  return irBLetTempTy(b, ev, ix, rep, heldTy(exprTyOf(ix)))
+}
+
 // The type read `ix` of global `d` at rep `rep` is held at: the read's own, or the type the
 // binding holds where the read's leaves a variable open and the held type's rep is `rep`.
 function globalReadTy(d: i32, ix: i32, rep: i32): i32 {
@@ -4145,7 +4174,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   const fe = fnStmtsPosOf(ibFnIx)
   const name = n.identName
   if captureValKind(fe, name) == "nulstr" && nulStrReadRecovers(ix, ibFnIx) {
-    return irBMiss("capture recover")
+    return capturedStrRecovered(b, fe, name, ix, rep)
   }
   const cr = capRepFor(fe, name, if unbox { -1 } else { rep })
   // A nullable capture read at the member the checker narrowed it to: the capture at its own rep.
@@ -4188,8 +4217,8 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     return irBMiss("capture binding")
   }
   if !cloLifted(fe) {
-    // An `is K[]`-tested capture may read the empty list legacy stands in (D4935).
-    if listIsTestedIdent(unwrapParen(ix)) {
+    // An `is K[]`-tested capture legacy reads as an empty `K[]` of its own (D4935).
+    if listFitCaptureStandIn(name, ix, ibFnIx, false, []) >= 0 {
       return irBMiss("capture list test")
     }
     const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
@@ -4427,11 +4456,20 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
         if t is OVar { v = t.ov }
       }
     }
-    if v < 0 || ib.irVars[v].vRep != r {
+    if v < 0 {
       irBMiss("closure env capture")
       return out
     }
     const o: Opnd = { ov: v }
+    // A closure held apart from its environment slot only in its holes is the same struct, retagged.
+    if ib.irVars[v].vRep != r {
+      if !holeRetagNoted(ib.irVars[v].vRep, r, true) {
+        irBMiss("closure env capture")
+        return out
+      }
+      out.push(repTemp(b, { rgV: o }, ix, r))
+      continue
+    }
     out.push(o)
   }
   return out
@@ -6425,7 +6463,8 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   }
   const unionIf = arm == "union" && nodeAt(unwrapParen(c.callArgs[0])) is IfStmt
   const from = b.length
-  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else { irBExpr(b, c.callArgs[0]) }
+  // An atom arm, or its `K | null`, streams the id its operand is held at (`emitStashAtomId`).
+  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else if want == "atom" || want == "nulAtom" { exprAt(b, c.callArgs[0], true) } else { irBExpr(b, c.callArgs[0]) }
   if ibMiss != "" { return 0 }
   // Legacy opens a nullable string's or boolean's print blocks before its operand, so a valued
   // `if` in it would sit above them.
@@ -8830,7 +8869,14 @@ function spreadSrcBuild(
 }
 
 // `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.
-function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+// `cell` as `exprAt`'s: an arm that writes its left operand alone passes it to that operand.
+function coalesce(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  cell: boolean,
+): Opnd {
   const arm = coalArmOf(n, ix, ibFnIx)
   if arm == "closed" { return coalClosed(b, n, ix, rep) }
   if arm == "chain" { return coalChain(b, n, ix, rep) }
@@ -8852,6 +8898,7 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     || arm == "fieldFlat"
     || arm == "popElem"
   ) {
+    if cell { return exprAt(b, n.binLeft, true) }
     return coalAsBuilt(b, unwrapParen(n.binLeft), rep, arm)
   }
   if arm == "deadJoin" {
@@ -10560,7 +10607,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if n.binOp == "=" { return assignValue(b, n, ix, rep) }
     const bt = binNulTestOf(n)
     if bt != null { return nulTest(b, n, bt, ix, rep) }
-    if n.binOp == "??" { return coalesce(b, n, ix, rep) }
+    if n.binOp == "??" { return coalesce(b, n, ix, rep, cell) }
     // A union box against a concrete operand is legacy's union compare, by legacy's own route.
     if (
       (n.binOp == "==" || n.binOp == "!=")
