@@ -1538,6 +1538,7 @@ Deno.test({
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
       "retag-closures-of-differing-arity": 2,
+      "retag-closures-of-differing-arity-noted": 0,
       "retag-field-alike-records-two-heaps": 2,
       "push-many-of-i32": 2,
       "global-read-off-store-type": 2,
@@ -1557,6 +1558,10 @@ Deno.test({
       "coal-str-default-off-rep": 2,
       "coal-atom-str-default-off-rep": 2,
       "opt-read-of-i32": 2,
+      "dead-return-after-returning-call": 5,
+      "pop-or-default-returning-call": 5,
+      "pop-or-default-never-call": 0,
+      "dead-return-after-never-call": 0,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
