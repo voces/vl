@@ -130,6 +130,7 @@ import {
   STrap,
   SpreadPairNote,
   StrOp,
+  TRAP_BLOCK_CUT,
   binPrimOp,
   coalArmStagesLeads,
   ifCondLetAt,
@@ -1101,6 +1102,8 @@ let ibLoopCont: i32[] = []
 // The result binding of each break label whose frame carries a loop value.
 let ibLvOf: {[i32]: i32} = Map()
 let ibLabelN = 0
+// `ifChain`'s answer for a guard that ends its block; `stmt` writes the cut behind it.
+const IF_CUTS_BLOCK = -9
 // The statements whose end closes a list reserve region the body opened (`reserve.open`).
 let ibReserveEnd: i32[] = []
 // The fully unrolled range loops being built, by `ForRange`, and the constant each copy's
@@ -1289,6 +1292,11 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   if arm == "variant" && vi < 0 { return isVariantTest(b, n, ix, rep) }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
   if rep != ibBool { return irBMiss("is result rep") }
+  if ta == "lacks" {
+    const lv = irBExpr(b, n.isObj)
+    if ibMiss != "" { return lv }
+    return isLacksTest(b, lv, ix, rep)
+  }
   const tag = boxTestTagOf(n, ix, arm, ta, vi)
   if ibMiss != "" { return irBMiss(ibMiss) }
   // A record's box field is read raw, at its storage, as legacy's `memStruct` arm reads it.
@@ -2218,11 +2226,19 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   }
   const ta: TagIsArm = if arm == "armTag" { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
   const vi = if arm == "variant" { isVariantTagPlain(ix, ibFnIx) } else { -1 }
-  const tag = if ta == "identBox" { isArmTagOf(ix, n, ibFnIx) } else if vi >= 0 && vi < uTags.length { uTags[vi] } else { -1 }
+  const tag = if ta == "identBox" || ta == "box" { isArmTagOf(ix, n, ibFnIx) } else if vi >= 0 && vi < uTags.length { uTags[vi] } else { -1 }
   storageReadLeave(mark)
   if arm != "armTag" && arm != "variant" { return irBMiss("is storage rung") }
   if arm == "variant" && tag < 0 { return irBMiss("is variant shape") }
   if ta == "tagAbsent" { return isTagAbsentTest(rep) }
+  if ta == "lacks" || ta == "box" && tag >= 0 {
+    // A name's or an element's read at its storage is the declared box.
+    const rn = nodeAt(unwrapParen(n.isObj))
+    if !(rn is Ident || rn is Index) {
+      return irBMiss("is stored box receiver")
+    }
+    return storedValueTagTest(b, n, ix, rep, ta, tag)
+  }
   if arm == "armTag" && (ta != "identBox" || tag < 0) {
     return irBMiss("is arm tag " + ta)
   }
@@ -2258,6 +2274,35 @@ function storedMemberBoxTest(
     return irBMiss("is member storage rep")
   }
   return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// A box value's test at its storage, the receiver read under the storage mark as legacy reads it:
+// its arm tag (`box`), or evaluated and dropped for a map the box cannot hold (`lacks`).
+function storedValueTagTest(
+  b: i32[],
+  n: IsExpr,
+  ix: i32,
+  rep: i32,
+  ta: TagIsArm,
+  tag: i32,
+): Opnd {
+  const mark = storageReadEnter(n.isObj)
+  const v = irBExpr(b, n.isObj)
+  storageReadLeave(mark)
+  if ibMiss != "" { return v }
+  if ta == "lacks" { return isLacksTest(b, v, ix, rep) }
+  if !(repNodeAt(irBOpRep(v)) is RBox) && !boxedNullable(irBOpRep(v)) {
+    return irBMiss("is stored box rep " + repWhat(irBOpRep(v)))
+  }
+  return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// A map the box cannot hold: receiver `v` evaluated and dropped, then `false`, as legacy's
+// `lacks` arm writes it.
+function isLacksTest(b: i32[], v: Opnd, ix: i32, rep: i32): Opnd {
+  irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  const o: Opnd = { oiRep: rep, oiBits: 0 }
+  return o
 }
 
 // The variable holding local box `r` (a binding, parameter or walk variable) in legacy's live
@@ -11519,6 +11564,7 @@ function ifChain(b: i32[], ix: i32) {
   let cur = ix
   let out = b
   let lastElse = -1
+  let cut = false
   // A link legacy writes as a `br_table` takes the rest of the chain, and is the last link's else;
   // so is a last link whose test the checker proved, written as its arm alone (`ifLinkExhausts`).
   let sw = false
@@ -11551,8 +11597,10 @@ function ifChain(b: i32[], ix: i32) {
     // Another constant `is` legacy decides off its bytes (`staticIsGuard`): a `false` writes no
     // then arm, a `true` no else. One that ends its block cuts the rest, which is legacy's.
     const k = if !decided && c is OImm && bareConstIs(c, n.ifCond, out, cat) { if c.oiBits != 0 { 1 } else { 0 } } else { -1 }
+    // Legacy cuts only after the statement, so a guard on a later link is not one.
     if k == 1 && guardEndsBlockWith(cur, k, ibFnIx) {
-      return skip("decided is guard ends block")
+      if links.length > 0 { return skip("decided is guard ends block") }
+      cut = true
     }
     // A list test whose narrowed region legacy reads through a fit shadow keeps that read's
     // emit-time rows (`listFitShadowSet`), which the builder cannot see.
@@ -11600,7 +11648,7 @@ function ifChain(b: i32[], ix: i32) {
     elseB = outs[k]
     k = k - 1
   }
-  return 0
+  return if cut { IF_CUTS_BLOCK } else { 0 }
 }
 
 function elseStmts(e: i32): i32[] {
@@ -11681,7 +11729,7 @@ function stmtRun(b: i32[], stmts: i32[]) {
   let i = 0
   while i < stmts.length {
     stmtAt(b, stmts, i)
-    i = i + 1
+    i = if blockCut(b) { stmts.length } else { i + 1 }
   }
   return 0
 }
@@ -11696,7 +11744,8 @@ function stmtAt(b: i32[], stmts: i32[], i: i32) {
 // is -1 outside a list.
 function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
-  stmtNode(b, ix, sibs, pos)
+  const cut = stmtNode(b, ix, sibs, pos) == IF_CUTS_BLOCK
+    && nodeAt(ix) is IfStmt
   if ibMiss != "" && censusGoesOn(ibMiss) { ibMiss = "" }
   // Legacy writes back a region's length after its last statement, inside that statement's
   // span (`emitStmtIn`).
@@ -11710,7 +11759,15 @@ function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     )
   }
   if b.length > n0 { irSpanNote(ib, ix, b[n0], b[b.length - 1]) }
+  if cut { irBNode(b, { tpWhy: TRAP_BLOCK_CUT }, -1, ibNoValue, ix) }
   return 0
+}
+
+// Whether the last statement built onto `b` cut the rest of its block (`TRAP_BLOCK_CUT`).
+function blockCut(b: i32[]): boolean {
+  if b.length == 0 { return false }
+  const n = ib.irNodes[b[b.length - 1]]
+  return n is STrap && n.tpWhy == TRAP_BLOCK_CUT
 }
 
 // Whether statement `ix` ends a reserve region the body opened; it is taken off the list.
@@ -12008,6 +12065,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   let i = 0
   while i < stmts.length - 1 {
     stmtAt(b, stmts, i)
+    if blockCut(b) { return 0 }
     i = i + 1
   }
   const last = stmts[stmts.length - 1]
