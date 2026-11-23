@@ -1636,6 +1636,10 @@ Deno.test({
       "never-call-value-into-bool": 2,
       "never-field-read-at-its-storage": 0,
       "never-field-read-off-its-storage": 3,
+      "walk-pair-map-value-record": 0,
+      "walk-pair-map-value-off-type": 3,
+      "walk-pair-string-index": 0,
+      "walk-pair-string-index-of-bool": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
