@@ -1,3 +1,5 @@
+import { variantFieldTypeAt } from "./emit_atom_kinds"
+
 // `ir_build_ref.vl` — the IR builder's reference values and list reads (ir-design-2026-11.md
 // §5.3, I2's list half). A `str` or a list of unpacked primitives may be a variable, parameter
 // or result. A list read on legacy's plain guarded path builds `SBoundsCheck` then `RListGet`
@@ -21,7 +23,13 @@ import {
   repWhat,
 } from "./ir"
 import { unwrapParen } from "./emit_base"
-import { letBindIsAtom, letBindIsNulAtom, localIndexOf } from "./emit_classify"
+import {
+  letBindIsAtom,
+  letBindIsNulAtom,
+  localIndexOf,
+  structIndexOfExpr,
+} from "./emit_classify"
+import { repStructRowIsOrTwin } from "./emit_shape_rows"
 import { isStorageRead, storageReadEnter, storageReadLeave } from "./emit_elab"
 import { identDeclOf } from "./symbols"
 import {
@@ -46,6 +54,7 @@ import {
   irBNode,
   irBNoteFieldReread,
   irBOpRep,
+  irBOpenLocalReadRep,
   irBStageLeads,
   irBUnboxKindRep,
   irInPlaceHook,
@@ -54,6 +63,7 @@ import {
   irListEqHook,
   irMemberHook,
   irNodeInShadow,
+  irOpenMemberRepHook,
   irStrBinHook,
   irUnionEqHook,
   irVarRepOkHook,
@@ -92,6 +102,7 @@ import {
   RMap,
   RNullable,
   RRecord,
+  RUnsup,
   repNodeAt,
   repNodeKids,
   repNodeOfTy,
@@ -102,6 +113,7 @@ import { nodeTyAt } from "./emit_capture_frames"
 import {
   REF_READ_CONTAINER,
   SRT_NARROW,
+  SRT_NONE,
   eqRouteOf,
   idxArmOf,
   irNodeInShadowHook,
@@ -386,7 +398,10 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   // A receiver held at legacy's declared row (`declRowReadTy`) is read at that row.
   const dt = declRowReadTy(n.memObj)
   const ot = if dt >= 0 { dt } else { nodeTyAt(n.memObj, irBFnIx()) }
-  const r = repNodeOfTy(ot)
+  // A hole receiver is read at the rep its parameter is held at (`irBOpenLocalReadRep`).
+  const r0 = repNodeOfTy(ot)
+  const hr = if repNodeAt(r0) is RUnsup { irBOpenLocalReadRep(n.memObj) } else { -1 }
+  const r = if hr >= 0 { hr } else { r0 }
   if repNodeAt(r) is RList {
     if n.memProp != "length" { return irBMiss("list member") }
     if !refRepOk(r, -1) { return irBMiss("list length rep") }
@@ -428,10 +443,20 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     if kr != rep && !own && !narrowed { return irBMiss("field read coercion") }
     const rv = irBExpr(b, n.memObj)
     if missed(rv) { return rv }
-    // A receiver held at its storage row (D14426) lays its fields out as that row does.
-    if irBOpRep(rv) != r { return irBMiss("field read of a stored row") }
+    // A receiver held at its storage row (D14426) reads that row's field, where it holds the read's
+    // own rep or the union box the read unboxes.
+    const sk = if irBOpRep(rv) == r { k } else { storedRowKid(n, irBOpRep(rv), fnIx) }
+    const skr = if sk >= 0 { repNodeKids(irBOpRep(rv))[sk] } else { -1 }
+    if sk < 0 || sk != k { return irBMiss("field read of a stored row") }
     irBNoteFieldReread(ix, k)
     const ur = if own { irBUnboxKindRep(unionFieldUnboxKindOf(ix, fnIx), rep) } else { rep }
+    const sn = repNodeAt(skr)
+    const boxRead = sn is RNullable
+      && sn.rnDisc == 4
+      && (rep == sn.rnInner || repPrim(rep) == "null")
+    if skr != kr && own && !boxRead {
+      return irBMiss("field read of a stored row's box")
+    }
     const gf: Rhs = {
       gfV: rv,
       gfIx: k,
@@ -441,6 +466,7 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
       gfShared: false,
     }
     if ur != rep { return irBLetStrTemp(b, gf, ix) }
+    if skr != kr && !own { return irBLetTempTy(b, gf, ix, skr, repTyOf(skr)) }
     // A raw read at the field's storage (`rawFieldRepOf`) is typed at that rep.
     if rep == kr && rep != repNodeOfTy(nodeTyAt(ix, fnIx)) {
       return irBLetTempTy(b, gf, ix, rep, repTyOf(rep))
@@ -467,7 +493,9 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   }
   // A shared field read over an un-narrowed box local, on legacy's plain dispatch.
   if repNodeAt(r) is RBox && sharedReadPlainOf(ix, irBFnIx()) {
-    if rep != repNodeOfTy(nodeTyAt(ix, irBFnIx())) {
+    const openRead = repNodeAt(repNodeOfTy(nodeTyAt(ix, irBFnIx()))) is RUnsup
+      && rep == openMemberRep(ix)
+    if rep != repNodeOfTy(nodeTyAt(ix, irBFnIx())) && !openRead {
       return irBMiss("shared read rep")
     }
     // The tail decides the read's rep: an unbox leaves its atom's, nothing else changes the box.
@@ -506,6 +534,7 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
       srGlobal: -1,
       srGlobalNonNull: false,
     }
+    if openRead { return irBLetTempTy(b, sr, ix, rep, repTyOf(rep)) }
     return irBLetTemp(b, sr, ix, rep)
   }
   // A grow candidate's arm turns on legacy's emit-time stash read, which the IR never asks.
@@ -623,6 +652,7 @@ export function irRefInstall() {
   irVarRepOkHook = refRepOk
   irIndexHook = buildIndex
   irMemberHook = buildMember
+  irOpenMemberRepHook = openMemberRep
   irStrBinHook = buildStrBin
   irInPlaceHook = strInPlaceModeAsked
   irUnionEqHook = unionEqOf
@@ -637,4 +667,37 @@ export function irRefInstall() {
   irLoopCloseHook = irLowerRefLoopClose
   irBoundsRuleHook = irBoundsRule
   return 0
+}
+
+// The kid of stored row `sr` that member read `n` reads, or -1 where legacy reads another row:
+// legacy reads the receiver's struct row (`structIndexOfExpr`), the row `sr` is stored under.
+function storedRowKid(n: Member, sr: i32, fnIx: i32): i32 {
+  if !(repNodeAt(sr) is RRecord) { return -1 }
+  if !repStructRowIsOrTwin(repTyOf(sr), structIndexOfExpr(n.memObj, fnIx)) {
+    return -1
+  }
+  return repRecordKidOf(sr, repTyOf(sr), n.memProp)
+}
+
+// The rep of shared field read `ix` off a hole parameter held as a box, where every arm stores the
+// field at one scalar type and no tail changes it; -1 otherwise.
+function openMemberRep(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if !(n is Member) { return -1 }
+  const r = irBOpenLocalReadRep(n.memObj)
+  if r < 0 || !(repNodeAt(r) is RBox) || !sharedReadPlainOf(ix, irBFnIx()) {
+    return -1
+  }
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const code = sharedReadPlanOf(ix, irBFnIx(), vis, fis)
+  if sharedReadTailOf(code, vis, fis, ix, irBFnIx()) != SRT_NONE { return -1 }
+  const t = variantFieldTypeAt(vis[0], fis[0])
+  let i = 1
+  while i < vis.length {
+    if variantFieldTypeAt(vis[i], fis[i]) != t { return -1 }
+    i = i + 1
+  }
+  const fr = if t >= 0 { repNodeOfTy(t) } else { -1 }
+  return if fr >= 0 && repPrim(fr) != null { fr } else { -1 }
 }

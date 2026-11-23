@@ -38,11 +38,13 @@ import {
   RCoerce,
   REnvDrop,
   REnvGet,
+  REqHelp,
   RFieldNull,
   RFnId,
   RGetField,
   RGlobalGet,
   RHandPick,
+  RHoleOptBox,
   RInitProgress,
   RJoinNull,
   RListCat,
@@ -801,8 +803,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if r.gfShared && dst >= 0 && dst != k {
         return fail(2, at, "a shared member read is not at its field's rep")
       }
-      // A read at its storage is the field's own box, unboxed nowhere.
-      if r.gfStored && (!(repNodeAt(k) is RBox) || dst != k) {
+      // A read at its storage is the field's own box or boxed nullable, unboxed nowhere.
+      const kb = repNodeAt(k) is RBox || kn is RNullable && kn.rnDisc == 4
+      if r.gfStored && (!kb || dst != k) {
         return fail(2, at, "a field read at its storage is its declared box")
       }
       0
@@ -1120,6 +1123,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       // Legacy's box writer may leave an immediate unread, so one stands only for an effect-free node.
       if (r.bxV is OImm || r.bxV is OStr) && !r.bxFree {
         return fail(2, at, "a box's immediate stands for a node with an effect")
+      }
+      0
+    }
+    RHoleOptBox => {
+      use(r.hxV, at)
+      // A type parameter's `as?` boxes the scalar its plain cast yields into a value union's box.
+      if !repIsScalar(opRep(r.hxV)) || dst >= 0 && !boxShaped(dst) {
+        return fail(2, at, "a type parameter's cast box is no box of a scalar")
       }
       0
     }
@@ -1505,6 +1516,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       if dst >= 0 && r.mgForm > 0 && opRep(r.mgDef) != dw {
         return fail(2, at, "a map read's default is not at its rep")
+      }
+      0
+    }
+    REqHelp => {
+      uses([r.ehL, r.ehR], at)
+      if repIsScalar(opRep(r.ehL)) || repIsScalar(opRep(r.ehR)) {
+        return fail(2, at, "a compare helper's operands are references")
+      }
+      if dst >= 0 && repPrim(dst) != "i32" {
+        return fail(2, at, "a compare helper's answer is an i32")
       }
       0
     }
@@ -2466,6 +2487,7 @@ function stmt(id: i32, prev: i32) {
           && !vfOpenTakes(vf.irRetTy, vf.irRetRep, opRep(n.rtV))
           && !vfStoresAs(vf.irRetRep, opRep(n.rtV))
           && !repNullRefFits(opRep(n.rtV), vf.irRetRep)
+          && !vfNicheTakes(vf.irRetRep, opRep(n.rtV))
         ) {
           return fail(2, id, "a return's rep is not the result's")
         }
@@ -2763,11 +2785,13 @@ function rhsReadsList(r: Rhs): boolean {
       RCoerce |
       REnvDrop |
       REnvGet |
+      REqHelp |
       RFieldNull |
       RFnId |
       RGetField |
       RGlobalGet |
       RHandPick |
+      RHoleOptBox |
       RInitProgress |
       RJoinNull |
       RListCat |
@@ -2936,6 +2960,15 @@ export function irUntypedClosure(ty: i32, rep: i32): boolean {
 // are stored at the same valtype, as the builder noted them (`irRepValtype`).
 function vfOpenTakes(ty: i32, rep: i32, v: i32): boolean {
   return irTyOpen(ty) && vfStoresAs(rep, v)
+}
+
+// Whether a ref-niche nullable `r` holds a value of rep `v` as it stands: its inner rep, or one
+// the builder noted stored at the inner's valtype.
+function vfNicheTakes(r: i32, v: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RNullable
+    && n.rnDisc == 1
+    && (n.rnInner == v || vfStoresAs(n.rnInner, v))
 }
 
 // Whether a value of rep `src` stands where rep `dst` is asked: both are stored at the valtype the

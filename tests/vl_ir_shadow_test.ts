@@ -210,9 +210,10 @@ Deno.test({
 });
 
 // A thunk whose target's result type is open is typed by its rep's own type where that is closed
-// and round-trips to the rep (`thunkRetTy`), and matches; where it does not, it stays uncovered.
+// and round-trips to the rep (`thunkRetTy`); where it does not, by legacy's declared result
+// descriptor (`resultDescTy`). Each matches.
 Deno.test({
-  name: "ir shadow: a thunk's open result type stands as its rep's own only where that round-trips",
+  name: "ir shadow: a thunk's open result type stands as its rep's own where that round-trips, else at its declared result",
   ignore,
   fn: () => {
     const fits = `export function id<T>(x: T): T { return x }\nconst k = () => id\nprint(k()(9))\n`;
@@ -223,8 +224,8 @@ Deno.test({
     const open = `function inc(x) { return x + 1 }\nfunction run(f) { return f()(41) }\n` +
       `print(run(() => inc) + run(() => inc))\n`;
     const { rows } = run(open, true);
-    if (rows.get("thunk uncovered thunk open result type") !== 2) {
-      throw new Error(`want two thunks uncovered on their open result type, got ${JSON.stringify([...rows])}`);
+    if (rows.has("thunk uncovered thunk open result type") || (rows.get("thunk matched") ?? 0) < 2) {
+      throw new Error(`want both open-result thunks matched at the declared result, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -433,19 +434,19 @@ Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // An `as?` over a type parameter at a pin where it cannot fail, which legacy boxes after the
-    // tag, is outside the set too.
+    // An `as!` over a type parameter pinned at no number, which legacy writes as the operand and a
+    // trap inside the expression, is outside the set too.
     const src = `function greet(c: boolean): i32 {
   const x = null
   return (if c { x } else { x }) ?? 0
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv<T>(u: T): i32 | null {
-  return u as? i32
+function cv<T>(u: T): i32 {
+  return u as! i32
 }
 print(greet(true))
 print(ap((x: i32) => x + 1))
-print(cv(3))
+print(cv("s"))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
@@ -1554,6 +1555,8 @@ Deno.test({
       "pop-or-bool-out": 2,
       "pop-or-out-unwritten": 5,
       "record-field-read-twice": 2,
+      "stored-read-of-i32-field": 2,
+      "stored-read-of-boxed-nullable-field": 0,
       "map-read-probe-of-i32": 2,
       "map-read-on-pop-arm": 2,
       "map-read-out-unwritten": 5,
@@ -1584,6 +1587,9 @@ Deno.test({
       "width-retag-pair-unnoted": 2,
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
+      "eq-helper-of-records": 0,
+      "eq-helper-of-i32": 2,
+      "eq-helper-into-bool": 2,
       "rep-typed-thunk-forwards": 0,
       "rep-typed-thunk-forwards-env": 1,
       "rep-typed-result-not-thunk": 1,
@@ -1591,6 +1597,8 @@ Deno.test({
       "init-progress-effect": 0,
       "literal-cast-of-record": 2,
       "literal-cast-of-i32": 0,
+      "hole-opt-box-of-record": 2,
+      "hole-opt-box-of-i32": 0,
       "retag-closures-of-differing-arity": 2,
       "retag-closures-of-differing-arity-noted": 0,
       "map-delete-of-map": 0,
@@ -1601,6 +1609,8 @@ Deno.test({
       "return-not-stored-alike": 2,
       "return-stored-alike": 0,
       "return-stored-unlike": 2,
+      "niche-return-not-stored-alike": 2,
+      "niche-return-stored-alike": 0,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
       "atom-tower-i32-read": 2,
