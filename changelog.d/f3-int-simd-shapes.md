@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **`std:simd` integer and byte shapes (#9678, SIMD S4 tier 2).** `U8x16`, `U16x8`, `I16x8`, `I32x4` with `Mask8x16`/`Mask16x8` beside `Mask32x4`: load/store at a `Buf`, splat, wrapping `+ -`, saturating add/sub (u8, u16, i16), min/max, the six compares to lane masks, select, bitwise and/or/xor/andNot on vectors and masks, `bitmask`/`anyTrue`/`allTrue`, widening u8→u16→i32 and i16→i32, saturating narrowing. Each wraps an existing tier-1 intrinsic; no compiler change. Graded by `tests/cases/simd/int-std-*.vl` on V8 and wasmtime, including a 4096-cell byte pass checked against a scalar loop.
