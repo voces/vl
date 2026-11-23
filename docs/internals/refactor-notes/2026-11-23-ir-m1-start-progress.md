@@ -30,6 +30,20 @@ payload}` box itself, and its null is one more tag. A read the checker typed at 
 (`nullNarrowArmOf` "plain") is legacy's plain `global.get`, with no `ref.as_non_null`. The IR reads
 it as a narrowed read with `ggNn` 0, which the verifier's narrowed arm already admits.
 
+## Readings
+
+tests/cases census, master eeac5bb6 → head, on fixpoint seeds:
+
+| class | master → head |
+| --- | --- |
+| `start: progress cell` | 31 → 0 |
+| `start: global read coercion` | 38 → 25 |
+| `global read coercion` | 9 → 7 |
+| programs fully IR-only, of 7,114 | 5,288 → 5,297 |
+
+43 functions are newly claimed and none newly missed. Three reach a later miss instead:
+`start: print union if` gains 2 and `start: union compare box` gains 1.
+
 ## Legacy tails the IR calls
 
 - `emitInitProgressAt`, through `irInitProgressHook`.
