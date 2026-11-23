@@ -265,6 +265,7 @@ import {
   fbLocalTee,
   fbLoop,
   fbMapTagOfI64,
+  fbOpenBlock,
   fbRefAsNonNull,
   fbRefCast,
   fbRefEq,
@@ -394,7 +395,6 @@ import {
   holeBoxHead,
   holeBoxLeads,
   holeBoxTail,
-  holeBoxTyAt,
   hostCallTail,
   identListOverrideOf,
   idxRowsOn,
@@ -709,6 +709,8 @@ let lwIfHeadAt: {[i32]: i32} = Map()
 let lwIfHeadBuilt = false
 // Each box by the out its value is (`stashIfBoxHead`), noted with `lwIfHeadAt`.
 let lwIfBoxAt: {[i32]: i32} = Map()
+// Each such box's union (`RToBox.bxTy`), by the same out.
+let lwIfBoxTy: {[i32]: i32} = Map()
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -1408,7 +1410,7 @@ function stashBoxHead(at: i32) {
     const r = n.lRhs
     if !(r is RToBox) || unwrapParen(r.bxAt) != at { continue }
     const bx = r.bxAt
-    const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+    const p = holeBoxPlanOf(bx, r.bxTy, lw.irAt)
     if p.hbArm == "rec" || p.hbArm == "obj" {
       leaf()
       holeBoxHead(p, bx, lw.irAt)
@@ -1439,7 +1441,7 @@ function joinBoxHead(out: i32, staged: boolean) {
   if !lwIfHeadBuilt { stashIfHeadsNote() }
   const bx = lwIfBoxAt.get(out) ?? -1
   if bx < 0 || i32ListHas(lwBoxHeadAt, unwrapParen(bx)) { return 0 }
-  const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+  const p = holeBoxPlanOf(bx, lwIfBoxTy.get(out) ?? -1, lw.irAt)
   if holeBoxLeads(p.hbArm) {
     if staged { lwPushing = true } else { leaf() }
     holeBoxHead(p, bx, lw.irAt)
@@ -1459,7 +1461,10 @@ function stashIfHeadsNote() {
       const mr = m.lRhs
       if mr is RToBox {
         const bv = mr.bxV
-        if bv is OVar { lwIfBoxAt.set(bv.ov, mr.bxAt) }
+        if bv is OVar {
+          lwIfBoxAt.set(bv.ov, mr.bxAt)
+          lwIfBoxTy.set(bv.ov, mr.bxTy)
+        }
       }
       if mr is RMakeRec && !mr.mrSet && mr.mrSrc.length > 0 {
         const k0 = mr.mrSrc[0]
@@ -3010,7 +3015,7 @@ function nulNicheEq(r: RNulNicheEq) {
 // unread), an atom box's widening, and the plan's tail.
 function boxOp(r: RToBox) {
   const fnIx = lw.irAt
-  const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, fnIx), fnIx)
+  const p = holeBoxPlanOf(r.bxAt, r.bxTy, fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
   // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
   if !i32ListHas(lwBoxHeadAt, unwrapParen(r.bxAt)) {
@@ -3181,7 +3186,7 @@ function retagOf(o: Opnd): i32 {
 function passBoxOf(t: i32): i32 {
   const r = tempRhs(t)
   if !(r is RToBox) { return -1 }
-  const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, lw.irAt), lw.irAt)
+  const p = holeBoxPlanOf(r.bxAt, r.bxTy, lw.irAt)
   return if p.hbArm == "pass" || p.hbArm == "memberBox" { t } else { -1 }
 }
 
@@ -4067,11 +4072,23 @@ function loopValueBlock(n: SBlock, pending: i32[], id: i32) {
   }
   const slot = varSlot(n.bkOut)
   const vt = valtypeOf(lw.irVars[n.bkOut].vRep)
-  if vt < 0 { return irLMiss("loop value rep") }
+  // A reference binding's frame is typed by its local's kind, as `lvFrameOpen` writes it.
+  const li = slot - fbFrameParams
+  if (
+    vt < 0
+    && (li < 0 || li >= localIsRef.length || li >= localStructIdx.length)
+  ) {
+    return irLMiss("loop value rep")
+  }
   irLSettle(pending)
   const hoists = irLoopOpenHook(lw.irNodeAt[id])
   if hoists < 0 { return irLMiss("loop hoist prologue") }
-  fbBlock(vt)
+  if vt >= 0 {
+    fbBlock(vt)
+  } else {
+    fbOpenBlock()
+    fbValtype(localIsRef[li], localStructIdx[li])
+  }
   lwFrames.push(n.bkLabel)
   lwLvLabels.push(n.bkLabel)
   const k = n.bkBody.length - 1
@@ -4413,6 +4430,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwIfHeadAt = Map()
   lwIfHeadBuilt = false
   lwIfBoxAt = Map()
+  lwIfBoxTy = Map()
   lwStashFi = []
   lwStashSlots = []
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
