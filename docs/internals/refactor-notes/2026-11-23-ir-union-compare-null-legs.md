@@ -37,7 +37,7 @@ same class has been read three ways, each with its own instrument and tree. They
 
 The two cells on master are the variant compare (a nullable record operand,
 `d2915_recn_{5,s}_eq_annot`), which #9749 does not take. The doors PR that follows clears them
-(0 by both instruments). Mode 4 also has the start-counting defect D17082 fixes.
+(0 by both instruments). Mode 4 also has the start-counting defect D17082 fixes (unfiled: D17082, the row lands with #9767).
 
 Still a miss: an element read of a global list as the box (`irReadElem` only covers a list held in
 a variable); the variant compare (a nullable record operand); the cross-width number compare.
