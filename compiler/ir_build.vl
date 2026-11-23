@@ -547,7 +547,7 @@ import {
   unionBoxArgReadsMapBox,
   unionLitIsPlanOf,
 } from "./wasmEmit"
-import { nodeTyInOf, readContainerTyAt } from "./emit_ty_canon"
+import { mapRecvTyIn, nodeTyInOf, readContainerTyAt } from "./emit_ty_canon"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -6986,6 +6986,21 @@ function recordRepOrNull(r: i32): boolean {
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
+  // A `??` whose own type has no rep (a link legacy mints) is built at the destination's rep, as
+  // legacy writes it at the kind its consumer asks.
+  const du = unwrapParen(ix)
+  const dn = if du >= 0 && du < P.nodes.length { nodeAt(du) } else { null }
+  if ibMiss == "" && dst >= 0 && dn is BinExpr && dn.binOp == "??" && exprRepOf(du) < 0 {
+    // At a box, a map read's `??` is built at the map's value rep and boxed as that member.
+    const lr = nodeAt(unwrapParen(dn.binLeft))
+    const vr = if heldAsBox(dst) && lr is Index { repNodeOfTy(tyMapValOf(mapRecvTyIn(lr.idxArr, ibFnIx))) } else { -1 }
+    if vr >= 0 {
+      const v = coalesce(b, dn, du, vr)
+      if ibMiss != "" { return v }
+      return boxTemp(b, v, du, dst)
+    }
+    return coalesce(b, dn, du, dst)
+  }
   // A read the checker narrowed to `null` is the destination's null where legacy's `nullread` arm
   // writes one (`nullReadDstOwnOf`), not its storage's.
   const nro = if ibMiss == "" && dst >= 0 { nullReadOwnAt(ix) } else { -1 }
@@ -9249,7 +9264,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const rp = repPrim(rep)
   const uk = if uq != null { uq.muWide } else { -1 }
   const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32"
-    || arm == "i32" && rp == "bool"
+    || (arm == "i32" || arm == "helper") && rp == "bool"
     || (at || st) && repHeldAsI32(rep)
     || mv
     || nz
