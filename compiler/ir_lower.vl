@@ -163,6 +163,7 @@ import {
   RMemOp,
   RNicheRead,
   RNulNicheEq,
+  RNulNoneBox,
   RNulTest,
   RNullOf,
   RNumCast,
@@ -273,6 +274,7 @@ import {
   fbRefEq,
   fbRefIsNull,
   fbRefNull,
+  fbRefNullNone,
   fbRefNullOfKind,
   fbRefNullStruct,
   fbRefTest,
@@ -349,6 +351,7 @@ import {
   coalNulRefBranch,
   coalNulRefJoinOpen,
   coalNulRefJoinPresent,
+  coalNulRefJoinTag,
   coalNulRefOpen,
   coalNulRefPlanOf,
   emitArmUnboxAt,
@@ -467,6 +470,8 @@ import {
   nulNicheEqNullTail,
   nulNicheEqRightTail,
   nulNicheEqWhy,
+  nulNoneBoxHead,
+  nulNoneBoxTail,
   nulTestAtomTail,
   nulTestBoolTail,
   nulTestBoxTagTail,
@@ -587,7 +592,12 @@ import {
   structFieldPlain,
   variantFieldPlain,
 } from "./emit_plan_union"
-import { CoalBoxArm, coalValBoxArm, nullRetPlanOf } from "./emit_plan_null"
+import {
+  CoalBoxArm,
+  coalNulRefArmOf,
+  coalValBoxArm,
+  nullRetPlanOf,
+} from "./emit_plan_null"
 import {
   NulTestArm,
   binNulTestOf,
@@ -1103,6 +1113,18 @@ function rhs(r: Rhs, tail: boolean) {
     RRetag => irLOpnd(r.rgV)
     RStage => irLOpnd(r.sgV)
     RNulTest => nulTestOp(r)
+    RNulNoneBox => {
+      // Legacy's null tag, the payload (the call, else the bottom ref), then the box.
+      leaf()
+      nulNoneBoxHead()
+      if r.nnPay {
+        irLOpnd(r.nnV)
+      } else {
+        leaf()
+        fbRefNullNone()
+      }
+      nulNoneBoxTail()
+    }
     RNulNicheEq => nulNicheEq(r)
     RClosureEq => closureEq(r)
     RFieldNull => {
@@ -4000,6 +4022,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "optLeaf" => coalOptLeaf(n, e, pending)
     "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
+    "nulStr" => coalNulStr(n, e, pending)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
@@ -4050,7 +4073,7 @@ function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
 
 // `p?.f ?? d` over a nullable record's scalar or string field along `coalOptLeafPlanOf`, as
 // `emitCoalesceOptNulRecord` writes it: the receiver variable, its null test opening the leaf's
-// `if`, the default writing the slotless out, the else, the receiver again, and its field.
+// `if`, the default writing the slotless out, the else, the receiver read again, and its field.
 function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   const m = nodeAt(unwrapParen(e.binLeft))
   if (
@@ -4069,7 +4092,7 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   fbElse()
-  irLOpnd(n.cbL)
+  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
   lwFrames.pop()
   return coalOptLeafRead(lp)
 }
@@ -4108,7 +4131,7 @@ function coalBoxArm(
     "valBox" | "valScalar" => true
     "elem" | "callBox" | "callScalar" | "boolPop" | "valNoKind" | "callNoKind" | "next" => false
   }
-  if reread { irLOpnd(n.cbL) }
+  if reread && opndAgain(n.cbL, e.binLeft) < 0 { return -1 }
   lwFrames.pop()
   return coalBoxEnd(arm, e, lhsIx, n.cbAt, fnIx)
 }
@@ -4137,6 +4160,22 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.pop()
   fbEnd()
   return 0
+}
+
+// A `string | null` `??` whose default computes: the plain block at the string heap, nullable as
+// `coalesceNulStrStaysNullable`, the operand inside it, the branch out on non-null, then the tail.
+function coalNulStr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  // A join stages the operand ahead of its `if` and boxes it on the present path.
+  if coalNulRefArmOf(e, n.cbAt, lw.irAt) == "join" {
+    cond(n.cbL, pending)
+    coalNulRefJoinOpen()
+    return coalNulRefTail(n, coalNulRefJoinTag(e, sTy(), lw.irAt))
+  }
+  if pending.length > 0 { return irLMiss("coalesce string below a temp") }
+  coalNulRefOpen(sTy(), coalesceNulStrStaysNullable(n.cbAt, lw.irAt))
+  cond(n.cbL, body(n.cbLB, false, -1, true))
+  coalNulRefBranch()
+  return coalNulRefTail(n, -1)
 }
 
 // A nullable reference's `??` along its plan: the plain block (the operand inside it, the branch
