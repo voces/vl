@@ -350,10 +350,25 @@ export const planRenameAt = async (
   }
 
   // ── Cursor on a use of an imported binding? ─────────────────────────────────
-  // `sources` keys by the LOCAL name, which is what a use spells. Confirm the
-  // cursor really is on that binding's occurrence (not a same-named local that
+  // The checker's site-resolved declaration decides, so a method call renames the
+  // candidate its receiver picked. Without one, `sources` keys by the LOCAL name,
+  // which is what a plain use spells but not what a member property names. Confirm
+  // the cursor really is on that binding's occurrence (not a same-named local that
   // shadows the import) via the module-0 occurrence set.
-  const importedTarget = targetOf(word);
+  const site = checker.definitionSiteAt === undefined
+    ? undefined
+    : await checker.definitionSiteAt(source, entryKey, read, line, character);
+  const before = (source.split("\n")[line] ?? "").slice(0, range.start.character);
+  const importedTarget: RenameTarget | undefined = site !== undefined
+    ? (site.key === entryKey ? undefined : {
+      key: site.key,
+      exportedName: site.name,
+      declLine: site.line,
+      declCol: site.range.start.character,
+    })
+    : /\.\s*$/.test(before)
+    ? undefined
+    : targetOf(word);
   if (importedTarget !== undefined) {
     const occs = await checker.referencesInEntry(source, entryKey, read, importedTarget);
     if (occs.some((o) => posInRange(o.range, line, character))) {
