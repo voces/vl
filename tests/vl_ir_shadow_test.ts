@@ -1553,6 +1553,7 @@ Deno.test({
       "call-write-back-not-a-capture": 2,
       "coal-str-default-off-rep": 2,
       "coal-atom-str-default-off-rep": 2,
+      "opt-read-of-i32": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {

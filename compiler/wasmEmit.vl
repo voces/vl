@@ -7656,21 +7656,46 @@ function emitOptChainIsNull(exprIx: i32, fnIx: i32) {
       return emitFail("emitProgram: `?.` field is not on the struct")
     }
     if emitOptChainIsNull(e.omObj, fnIx) < 0 { return -1 }
-    fbIf(127)
-    fbI32Const(1)
-    fbElse()
-    if optChainLeafNulDisc(psi, pfi) == 0 {
-      fbI32Const(0)
-    } else {
+    if emitOptLinkNullOpen(exprIx, fnIx) {
       if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[psi], pfi)
-      emitOptChainLeafNulTest(psi, pfi)
     }
-    fbEnd()
-    return 0
+    return emitOptLinkNullClose(exprIx, fnIx)
   }
   if emitOptRecvBase(exprIx, fnIx, false) < 0 { return -1 }
   fbRefIsNull()
+  return 0
+}
+
+// After `?.` link `exprIx`'s receiver null test: the `if` that answers true for a null receiver, else
+// tests the field. Whether the field's own null is tested, so the receiver's value comes next.
+export function emitOptLinkNullOpen(exprIx: i32, fnIx: i32): boolean {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return false }
+  const psi = optChainStructIdxOf(e.omObj, fnIx)
+  if psi < 0 || psi >= sHeapIdx.length { return false }
+  const pfi = sFieldIndex(psi, e.omProp)
+  fbIf(127)
+  fbI32Const(1)
+  fbElse()
+  if optChainLeafNulDisc(psi, pfi) == 0 {
+    fbI32Const(0)
+    return false
+  }
+  return true
+}
+
+// The close of `emitOptLinkNullOpen`: the field read and its null test where the field has one.
+export function emitOptLinkNullClose(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return 0 }
+  const psi = optChainStructIdxOf(e.omObj, fnIx)
+  if psi < 0 || psi >= sHeapIdx.length { return 0 }
+  const pfi = sFieldIndex(psi, e.omProp)
+  if optChainLeafNulDisc(psi, pfi) != 0 {
+    fbStructGet(sHeapIdx[psi], pfi)
+    emitOptChainLeafNulTest(psi, pfi)
+  }
+  fbEnd()
   return 0
 }
 
@@ -7872,191 +7897,217 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
       if emitNulNoneForEffect(e.omObj, fnIx) < 0 { return -1 }
       return emitNullAt(exprIx, fnIx)
     }
-    const osi = optChainStructIdxOf(e.omObj, fnIx)
-    if osi < 0 {
-      return emitFailAt(
-        "emitProgram: `?.` receiver is not a struct chain",
-        exprIx,
-      )
+    const arm = optLeafArmOf(exprIx, fnIx)
+    if arm == "fail" { return optLeafFail(exprIx, fnIx) }
+    // Every arm but a pinned non-null one tests the chain, then opens the leaf's `if`.
+    if arm != "nonNull" {
+      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
+      emitOptLeafHead(exprIx, fnIx)
     }
-    const ofi = sFieldIndex(osi, e.omProp)
-    if ofi < 0 {
-      return emitFailAt("emitProgram: `?.` field is not on the struct", exprIx)
-    }
-    const oRow = sFieldStart[osi] + ofi
-    const oKind = fieldRowKind(oRow)
-    const oRefHeap = optChainLeafRefHeap(osi, ofi)
+    if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
+    return emitOptLeafTail(exprIx, fnIx)
+  }
+  return emitFailAt(
+    "emitProgram: expected an optional-chain member access",
+    exprIx,
+  )
+}
 
-    // The record leaf, the arm the `?.` producer needs (D1084). `o?.f` over
-    // `o: T | null` with `T = {f: S}` has type `S | null`, and the rep for that is the nullable
-    // struct ref the whole `nulstruct` family already speaks.
+// How `emitOptMemberValueGo` writes a standalone `?.` leaf, by the leaf field's kind and the read's
+// own rep: a nullable reference's `if` (`record`, `ref`, `map`, `closure`, `nulstr`), the i32
+// sentinel's (`sentinel`), the union box's over a union field or a scalar (`boxUnion`,
+// `boxScalar`), a chain the instance pins non-null (`nonNull`), or `fail`.
+export type OptLeafArm = "record"
+  | "ref"
+  | "map"
+  | "closure"
+  | "sentinel"
+  | "boxUnion"
+  | "boxScalar"
+  | "nulstr"
+  | "nonNull"
+  | "fail"
 
-    // Shape-identical to the `nulstr` arm below it, with the field's own target struct as the
-    // heap type instead of the string array: a null receiver chain yields `ref.null $S`, a live
-    // one reads the field. The `else` arm leaves a `(ref $S)`, a subtype of the block's
-    // `(ref null $S)`, so the arms join without a cast. `structIndexOfExpr` is the other half.
-    if eqKindIsRecord(oKind) {
-      const oti = sFieldTgtStructIdx(osi, ofi)
-      if oti < 0 {
-        return emitFailAt(
-          "emitProgram: `?.` yields a nullable struct whose field names no struct row",
-          exprIx,
-        )
-      }
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
-      fbIfRefNul(sHeapIdx[oti], true)
-      fbRefNull(sHeapIdx[oti])
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return optReadRecoverNonNull(exprIx, fnIx)
-    }
+// The arm standalone `?.` at `exprIx` takes in `emitOptMemberValueGo`'s order, past its `null`
+// unit read; the IR builder asks it too.
+export function optLeafArmOf(exprIx: i32, fnIx: i32): OptLeafArm {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return "fail" }
+  const osi = optChainStructIdxOf(e.omObj, fnIx)
+  if osi < 0 { return "fail" }
+  const ofi = sFieldIndex(osi, e.omProp)
+  if ofi < 0 { return "fail" }
+  const oRow = sFieldStart[osi] + ofi
+  const oKind = fieldRowKind(oRow)
+  // The record leaf (D1084): `o?.f` over `o: T | null` is the nullable struct ref of `f`'s row.
+  if eqKindIsRecord(oKind) {
+    return if sFieldTgtStructIdx(osi, ofi) < 0 { "fail" } else { "record" }
+  }
+  // A list leaf: the list wrapper's own nullable ref.
+  if optChainLeafRefHeap(osi, ofi) >= 0 { return "ref" }
+  // A map leaf: its map struct's nullable ref, once its value type is closed.
+  if oKind == "map" || oKind == "nulmap" {
+    return if sFieldMapShape(osi, ofi) == -3 { "fail" } else { "map" }
+  }
+  // A function-value leaf: the closure fat pointer's own nullable ref.
+  if oKind == "closure" || oKind == "nulclosure" { return "closure" }
+  if !optChainLeafBoxable(oKind) && fieldRowNumKind(oRow) < 0 { return "fail" }
+  const ord = repOfNode(exprIx, fnIx)
+  // `boolean | null` and `K | null` share one i32 blocktype with their sentinel.
+  if (
+    (ord.rdKind == "nulbool" && ord.rdNul == 2)
+    || (ord.rdKind == "i32" && ord.rdNul == 3)
+  ) {
+    return "sentinel"
+  }
+  // A nullable scalar rides the `{tag, payload}` box, `null` its null tag; a union field is the box.
+  const oBoxKind = fieldRowNumKind(oRow)
+  if (
+    oKind == "union"
+    || (ord.rdKind == "union" && ord.rdNul == 4)
+    || (oBoxKind > 0 && ord.rdNul == 4)
+  ) {
+    const ovb = vbHeapIdxOfKind(optLeafBoxKind(oRow))
+    if !uDeclared || (oKind != "union" && ovb < 0) { return "fail" }
+    return if oKind == "union" { "boxUnion" } else { "boxScalar" }
+  }
+  // `string | null` is the nullable raw-array ref niche.
+  if oKind == "nulstr" || (ord.rdKind == "nulstr" && ord.rdNul == 1) {
+    return "nulstr"
+  }
+  // A chain the hole instance pins non-null is the plain field read, at the field's own rep (D3215).
+  if tyProvesNonNull(nodeTyAt(exprIx, fnIx)) { return "nonNull" }
+  return "fail"
+}
 
-    // A LIST leaf, the record arm one table over: `T[] | null` is the list wrapper's own
-    // nullable ref, so a null link yields `ref.null $wrap` and a live one reads the field.
-    // A nullable-list field is already `(ref null $wrap)`, which the same blocktype accepts.
-    if oRefHeap >= 0 {
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
-      fbIfRefNul(oRefHeap, true)
-      fbRefNull(oRefHeap)
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return optReadRecoverNonNull(exprIx, fnIx)
-    }
-    // A MAP leaf: `{[K]: V} | null` is the field's map struct's own nullable ref, the list
-    // arm's shape over the struct `sFieldMapShape` names.
-    if oKind == "map" || oKind == "nulmap" {
-      const msh = sFieldMapShape(osi, ofi)
-      if msh == -3 {
-        return emitFailAt(
-          "emitProgram: a standalone `?.` map leaf's value type is still open",
-          exprIx,
-        )
-      }
-      const mHeap = mapTypeIdxOf(msh)
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
-      fbIfRefNul(mHeap, true)
-      fbRefNull(mHeap)
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return optReadRecoverNonNull(exprIx, fnIx)
-    }
-    // A function-value leaf: `F | null` is the closure fat pointer's own nullable ref.
-    if oKind == "closure" || oKind == "nulclosure" {
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
-      fbIfRefNul(cloStructIdx, true)
-      fbRefNull(cloStructIdx)
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return optReadRecoverNonNull(exprIx, fnIx)
-    }
-    // The leaf reps this arm can build, in the order the arms below take them: a nullable
-    // REF (a list, a map, a function value, a nested struct, a string), the scalar box
-    // (i32/boolean/f64/i64/f32), and the value-union box. Any other leaf is named as such.
-    if (
-      !optChainLeafBoxable(oKind)
-      && fieldRowNumKind(oRow) < 0
-      && oRefHeap < 0
-    ) {
-      return emitFailAt(
-        "emitProgram: a standalone `?.` has no rep for this leaf field — read it through a `!= null` guard",
-        exprIx,
-      )
-    }
-    const ord = repOfNode(exprIx, fnIx)
+// The failure `optLeafArmOf`'s `fail` names, by the first check that refused.
+function optLeafFail(exprIx: i32, fnIx: i32) {
+  const e = nodeAt(unwrapParen(exprIx))
+  const osi = if e is OptMember { optChainStructIdxOf(e.omObj, fnIx) } else { -1 }
+  if !(e is OptMember) || osi < 0 {
+    return emitFailAt(
+      "emitProgram: `?.` receiver is not a struct chain",
+      exprIx,
+    )
+  }
+  const ofi = sFieldIndex(osi, e.omProp)
+  if ofi < 0 {
+    return emitFailAt("emitProgram: `?.` field is not on the struct", exprIx)
+  }
+  const oRow = sFieldStart[osi] + ofi
+  const oKind = fieldRowKind(oRow)
+  if eqKindIsRecord(oKind) {
+    return emitFailAt(
+      "emitProgram: `?.` yields a nullable struct whose field names no struct row",
+      exprIx,
+    )
+  }
+  if oKind == "map" || oKind == "nulmap" {
+    return emitFailAt(
+      "emitProgram: a standalone `?.` map leaf's value type is still open",
+      exprIx,
+    )
+  }
+  if !optChainLeafBoxable(oKind) && fieldRowNumKind(oRow) < 0 {
+    return emitFailAt(
+      "emitProgram: a standalone `?.` has no rep for this leaf field — read it through a `!= null` guard",
+      exprIx,
+    )
+  }
+  const ord = repOfNode(exprIx, fnIx)
+  if (
+    oKind == "union"
+    || (ord.rdKind == "union" && ord.rdNul == 4)
+    || (fieldRowNumKind(oRow) > 0 && ord.rdNul == 4)
+  ) {
+    return emitFailAt(
+      "emitProgram: `?.` yields a nullable scalar but its union box was not collected",
+      exprIx,
+    )
+  }
+  return emitFailAt(
+    "emitProgram: a standalone `?.` has no rep for this result type — read it through `?? d` or a `!= null` guard",
+    exprIx,
+  )
+}
 
-    // `boolean | null` shares one unconditional i32 blocktype: the sentinel 2 (`null`) and
-    // the live 0/1 result are the same valtype, so the two arms below need no cast to join.
-    // `K | null` is the same shape over the literal union's atom, `-1` its null.
-    if (
-      (ord.rdKind == "nulbool" && ord.rdNul == 2)
-      || (ord.rdKind == "i32" && ord.rdNul == 3)
-    ) {
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
+// The leaf's head, after the chain's null test: the `if` at its blocktype, the null arm, `else`.
+// A scalar box's `else` also opens the box with the leaf's tag before the value.
+export function emitOptLeafHead(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return 0 }
+  const osi = optChainStructIdxOf(e.omObj, fnIx)
+  if osi < 0 || osi >= sFieldStart.length || osi >= sHeapIdx.length { return 0 }
+  const ofi = sFieldIndex(osi, e.omProp)
+  const oRow = sFieldStart[osi] + ofi
+  match optLeafArmOf(exprIx, fnIx) {
+    "record" => optLeafNulRefHead(sHeapIdx[sFieldTgtStructIdx(osi, ofi)])
+    "ref" => optLeafNulRefHead(optChainLeafRefHeap(osi, ofi))
+    "map" => optLeafNulRefHead(mapTypeIdxOf(sFieldMapShape(osi, ofi)))
+    "closure" => optLeafNulRefHead(cloStructIdx)
+    "nulstr" => optLeafNulRefHead(sTy())
+    "sentinel" => {
       fbIf(127)
-      if ord.rdNul == 2 { fbI32Const(2) } else { fbI32Const(0 - 1) }
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return 0
-    }
-
-    // `i32 | null` (and a boxed code-16 leaf) rides the `{tag, payload}` box, `null` as the
-    // null tag over an unread payload; both heap types are usage-gated against an uncollected union.
-    // A wide scalar leaf rides the same box: `f64 | null` and `i32 | null` are one rep with
-    // a different tag, so the kind comes from the leaf's own code and never from `i32`.
-    const oBoxKind = fieldRowNumKind(oRow)
-    if (
-      oKind == "union"
-      || (ord.rdKind == "union" && ord.rdNul == 4)
-      || (oBoxKind > 0 && ord.rdNul == 4)
-    ) {
-      let ovbKind = 0
-      if oBoxKind > 0 { ovbKind = oBoxKind }
-      const ovb = vbHeapIdxOfKind(ovbKind)
-      if !uDeclared || (oKind != "union" && ovb < 0) {
-        return emitFailAt(
-          "emitProgram: `?.` yields a nullable scalar but its union box was not collected",
-          exprIx,
-        )
+      if repOfNode(exprIx, fnIx).rdNul == 2 {
+        fbI32Const(2)
+      } else {
+        fbI32Const(0 - 1)
       }
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
+      fbElse()
+    }
+    "boxUnion" | "boxScalar" => {
       fbOpenIf()
       fbValtype("union", -1)
       fbI32Rel(RS_TAG, nullBoxTag())
       fbRefNullNone()
       fbStructNew(uBoxIdx)
       fbElse()
-      if oKind == "union" {
-        if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-        fbStructGet(sHeapIdx[osi], ofi)
-        fbEnd()
-        return 0
+      if fieldRowKind(oRow) != "union" {
+        fbI32Rel(RS_TAG, scalarTagOfKind(optLeafBoxKind(oRow)))
       }
-      fbI32Rel(RS_TAG, scalarTagOfKind(ovbKind))
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbStructNew(ovb)
+    }
+    "nonNull" | "fail" => {}
+  }
+  return 0
+}
+
+// The scalar kind a boxed `?.` leaf at field row `row` rides: its number kind, else 0.
+function optLeafBoxKind(row: i32): i32 {
+  const k = fieldRowNumKind(row)
+  return if k > 0 { k } else { 0 }
+}
+
+// A nullable reference leaf's head over heap `h`: a null link is `ref.null h`.
+function optLeafNulRefHead(h: i32) {
+  fbIfRefNul(h, true)
+  fbRefNull(h)
+  fbElse()
+  return 0
+}
+
+// The leaf's tail, after the non-null chain value: the field read, a scalar's box, the `if`'s end,
+// and a reference leaf's non-null recover.
+export function emitOptLeafTail(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return 0 }
+  const osi = optChainStructIdxOf(e.omObj, fnIx)
+  if osi < 0 || osi >= sFieldStart.length || osi >= sHeapIdx.length { return 0 }
+  const ofi = sFieldIndex(osi, e.omProp)
+  fbStructGet(sHeapIdx[osi], ofi)
+  match optLeafArmOf(exprIx, fnIx) {
+    "record" | "ref" | "map" | "closure" => {
+      fbEnd()
+      return optReadRecoverNonNull(exprIx, fnIx)
+    }
+    "boxScalar" => {
+      fbStructNew(vbHeapIdxOfKind(optLeafBoxKind(sFieldStart[osi] + ofi)))
       fbStructNew(uBoxIdx)
       fbEnd()
-      return 0
     }
-
-    // `string | null` is the nullable raw-array ref niche, so a null link is `ref.null
-    // $sTypeIdx` and a present one the field's own string — no box needed.
-    if oKind == "nulstr" || (ord.rdKind == "nulstr" && ord.rdNul == 1) {
-      if emitOptChainIsNull(exprIx, fnIx) < 0 { return -1 }
-      fbIfRefNul(sTy(), true)
-      fbRefNull(sTy())
-      fbElse()
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      fbEnd()
-      return 0
-    }
-    // A chain the hole instance pins non-null is the plain field read, at the field's own rep (D3215).
-    if tyProvesNonNull(nodeTyAt(exprIx, fnIx)) {
-      if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[osi], ofi)
-      return 0
-    }
-    return emitFailAt(
-      "emitProgram: a standalone `?.` has no rep for this result type — read it through `?? d` or a `!= null` guard",
-      exprIx,
-    )
+    "sentinel" | "boxUnion" | "nulstr" => fbEnd()
+    "nonNull" | "fail" => {}
   }
-  return emitFailAt(
-    "emitProgram: expected an optional-chain member access",
-    exprIx,
-  )
+  return 0
 }
 
 // Push the raw union box ref of the binding the `Ident` read at `ix` denotes (a local, param,

@@ -14,6 +14,7 @@ import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleFe, monoBundleReadFe } from "./emit_mono"
 import { slotRowTyOf } from "./emit_rep"
+import { optLeafArmOf } from "./wasmEmit"
 import {
   bundleAnyNoted,
   bundleParamOfRead,
@@ -9008,6 +9009,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     return asCast(b, n, ix, rep)
   }
   if n is ObjLit { return objLit(b, ix, rep) }
+  if n is OptMember { return optRead(b, n, ix, rep) }
   return irBMiss("expression " + irAstKind(ix))
 }
 
@@ -9143,6 +9145,30 @@ function shiftMaskFold(b: i32[], f: i64[], w: i32, ix: i32, rep: i32): Opnd {
     oiBits: if w == 64 { mj } else { (mj as% i32) as i64 },
   }
   return irBLetTemp(b, { poOp: "and", poArgs: [s, m] }, ix, rep)
+}
+
+// A standalone `?.` over one link and an unstaged base (`ROptRead`), as `emitOptMemberValueGo`
+// writes it along `optLeafArmOf`: the base is a variable read twice, which owes no recover.
+function optRead(b: i32[], n: OptMember, ix: i32, rep: i32): Opnd {
+  if exprIsNulNone(ix, ibFnIx) { return irBMiss("optional read of null") }
+  if optLeafArmOf(ix, ibFnIx) == "fail" { return irBMiss("optional read arm") }
+  const base = unwrapParen(n.omObj)
+  if base < 0 || base >= P.nodes.length || nodeAt(base) is OptMember {
+    return irBMiss("optional read chain")
+  }
+  if optChainStagesRecv(ix) { return irBMiss("optional read staged") }
+  if readOwesNonNullRecover(n.omObj, ibFnIx) {
+    return irBMiss("optional read recover")
+  }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  if rep != repNodeOfTy(ty) { return irBMiss("optional read rep") }
+  const r = irBExpr(b, n.omObj)
+  if ibMiss != "" { return r }
+  if !(r is OVar) || r.ov < 0 || ib.irVars[r.ov].vKind == "temp" {
+    return irBMiss("optional read base")
+  }
+  return irBLetTempTy(b, { orV: r, orAt: ix }, ix, rep, ty)
 }
 
 // A string literal at the `str` rep, or delivered as its destination's interned atom.
