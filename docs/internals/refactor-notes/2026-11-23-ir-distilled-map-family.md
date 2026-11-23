@@ -11,11 +11,14 @@ takes its map family as one batch.
 | `map key i64` | 10 | `mapKeyArmOf`'s i64 arm: the key at its own width | yes |
 | `method delete` | 10 (exposed) | the IR has no map delete | yes |
 | `for in pair` | 13 (exposed) | a walk's second name | yes, at an i32 or a string |
-| `map get rep` | 20 | the hole instance types the read `boolean`/`AB`, and the map holds `\| null` | yes; next stop named below |
+| `map get rep` | 20 | the hole instance types the read `boolean`/`AB`, and the map holds `\| null` | 17, at `boolean \| null`; next stop named below |
 | `map read default rep` | 12 | a record type with no struct row (`{r: null}`), stored in another row | no: its own follow-up |
 
 `map get rep`'s next stops: 10 functions at `box ladder` (`holeBoxPlanOf`'s "ladder", which the IR
-has no plan for, sent to IR-N9) and 10 at `union if arm rep` (chained `a ?? b ?? c`, sent to IR-N2).
+has no plan for; IR-N9 placed it in IR-N2's coalesce family) and 10 at `union if arm rep` (chained
+`a ?? b ?? c`, IR-N2's). The 3 left at `map get rep` hold a `K | null` atom value: a niche read of
+one fed a following `?? "s"` a bare-atom decode (verifier rule 2 in
+`tests/cases/maps/one-literal-map-value-delivery.vl`), so the read takes only `boolean | null`.
 
 `map read default rep`: in every cell the map slot's value type is the literal-inferred
 `{r: null}`, which has no struct row, yet the slot stores struct row 0 or 1 (`mvValStructIdxOf`).
@@ -40,9 +43,10 @@ row that stores it, so it goes in a follow-up of its own.
    computes it with; the lowering checks the variable against the loop record's `pIdx`. Legacy's
    index-counter init is `forInPairInit`, shared by both writers. The rolled helpers already bind
    and step the pair.
-5. **a niche map read.** A read the instance types without its map value's null is held at the
-   map's value rep and typed at its value type (`mapReadNicheTy`), as legacy's helper returns that
-   niche.
+5. **a niche map read.** A read the instance types without its map value's `boolean | null` null
+   is held at the map's value rep and typed at its value type (`mapReadNicheTy`), as legacy's
+   helper returns that niche. `ir_build.vl` now imports `tyMapValOf`, `forInBindTy` and `TY_I64`,
+   so its phase-state surface is re-baselined 9 -> 12.
 
 ## Legacy tails the IR calls
 
@@ -53,7 +57,23 @@ row that stores it, so it goes in a follow-up of its own.
 
 ## Readings (fixpoint seeds on both sides)
 
-READINGS
+Functions with no blocker, `VL_IR_SHADOW=4`: distilled corpus 45,401 -> 45,424; tests/cases
+71,667 -> 71,738. Fully IR-only tests/cases programs (`ir-only-census.vl`): 5,224 -> 5,289.
+
+| class | corpus any (alone) before | after | tests/cases any (alone) before | after |
+| --- | --- | --- | --- | --- |
+| `print nulBool` | 11 (11) | 2 (0) | 29 (27) | 2 (0) |
+| `map key` | 10 (0) | 0 | 21 (0) | 5 (0) |
+| `method delete` | 10 (4) | 0 | 40 (24) | 0 |
+| `for in pair` | 13 (7) | 9 (0) | 28 (17) | 5 (0) |
+| `map get rep` | 20 (20) | 3 (3) | 1 (1) | 1 (1) |
+
+Armed tests/cases: covered 71,667 -> 71,738, matched 71,666 -> 71,737. Identity: `--names`
+identical 9,037, differ 0; `--cases` identical 7,686, differ 0, witnesses same 61; tests/cases A/B
+identical 7,405, differ 0; `--claimless` identical 14,033, differ 0; mode 3 and armed
+self-compile identical. L2 self-compile fuel +0.23% on its base. Late demands 9 (baseline 9),
+late tag rows 307 (baseline 307). `regress.vl`: no runs lost. Deep-nesting margin: base 900 KB,
+head 910 KB.
 
 Witnesses, one per mechanism, each printing the same under the base and the candidate seed:
 `tests/cases/null/print-nullable-boolean-of-map-has-and-field.vl`,
