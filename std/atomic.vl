@@ -1,0 +1,85 @@
+// `std:atomic` — indivisible reads, writes and waits on i32 words inside a `Buf`.
+//
+//     import { atomicAddI32, atomicLoadI32, atomicNotify, atomicWaitI32 } from "std:atomic"
+//
+// For instances sharing one memory (`vl build --import-memory --shared-memory=<pages>`). Every
+// op is sequentially consistent. `off` is a byte offset into the `Buf`; each call traps unless
+// [off, off + 4) is inside it, and on an address that is not a multiple of 4. A module apart
+// from `std:buffer`, which stays plain access, so an atomic is always visible at its import.
+// Only i32 words: no i64 or narrow widths, no fence, and no lock or barrier — build those
+// from these.
+
+import { Buf } from "std:buffer"
+
+// The address of the word at `off`, after the range check every export makes.
+function wordAt(self: Buf, off: i32) {
+  if off < 0 || off > self.length - 4 {
+    __trap__("std:atomic: [off, off + 4) is not inside the buffer")
+  }
+  return self.base + off
+}
+
+// The word at `off`, read atomically: never a mix of two writes.
+export function atomicLoadI32(self: Buf, off: i32): i32 {
+  return __atomic_load_i32__(wordAt(self, off))
+}
+
+// Write `v` to the word at `off` atomically, visible to every instance's next atomic read.
+export function atomicStoreI32(self: Buf, off: i32, v: i32) {
+  __atomic_store_i32__(wordAt(self, off), v)
+}
+
+// The read-modify-writes: each replaces the word at `off` with `old op v` in one indivisible
+// step and answers `old`, the value it replaced. Add and sub wrap on overflow.
+export function atomicAddI32(self: Buf, off: i32, v: i32): i32 {
+  return __atomic_rmw_add_i32__(wordAt(self, off), v)
+}
+
+export function atomicSubI32(self: Buf, off: i32, v: i32): i32 {
+  return __atomic_rmw_sub_i32__(wordAt(self, off), v)
+}
+
+export function atomicAndI32(self: Buf, off: i32, v: i32): i32 {
+  return __atomic_rmw_and_i32__(wordAt(self, off), v)
+}
+
+export function atomicOrI32(self: Buf, off: i32, v: i32): i32 {
+  return __atomic_rmw_or_i32__(wordAt(self, off), v)
+}
+
+// Replace the word at `off` with `v` unconditionally; answers the value it replaced.
+export function atomicExchangeI32(self: Buf, off: i32, v: i32): i32 {
+  return __atomic_rmw_xchg_i32__(wordAt(self, off), v)
+}
+
+// Replace the word at `off` with `v` only if it holds `expected`; answers the value it held
+// either way, so the swap happened exactly when the answer equals `expected`.
+export function atomicCompareExchangeI32(
+  self: Buf,
+  off: i32,
+  expected: i32,
+  v: i32,
+): i32 {
+  return __atomic_rmw_cmpxchg_i32__(wordAt(self, off), expected, v)
+}
+
+// Block until an `atomicNotify` on this word wakes it, if the word at `off` still holds
+// `expected`; "not-equal" returns at once when it does not. A wake is not a promise the word
+// changed: re-read it in a loop. Traps over an unshared memory, and where the host forbids
+// blocking (a browser's main thread). There is no timeout.
+export function atomicWaitI32(
+  self: Buf,
+  off: i32,
+  expected: i32,
+): "woken" | "not-equal" {
+  const r = __atomic_wait32__(wordAt(self, off), expected, -1 as i64)
+  if r == 1 { return "not-equal" }
+  return "woken"
+}
+
+// Wake at most `count` instances blocked in `atomicWaitI32` on the word at `off`, oldest
+// first; answers how many it woke, 0 when none was waiting. Traps on a negative `count`.
+export function atomicNotify(self: Buf, off: i32, count: i32): i32 {
+  if count < 0 { __trap__("std:atomic.atomicNotify: count is negative") }
+  return __atomic_notify__(wordAt(self, off), count)
+}

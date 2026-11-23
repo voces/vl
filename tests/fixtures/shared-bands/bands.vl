@@ -1,0 +1,149 @@
+// One module, instantiated by an owner worker and N helper workers over one shared memory
+// (`vl build --import-memory --shared-memory=<pages>`): the pattern `docs/guide/workers.md`
+// documents. Top-level code runs in every instance, so it writes nothing to the shared memory;
+// the owner calls `setup` once and hands the one address it answers to every helper.
+import {
+  Buf,
+  Buffer,
+  loadF32,
+  loadF64,
+  loadI32,
+  storeF32,
+  storeF64,
+  storeI32,
+} from "std:buffer"
+import {
+  atomicAddI32,
+  atomicLoadI32,
+  atomicNotify,
+  atomicStoreI32,
+  atomicWaitI32,
+} from "std:atomic"
+
+// The control block, as byte offsets of i32 words. GEN wakes helpers for a new tick (-1 asks
+// them to stop), TICK is the tick a claimed band belongs to, NEXT is the job counter helpers
+// claim bands from, and DONE counts finished bands.
+const GEN = 0
+const TICK = 4
+const NEXT = 8
+const DONE = 12
+// Plain words the owner writes in `setup`, before any helper exists: the layout of the job.
+const WIDTH = 16
+const HEIGHT = 20
+const BANDS = 24
+const GRID = 28
+const PARTIALS = 32
+const CTL_BYTES = 36
+
+// A notify count no worker pool reaches: wake every waiter.
+const EVERY_WAITER = 2147483647
+
+// The control block at `ctl`, the address `setup` answered.
+function control(ctl: i32): Buf { return { base: ctl, length: CTL_BYTES } }
+
+// Owner only: allocate the control block, a `width` × `height` f32 grid and one f64 partial
+// sum per band, zero the grid, and answer the control block's address for the helpers.
+export function setup(width: i32, height: i32, bands: i32): i32 {
+  const c = Buffer(CTL_BYTES)
+  const grid = Buffer(width * height * 4)
+  const partials = Buffer(bands * 8)
+  c.storeI32(WIDTH, width)
+  c.storeI32(HEIGHT, height)
+  c.storeI32(BANDS, bands)
+  c.storeI32(GRID, grid.base)
+  c.storeI32(PARTIALS, partials.base)
+  return c.base
+}
+
+// One band's rows: regrow every cell, then sum the band in row order into its own partial.
+function runBand(c: Buf, band: i32, tick: i32) {
+  const width = c.loadI32(WIDTH)
+  const height = c.loadI32(HEIGHT)
+  const bands = c.loadI32(BANDS)
+  const grid: Buf = { base: c.loadI32(GRID), length: width * height * 4 }
+  const partials: Buf = { base: c.loadI32(PARTIALS), length: bands * 8 }
+  const y0 = band * height / bands
+  const y1 = (band + 1) * height / bands
+  let sum = 0.0
+  let y = y0
+  while y < y1 {
+    let x = 0
+    while x < width {
+      const off = (y * width + x) * 4
+      const grow = ((x * 31 + y * 17 + tick) & 15) as f32
+      const v = grid.loadF32(off) * (0.75 as f32) + grow
+      grid.storeF32(off, v)
+      sum = sum + (v as f64)
+      x = x + 1
+    }
+    y = y + 1
+  }
+  partials.storeF64(band * 8, sum)
+}
+
+// Claim bands from the job counter until none is left; each finished band counts in DONE,
+// and the one that finishes the last band wakes the owner. The tick is read AFTER the claim:
+// a helper still draining tick t can win band 0 of tick t + 1, and TICK already says t + 1.
+function drain(c: Buf) {
+  const bands = c.loadI32(BANDS)
+  while true {
+    const band = c.atomicAddI32(NEXT, 1)
+    if band >= bands { return }
+    runBand(c, band, c.atomicLoadI32(TICK))
+    if c.atomicAddI32(DONE, 1) + 1 == bands { c.atomicNotify(DONE, 1) }
+  }
+}
+
+// Owner: run tick `tick` (1, 2, 3, ...: GEN starts at 0) across every helper and itself, block
+// until every band is done, and answer the partials combined in band order — the same bits for
+// any helper count.
+export function tick(ctl: i32, tick: i32): f64 {
+  const c = control(ctl)
+  const bands = c.loadI32(BANDS)
+  // TICK and DONE before NEXT: the first claim of this tick must see both.
+  c.atomicStoreI32(TICK, tick)
+  c.atomicStoreI32(DONE, 0)
+  c.atomicStoreI32(NEXT, 0)
+  c.atomicStoreI32(GEN, tick)
+  c.atomicNotify(GEN, EVERY_WAITER)
+  drain(c)
+  let done = c.atomicLoadI32(DONE)
+  while done < bands {
+    c.atomicWaitI32(DONE, done)
+    done = c.atomicLoadI32(DONE)
+  }
+  const partials: Buf = { base: c.loadI32(PARTIALS), length: bands * 8 }
+  let total = 0.0
+  let b = 0
+  while b < bands {
+    total = total + partials.loadF64(b * 8)
+    b = b + 1
+  }
+  return total
+}
+
+// Owner: wake every helper with GEN = -1, so each `serve` returns.
+export function stop(ctl: i32) {
+  const c = control(ctl)
+  c.atomicStoreI32(GEN, -1)
+  c.atomicNotify(GEN, EVERY_WAITER)
+}
+
+// Helper: wait for each new tick, drain its bands, and return once the owner stops it.
+// Answers how many ticks this helper saw.
+export function serve(ctl: i32): i32 {
+  const c = control(ctl)
+  let seen = c.atomicLoadI32(GEN)
+  let ticks = 0
+  while true {
+    let gen = c.atomicLoadI32(GEN)
+    while gen == seen {
+      c.atomicWaitI32(GEN, seen)
+      gen = c.atomicLoadI32(GEN)
+    }
+    if gen == -1 { return ticks }
+    seen = gen
+    ticks = ticks + 1
+    drain(c)
+  }
+}

@@ -127,8 +127,9 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 Each consumer keeps its own list. Re-run an ask before scheduling it.
 - **webcraft:** `~/webcraft/docs/design/vl-requirements.md`, and in-repo
   [`docs/webcraft-requirements.md`](docs/webcraft-requirements.md).
-- **plumb:** `~/plumb/docs/vl-issues.md`. Queued: std wrappers over the shared-memory and atomics
-  intrinsics, and raw integer SIMD intrinsics, each through std-api-reviewer.
+- **plumb:** `~/plumb/docs/vl-issues.md`. Queued: raw integer SIMD intrinsics, through
+  std-api-reviewer. The i32 atomics wrappers are `std:atomic` (#9677, shared with aillu); re-run
+  plumb's ask against it for any width or op it still lacks.
 - **veldt and sunsuz:** these are on ask only.
   - SIMD S4: integer and byte shapes (`I32x4`, `U8x16`, ...) in `std:simd`.
   - `flat` sub-byte fields and newtypes over byte widths (flat-records-design.md §11.3).
