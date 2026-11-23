@@ -138,6 +138,9 @@ export type RBoxNarrow = {
 // `uaCellNul`: the destination is a binding whose cell is a nullable arm, which legacy casts to as
 // a nullable ref whatever the value's own nullability (`emitLetDelivery`).
 export type RArmUnbox = { uaV: Opnd, uaAt: i32, uaCellNul: boolean }
+// An element read `asAt` through a union-of-lists box variable `asV`, written by legacy's tag chain
+// (`armSiteWrite`) per arm with `asIx`, a variable or an immediate, as its index.
+export type RArmSite = { asV: Opnd, asIx: Opnd, asAt: i32 }
 // A box local read at its storage as the niche (`nicheReadKindAt`, kind `nrKind`) its narrowing
 // names, `nrAt` the read: the null tag is the niche's null, any other arm its payload.
 export type RNicheRead = { nrV: Opnd, nrAt: i32, nrKind: i32 }
@@ -247,8 +250,15 @@ export type RTruncSat = {
 // A memory-management intrinsic at call node `moAt` over its i32 operands (`memOpPlanOf`).
 export type RMemOp = { moArgs: Opnd[], moAt: i32 }
 // `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on;
-// `lgStored` where the builder built it at its storage (`isStorageRead`).
-export type RListGet = { lgV: Opnd, lgIx: Opnd, lgAt: i32, lgStored: boolean }
+// `lgStored` where the builder built it at its storage (`isStorageRead`). `lgAgain`: the read as
+// `irHoistRecv` writes it once more, a temp operand read again, not taken.
+export type RListGet = {
+  lgV: Opnd,
+  lgIx: Opnd,
+  lgAt: i32,
+  lgStored: boolean,
+  lgAgain: boolean,
+}
 // `llAt`: the `.length` `Member` node, which legacy's hoist and view decisions key on.
 export type RListLen = { llV: Opnd, llAt: i32 }
 // `nwV`, of number kind `nwSrc`, widened to kind `nwDst` at delivery node `nwAt` (kinds as
@@ -559,6 +569,9 @@ export type RResultPick = { rkV: Opnd, rkAt: i32, rkFe: i32 }
 // The member closure argument `hpI` (node `hpArg`) of direct call `hpAt` hands of the bundle record
 // `hpV` it reads, as `bundleMemberPickOf` (legacy's `emitBundleMemberPick`) names it.
 export type RHandPick = { hpV: Opnd, hpAt: i32, hpArg: i32, hpI: i32 }
+// The member annotated binding `hkAt` takes of the bundle holder record `hkV` its initializer
+// `hkArg` reads, as legacy's `emitTypedHolderInit` picks it (`typedHolderMember`).
+export type RHolderPick = { hkV: Opnd, hkAt: i32, hkArg: i32 }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
 // reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing. `tag64`
@@ -573,7 +586,8 @@ export type RRel = { rlSp: i32, rlSub: i32, rlVal: i32 }
 // argument before one whose valued `if` the lowering writes it below (`stageLead`), or a union box
 // read at a narrower union's box rep, the same box.
 export type RStage = { sgV: Opnd }
-export type Rhs = RArmUnbox
+export type Rhs = RArmSite
+  | RArmUnbox
   | RAsTail
   | RAsUnion
   | RAtomEq
@@ -602,6 +616,7 @@ export type Rhs = RArmUnbox
   | RGetField
   | RGlobalGet
   | RHandPick
+  | RHolderPick
   | RHoleOptBox
   | RInitProgress
   | RJoinNull
@@ -1233,7 +1248,8 @@ export function irNodeEndsPath(n: IrNode): boolean {
   return match r {
     RCall => r.caNever
     RCallHost => r.chNever
-    RArmUnbox |
+    RArmSite |
+      RArmUnbox |
       RAsTail |
       RAsUnion |
       RAtomEq |
@@ -1260,6 +1276,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RGetField |
       RGlobalGet |
       RHandPick |
+      RHolderPick |
       RHoleOptBox |
       RInitProgress |
       RJoinNull |
@@ -1649,6 +1666,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RAsUnion => [r.auV]
     RAsTail => [r.akV]
     RArmUnbox => [r.uaV]
+    RArmSite => [r.asV, r.asIx]
     RTagStash => [r.tgsV]
     RStashSet => [r.ssV]
     RTagIs => []
@@ -1681,6 +1699,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RBundlePick => [r.bpV]
     RResultPick => [r.rkV]
     RHandPick => [r.hpV]
+    RHolderPick => [r.hkV]
     RRawOp => r.rwArgs
     RRel => []
     RStage => [r.sgV]
@@ -1762,6 +1781,7 @@ function rhsText(r: Rhs): string {
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RAsUnion => "as.union " + opndText(r.auV)
     RAsTail => "as.tail " + opndText(r.akV)
+    RArmSite => "arm_site " + opndText(r.asV) + "[" + opndText(r.asIx) + "]"
     RArmUnbox => "arm_unbox "
       + opndText(r.uaV)
       + " @"
@@ -1851,6 +1871,7 @@ function rhsText(r: Rhs): string {
     RBundlePick => "bundle pick " + opndText(r.bpV)
     RResultPick => "result pick " + opndText(r.rkV)
     RHandPick => "hand pick " + opndText(r.hpV)
+    RHolderPick => "holder pick " + opndText(r.hkV)
     RGlobalGet => "global " + i32ToStr(r.ggSym) + (if r.ggNonNull { " nonnull" } else { "" })
   }
 }
@@ -2155,7 +2176,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RMapNew |
       RMapOp |
       RMapSet => "map"
-    RArmUnbox |
+    RArmSite |
+      RArmUnbox |
       RAsUnion |
       RBoxField |
       RBoxNarrow |
@@ -2178,6 +2200,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       REnvDrop |
       REnvGet |
       RHandPick |
+      RHolderPick |
       RMakeClo |
       RResultPick => "closure"
     RCellGet |
