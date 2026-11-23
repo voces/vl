@@ -272,6 +272,16 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   `-O` and `-O3` inline it away; §M2 has the number. `wasm-opt -O` does NOT inline the
   plain accessor wrappers; `-O3 --closed-world` does (§O1).
 
+- **The byte-wide views (`u8view`/`u16view`, #9675) copy the i32 contract exactly**: an
+  extent check per view, `0 <= i < length` per access, and an out-of-range WRITE traps as
+  `setI32` does, because a silent write corrupts the neighbouring column. A write keeps the
+  low bits like `store8`/`store16`, so storing 300 into a u8 is not checked. A u16 view
+  needs no even `off`: the halfword instructions are legal at any address. There is no
+  `i8`/`i16` view because no consumer column is signed: they would add ~11 exports per
+  width on speculation, and a signed column reads through `loadI8`/`loadI16` meanwhile.
+  `viewNarrowBase` is separate from `view4Base` so the i32/f32 views' bodies, and so every
+  existing program's bytes, stay as they were.
+
 - **`window` is a view, not a copy, and CHECKS its range** — the one `Buf`-returning
   function besides `Buffer`. It traps rather than answering an error, which is this
   module's convention for every range check (`storeBytes`, `loadBytes`, the views), and is
@@ -1279,3 +1289,29 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
   release can legitimately rewind below it.
 - Protocol and rationale: DECISIONS.md §"std:buffer's allocator over a shared memory";
   layout: `buffer-design.md` §N.
+
+## `std:atomic` (2026-11-23, #9677)
+
+- **A module of its own, not more of `std:buffer`.** `std:buffer`'s header is at its 10-line
+  budget with the allocator's contract, and an atomic op is a different promise from a plain
+  load (ordering, blocking). A separate import also makes every file that coordinates workers
+  say so at its top. `std:atomic` imports `Buf` and does not re-export it: every caller already
+  imports `std:buffer` for `Buffer`.
+- **Every export range-checks, unlike `loadI32`.** A stray atomic is a write into another
+  worker's protocol word that nothing traps; the check is one compare beside an atomic op.
+  Alignment is left to the engine, which traps a misaligned atomic address itself
+  (`tests/cases/atomics/unaligned-traps.vl`).
+- **No timeout, no fence, no i64 or narrow widths**: aillu's barrier and job counter (#9677) and
+  plumb's queued ask need none. `atomicWaitI32` passes `-1` (no timeout), so the engine's
+  third answer, 2 "timed out", cannot occur and the result is `"woken" | "not-equal"`.
+- **`atomicNotify` traps on a negative count** rather than reading it as unsigned (`-1` would
+  wake 2^32 − 1); its doc comment tells a caller who means every waiter to pass `2147483647`.
+- **`"woken"` is a deliberate rename of JS `Atomics.wait`'s `"ok"`** (`"not-equal"` is kept):
+  `"ok"` reads as a success flag beside the `T | E` model. A timeout form would be a new export
+  (`atomicWaitI32For(self, off, expected, timeoutNs: i64)`) adding `"timed-out"`.
+- **Admitted under D2's consumer-in-the-tree clause**: the `tests/fixtures/shared-bands/`
+  fixtures and the guide, on aillu's #9677 and plumb's queued ask. xor is left out for want of one.
+- The wrappers lower to the existing `__atomic_*__` intrinsics (`check_intrinsics.vl`
+  `atomicTableBuild`); no compiler change. Pinned by `tests/cases/std/atomic-*.vl` and
+  `tests/vl_shared_memory_bands_test.ts`; the multi-instance facts it relies on are measured in
+  `docs/guide/workers.md`.
