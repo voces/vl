@@ -20,7 +20,7 @@ Shadow mode over tests/cases, every `open temp type` row, master 3db525436's fix
 this branch: functions 11 → 0, start bodies 7 → 7.
 
 Rows: `tests/ir-shadow-rows/capture-hole-bundle-parameter.vl` (master 39 of 45 matched, branch 45)
-and `tests/ir-shadow-rows/capture-forward-no-binding-frame.vl` (master 77 of 78, branch 78).
+and `tests/ir-shadow-rows/capture-forward-no-binding-frame.vl` (master 16 of 17, branch 17).
 
 ## Left
 
