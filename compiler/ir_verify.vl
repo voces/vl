@@ -15,6 +15,7 @@ import {
   OVar,
   Opnd,
   PStaged,
+  RArmSite,
   RArmUnbox,
   RAsTail,
   RAsUnion,
@@ -44,6 +45,7 @@ import {
   RGetField,
   RGlobalGet,
   RHandPick,
+  RHolderPick,
   RHoleOptBox,
   RInitProgress,
   RJoinNull,
@@ -119,6 +121,8 @@ import {
   RTruncSat,
   RUnionConcreteEq,
   RUnionEq,
+  RUnionNumCrossEq,
+  RUnionVariantEq,
   RVariantChain,
   RVariantDiscrim,
   Rhs,
@@ -172,10 +176,12 @@ import {
   repNodeAt,
   repNodeKids,
   repNodeOfTy,
+  repTyIsLoneStrLit,
   repTyOf,
 } from "./emit_rep"
 import {
   boxListRetag,
+  boxMapRetag,
   cloHoleRetag,
   irNodeEndsPath,
   listRetag,
@@ -607,6 +613,19 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RArmSite => {
+      use(r.asV, at)
+      use(r.asIx, at)
+      const kr = opRep(r.asIx)
+      if !boxShaped(opRep(r.asV)) || kr != vfI32 && kr != vfStr {
+        return fail(
+          2,
+          at,
+          "an arm-site read takes a union box and an i32 index or a string key",
+        )
+      }
+      0
+    }
     RArmUnbox => {
       use(r.uaV, at)
       if !boxShaped(opRep(r.uaV)) {
@@ -940,6 +959,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if (
         !listRetag(opRep(r.rgV), dst)
         && !boxListRetag(opRep(r.rgV), dst)
+        && !boxMapRetag(opRep(r.rgV), dst)
         && !listRetagHole(vf, opRep(r.rgV), dst)
         && !cloHoleRetagAlike(opRep(r.rgV), dst)
         && !recRetag(opRep(r.rgV), dst)
@@ -947,6 +967,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         && !plainRecordsLowerAlike(opRep(r.rgV), dst)
         && !recFieldsWiden(opRep(r.rgV), dst, vf.irRecHeap)
         && !recSubRetag(opRep(r.rgV), dst, vf.irRecHeap, vf.irRecSub)
+        && !repNullRefFits(opRep(r.rgV), dst)
         && (!(d is RNullable)
           || !nicheRetag(d.rnDisc, d.rnInner)
           || d.rnInner != opRep(r.rgV))
@@ -954,7 +975,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(
           2,
           at,
-          "a retag is not of an atom or a string into its own nullable niche, a ref list as itself or into its hole, a variant record as its struct twin, or a record as one whose fields, or leading fields, lower alike or widen to its nullable fields",
+          "a retag is not of an atom or a string into its own nullable niche, the bottom ref into a nullable reference, a box map as another, a ref list as itself or into its hole, a variant record as its struct twin, or a record as one whose fields, or leading fields, lower alike or widen to its nullable fields",
         )
       }
       0
@@ -1087,15 +1108,39 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         && (!(bv is OVar)
           || bv.ov < 0
           || bv.ov >= vf.irVars.length
-          || vf.irVars[bv.ov].vKind == "temp")
+          || vf.irVars[bv.ov].vKind == "temp" && !r.ucAgain)
       ) {
         return fail(2, at, "a union compare's box is not a re-read variable")
+      }
+      const ov = r.ucOther
+      if (
+        r.ucNul
+        && (!(ov is OVar)
+          || ov.ov < 0
+          || ov.ov >= vf.irVars.length
+          || vf.irVars[ov.ov].vKind == "temp")
+      ) {
+        return fail(
+          2,
+          at,
+          "a union compare's null-leg operand is not a re-read variable",
+        )
       }
       0
     }
     RUnionEq => {
       use(r.ueL, at)
       use(r.ueR, at)
+      0
+    }
+    RUnionVariantEq => {
+      use(r.uvBox, at)
+      use(r.uvOther, at)
+      0
+    }
+    RUnionNumCrossEq => {
+      use(r.ncBox, at)
+      use(r.ncOther, at)
       0
     }
     RListEq => {
@@ -1650,6 +1695,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       if dst >= 0 && !(repNodeAt(dst) is RClosure) {
         return fail(2, at, "a hand member of a non-closure rep")
+      }
+      0
+    }
+    RHolderPick => {
+      use(r.hkV, at)
+      if !(repNodeAt(opRep(r.hkV)) is RRecord) {
+        return fail(2, at, "a holder pick of a non-record value")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RClosure) {
+        return fail(2, at, "a holder member of a non-closure rep")
       }
       0
     }
@@ -2375,14 +2430,14 @@ function stmt(id: i32, prev: i32) {
           "a walk's variable is not a local of its element rep",
         )
       }
-      // A second name is a local index, or a map walk's value at an i32 or a string.
+      // A second name is a local index, or a map walk's value, whose rep rule 3 ties to its type.
       const v2 = n.xfVar2
       if v2 >= 0 && (v2 >= vf.irVars.length || vf.irVars[v2].vKind != "local") {
         return fail(2, id, "a walk's second name is not a local")
       }
       if v2 >= 0 {
         const pr = vf.irVars[v2].vRep
-        if pr != vfI32 && !((n.xfMap >= 0 || recvMap) && pr == vfStr) {
+        if pr != vfI32 && n.xfMap < 0 && !recvMap {
           return fail(
             2,
             id,
@@ -2764,7 +2819,8 @@ function simdCheck(r: RSimd, dst: i32, at: i32) {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RArmUnbox |
+    RArmSite |
+      RArmUnbox |
       RAsTail |
       RAsUnion |
       RAtomEq |
@@ -2793,6 +2849,7 @@ function rhsReadsList(r: Rhs): boolean {
       RGetField |
       RGlobalGet |
       RHandPick |
+      RHolderPick |
       RHoleOptBox |
       RInitProgress |
       RJoinNull |
@@ -2867,6 +2924,8 @@ function rhsReadsList(r: Rhs): boolean {
       RTruncSat |
       RUnionConcreteEq |
       RUnionEq |
+      RUnionNumCrossEq |
+      RUnionVariantEq |
       RVariantChain |
       RVariantDiscrim => false
   }
@@ -3052,7 +3111,12 @@ export function irVerify(f: IrFn): IrVerdict {
       )
     } else if vfHeldOpen(i, v.vTy, v.vRep) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
-    } else if !untyped && repNodeOfTy(v.vTy) != v.vRep && !neverCallTemp(f, i) {
+    } else if (
+      !untyped
+      && repNodeOfTy(v.vTy) != v.vRep
+      && !neverCallTemp(f, i)
+      && !loneLitAtom(v.vTy, v.vRep)
+    ) {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
     }
     i = i + 1
@@ -3199,6 +3263,12 @@ function opndsHoldVar(os: Opnd[], v: i32): boolean {
     if o is OVar && o.ov == v { return true }
   }
   return false
+}
+
+// Whether a variable of type `ty` at rep `rep` is a lone string literal's atom: the rep a record
+// field keeps that literal at (`repTyIsLoneStrLit`), where a binding of it holds the string.
+function loneLitAtom(ty: i32, rep: i32): boolean {
+  return repNodeAt(rep) is RAtom && repTyIsLoneStrLit(ty)
 }
 
 // Whether variable `i` of `f` is a temp whose checker type has no value, defined by a call that
