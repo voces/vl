@@ -1538,6 +1538,7 @@ Deno.test({
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
       "retag-closures-of-differing-arity": 2,
+      "retag-closures-of-differing-arity-noted": 0,
       "retag-field-alike-records-two-heaps": 2,
       "push-many-of-i32": 2,
       "global-read-off-store-type": 2,
