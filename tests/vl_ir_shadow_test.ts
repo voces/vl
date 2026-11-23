@@ -2927,3 +2927,27 @@ Deno.test({
     }
   },
 });
+
+// A field typed by one bare string literal reps at the storage of the row its record is stored at
+// (`rowFieldStorage`): the string where an anonymous literal built from a binding keeps it, the
+// atom where a declared record's row does.
+const ROW_FIELD_STORAGE_ANON =
+  `function h(x: "a") {\n  const w = { f: x, g: 1 }\n  print(w.f)\n}\nh("a")\n`;
+const ROW_FIELD_STORAGE_DECLARED =
+  `type R = { f: "a", g: i32 }\nfunction h(x: "a") {\n  const v: R = { f: "a", g: 1 }\n  const w = { f: x, g: 1 }\n  print(v.f)\n  print(w.f)\n  print(v.g + w.g)\n}\nh("a")\n`;
+Deno.test({
+  name: "ir shadow: a bare-literal field reps at its row's storage and matches",
+  ignore,
+  fn: () => {
+    for (const src of [ROW_FIELD_STORAGE_ANON, ROW_FIELD_STORAGE_DECLARED]) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+      if (src !== ROW_FIELD_STORAGE_ANON) continue;
+      if ((rows.get("covered") ?? 0) !== (rows.get("fns") ?? -1) || (rows.get("matched") ?? 0) !== (rows.get("fns") ?? -1)) {
+        throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+      }
+    }
+  },
+});
