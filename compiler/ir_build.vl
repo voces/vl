@@ -13,13 +13,13 @@ import { cboxElemTyOfCell } from "./emit_rewrite"
 // (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
 // globals); any other construct leaves the function uncovered, a counted reason, not an error.
 // A covered function is verified and then discarded: nothing is claimed, so no byte moves.
-import { emitFail, htStructHeap } from "./emit_bytes"
+import { emitFail, htStructHeap, lbPlanAdd, lbPlanDrop } from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleFe, monoBundleReadFe } from "./emit_mono"
 import { repElemTyOfName, slotRowTyOf } from "./emit_rep"
-import { optLeafArmOf } from "./wasmEmit"
+import { listReserveRegionPushes, optLeafArmOf } from "./wasmEmit"
 import {
   bundleAnyNoted,
   bundleParamOfRead,
@@ -1075,8 +1075,10 @@ let ibLoopCont: i32[] = []
 // The result binding of each break label whose frame carries a loop value.
 let ibLvOf: {[i32]: i32} = Map()
 let ibLabelN = 0
-// The statements whose end closes a list reserve region the body opened (`reserve.open`).
+// The statements whose end closes a list reserve region the body opened (`reserve.open`), and
+// each region's counted pushes, planned for legacy's unroll decision (`lbPlanAdd`).
 let ibReserveEnd: i32[] = []
+let ibReservePushes: i32[][] = []
 // The fully unrolled range loops being built, by `ForRange`, and the constant each copy's
 // variable reads, innermost last. Stacks, not a map: a map delete anywhere in the compiler makes
 // every map it builds dearer.
@@ -10947,10 +10949,6 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
   if why != "" && !opened && !(helpers && why == "wrap exit") {
     return skip("for range " + why)
   }
-  // Inside a list reserve region legacy's pushes append through its locals (D3623).
-  for e in ibReserveEnd {
-    if e >= 0 { return skip("for range in a reserve region") }
-  }
   const k = forRangeStaticStep(n)
   const s = declaredSlotOfDecl(ix)
   const vw = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
@@ -11476,6 +11474,7 @@ function reserveEnds(ix: i32): boolean {
   while i < ibReserveEnd.length {
     if ibReserveEnd[i] == ix {
       ibReserveEnd[i] = -1
+      lbPlanDrop(ibReservePushes[i])
       hit = true
     }
     i = i + 1
@@ -11568,6 +11567,15 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
         ix,
       )
       ibReserveEnd.push(sibs[lr.lrLast])
+      const pushes = listReserveRegionPushes(
+        n,
+        sibs,
+        pos,
+        declaredSlotOfDecl(ix),
+        ibFnIx,
+      )
+      ibReservePushes.push(pushes)
+      lbPlanAdd(pushes)
     }
     return 0
   }
@@ -11992,6 +12000,8 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibMiss = ""
   ibMisses = []
   ibReserveEnd = []
+  ibReservePushes = []
+  lbPlanDrop(null)
   ibRangeImmAt = []
   ibRangeImmVal = []
   ibDeclVar = Map()
