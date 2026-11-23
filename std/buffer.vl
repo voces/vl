@@ -2,8 +2,8 @@
 //
 //     import { Buffer, bufferMark, bufferRelease, loadI32, storeI32 } from "std:buffer"
 //
-// A `Buf` is an ordinary value describing an extent of linear memory that a host reads in
-// place. Only the typed views, `window` and `storeBytes`/`loadBytes` check a range and trap;
+// A `Buf` describes an extent of linear memory that a host reads in place. Only the views
+// (u8, u16, i32, f32; no i8/i16), `window` and `storeBytes`/`loadBytes` check a range and trap;
 // any other read past a `Buf`'s end, or through a view whose `base`/`length` was overwritten,
 // reads whatever is there. `bufferRelease(mark)` invalidates every later `Buf`. `Buffer` uses
 // only the heap window, [1024, 2 GiB) unless `vl build` moves it; under `--shared-memory` its
@@ -349,6 +349,20 @@ export type F32Base = new i32
 // The i32 twin, distinct from `F32Base` only by name — which is the whole job.
 export type I32Base = new i32
 
+// A view of bytes. An element reads zero-extended to i32; a write keeps the low
+// 8 bits of its i32.
+export type U8View = new { base: i32, length: i32 }
+
+// A view of little-endian 16-bit halfwords, read zero-extended; a write keeps
+// the low 16 bits. Element `i` is at byte `2*i`, aligned or not.
+export type U16View = new { base: i32, length: i32 }
+
+// The base address of a u8 view, minted only by `u8base`.
+export type U8Base = new i32
+
+// The u16 twin, minted only by `u16base`.
+export type U16Base = new i32
+
 // Check that `count` 4-byte elements starting at BYTE offset `off` lie inside
 // `self`, and answer their address. Taken once per view, which is what lets
 // each access check only `0 <= i < length`. An empty view is in range.
@@ -358,6 +372,17 @@ function view4Base(self: Buf, off: i32, count: i32): i32 {
   if count > MAX_COUNT_4 { __trap__() }
   const bytes = count << 2
   const end = off + bytes
+  if end < off { __trap__() }
+  if end > self.length { __trap__() }
+  return self.base + off
+}
+
+// `view4Base` for an element of `1 << shift` bytes, `shift` being 0 or 1.
+function viewNarrowBase(self: Buf, off: i32, count: i32, shift: i32): i32 {
+  if off < 0 { __trap__() }
+  if count < 0 { __trap__() }
+  if count > (2147483647 >> shift) { __trap__() }
+  const end = off + (count << shift)
   if end < off { __trap__() }
   if end > self.length { __trap__() }
   return self.base + off
@@ -374,6 +399,20 @@ export function f32view(self: Buf, off: i32, count: i32): F32View {
 // lies inside `self`. A `count` of 0 is in range and satisfies no index.
 export function i32view(self: Buf, off: i32, count: i32): I32View {
   const b = view4Base(self, off, count)
+  return { base: b, length: count }
+}
+
+// `count` bytes starting at byte `off`. Traps unless the whole range lies
+// inside `self`. A `count` of 0 is in range and satisfies no index.
+export function u8view(self: Buf, off: i32, count: i32): U8View {
+  const b = viewNarrowBase(self, off, count, 0)
+  return { base: b, length: count }
+}
+
+// `count` halfwords starting at byte `off`, which need not be even. Traps
+// unless all `2*count` bytes lie inside `self`.
+export function u16view(self: Buf, off: i32, count: i32): U16View {
+  const b = viewNarrowBase(self, off, count, 1)
   return { base: b, length: count }
 }
 
@@ -405,6 +444,38 @@ export function setI32(self: I32View, i: i32, v: i32) {
   __store_i32__(self.base + (i << 2), v)
 }
 
+// Element `i` of a u8 view, zero-extended: 0 to 255. Traps on an index outside
+// `[0, length)`.
+export function getU8(self: U8View, i: i32): i32 {
+  if i < 0 { __trap__() }
+  if i >= self.length { __trap__() }
+  return __load_u8__(self.base + i)
+}
+
+// Write the low 8 bits of `v` to element `i` of a u8 view; higher bits are
+// discarded, not checked. Traps on an index outside `[0, length)`.
+export function setU8(self: U8View, i: i32, v: i32) {
+  if i < 0 { __trap__() }
+  if i >= self.length { __trap__() }
+  __store_i8__(self.base + i, v)
+}
+
+// Element `i` of a u16 view, zero-extended: 0 to 65535. Traps on an index
+// outside `[0, length)`.
+export function getU16(self: U16View, i: i32): i32 {
+  if i < 0 { __trap__() }
+  if i >= self.length { __trap__() }
+  return __load_u16__(self.base + (i << 1))
+}
+
+// Write the low 16 bits of `v` to element `i` of a u16 view; higher bits are
+// discarded, not checked. Traps on an index outside `[0, length)`.
+export function setU16(self: U16View, i: i32, v: i32) {
+  if i < 0 { __trap__() }
+  if i >= self.length { __trap__() }
+  __store_i16__(self.base + (i << 1), v)
+}
+
 // ── the bracket spelling ─────────────────────────────────────────────────────
 
 // `v[i]` and `v[i] = x` over a view: the same bounds check and the same single
@@ -417,6 +488,14 @@ export function "[]"(self: I32View, i: i32): i32 { return getI32(self, i) }
 
 export function "[]="(self: I32View, i: i32, v: i32) { setI32(self, i, v) }
 
+export function "[]"(self: U8View, i: i32): i32 { return getU8(self, i) }
+
+export function "[]="(self: U8View, i: i32, v: i32) { setU8(self, i, v) }
+
+export function "[]"(self: U16View, i: i32): i32 { return getU16(self, i) }
+
+export function "[]="(self: U16View, i: i32, v: i32) { setU16(self, i, v) }
+
 // The ABSOLUTE byte address of element `i` — what a caller mixing view access
 // with the raw intrinsics, or with a host-side typed array, needs. NOT bounds
 // checked: it computes an address rather than dereferencing one, and the
@@ -428,6 +507,14 @@ export function byteAddrF32(self: F32View, i: i32): i32 {
 // The i32 twin.
 export function byteAddrI32(self: I32View, i: i32): i32 {
   return self.base + (i << 2)
+}
+
+// The u8 twin: `base + i`.
+export function byteAddrU8(self: U8View, i: i32): i32 { return self.base + i }
+
+// The u16 twin: `base + 2*i`.
+export function byteAddrU16(self: U16View, i: i32): i32 {
+  return self.base + (i << 1)
 }
 
 // ── hoisted accessors ────────────────────────────────────────────────────────
@@ -446,6 +533,12 @@ export function f32base(self: F32View): F32Base { return self.base as F32Base }
 
 // The i32 twin.
 export function i32base(self: I32View): I32Base { return self.base as I32Base }
+
+// The u8 twin.
+export function u8base(self: U8View): U8Base { return self.base as U8Base }
+
+// The u16 twin.
+export function u16base(self: U16View): U16Base { return self.base as U16Base }
 
 // Element `i` of the f32 extent `[base, base + length*4)`. Traps on an index
 // outside `[0, length)`. `base` comes from `f32base(v)`.
@@ -477,4 +570,36 @@ export function setI32At(base: I32Base, length: i32, i: i32, v: i32) {
   if i < 0 { __trap__() }
   if i >= length { __trap__() }
   __store_i32__((base as! i32) + (i << 2), v)
+}
+
+// Element `i` of the byte extent `[base, base + length)`, zero-extended. Traps
+// on an index outside `[0, length)`. `base` comes from `u8base(v)`.
+export function getU8At(base: U8Base, length: i32, i: i32): i32 {
+  if i < 0 { __trap__() }
+  if i >= length { __trap__() }
+  return __load_u8__((base as! i32) + i)
+}
+
+// Write the low 8 bits of `v` to element `i` of the byte extent. Traps on an
+// index outside `[0, length)`.
+export function setU8At(base: U8Base, length: i32, i: i32, v: i32) {
+  if i < 0 { __trap__() }
+  if i >= length { __trap__() }
+  __store_i8__((base as! i32) + i, v)
+}
+
+// Element `i` of the halfword extent `[base, base + length*2)`, zero-extended.
+// Traps on an index outside `[0, length)`. `base` comes from `u16base(v)`.
+export function getU16At(base: U16Base, length: i32, i: i32): i32 {
+  if i < 0 { __trap__() }
+  if i >= length { __trap__() }
+  return __load_u16__((base as! i32) + (i << 1))
+}
+
+// Write the low 16 bits of `v` to element `i` of the halfword extent. Traps on
+// an index outside `[0, length)`.
+export function setU16At(base: U16Base, length: i32, i: i32, v: i32) {
+  if i < 0 { __trap__() }
+  if i >= length { __trap__() }
+  __store_i16__((base as! i32) + (i << 1), v)
 }
