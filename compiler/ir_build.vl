@@ -195,6 +195,7 @@ import {
   StructFieldArm,
   VariantFieldArm,
   VariantIsArm,
+  VariantRowArm,
   armIndexWriteArmsOf,
   arrCopyCallNamed,
   arrCopyPlanOf,
@@ -398,6 +399,7 @@ import {
   variantFieldBoxTy,
   variantFieldStoreValueArmOf,
   variantIsArmOf,
+  variantRowArmOf,
   zextLoadOf,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
@@ -1373,11 +1375,10 @@ function isEmptyFitArms(
 }
 
 // `recv is X` over a nullable niche at `isArmOf`'s null-test rung: the niche's own null test
-// (`nulTestArmOf`, niche only), true for present unless `X` is `null`. An impossible test misses.
+// (`nulTestArmOf`, niche only), true for present unless `X` is `null`. An impossible test is
+// false, its receiver evaluated when it is no re-readable place.
 function isNulTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
-  if isNulTestImpossible(ix, ibFnIx) {
-    return irBMiss("is impossible null test")
-  }
+  if isNulTestImpossible(ix, ibFnIx) { return isConstTest(b, n, 0, ix, rep) }
   if rep != ibBool { return irBMiss("is result rep") }
   const invert = !isTestsNull(ix)
   const arm = nulTestArmOf(n.isObj, ibFnIx, invert, true)
@@ -1392,11 +1393,20 @@ function isNulTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
 
 // `recv is V` at the variant rung where `V` has no plain tag, along `variantIsArmOf` as
 // `emitIsTestVariant` writes it: the receiver evaluated and dropped, then its constant. The row
-// arm and the alias arm's tag chain are misses.
+// arm is `isVariantRow`'s; the alias arm's tag chain misses.
 function isVariantTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   if rep != ibBool { return irBMiss("is result rep") }
-  const na: VariantIsArm = variantIsArmOf(ix, n, ibFnIx, [])
-  if na == "row" { return irBMiss("is variant shape") }
+  const tags: i32[] = []
+  const na: VariantIsArm = variantIsArmOf(ix, n, ibFnIx, tags)
+  if na == "row" {
+    return isVariantRow(
+      b,
+      n,
+      ix,
+      rep,
+      if tags.length > 0 { tags[0] } else { -1 },
+    )
+  }
   if na != "recordTrue" && na != "pinFalse" {
     return irBMiss("is variant " + na)
   }
@@ -1406,6 +1416,44 @@ function isVariantTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   const bits: i64 = if na == "recordTrue" { 1 } else { 0 }
   const c: Opnd = { oiRep: rep, oiBits: bits }
   return c
+}
+
+// `recv is V` at `V`'s tested row `vi`, along `variantRowArmOf` as `emitIsTestVariantRow` writes
+// it: a static fold, a closed record that never fits, the row's tag alone, or the tag and its
+// discriminant fields. A chain with shared or cross-row field fits misses.
+function isVariantRow(b: i32[], n: IsExpr, ix: i32, rep: i32, vi: i32): Opnd {
+  const arm: VariantRowArm = variantRowArmOf(ix, n, ibFnIx, vi)
+  if arm == "foldTrue" || arm == "foldFalse" {
+    const c: Opnd = {
+      oiRep: rep,
+      oiBits: if arm == "foldTrue" { 1 } else { 0 },
+    }
+    return c
+  }
+  if arm == "neverFits" {
+    const o = irBExpr(b, n.isObj)
+    if ibMiss != "" { return o }
+    irBNode(b, { dpV: o }, -1, ibNoValue, ix)
+    const z: Opnd = { oiRep: rep, oiBits: 0 }
+    return z
+  }
+  if arm != "plainTag" && arm != "discrim" {
+    return irBMiss("is variant row " + arm)
+  }
+  if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  if arm == "discrim" {
+    // Read once per literal, so a variable; the cast to the arm's heap needs a non-null box.
+    if !(v is OVar) || !(repNodeAt(irBOpRep(v)) is RBox) {
+      return irBMiss("is variant discrim receiver")
+    }
+    return irBLetTemp(b, { vdV: v, vdVi: vi, vdAt: ix }, ix, rep)
+  }
+  if !(repNodeAt(irBOpRep(v)) is RBox) && !boxedNullable(irBOpRep(v)) {
+    return irBMiss("is operand rep")
+  }
+  return irBLetTemp(b, { teV: v, teTag: uTags[vi] }, ix, rep)
 }
 
 // `recv is null` over a pinned instance's operand (`nullInstanceIsResult`): its constant, the
