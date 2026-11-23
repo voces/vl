@@ -1204,7 +1204,6 @@ import {
   lastStmtIsValueIf,
   listOpKindOfBin,
   listOpSlotOfBin,
-  memberLenWidensAtom,
   msSetHasPrimKind,
   printUnionArmsUnrenderable,
   printUnionPlan,
@@ -1791,7 +1790,6 @@ import {
   isTestsStorage,
   isVariantTagPlain,
   isWholeOfOneListUnion,
-  lengthIsField,
   listIsAcrossRepsPlan,
   listIsArmTag,
   listLeafTyOf,
@@ -1802,6 +1800,8 @@ import {
   mapSoftTwinClashOf,
   memReadArmOf,
   memRecvOwesNonNull,
+  memberLengthArmOf,
+  memberLengthArmPastGrow,
   monoStaticIsResult,
   msSetOfUnionBox,
   narrowBoxWideArmOf,
@@ -40625,21 +40625,10 @@ export function mapSizeTail(recvIx: i32, fnIx: i32): i32 {
 // Whether `m.length` at `memIx` reaches `emitMemberNode`'s map arm: a map receiver that no earlier
 // `length` arm takes (a record's own field, a list-fit grow row, an arm site, a list or string).
 export function mapLengthPlain(m: Member, memIx: i32, fnIx: i32): boolean {
-  if m.memProp != "length" || !exprMap(m.memObj, fnIx) { return false }
-  if twoListUseMsg(m.memObj, m.memProp, fnIx) != "" { return false }
-  if lengthIsField(m, memIx, fnIx) || armSiteReads(memIx, fnIx) { return false }
-  if (
-    listFitGrowRow(m.memObj, -1, fnIx) >= 0
-    || memberLenWidensAtom(m.memObj, fnIx)
-  ) {
+  if m.memProp != "length" || twoListUseMsg(m.memObj, m.memProp, fnIx) != "" {
     return false
   }
-  return !(exprArray(m.memObj, fnIx)
-    || exprString(m.memObj, fnIx)
-    || exprRefArray(m.memObj, fnIx)
-    || exprStringArray(m.memObj, fnIx)
-    || numListElemOf(exprListRep(m.memObj, fnIx)) != null
-    || exprU8Array(m.memObj, fnIx))
+  return memberLengthArmOf(m, memIx, fnIx) == "map"
 }
 
 function emitMemberNode(e: Member, exprIx: i32, fnIx: i32) {
@@ -40649,33 +40638,34 @@ function emitMemberNode(e: Member, exprIx: i32, fnIx: i32) {
   // length field — the list wrapper's `len` (field 1) or the string header's `len`
   // (field 2), a code-point count. `length` over any other receiver falls through to the struct path.
   if e.memProp == "length" {
-    // A record's own `length` field is any field; the IR's plain read takes the same decision.
-    if lengthIsField(e, exprIx, fnIx) { return emitMem(exprIx, fnIx) }
-    const growLen = emitListFitGrowLen(e, exprIx, fnIx)
-    if growLen != 0 { return if growLen < 0 { -1 } else { 0 } }
-    const armLen = emitArmSite(exprIx, fnIx)
-    if armLen != 0 { return if armLen < 0 { -1 } else { 0 } }
-    // A string-literal union atom widens to its member's string, whose header holds the length.
-    if memberLenWidensAtom(e.memObj, fnIx) {
-      if emitAtomToStr(e.memObj, fnIx) < 0 { return -1 }
-      fbStrLen()
-      return 0
+    // The arm is the one the IR's plain read asks (`memberLengthArmOf`); only a grow candidate's
+    // stash read is decided here, at emit time, and a declined one takes the arm past it.
+    let arm = memberLengthArmOf(e, exprIx, fnIx)
+    if arm == "growCandidate" {
+      const growLen = emitListFitGrowLen(e, exprIx, fnIx)
+      if growLen != 0 { return if growLen < 0 { -1 } else { 0 } }
+      arm = memberLengthArmPastGrow(e, exprIx, fnIx)
     }
-    if (
-      exprArray(e.memObj, fnIx)
-      || exprString(e.memObj, fnIx)
-      || exprRefArray(e.memObj, fnIx)
-      || exprStringArray(e.memObj, fnIx)
-      || numListElemOf(exprListRep(e.memObj, fnIx)) != null
-      || exprU8Array(e.memObj, fnIx)
-    ) {
-      return emitArrLen(exprIx, fnIx)
-    }
-    // G8: `m.length` on a MAP is the LIVE entry count — struct field 5 (`size`),
-    // maintained by set/delete (NOT `count`, which includes tombstones).
-    if exprMap(e.memObj, fnIx) {
-      if emitExpr(e.memObj, fnIx) < 0 { return -1 }
-      return mapSizeTail(e.memObj, fnIx)
+    match arm {
+      "armSite" => {
+        const armLen = emitArmSite(exprIx, fnIx)
+        if armLen != 0 { return if armLen < 0 { -1 } else { 0 } }
+      }
+      // A string-literal union atom widens to its member's string, whose header holds the length.
+      "atomStr" => {
+        if emitAtomToStr(e.memObj, fnIx) < 0 { return -1 }
+        fbStrLen()
+        return 0
+      }
+      "list" => {
+        return emitArrLen(exprIx, fnIx)
+      }
+      // `m.length` on a map is the live entry count, its struct's `size` field.
+      "map" => {
+        if emitExpr(e.memObj, fnIx) < 0 { return -1 }
+        return mapSizeTail(e.memObj, fnIx)
+      }
+      "field" | "growCandidate" | "mem" => {}
     }
   }
   return emitMem(exprIx, fnIx)
