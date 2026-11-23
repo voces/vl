@@ -1568,6 +1568,8 @@ Deno.test({
       "shared-read-global-not-box": 2,
       "niche-read-of-i32": 2,
       "arm-unbox-of-i32": 2,
+      "record-arms-unbox-at-its-record": 0,
+      "record-arms-unbox-at-another-record": 2,
       "box-list-retag-into-i32-list": 2,
       "box-list-retag-into-niche-record-list": 2,
       "num-union-conversion-of-non-box": 2,
