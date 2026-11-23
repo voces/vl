@@ -18,7 +18,7 @@ None new: the global's `global.get` and the delivery's existing atom decode.
 
 ## Measured (fixpoint seeds on both sides)
 
-Full proof on base ed1817bb8; after merging master 4982aa4a+ (#9733, #9726), the mechanical
+Full proof on base ed1817bb8; after merging master ff34a69e4 (with #9733 and #9726), the mechanical
 rerun and the class count.
 
 | reading | result |
