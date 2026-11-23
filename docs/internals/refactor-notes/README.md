@@ -8,6 +8,43 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-23-ir-self-sweep](2026-11-23-ir-self-sweep.md): IR-S1: the self-compile builds wholly in the IR (2026-11-23, lane IR-S1)
+- [2026-11-23-fix-d17064](2026-11-23-fix-d17064.md): Fix D17064: an operator over a `never` operand works at its other operand's width (IR-C1)
+- [2026-11-23-ir-rowless-record-rep](2026-11-23-ir-rowless-record-rep.md): IR: a record type no struct row records, at the row legacy stores it in, 2026-11-23
+- [2026-11-23-ir-cf-batch4](2026-11-23-ir-cf-batch4.md): IR: control-flow batch 4, 2026-11-23
+- [2026-11-23-ir-capture-open-temp-type](2026-11-23-ir-capture-open-temp-type.md): IR coverage: open temp types on captures (2026-11-23, lane IR-N8)
+- [2026-11-23-ir-m1-thunk-rep-typed](2026-11-23-ir-m1-thunk-rep-typed.md): IR-M1: a closure thunk's open result type typed by its rep (2026-11-23, lane IR-M1)
+- [2026-11-23-ir-n3-batch3](2026-11-23-ir-n3-batch3.md): IR-N3 batch 3: a variadic push's spread run, and a record's `push` field (2026-11-23, lane IR-N3)
+- [2026-11-23-ir-capture-function-value-cell](2026-11-23-ir-capture-function-value-cell.md): IR coverage: function-value cells (2026-11-23, lane IR-N8)
+- [2026-11-23-ir-n7-batch-c](2026-11-23-ir-n7-batch-c.md): IR coverage, batch C: union arms boxed at their union, print's union `if`, and a valued `if` leading an indexed receiver (2026-11-23, lane IR-N7)
+- [2026-11-23-ir-c1-never-value](2026-11-23-ir-c1-never-value.md): `rep novalue`, step 7: a call that never returns, as a value (IR-C1)
+- [2026-11-23-ir-object-family-shared-arms](2026-11-23-ir-object-family-shared-arms.md): Object-family batch: shared-read arm forms, field retags, arm cells (2026-11-23, lane IR-N5)
+- [2026-11-23-view-global-reload](2026-11-23-view-global-reload.md): View indexing from a module global: the descriptor reload, and the post-I8 plan (2026-11-23, lane F1, #9676)
+- [2026-11-23-ir-start-call-result](2026-11-23-ir-start-call-result.md): IR: a reference call result at its callee's rep (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-n3-batch2](2026-11-23-ir-n3-batch2.md): IR-N3 batch 2: variadic push, and the unrolled copy's hoisted iterable (2026-11-23, lane IR-N3)
+- [2026-11-23-ir-mv4-cluster](2026-11-23-ir-mv4-cluster.md): A `??` over a mono-closed binding read holds that binding's type (D17057, D17058), 2026-11-23
+- [2026-11-23-ir-member-length-arm](2026-11-23-ir-member-length-arm.md): One `.length` arm for legacy and the IR (2026-11-23, lane IR-N5)
+- [2026-11-23-ir-m1-start-progress](2026-11-23-ir-m1-start-progress.md): IR-M1: the start body's progress cell, and a boxed nullable global read at its box (2026-11-23, lane IR-M1)
+- [2026-11-23-ir-m1-expression-as](2026-11-23-ir-m1-expression-as.md): IR-M1: the `expression as` class (2026-11-23, lane IR-M1)
+- [2026-11-23-ir-is-variant-row](2026-11-23-ir-is-variant-row.md): IR batch: an impossible `nulTest` and the variant row's discriminant test (2026-11-23, lane IR-N1)
+- [2026-11-23-ir-is-variant-chain](2026-11-23-ir-is-variant-chain.md): IR: the variant row's full chain over legacy's tail, through `fitRecvReadHook` (2026-11-23, lane IR-N1)
+- [2026-11-23-ir-is-record-fit](2026-11-23-ir-is-record-fit.md): IR: the `recordFit` rung over legacy's writer, through `fitRecvReadHook` (2026-11-23, lane IR-N1)
+- [2026-11-23-ir-distilled-map-family](2026-11-23-ir-distilled-map-family.md): IR: the distilled corpus's map family — a nullable-boolean print, i64 keys, delete, a walk's pair, a niche map read, 2026-11-23
+- [2026-11-23-ir-coalesce-boxladder-batch](2026-11-23-ir-coalesce-boxladder-batch.md): IR coverage: atom map reads into a hole box, field casts, the boolean join (2026-11-23, lane IR-N2)
+- [2026-11-23-ir-coalesce-batch](2026-11-23-ir-coalesce-batch.md): IR coverage: the coalesce batch (2026-11-23, lane IR-N2)
+- [2026-11-23-ir-closure-record-family](2026-11-23-ir-closure-record-family.md): IR: a closure at a record field, and a returned record on its result's heap, retag, 2026-11-23
+- [2026-11-23-ir-cf-batch3](2026-11-23-ir-cf-batch3.md): IR: control-flow batch 3, 2026-11-23
+- [2026-11-23-ir-capture-parent-binding](2026-11-23-ir-capture-parent-binding.md): IR capture: no parent binding (2026-11-23)
+- [2026-11-23-ir-capture-null-instance](2026-11-23-ir-capture-null-instance.md): IR capture: a generic's `null` instance (2026-11-23)
+- [2026-11-23-ir-capture-holder](2026-11-23-ir-capture-holder.md): IR: a holder captured whole (2026-11-23, lane IR-N8)
+- [2026-11-23-ir-capture-binding](2026-11-23-ir-capture-binding.md): IR: start-body captures and bundles captured whole (2026-11-23, lane IR-N8)
+- [2026-11-23-ir-call-result-lifted](2026-11-23-ir-call-result-lifted.md): IR: lifted extra results and stored-alike call results (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-c1-novalue-step6](2026-11-23-ir-c1-novalue-step6.md): `rep novalue`, step 6: a never `??` default in the last three null-arm builders (IR-C1)
+- [2026-11-23-ir-c1-claim-numunion](2026-11-23-ir-c1-claim-numunion.md): IR-C1: RNumUnionConvert and RNulNoneBox are claimed (2026-11-23)
+- [2026-11-23-ir-c1-claim-atom](2026-11-23-ir-c1-claim-atom.md): IR-C1: the atom-hook kinds are claimed (2026-11-23)
+- [2026-11-22-ir-verify-d17049-rest](2026-11-22-ir-verify-d17049-rest.md): IR verifier: the last 16 legacy queries become noted facts (2026-11-22, lane IR-D1)
+- [2026-11-22-ir-rep-novalue-ret-coal](2026-11-22-ir-rep-novalue-ret-coal.md): `rep novalue`, steps 3 to 5: a returned never call, a never `??` default and a union join's never arm (IR-C1)
+- [2026-11-22-ir-opt-member-read](2026-11-22-ir-opt-member-read.md): IR: standalone `?.` (2026-11-22, lane IR-N5)
 - [2026-11-23-ir-cf-batch2](2026-11-23-ir-cf-batch2.md): IR: the valued integer switch, 2026-11-23
 - [2026-11-23-coalesce-field-call-receiver-once](2026-11-23-coalesce-field-call-receiver-once.md): D17059: a union-field `??` evaluates a call receiver once (2026-11-23, lane IR-N2)
 - [2026-11-22-ir-verify-end-pad](2026-11-22-ir-verify-end-pad.md): IR verifier: thirteen legacy queries become builder records (2026-11-22, lane IR-D1)

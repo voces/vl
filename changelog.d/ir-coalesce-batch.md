@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage, the coalesce batch:** the IR builds a `string | null` `??` whose default computes, joins into a box, or is a literal atom (a new `nulStr` coalesce arm on legacy's `br_on_non_null` core); an atom `??` over a default that builds nothing; the arms whose answer the operand's type decides (`retypedDead`, `pinNonNull`, `fieldFlat`, `popElem`, and `deadJoin`, whose minted `if` legacy now caches per `??` and instance in `coalDeadJoinIfOf`); a `null`-typed operand run for its effect (`nulnone`); and module-scope `?.` and boxed-binding `??` places over a global receiver, re-read as the builder read them.

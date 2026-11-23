@@ -164,6 +164,32 @@ Deno.test({
   },
 });
 
+// A record literal whose row drops an effectful field (D1696) is built through legacy's stash, the
+// dropped initialiser run for its effect in source order: at a struct row and at a union arm, a
+// partial literal at its destination's row, each matching legacy's bytes.
+Deno.test({
+  name: "ir shadow: a literal that drops or omits fields is built at its destination's row and matches",
+  ignore,
+  fn: () => {
+    const src = `type Plain = { legs: i64 }\ntype Shallow = { pet: Plain }\n` +
+      `type A = { k: i32, legs: i64 }\ntype B = { s: string }\ntype Pet = A | B\n` +
+      `type Cfg = { verbose: boolean | null, out: string | null }\n` +
+      `let n = 0\nfunction f() { n = n + 1\n  return true }\n` +
+      `function mk(): Shallow {\n  const sv = { pet: { legs: 4, purr: f() } }\n  return sv\n}\n` +
+      `function arm(): Pet {\n  const sv = { k: 1, legs: 4, purr: f() }\n  return sv\n}\n` +
+      `function cfg(): Cfg {\n  const c: Cfg = { out: "x" }\n  return c\n}\n` +
+      `print(mk().pet.legs)\nconst p = arm()\nif p is A { print(p.legs) }\nprint(cfg().out ?? "none")\nprint(n)\n`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
+    const unc = [...rows.keys()].filter((k) => k.startsWith("uncovered ") || k.startsWith("mismatch"));
+    if (unc.length > 0 || (rows.get("matched") ?? 0) < 4) {
+      throw new Error(`want mk, arm, cfg and f matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A closure thunk's IR lowering under the dual emit's control 3 must report a bytes mismatch;
 // unbroken, each thunk matches legacy's `emitCloThunkCode` (a valued and a void target).
 Deno.test({
@@ -557,16 +583,16 @@ Deno.test({
   },
 });
 
-// A code-point list that is no local is legacy's spill through a scratch slot: a named miss,
-// never a byte mismatch.
+// A code-point list that is no local is legacy's spill through a scratch slot, read once into
+// it (`fcpSpillTail`): covered and matched.
 Deno.test({
-  name: "ir shadow: a spilled code-point list is a named miss",
+  name: "ir shadow: a spilled code-point list is read once into its spill slot",
   ignore,
   fn: () => {
     const src = `function sp(n: i32): string { return fromCodePoints([n, 33]) }\nprint(sp(111))\n`;
     const { rows } = run(src, true);
-    if (rows.get("uncovered code point list spill") !== 1) {
-      throw new Error(`want one "uncovered code point list spill" row, got ${JSON.stringify([...rows])}`);
+    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
+      throw new Error(`want the spill covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -1573,6 +1599,9 @@ Deno.test({
       "retag-field-alike-records-two-heaps": 2,
       "push-many-of-i32": 2,
       "global-read-off-store-type": 2,
+      "return-not-stored-alike": 2,
+      "return-stored-alike": 0,
+      "return-stored-unlike": 2,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
       "atom-tower-i32-read": 2,
@@ -1596,6 +1625,8 @@ Deno.test({
       "never-call-value-at-consumer-rep": 0,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
+      "never-field-read-at-its-storage": 0,
+      "never-field-read-off-its-storage": 3,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -1619,6 +1650,9 @@ Deno.test({
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
     // A fit tail that misses leaves legacy's receiver read in place (`fitRecvReadHook`).
     if (exp.irFitTailSelfTest() !== 1) throw new Error("want the fit hook restored after a miss");
+    // Each kind legacy's descriptor names alone maps to a type that describes back at that kind.
+    const rd = exp.repDescSelfTest();
+    if (rd !== 0) throw new Error(`want every descriptor kind to round-trip, got kind ${rd} off`);
   },
 });
 
@@ -1655,34 +1689,19 @@ print(two(true))
   },
 });
 
-// `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
-// bound to a literal delivered to an atom (a record copy re-read per field builds, as
-// `RRecCopyPure`: `record-copy-into-wider-row.vl`). Each program is the smallest the corpus has.
-const PRE_PATHS: [string, string][] = [
-  [
-    "atom hook",
-    `const JX = "x"\nconst B: "y" = "y"\nfunction join(c: boolean) {\n  const M: "x" | "y" | "z" = if c { JX } else { B }\n  return M == "z"\n}\nprint(join(true))\n`,
-  ],
-];
+// A join of an atom binding whose arms are a literal-bound const and a one-literal const, which the
+// atom hook writes at the destination (`emitIfExprAs`): covered and matched.
 Deno.test({
-  name:
-    "ir shadow: a node emitExpr takes a generic pre-path for is a named miss",
+  name: "ir shadow: a join the atom hook writes at its destination is built and matched",
   ignore,
   fn: () => {
-    for (const [why, src] of PRE_PATHS) {
-      const { rc, rows } = run(src, true);
-      if (rc !== 0) throw new Error(`${why}: want compileSrc rc 0, got ${rc}`);
-      const fails = failures(rows);
-      if (fails.length > 0) {
-        throw new Error(`${why}: want no failure, got:\n${fails.join("\n")}`);
-      }
-      if (!rows.has(`uncovered pre-path ${why}`)) {
-        throw new Error(
-          `${why}: want an "uncovered pre-path ${why}" row, got ${
-            JSON.stringify([...rows])
-          }`,
-        );
-      }
+    const src = `const JX = "x"\nconst B: "y" = "y"\nfunction join(c: boolean) {\n  const M: "x" | "y" | "z" = if c { JX } else { B }\n  return M == "z"\n}\nprint(join(true))\n`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
+      throw new Error(`want the join covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

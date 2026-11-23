@@ -68,6 +68,7 @@ import {
   RMakeList,
   RMakeRec,
   RMapDelete,
+  RMapEq,
   RMapFilter,
   RMapGet,
   RMapGetOr,
@@ -1076,11 +1077,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.ucBox, at)
       use(r.ucOther, at)
       const bv = r.ucBox
+      // A stashed box is read once, so it may be any value.
       if (
-        !(bv is OVar)
-        || bv.ov < 0
-        || bv.ov >= vf.irVars.length
-        || vf.irVars[bv.ov].vKind == "temp"
+        !r.ucStash
+        && (!(bv is OVar)
+          || bv.ov < 0
+          || bv.ov >= vf.irVars.length
+          || vf.irVars[bv.ov].vKind == "temp")
       ) {
         return fail(2, at, "a union compare's box is not a re-read variable")
       }
@@ -1183,6 +1186,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(2, at, "a map or filter of a non-list")
       }
       if !(r.hfC is OImm) { use(r.hfC, at) }
+      uses(r.hfEnv, at)
+      if r.hfEnv.length > 0 && !(r.hfC is OImm) {
+        return fail(2, at, "a map callback built from captures is no value")
+      }
       0
     }
     RListSlice => {
@@ -1450,6 +1457,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RMapEq => {
+      use(r.mqKey, at)
+      use(r.mqOther, at)
+      if !mapRecvOk(r.mqSym, r.mqLoc, at) {
+        return fail(2, at, "a map compare of a receiver that is no map")
+      }
+      if dst >= 0 && dst != vfBool && dst != vfI32 {
+        return fail(2, at, "a map compare is a boolean")
+      }
+      0
+    }
     RMapHas => {
       use(r.mhKey, at)
       if !mapRecvOk(r.mhSym, r.mhLoc, at) {
@@ -1547,7 +1565,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       let i = 0
       while i < r.soArgs.length {
-        const idx = (r.soOp == "slice" || r.soOp == "charcode") && i > 0
+        const idx = (r.soOp == "slice"
+          || r.soOp == "charcode"
+          || r.soOp == "cpat")
+          && i > 0
         const want = if r.soOp == "fromcp" || idx { vfI32 } else { vfStr }
         if opRep(r.soArgs[i]) != want {
           return fail(2, at, "a string operator's operand rep")
@@ -2444,6 +2465,8 @@ function stmt(id: i32, prev: i32) {
         if (
           opRep(n.rtV) != vf.irRetRep
           && !vfOpenTakes(vf.irRetTy, vf.irRetRep, opRep(n.rtV))
+          && !vfStoresAs(vf.irRetRep, opRep(n.rtV))
+          && !repNullRefFits(opRep(n.rtV), vf.irRetRep)
         ) {
           return fail(2, id, "a return's rep is not the result's")
         }
@@ -2770,6 +2793,7 @@ function rhsReadsList(r: Rhs): boolean {
       RMakeList |
       RMakeRec |
       RMapDelete |
+      RMapEq |
       RMapFilter |
       RMapGet |
       RMapGetOr |
@@ -3145,7 +3169,8 @@ function opndsHoldVar(os: Opnd[], v: i32): boolean {
 }
 
 // Whether variable `i` of `f` is a temp whose checker type has no value, defined by a call that
-// never returns: no value reaches it, so it takes the rep of the consumer legacy writes after it.
+// never returns or by a field read at the rep its record's row stores the field at. No value
+// reaches it, so it takes the rep legacy writes its consumer at.
 function neverCallTemp(f: IrFn, i: i32): boolean {
   const v = f.irVars[i]
   if v.vKind != "temp" || v.vTy < 0 || !repIsNoValue(repNodeOfTy(v.vTy)) {
@@ -3154,6 +3179,10 @@ function neverCallTemp(f: IrFn, i: i32): boolean {
   for n in f.irNodes {
     if n is SLet && n.lDst == i {
       const r = n.lRhs
+      if r is RGetField {
+        const ks = repNodeKids(opRep(r.gfV))
+        return r.gfIx >= 0 && r.gfIx < ks.length && ks[r.gfIx] == v.vRep
+      }
       return r is RCall && r.caNever
     }
   }

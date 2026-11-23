@@ -13,6 +13,7 @@ import { mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
 import {
+  emitInitGuard,
   emitOptLeafHead,
   emitOptLeafTail,
   emitOptLinkNullClose,
@@ -100,6 +101,7 @@ import {
   memberBoxReadLeave,
   readOwesNonNullRecover,
   structIndexOfExpr,
+  structIndexOfObjCtx,
 } from "./emit_classify"
 import { elabSpreadNote, storageReadEnter, storageReadLeave } from "./emit_elab"
 import { forInStringSrc, forInU8Src } from "./emit_value_sites"
@@ -165,6 +167,7 @@ import {
   RMakeList,
   RMakeRec,
   RMapDelete,
+  RMapEq,
   RMapFilter,
   RMapGet,
   RMapGetOr,
@@ -511,14 +514,14 @@ import {
   numUnionStashLeave,
   numUnionStashTail,
   numWidenTail,
+  objLitDropStashRowAt,
   objLitLayoutRowAt,
   objLitLayoutRowOf,
   objLitStashRowAt,
-  objLitStashRowOf,
+  objLitVariantDropStashAt,
   objLitVariantLayoutAt,
   objLitVariantLayoutOf,
   objLitVariantStashAt,
-  objLitVariantStashOf,
   objStructNewTail,
   popOrOpen,
   popOrPlanOf,
@@ -543,6 +546,9 @@ import {
   recCopyPureEmit,
   refArrayUnionUnboxTail,
   sFieldStorageSlot,
+  scalarMapEqPlanOf,
+  scalarMapEqReadTail,
+  scalarMapEqTail,
   sharedArmHead,
   sharedArmModeOf,
   sharedArmModeReads,
@@ -587,6 +593,8 @@ import {
   unionEqCmpTail,
   unionEqHead,
   unionEqPayloadTail,
+  unionEqStashPlanOf,
+  unionEqStashTail,
   unionEqTagTail,
   unionLetSinkClose,
   unionUnionBoxesTail,
@@ -633,6 +641,7 @@ import {
 } from "./emit_plan_null"
 import {
   arrLitRefShortSlot,
+  objLitBuildVariantRow,
   spreadBackIdx,
   spreadPlanOf,
   spreadWrapIdx,
@@ -1075,6 +1084,7 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RMapHas => mapHas(r)
     RMapDelete => mapDelete(r)
+    RMapEq => mapEq(r)
     RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
     RNumUnionBin => numUnionBin(r)
@@ -1419,15 +1429,29 @@ function stmtsHolding(root: i32, ix: i32, pos: i32): i32[] {
 function recRowOf(at: i32, rowIn: i32, variant: boolean, stash: boolean): i32 {
   const fnIx = lw.irAt
   if rowIn >= 0 && variant {
-    return if stash { objLitVariantStashAt(at, rowIn) } else { objLitVariantLayoutAt(at, rowIn) }
+    return if stash { variantStashRowAt(at, rowIn, fnIx) } else { objLitVariantLayoutAt(at, rowIn) }
   }
   if rowIn >= 0 {
-    return if stash { objLitStashRowAt(at, rowIn) } else { objLitLayoutRowAt(at, rowIn) }
+    return if stash { structStashRowAt(at, rowIn) } else { objLitLayoutRowAt(at, rowIn) }
   }
   if variant {
-    return if stash { objLitVariantStashOf(at, fnIx) } else { objLitVariantLayoutOf(at, fnIx) }
+    return if stash { variantStashRowAt(at, objLitBuildVariantRow(at, fnIx), fnIx) } else { objLitVariantLayoutOf(at, fnIx) }
   }
-  return if stash { objLitStashRowOf(at, fnIx) } else { objLitLayoutRowOf(at, fnIx) }
+  return if stash { structStashRowAt(at, structIndexOfObjCtx(at, fnIx)) } else { objLitLayoutRowOf(at, fnIx) }
+}
+
+// The variant row a stashed literal at `at` is written at, row `vi`: the order stash's, else the
+// one a dropped effectful field takes (`objLitVariantDropStashAt`).
+function variantStashRowAt(at: i32, vi: i32, fnIx: i32): i32 {
+  const r = objLitVariantStashAt(at, vi)
+  return if r >= 0 { r } else { objLitVariantDropStashAt(at, vi, fnIx) }
+}
+
+// The struct row a stashed literal at `at` is written at, row `si`: the order stash's, else the
+// one a dropped field takes (`objLitDropStashRowAt`).
+function structStashRowAt(at: i32, si: i32): i32 {
+  const r = objLitStashRowAt(at, si)
+  return if r >= 0 { r } else { objLitDropStashRowAt(at, si) }
 }
 
 // `RMakeRec`: each field in layout order, then legacy's `struct.new` of the literal's row. Under
@@ -1607,6 +1631,9 @@ function stashSlotOf(at: i32, fi: i32): i32 {
 
 // `RMakeClo`: legacy's closure writer for a capture-free function, then a name read's recovery,
 // as `emitExpr` writes a function literal or a function name.
+// `RMakeClo` written where another node's lowering builds its closure (`RMapFilter`).
+export function irLMakeClo(r: RMakeClo) { return makeClo(r) }
+
 function makeClo(r: RMakeClo) {
   if fnEnvIdxOf(r.mcFn) >= 0 && !cloCellReaches(r.mcFn, lw.irAt) {
     // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure. A
@@ -1691,7 +1718,7 @@ export function irGlobalReadMiss(g: i32, c: GlobalCtx): string {
     "plain" => if globalMinted(g) { "" } else { "global index" }
     "fold" => ""
     "promo" => if promoSlotIn(g, c) >= 0 { "" } else { "promoted global read" }
-    "guard" => "guarded global read"
+    "guard" => if globalMinted(g) { "" } else { "global index" }
   }
 }
 
@@ -1724,7 +1751,16 @@ function globalRead(sym: i32, nonNull: boolean) {
       leaf()
       fbLocalGet(ps)
     }
-    "guard" => irLMiss("guarded global read")
+    // Legacy's read-before-init guard, then the read (`emitUserGlobalGet`).
+    "guard" => {
+      if !globalMinted(sym) { return irLMiss("global index") }
+      leaf()
+      if emitInitGuard(sym, "read") < 0 {
+        return irLMiss("guarded global read")
+      }
+      fbGlobalGet(userGlobalIdx(sym))
+      if nonNull { fbRefAsNonNull() }
+    }
   }
   return 0
 }
@@ -2721,6 +2757,8 @@ function rangeLoop(n: SRangeLoop, pending: i32[]) {
   if rt.vIdx < 0 || rt.vIdx != varSlot(n.rlVar) { return irLMiss("range slot") }
   const wraps = rangeMayWrap(s, rt)
   irLSettle(pending)
+  const hoists = irLoopOpenHook(n.rlAt)
+  if hoists.loHoists < 0 { return irLMiss("loop hoist prologue") }
   scopeBind(s.frVar, declaredSlotOfDecl(n.rlAt))
   let kb = 0
   if n.rlPartial {
@@ -2757,6 +2795,7 @@ function rangeLoop(n: SRangeLoop, pending: i32[]) {
     framesPop(kb)
     rangePartialOuterClose()
   }
+  irLoopCloseHook(hoists)
   scopeUnbind()
   return 0
 }
@@ -3091,8 +3130,8 @@ function mapOp(r: RMapOp) {
   }
 }
 
-// `RMapIter`: legacy's keys or values writer, the map variable read before each of its steps. A
-// Set's values are its keys.
+// `RMapIter`: legacy's keys or values writer, the receiver read before each of its steps, again as
+// the builder read it (`opndAgain`). A Set's values are its keys.
 function mapIter(r: RMapIter) {
   const c = nodeAt(r.miAt)
   if !(c is Call) || c.callFn < 0 { return irLMiss("map iter node") }
@@ -3104,9 +3143,32 @@ function mapIter(r: RMapIter) {
   }
   const q = if keys { mapKeysFrameOf(m.memObj, lw.irAt) } else { mapValsFrameOf(m.memObj, lw.irAt) }
   for step in [0, 1, 2] {
-    irLOpnd(r.miV)
+    if step == 0 { irLOpnd(r.miV) }
+    else if opndAgain(r.miV, m.memObj) < 0 { return -1 }
     mapListStep(q, step)
   }
+  return 0
+}
+
+// `RMapEq`: a scalar map read against an operand as `emitScalarMapReadOtherEq` writes it: the
+// probe, its hit and value, the operand in source order, the compare, then `!=`'s negation.
+function mapEq(r: RMapEq) {
+  const fnIx = lw.irAt
+  const e = nodeAt(r.mqAt)
+  if !(e is BinExpr) { return irLMiss("map compare node") }
+  const p = scalarMapEqPlanOf(e, fnIx)
+  const rd = nodeAt(unwrapParen(p.smRead))
+  if p.smArm != "read" || !(rd is Index) { return irLMiss("map compare plan") }
+  if r.mqSym >= 0 && userGlobalReadClass(r.mqSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map compare of a global not read plainly")
+  }
+  const left = p.smRead == e.binLeft
+  if !left { irLOpnd(r.mqOther) }
+  mapProbeHead(rd.idxArr, r.mqSym, r.mqNonNull, r.mqLoc, r.mqKey)
+  if scalarMapEqReadTail(rd.idxArr, left, fnIx) < 0 { return -1 }
+  if left { irLOpnd(r.mqOther) }
+  scalarMapEqTail(p.smKind, left)
+  if e.binOp == "!=" { fbI32Eqz() }
   return 0
 }
 
@@ -3215,19 +3277,23 @@ function staticSide(o: Opnd, lex: string) {
   return staticAtomId(lex)
 }
 
-// `RUnionConcreteEq`: legacy's plan around the box read twice and the operand once (the tag test,
-// the payload, the compare), as `emitUnionConcreteEq` writes it.
+// `RUnionConcreteEq`: legacy's plan around the box read twice, or once into the stash, and the
+// operand once (the tag test, the payload, the compare), as `emitUnionConcreteEq` writes it.
 function unionConcreteEqOp(r: RUnionConcreteEq) {
   const n = nodeAt(r.ucAt)
   if !(n is BinExpr) { return irLMiss("union compare node") }
   const boxIx = if r.ucSwap { n.binRight } else { n.binLeft }
   const otherIx = if r.ucSwap { n.binLeft } else { n.binRight }
-  const qp = unionConcreteEqPlanOf(boxIx, otherIx, lw.irAt)
+  const qp = if r.ucStash { unionEqStashPlanOf(boxIx, otherIx, lw.irAt) } else { unionConcreteEqPlanOf(boxIx, otherIx, lw.irAt) }
   if qp.uqKind < 0 { return irLMiss("union compare plan") }
   unionEqHead()
   irLOpnd(r.ucBox)
-  unionEqTagTail(qp)
-  irLOpnd(r.ucBox)
+  if r.ucStash {
+    unionEqStashTail(qp)
+  } else {
+    unionEqTagTail(qp)
+    irLOpnd(r.ucBox)
+  }
   unionEqPayloadTail(qp)
   irLOpnd(r.ucOther)
   return unionEqCmpTail(qp, r.ucNe, lw.irAt)
@@ -3756,6 +3822,21 @@ function tagStashEffect(r: RTagStash, pending: i32[]) {
   return 0
 }
 
+// An order stash's field set. An operand the literal follows reaches the stack first, as legacy
+// writes it before the literal's fields; its roots wait below the set for their reader.
+function stashSetEffect(r: RStashSet, pending: i32[]) {
+  const roots = stageLead(r.ssV, pending)
+  if lwMiss != "" { return 0 }
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length - liveCountIn(pending)
+  stashSet(r)
+  liveNeutral()
+  irLSettle(pending)
+  lwFloor = lwFloors.pop() ?? 0
+  for v in roots { pending.push(v) }
+  return 0
+}
+
 function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
   if id < 0 || id >= lw.irNodes.length { return irLMiss("no node") }
   const n = lw.irNodes[id]
@@ -3889,11 +3970,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         return 0
       }
       if r is RTagStash { return tagStashEffect(r, pending) }
-      if r is RStashSet {
-        stashSet(r)
-        irLSettle(pending)
-        return 0
-      }
+      if r is RStashSet { return stashSetEffect(r, pending) }
       // A void import leaves nothing; any other host call's discarded value is dropped.
       if r is RCallHost {
         hostCall(r)
@@ -3912,7 +3989,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       irLSettle(pending)
       // A loop's list-header hoists open before its block, as legacy's do.
       const hoists = irLoopOpenHook(lw.irNodeAt[id])
-      if hoists < 0 { return irLMiss("loop hoist prologue") }
+      if hoists.loHoists < 0 { return irLMiss("loop hoist prologue") }
       fbBlock(64)
       lwFrames.push(n.bkLabel)
       body(n.bkBody, false, -1, false)
@@ -4606,7 +4683,7 @@ function loopValueBlock(n: SBlock, pending: i32[], id: i32) {
   }
   irLSettle(pending)
   const hoists = irLoopOpenHook(lw.irNodeAt[id])
-  if hoists < 0 { return irLMiss("loop hoist prologue") }
+  if hoists.loHoists < 0 { return irLMiss("loop hoist prologue") }
   if vt >= 0 {
     fbBlock(vt)
   } else {
@@ -5555,9 +5632,15 @@ function boundsUnset(_n: SBoundsCheck, _p: i32[]): i32 {
   return irLMiss("bounds hook not installed")
 }
 
-function loopOpenNone(_at: i32): i32 { return 0 }
+// What a loop's prologue opened: its list-header hoists (-1 on a failed prologue) and its range
+// proofs, each closed by `irLoopCloseHook`.
+export type LoopOpened = { loHoists: i32, loProofs: i32 }
 
-function loopCloseNone(_n: i32): i32 { return 0 }
+function loopOpenNone(_at: i32): LoopOpened {
+  return { loHoists: 0, loProofs: 0 }
+}
+
+function loopCloseNone(_n: LoopOpened): i32 { return 0 }
 
 // The list lowering's hooks (`ir_lower_ref.vl`), installed before emit; the defaults leave list
 // reads and bounds checks unlowered.
@@ -5573,7 +5656,7 @@ export let irLowerListSetHook: (n: SListSet, at: i32) => i32 = listSetUnset
 // A list op in statement position, whose value is not wanted.
 export let irLowerEffectHook: (r: Rhs) => i32 = listUnset
 export let irLowerBoundsHook: (n: SBoundsCheck, pending: i32[]) => i32 = boundsUnset
-// Opens the list-header hoists of the loop statement at AST node `at` (how many, or -1 on a failed
-// prologue), and closes that many; the defaults open none.
-export let irLoopOpenHook: (at: i32) => i32 = loopOpenNone
-export let irLoopCloseHook: (n: i32) => i32 = loopCloseNone
+// Opens the list-header hoists and range proof of the loop statement at AST node `at`, and closes
+// what it opened; the defaults open none.
+export let irLoopOpenHook: (at: i32) => LoopOpened = loopOpenNone
+export let irLoopCloseHook: (n: LoopOpened) => i32 = loopCloseNone
