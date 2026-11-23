@@ -4,12 +4,14 @@
 reps at each miss: 10 are a record built wider at its delivery (D14730, D15129), whose fields
 differ from the parameter's checked type (`nullable(i32)` against `null`, a box against `i32`).
 
-- **`calleeParamTy` (ir_build.vl)** delivers at `paramFrameTy`, not the checked type. Legacy's
-  instance takes the record at its declared row (`paramStructIdxOf`): `ignore` in
-  `soundness/mixed-instance-unrelated-arguments-runs.vl` takes `Circle`'s struct, and the call
-  passes the global as it stands. The callee's frame already held the parameter there
-  (`paramHeldTy` → `paramDeclRowTy`), as the thunk builder forwards it; the call's signature
-  now agrees with the frame.
+- **`calleeParamTy` (ir_build.vl)** delivers a struct parameter at legacy's declared row where its
+  checked type's row is another, as the callee's frame holds it (`paramHeldTy` →
+  `paramDeclRowTy`, which the thunk builder forwards at). Legacy's instance takes the record at
+  that row (`paramStructIdxOf`): `ignore` in `soundness/mixed-instance-unrelated-arguments-runs.vl`
+  takes `Circle`'s struct, and the call passes the global as it stands. Any other parameter keeps
+  its checked type. The answer is memoized per parameter for the function being built
+  (`ibCalleeParamAt`), since every direct-call argument asks it: calling the full `paramFrameTy`
+  per argument cost +0.48% L2 fuel.
 
 ## Measured
 
@@ -24,5 +26,5 @@ Row: `tests/ir-shadow-rows/arg-built-wider-at-frame-row.vl`.
 
 ## Legacy tails the IR calls
 
-None new: `paramFrameTy` already reads `paramStructIdxOf`, `vtKindOfParam`, `declRowTy` and
-`repDescTy`.
+None new: `vtKindOfParam`, `paramStructIdxOf`, `repRowOfTyStruct` and `declRowTy`, which
+`paramHeldTy` already calls.
