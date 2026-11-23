@@ -10409,6 +10409,38 @@ export function unionConcreteEqPlanOf(
   return p
 }
 
+// The plan of a union `==` whose box is no place (`unionEqOperandOk`), legacy's stashed arm: the
+// box carries the operand's arm, read once into the stash. `uqKind` -1 where another arm writes it.
+export function unionEqStashPlanOf(
+  boxIx: i32,
+  otherIx: i32,
+  fnIx: i32,
+): UnionEqPlan {
+  const no: UnionEqPlan = { uqKind: -1, uqTag: -1 }
+  if unionEqOperandOk(boxIx) { return no }
+  const unr: i32[] = []
+  const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
+  const usid = msSetOfUnionBox(boxIx, fnIx)
+  const eak = unionEqAtomKindOf(otherIx, usid, unionBoxTyOfRead(boxIx, fnIx), fnIx)
+  if eak < 0 || uname == "" { return no }
+  let hasArm = unionEqArmPresent(usid, valueAtomNameOfKind(eak), eak)
+  if !hasArm && eak == 2 && msSetTakesAtomAsStr(usid) { hasArm = true }
+  if !hasArm { return no }
+  const p: UnionEqPlan = {
+    uqKind: eak,
+    uqTag: unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], fnIx)),
+  }
+  return p
+}
+
+// After the stashed arm's one box read: the stash, the tag tail, and the stash read back.
+export function unionEqStashTail(qp: UnionEqPlan): i32 {
+  fbLocalTee(unionEqStashSlot())
+  unionEqTagTail(qp)
+  fbLocalGet(unionEqStashSlot())
+  return 0
+}
+
 // What a union `==` takes before its first box read: its stash slot, which the frame holds.
 export function unionEqHead(): i32 {
   unionEqStashSlot()
@@ -10461,16 +10493,18 @@ function emitUnionConcreteEq(
     if emitUnionEqOther(otherIx, qp.uqKind, fnIx) < 0 { return -1 }
     return unionEqCmpTail(qp, isNe, fnIx)
   }
-  // D972 — a non-re-readable operand is stashed at its first read, not refused. This compare
-  // reads the box up to three times — the no-arm fold, the tag, and the payload inside the
-  // tag-matched arm — which is the whole content of `unionEqOperandOk` (Ident, NumLit, StrLit,
-  // Member, Index). A call operand is not re-readable.
-
-  // Teed at the first read rather than pre-emitted at the top: the operand must be evaluated
-  // where the original code evaluated it, so any context the surrounding lowering seeds is still
-  // in force. Pre-emitting it ahead of the gates traps.
-  const eqStash = unionEqStashSlot()
-  const eqOnce = !unionEqOperandOk(boxIx)
+  const sp = unionEqStashPlanOf(boxIx, otherIx, fnIx)
+  if sp.uqKind >= 0 {
+    unionEqHead()
+    if emitExpr(boxIx, fnIx) < 0 { return -1 }
+    unionEqStashTail(sp)
+    if unionEqPayloadTail(sp) < 0 { return -1 }
+    if emitUnionEqOther(otherIx, sp.uqKind, fnIx) < 0 { return -1 }
+    return unionEqCmpTail(sp, isNe, fnIx)
+  }
+  // D972 — a non-re-readable box (`unionEqOperandOk`) whose operand has an arm took the stashed
+  // arm above; the arms below read it once each. The stash slot is still reserved here.
+  unionEqHead()
   const unr: i32[] = []
   const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
   // D-VALUNION / D-SETONCE: the union's interned member set, resolved ONCE — the
@@ -10553,7 +10587,6 @@ function emitUnionConcreteEq(
   const nulOther = eak == 2
     && exprNulLitUnion(otherIx, fnIx)
     && unionEqOperandOk(otherIx)
-    && !eqOnce
     && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   if nulOther {
     if emitExpr(otherIx, fnIx) < 0 { return -1 }
@@ -10572,13 +10605,11 @@ function emitUnionConcreteEq(
     && !nulOther
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
     && unionEqOperandOk(otherIx)
-    && !eqOnce
     && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   // The `boolean | null` niche's null is the value 2 (D2260).
   const nulBoolOther = eak == 1
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
     && unionEqOperandOk(otherIx)
-    && !eqOnce
     && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   if nulBoolOther {
     if emitExpr(otherIx, fnIx) < 0 { return -1 }
@@ -10611,10 +10642,8 @@ function emitUnionConcreteEq(
     ),
   }
   if emitExpr(boxIx, fnIx) < 0 { return -1 }
-  if eqOnce { fbLocalTee(eqStash) }
   unionEqTagTail(qt)
-  if eqOnce { fbLocalGet(eqStash) }
-  else if emitExpr(boxIx, fnIx) < 0 { return -1 }
+  if emitExpr(boxIx, fnIx) < 0 { return -1 }
   if unionEqPayloadTail(qt) < 0 { return -1 }
   if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
   // The null took the other branch, so a nullable operand is the non-null ref here.
