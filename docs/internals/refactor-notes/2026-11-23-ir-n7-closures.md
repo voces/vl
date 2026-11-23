@@ -11,10 +11,10 @@ Moved on, not closed (alone): `for range in a reserve region` 14 → 19, `for in
 
 ## Measured
 
-Fixpoint seeds: master 88df143ea and the merged batch head.
-- tests/cases functions with no blocker: 78,599 → 78,681; covered = verified = matched (one
+Fixpoint seeds: master d6341e57c and the merged batch head.
+- tests/cases functions with no blocker: 78,635 → 78,717; covered = verified = matched (one
   unmatched function is the same on both sides).
-- `ir-only-census`: programs fully IR-only, 5,431 → 5,477 of 7,135.
+- `ir-only-census`: programs fully IR-only, 5,445 → 5,491 of 7,135.
 - Before the merge, against master 693fd72cd: corpus 45,405 → 45,412 matched; self-compile
   20,202 → 20,202.
 
