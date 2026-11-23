@@ -479,6 +479,7 @@ import {
   cloLiftedFes,
   cloStructIdx,
   cmSlot,
+  coalDeadJoinIfs,
   coalLinkChains,
   coalNullTestIfs,
   coalesceCallBoolSlot,
@@ -1416,6 +1417,7 @@ import {
   asExprNumSrcName,
   asExprNumTgtName,
   callRefNestSlot,
+  coalFieldRecvSlot,
   fcpSpillStashSlot,
   fnMvMapRefLocal,
   fnMvValStashLocal,
@@ -4755,6 +4757,37 @@ function emitListFitAt(
   stash: i32,
   fnIx: i32,
 ): i32 {
+  const p = listFitPlanOf(recv, chk, fnIx)
+  if p.lftOk == 0 { return 0 }
+  if p.lftOk < 0 { return emitFailAt(p.lftWhy, anchor) }
+  if stash >= 0 { fbLocalGet(stash) }
+  else if emitExpr(recv, fnIx) < 0 { return -1 }
+  return listFitTail(p, fnIx)
+}
+
+// How `emitListFitAt` walks list `recv` against `chk`. `lftOk`: 0 not that shape, -1 refused
+// for `lftWhy`, 1 walked over ref-list `lftSlots` to `lftScalar` elements compared as `lftLeaf`
+// with `lftLexes`; `lftNullable`, a null list is false.
+export type ListFitPlan = {
+  lftOk: i32,
+  lftWhy: string,
+  lftSlots: i32[],
+  lftNullable: boolean,
+  lftScalar: string,
+  lftLeaf: string,
+  lftLexes: string[],
+}
+
+function listFitPlanOf(recv: i32, chk: i32, fnIx: i32): ListFitPlan {
+  const no: ListFitPlan = {
+    lftOk: 0,
+    lftWhy: "",
+    lftSlots: [],
+    lftNullable: false,
+    lftScalar: "",
+    lftLeaf: "",
+    lftLexes: [],
+  }
   // A generic receiver tests its instance's type, or only its rep where the instance names no
   // type; a nullable one is false on null.
   const instTy = listIsRecvTyOf(recv, fnIx)
@@ -4762,7 +4795,7 @@ function emitListFitAt(
   const recvTy = if nullable { nonNullTy(instTy) } else { instTy }
   const layers: i32[] = []
   const lit = listFitLitLeafOf(chk, recvTy, layers)
-  if lit < 0 { return 0 }
+  if lit < 0 { return no }
   const rep = exprListRep(recv, fnIx)
   if (
     recvTy < 0
@@ -4771,14 +4804,16 @@ function emitListFitAt(
     && rep != "strlist"
     && rep != "reflist"
   ) {
-    return 0
+    return no
   }
   const depth = layers.length - 1
   const slots: i32[] = []
-  const scalar = listFitScalarOf(recv, rep, layers, slots, anchor, fnIx)
-  if scalar == "" { return -1 }
-  const scalarKind: ListKind = if scalar == "str" { "strlist" } else if scalar == "i64" { "i64list" } else { "list" }
-  const scalarV: VKind = if scalar == "str" { "str" } else if scalar == "i64" { "i64" } else { "i32" }
+  const scalar = listFitScalarOf(recv, rep, layers, slots, fnIx)
+  if scalar == "" {
+    no.lftOk = -1
+    no.lftWhy = LIST_FIT_REP_MSG
+    return no
+  }
   // How an element compares with a member of `L`: at its integer base, `i64w` for an `i32`
   // widened to `i64`, as a string, or as an atom.
   const numBase = numLitUnionBaseName(lit)
@@ -4802,22 +4837,54 @@ function emitListFitAt(
     if leaf < 0 || tyLitMemberTexts(leaf).length > 0 { leafKind = "atom" }
   }
   if leafKind == "" || lexes.length == 0 {
-    return emitFailAt(
-      "emitProgram: `is` over a list tests its elements against a literal set this element type has no compare for",
-      anchor,
-    )
+    no.lftOk = -1
+    no.lftWhy = "emitProgram: `is` over a list tests its elements against a literal set this element type has no compare for"
+    return no
   }
-  if stash >= 0 { fbLocalGet(stash) }
-  else if emitExpr(recv, fnIx) < 0 { return -1 }
+  const p: ListFitPlan = {
+    lftOk: 1,
+    lftWhy: "",
+    lftSlots: slots,
+    lftNullable: nullable,
+    lftScalar: scalar,
+    lftLeaf: leafKind,
+    lftLexes: lexes,
+  }
+  return p
+}
+
+// `listFitPlanOf` for `is` test `isIx`'s receiver against its tested type.
+export function listFitIsPlanOf(isIx: i32, fnIx: i32): ListFitPlan {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) {
+    const no: ListFitPlan = {
+      lftOk: 0,
+      lftWhy: "",
+      lftSlots: [],
+      lftNullable: false,
+      lftScalar: "",
+      lftLeaf: "",
+      lftLexes: [],
+    }
+    return no
+  }
+  return listFitPlanOf(nd.isObj, isVarTyIxOf(isIx), fnIx)
+}
+
+// The walk of an `lftOk` plan over the list on the stack, leaving 1 or 0; -1 when refused.
+export function listFitTail(p: ListFitPlan, fnIx: i32): i32 {
+  const scalar = p.lftScalar
+  const scalarKind: ListKind = if scalar == "str" { "strlist" } else if scalar == "i64" { "i64list" } else { "list" }
+  const scalarV: VKind = if scalar == "str" { "str" } else if scalar == "i64" { "i64" } else { "i32" }
   if (
     emitListFitLoop(
-      slots,
+      p.lftSlots,
       0,
-      nullable,
+      p.lftNullable,
       scalarKind,
       scalarV,
-      leafKind,
-      lexes,
+      p.lftLeaf,
+      p.lftLexes,
       fnIx,
     )
     < 0
@@ -4829,14 +4896,12 @@ function emitListFitAt(
 
 // The innermost list's element rep — `i32`, `i64` or `str` — of list `recv` (rep `rep`) nested
 // as deep as `layers` says, pushing each enclosing ref list's slot onto `slots`, outermost
-// first; "" after a refusal at `isIx` when the rep does not nest that way or disagrees with a
-// known type in `layers`.
+// first; "" when the rep does not nest that way or disagrees with a known type in `layers`.
 function listFitScalarOf(
   recv: i32,
   rep: VKind | null,
   layers: i32[],
   slots: i32[],
-  isIx: i32,
   fnIx: i32,
 ): string {
   const depth = layers.length - 1
@@ -4844,43 +4909,34 @@ function listFitScalarOf(
     if rep == "list" { return "i32" }
     if rep == "i64list" { return "i64" }
     if rep == "strlist" { return "str" }
-    emitFailAt(LIST_FIT_REP_MSG, isIx)
     return ""
   }
-  if rep != "reflist" { return listFitRepMiss(isIx) }
+  if rep != "reflist" { return "" }
   let s = refListSlotOfExpr(recv, fnIx)
   let k = 1
   while k < depth {
     if s < 0 || s >= rlElemTyIx.length || s >= rlElemNullable.length {
-      return listFitRepMiss(isIx)
+      return ""
     }
-    if rlElemNullable[s] != 0 { return listFitRepMiss(isIx) }
-    if layers[k] >= 0 && rlSlotOfTy(layers[k]) != s {
-      return listFitRepMiss(isIx)
-    }
+    if rlElemNullable[s] != 0 { return "" }
+    if layers[k] >= 0 && rlSlotOfTy(layers[k]) != s { return "" }
     slots.push(s)
     const ek = rlElemKindAt(s)
     if k < depth - 1 {
-      if ek != RLK_REF_LIST { return listFitRepMiss(isIx) }
+      if ek != RLK_REF_LIST { return "" }
       s = rlElemInnerSlot(s)
     } else {
       if ek == RLK_I32_LIST { return "i32" }
       if ek == RLK_I64_LIST { return "i64" }
       if ek == RLK_STR_LIST { return "str" }
-      return listFitRepMiss(isIx)
+      return ""
     }
     k = k + 1
   }
-  return listFitRepMiss(isIx)
+  return ""
 }
 
 const LIST_FIT_REP_MSG = "emitProgram: `is` over a list tests its elements, and this list's rep is not the one its type names"
-
-// Refuses the fit test at `isIx` for a list rep it cannot walk, answering "".
-function listFitRepMiss(isIx: i32): string {
-  emitFailAt(LIST_FIT_REP_MSG, isIx)
-  return ""
-}
 
 // `xs is K[]` where, at some list depth, the elements of `xs` and of `K[]` can never meet: true
 // exactly when every list at that depth is empty (D4910, by the D4771 ruling). A region the
@@ -9208,7 +9264,7 @@ function emitNulNoneLeafPayload(exprIx: i32, fnIx: i32) {
 }
 
 // The `a ?? b` node at `exprIx`, parentheses peeled, or null for any other node or a `??=`.
-function plainCoalesceAt(exprIx: i32): BinExpr | null {
+export function plainCoalesceAt(exprIx: i32): BinExpr | null {
   const n = nodeAt(unwrapParen(exprIx))
   if n is BinExpr {
     if n.binOp == "??" && n.binCompound.length == 0 { return n }
@@ -22925,7 +22981,14 @@ export function ifExprShapeWhy(ifIx: i32, fnIx: i32): string {
     return "arm prelude unwalked"
   }
   if optGuardCallOf(ifIx, fnIx) >= 0 { return "optional guard" }
-  if intMatchHeadAt(ifIx) { return "int match" }
+  // An integer `match` over a plain place whose `br_table` plan declines is written as the plain
+  // chain; one over anything else stays refused.
+  if intMatchHeadAt(ifIx) {
+    const p = intSwitchPlanOf(ifIx, fnIx)
+    if p != null && p.ispElse >= 0 { return "int match" }
+    const sc = switchScrutOf(n.ifCond)
+    if sc < 0 || !(nodeAt(sc) is Ident) { return "int match" }
+  }
   return ""
 }
 
@@ -23358,8 +23421,14 @@ function emitIfExprAs(ifIx: i32, fnIx: i32, kind: i32) {
 
 // One link of `emitIfExprAs`: 0 or -1 as that function returns, or 1 when the else is another `if`
 // and this link's frame is left open (its else restore target pushed onto `open`).
+// Whether the value `if` link at `ifIx` may be a valued `br_table` (`emitIntSwitch` mode 2): a
+// nullable one's arms are not all the blocktype's value.
+export function ifExprSwitchMay(ifIx: i32): boolean {
+  return !nodeTyIsNullable(ifIx)
+}
+
 function emitIfExprAsLink(ifIx: i32, fnIx: i32, kind: i32, open: i32[]) {
-  if !nodeTyIsNullable(ifIx) {
+  if ifExprSwitchMay(ifIx) {
     const sw = emitIntSwitch(ifIx, fnIx, 2, kind, "i32", -1)
     if sw < 0 { return -1 }
     if sw > 0 { return 0 }
@@ -28613,11 +28682,15 @@ export function callRefArgPlain(
   ) {
     return plainListArg(a, fnIx)
   }
-  // A boolean is an `i32` in wasm, and a vector its own `v128`.
+  // A boolean is an `i32` in wasm, a vector its own `v128`, and a tagged set's value its
+  // member's `i32` id.
   const w = exprScalarWidth(a, fnIx)
   return (k == "i32" || k == "i64" || k == "f64" || k == "f32" || k == "v128")
     && w == k
     || k == "i32" && w == "boolean"
+    || k == "i32"
+    && w == ""
+    && fnTagSetIsTagged(fnTagSetOfTy(nodeTyAt(a, fnIx)))
 }
 
 // Whether list or map argument `a` is written as it stands: no narrowing unbox, and not nullable.
@@ -29181,19 +29254,54 @@ export function typedHolderMember(letIx: i32, fnIx: i32): i32 {
 // The bundle read `arg`'s member `m`, -1 where the record holds none at the destination's type.
 // 0, or -1.
 function emitBundleMemberPick(arg: i32, m: i32, fnIx: i32): i32 {
-  const rp = bundleParamOfRead(unwrapParen(arg), fnIx)
-  const ua = unwrapParen(arg)
-  const si = if rp >= 0 { paramStructIdxOf(rp) } else if ua >= 0 && nodeAt(ua) is Ident { holderRecordRow(identDeclOf(ua), fnIx) } else { -1 }
-  const fi = if m >= 0 { sFieldIndex(si, "c" + i32ToStr(m)) } else { -1 }
-  if fi < 0 || si < 0 || si >= sHeapIdx.length {
+  const pk = bundleMemberPickOf(arg, m, fnIx)
+  if pk.bpHeap == -2 {
     return emitFailAt(
       "emitProgram: a bundle of closures is handed to a parameter whose closure type its record was not built with",
       arg,
     )
   }
   if emitExpr(arg, fnIx) < 0 { return -1 }
-  fbStructGet(sHeapIdx[si], fi)
+  fbStructGet(pk.bpHeap, pk.bpField)
   return 0
+}
+
+// The heap and field of bundle read `arg`'s member `m` (`emitBundleMemberPick`'s pick); heap -2
+// where the record holds no such member, which legacy refuses.
+export function bundleMemberPickOf(arg: i32, m: i32, fnIx: i32): BundlePick {
+  const rp = bundleParamOfRead(unwrapParen(arg), fnIx)
+  const ua = unwrapParen(arg)
+  const si = if rp >= 0 { paramStructIdxOf(rp) } else if ua >= 0 && nodeAt(ua) is Ident { holderRecordRow(identDeclOf(ua), fnIx) } else { -1 }
+  const fi = if m >= 0 { sFieldIndex(si, "c" + i32ToStr(m)) } else { -1 }
+  if fi < 0 || si < 0 || si >= sHeapIdx.length {
+    const bad: BundlePick = { bpHeap: -2, bpField: -1, bpTy: -1, bpKey: "" }
+    return bad
+  }
+  const pk: BundlePick = {
+    bpHeap: sHeapIdx[si],
+    bpField: fi,
+    bpTy: -1,
+    bpKey: "",
+  }
+  return pk
+}
+
+// The member argument `i` (`arg`) of direct call `callIx` in `fnIx` hands of its bundle: the one
+// noted, else the one the elaboration chose for the callee's annotation; -2 for neither.
+export function bundleHandMemberAt(
+  callIx: i32,
+  i: i32,
+  arg: i32,
+  fnIx: i32,
+): i32 {
+  const m = bundleHandMemberOf(arg)
+  if m != -2 { return m }
+  const ehm = elabCallHandMemberAt(
+    nodeSrc[callIx] ?? callIx,
+    i,
+    elabKeyOfFn(fnIx),
+  )
+  return if ehm >= -1 { ehm } else { -2 }
 }
 
 // Whether parameter `par` takes the function read `arg` in function `fnIx` as a bundle; a read of
@@ -43695,6 +43803,18 @@ export function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   return ifIx
 }
 
+// The `deadJoin` arm's `if true { l } else { d }`, minted once per `??` and instance, typed at its
+// join when minted: a later reader, legacy's or the IR builder's, takes it.
+export function coalDeadJoinIfOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  const key = i32ToStr(exprIx) + ":" + i32ToStr(fnIx)
+  const had = coalDeadJoinIfs[key] ?? -1
+  if had >= 0 { return had }
+  const pt = coalRetypedDeadJoinTy(unwrapParen(e.binLeft), exprIx, fnIx)
+  const ifIx = coalRetypedDeadJoinIf(e, pt)
+  coalDeadJoinIfs[key] = ifIx
+  return ifIx
+}
+
 // `if true { l } else { d }` typed at join `pt`, so the dead default still shapes the join the
 // arms deliver into.
 function coalRetypedDeadJoinIf(e: BinExpr, pt: i32): i32 {
@@ -43891,10 +44011,7 @@ function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
     return emitExpr(lhsIx, fnIx)
   }
   if arm == "deadJoin" {
-    return emitExpr(
-      coalRetypedDeadJoinIf(e, coalRetypedDeadJoinTy(lhsIx, exprIx, fnIx)),
-      fnIx,
-    )
+    return emitExpr(coalDeadJoinIfOf(e, exprIx, fnIx), fnIx)
   }
   if arm == "atomToStr" { return emitAtomToStr(lhsIx, fnIx) }
   if arm == "boxRuntime" {
@@ -44452,13 +44569,14 @@ function emitCoalesceUnionField(
     // The box kept: the default coerced into the result's union, the present arm the field's
     // own box re-read (D801).
     "boxed" => {
-      if emitCoalArmRecv(lhs.memObj, p.cfCast, fnIx) < 0 { return -1 }
+      const st = coalFieldRecvStash(lhs.memObj, p)
+      if coalFieldRecvFirst(lhs.memObj, p, st, fnIx) < 0 { return -1 }
       coalFieldBoxOpen(p)
       if (emitUnionBoxOwed(p.cfCoerceN, p.cfCoerceTy, e.binRight, fnIx) < 0) {
         return -1 // d, its own box
       }
       fbElse() // 0x05 else — present → re-read the field
-      if emitCoalArmRecv(lhs.memObj, p.cfCast, fnIx) < 0 { return -1 }
+      if coalFieldRecvAgain(lhs.memObj, p, st, fnIx) < 0 { return -1 }
       coalFieldRead(p)
       fbEnd() // 0x0b end
       0
@@ -44466,17 +44584,49 @@ function emitCoalesceUnionField(
     // The scalar: the default at the result kind, the present arm the field's payload unboxed
     // and widened to it (D1699, D10060).
     "unbox" => {
-      if emitCoalArmRecv(lhs.memObj, p.cfCast, fnIx) < 0 { return -1 }
+      const st = coalFieldRecvStash(lhs.memObj, p)
+      if coalFieldRecvFirst(lhs.memObj, p, st, fnIx) < 0 { return -1 }
       coalFieldValOpen(p)
       if emitExprAsKind(e.binRight, p.cfRk, fnIx) < 0 { return -1 }
       fbElse() // 0x05 else — present → unbox
-      if emitCoalArmRecv(lhs.memObj, p.cfCast, fnIx) < 0 { return -1 }
+      if coalFieldRecvAgain(lhs.memObj, p, st, fnIx) < 0 { return -1 }
       if coalFieldUnbox(p) < 0 { return -1 }
       fbEnd() // 0x0b end
       0
     }
     "none" => emitCoalesceOptMember(e, lhsIx, exprIx, fnIx)
   }
+}
+
+// The stash of a union-field `??`'s receiver `recv` along plan `p`: -1 for a re-readable place,
+// which each arm writes again, else the slot one evaluation is kept in (D17059).
+function coalFieldRecvStash(recv: i32, p: CoalFieldPlan): i32 {
+  if unionEqOperandOk(recv) || p.cfHeap < 0 { return -1 }
+  return coalFieldRecvSlot(p.cfHeap)
+}
+
+// The receiver before the null test: written, and kept in stash `st` when there is one.
+function coalFieldRecvFirst(
+  recv: i32,
+  p: CoalFieldPlan,
+  st: i32,
+  fnIx: i32,
+): i32 {
+  if emitCoalArmRecv(recv, p.cfCast, fnIx) < 0 { return -1 }
+  if st >= 0 { fbLocalTee(st) }
+  return 0
+}
+
+// The receiver on the present arm: the stash's read, or the place written again.
+function coalFieldRecvAgain(
+  recv: i32,
+  p: CoalFieldPlan,
+  st: i32,
+  fnIx: i32,
+): i32 {
+  if st < 0 { return emitCoalArmRecv(recv, p.cfCast, fnIx) }
+  fbLocalGet(st)
+  return 0
 }
 
 // How `emitCoalesceUnionField` writes `o.v ?? d` over a value-union record field `lhsIx` (code 16,

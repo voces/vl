@@ -42,6 +42,7 @@ import {
   RFnId,
   RGetField,
   RGlobalGet,
+  RHandPick,
   RJoinNull,
   RListCat,
   RListClear,
@@ -49,6 +50,7 @@ import {
   RListEmpty,
   RListEmptyArms,
   RListEq,
+  RListFitIs,
   RListGet,
   RListIsAcross,
   RListLen,
@@ -523,6 +525,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCall => {
       uses(r.caCaps, at)
       uses(r.caArgs, at)
+      // A capture handed back goes to a variable the call passed it from.
+      for w in r.caWb {
+        if !opndsHoldVar(r.caCaps, w) {
+          return fail(2, at, "a call's write-back is not a capture it passes")
+        }
+      }
       callSig(r.caCallee, r.caArgs, dst, at)
     }
     RCallRef => {
@@ -1174,6 +1182,11 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst != vfBool { return fail(2, at, "a list is-across test is a bool") }
       0
     }
+    RListFitIs => {
+      use(r.lsV, at)
+      if dst != vfBool { return fail(2, at, "a list fit test is a bool") }
+      0
+    }
     RLitArms => {
       use(r.liV, at)
       if dst != vfBool { return fail(2, at, "a literal arms test is a bool") }
@@ -1203,7 +1216,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       ) {
         return fail(2, at, "an atom coalesce of a non-`K | null`")
       }
-      if !(r.zaD is OStr) || opRep(r.zaD) != vfStr || dst != vfStr {
+      if opRep(r.zaD) != vfStr || dst != vfStr {
         return fail(
           2,
           at,
@@ -1219,11 +1232,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if (!(l is RNullable) || l.rnDisc != 1 || repPrim(l.rnInner) != "str") {
         return fail(2, at, "a string coalesce of a non-string | null")
       }
-      if !(r.czD is OStr) {
+      // The default is written in the block in place: a literal, or a value at the result's rep.
+      if !(r.czD is OStr) && (dst < 0 || opRep(r.czD) != dst) {
         return fail(
           2,
           at,
-          "a string coalesce's default is not a string literal",
+          "a string coalesce's default is neither a string literal nor at its rep",
         )
       }
       if dst >= 0 && dst != l.rnInner && dst != opRep(r.czL) {
@@ -1471,6 +1485,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.bpV, at)
       if dst >= 0 && !(repNodeAt(dst) is RClosure) {
         return fail(2, at, "a bundle member of a non-closure rep")
+      }
+      0
+    }
+    RHandPick => {
+      use(r.hpV, at)
+      if !(repNodeAt(opRep(r.hpV)) is RRecord) {
+        return fail(2, at, "a hand pick of a non-record value")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RClosure) {
+        return fail(2, at, "a hand member of a non-closure rep")
       }
       0
     }
@@ -1768,6 +1792,26 @@ function coalNulRefWhy(n: SCoalBox): string {
   return ""
 }
 
+// Why a `string | null` `??` whose default computes is ill-formed, or "": it reads a nullable
+// string and yields that string or its non-null inner.
+function coalNulStrWhy(n: SCoalBox): string {
+  const lr = repNodeAt(opRep(n.cbL))
+  if !(lr is RNullable) || lr.rnDisc != 1 || repPrim(lr.rnInner) != "str" {
+    return "a string `??` reads no nullable string"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a string `??` writes no variable"
+  }
+  const or = vf.irVars[o].vRep
+  const on = repNodeAt(or)
+  const boxed = on is RBox || on is RNullable && on.rnDisc == 4
+  if !boxed && or != opRep(n.cbL) && or != lr.rnInner {
+    return "a string `??` yields neither the string, its inner, nor a box"
+  }
+  return ""
+}
+
 // Why a shared `scalar | null` field's `??` is ill-formed, or "": it reads a boxed nullable and
 // yields a scalar.
 function coalBoxFieldScalarWhy(n: SCoalBox): string {
@@ -1939,7 +1983,10 @@ function ifSpine(id0: i32) {
 
 // Whether `v` is a declared binding, the one a loop value's frame carries out through.
 function declaredVar(v: i32): boolean {
-  return v >= 0 && v < vf.irVars.length && vf.irVars[v].vKind != "temp"
+  return v >= 0
+    && v < vf.irVars.length
+    && vf.irVars[v].vKind != "temp"
+    && vf.irVars[v].vSlot >= 0
 }
 
 function labelled(label: i32, out: i32, body: i32[]) {
@@ -1969,7 +2016,7 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
   if (n.cbMap != null) != mapArm {
     return fail(2, id, "a `??` holds a map probe off the map-read arm")
   }
-  if n.cbLB.length > 0 && n.cbArm != "nulRef" {
+  if n.cbLB.length > 0 && n.cbArm != "nulRef" && n.cbArm != "nulStr" {
     return fail(
       2,
       id,
@@ -1996,6 +2043,7 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
     "optLeaf" => coalOptLeafWhy(n)
     "boxStash" => coalBoxStashWhy(n)
     "boxFieldScalar" => coalBoxFieldScalarWhy(n)
+    "nulStr" => coalNulStrWhy(n)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
   }
   if why != "" { return fail(2, id, why) }
@@ -2272,8 +2320,12 @@ function intSwitchCheck(n: SIntSwitch, id: i32) {
       return fail(7, id, "a table entry names no arm")
     }
   }
-  for a in n.isArms { nested(a) }
+  for a in n.isArms {
+    nested(a)
+    endsWriting(a, n.isOut, id)
+  }
   nested(n.isElse)
+  endsWriting(n.isElse, n.isOut, id)
   return 0
 }
 
@@ -2535,6 +2587,7 @@ function rhsReadsList(r: Rhs): boolean {
       RFnId |
       RGetField |
       RGlobalGet |
+      RHandPick |
       RJoinNull |
       RListCat |
       RListClear |
@@ -2542,6 +2595,7 @@ function rhsReadsList(r: Rhs): boolean {
       RListEmpty |
       RListEmptyArms |
       RListEq |
+      RListFitIs |
       RListIsAcross |
       RListLen |
       RListNew |
@@ -2887,4 +2941,12 @@ function plainRecordsLowerAlike(a: i32, b: i32): boolean {
     && !x.rrVariant
     && !y.rrVariant
     && repsLowerAlike(a, b, vf.irRecHeap)
+}
+
+// Whether operands `os` read variable `v`.
+function opndsHoldVar(os: Opnd[], v: i32): boolean {
+  for o in os {
+    if o is OVar && o.ov == v { return true }
+  }
+  return false
 }
