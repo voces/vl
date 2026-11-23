@@ -1,3 +1,4 @@
+import { asExprNumCastDomain } from "./emit_union_casts"
 import { nulAtomWidenTexts } from "./emit_lit_atoms"
 import { rangeConstIs, rangeConstVal } from "./emit_plan_list"
 import { blockHasContinueFor } from "./emit_query"
@@ -209,8 +210,11 @@ import {
   arrNewFillBoxTy,
   arrNewWhyOf,
   asCastArmOf,
+  asLitAtomWhy,
   asNicheCastWhy,
+  asNumLitScalarWhy,
   asUnionTagWhy,
+  asWrapArmOf,
   asgValueArmOf,
   atomHookArmOf,
   atomStrPlanOf,
@@ -375,6 +379,7 @@ import {
   simdOperandPrim,
   simdResultPrim,
   simdRowIsMem,
+  srWrappedMask,
   startInitArmOf,
   stmtWritesNothing,
   strAccRowsAre,
@@ -9633,6 +9638,14 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     const arm = asCastArmOf(ix, ibFnIx)
     if arm == "zextLoad" { return irBMiss("expression as zextLoad") }
     if arm == "union" { return asUnion(b, n, ix, rep) }
+    if arm == "litAtom" || arm == "numLitScalar" {
+      return asLit(b, n, ix, rep, arm)
+    }
+    if arm == "wrap" {
+      const wa = asWrapArmOf(ix, ibFnIx)
+      if wa == "narrowMask" { return wrapNarrowed(b, ix, rep) }
+      if wa == "litFold" { return wrapLit(b, n, ix, rep) }
+    }
     return asCast(b, n, ix, rep)
   }
   if n is ObjLit { return objLit(b, ix, rep) }
@@ -9659,6 +9672,45 @@ function asUnion(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("union cast operand rep")
   }
   return irBLetTemp(b, { auV: v, auAt: ix }, ix, rep)
+}
+
+// `((y >>> k) & m) as% i32` narrowed to i32 (`asWrapArmOf`'s `narrowMask`), as legacy's
+// `srEmitNarrowed` writes `srWrappedMask`'s [y, k, 1, m]: `shiftMaskFold`'s form with no outer shift.
+function wrapNarrowed(b: i32[], ix: i32, rep: i32): Opnd {
+  const f = srWrappedMask(ix, ibFnIx)
+  if f.length != 4 { return irBMiss("wrap narrowed mask") }
+  return shiftMaskFold(b, [f[0], f[1], f[2], f[3], -1], 32, ix, rep)
+}
+
+// An integer literal under `as%` (`asWrapArmOf`'s `litFold`), as `emitNumWrapLit` writes it: the
+// 32-bit constant its text denotes (`parseI64Pair`'s low word), then the byte mask at `u8`.
+function wrapLit(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  const lit = nodeAt(unwrapParen(n.asObj))
+  if !(lit is NumLit) || repPrim(rep) != "i32" {
+    return irBMiss("wrap literal rep")
+  }
+  const c: Opnd = { oiRep: rep, oiBits: parseI64Pair(lit.numText)[1] as i64 }
+  if asExprNumCastDomain(ix) != "u8" { return c }
+  const m: Opnd = { oiRep: rep, oiBits: 255 }
+  return irBLetTemp(b, { poOp: "and", poArgs: [c, m] }, ix, rep)
+}
+
+// A literal-union cast (`asCastArmOf`'s `litAtom` and `numLitScalar` arms), as legacy writes it:
+// the operand by its own `emitExpr`, then the staged member test and tail (`RAsTail`), at the
+// cast's own rep. A cast legacy refuses (`asLitAtomWhy`, `asNumLitScalarWhy`) is left to it.
+function asLit(b: i32[], n: AsExpr, ix: i32, rep: i32, arm: string): Opnd {
+  const why = if arm == "litAtom" { asLitAtomWhy(ix, ibFnIx) } else { asNumLitScalarWhy(ix, ibFnIx) }
+  if why != "" { return irBMiss("literal cast refused") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  if rep != repNodeOfTy(ty) { return irBMiss("literal cast result rep") }
+  const v = irBExpr(b, n.asObj)
+  if ibMiss != "" { return v }
+  const vr = irBOpRep(v)
+  if !repIsScalar(vr) && !(repNodeAt(vr) is RAtom) {
+    return irBMiss("literal cast operand rep")
+  }
+  return irBLetTemp(b, { akV: v, akAt: ix }, ix, rep)
 }
 
 // A cast over a niche-repped `T | null` operand, as `emitAsNulNiche` writes it: `as?` is the
