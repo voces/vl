@@ -35,6 +35,12 @@ The ordering is enforced rather than just measured. Every answer the tree used i
 scratch compiler whose `famRelayStructRow` builds the row's rep and then re-lays the field from
 string to `i32`; on the witness it fires that message.
 
+An earlier control forced every family row's rep to be built before the real family re-lays
+(`layout-family-literal-set-beside-string.vl`, `discriminant-set-beside-base-alias-arm.vl`), and it
+did not fire. That is correct, not a blind guard. Those re-lays move literal-SET fields
+(`K = "circle" | "round"`), which the tree answers through the union path (`URC_ATOM`), so this
+predicate is never asked about them and no recorded answer can change.
+
 ## Readings
 
 PENDING
