@@ -896,6 +896,7 @@ import {
   relSkew,
 } from "./emit_reloc"
 import {
+  fieldRowIsNulAtom,
   fieldRowIsNulNone,
   fieldRowIsPlainI32,
   fieldRowIsRecordRef,
@@ -4557,7 +4558,8 @@ function emitFieldLitEq(r: i32, lex: string, fnIx: i32) {
   if fieldRowIsStr(r, false) || fieldRowIsStr(r, true) {
     return emitStrEqLit(mkStr(lex, -1), fnIx)
   }
-  if nk == 0 {
+  // A `null` niche never equals a member, so a nullable `i32` row compares as a plain one.
+  if nk == 0 || fieldRowIsNulAtom(r) {
     // The i32 slot serves both the interned string ATOM and a small numeric literal; the
     // quotes are what part them, exactly as they do in `emitLitMemberEq`.
     if nameIsQuotedLeaf(lex) {
@@ -7396,6 +7398,22 @@ function emitCrossTagFits(
   return 0
 }
 
+// The lexemes of literal set `yTy`'s non-null members that fit field type `xTy`, in declaration
+// order: the values of a literal-set field a wider field admits (D17074).
+function litMembersFitting(yTy: i32, xTy: i32): string[] {
+  const out: string[] = []
+  const nn = nonNullTy(yTy)
+  if nn < 0 || xTy < 0 { return out }
+  const t = tyAt(nn)
+  const ms: i32[] = if t is TyUnion { t.uMembers } else { [nn] }
+  for m in ms {
+    if tyAt(m) is TyLit && tyFitKind(m, xTy) == 1 {
+      for lx in tyLitSetMemberLexes(m) { out.push(lx) }
+    }
+  }
+  return out
+}
+
 // Leaves 1 when the payload of arm `yi` (arena `yTy`) fits record `xTy` field by field, given that
 // its tag already matched. A field only some values fit is either a scalar tested against the
 // literal set `xTy` narrows it to, or a box whose every member fits or does not, answered by its
@@ -7431,6 +7449,39 @@ function emitArmFieldsFit(
     const lexes = tyLitSetMemberLexes(
       if nulStr { nonNullTy(fxSet) } else { fxSet },
     )
+    // A field whose own type is a literal set, tested against a wider field: the members that
+    // fit it, compared one by one; its `null`, where the other field admits none, fits nothing.
+    const ylex = litMembersFitting(fys[i], fxs[i])
+    if (
+      fi >= 0
+      && !fieldRowIsUnionBox(uFieldStart[yi] + fi)
+      && lexes.length == 0
+      && nnKind == 2
+      && tyLitSetMemberLexes(nonNullTy(fys[i])).length > 0
+      && !nulStr
+      && (nonNullTy(fys[i]) == fys[i] || nonNullTy(fxs[i]) == fxs[i])
+    ) {
+      let yi2 = 0
+      while yi2 < ylex.length {
+        if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
+        fbStructGet(uBoxIdx, 1)
+        fbRefCast(variantHeap(yi))
+        fbStructGet(variantHeap(yi), fi)
+        if emitFieldLitEq(uFieldStart[yi] + fi, ylex[yi2], fnIx) < 0 {
+          return -1
+        }
+        if yi2 > 0 {
+          fbI32Bin(114) // i32.or
+        }
+        yi2 = yi2 + 1
+      }
+      if ylex.length == 0 { fbI32Const(0) }
+      if i > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      i = i + 1
+      continue
+    }
     if (
       fi >= 0
       && !fieldRowIsUnionBox(uFieldStart[yi] + fi)
@@ -7511,7 +7562,18 @@ function emitArmFieldsFit(
       const fk = tyFitKind(mm, fxs[i])
       const tags: i32[] = []
       const vis: i32[] = []
-      if !unionArmTagsOfTy(mm, -1, tags, vis) || tags.length != 1 {
+      let tagged = unionArmTagsOfTy(mm, -1, tags, vis) && tags.length == 1
+      // A numeric literal member rides the box under its scalar's tag (D17074).
+      const mt = tyAt(mm)
+      if !tagged && mt is TyLit && mt.litKind != "str" {
+        const lk = scalarArmKindOfTy(mm)
+        if lk >= 0 {
+          tags.clear()
+          tags.push(scalarTagOfKind(lk))
+          tagged = true
+        }
+      }
+      if !tagged {
         return emitFail(
           "emitProgram: `is` across record arms whose shared field's box holds a member with no one tag",
         )
@@ -24784,14 +24846,15 @@ function emitAsInstMiss(e: AsExpr, exprIx: i32, fnIx: i32) {
     fbUnreachable()
     return 0
   }
+  return emitNullOwn(asInstMissNullOwn(exprIx))
+}
+
+// The null `as?` cast `exprIx` answers on an instance miss (`emitAsInstMiss`): a union result's
+// null-tagged box, else its type's own null (`nullOwnOfTy`).
+export function asInstMissNullOwn(exprIx: i32): i32 {
   const mt = nodeTyIxOf(exprIx)
-  if repOfTy(mt).rdKind == "union" {
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbRefNullNone()
-    fbStructNew(uBoxIdx)
-    return 0
-  }
-  return emitNullOwn(nullOwnOfTy(mt))
+  if repOfTy(mt).rdKind == "union" { return NULL_OWN_BOX }
+  return nullOwnOfTy(mt)
 }
 
 // The cast node `exprIx` copies, through a mono copy's source nodes (`nodeSrc`).
@@ -25139,6 +25202,11 @@ function nulNicheHeapOf(obj: i32, payload: i32, fnIx: i32): i32 {
 // key and reading the stored value otherwise. Returns 0 or -1.
 function emitAsMapProbeTrap(amRef: Index, fnIx: i32) {
   if emitMapPrep(amRef.idxArr, amRef.idxIndex, fnIx) < 0 { return -1 }
+  return asMapProbeTrapTail()
+}
+
+// `emitAsMapProbeTrap` after its probe: the trap on a missing key, then the stored value.
+export function asMapProbeTrapTail() {
   pushMapScr(5) // entry
   fbI32Eqz()
   fbIf(64) // void
@@ -26043,6 +26111,22 @@ function holeOptPinTy(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
   return -1
 }
 
+// How `emitHoleNumAsOpt` writes `u as? N` over a type-parameter operand at this instance's pin:
+// "null", the null-tagged box with the operand unread, at a pin no number or `boolean`; "exact",
+// the exact cast where it can fail (`holeOptExactSrc`); "box", the plain cast boxed; "none" with
+// no pin.
+export type HoleOptShape = "null" | "exact" | "box" | "none"
+export function holeOptShapeOf(exprIx: i32, fnIx: i32): HoleOptShape {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return "none" }
+  const ext = holeOptPinTy(e, exprIx, fnIx)
+  if ext < 0 { return "none" }
+  const src = primNameStr(primNameOf(ext))
+  const srcNum = src == "i32" || src == "i64" || src == "f32" || src == "f64"
+  if !srcNum && src != "boolean" { return "null" }
+  return if holeOptExactSrc(exprIx, fnIx) != "" { "exact" } else { "box" }
+}
+
 // The number `u as? N` over a type-parameter operand converts from when its cast can fail at
 // this pin, which `emitHoleNumAsOpt` writes as the exact cast; "" for every other pin.
 function holeOptExactSrc(exprIx: i32, fnIx: i32): string {
@@ -26079,9 +26163,7 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
         + "` over a type parameter needs the instance's exact pin",
     )
   }
-  const src = primNameStr(primNameOf(ext))
-  const srcNum = src == "i32" || src == "i64" || src == "f32" || src == "f64"
-  if !srcNum && src != "boolean" {
+  if holeOptShapeOf(exprIx, fnIx) == "null" {
     fbI32Rel(RS_TAG, nullBoxTag())
     fbRefNullNone()
     fbStructNew(uBoxIdx)
@@ -26089,9 +26171,24 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
   }
   const xs = holeOptExactSrc(exprIx, fnIx)
   if xs != "" { return emitNumExactCastFrom(e, exprIx, xs, fnIx) }
-  fbI32Rel(RS_TAG, scalarTagOfKind(nck))
+  holeOptBoxHead(exprIx)
   if emitNumPlainCast(e.asObj, tgt, fnIx) < 0 { return -1 }
-  fbStructNew(nvb)
+  return holeOptBoxTail(exprIx)
+}
+
+// The tag of `holeOptShapeOf`'s "box" at cast `exprIx`, written ahead of its operand.
+export function holeOptBoxHead(exprIx: i32) {
+  return fbI32Rel(RS_TAG, scalarTagOfKind(asExprNumTgtKind(exprIx)))
+}
+
+// The scalar type `holeOptShapeOf`'s "box" at cast `exprIx` boxes: its target's.
+export function holeOptBoxScalarTy(exprIx: i32): i32 {
+  return numPrimTyOfKind(asExprNumTgtKind(exprIx))
+}
+
+// After the box's operand: its value box, then the union box.
+export function holeOptBoxTail(exprIx: i32) {
+  fbStructNew(vbHeapIdxOfKind(asExprNumTgtKind(exprIx)))
   fbStructNew(uBoxIdx)
   return 0
 }
@@ -26110,7 +26207,16 @@ export function numCastKindOf(exprIx: i32, fnIx: i32): i32 {
     "holeExact" => numExactCastKind(asExprHolePinSrc(exprIx, fnIx))
     "holeOpt" => {
       const hs = holeOptExactSrc(exprIx, fnIx)
-      if hs != "" { numExactCastKind(hs) } else { -1 }
+      if hs != "" {
+        numExactCastKind(hs)
+      } else if holeOptShapeOf(exprIx, fnIx) == "box" {
+        numPlainCastKind(
+          numCastSrcRepOf(e.asObj, fnIx),
+          asExprNumTgtName(exprIx),
+        )
+      } else {
+        -1
+      }
     }
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => -1
     "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => -1
@@ -26139,7 +26245,7 @@ export function numCastTail(exprIx: i32, fnIx: i32): i32 {
     "exact" => numExactCastTail(exprIx, asExprNumSrcName(exprIx), fnIx)
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => numCastNoTail()
     "holeExact" => numExactCastTail(exprIx, asExprHolePinSrc(exprIx, fnIx), fnIx)
-    "holeOpt" => numExactCastTail(exprIx, holeOptExactSrc(exprIx, fnIx), fnIx)
+    "holeOpt" => if holeOptExactSrc(exprIx, fnIx) != "" { numExactCastTail(exprIx, holeOptExactSrc(exprIx, fnIx), fnIx) } else { numPlainCastTail(numCastSrcRepOf(e.asObj, fnIx), asExprNumTgtName(exprIx)) }
     "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => numCastNoTail()
     "union" | "notCast" => numCastNoTail()
   }
