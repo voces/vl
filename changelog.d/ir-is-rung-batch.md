@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage: `x is "lit"` on the `litMember` rung and `l ?? d` on the `boxStash` rung.** One string literal's member test is built as the literal arms' one-member compare (a number literal stays a named miss). A `??` over a value-union box that legacy stashes and tag-tests is built as an `SCoalBox` `boxStash` node over legacy's own head (`coalBoxStashOpen`). Two legacy sites, `emitCoalesceBoxStash` and `emitListIsAcrossReps`, now take the shared receiver slot after writing their operand, as #9599 did for three others, so the IR builds both operands as ordinary values (and `listAcross` takes any receiver).
