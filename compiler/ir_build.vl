@@ -1429,8 +1429,8 @@ function isVariantTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
 }
 
 // `recv is V` at `V`'s tested row `vi`, along `variantRowArmOf` as `emitIsTestVariantRow` writes
-// it: a static fold, a closed record that never fits, the row's tag alone, or the tag and its
-// discriminant fields. A chain with shared or cross-row field fits misses.
+// it: a static fold, a closed record that never fits, the row's tag alone, the tag and its
+// discriminant fields, or the full chain over legacy's tail. A staged chain misses.
 function isVariantRow(b: i32[], n: IsExpr, ix: i32, rep: i32, vi: i32): Opnd {
   const arm: VariantRowArm = variantRowArmOf(ix, n, ibFnIx, vi)
   if arm == "foldTrue" || arm == "foldFalse" {
@@ -1447,7 +1447,11 @@ function isVariantRow(b: i32[], n: IsExpr, ix: i32, rep: i32, vi: i32): Opnd {
     const z: Opnd = { oiRep: rep, oiBits: 0 }
     return z
   }
-  if arm != "plainTag" && arm != "discrim" {
+  // A chain staged into the shared slot (a receiver no re-readable place) stays legacy's.
+  if arm == "chain" && !unionEqOperandOk(n.isObj) {
+    return irBMiss("is variant row chain staged")
+  }
+  if arm != "plainTag" && arm != "discrim" && arm != "chain" {
     return irBMiss("is variant row " + arm)
   }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
@@ -1459,6 +1463,13 @@ function isVariantRow(b: i32[], n: IsExpr, ix: i32, rep: i32, vi: i32): Opnd {
       return irBMiss("is variant discrim receiver")
     }
     return irBLetTemp(b, { vdV: v, vdVi: vi, vdAt: ix }, ix, rep)
+  }
+  if arm == "chain" {
+    // Legacy's tail re-reads it, so a box variable (`fitRecvReadHook`).
+    if !(v is OVar) || !(repNodeAt(irBOpRep(v)) is RBox) {
+      return irBMiss("is variant chain receiver")
+    }
+    return irBLetTemp(b, { vcV: v, vcVi: vi, vcAt: ix }, ix, rep)
   }
   if !(repNodeAt(irBOpRep(v)) is RBox) && !boxedNullable(irBOpRep(v)) {
     return irBMiss("is operand rep")
@@ -7853,18 +7864,23 @@ function coalNulStr(
   const want = if nul { irBOpRep(l) } else { strInnerOf(irBOpRep(l)) }
   if rep != want { return irBMiss("coalesce result rep") }
   const nb: i32[] = []
-  const d0 = irBExpr(nb, n.binRight)
-  if ibMiss != "" { return d0 }
-  const d = if atom { coalAtomStrDefault(nb, d0, n.binRight, nul, rep) } else { d0 }
-  if ibMiss != "" { return d }
-  if irBOpRep(d) != rep { return irBMiss("coalesce string default rep") }
-  // A default and an operand that build nothing are written in place, as the literal's core is.
-  if lb.length == 0 && nb.length == 0 {
-    const r: Rhs = { czL: l, czD: d, czAt: ix }
-    return irBLetTemp(b, r, ix, rep)
+  let t = -1
+  if atom || !coalNeverDefault(nb, n.binRight, rep) {
+    const d0 = irBExpr(nb, n.binRight)
+    if ibMiss != "" { return d0 }
+    const d = if atom { coalAtomStrDefault(nb, d0, n.binRight, nul, rep) } else { d0 }
+    if ibMiss != "" { return d }
+    if irBOpRep(d) != rep { return irBMiss("coalesce string default rep") }
+    // A default and an operand that build nothing are written in place, as the literal's core is.
+    if lb.length == 0 && nb.length == 0 {
+      const r: Rhs = { czL: l, czD: d, czAt: ix }
+      return irBLetTemp(b, r, ix, rep)
+    }
+    t = irVarNew(ib, rep, ty, "local", -1)
+    irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
   }
-  const t = irVarNew(ib, rep, ty, "local", -1)
-  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  if t < 0 { t = irVarNew(ib, rep, ty, "local", -1) }
   const arm: CoalValArm = "nulStr"
   irBNode(
     b,
@@ -7967,10 +7983,13 @@ function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
-  const d = deliver(nb, n.binRight, rep, -1)
-  if ibMiss != "" { return d }
-  if irBOpRep(d) != rep { return irBMiss("coalesce box stash default rep") }
-  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  if !coalNeverDefault(nb, n.binRight, rep) {
+    const d = deliver(nb, n.binRight, rep, -1)
+    if ibMiss != "" { return d }
+    if irBOpRep(d) != rep { return irBMiss("coalesce box stash default rep") }
+    irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  }
+  if ibMiss != "" { return irBMiss(ibMiss) }
   irBNode(
     b,
     {
@@ -8139,10 +8158,13 @@ function coalBoxFieldScalar(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
-  const d = deliver(nb, n.binRight, rep, -1)
-  if ibMiss != "" { return d }
-  if irBOpRep(d) != rep { return irBMiss("coalesce nulRef default rep") }
-  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  if !coalNeverDefault(nb, n.binRight, rep) {
+    const d = deliver(nb, n.binRight, rep, -1)
+    if ibMiss != "" { return d }
+    if irBOpRep(d) != rep { return irBMiss("coalesce nulRef default rep") }
+    irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  }
+  if ibMiss != "" { return irBMiss(ibMiss) }
   const arm: CoalValArm = "boxFieldScalar"
   irBNode(
     b,
