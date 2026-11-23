@@ -671,8 +671,10 @@ import {
   fnStmts,
   fnStmtsPosOf,
   gConstExprEmit,
+  gInitProgAfter,
   gInitProgIdx,
   gPromoInStart,
+  globalStmtOrd,
   liFrameRestore,
   liFrameSave,
   monoGen,
@@ -686,6 +688,8 @@ import {
   sTy,
   sTyIx,
   setIrShadowOn,
+  startStmtOrd,
+  startStmts,
   synthMintCount,
   uFieldCount,
   uFieldStart,
@@ -11715,9 +11719,9 @@ export function irShadowThunk(fe: i32, out: u8[], from: i32) {
   return count("thunk matched")
 }
 
-// Builds a start body: each top-level statement, or global `orderGi[i]`'s initializer, in order,
-// each under a top-level row (kind 1) and no statement row; the single start's opens with the
-// pool fill (`poolFill`). "" or the first miss.
+// Builds a start body: each top-level statement (`orderGi[i]` -1), or global `orderGi[i]`'s
+// initializer (`-2 - gi` for one that runs elsewhere), in order, each with its progress store under
+// a top-level row (kind 1); the single start's opens with the pool fill. "" or the first miss.
 function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ib = irFnNew(-1, if poolFill { "@start" } else { "@init" })
   ib.irPoolFill = poolFill
@@ -11733,7 +11737,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibStartRoots = []
   let k = 0
   while k < order.length {
-    if orderGi[k] < 0 { ibStartRoots.push(order[k]) }
+    if orderGi[k] == -1 { ibStartRoots.push(order[k]) }
     k = k + 1
   }
   ibLoopName = []
@@ -11746,25 +11750,46 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   if !repIsNoValue(ibNoValue) { return "no void rep" }
   ib.irRetRep = ibNoValue
   ib.irRetTy = TY_NEVER
-  if gInitProgIdx >= 0 { return "progress cell" }
   const top: i32[] = []
   let i = 0
   while i < order.length {
     const n0 = top.length
-    if orderGi[i] >= 0 {
-      globalInit(top, orderGi[i], order[i])
-    } else {
-      stmtNode(top, order[i], NO_SIBS, -1)
+    // A global whose initializer runs elsewhere writes only its progress (`startIrOrder`).
+    const gi = if orderGi[i] <= -2 { -2 - orderGi[i] } else { orderGi[i] }
+    if orderGi[i] >= 0 { globalInit(top, orderGi[i], order[i]) }
+    else if orderGi[i] == -1 { stmtNode(top, order[i], NO_SIBS, -1) }
+    if ibMiss != "" { return ibMiss }
+    // Legacy advances the read-before-init progress cell after each item where a guarded global
+    // settles (`emitInitProgressAt`), before it banks the item's row.
+    if gInitProgIdx >= 0 {
+      const ord = startItemOrd(order[i], gi)
+      if ord < 0 { return "progress cell position" }
+      if (gInitProgAfter[ord] ?? -1) >= 0 {
+        irBNode(top, { efRhs: { ipOrd: ord } }, -1, ibNoValue, order[i])
+      }
     }
     // Legacy banks a top-level row (kind 1) over each item that wrote bytes.
     if top.length > n0 {
       irSpanNoteKind(ib, order[i], top[n0], top[top.length - 1], 1)
     }
-    if ibMiss != "" { return ibMiss }
     i = i + 1
   }
   ib.irBody = top
   return ibMiss
+}
+
+// The top-level position of start item `node`, global `gi`'s initializer when `gi` >= 0, as the
+// start body numbers it for its progress cell (`globalStmtOrd`, `startStmtOrd`); -1 for none.
+function startItemOrd(node: i32, gi: i32): i32 {
+  if gi >= 0 {
+    return if gi < globalStmtOrd.length { globalStmtOrd[gi] } else { -1 }
+  }
+  let si = 0
+  while si < startStmts.length && si < startStmtOrd.length {
+    if startStmts[si] == node { return startStmtOrd[si] }
+    si = si + 1
+  }
+  return -1
 }
 
 // Global `gi`'s initializer, at statement `gst`, written as legacy's plain arm writes it: the
