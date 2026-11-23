@@ -20,7 +20,11 @@
 
 ## Measured
 
-To be filled in from the proof.
+Against master `88df143ea` at its fixpoint seed:
+- Census: `coalesce of a valued if` 10 + 4 `start:` → 0; `start: coalesce field place` 24 → 14.
+- tests/cases: covered = verified 71,931 → 71,944, matched 71,930 → 71,943. Programs fully
+  IR-only 5,431 → 5,439.
+- Legacy A/B, `--names`, `--cases` and `--claimless` differ 0. L2 fuel per PR is +0.01%.
 
 Open: 14 `start:` `coalesce field place` functions read the field off a top-level list element
 (`xs[0].r ?? d`). That needs an element re-read over a global's temp, plus legacy's bounds
