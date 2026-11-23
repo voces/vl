@@ -1531,6 +1531,8 @@ Deno.test({
       "width-retag-noted-leading": 0,
       "width-retag-field-not-leading": 2,
       "width-retag-pair-unnoted": 2,
+      "hand-pick-of-i32": 2,
+      "hand-pick-record-into-i32": 2,
       "retag-closures-of-differing-arity": 2,
       "retag-field-alike-records-two-heaps": 2,
       "global-read-off-store-type": 2,
