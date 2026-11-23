@@ -1,7 +1,9 @@
 #!/bin/bash
 # Worktree setup for parallel compiler agents (docs/agent-playbook.md).
-# Symlinks the warm cargo target + node_modules from the main checkout and
-# builds the seed compiler. Run from the WORKTREE root.
+# Symlinks the warm cargo target + node_modules from the main checkout,
+# builds the seed compiler, then checks the host. Run from the WORKTREE root.
+#   scripts/agent-setup.sh               set up, then check the host
+#   scripts/agent-setup.sh --host-check  only check (and repair) the host
 set -e
 # The MAIN checkout, derived rather than hardcoded: in a worktree
 # `--git-common-dir` is the main repo's `.git`, so its parent is that checkout;
@@ -14,8 +16,58 @@ if [ -z "$MAIN" ]; then
   case "$common" in /*) ;; *) common="$PWD/$common" ;; esac
   MAIN="$(cd "$(dirname "$common")" && pwd)"
 fi
+VL=scripts/vl-host/target/release/vl
+
+# Whether the host serves this tree's guest protocol: the newest `$VL_IR_SHADOW` mode (6, the
+# order check) must print `[ir]` rows. A host built before a mode landed maps it to off, and
+# every gate row that asks for it reads "no `[ir]` rows".
+host_ok() {
+  [ -x "$VL" ] && [ -f build/vl-compiler.wasm ] || return 1
+  local d
+  d="$(mktemp -d)"
+  printf 'function f(x: i32): i32 { return x + 1 }\nprint(f(2))\n' > "$d/t.vl"
+  VL_STD="$PWD/std" VL_IR_SHADOW=6 VL_COMPILER_WASM=build/vl-compiler.wasm \
+    "$VL" build "$d/t.vl" -o "$d/t.wasm" 2>&1 | grep -q '^\[ir\]'
+  local rc=$?
+  rm -rf "$d"
+  return $rc
+}
+
+# A stale shared host is rebuilt for THIS worktree only: an isolated `--target-dir` under
+# `$TMPDIR`, deleted on exit, copied over the worktree's own target in place of the symlink.
+# The shared target is never built into (CLAUDE.md); the coordinator rebuilds it after a merge.
+host_check() {
+  if host_ok; then
+    echo "agent-setup: host ok (\`VL_IR_SHADOW=6\` prints \`[ir]\` rows)"
+    return 0
+  fi
+  if [ ! -L scripts/vl-host/target ]; then
+    echo "agent-setup: the host at $VL predates this tree's \`\$VL_IR_SHADOW\` modes." >&2
+    echo "  This target is not a worktree's symlink, so it is not rebuilt here: force-rebuild it" >&2
+    echo "  (rm $VL && touch scripts/vl-host/src/main.rs && cargo build --release)." >&2
+    return 1
+  fi
+  echo "agent-setup: the shared host predates this tree's \`\$VL_IR_SHADOW\` modes; building an isolated one"
+  HOST_TGT="$(mktemp -d "${TMPDIR:-/tmp}/vl-host-target.XXXXXX")"
+  trap 'rm -rf "$HOST_TGT"' EXIT
+  (cd scripts/vl-host && cargo build --release -j "${JOBS:-6}" --target-dir "$HOST_TGT")
+  rm scripts/vl-host/target
+  mkdir -p scripts/vl-host/target/release
+  cp "$HOST_TGT/release/vl" "$VL"
+  rm -rf "$HOST_TGT"
+  trap - EXIT
+  host_ok || { echo "agent-setup: the rebuilt host still prints no \`[ir]\` rows" >&2; return 1; }
+  echo "agent-setup: host rebuilt into this worktree's own target (remove the worktree to drop it)"
+}
+
+if [ "${1:-}" = "--host-check" ]; then
+  host_check
+  exit $?
+fi
+
 [ -d "$MAIN/node_modules" ] || { echo "agent-setup: no node_modules at $MAIN (run npm ci there)" >&2; exit 1; }
 [ -e node_modules ] || ln -s "$MAIN/node_modules" node_modules
 [ -e scripts/vl-host/target ] || ln -s "$MAIN/scripts/vl-host/target" scripts/vl-host/target
 bash scripts/refresh-compiler.sh
-echo "agent-setup: ready (vl: scripts/vl-host/target/release/vl, seed: build/vl-compiler.wasm)"
+host_check
+echo "agent-setup: ready (vl: $VL, seed: build/vl-compiler.wasm)"
