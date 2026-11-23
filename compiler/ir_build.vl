@@ -198,6 +198,7 @@ import {
 import {
   BundlePick,
   CallRefArgArm,
+  CapturedArgArm,
   FieldStoreValArm,
   GlobalCtx,
   IntSwitchPlan,
@@ -3839,9 +3840,11 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if cr != rep && !narrowed && !holed && !capCellListSame(fe, name, cr, rep) {
     return irBMiss("capture binding")
   }
-  // The capture is held at its binding's type, whose rep must be the one it is read at first.
+  // The capture is held at its binding's type, or a walk variable's (`capLoopTyOf`), whose rep
+  // must be the one it is read at first.
   const atOwn = narrowed || holed
-  const cty = if atOwn { capTyOf(fe, name) } else { -1 }
+  const bty = if atOwn { capTyOf(fe, name) } else { -1 }
+  const cty = if atOwn && bty < 0 { capLoopTyOf(fe, name) } else { bty }
   if atOwn && (cty < 0 || repNodeOfTy(cty) != cr) {
     return irBMiss("capture binding")
   }
@@ -3923,14 +3926,17 @@ function capRepOf(fe: i32, name: string): i32 { return capRepFor(fe, name, -1) }
 
 // `capRepOf`, where a captured loop variable (`captureLoopNodeOf`), whose declaration records no
 // type, takes read rep `readRep`, or with no read its loop's type (`capLoopTyOf`), when legacy's
-// capture valtype for it (`captureValKind`) agrees, else -1.
+// capture valtype for it (`captureValKind`) agrees, else -1. A binding whose type gives no rep (open
+// in the frame that owns it) takes `readRep` the same way.
 function capRepFor(fe: i32, name: string, readRep: i32): i32 {
   let ty = capTyOf(fe, name)
   if ty < 0 && readRep >= 0 && captureLoopNodeOf(fe, name) >= 0 {
     ty = repTyOf(readRep)
   }
   if ty < 0 && readRep < 0 { ty = capLoopTyOf(fe, name) }
-  return capRepAtTy(fe, name, ty)
+  const r = capRepAtTy(fe, name, ty)
+  if r >= 0 || readRep < 0 { return r }
+  return capRepAtTy(fe, name, repTyOf(readRep))
 }
 
 // The rep of capture `name` of `fe` held at type `ty`; -1 when `ty` is -1, no value, open, or not
@@ -5116,18 +5122,22 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
       return missRhs("bundle argument")
     }
-    if capturedArgArmOf(c.callArgs[i], i, pos, ibFnIx) != "plain" {
-      return missRhs("captured call argument coercion")
+    // A widening is delivered at its parameter's number (`emitWidened`), and a box at the
+    // parameter's union (`emitDelivered`, `emitUnionBoxOwed`).
+    const arm = capturedArgArmOf(c.callArgs[i], i, pos, ibFnIx)
+    const pty = scopeTyAt(callee.fnParams[i], fnStmts[pos])
+    const dst = repNodeOfTy(pty)
+    const delivers = capturedArgDelivers(arm)
+    if arm != "plain" && !delivers {
+      return missRhs("captured call argument " + arm)
     }
     const at = b.length
-    const a = irBExpr(b, c.callArgs[i])
+    const a = if delivers { deliver(b, c.callArgs[i], dst, pty) } else { irBExpr(b, c.callArgs[i]) }
     if ibMiss != "" { return missRhs("argument") }
     if ifBelowLead(b, at, "short-circuit closure argument") {
       return missRhs("short-circuit closure argument")
     }
-    if irBOpRep(a) != repNodeOfTy(scopeTyAt(callee.fnParams[i], fnStmts[pos])) {
-      return missRhs("captured call argument rep")
-    }
+    if irBOpRep(a) != dst { return missRhs("captured call argument rep") }
     args.push(a)
     i = i + 1
   }
@@ -5140,6 +5150,15 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     crDrop: !isVoid,
   }
   return r
+}
+
+// Whether a captured-call argument on arm `arm` is delivered at its parameter's rep: a widening the
+// IR builds, or a box; `widenF32`, a literal union, an atom and an unbox are legacy's alone.
+function capturedArgDelivers(arm: CapturedArgArm): boolean {
+  return match arm {
+    "widenI64" | "widenF64" | "boxTable" | "boxFloor" => true
+    "widenF32" | "lit" | "atomStr" | "unbox" | "plain" => false
+  }
 }
 
 // A call `ix` through a closure binding that legacy writes plainly (`callRefPlainKey`): the
