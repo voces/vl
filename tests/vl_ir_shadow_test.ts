@@ -1587,6 +1587,9 @@ Deno.test({
       "width-retag-pair-unnoted": 2,
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
+      "holder-pick-of-i32": 2,
+      "holder-pick-record-into-i32": 2,
+      "holder-pick-record-into-closure": 0,
       "eq-helper-of-records": 0,
       "eq-helper-of-i32": 2,
       "eq-helper-into-bool": 2,
@@ -3083,6 +3086,30 @@ Deno.test({
       if ((rows.get("matched") ?? 0) < 1 || (rows.get("uncovered member record") ?? 0) !== 1) {
         throw new Error(`want h matched and show a named member-record miss, got ${JSON.stringify([...rows])}\nin:\n${src}`);
       }
+    }
+  },
+});
+
+// A variant literal that omits a field its arm may omit is built at the arm's row with that field's
+// null (a module const cell, a return, a list element, a union of records), and a literal-set field a
+// layout family re-lays at the string reps there: no `object layout` or `object field coercion`.
+const OMIT_AND_RELAY: string[] = [
+  "type U = { kind: \"a\", q: i32 | null } | { kind: \"b\" }\nconst o: U = { kind: \"a\" }\nif o.kind == \"a\" { print(o.q ?? 9) }\nfunction mk(): U { return { kind: \"a\" } }\nconst m = mk()\nif m.kind == \"a\" { print(m.q ?? 8) }\n",
+  "type U = { kind: \"a\", q: i32 | null } | { kind: \"b\" }\nconst ys: U[] = [{ kind: \"a\" }, { kind: \"b\" }]\nprint(ys.length)\n",
+  "type Other = { a: string }\ntype Opt = { b: i32 | null, c: string | null }\nconst u1: Other | Opt = {}\nif u1 is Opt { print(u1.b ?? 3) }\n",
+  "type K = \"circle\" | \"round\"\ntype A = { kind: K, r: i32 }\ntype B = { kind: string, r: i32 }\nfunction f(n: i32): A | B {\n  if n == 0 {\n    const a: A = { kind: \"circle\", r: 1 }\n    return a\n  }\n  const b: B = { kind: \"round\", r: 3 }\n  return b\n}\nconst x = f(0)\nif x is A { print(x.kind) }\nconst s: A = { kind: \"circle\", r: 4 }\nprint(s.kind)\n",
+];
+Deno.test({
+  name: "ir shadow: an omitting variant literal and a re-laid literal-set field build at their row",
+  ignore,
+  fn: () => {
+    for (const src of OMIT_AND_RELAY) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const bad = [...rows.keys()].filter((k) => k.includes("object layout") || k.includes("object field coercion"));
+      if (bad.length > 0) throw new Error(`want no object layout or field coercion miss, got ${JSON.stringify([...rows])}\nin:\n${src}`);
     }
   },
 });
