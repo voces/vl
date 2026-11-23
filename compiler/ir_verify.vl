@@ -38,6 +38,7 @@ import {
   RCoerce,
   REnvDrop,
   REnvGet,
+  REqHelp,
   RFieldNull,
   RFnId,
   RGetField,
@@ -1199,6 +1200,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(2, at, "a map or filter of a non-list")
       }
       if !(r.hfC is OImm) { use(r.hfC, at) }
+      uses(r.hfEnv, at)
+      if r.hfEnv.length > 0 && !(r.hfC is OImm) {
+        return fail(2, at, "a map callback built from captures is no value")
+      }
       0
     }
     RListSlice => {
@@ -1515,6 +1520,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       if dst >= 0 && r.mgForm > 0 && opRep(r.mgDef) != dw {
         return fail(2, at, "a map read's default is not at its rep")
+      }
+      0
+    }
+    REqHelp => {
+      uses([r.ehL, r.ehR], at)
+      if repIsScalar(opRep(r.ehL)) || repIsScalar(opRep(r.ehR)) {
+        return fail(2, at, "a compare helper's operands are references")
+      }
+      if dst >= 0 && repPrim(dst) != "i32" {
+        return fail(2, at, "a compare helper's answer is an i32")
       }
       0
     }
@@ -2083,6 +2098,14 @@ function nested(body: i32[]) {
   return 0
 }
 
+// Whether `out` is held in a box: a value `if` written at a box (`siAtDst`) writes one, and each
+// arm's assignment then delivers at that box's rep.
+function atBoxOut(out: i32): boolean {
+  if out < 0 || out >= vf.irVars.length { return false }
+  const r = repNodeAt(vf.irVars[out].vRep)
+  return r is RBox || r is RNullable && r.rnDisc == 4
+}
+
 // An `if` and every `if` its `else` bodies hold, checked along the spine with one frame per open
 // `else` rather than by recursing (D1990): a link's test and `then`, its `else` in order, then its
 // arms' writes, as `nested` would order them.
@@ -2098,6 +2121,8 @@ function ifSpine(id0: i32) {
         use(h.siCond, next)
         if opRep(h.siCond) != vfBool {
           fail(2, next, "an `if` tests a bool")
+        } else if h.siAtDst && !atBoxOut(h.siOut) {
+          fail(2, next, "an `if` written at a box writes no box")
         } else {
           nested(h.siThen)
           links.push(next)
@@ -2464,6 +2489,9 @@ function stmt(id: i32, prev: i32) {
         if (
           opRep(n.rtV) != vf.irRetRep
           && !vfOpenTakes(vf.irRetTy, vf.irRetRep, opRep(n.rtV))
+          && !vfStoresAs(vf.irRetRep, opRep(n.rtV))
+          && !repNullRefFits(opRep(n.rtV), vf.irRetRep)
+          && !vfNicheTakes(vf.irRetRep, opRep(n.rtV))
         ) {
           return fail(2, id, "a return's rep is not the result's")
         }
@@ -2761,6 +2789,7 @@ function rhsReadsList(r: Rhs): boolean {
       RCoerce |
       REnvDrop |
       REnvGet |
+      REqHelp |
       RFieldNull |
       RFnId |
       RGetField |
@@ -2934,6 +2963,15 @@ export function irUntypedClosure(ty: i32, rep: i32): boolean {
 // are stored at the same valtype, as the builder noted them (`irRepValtype`).
 function vfOpenTakes(ty: i32, rep: i32, v: i32): boolean {
   return irTyOpen(ty) && vfStoresAs(rep, v)
+}
+
+// Whether a ref-niche nullable `r` holds a value of rep `v` as it stands: its inner rep, or one
+// the builder noted stored at the inner's valtype.
+function vfNicheTakes(r: i32, v: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RNullable
+    && n.rnDisc == 1
+    && (n.rnInner == v || vfStoresAs(n.rnInner, v))
 }
 
 // Whether a value of rep `src` stands where rep `dst` is asked: both are stored at the valtype the
@@ -3165,7 +3203,8 @@ function opndsHoldVar(os: Opnd[], v: i32): boolean {
 }
 
 // Whether variable `i` of `f` is a temp whose checker type has no value, defined by a call that
-// never returns: no value reaches it, so it takes the rep of the consumer legacy writes after it.
+// never returns or by a field read at the rep its record's row stores the field at. No value
+// reaches it, so it takes the rep legacy writes its consumer at.
 function neverCallTemp(f: IrFn, i: i32): boolean {
   const v = f.irVars[i]
   if v.vKind != "temp" || v.vTy < 0 || !repIsNoValue(repNodeOfTy(v.vTy)) {
@@ -3174,6 +3213,10 @@ function neverCallTemp(f: IrFn, i: i32): boolean {
   for n in f.irNodes {
     if n is SLet && n.lDst == i {
       const r = n.lRhs
+      if r is RGetField {
+        const ks = repNodeKids(opRep(r.gfV))
+        return r.gfIx >= 0 && r.gfIx < ks.length && ks[r.gfIx] == v.vRep
+      }
       return r is RCall && r.caNever
     }
   }

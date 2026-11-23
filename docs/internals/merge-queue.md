@@ -239,6 +239,55 @@ For the queue:
   (queue practice).
 - **Q38.** A docs merge conflict on a squash reparent, such as an inventory add/add, takes the
   train's version, which is the closed row. D17055 in #9639 was that case (queue practice).
+- **Q39.** A lane runs `git fetch origin master` before it branches or merges master. A shallow
+  clone carries a stale `origin/master` ref, which is how #9680's first base was #9306's master
+  (coordinator ruling, 2026-11-23).
+- **Q40.** A moved-programs list (Q15) comes from a legacy byte A/B over the whole of `tests/cases`
+  and `scripts/capability-probes`, never a directory pick. #9685 missed 2 of 26 and #9680 missed 7
+  of 95 (a probe, and cases newer than its base); the queue names such omissions in the squash
+  message, as for CY1 (coordinator ruling, 2026-11-23).
+- **Q41.** A verifier builds each arm's host in a fresh cargo `--target-dir`, or touches the
+  sources first, and checks the binary by hash. `git archive` sets old mtimes, so a reused target
+  skips the rebuild and serves the previous host (IR-V2 on DB1) (queue practice).
+- **Q42.** IR lowering may read shared emitter state, such as `liKinds.length`, at the same
+  emission point legacy reads it; the IR build may not. The lane lists that state under its
+  refactor note's "Legacy tails the IR calls" heading, marked "state", and the fold carries it
+  into [`ir-legacy-tails.md`](ir-legacy-tails.md) (coordinator ruling, 2026-11-23).
+- **Q43.** While the queue's own box is gating, a built train goes to any free verifier as
+  GATE+VERIFY. IR-V3 and IR-V4 are end-to-end gate-and-verify lanes (coordinator ruling,
+  2026-11-23).
+- **Q44.** On each MERGED, the queue sends a one-line "#X merged" to the lane that owns the PR and to
+  any lane that asked "notify me when #X merges". A blocked lane asks for that instead of waiting
+  silently (coordinator ruling, 2026-11-23, after four lanes waited hours on merges already made).
+- **Q45.** The gate carries the `self ir misses` row (#9701; kill-matrix mutant `selfirmiss`, about
+  65 CPU-s): it is the only row that catches a new self-compile function landing in a missed shape.
+  When it reds on a train, the queue pulls that PR and rebuilds the trains behind it without it
+  (coordinator ruling, 2026-11-23; its first catch was on a train).
+- **Q46.** When GitHub refuses a verified PR's squash as dirty, the queue pushes one mechanical
+  master-merge to the PR branch whose tree equals the verified train's tree outside docs, then
+  squashes; no ungated tree merges (queue practice; #9696, #9682).
+- **Q47.** A lane's identity readings set `VL_STD=<tree>/std` on both arms. A stale shared std shows up
+  as extra "fail under both" rows or a spurious differ (#9699's 72 against 68; #9702's D16943
+  differ), which the lane must explain before READY (queue practice).
+- **Q48.** Every READY that touches `compiler/` quotes `self-ir-misses` = 0 and
+  `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check tests/vl_deep_nesting_test.ts` passing with all
+  8 tests run (the shared host linked; an isolated host skips 3). The queue refuses a READY without
+  both (coordinator ruling, 2026-11-23, after DX2 and DW1 red on trains).
+- **Q49.** The queue broadcasts the lane-claims list to every lane on each change. A lane reads the
+  latest broadcast before picking, announces its pick and waits for the queue's ack before writing
+  code; a collision is answered "taken by X", and a contested class goes to the coordinator
+  (coordinator ruling, 2026-11-23). The coordinator has split a class by mechanism, each lane
+  taking a named sub-cut, and has given a contested class to the lane whose own refusal and
+  in-flight cells depend on it.
+- **Q50.** A train's tree holds every file master holds. A train merge over the PR's master base
+  reads a docs-only commit that went straight to master as a train-side deletion and drops it; an
+  `inventory refs` red on a later citing PR is the symptom (IR-V3 on EM1, D17073). The queue's
+  merge restores any master file the merged train lacks unless the PR deleted it (queue practice).
+- **Q51.** A PR stacked on another queued PR merges into the train with the lower PR's head as merge
+  base, and the train's delta is checked to equal the PR's own diff. Once the lower PR squashes,
+  the upper squash needs a Q46 mechanical merge (#9717, #9720) (queue practice).
+- **Q52.** A verifier given VERIFY-only runs no gate when the queue box gated the same train; the
+  queue box gates while a verifier proves (queue practice).
 
 ### Squash artifacts and Q3 members
 
