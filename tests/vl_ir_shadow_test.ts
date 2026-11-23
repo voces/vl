@@ -184,9 +184,10 @@ Deno.test({
 });
 
 // A thunk whose target's result type is open is typed by its rep's own type where that is closed
-// and round-trips to the rep (`thunkRetTy`), and matches; where it does not, it stays uncovered.
+// and round-trips to the rep (`thunkRetTy`); where it does not, by legacy's declared result
+// descriptor (`resultDescTy`). Each matches.
 Deno.test({
-  name: "ir shadow: a thunk's open result type stands as its rep's own only where that round-trips",
+  name: "ir shadow: a thunk's open result type stands as its rep's own where that round-trips, else at its declared result",
   ignore,
   fn: () => {
     const fits = `export function id<T>(x: T): T { return x }\nconst k = () => id\nprint(k()(9))\n`;
@@ -197,8 +198,8 @@ Deno.test({
     const open = `function inc(x) { return x + 1 }\nfunction run(f) { return f()(41) }\n` +
       `print(run(() => inc) + run(() => inc))\n`;
     const { rows } = run(open, true);
-    if (rows.get("thunk uncovered thunk open result type") !== 2) {
-      throw new Error(`want two thunks uncovered on their open result type, got ${JSON.stringify([...rows])}`);
+    if (rows.has("thunk uncovered thunk open result type") || (rows.get("thunk matched") ?? 0) < 2) {
+      throw new Error(`want both open-result thunks matched at the declared result, got ${JSON.stringify([...rows])}`);
     }
   },
 });
