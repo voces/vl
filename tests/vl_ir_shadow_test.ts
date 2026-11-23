@@ -1595,6 +1595,8 @@ Deno.test({
       "never-call-value-at-consumer-rep": 0,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
+      "never-field-read-at-its-storage": 0,
+      "never-field-read-off-its-storage": 3,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
