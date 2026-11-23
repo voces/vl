@@ -1302,10 +1302,12 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
     if ibMiss != "" { return lv }
     return isLacksTest(b, lv, ix, rep)
   }
+  // Membership over the box's string payload is the `boxLits` arm's test over the same members.
+  if ta == "boxLitSet" { return isLitArmsTest(b, n, ix, rep, "boxLits") }
   const tag = boxTestTagOf(n, ix, arm, ta, vi)
   if ibMiss != "" { return irBMiss(ibMiss) }
   // A record's box field is read raw, at its storage, as legacy's `memStruct` arm reads it.
-  const stored = arm == "armTag" && ta == "memStruct"
+  const stored = arm == "armTag" && (ta == "memStruct" || ta == "memVariant")
   const mark = if stored { storageReadEnter(n.isObj) } else { storageReadEnter(-1) }
   const v = irBExpr(b, n.isObj)
   storageReadLeave(mark)
@@ -2233,9 +2235,22 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   const vi = if arm == "variant" { isVariantTagPlain(ix, ibFnIx) } else { -1 }
   const tag = if ta == "identBox" || ta == "box" { isArmTagOf(ix, n, ibFnIx) } else if vi >= 0 && vi < uTags.length { uTags[vi] } else { -1 }
   storageReadLeave(mark)
-  if arm != "armTag" && arm != "variant" { return irBMiss("is storage rung") }
+  // Any other rung is the ordinary one, its receiver read at the storage legacy marks.
+  if arm != "armTag" && arm != "variant" {
+    if arm == "notIs" { return irBMiss("is storage rung") }
+    const om = storageReadEnter(n.isObj)
+    const o = isRung(b, n, ix, rep, arm)
+    storageReadLeave(om)
+    return o
+  }
   if arm == "variant" && tag < 0 { return irBMiss("is variant shape") }
   if ta == "tagAbsent" { return isTagAbsentTest(rep) }
+  if ta == "boxLitSet" {
+    const lm = storageReadEnter(n.isObj)
+    const lo = isLitArmsTest(b, n, ix, rep, "boxLits")
+    storageReadLeave(lm)
+    return lo
+  }
   if ta == "lacks" || ta == "box" && tag >= 0 {
     // A name's or an element's read at its storage is the declared box.
     const rn = nodeAt(unwrapParen(n.isObj))
@@ -2344,7 +2359,14 @@ function boxTestTagOf(
   }
   // A box value's tag is read off the receiver's own value, as legacy's `box` arm reads it, and a
   // record's box field off the field read at its storage (`memStruct`).
-  if ta == "box" || ta == "memStruct" { return isArmTagOf(ix, n, ibFnIx) }
+  if (
+    ta == "box"
+    || ta == "memStruct"
+    || ta == "memNarrow"
+    || ta == "memVariant"
+  ) {
+    return isArmTagOf(ix, n, ibFnIx)
+  }
   if ta != "identBox" {
     irBMiss("is arm tag " + ta)
     return 0
@@ -11714,10 +11736,15 @@ function ifChain(b: i32[], ix: i32) {
     // Another constant `is` legacy decides off its bytes (`staticIsGuard`): a `false` writes no
     // then arm, a `true` no else. One that ends its block cuts the rest, which is legacy's.
     const k = if !decided && c is OImm && bareConstIs(c, n.ifCond, out, cat) { if c.oiBits != 0 { 1 } else { 0 } } else { -1 }
-    // Legacy cuts only after the statement, so a guard on a later link is not one.
-    if k == 1 && guardEndsBlockWith(cur, k, ibFnIx) {
-      if links.length > 0 { return skip("decided is guard ends block") }
+    // Legacy cuts only after the statement, so a guard on a later link is not one. A head
+    // guard the instance decides true cuts even where its test is written (`monoStaticIsGuardOf`).
+    if (
+      links.length == 0
+      && guardEndsBlockWith(cur, if k == 1 { 1 } else { -1 }, ibFnIx)
+    ) {
       cut = true
+    } else if k == 1 && guardEndsBlockWith(cur, k, ibFnIx) {
+      return skip("decided is guard ends block")
     }
     // A list test whose narrowed region legacy reads through a fit shadow keeps that read's
     // emit-time rows (`listFitShadowSet`), which the builder cannot see.
