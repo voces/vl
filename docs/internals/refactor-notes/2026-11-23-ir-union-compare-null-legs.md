@@ -22,8 +22,8 @@ compare box" (IR-only census: 20 fns, 20 programs, 18 sole). Both were measured 
 
 | run | before | after |
 |---|---|---|
-| distilled "union compare plan" | 9 cells | 2 (a nullable record operand, a list operand) |
-| IR-only `start: union compare box` | 21 programs | 8 still list it; 13 clear it, 10 of them wholly IR-only |
+| distilled "union compare plan" | 9 cells | 2 (both a nullable record operand, the variant compare) |
+| IR-only `start: union compare box` | 21 programs | 7 still list it; 14 clear it, 10 of them wholly IR-only |
 | self-compile IR misses | 0 | 0 (20,298 fns) |
 
 Still a miss: an element read of a global list as the box (`irReadElem` only covers a list held in
