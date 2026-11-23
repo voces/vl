@@ -1326,8 +1326,6 @@ import {
   ListBuild,
   emptyArrHoleBuildKind,
   emptyArrHoleBuildSlot,
-  emptyArrUnionArmKind,
-  emptyArrUnionArmSlot,
   rlBoxIntoRowList,
   rlWidenAllowed,
   rlWidenTagOf,
@@ -1454,7 +1452,6 @@ import {
   rlElemUnionName,
   unMemIsMap,
   unMemIsRefElemArray,
-  unionHasAtomOfTy,
   unionMemberSetOfRow,
   unionMemberTysOfRow,
   unionRowKeyAB,
@@ -1777,6 +1774,7 @@ import {
   coerceSetHasNull,
   coerceTakesAtomAsStr,
   coerceValueAtomKind,
+  emptyArrUnionArmTag,
   eqAtomOperandOk,
   eqOperandRecovers,
   holeBoxPlanOf,
@@ -8625,22 +8623,7 @@ function emitEmptyArrUnionArm(
   fnIx: i32,
 ) {
   if unionName == "" { return 0 }
-  const bare = nodeAt(unwrapParen(exprIx))
-  if bare is ArrayLit {
-    if bare.arrElems.length != 0 { return 0 }
-  } else {
-    return 0
-  }
-  if unionHasAtomOfTy(unionTy, "i32", true) { return 0 }
-  const k = emptyArrUnionArmKind(exprIx)
-  let tag = -1
-  if k == "strlist" {
-    tag = scalarTagOfKind(9) // "string[]", the tag a `(string | null)[]` arm shares
-  } else if k == "reflist" {
-    const slot = emptyArrUnionArmSlot(exprIx)
-    if !unionHasRefArrayArmSlot(unionTy, slot) { return 0 }
-    tag = refArrBoxTagOf(exprIx, fnIx, slot, unionTy)
-  }
+  const tag = emptyArrUnionArmTag(unionTy, exprIx, fnIx)
   if tag < 0 { return 0 }
   fbI32Rel(RS_TAG, tag)
   const rc = emitExpr(exprIx, fnIx)
@@ -9202,6 +9185,19 @@ export function elseLessUnionIfWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
   return ifShapeWhyOf(ix, fnIx, false)
 }
 
+// Why a value `if` with an `else`, delivered into union `unionTy`'s box, is not written arm by arm
+// at that box (`emitUnionCoerceUnder`'s `if` arm, `emitUnionIfValue`), or "".
+export function unionIfAtDstWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
+  const ix = unwrapParen(ixIn)
+  if ix < 0 { return "node" }
+  const n = nodeAt(ix)
+  if !(n is IfStmt) || n.ifElse < 0 { return "no else" }
+  if unionArmTagClash(unionTy) != "" { return "tag clash" }
+  if callIsNever(ix) { return "never" }
+  if unionCoerceIfArmOf(ix, fnIx) != "value" { return "not value arm" }
+  return ifShapeWhyOf(ix, fnIx, true)
+}
+
 // `emitUnionCoerce`'s body: the arms that thread a list or f32 context apply it and leave it
 // for the wrapper's exit to undo.
 function emitUnionCoerceUnder(
@@ -9649,7 +9645,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
     "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "clo" => true
-    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "ladder" => false
+    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "retag" | "ladder" => false
   }
 }
 
@@ -9673,7 +9669,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     // The niche's stash slot is taken ahead of its value, as legacy's rung takes it.
     "nulNiche" => if nulNicheBoxSlot() < 0 { -1 } else { 0 }
     "nulBool" => if nulBoolBoxSlot() < 0 { -1 } else { 0 }
-    "pass" | "memberBox" | "atomStr" | "mapScalar" => 0
+    "pass" | "memberBox" | "atomStr" | "mapScalar" | "retag" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
 }
@@ -9686,6 +9682,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
     "nulBool" => nulBoolBoxTail()
+    "retag" => boxRetagTail(p.hbKind, exprIx, fnIx)
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
   }
 }
@@ -9722,6 +9719,7 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     || p.hbArm == "refList"
     || p.hbArm == "map"
     || p.hbArm == "clo"
+    || p.hbArm == "retag"
   ) {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
   }
@@ -9774,6 +9772,12 @@ function emitUnionBoxArg(
   boxDstShadowLeave()
   if go < 0 { return -1 }
   if !exprUnion(exprIx, fnIx) || deliveryRetagHas(exprIx) { return 0 }
+  return boxRetagTail(unionTy, exprIx, fnIx)
+}
+
+// The box of `exprIx` on the stack rebuilt at `unionTy` where its members' tags owe it
+// (`emitBoxAtomRetagMembers`); nothing where they owe none.
+export function boxRetagTail(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
   const ft: i32[] = []
   const tt: i32[] = []
   if !boxRetagArmsOfTys(unionBoxTyIxOfExpr(exprIx, fnIx), unionTy, ft, tt) {
