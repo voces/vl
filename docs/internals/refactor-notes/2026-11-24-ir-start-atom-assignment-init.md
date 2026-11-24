@@ -1,5 +1,7 @@
 # IR soundness: an atom cell's assignment as a global initializer declines (2026-11-24, lane IR-N11, D17133)
 
+(unfiled: D17133 — N7 files the row.)
+
 Express fix for a clause-1 build: an invalid module, with the G3 fallback the only net. Take
 `const c = (k = "ww")` with `k: K` (or an inline literal union) and `c` read from a function or
 closure. The start's claim re-read `k`'s atom and decoded it to a string: the decode's slot was a
