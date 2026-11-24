@@ -3239,6 +3239,19 @@ function localVarAt(w: i32): i32 {
   return ib.irLocalAt[w] ?? -1
 }
 
+// Whether the shadowed list test at `condIx` (`decidedIsShadowed`) is a pushing arm's, whose grow
+// row (`listFitShadowPlanOf` 2) the region reads.
+function decidedIsGrowShadowed(condIx: i32): boolean {
+  if !decidedIsShadowed(condIx) { return false }
+  let ix = unwrapParen(condIx)
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const c = nodeAt(ix)
+  if c is Unary { ix = unwrapParen(c.unArg) }
+  const p = emptyFitPlanOf(ix, ibFnIx)
+  return p.efArm != "shadow"
+    || listFitShadowPlanOf(ix, p.efRecvTy, p.efDepth, ibFnIx) == 2
+}
+
 // Whether the `is` (or `!is`) at `condIx` is a list test whose plan reads an arm's empty list
 // through a narrowed region's shadow (`emptyFitPlanOf`'s `shadow` arm, or a shadowed row).
 function decidedIsShadowed(condIx: i32): boolean {
@@ -4802,6 +4815,8 @@ function narrowedLocalRead(
     return o
   }
   if localReadStored(v, identDeclOf(ix), rep) { return o }
+  // A seated read of a box cell on the plain arm is the box legacy's `local.get` writes.
+  if cell && arm == "local" && heldAsBox(ib.irVars[v].vRep) { return o }
   // A non-delivery read of a variable held at a row its read type does not record is the variable
   // as it is, the row `declRowReadTy` reads its fields at (`boundRowlessReadTy`).
   if !cell && boundRowlessReadTy(ix) == ib.irVars[v].vTy { return o }
@@ -7149,7 +7164,9 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const why = pushPlainWhy(pp, ibFnIx)
   // A late receiver held in its own local is read by index after the value either way.
   const late = why == "push late receiver" && pushRecvHeldAtRest(pp.ppRecv)
-  if why != "" && !late { return missRhs(why) }
+  // A nullable element slot's push is legacy's plain build of the value (`pushNestSlot`).
+  const nest = why == "push nested list element"
+  if why != "" && !late && !nest { return missRhs(why) }
   const clear = !endsInTemp(b)
   const at = b.length
   const v = pushRecvExpr(b, m.memObj)
@@ -7161,6 +7178,9 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const x = deliver(b, c.callArgs[0], er, -1)
   if ibMiss != "" { return missRhs("method operand") }
   if irBOpRep(x) != er { return missRhs("push operand coercion") }
+  if nest && !pushNullableElemPlain(c.callArgs[0], er) {
+    return missRhs("push nullable element coercion")
+  }
   // A receiver held in its own local is read by index after the value, as legacy reads it.
   // A value holding a valued `if` stages the receiver below it, as does one holding only a boxed
   // `??` (`coalBoxFrom`).
@@ -7178,6 +7198,16 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   }
   const r: Rhs = { lpV: recv, lpX: x, lpAt: ix }
   return r
+}
+
+// Whether value `argIx` pushed onto a nullable element slot `er` is legacy's plain build of it: at
+// its own rep, that ref widened to its nullable (no bytes), or a bare `null` as the slot's null ref.
+function pushNullableElemPlain(argIx: i32, er: i32): boolean {
+  const a = exprRepOf(argIx)
+  if a == er { return true }
+  const n = repNodeAt(er)
+  if !(n is RNullable) || !refNullable(er) { return false }
+  return n.rnInner == a || nodeAt(unwrapParen(argIx)) is NullLit
 }
 
 // A variadic push `ix` (`emitPushMany`): the receiver, then the run legacy builds of the
@@ -8904,8 +8934,9 @@ function nulTest(
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
 }
 
-// The operand of null test arm `arm` over `ref`: a union-box global the checker narrowed to a rep
-// that is no box is read as its cell stores it, the box whose tag legacy compares.
+// The operand of null test arm `arm` over `ref`: a box's tag test reads the box legacy compares,
+// a union-box global narrowed to a rep that is no box as its cell stores it, and any other read
+// at its cell, a read narrowed past one of the box's members included.
 function nulTestOperand(b: i32[], arm: NulTestArm, ref: i32): Opnd {
   const r = unwrapParen(ref)
   if (
@@ -8928,7 +8959,7 @@ function nulTestOperand(b: i32[], arm: NulTestArm, ref: i32): Opnd {
       return globalStoredRead(b, g, r, cr, st)
     }
   }
-  return irBExpr(b, ref)
+  return if arm == "boxTag" { exprAt(b, ref, true) } else { irBExpr(b, ref) }
 }
 
 // Whether operand rep `vr` is the one null-test arm `arm` reads; an arm `RNulTest` does not
@@ -12774,10 +12805,9 @@ function ifChain(b: i32[], ix: i32) {
     } else if k == 1 && guardEndsBlockWith(cur, k, ibFnIx) {
       return skip("decided is guard ends block")
     }
-    // A list test whose narrowed region legacy reads through a fit shadow keeps that read's
-    // emit-time rows (`listFitShadowSet`), which the builder cannot see.
-    if k >= 0 && decidedIsShadowed(n.ifCond) {
-      return skip("decided is fit shadow")
+    // A decided list test whose arm pushes keeps legacy's grow row, which a constant never fills.
+    if k >= 0 && decidedIsGrowShadowed(n.ifCond) {
+      return skip("decided is fit shadow grow")
     }
     const th = nodeAt(n.ifThen)
     const thenB: i32[] = []
@@ -13406,8 +13436,8 @@ function tailIf(b: i32[], ix: i32) {
   // Another constant `is` legacy decides off its bytes (`emitGuardCond`): a `false` writes no
   // then arm, a `true` no `else`.
   const k = if !decided && c is OImm && bareConstIs(c, n.ifCond, b, cat) { if c.oiBits != 0 { 1 } else { 0 } } else { -1 }
-  if k >= 0 && decidedIsShadowed(n.ifCond) {
-    return skip("decided is fit shadow")
+  if k >= 0 && decidedIsGrowShadowed(n.ifCond) {
+    return skip("decided is fit shadow grow")
   }
   const thenB = if decided || k == 0 { [] } else { tailArm(n.ifThen) }
   // An else-less link writes no `else` (`emitIfLinkTail`); what falls through is its caller's pad.
