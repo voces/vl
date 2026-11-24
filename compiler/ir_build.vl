@@ -6393,6 +6393,14 @@ export function ifBelowLead(b: i32[], at: i32, why: string): boolean {
 
 // `ifBelowLead` over the operands built into `b` from `at` up to `to`.
 function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
+  if !ifBelowLeadHas(b, at, to) { return false }
+  irBMiss(why)
+  return true
+}
+
+// Whether the operands built into `b` from `at` up to `to` write a statement legacy would write
+// below a lead opened before them: a valued `if`, a boxed `??` or a stash.
+function ifBelowLeadHas(b: i32[], at: i32, to: i32): boolean {
   let i = at
   while i < to {
     const n = ib.irNodes[b[i]]
@@ -6402,7 +6410,6 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
       || n is SEffect && n.efRhs is RStashSet
       || storeAt(n)
     ) {
-      irBMiss(why)
       return true
     }
     i = i + 1
@@ -6889,14 +6896,10 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   // An atom arm, or its `K | null`, streams the id its operand is held at (`emitStashAtomId`).
   const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else if want == "atom" || want == "nulAtom" { exprAt(b, c.callArgs[0], true) } else { irBExpr(b, c.callArgs[0]) }
   if ibMiss != "" { return 0 }
-  // Legacy opens a nullable string's or boolean's print blocks before its operand, so a valued
-  // `if` in it would sit above them.
-  if want == "nulStr" && ifBelowLead(b, from, "print nulStr of a valued if") {
-    return 0
-  }
-  if want == "nulBool" && ifBelowLead(b, from, "print nulBool of a valued if") {
-    return 0
-  }
+  // Legacy opens a nullable string's or boolean's print blocks before its operand, so where the
+  // operand wrote a valued `if` (or a stash) the blocks open before it (`RPrintOpen`).
+  const opened = if (want == "nulStr" || want == "nulBool") && ifBelowLeadHas(b, from, b.length) { if want == "nulBool" { 1 } else { 0 } } else { -1 }
+  if opened >= 0 { printOpenAt(b, from, opened, ix) }
   const vr = irBOpRep(v)
   const p = repPrim(vr)
   let ok = p != null && p == want
@@ -6910,7 +6913,13 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   if want == "nulAtom" { ok = atomNullable(vr) || repNodeAt(vr) is RAtom }
   if want == "union" { ok = repNodeAt(vr) is RBox || boxedNullable(vr) }
   if !ok { return skip("print operand rep") }
-  irBNode(b, { efRhs: { pnV: v, pnAt: ix } }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { efRhs: { pnV: v, pnAt: ix, pnOpened: opened } },
+    -1,
+    ibNoValue,
+    ix,
+  )
   return 0
 }
 
@@ -6940,9 +6949,24 @@ function trapStmt(b: i32[], c: Call, ix: i32) {
     const v = irBExpr(b, c.callArgs[0])
     if ibMiss != "" { return 0 }
     if repPrim(irBOpRep(v)) != "str" { return skip("trap message rep") }
-    irBNode(b, { efRhs: { pnV: v, pnAt: ix } }, -1, ibNoValue, ix)
+    irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
   }
   irBNode(b, { tpWhy: 0 }, -1, ibNoValue, ix)
+  return 0
+}
+
+// Places the blocks a nullable print opens (`RPrintOpen`, arm `arm`) at index `at` of body `b`,
+// before the operand statements built from there.
+function printOpenAt(b: i32[], at: i32, arm: i32, ix: i32) {
+  irBNode(b, { efRhs: { poArm: arm } }, -1, ibNoValue, ix)
+  const id = b.pop() ?? -1
+  let i = b.length
+  b.push(id)
+  while i > at {
+    b[i] = b[i - 1]
+    i = i - 1
+  }
+  b[at] = id
   return 0
 }
 
