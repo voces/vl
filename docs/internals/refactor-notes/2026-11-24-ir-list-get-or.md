@@ -73,6 +73,12 @@ Fixpoint seeds on both sides. Head seed sha256 `92b1c0f6…a675`.
     left is the interpolation, `string operand after another`, which runs and is
     claimless-identical (#24).
 - Fuel: per PR +0.05% on 129492555896 (base `80d557f6`).
+- After merging master `f36bea69` (mechanical, no conflict), on its fixpoint seed:
+  - `gate.sh --fast` passed; `ir-identity.sh --cases` `identical 8172, differ 0`, witnesses
+    `same 88`.
+  - Door guard and emitter audit 20 passed; self ir misses 0; deep nesting 8 passed.
+  - `check-filed-witnesses --strict`: 5702 as filed, 0 MOVED.
+  - The sweep is unchanged.
 
 ## Legacy tails the IR calls
 
