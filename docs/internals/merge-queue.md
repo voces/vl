@@ -383,6 +383,8 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 - any differ under `ir-identity.sh --claimless` or `--cases`;
 - a claimed module that fails validation under `$VL_IR_STRICT=1`, or any differ in the gate row
   `ir claim refusals` (`ir-parity.vl --pop refusals`);
+- a red in the gate row `ir claim cross` (`ir-parity.vl --cross`): a shipped build that fails, or
+  runs otherwise, where the claimless build runs clean;
 - a shipping door that bypasses `claimable()` (ir-design §10.2).
 
 ## A chosen divergence (Q57)
