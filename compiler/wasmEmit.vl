@@ -11090,10 +11090,12 @@ export type UnionEqNulPlan = {
   unOpStaged: boolean,
 }
 
-// The null-leg plan of box `boxIx` against `otherIx`; `unLeg` 0 where another arm writes it.
+// The null-leg plan of box `boxIx` against `otherIx`, `opLeft` where the operand is the compare's
+// left side; `unLeg` 0 where another arm writes it.
 export function unionEqNulPlanOf(
   boxIx: i32,
   otherIx: i32,
+  opLeft: boolean,
   fnIx: i32,
 ): UnionEqNulPlan {
   const none: UnionEqPlan = { uqKind: -1, uqTag: -1 }
@@ -11116,7 +11118,7 @@ export function unionEqNulPlanOf(
   if !hasArm { return no }
   const nul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
   const boxNul = unionSetHasNullTy(uname, bty)
-  const opStaged = !unionEqOperandOk(otherIx)
+  const opStaged = nulOperandStaged(boxIx, otherIx, opLeft)
   let leg = 0
   if eak == 2 && nul && !exprNulLitUnion(otherIx, fnIx) { leg = 3 }
   if eak == 1 && nul && boxNul { leg = 2 }
@@ -11133,6 +11135,20 @@ export function unionEqNulPlanOf(
     unBoxStaged: !unionEqOperandOk(boxIx),
     unOpStaged: opStaged,
   }
+}
+
+// Whether a null-leg operand is read once into its slot: it is no place, or it is left of a box
+// with effects, which may write it (D17116).
+function nulOperandStaged(boxIx: i32, otherIx: i32, opLeft: boolean): boolean {
+  if !unionEqOperandOk(otherIx) { return true }
+  return opLeft && !exprEffectFree(unwrapParen(boxIx))
+}
+
+// Whether a union compare's sides must each be read once in source order: the operand has effects,
+// or it is left of a box with effects, which may write it (D17068, D17116).
+function unionEqSideMoves(boxIx: i32, otherIx: i32, opLeft: boolean): boolean {
+  if !exprEffectFree(unwrapParen(otherIx)) { return true }
+  return opLeft && !exprEffectFree(unwrapParen(boxIx))
 }
 
 // After a null-leg operand: its null test at leg `leg` (1 a `K | null` id, 2 the `boolean | null`
@@ -11201,7 +11217,7 @@ function emitUnionConcreteEq(
   const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
   // An operand with effects runs whatever the box holds: both sides are read once, in source
   // order, ahead of the tag test (D17068).
-  const pp = unionEqStagedPlanOf(boxIx, otherIx, fnIx)
+  const pp = unionEqStagedPlanOf(boxIx, otherIx, !boxLeft, fnIx)
   if pp.uqKind >= 0 {
     return emitUnionEqStaged(boxIx, otherIx, pp, isNe, boxLeft, fnIx)
   }
@@ -11311,7 +11327,7 @@ function emitUnionConcreteEq(
   // otherwise, where the widened operand is non-null (D3347).
   const nulOther = eak == 2 && exprNulLitUnion(otherIx, fnIx)
   // A `K | null` operand that is no place is read once, as its id, into its own slot (D17066).
-  const atomStage = nulOther && !unionEqOperandOk(otherIx)
+  const atomStage = nulOther && nulOperandStaged(boxIx, otherIx, !boxLeft)
   // A nullable string at the instance (`T` pinned to `string | null`) equals the box's null when
   // it is null, read raw for the test; present, it compares as the string below.
   const nulStrOperand = eak == 2
@@ -11319,14 +11335,14 @@ function emitUnionConcreteEq(
     && !exprNulLitUnion(otherIx, fnIx)
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
   // A nullable string operand that is no place is read once, into its own slot (`opStage`).
-  const opStage = nulStrOperand && !unionEqOperandOk(otherIx)
+  const opStage = nulStrOperand && nulOperandStaged(boxIx, otherIx, !boxLeft)
   const nulStrOther = nulStrOperand
   // The `boolean | null` niche's null is the value 2 (D2260); an operand that is no place is
   // read once, into its own slot (`boolStage`).
   const nulBoolOther = eak == 1
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
     && boxNul
-  const boolStage = nulBoolOther && !unionEqOperandOk(otherIx)
+  const boolStage = nulBoolOther && nulOperandStaged(boxIx, otherIx, !boxLeft)
   const staged = eqOnce && (nulOther || nulStrOther || nulBoolOther)
   if eqOnce && !staged {
     return emitFail(
@@ -11464,15 +11480,17 @@ function emitUnionEqStaged(
   return unionEqStagedTail(qp, isNe, fnIx)
 }
 
-// The plan of a union `==` whose operand has effects, read with the box once each in source order
-// (`emitUnionEqStaged`); `uqKind` -1 where another arm writes it.
+// The plan of a union `==` read with the box once each in source order (`emitUnionEqStaged`):
+// its operand has effects, or is left of a box with effects (`opLeft`), which may write it. `uqKind`
+// -1 where another arm writes it.
 export function unionEqStagedPlanOf(
   boxIx: i32,
   otherIx: i32,
+  opLeft: boolean,
   fnIx: i32,
 ): UnionEqPlan {
   const no: UnionEqPlan = { uqKind: -1, uqTag: -1 }
-  if exprEffectFree(unwrapParen(otherIx)) { return no }
+  if !unionEqSideMoves(boxIx, otherIx, opLeft) { return no }
   const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
   if qp.uqKind >= 0 { return qp }
   return unionEqStashPlanOf(boxIx, otherIx, fnIx)
