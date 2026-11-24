@@ -5,10 +5,10 @@
 #
 # `scripts/ir-only-census.vl` builds its claim-all compiler from the working tree's `compiler/`
 # sources (the seed only compiles them), so two runs from one tree measure one compiler whatever
-# seeds they name. This restores `compiler/` to <base-commit> for the base run, puts the tree's own
-# back for the head run, and prints each class whose count moved and each function that moved
-# (`built` where a side has no row). Run it from a clean checkout root; `$VL` is the host,
-# `$JOBS` the census's fan-out.
+# seeds they name. This restores `compiler/` and `tests/cases/` to <base-commit> for the base run,
+# so the base census builds only the programs its own tree held, puts the tree's own back for the
+# head run, and prints each class whose count moved and each function that moved (`built` where a
+# side has no row). Run it from a clean checkout root; `$VL` is the host, `$JOBS` the fan-out.
 set -u
 if [ $# -ne 4 ]; then
   echo "usage: scripts/ir-only-census-ab.sh <base-commit> <base-seed> <head-seed> <out-dir>" >&2
@@ -19,8 +19,9 @@ SEED_BASE=$2
 SEED_HEAD=$3
 OUT=$4
 VL=${VL:-scripts/vl-host/target/release/vl}
-if ! git diff --quiet -- compiler; then
-  echo "ir-only-census-ab: compiler/ has local changes; commit them first" >&2
+if ! git diff --quiet -- compiler tests/cases \
+  || [ -n "$(git ls-files --others --exclude-standard -- compiler tests/cases)" ]; then
+  echo "ir-only-census-ab: compiler/ or tests/cases/ has local changes; commit them first" >&2
   exit 2
 fi
 mkdir -p "$OUT"
@@ -28,9 +29,13 @@ census() {
   JOBS=${JOBS:-4} "$VL" run scripts/ir-only-census.vl --compiler "$1" -- --seed "$1" --out "$2" \
     > "$2.log" 2>&1
 }
-restore() { git restore --worktree compiler; }
+# Files only the base held come back untracked; the check above saw none at the start.
+restore() {
+  git restore --worktree compiler tests/cases
+  git ls-files --others --exclude-standard -z -- compiler tests/cases | xargs -0 -r rm -f
+}
 trap restore EXIT
-git restore --source="$BASE" --worktree compiler
+git restore --source="$BASE" --worktree compiler tests/cases
 census "$SEED_BASE" "$OUT/base" || { echo "ir-only-census-ab: base census failed" >&2; exit 2; }
 restore
 census "$SEED_HEAD" "$OUT/head" || { echo "ir-only-census-ab: head census failed" >&2; exit 2; }
