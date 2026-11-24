@@ -18,7 +18,7 @@
 //
 // Run with:  deno test -A tests/vl_ir_shadow_test.ts
 
-import { COMPILER, exists, ROOT } from "./support/tree.ts";
+import { COMPILER, exists, ROOT, VL } from "./support/tree.ts";
 
 const ignore = !exists(COMPILER);
 if (ignore) {
@@ -1740,6 +1740,8 @@ Deno.test({
       "union-cast-of-boxed-nullable": 0,
       "union-cast-of-niche-nullable": 2,
       "union-cast-of-i32": 2,
+      "never-closure-call-value-at-consumer-rep": 0,
+      "returning-closure-call-temp-typed-never": 3,
       "never-field-read-at-its-storage": 0,
       "never-field-read-off-its-storage": 3,
       "walk-pair-map-value-record": 0,
@@ -3280,6 +3282,59 @@ Deno.test({
     const miss = [...rows.keys()].filter((k) => k.startsWith("start uncovered"));
     if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
       throw new Error(`want the start matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `ir-shadow.vl` with a chunk that does not finish: a host standing in for `vl check` exits 70 on
+// every chunk, as a compiler crash does. The run reports each chunk and exits 2. It once looped:
+// with no listed divergence the detail pass was the run itself, whose broken list it copied into
+// itself until the GC heap ran out.
+Deno.test({
+  name: "ir shadow: ir-shadow.vl reports a chunk that did not finish and exits 2",
+  ignore: ignore || !exists(VL) || Deno.build.os === "windows",
+  fn: () => {
+    const tmp = Deno.makeTempDirSync();
+    try {
+      const host = `${tmp}/crashing-host`;
+      Deno.writeTextFileSync(host, "#!/bin/sh\nexit 70\n");
+      Deno.chmodSync(host, 0o755);
+      const prog = `${tmp}/p.vl`;
+      Deno.writeTextFileSync(prog, "print(1)\n");
+      const out = new Deno.Command("timeout", {
+        args: ["300", VL, "run", "scripts/silent-sweep/distilled/ir-shadow.vl", "--compiler", COMPILER, "--", "--files", prog, "--seed", COMPILER],
+        cwd: ROOT,
+        env: { VL: host, IR_DIVERGENCE_BASELINE: `${tmp}/none.txt` },
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      const text = new TextDecoder().decode(out.stdout) + new TextDecoder().decode(out.stderr);
+      if (out.code !== 2 || !text.includes("ir-shadow: chunk did not finish:") || !text.includes("(rc=70)")) {
+        throw new Error(`want exit 2 naming the chunk (rc=70), got exit ${out.code}:\n${text.slice(0, 2000)}`);
+      }
+    } finally {
+      Deno.removeSync(tmp, { recursive: true });
+    }
+  },
+});
+
+// A capture of a record whose type has no heap of its own, stored at its environment row (legacy's
+// `captureValStructIdx`): the read takes that row's heap, so a binding of it at the row's record
+// builds; a `let` reassigned before the closure runs does too.
+const CAPTURE_ENV_HEAP: string[] = ["type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nfunction fr() {\n  const __c = mk2()\n  const __f = () => {\n    const v = __c\n    print(v.f ?? 8)\n  }\n  __f()\n}\nfr()\n", "type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nfunction fr() {\n  let __c = mk2()\n  __c = mk2()\n  const __f = () => {\n    const v = __c\n    print(v.f ?? 9)\n  }\n  __f()\n}\nfr()\n"];
+Deno.test({
+  name: "ir shadow: a heapless record capture takes its environment row's heap",
+  ignore,
+  fn: () => {
+    for (const src of CAPTURE_ENV_HEAP) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const miss = [...rows.keys()].filter((k) => k.includes("uncovered"));
+      if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want every function and the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
     }
   },
 });
