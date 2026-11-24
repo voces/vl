@@ -152,3 +152,12 @@ Readings (base master 89ce9eefe, head 5b6b71edc, fixpoint seeds):
   record-literal field): all `start matched`; `ir-identity --claimless` identical 11, differ 0.
 - Neighbours: top-level `let` and closure read covered and matched (`1 10` under both seeds); an
   annotated binding of the literal's type is refused by the checker (only a fresh record widens).
+- Per class (quick A/B, tests/cases plus the named cells, start rows): `argument coercion`
+  13 → 10, `array element coercion` 8 → 7, `global initializer coercion` 8 → 6, `global
+  initializer variant coercion` 2 → 1, `field read of a stored row's box` 5 → 4, `field read of a
+  stored row` 0 → 1 (the one moved miss above); starts covered and matched 14,972 → 14,979.
+- Per mechanism: the storage-row hold (1) alone moves a start out of its coercion class into the
+  stored-row field read, where (2) is what lets it build. Measured on the D17087 witness: (1) alone
+  takes it from `argument coercion` to `field read of a stored row's box`; (1) and (2) take it to
+  matched. (2) alone admits nothing new: its receiver is held at a storage row only where (1), or
+  an existing holder, put it there. The two ship together for that reason.
