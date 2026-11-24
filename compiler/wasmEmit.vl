@@ -147,6 +147,7 @@ import { listDisjointDepth, listFitLitLeafOf } from "./check_type_shape"
 import { inferRetFnKey, isDeadArm } from "./check_side_rows"
 import { u8LexValue } from "./check_literals"
 import { isPatTyIxOf, isVarTyIxOf, luMembersAt } from "./check_list_union"
+import { tySameSealed } from "./emit_ty_seal"
 import {
   deliveryRetagHas,
   listWidenRetagAny,
@@ -5473,55 +5474,37 @@ const LIST_FIT_SHADOW_MSG = "emitProgram: this `is` arm reads an empty list at a
 // its receiver (`listFitShadowRead`), since the test fits only an empty list. 1 when stored, 2
 // when a pushing arm's `listFitGrowRow` local is the test's to store, -1 when refused for a
 // receiver no read can be redirected for.
-function listFitShadowSet(isIx: i32, recvTy: i32, depth: i32, fnIx: i32): i32 {
+export function listFitShadowSet(
+  isIx: i32,
+  recvTy: i32,
+  depth: i32,
+  fnIx: i32,
+): i32 {
+  if (
+    isIx < 0
+    || isIx >= P.nodes.length
+    || listFitShadowPlanOf(isIx, recvTy, depth, fnIx) < 0
+  ) {
+    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
+  }
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
   const r = nodeAt(unwrapParen(nd.isObj))
-  if fnIx < 0 { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
-  const fn = nodeAt(fnIx)
-  if !(r is Ident) || !(fn is FuncDecl) || depth != 1 {
-    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
-  }
+  if !(r is Ident) { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
   const kTy = isVarTyIxOf(isIx)
   if kTy < 0 || kTy >= T.tys.length {
     return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
   }
   const kt = tyAt(kTy)
-  if !(kt is TyArray) { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
   const heaps: i32[] = []
-  const kind = listFitElemKind(tyElemOf(kt), heaps)
+  const kind = if kt is TyArray { listFitElemKind(tyElemOf(kt), heaps) } else { null }
   if kind == null { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
-  // A closure's read stands in with its own empty `K[]` (`listFitCaptureStandIn`), except
-  // between two record lists, which that read cannot tell apart.
-  const rt = if recvTy >= 0 && recvTy < T.tys.length { tyAt(recvTy) } else { kt }
-  const recvHeaps: i32[] = []
-  const recvKind = if rt is TyArray { listFitElemKind(tyElemOf(rt), recvHeaps) } else { null }
-  if (
-    kind == "reflist"
-    && (recvKind == null || recvKind == "reflist")
-    && (nestedFnReadsDisjoint(fn.fnBody, r.identName, recvTy, false)
-      || liftedFnReadsDisjoint(r.identName, recvTy, fnIx))
-  ) {
-    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
-  }
   const slot = heaps[0]
   const back = heaps[1]
   const wrap = heaps[2]
   const recvLoc = localIndexOf(fnIx, unwrapParen(nd.isObj))
-  if recvLoc < 0 { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
   const grow = listFitGrowRow(unwrapParen(nd.isObj), kTy, fnIx)
-  let loc = -1
-  let i = 0
-  while i < fitShName.length {
-    if (
-      fitShName[i] == r.identName
-      && tySame(fitShTy[i], kTy)
-      && fitShRecv[i] == recvLoc
-    ) {
-      loc = fitShLocal[i]
-    }
-    i = i + 1
-  }
+  let loc = listFitShadowLocalOf(isIx, fnIx)
   if loc < 0 {
     loc = if grow >= 0 { fitGrowLocal[grow] } else { listFitSlot(kind, slot, 11) }
     fitShName.push(r.identName)
@@ -5535,6 +5518,90 @@ function listFitShadowSet(isIx: i32, recvTy: i32, depth: i32, fnIx: i32): i32 {
   arrLitWrap(0, wrap)
   fbLocalSet(loc)
   return 1
+}
+
+// How `listFitShadowSet` takes `is` test `isIx` over a receiver of type `recvTy` at list depth
+// `depth`: 1 a fresh `K[]` stored, 2 a pushing arm's grow row, -1 refused.
+export function listFitShadowPlanOf(
+  isIx: i32,
+  recvTy: i32,
+  depth: i32,
+  fnIx: i32,
+): i32 {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) || fnIx < 0 { return -1 }
+  const r = nodeAt(unwrapParen(nd.isObj))
+  const fn = nodeAt(fnIx)
+  if !(r is Ident) || !(fn is FuncDecl) || depth != 1 { return -1 }
+  const kTy = isVarTyIxOf(isIx)
+  if kTy < 0 || kTy >= T.tys.length { return -1 }
+  const kt = tyAt(kTy)
+  if !(kt is TyArray) { return -1 }
+  const heaps: i32[] = []
+  const kind = listFitElemKind(tyElemOf(kt), heaps)
+  if kind == null { return -1 }
+  // A closure's read stands in with its own empty `K[]` (`listFitCaptureStandIn`), except
+  // between two record lists, which that read cannot tell apart.
+  const rt = if recvTy >= 0 && recvTy < T.tys.length { tyAt(recvTy) } else { kt }
+  const recvHeaps: i32[] = []
+  const recvKind = if rt is TyArray { listFitElemKind(tyElemOf(rt), recvHeaps) } else { null }
+  if (
+    kind == "reflist"
+    && (recvKind == null || recvKind == "reflist")
+    && (nestedFnReadsDisjoint(fn.fnBody, r.identName, recvTy, false)
+      || liftedFnReadsDisjoint(r.identName, recvTy, fnIx))
+  ) {
+    return -1
+  }
+  if localIndexOf(fnIx, unwrapParen(nd.isObj)) < 0 { return -1 }
+  return if listFitGrowRow(unwrapParen(nd.isObj), kTy, fnIx) >= 0 { 2 } else { 1 }
+}
+
+// The `K[]` of `is K[]` test `isIx`, a `shadow` row's type.
+export function listFitShadowTyOf(isIx: i32): i32 { return isVarTyIxOf(isIx) }
+
+// Whether rows typed `a` and `b` are one `shadow` row, as `listFitShadowSet` keys them.
+export function listFitShadowSameTy(a: i32, b: i32): boolean {
+  return tySame(a, b)
+}
+
+// Whether read `ix` takes the `shadow` row typed `rowTy` (`listFitShadowRow`): typed as the row's
+// list and not a read of the declaration's own list.
+export function listFitShadowReadsRow(rowTy: i32, ix: i32, fnIx: i32): boolean {
+  const t = nodeTyAt(ix, fnIx)
+  return t >= 0 && !narListReadsDecl(ix) && tySameSealed(rowTy, t)
+}
+
+// Whether wasm local `loc` holds an `is` arm's empty `K[]` this frame's `listFitShadowSet` stored.
+export function listFitShadowHolds(loc: i32): boolean {
+  for l in fitShLocal {
+    if l == loc { return true }
+  }
+  return false
+}
+
+// The local `listFitShadowSet` stored `is` test `isIx`'s `K[]` in (its name, `K` and receiver
+// local's row), or -1 before it is stored.
+export function listFitShadowLocalOf(isIx: i32, fnIx: i32): i32 {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) { return -1 }
+  const r = nodeAt(unwrapParen(nd.isObj))
+  if !(r is Ident) { return -1 }
+  const kTy = isVarTyIxOf(isIx)
+  const recvLoc = localIndexOf(fnIx, unwrapParen(nd.isObj))
+  let loc = -1
+  let i = 0
+  while i < fitShName.length {
+    if (
+      fitShName[i] == r.identName
+      && tySame(fitShTy[i], kTy)
+      && fitShRecv[i] == recvLoc
+    ) {
+      loc = fitShLocal[i]
+    }
+    i = i + 1
+  }
+  return loc
 }
 
 // The local `listFitShadowSet` stored for a read of `name` at node `exprIx` typed as that
@@ -5734,7 +5801,7 @@ function liftedFnCapturesIn(fe: i32, name: string, fnIx: i32): boolean {
 }
 
 // Whether some lifted closure inside the function at `fnIx` captures `name`.
-function liftedFnCaptures(name: string, fnIx: i32): boolean {
+export function liftedFnCaptures(name: string, fnIx: i32): boolean {
   let k = 0
   while k < cloLiftedFes.length {
     if liftedFnCapturesIn(cloLiftedFes[k], name, fnIx) { return true }
@@ -29788,6 +29855,7 @@ export function callRefArgPlain(
     || arm == "widenF32"
     || arm == "box"
     || arm == "atom"
+    || arm == "atomToStr"
   ) {
     return true
   }
@@ -29795,8 +29863,13 @@ export function callRefArgPlain(
   if arm == "armUnbox" {
     return callRefArmUnboxPlan(ckey, i, a, fnIx) != "crossTag"
   }
+  // A nullable scalar list parameter takes the list as it is, nullable or not: the non-null
+  // recover writes nothing for it.
   if arm == "scalarList" {
-    return k != null && !isNulScalarListKind(k) && plainListArg(a, fnIx)
+    if k != null && isNulScalarListKind(k) {
+      return !narrowedArmNeedsUnbox(a, fnIx)
+    }
+    return k != null && plainListArg(a, fnIx)
   }
   if arm != "general" { return false }
   if tyIsLitUnion(nodeTyAt(a, fnIx)) { return false }
@@ -31146,21 +31219,18 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
   return 0
 }
 
-// Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": a scalar,
-// string, atom, niche or plain reference list's value built as itself or widened, a union list's
-// that the record boxes or is already a named union, or a nested list's that is no literal (an atom
-// into a string list decodes); with no arm unbox at a record row.
-export function idxStorePlainWhy(st: IdxStore, rhs: i32, fnIx: i32): string {
-  if (
-    st.unionNm != ""
+// Whether element store `st` boxes value `rhs` at its site's union (`emitUnionBoxAtRecord`'s last
+// arm, `emitUnionBoxArg` at `unionNm`): a union list's value that owes no box and is no union.
+export function idxStoreSiteBoxes(st: IdxStore, rhs: i32, fnIx: i32): boolean {
+  return st.unionNm != ""
     && !boxOwedAt(rhs, fnIx)
     && !(exprUnion(rhs, fnIx) && boxTyName(nodeTyAt(rhs, fnIx)) != "")
-  ) {
-    return "store element"
-  }
-  if st.nestSlot >= 0 && nodeAt(unwrapParen(rhs)) is ArrayLit {
-    return "store element"
-  }
+}
+
+// Why element store plan `st` (value `rhs`) is not a store the IR writes, or "": an arm unbox at a
+// record row. A union list's value is boxed by the record or already a named union, or
+// `idxStoreSiteBoxes` boxes it at the site; a nested list's literal builds as the inner list.
+export function idxStoreOtherWhy(st: IdxStore, rhs: i32, fnIx: i32): string {
   // The arm unbox casts at the element's own row; a store with none writes no cast.
   if (
     narrowedArmNeedsUnbox(rhs, fnIx)

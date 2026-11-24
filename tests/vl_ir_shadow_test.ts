@@ -3144,3 +3144,27 @@ Deno.test({
     }
   },
 });
+
+// A record with no row of its own on its storage row's heap (`recHeapOf`), stood at a record whose
+// field is nullable over its own or where its own is `null` (`recFieldsWiden`), and a global read
+// noting its cell's heap: each start builds, verifies and matches.
+const HEAP_IDENTITY_1: string[] = [
+  "type J = { f: i32 }\ntype K = { j: J | null }\nfunction mk() { return { j: { f: 4 } } }\nconst _k: K = mk()\nconst y = mk()\nprint(y.j.f)\n",
+  "type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nconst go = [1].length > 0\nconst __c = mk2()\nconst __f = () => {\n  const v = __c\n  print(v.f)\n}\n__f()\n",
+];
+Deno.test({
+  name: "ir shadow: a rowless record on its storage row's heap widens to a nullable field",
+  ignore,
+  fn: () => {
+    for (const src of HEAP_IDENTITY_1) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const miss = [...rows.keys()].filter((k) => k.startsWith("start uncovered"));
+      if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
+    }
+  },
+});
