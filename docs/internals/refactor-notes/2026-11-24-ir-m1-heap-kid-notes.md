@@ -56,4 +56,24 @@ cell also misses `narrowed read`.
 
 ## Readings
 
-READINGS
+Base 341b3bc73 (4b) and head 5a1de9dbd, each built in its own tree, fixpoint seeds, current host:
+
+| reading | result |
+| --- | --- |
+| mode-6 | corpus 0 prepost differs in 86,259 rows; tests/cases 1 in 69,683, the `error-` case the same on base |
+| `ir-identity --cases` / `--claimless` / `--names` | 7,903 / 14,467 / 9,433 identical, differ 0 |
+| self-compile | identical; IR shadow 20,567 of 20,567 covered and matched on both |
+| L2 self-compile fuel | +0.05% against master bd9d941c9; the fuel pair against 4b is output-identical |
+| rep-fuzz, `gate.sh --fast`, D17047 | exact, passed, identical |
+| A/B over tests/cases | covered 83,339 → 83,346, matched 83,328 → 83,335, mismatch/fail 22 → 22 |
+| regress.vl | 0 runs → not-runs, 0 → silent, over 261,224 census cells |
+
+The census class diff leaves `return coercion` for three functions outside the sweep:
+`hole-fn-param-into-returned-record.vl::mk2`, and `hole-fn-in-nested-maker-record-read-inline.vl::mk2`
+and `::mk5`. Both files' modules are cmp-identical between base and head.
+
+## Control: the walk never overwrites
+
+The control seed has `recHeapsNote` overwrite an already-noted kid with its heap + 1. On it, the pin
+and `heap-kid-row-ret`, `-field` and `-ifarm` fall back to `return coercion`: a wrong entry reds as a
+miss, never as a silent wrong store. `twokid-mixed` and 4b's `heap-value-ret-s` stay covered.
