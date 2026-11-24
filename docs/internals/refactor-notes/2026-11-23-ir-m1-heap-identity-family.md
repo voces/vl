@@ -161,3 +161,84 @@ Readings (base master 89ce9eefe, head 5b6b71edc, fixpoint seeds):
   takes it from `argument coercion` to `field read of a stored row's box`; (1) and (2) take it to
   matched. (2) alone was not measured: an existing storage-row holder (D14426) may reach it too, so
   the per-class rows above are the pair's reading, not (1)'s or (2)'s alone.
+- Correction (V5's verify of #9818): the named cells alone read 8,462 → 8,462, unchanged; the
+  quick A/B's 14,972 → 14,979 is tests/cases and the named cells together, so the +7 is all
+  tests/cases. V5 attributes it 6 to the storage-row hold and 1 to the stored-row box unbox.
+
+## Batch 2b part 1: a capture's environment row heap
+
+`captureRead` notes the heap of the struct row legacy stores the capture at
+(`captureValStructIdx`, where `captureValKind` is a struct) for a heapless record read rep
+(`noteCapHeap`), through the cell note's row-match guard, now shared as `rowHeapFor`; one answer
+per rep, memoised per program.
+
+Readings (base batch 2a 3977fec35 = master 1db11290 in compiler, head 7736511f3, fixpoint seeds):
+- Named cells alone: covered, verified and matched 41,563 → 41,567; `declaration coercion` 4 → 0
+  (d16132_{block_bare,block_if,block_while,fn_body}_capture_unann). tests/cases unchanged: A/B
+  covered 76,728 → 76,728, start 6,913 → 6,913, mismatch/fail 0; census 6,045 of 7,175 on both.
+  The three block cells keep `start uncovered closure env capture` (N7's class), as on base.
+- The `rowHeapFor` fold is byte-neutral for the existing paths: 17 programs (batch 1's cells,
+  D17047's witness, the D17087 witness, batch 2a's Q58 sweep, overload-pick-reads-only-delivery)
+  build byte-identical under the 2a and 2b seeds.
+- Identity `--cases` 7,755, `--claimless` 14,453, `--names` 9,433: differ 0; self-compile
+  identical; mode 6 corpus differs 0 of 86,287, cases 1 (the pre-existing own refusal).
+- rep-fuzz exact; fuel pair 124,988,908,629 → 124,988,908,629 (the note never fires in the
+  self-compile); `self ir misses` 0; deep nesting 8 passed.
+- Witnesses, one per frame shape (block, if, while, fn body), read `v.f` and print 5, 6, 7, 8
+  under both seeds; a `let` reassigned before the closure runs prints 9 and matches.
+- Q58: 11 positions of the capture inside the closure. Output and `ir-identity --claimless`
+  identical 11, differ 0. The `const` initializer (the claim) and a union argument match; nine
+  positions are uncovered under both seeds in classes this note does not touch (`argument
+  coercion`, `string operand after another`, `return coercion`, `assignment coercion`, `ref if
+  arm rep`, `coalesce nulRef default rep`, `object field coercion`).
+
+## Batch 2b part 2: a nullable struct cell's heap
+
+D1's two d16132 cells `d16132_map_set_unann` and `d16132_map_value_unann` read no map at the
+miss: `const v = __mv` reads the top-level `{f: null} | null` global narrowed under
+`if __mv != null`. `noteCellHeap` ran there, but `cellHeapOf` took only a `struct` cell; this is
+a `nulstruct` cell, whose `globalCellStructIdx` is its record's row (row 0, heap 0, the binding's
+`J$m…` rep). `cellHeapOf` now takes `struct` or `nulstruct`; the row-match guard and memo stand.
+- Both cells: `start uncovered declaration coercion` → start matched; print `null` on both seeds.
+- Witnesses with a non-null field beside the null one print `7 3` and `12 4` on both seeds.
+- Neighbours unchanged under both seeds: an un-narrowed read of the nullable global (`false 7`)
+  and a nullable global whose row does not match (`10`) are matched on base and head alike.
+- Committed programs (Q58 addendum): witnesses `tests/cases/globals/heap-nullable-cell-narrowed-
+  {two-fields,set-get}.vl` (base `declaration coercion` → head clean); neighbours `…-unnarrowed-
+  read.vl` and `…-row-mismatch.vl` (unchanged on both seeds); the sweep `…-q58-{arg_record,
+  arg_union,arg_nested,return,if_arm,coalesce,record_field}.vl`, every one runs and is unchanged
+  on both seeds but `record_field`, whose uncovered row moves from `object field coercion` to
+  `field read coercion`. The concat, interpolation, `const` and `let` initializer positions are
+  D17103's reds (invalid wasm or a failed emit under both seeds and claimless), not `@run` cases.
+- V1's annotated capture neighbour (`const v: J = __c` in the closure) is committed as
+  `tests/cases/closures/heap-capture-annotated-binding-{fn-body,block}.vl`: measured here it is
+  no `declaration coercion` miss on either seed in any of four frame shapes; the block frames keep
+  only `start uncovered closure env capture` (N7's class).
+
+## Parked: N6's three map-read-default cells (queue ruling 2026-11-24, option 1)
+
+b011298, b011299 and b021775 (`uncovered map read default rep`) stay named misses. In `mapGetOr`,
+`rep` is `g1`'s target, fixed by the caller from `storeRowTyOf`'s `{r: null}` row (a row a
+`{r: null}` literal minted, D14890's own-row rule), while the map's value and the default build
+at `{r: i32 | null}` on the same struct. The two closes are both out: (a) the narrowing retag
+`{r: i32 | null}` → `{r: null}` is refused as clause 1, since a stored non-null `r` read through the
+narrower view reads wrong; (b) holding `g1` at its checked type's rep moves `storeRowTyOf` for every
+such let. "Let at checked rep over a narrow-minted row (D14890), Q57" is a FREE design item.
+
+## 4a: the "no heap of its own" a cell or capture note rests on is held (a guard)
+
+`noteCellHeap` and `noteCapHeap` note a heap only when `recHeapOf(rep)` reads -1. That -1 is now
+recorded (`askRecordHeapNone`, emit_rep.vl) and re-asked at `rowFieldAsksCheck`: if the type has
+gained a heap by then (`recordHeapAll`: its own, else its storage row's), emit fails with
+`internal: … (recordHeapNone)`. A guard, not a fix — no stale note was constructible:
+- 0 trips over tests/cases and the 10,827 named cells. Two hand-built attempts run correctly
+  without tripping: a cell read noted before a later function mints a literal of the same shape,
+  and a capture read noted before a later `{f: null}` global.
+- Control (the hold re-asked at `>= -1`, so it fires on every recorded -1): fires on the cell
+  witness `tests/cases/globals/heap-nullable-cell-narrowed-two-fields.vl` and the capture witness
+  `tests/cases/closures/heap-capture-unannotated-binding-fn-body.vl`. Over the 7,082 `// @run`
+  programs of tests/cases it fires on 6, all heap-identity witnesses (`closures/heap-capture-*`
+  ×3, `globals/heap-nullable-cell-*` ×3); it does not fire on the self-compile.
+- Readings vs #9851's head (ad2259f5): mode-6 corpus 0 of 86,272; `--cases` 7,800, `--claimless`
+  14,459, `--names` 9,433, differ 0 each; L2 +0.02%; census 6,170 of 7,220 runs on both arms;
+  regress.vl 0 runs → not-runs, 0 → silent (261,224 census cells, 11,223 named).

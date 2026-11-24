@@ -49,6 +49,7 @@ import {
   RHandPick,
   RHolderPick,
   RHoleOptBox,
+  RIdentityEq,
   RInitProgress,
   RJoinNull,
   RListCat,
@@ -163,6 +164,7 @@ import {
   irSigOf,
   mapBoxReadsAt,
   mapNicheReadsAt,
+  mapWalkElemRep,
   repHeldAsI32,
   repNullRefFits,
 } from "./ir"
@@ -744,8 +746,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RAsUnion => {
       use(r.auV, at)
-      // The tag test reads a box; what it yields is the cast's own rep, which the builder takes.
-      if !(repNodeAt(opRep(r.auV)) is RBox) {
+      // The tag test reads a box, a boxed nullable's null-tagged one too; what it yields is the
+      // cast's own rep, which the builder takes.
+      const on = repNodeAt(opRep(r.auV))
+      if !(on is RBox || on is RNullable && on.rnDisc == 4) {
         return fail(2, at, "a union cast's operand is a box")
       }
       0
@@ -1095,6 +1099,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RClosureEq => closureEqCheck(r, dst, at)
+    RIdentityEq => identityEqCheck(r, dst, at)
     RNulTest => {
       use(r.ntV, at)
       const d = repNodeAt(opRep(r.ntV))
@@ -1138,6 +1143,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if (
         r.ucNul
         && (r.ucStage & 2) == 0
+        && !r.ucOtherAgain
         && (!(ov is OVar)
           || ov.ov < 0
           || ov.ov >= vf.irVars.length
@@ -1147,6 +1153,22 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           2,
           at,
           "a union compare's null-leg operand is not a re-read variable",
+        )
+      }
+      // An operand read again is a null leg's, unparked, beside a box held in a variable.
+      if (
+        r.ucOtherAgain
+        && (!r.ucNul
+          || (r.ucStage & 2) != 0
+          || !(bv is OVar)
+          || bv.ov < 0
+          || bv.ov >= vf.irVars.length
+          || vf.irVars[bv.ov].vKind == "temp")
+      ) {
+        return fail(
+          2,
+          at,
+          "a union compare's operand is read again off a null leg or beside a box that is no variable",
         )
       }
       0
@@ -2461,20 +2483,21 @@ function stmt(id: i32, prev: i32) {
         er = if repPrim(ln.rlsElem) == "u8" { vfI32 } else { ln.rlsElem }
       }
       if opRep(n.xfList) == vfStr { er = vfI32 }
-      // A map walks its keys or values, each an i32 or a string.
-      if (
-        (n.xfMap >= 0 || recvMap)
-        && n.xfVar >= 0
-        && n.xfVar < vf.irVars.length
-      ) {
-        const vr = vf.irVars[n.xfVar].vRep
-        if vr == vfI32 || vr == vfStr { er = vr }
+      // A map walks its keys or values into an i32 or a string, or at the rep its receiver's map
+      // stores them at: the global's own rep, or the receiver operand's (`mapWalkElemRep`).
+      if (n.xfMap >= 0 || recvMap) {
+        const mrep = if n.xfMap >= 0 { irGlobalRepOf(vf, n.xfMap) } else { opRep(n.xfList) }
+        er = mapWalkElemRep(mrep, n.xfVals)
+        if n.xfVar >= 0 && n.xfVar < vf.irVars.length {
+          const vr = vf.irVars[n.xfVar].vRep
+          if vr == vfI32 || vr == vfStr { er = vr }
+        }
       }
       if n.xfVar < 0 || n.xfVar >= vf.irVars.length || er < 0 {
         return fail(
           2,
           id,
-          "a walk is not of a list or a string into a variable",
+          "a walk is not of a list, a string or a map into a variable",
         )
       }
       if vf.irVars[n.xfVar].vKind != "local" || vf.irVars[n.xfVar].vRep != er {
@@ -2781,6 +2804,23 @@ function closureEqCheck(r: RClosureEq, dst: i32, at: i32) {
   return 0
 }
 
+// A reference identity's two operands at references no string or scalar is, and its 0/1 answer
+// a bool: the check refuses identity over a value with none.
+function identityEqCheck(r: RIdentityEq, dst: i32, at: i32) {
+  use(r.ieL, at)
+  use(r.ieR, at)
+  for o in [r.ieL, r.ieR] {
+    const or = opRep(o)
+    if repIsScalar(or) || repPrim(or) == "str" || repPrim(or) == "bool" {
+      return fail(2, at, "an identity compare's operands are references")
+    }
+  }
+  if dst >= 0 && repPrim(dst) != "bool" {
+    return fail(2, at, "an identity compare is a bool")
+  }
+  return 0
+}
+
 // A guarded nullable compare's two operands at reference reps, and its 0/1 answer a bool.
 function nulNicheEqCheck(r: RNulNicheEq, dst: i32, at: i32) {
   use(r.neL, at)
@@ -2907,6 +2947,7 @@ function rhsReadsList(r: Rhs): boolean {
       RHandPick |
       RHolderPick |
       RHoleOptBox |
+      RIdentityEq |
       RInitProgress |
       RJoinNull |
       RListCat |
@@ -3344,7 +3385,9 @@ function neverCallTemp(f: IrFn, i: i32): boolean {
         const ks = repNodeKids(opRep(r.gfV))
         return r.gfIx >= 0 && r.gfIx < ks.length && ks[r.gfIx] == v.vRep
       }
-      return r is RCall && r.caNever || r is RDeadNever
+      return (r is RCall && r.caNever)
+        || (r is RCallRef && r.crNever)
+        || r is RDeadNever
     }
   }
   return false

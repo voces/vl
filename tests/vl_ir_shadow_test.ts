@@ -364,6 +364,25 @@ Deno.test({
   },
 });
 
+// The operand re-read's control: a union compare off its null leg marked as reading its operand
+// again (`irShadowCorrupt(8)`), which the verifier must refuse; the re-read is a null leg's alone.
+Deno.test({
+  name: "ir shadow: a union compare's operand read again off its null leg fails the verifier",
+  ignore,
+  fn: () => {
+    const src = `type U = i32 | string\nfunction f(u: U) { return u == "s" }\nprint(f("s"))\n`;
+    const ok = run(src, true);
+    if (failures(ok.rows).length > 0 || ok.rows.get("matched") !== 1) {
+      throw new Error(`want f matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 8);
+    const want = "operand is read again off a null leg";
+    if (!failures(rows).some((k) => k.includes(want))) {
+      throw new Error(`want a fail row naming "${want}", got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The file rows' controls: an unreadable directive is refused, and a row whose expectation the
 // compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
 Deno.test({
@@ -1726,6 +1745,8 @@ Deno.test({
       "coal-atom-str-default-off-rep": 2,
       "atom-decode-nullable-into-string": 2,
       "atom-decode-nullable-into-nullable-string": 0,
+      "captured-atom-param-decoded-at-string": 0,
+      "captured-atom-param-typed-as-string": 3,
       "opt-read-of-i32": 2,
       "dead-return-after-returning-call": 5,
       "pop-or-default-returning-call": 5,
@@ -1734,14 +1755,27 @@ Deno.test({
       "never-call-value-at-consumer-rep": 0,
       "dead-never-temp-at-consumer-rep": 0,
       "dead-never-bound-to-non-temp": 3,
+      "identity-eq-of-records": 0,
+      "identity-eq-of-string": 2,
+      "identity-eq-of-i32": 2,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
+      "union-cast-of-box": 0,
+      "union-cast-of-boxed-nullable": 0,
+      "union-cast-of-niche-nullable": 2,
+      "union-cast-of-i32": 2,
+      "never-closure-call-value-at-consumer-rep": 0,
+      "returning-closure-call-temp-typed-never": 3,
       "never-field-read-at-its-storage": 0,
       "never-field-read-off-its-storage": 3,
       "walk-pair-map-value-record": 0,
       "walk-pair-map-value-off-type": 3,
       "walk-pair-string-index": 0,
       "walk-pair-string-index-of-bool": 2,
+      "walk-map-value-record": 0,
+      "walk-map-value-off-rep": 2,
+      "walk-map-key-i32": 0,
+      "walk-map-key-off-rep": 2,
       "map-scalar-join-of-i32": 0,
       "map-scalar-join-of-string": 2,
     };
@@ -1765,6 +1799,14 @@ Deno.test({
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
+    // A staged root reads above a run of roots on the stack, never above a value that is no root
+    // (`rootsFloor`, D17089): the floor cannot hide a real order violation.
+    for (const [k, want, what] of [[0, 1, "above a run of roots"], [1, 0, "above a non-root"], [2, 0, "above a non-root over a root"]] as const) {
+      const got = exp.irStageFloorSelfTest(k);
+      if (got !== want) throw new Error(`stage floor ${what}: want ${want}, got ${got}`);
+    }
+    // A door fragment lowered while a root is staged gives the staging's root run back.
+    if (exp.irRootRunFrameSelfTest() !== 1) throw new Error("want the fragment frame to restore the root run");
     // A fit tail that misses leaves legacy's receiver read in place (`fitRecvReadHook`).
     if (exp.irFitTailSelfTest() !== 1) throw new Error("want the fit hook restored after a miss");
     // Each kind legacy's descriptor names alone maps to a type that describes back at that kind.
@@ -3308,6 +3350,47 @@ Deno.test({
       }
     } finally {
       Deno.removeSync(tmp, { recursive: true });
+    }
+  },
+});
+
+// A capture of a record whose type has no heap of its own, stored at its environment row (legacy's
+// `captureValStructIdx`): the read takes that row's heap, so a binding of it at the row's record
+// builds; a `let` reassigned before the closure runs does too.
+const CAPTURE_ENV_HEAP: string[] = ["type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nfunction fr() {\n  const __c = mk2()\n  const __f = () => {\n    const v = __c\n    print(v.f ?? 8)\n  }\n  __f()\n}\nfr()\n", "type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nfunction fr() {\n  let __c = mk2()\n  __c = mk2()\n  const __f = () => {\n    const v = __c\n    print(v.f ?? 9)\n  }\n  __f()\n}\nfr()\n"];
+Deno.test({
+  name: "ir shadow: a heapless record capture takes its environment row's heap",
+  ignore,
+  fn: () => {
+    for (const src of CAPTURE_ENV_HEAP) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const miss = [...rows.keys()].filter((k) => k.includes("uncovered"));
+      if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want every function and the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
+    }
+  },
+});
+
+// A `T | null` global (a nullable struct cell) read narrowed at its record's heapless rep takes
+// its cell row's heap, so a binding of it at that row's record builds and reads both fields.
+const NULLABLE_CELL_HEAP: string[] = ["type J = { f: i32 | null, g: i32 }\nfunction mk2() { return { f: null, g: 7 } }\nconst dA: J = mk2()\nconst __m = Map()\n__m[\"k\"] = mk2()\nconst __mv = __m[\"k\"]\nif __mv != null {\n  const v = __mv\n  print(v.g)\n  print(v.f ?? 3)\n}\n", "type J = { f: i32 | null, g: i32 }\nfunction mk2() { return { f: null, g: 11 } }\nconst dA: J = mk2()\nconst __m = Map()\n__m.set(\"k\", mk2())\nconst __mv = __m.get(\"k\")\nif __mv != null {\n  const v = __mv\n  print(v.g + 1)\n  print(v.f ?? 4)\n}\n"];
+Deno.test({
+  name: "ir shadow: a nullable struct cell's narrowed read takes its record row's heap",
+  ignore,
+  fn: () => {
+    for (const src of NULLABLE_CELL_HEAP) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const miss = [...rows.keys()].filter((k) => k.includes("uncovered"));
+      if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
     }
   },
 });
