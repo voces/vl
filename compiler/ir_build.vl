@@ -676,6 +676,7 @@ import {
   armSiteReads,
   asgReReadEnter,
   asgReReadLeave,
+  asgReadNode,
   asgReadUnwidenOp,
   asgYieldsNullLit,
   boxedFieldUnionTyOf,
@@ -11273,10 +11274,31 @@ function armUnboxOwed(ix: i32, dst: i32): boolean {
   return dst >= 0
     && au >= 0
     && au < P.nodes.length
-    && nodeAt(au) is Ident
     && recordRepOrNull(dst)
     && narrowedArmNeedsUnbox(ix, ibFnIx)
-    && narrowedArmTyAt(au, ibFnIx) >= 0
+    && (nodeAt(au) is Ident && narrowedArmTyAt(au, ibFnIx) >= 0
+    || asgBoxRep(au) >= 0)
+}
+
+// The box rep of assignment `ix` used as a value, where legacy's value is its target's re-read
+// (`asgReadNode`) and that is a union box (`exprUnion`): the target's own rep; -1 for any other node.
+function asgBoxRep(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if (
+    !(n is BinExpr)
+    || n.binOp != "="
+    || asgValueArmOf(ix, ibFnIx) != "reRead"
+  ) {
+    return -1
+  }
+  if (
+    asgReadNode(ix, ibFnIx) != unwrapParen(n.binLeft)
+    || !exprUnion(ix, ibFnIx)
+  ) {
+    return -1
+  }
+  const r = exprRepOf(n.binLeft)
+  return if r >= 0 && heldAsBox(r) { r } else { -1 }
 }
 
 // Whether `ix` is a union of records each stored at record destination `dst`'s heap, which the
@@ -11314,12 +11336,17 @@ function armUnboxTemp(
   cellNul: boolean,
 ): Opnd {
   const au = unwrapParen(ix)
-  const bo = irBBoxLocal(b, au)
+  const bo = if asgBoxRep(au) >= 0 { exprAt(b, au, true) } else { irBBoxLocal(b, au) }
   if ibMiss != "" { return bo }
   const ut = if dstTy >= 0 && primRepOfTy(dstTy) == dst { dstTy } else { repTyOf(dst) }
   return irBLetTempTy(
     b,
-    { uaV: bo, uaAt: au, uaCellNul: cellNul, uaDst: -1 },
+    {
+      uaV: bo,
+      uaAt: au,
+      uaCellNul: cellNul,
+      uaDst: if asgBoxRep(au) >= 0 { dst } else { -1 },
+    },
     ix,
     dst,
     ut,
@@ -11389,7 +11416,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   // A `??` map read whose own type has no rep (a link legacy mints) is at the map's value rep,
   // where legacy's `mapGetOr` arm writes it.
   const cr = if own < 0 && !nv && pr < 0 && br < 0 { openCoalMapRep(ix) } else { -1 }
-  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else { own }
+  // An assignment whose value legacy re-reads off a union-box target is that box (`asgBoxRep`).
+  const xr = if own >= 0 && n is BinExpr { asgBoxRep(ix) } else { -1 }
+  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else if xr >= 0 { xr } else { own }
   // A direct call whose own type has no rep is at its callee's result rep.
   if rep < 0 && n is Call && !nv { return openCallValue(b, n, ix) }
   if rep < 0 {
@@ -12094,6 +12123,11 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if arm == "lit" { return assignValueLit(b, n, ix, rep) }
   if arm == "nullLit" { return assignValueNullLit(b, n, ix, rep) }
   if arm != "reRead" { return irBMiss("assignment value " + arm) }
+  // The store between an operand already built and the box's re-read would put that operand out of
+  // stack order, as `assignValueLit`'s would.
+  if asgBoxRep(ix) >= 0 && endsInTemp(b) {
+    return irBMiss("assignment value box after an operand")
+  }
   if asgReadUnwidenOp(ix, ibFnIx) >= 0 {
     return irBMiss("assignment value unwiden")
   }
