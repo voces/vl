@@ -152,3 +152,6 @@ Readings (base master 89ce9eefe, head 5b6b71edc, fixpoint seeds):
   record-literal field): all `start matched`; `ir-identity --claimless` identical 11, differ 0.
 - Neighbours: top-level `let` and closure read covered and matched (`1 10` under both seeds); an
   annotated binding of the literal's type is refused by the checker (only a fresh record widens).
+- Correction (V5's verify of #9818): the named cells alone read 8,462 → 8,462, unchanged; the
+  quick A/B's 14,972 → 14,979 is tests/cases and the named cells together, so the +7 is all
+  tests/cases. V5 attributes it 6 to the storage-row hold and 1 to the stored-row box unbox.
