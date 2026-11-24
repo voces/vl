@@ -50,7 +50,7 @@ Hook 2 refuses after the whole body is lowered, the latest point a lowering can 
 | phase-state `hidden` in emit_state.vl | 11 → 12, `emitSoftMsg` scoped in `softEnd` (queue ruling: the save and restore is chosen; the census misses `emitSoftFail`, saved through a struct literal, so the true count is 13) |
 
 `ir-parity.vl`'s `firstError` now skips the one line a host prints before legacy's refusal when a
-claim declined (`vl: note: an IR claim refused inside `…), matched by that exact prefix. Without the
+claim declined (`vl: note: an IR claim refused inside …`), matched by its exact prefix. Without the
 skip, a refusal with no source position compared the note against legacy's line. Control:
 `hole-fn-map-in-record-field_argument_unann`, which is `differs` with the old harness and
 `build-fails(both)` (`Error: emit error`) with the new one.
