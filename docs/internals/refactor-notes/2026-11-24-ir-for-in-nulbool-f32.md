@@ -18,8 +18,9 @@ the list takes the non-hoisted walk on both sides; the byte identity of `growB`,
 The change does not touch the builder's `for in map element` check (D1's PR3 mechanism E), which
 admits a map walk's key or value only at `i32` or a string. A map walk asks `forInElemPlain`
 first, so the two f32-valued map walks in `tests/cases` (`maps/f32-valued-map.vl`,
-`maps/scalar-value-bare-read-boundary.vl`) now stop at that check instead: in `tests/cases`,
-`for in map element` goes 16 → 18.
+`maps/scalar-value-bare-read-boundary.vl`) stopped at that check on base 7bfe6596: in
+`tests/cases`, `for in map element` went 16 → 18. #9869 has since removed that check, and on the
+merged tree both files are covered and matched (1/1, 4/4).
 
 ## Legacy tails the IR calls
 
@@ -50,3 +51,20 @@ first, so the two f32-valued map walks in `tests/cases` (`maps/f32-valued-map.vl
   Under `VL_IR_SHADOW=6`, nulbool goes from 64/75 matched with 11 misses to 75/75, and f32 from
   63/74 with 11 misses to 74/74. Claims-on equals claims-off, and both print what the `@log`
   lines expect.
+
+## Bytes and coverage
+
+- Self-compile `--names`: identical 9,433, differ 0. `--cases`: identical 7,860, differ 0, with
+  2 expected divergences (both listed in the baseline). `--claimless`: identical 14,462, differ 0.
+  `tests/cases` A/B: same 8,979, differ 0. The moved list is empty. The mode 3 self-compile is
+  byte-identical to legacy.
+- `tests/cases` armed shadow, with this PR's witnesses included:
+  - `for in element nulbool` 27 → 0 (start 1 → 0) and `for in element f32` 23 → 0 (start 3 → 0);
+  - covered = matched 82,875 → 82,923, and start matched 7,234 → 7,238.
+
+  Before the witnesses were added the classes were 15, 10 and 3 (start). The corpus is unchanged:
+  46,880 of 46,958 functions with no blocker. The self-compile walks neither kind.
+
+## Fuel
+
+L2 −0.00% per PR on base 7bfe6596.
