@@ -18,7 +18,7 @@
 //
 // Run with:  deno test -A tests/vl_ir_shadow_test.ts
 
-import { COMPILER, exists, ROOT } from "./support/tree.ts";
+import { COMPILER, exists, ROOT, VL } from "./support/tree.ts";
 
 const ignore = !exists(COMPILER);
 if (ignore) {
@@ -3276,6 +3276,38 @@ Deno.test({
     const miss = [...rows.keys()].filter((k) => k.startsWith("start uncovered"));
     if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
       throw new Error(`want the start matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `ir-shadow.vl` with a chunk that does not finish: a host standing in for `vl check` exits 70 on
+// every chunk, as a compiler crash does. The run reports each chunk and exits 2. It once looped:
+// with no listed divergence the detail pass was the run itself, whose broken list it copied into
+// itself until the GC heap ran out.
+Deno.test({
+  name: "ir shadow: ir-shadow.vl reports a chunk that did not finish and exits 2",
+  ignore: ignore || !exists(VL) || Deno.build.os === "windows",
+  fn: () => {
+    const tmp = Deno.makeTempDirSync();
+    try {
+      const host = `${tmp}/crashing-host`;
+      Deno.writeTextFileSync(host, "#!/bin/sh\nexit 70\n");
+      Deno.chmodSync(host, 0o755);
+      const prog = `${tmp}/p.vl`;
+      Deno.writeTextFileSync(prog, "print(1)\n");
+      const out = new Deno.Command("timeout", {
+        args: ["300", VL, "run", "scripts/silent-sweep/distilled/ir-shadow.vl", "--compiler", COMPILER, "--", "--files", prog, "--seed", COMPILER],
+        cwd: ROOT,
+        env: { VL: host, IR_DIVERGENCE_BASELINE: `${tmp}/none.txt` },
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      const text = new TextDecoder().decode(out.stdout) + new TextDecoder().decode(out.stderr);
+      if (out.code !== 2 || !text.includes("ir-shadow: chunk did not finish:") || !text.includes("(rc=70)")) {
+        throw new Error(`want exit 2 naming the chunk (rc=70), got exit ${out.code}:\n${text.slice(0, 2000)}`);
+      }
+    } finally {
+      Deno.removeSync(tmp, { recursive: true });
     }
   },
 });
