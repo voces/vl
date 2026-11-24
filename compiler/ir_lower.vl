@@ -732,6 +732,9 @@ import {
   fitRecvLegacy,
   fitRecvReadHook,
   listFitIsPlanOf,
+  listFitShadowHolds,
+  listFitShadowLocalOf,
+  listFitShadowSet,
   listFitTail,
   listIsAcrossPlanOf,
   listIsAcrossTail,
@@ -942,6 +945,8 @@ export function irLOpnd(o: Opnd) {
       leaf()
       // A range loop copy's variable reads as legacy's copy reads it (`urLocalRead`).
       if !urLocalRead(s) { fbLocalGet(s) }
+      // A `shadow` arm's list is the frame's nullable list scratch, read non-null.
+      if listFitShadowHolds(s) { fbRefAsNonNull() }
     }
     OImm => {
       leaf()
@@ -1886,7 +1891,21 @@ function nulTestOp(r: RNulTest) {
 // `RListEmpty`: the list, then legacy's emptiness walk over the slots and kind its plan names.
 function listEmpty(r: RListEmpty) {
   const p = emptyFitPlanOf(r.leAt, lw.irAt)
-  if p.efArm != "loop" || p.efRepWhy != "" { return irLMiss("list empty plan") }
+  const shadow = p.efArm == "shadow"
+    && r.leFit >= 0
+    && r.leFit < lw.irVars.length
+  if p.efArm != "loop" && !shadow || p.efRepWhy != "" {
+    return irLMiss("list empty plan")
+  }
+  // The arm's empty `K[]` is stored first, and its local is the region's variable.
+  if shadow {
+    if listFitShadowSet(r.leAt, p.efRecvTy, p.efDepth, lw.irAt) != 1 {
+      return irLMiss("list fit shadow store")
+    }
+    const loc = listFitShadowLocalOf(r.leAt, lw.irAt)
+    if loc < 0 { return irLMiss("list fit shadow local") }
+    lw.irVars[r.leFit].vSlot = loc
+  }
   irLOpnd(r.leV)
   return emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
 }
@@ -5365,7 +5384,12 @@ export function valtypeOf(r: i32): i32 {
 function framedLocals(): u8[] {
   const nLocals = listIdxScratchBase - fbFrameParams - fbEagerScratch
   for v in lw.irVars {
-    if v.vKind == "local" && v.vSlot >= fbFrameParams {
+    // A `shadow` arm's variable sits in the frame's list scratch, which the frame declares.
+    if (
+      v.vKind == "local"
+      && v.vSlot >= fbFrameParams
+      && !listFitShadowHolds(v.vSlot)
+    ) {
       const li = v.vSlot - fbFrameParams
       if li >= nLocals || !runAgrees(v.vRep, li) { irLMiss("locals layout") }
     }
