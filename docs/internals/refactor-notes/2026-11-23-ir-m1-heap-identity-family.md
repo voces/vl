@@ -128,3 +128,66 @@ covered, verified and matched 118,179 → 118,180; start covered, verified and m
 - rep-fuzz exact; L2 self-compile fuel +0.06% on 124,231,434,992; fuel pair +0.03%
   (124,232,156,004 → 124,268,594,079), after the cell-heap memo (the unmemoised note cost
   +0.70%); `self ir misses` 0; deep nesting 8 passed, 0 failed.
+
+## Batch 2a (D17087): the global storage row and a stored row's union box
+
+1. `globalRep` holds a record global whose checked rep has no struct heap at its storage row's rep
+   (`cellAtStorageRow`, N8's cut), memoised per (global, rep, type) for the program; it is right
+   only with #9772's delivery at legacy's declared row (without it, the D17087 witness's start
+   went matched → `argument coercion`).
+2. ir_build_ref's stored-row field read admits a union box the row stores under a read that keeps
+   the field plain: legacy's field get and unbox tail.
+
+Readings (base master 89ce9eefe, head 5b6b71edc, fixpoint seeds):
+- A/B (mode 1, tests/cases): start covered and matched 6,906 → 6,913, mismatch/fail 0 → 0; quick
+  A/B with the named cells: start 14,972 → 14,979, no losses; one moved miss (generics/
+  inferred-return-identity-literal-also-read-at-own-type: `global initializer variant coercion` →
+  `field read of a stored row`). ir-only census 6,039 → 6,045 of 7,175.
+- Identity `--cases` 7,755, `--claimless` 14,453, `--names` 9,433: differ 0; self-compile
+  identical; mode 6 corpus differs 0 of 86,291, cases 1 (a pre-existing own refusal).
+- rep-fuzz exact; L2 +0.02%; fuel pair +0.01% (the unmemoised hold cost +0.37%); `self ir misses`
+  0; deep nesting 8 passed.
+- Q58 position sweep of `i.x` off the held global (11 positions: scalar, union and nested call
+  argument, concat, interpolation, return, const and let initializer, if arm, `??` operand,
+  record-literal field): all `start matched`; `ir-identity --claimless` identical 11, differ 0.
+- Neighbours: top-level `let` and closure read covered and matched (`1 10` under both seeds); an
+  annotated binding of the literal's type is refused by the checker (only a fresh record widens).
+- Per class (quick A/B, tests/cases plus the named cells, start rows): `argument coercion`
+  13 → 10, `array element coercion` 8 → 7, `global initializer coercion` 8 → 6, `global
+  initializer variant coercion` 2 → 1, `field read of a stored row's box` 5 → 4, `field read of a
+  stored row` 0 → 1 (the one moved miss above); starts covered and matched 14,972 → 14,979.
+- Per mechanism: the storage-row hold (1) alone moves a start out of its coercion class into the
+  stored-row field read, where (2) is what lets it build. Measured on the D17087 witness: (1) alone
+  takes it from `argument coercion` to `field read of a stored row's box`; (1) and (2) take it to
+  matched. (2) alone was not measured: an existing storage-row holder (D14426) may reach it too, so
+  the per-class rows above are the pair's reading, not (1)'s or (2)'s alone.
+- Correction (V5's verify of #9818): the named cells alone read 8,462 → 8,462, unchanged; the
+  quick A/B's 14,972 → 14,979 is tests/cases and the named cells together, so the +7 is all
+  tests/cases. V5 attributes it 6 to the storage-row hold and 1 to the stored-row box unbox.
+
+## Batch 2b part 1: a capture's environment row heap
+
+`captureRead` notes the heap of the struct row legacy stores the capture at
+(`captureValStructIdx`, where `captureValKind` is a struct) for a heapless record read rep
+(`noteCapHeap`), through the cell note's row-match guard, now shared as `rowHeapFor`; one answer
+per rep, memoised per program.
+
+Readings (base batch 2a 3977fec35 = master 1db11290 in compiler, head 7736511f3, fixpoint seeds):
+- Named cells alone: covered, verified and matched 41,563 → 41,567; `declaration coercion` 4 → 0
+  (d16132_{block_bare,block_if,block_while,fn_body}_capture_unann). tests/cases unchanged: A/B
+  covered 76,728 → 76,728, start 6,913 → 6,913, mismatch/fail 0; census 6,045 of 7,175 on both.
+  The three block cells keep `start uncovered closure env capture` (N7's class), as on base.
+- The `rowHeapFor` fold is byte-neutral for the existing paths: 17 programs (batch 1's cells,
+  D17047's witness, the D17087 witness, batch 2a's Q58 sweep, overload-pick-reads-only-delivery)
+  build byte-identical under the 2a and 2b seeds.
+- Identity `--cases` 7,755, `--claimless` 14,453, `--names` 9,433: differ 0; self-compile
+  identical; mode 6 corpus differs 0 of 86,287, cases 1 (the pre-existing own refusal).
+- rep-fuzz exact; fuel pair 124,988,908,629 → 124,988,908,629 (the note never fires in the
+  self-compile); `self ir misses` 0; deep nesting 8 passed.
+- Witnesses, one per frame shape (block, if, while, fn body), read `v.f` and print 5, 6, 7, 8
+  under both seeds; a `let` reassigned before the closure runs prints 9 and matches.
+- Q58: 11 positions of the capture inside the closure. Output and `ir-identity --claimless`
+  identical 11, differ 0. The `const` initializer (the claim) and a union argument match; nine
+  positions are uncovered under both seeds in classes this note does not touch (`argument
+  coercion`, `string operand after another`, `return coercion`, `assignment coercion`, `ref if
+  arm rep`, `coalesce nulRef default rep`, `object field coercion`).
