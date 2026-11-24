@@ -128,3 +128,36 @@ covered, verified and matched 118,179 → 118,180; start covered, verified and m
 - rep-fuzz exact; L2 self-compile fuel +0.06% on 124,231,434,992; fuel pair +0.03%
   (124,232,156,004 → 124,268,594,079), after the cell-heap memo (the unmemoised note cost
   +0.70%); `self ir misses` 0; deep nesting 8 passed, 0 failed.
+
+## Batch 2a (D17087): the global storage row and a stored row's union box
+
+1. `globalRep` holds a record global whose checked rep has no struct heap at its storage row's rep
+   (`cellAtStorageRow`, N8's cut), memoised per (global, rep, type) for the program; it is right
+   only with #9772's delivery at legacy's declared row (without it, the D17087 witness's start
+   went matched → `argument coercion`).
+2. ir_build_ref's stored-row field read admits a union box the row stores under a read that keeps
+   the field plain: legacy's field get and unbox tail.
+
+Readings (base master 89ce9eefe, head 5b6b71edc, fixpoint seeds):
+- A/B (mode 1, tests/cases): start covered and matched 6,906 → 6,913, mismatch/fail 0 → 0; quick
+  A/B with the named cells: start 14,972 → 14,979, no losses; one moved miss (generics/
+  inferred-return-identity-literal-also-read-at-own-type: `global initializer variant coercion` →
+  `field read of a stored row`). ir-only census 6,039 → 6,045 of 7,175.
+- Identity `--cases` 7,755, `--claimless` 14,453, `--names` 9,433: differ 0; self-compile
+  identical; mode 6 corpus differs 0 of 86,291, cases 1 (a pre-existing own refusal).
+- rep-fuzz exact; L2 +0.02%; fuel pair +0.01% (the unmemoised hold cost +0.37%); `self ir misses`
+  0; deep nesting 8 passed.
+- Q58 position sweep of `i.x` off the held global (11 positions: scalar, union and nested call
+  argument, concat, interpolation, return, const and let initializer, if arm, `??` operand,
+  record-literal field): all `start matched`; `ir-identity --claimless` identical 11, differ 0.
+- Neighbours: top-level `let` and closure read covered and matched (`1 10` under both seeds); an
+  annotated binding of the literal's type is refused by the checker (only a fresh record widens).
+- Per class (quick A/B, tests/cases plus the named cells, start rows): `argument coercion`
+  13 → 10, `array element coercion` 8 → 7, `global initializer coercion` 8 → 6, `global
+  initializer variant coercion` 2 → 1, `field read of a stored row's box` 5 → 4, `field read of a
+  stored row` 0 → 1 (the one moved miss above); starts covered and matched 14,972 → 14,979.
+- Per mechanism: the storage-row hold (1) alone moves a start out of its coercion class into the
+  stored-row field read, where (2) is what lets it build. Measured on the D17087 witness: (1) alone
+  takes it from `argument coercion` to `field read of a stored row's box`; (1) and (2) take it to
+  matched. (2) alone was not measured: an existing storage-row holder (D14426) may reach it too, so
+  the per-class rows above are the pair's reading, not (1)'s or (2)'s alone.
