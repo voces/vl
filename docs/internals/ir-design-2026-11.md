@@ -511,6 +511,10 @@ Legacy's refusal is then the answer (rc 1). Otherwise legacy's bytes ship with a
 `$VL_IR_STRICT=1`, which every gate and CI job sets, the build fails with rc 70. Once legacy is deleted
 there is nothing to fall back to. From I8 on, an invalid claimed module is a loud internal compiler
 error (rc 70) in every mode, and each refusal legacy raised must by then exist as the IR's own.
+The soft refusal leaves with it (coordinator ruling (a), 2026-11-24). Until I8, a claim whose build or
+lowering meets a shared legacy helper's `emitFail` declines (`softBegin` in ir_build), and legacy
+writes the unit and owns its refusal. Without legacy there is nothing to decline to, so a refusal
+mid-claim becomes a loud internal compiler error.
 
 The order is forced:
 - I1 → I2 → I4, because each widens the operand reps the next one's lowering takes.

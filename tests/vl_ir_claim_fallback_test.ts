@@ -97,3 +97,92 @@ Deno.test({
     }
   },
 });
+
+// A CLAIM THAT MEETS A SHARED LEGACY HELPER'S REFUSAL DECLINES (D17123; coordinator ruling (a)): the
+// guest records the refusal instead of latching it, legacy writes the unit, and the host reports
+// it as the same G3 event. `$VL_TEST_CLAIM_REFUSAL` (1 before the body, 2 after) makes every claimed
+// function or start refuse, the control for the case legacy builds.
+const SOFT_NOTE = "an IR claim refused inside `";
+const SOFT_FELL = "IR claim refused; used the legacy emitter";
+const UNION_ROWS = "emitProgram: a union's arm rows were asked of a type no row holds";
+
+for (const strict of [false, true]) {
+  Deno.test({
+    name: `ir claim fallback: D17123's claim declines on a helper's refusal; legacy's refusal stands${strict ? " (strict)" : ""}`,
+    ignore,
+    fn: () => {
+      const r = vl(["run", `${DIR}/claim-helper-refusal-legacy-refused.vl`], strict ? { VL_IR_STRICT: "1" } : {});
+      const note = `${SOFT_NOTE}take\` (emitProgram: scalar map read has no value-box type); legacy's emitter refuses the program`;
+      if (r.code !== 1 || !r.err.includes(UNION_ROWS) || !r.err.includes(note)) {
+        throw new Error(`want rc 1 with legacy's refusal and the note on \`take\`, got rc ${r.code}:\n${r.err.slice(0, 1500)}`);
+      }
+    },
+  });
+}
+
+for (const k of ["1", "2"]) {
+  Deno.test({
+    name: `ir claim fallback: a claim refusing ${k === "1" ? "before" : "after"} its body falls back; strict is rc 70`,
+    ignore,
+    fn: () => {
+      const r = vl(["run", VALID], { VL_TEST_CLAIM_REFUSAL: k });
+      if (r.code !== 0 || r.out.trim() !== "3" || !r.err.includes(SOFT_FELL) || !r.err.includes("test claim refusal")) {
+        throw new Error(`want rc 0 printing 3 and the fallback line, got rc ${r.code}, stdout ${JSON.stringify(r.out)}:\n${r.err}`);
+      }
+      const s = vl(["run", VALID], { VL_TEST_CLAIM_REFUSAL: k, VL_IR_STRICT: "1" });
+      if (s.code !== 70 || !s.err.includes("VL_IR_STRICT=1") || s.out.trim() !== "") {
+        throw new Error(`want rc 70 under VL_IR_STRICT=1, got rc ${s.code}:\n${s.err}`);
+      }
+    },
+  });
+}
+
+// Whatever a claim wrote before it refused is undone: with every claim refusing, the module is
+// legacy's byte for byte (the armed shadow writes legacy's bytes for every unit).
+const ROLLBACK = [VALID, `${ROOT}/tests/cases/closures/hole-fn-choice-to-generic-hof-at-two-types.vl`];
+for (const k of ["1", "2"]) {
+  Deno.test({
+    name: `ir claim fallback: a claim refusing ${k === "1" ? "before" : "after"} its body leaves legacy's bytes`,
+    ignore,
+    fn: () => {
+      const tmp = Deno.makeTempDirSync();
+      try {
+        for (const p of ROLLBACK) {
+          const a = vl(["build", p, "-o", `${tmp}/soft.wasm`], { VL_TEST_CLAIM_REFUSAL: k });
+          const b = vl(["build", p, "-o", `${tmp}/legacy.wasm`], { VL_IR_SHADOW: "1" });
+          if (a.code !== 0 || b.code !== 0) throw new Error(`${p}: want both builds rc 0, got ${a.code} and ${b.code}:\n${a.err}\n${b.err}`);
+          const x = Deno.readFileSync(`${tmp}/soft.wasm`), y = Deno.readFileSync(`${tmp}/legacy.wasm`);
+          if (x.length !== y.length || x.some((v, i) => v !== y[i])) {
+            throw new Error(`${p}: want legacy's bytes after every claim refused, got ${x.length} vs ${y.length} bytes that differ`);
+          }
+        }
+      } finally {
+        Deno.removeSync(tmp, { recursive: true });
+      }
+    },
+  });
+}
+
+Deno.test({
+  name: "ir claim fallback: after an earlier claim falls back, the refusal reported is the later unit's, legacy's",
+  ignore,
+  fn: () => {
+    const r = vl(["run", `${DIR}/claim-refusal-then-legacy-refusal.vl`], { VL_TEST_CLAIM_REFUSAL: "1" });
+    // The diagnostic line the build reports, `<file>:<line>:<col>: emitProgram: …`, is `take`'s (line 8).
+    const reported = r.err.split("\n").find((l) => /:\d+:\d+: emitProgram: /.test(l)) ?? "";
+    if (r.code !== 1 || !reported.includes(`:8:10: ${UNION_ROWS}`)) {
+      throw new Error(`want rc 1 reporting \`take\`'s legacy refusal at 8:10, got rc ${r.code}, "${reported}":\n${r.err.slice(0, 1500)}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "ir claim fallback: a refusal legacy raises outside any claim stays hard, with no note",
+  ignore,
+  fn: () => {
+    const r = vl(["run", `${ROOT}/tests/cases/types/error-record-join-lambda-to-generic.vl`]);
+    if (r.code !== 1 || !r.err.includes("emitProgram:") || r.err.includes(SOFT_NOTE) || r.err.includes("IR claim")) {
+      throw new Error(`want rc 1 with legacy's refusal and no claim note, got rc ${r.code}:\n${r.err.slice(0, 1500)}`);
+    }
+  },
+});
