@@ -344,6 +344,7 @@ import {
   holeBoxTyAt,
   hostCallNamed,
   hostCallPlanOf,
+  idxStoreNullUnitUnstamped,
   idxStoreOtherWhy,
   idxStoreSiteBoxes,
   ifExprJoinVt,
@@ -646,6 +647,7 @@ import {
   repNodeAt,
   repNodeGen,
   repNodeKids,
+  repNodeOfNullUnit,
   repNodeOfTy,
   repRawOf,
   repRecordKidOf,
@@ -4909,6 +4911,20 @@ function narrowedLocalRead(
 ): Opnd {
   const o: Opnd = { ov: v }
   const arm = identReadArmOf(n, ix, ibFnIx, false)
+  // A string cell narrowed to a literal set reads, where legacy decodes no atom
+  // (`exprIsLitAtom`), as the string it holds: a `string | null` through its recover.
+  const own = ib.irVars[v].vRep
+  if (
+    arm == "local"
+    && repNodeAt(rep) is RAtom
+    && (repPrim(own) == "str" || strNullable(own))
+    && !exprIsLitAtom(ix, ibFnIx)
+  ) {
+    if repPrim(own) == "str" { return o }
+    const src: Rhs = { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) }
+    ib.irReadAgain[ix] = src
+    return irBLetTempTy(b, src, ix, repNodeOfTy(TY_STR), TY_STR)
+  }
   const ba = boxNarrowArmOf(ix, ib.irVars[v].vRep, rep, arm)
   if ba == "variant" {
     return irBLetTemp(
@@ -4970,11 +4986,12 @@ function narrowedLocalRead(
   if cell && atomNullable(ib.irVars[v].vRep) && repPrim(rep) == "str" {
     return o
   }
-  // A read narrowed to `null` whose storage read is its null (`nullReadOwnAt`) is the local.
+  // A read narrowed to `null` whose storage read is its null (`nullReadOwnAt`) is the local:
+  // seated, or any read whose destination holds no null of its own, as legacy's past-null arm.
   if (
-    cell
-    && arm == "nullread"
+    arm == "nullread"
     && identReadArmOf(n, ix, ibFnIx, true) == "local"
+    && (cell || nullReadOwnAt(ix) == NULL_READ_STORED)
   ) {
     return o
   }
@@ -6938,6 +6955,11 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     op = "charcode"
   } else if exprIsStrMethod(ix, ibFnIx, "cpAt") && c.callArgs.length == 1 {
     op = "cpat"
+  } else if (
+    exprIsStrMethod(ix, ibFnIx, "isCharBoundary")
+    && c.callArgs.length == 1
+  ) {
+    op = "charbound"
   } else if exprIsStrMethod(ix, ibFnIx, "bytes") && c.callArgs.length == 0 {
     op = "bytes"
   } else if exprIsStrIndexOf(ix, ibFnIx) && c.callArgs.length == 1 {
@@ -8123,6 +8145,11 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     const own = if atom || ref || bool || strNullable(dst) { nullOwnAt(lit, ibFnIx) } else { -1 }
     const want = if atom { NULL_OWN_ATOM } else if ref { NULL_OWN_NONE } else if bool { NULL_OWN_BOOL } else { NULL_OWN_STR }
     if own == want {
+      return repTemp(b, { nuAt: lit, nuOwn: own, nuRead: [] }, ix, dst)
+    }
+    // A `null` naming no null of its own is the bottom ref, which a nullable string also holds
+    // (`emitNullAt`).
+    if own == NULL_OWN_NONE && strNullable(dst) {
       return repTemp(b, { nuAt: lit, nuOwn: own, nuRead: [] }, ix, dst)
     }
   }
@@ -10039,9 +10066,13 @@ function coalesce(
   }
   // A `null`-typed operand runs for its effect alone, then the default is the value.
   if arm == "nulnone" {
-    const e = nulNoneEffect(b, n.binLeft, ix)
+    const effs: Opnd[] = []
+    const e = nulNoneEffect(b, n.binLeft, ix, effs)
     if ibMiss != "" { return e }
-    return coalAsBuilt(b, n.binRight, rep, arm)
+    const d = coalAsBuilt(b, n.binRight, rep, arm)
+    if ibMiss != "" || effs.length == 0 { return d }
+    // The left's effects are written where the value is read, as legacy writes the whole `??`.
+    return irBLetTemp(b, { aeEff: effs, aeV: d, aeAt: ix }, ix, rep)
   }
   // A hole's map read is legacy's null-test `if` too (`coalHoleMapIfOf`).
   if arm == "holeMap" {
@@ -10102,24 +10133,29 @@ function coalMapScalarJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 
 // A `null`-typed operand `x` run for its effect, as legacy's `emitNulNoneForEffect` writes it:
 // nothing for a `null` or a name, the receiver of a `?.`, both sides of a `??`, else the value
-// built and dropped. An if-expression is a miss.
-function nulNoneEffect(b: i32[], x: i32, ix: i32): Opnd {
+// built and dropped here, or where `sink` is given, pushed onto it for its reader to drop. An
+// if-expression is a miss.
+function nulNoneEffect(b: i32[], x: i32, ix: i32, sink: Opnd[] | null): Opnd {
   const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
   if nulNoneWritesNothing(x) { return none }
   const u = unwrapParen(x)
   if u < 0 { return irBMiss("coalesce nulnone effect") }
   const n = nodeAt(u)
   if n is IfStmt { return irBMiss("coalesce nulnone effect if") }
-  if n is OptMember { return nulNoneEffect(b, n.omObj, ix) }
+  if n is OptMember { return nulNoneEffect(b, n.omObj, ix, sink) }
   const co = plainCoalesceAt(u)
   if co != null {
-    const l = nulNoneEffect(b, co.binLeft, ix)
+    const l = nulNoneEffect(b, co.binLeft, ix, sink)
     if ibMiss != "" { return l }
-    return nulNoneEffect(b, co.binRight, ix)
+    return nulNoneEffect(b, co.binRight, ix, sink)
   }
   const v = irBExpr(b, u)
   if ibMiss != "" { return v }
-  irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  if sink == null {
+    irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  } else {
+    sink.push(v)
+  }
   return none
 }
 
@@ -11128,6 +11164,9 @@ function mapGetRepOk(sh: i32, val: i32, rep: i32, recvIx: i32): boolean {
   // `-1`, the `K | null` one (`mapGetMissOf`).
   if sh < 0 {
     if rep == val { return true }
+    // A read typed at the bare atom is narrowed past an atom value's `-1` null: the same bits.
+    const vn = repNodeAt(val)
+    if atomNullable(val) && vn is RNullable && vn.rnInner == rep { return true }
     const bn = repNodeAt(rep)
     if !(bn is RNullable) || bn.rnInner != val { return false }
     const miss = mapGetMissOf(recvIx, ibFnIx)
@@ -11849,7 +11888,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   const cr = if own < 0 && !nv && pr < 0 && br < 0 { openCoalMapRep(ix) } else { -1 }
   // An assignment whose value legacy re-reads off a union-box target is that box (`asgBoxRep`).
   const xr = if own >= 0 && n is BinExpr { asgBoxRep(ix) } else { -1 }
-  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else if xr >= 0 { xr } else { own }
+  // A `null` literal with no type of its own (one a rewrite minted) is legacy's `emitNullAt`:
+  // the bottom ref, at the `null` unit, where it names no null of its own.
+  const un = own < 0
+    && !nv
+    && n is NullLit
+    && nullOwnAt(ix, ibFnIx) == NULL_OWN_NONE
+  const rep = if un { repNodeOfNullUnit() } else if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else if xr >= 0 { xr } else { own }
   // A direct call whose own type has no rep is at its callee's result rep.
   if rep < 0 && n is Call && !nv { return openCallValue(b, n, ix) }
   // A desugared optional call's minted callee has no type: it is the field the plain `.f` call reads
@@ -12617,9 +12662,10 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if ibMiss != "" { return irBMiss(ibMiss) }
   const m = asgReReadEnter(ix)
   // A field or element target is read again whole, its receiver and index included. A global's
-  // re-read is seated (`cell`): its atom cell's id is the read, which `widenTo` below decodes.
+  // or an atom local's re-read is seated (`cell`): its cell's id is the read `widenTo` decodes.
   const rr = if uw >= 0 { repNodeOfTy(heldTy(exprTyOf(n.binLeft))) } else { rep }
-  const o = if t is Ident { identRead(b, t, n.binLeft, rr, globalTarget(n.binLeft)) } else { irBExpr(b, n.binLeft) }
+  const seat = if uw >= 0 { globalTarget(n.binLeft) } else { asgReReadSeated(n.binLeft) }
+  const o = if t is Ident { identRead(b, t, n.binLeft, rr, seat) } else { irBExpr(b, n.binLeft) }
   asgReReadLeave(m)
   if uw >= 0 {
     if ibMiss != "" { return o }
@@ -12630,8 +12676,12 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     }
     return irBLetTemp(b, { uwV: o, uwOp: uw, uwAt: ix }, ix, rep)
   }
-  // The cell's atom re-read at a `string` assignment is decoded, as legacy widens it (`widenTo`).
-  const w = if ibMiss == "" && atomAtStr(irBOpRep(o), rep) { widenTo(b, o, ix, rep, -1) } else { o }
+  // The cell's atom re-read at a `string` assignment is decoded, as legacy widens it (`widenTo`),
+  // a local `K | null` cell's included: the assigned member is no `null` (`atomToStr` checks).
+  const r0 = irBOpRep(o)
+  const nulLocal = t is Ident && !globalTarget(n.binLeft) && atomNullable(r0)
+  const dec = atomAtStr(r0, rep) || nulLocal && repPrim(rep) == "str"
+  const w = if ibMiss == "" && dec { widenTo(b, o, ix, rep, -1) } else { o }
   if ibMiss == "" && irBOpRep(w) != rep {
     return irBMiss("assignment value re-read rep")
   }
@@ -12657,6 +12707,19 @@ function assignValueNullLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 }
 
 // Whether identifier `ix` names a module global's `let`, not a local or a capture.
+// Whether the re-read of assignment target `ix` is seated: a global, or a local already held at a
+// cell of an atom or a `K | null`, which legacy's `emitExpr` reads as the cell's id. It asks the
+// local the store just wrote, minting none: a captured cell is held elsewhere.
+function asgReReadSeated(ix: i32): boolean {
+  if globalTarget(ix) { return true }
+  const d = identDeclOf(ix)
+  if d < 0 || !(nodeAt(d) is LetDecl) { return false }
+  const v = ibDeclVar[d] ?? -1
+  return v >= 0
+    && (repNodeAt(ib.irVars[v].vRep) is RAtom
+    || atomNullable(ib.irVars[v].vRep))
+}
+
 function globalTarget(ix: i32): boolean {
   const d = identDeclOf(ix)
   return d >= 0
@@ -12749,7 +12812,7 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
     ) {
       return skip("store of an assignment of null into a null local")
     }
-    const src = deliver(b, n.binRight, ib.irVars[v].vRep, -1)
+    const src = storeValue(b, n.binRight, ib.irVars[v].vRep, ix)
     if ibMiss != "" { return 0 }
     if irBOpRep(src) != ib.irVars[v].vRep { return skip("assignment coercion") }
     irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
@@ -12757,13 +12820,23 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
   }
   const g = globalIndexOfSid(sidOfNode(n.binLeft))
   if g < 0 || d < 0 { return skip("assignment target") }
-  const src = deliver(b, n.binRight, globalRep(g, d), -1)
+  const src = storeValue(b, n.binRight, globalRep(g, d), ix)
   if ibMiss != "" { return 0 }
   if globalRep(g, d) != irBOpRep(src) { return skip("global store coercion") }
   const gm = irGlobalWriteMiss(g, ibGlobalCtx())
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
   return 0
+}
+
+// Assignment `at`'s value `x` at its cell's rep `rep`: delivered, or into a `null` cell, run for its
+// effect and then the bottom null at `at`, as legacy's `nulnone` store writes it
+// (`emitNulNoneForEffect`).
+function storeValue(b: i32[], x: i32, rep: i32, at: i32): Opnd {
+  if repPrim(rep) != "null" { return deliver(b, x, rep, -1) }
+  const e = nulNoneEffect(b, x, at, null)
+  if ibMiss != "" { return e }
+  return repTemp(b, { nuAt: at, nuOwn: NULL_OWN_NONE, nuRead: [] }, at, rep)
 }
 
 // `xs[i] = v` that legacy writes as the plain store (`idxStoreOtherWhy`): receiver, index and
@@ -12780,6 +12853,10 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   }
   const st = idxStorePlanOf(t, ibFnIx)
   if st == null { return skip("store plan") }
+  // Legacy writes an unstamped unit into a `null[]` as its sentinel, apart from the value's emit.
+  if idxStoreNullUnitUnstamped(t.idxArr, n.binRight, ibFnIx) {
+    return skip("store null unit sentinel")
+  }
   const why = idxStoreOtherWhy(st, n.binRight, ibFnIx)
   if why != "" { return skip(why) }
   const site = idxStoreSiteBoxes(st, n.binRight, ibFnIx)
@@ -15319,7 +15396,7 @@ function nulNonePayload(b: i32[], x: i32, rep: i32): Opnd {
   }
   const co = plainCoalesceAt(u)
   if co != null {
-    const l = nulNoneEffect(b, co.binLeft, u)
+    const l = nulNoneEffect(b, co.binLeft, u, null)
     if ibMiss != "" { return l }
     return nulNonePayload(b, co.binRight, rep)
   }
@@ -15327,7 +15404,7 @@ function nulNonePayload(b: i32[], x: i32, rep: i32): Opnd {
     assign(b, n, u)
     if ibMiss != "" { return irBMiss(ibMiss) }
   } else {
-    const e = nulNoneEffect(b, u, u)
+    const e = nulNoneEffect(b, u, u, null)
     if ibMiss != "" { return e }
   }
   return repTemp(b, { nuAt: u, nuOwn: NULL_OWN_NONE, nuRead: [] }, u, rep)

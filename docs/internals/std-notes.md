@@ -1227,7 +1227,7 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
   operand; a `new v128` brand has no arithmetic of its own, so `tyIsV128Brand` admits it at
   both the declaration gate (`binOpDeadSelf`) and the site (`checkBinary`). A `new i32`
   brand is deliberately not admitted: its `+` is the language's own.
-- **`reduceAddF32x4` order.** Two shuffles: `s = v + v.zwxy`, `t = s + s.yxwz`, lane 0 of `t`
+- **`reduceAdd` order.** Two shuffles: `s = v + v.zwxy`, `t = s + s.yxwz`, lane 0 of `t`
   is `(x + z) + (y + w)`. Documented in the export because a scalar oracle has to copy it.
 - **`cross`** is `a.yzxw * b.zxyw - a.zxyw * b.yzxw` with lane 3 then replaced by `0.0`; the
   raw lane 3 would be `aw*bw - aw*bw`, which is NaN for an infinite or NaN `w`.
@@ -1257,10 +1257,11 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
   lowers them through the same `simdTableBuild` rows as legacy and no compiler line changed.
   Signedness belongs to the type, not the call: `minU16x8` is `min_u`, `minI16x8` is `min_s`,
   which is why `U16x8` exists beyond the issue's three shapes (aillu's u16 owner column, and the
-  landing shape of u8 widening). Names are width-suffixed because a named function cannot be
-  declared once per receiver type (only operators can, #3003), so `min` for two shapes would be
-  `redeclared min`. The mask reductions take the bare shape (`bitmask8x16`, not
-  `bitmaskMask8x16`). `narrowSatU16x8ToU8x16` is `min_u` with 255 then `narrow_i16x8_u`, since the
+  landing shape of u8 widening). Names were width-suffixed (`minU8x16`) until receiver
+  overloading reached one module (#9946, `receiver-overloading.md`); the keyed rename collapsed
+  them to `min` per receiver, with `select` keyed on the value (D3) and the mask ops on the mask.
+  `splat`, `load` and `store` keep the suffix: no vector receiver names the shape.
+  `narrowSatToU8x16` on `U16x8` is `min_u` with 255 then `narrow_i16x8_u`, since the
   wasm instruction reads its input as signed and would send 32768..65535 to 0.
   `andNot` is wasm's `a & ~b`. Not built: integer lane access, shifts, integer `*`, `abs`/`neg`,
   `avgr`, `popcnt`, an `I8x16`/`U32x4`; each is a tier-1 intrinsic already, so adding one is a
