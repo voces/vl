@@ -217,6 +217,37 @@ Deno.test({
   },
 });
 
+// Verifier rule 2's reference niche pairs: a list's, closure's and map's niche read verifies at its
+// own `A | null`, and reds at either other shape's (`irShadowCorrupt(10)` forward, `(11)` back).
+Deno.test({
+  name: "ir shadow: a reference niche read verifies at its own shape and at no other",
+  ignore,
+  fn: () => {
+    const kinds = [
+      "type U = i32[] | null | string\nfunction f(u: U) {\n  if u is string { return 0 }\n  const l = u\n" +
+      "  return if l == null { 1 } else { l.length }\n}\nprint(f([1]))\n",
+      "type F = (a: i32) => i32\ntype U = F | null | string\nfunction f(u: U) {\n  if u is string { return 0 }\n" +
+      "  const c = u\n  return if c == null { 1 } else { c(2) }\n}\nprint(f((a: i32) => a))\n",
+      "type M = {[string]: i32}\ntype U = M | null | i32\nfunction f(u: U) {\n  if u is i32 { return 0 }\n" +
+      "  const m = u\n  return if m == null { 1 } else { m.length }\n}\nconst mm: M = Map()\nprint(f(mm))\n",
+    ];
+    const want = "a niche read is at its niche's rep";
+    for (const src of kinds) {
+      const ok = run(src, true);
+      const m = ok.rows.get("matched") ?? 0;
+      if (failures(ok.rows).length > 0 || m < 1 || m !== ok.rows.get("covered")) {
+        throw new Error(`want every covered function matched, got ${JSON.stringify([...ok.rows])}\n${src}`);
+      }
+      for (const k of [10, 11]) {
+        const { rows } = run(src, true, k);
+        if (!failures(rows).some((r) => r.includes(want))) {
+          throw new Error(`want control ${k} to red with "${want}", got ${JSON.stringify([...rows])}\n${src}`);
+        }
+      }
+    }
+  },
+});
+
 // A nullable record compare's element side banks the element-read rows of its null tests and
 // fields: with them dropped (control 5) the row's spans count reds.
 Deno.test({

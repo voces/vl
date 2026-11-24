@@ -177,6 +177,7 @@ import {
   sIf,
 } from "./ir"
 import {
+  RNicheRead,
   RStructEq,
   RUnionConcreteEq,
   boxListRetag,
@@ -750,6 +751,7 @@ import {
   memberBoxReadEnter,
   memberBoxReadLeave,
   nicheReadKindAt,
+  nicheReadRefOf,
   nulLitAtomTexts,
   readOwesNonNullRecover,
   sFieldIsUnionBox,
@@ -872,7 +874,12 @@ import {
   structIndexOfTy,
 } from "./emit_atom_kinds"
 import { recordHeapOfTy, structRowHeap } from "./emit_shape_intern"
-import { RC_MAP, RC_REF_LIST, letBindingUnionTy } from "./emit_start_block"
+import {
+  NICHE_NUL_MAP,
+  RC_MAP,
+  RC_REF_LIST,
+  letBindingUnionTy,
+} from "./emit_start_block"
 import {
   TY_BOOL,
   TY_I32,
@@ -1172,9 +1179,9 @@ function claimStart(
 }
 
 // The shadow's failing controls: 0 none; the verifier must refuse 1 (a variable's rep swapped), 2
-// (a temp's definition deleted), 7, 8 and 9 (`unrelatedMapControl`, `otherAgainControl`,
-// `nulEqNoNullableControl`); the dual emit must report 3 (a byte added to the lowering), 4 (a span
-// row dropped) and 5 (its element-read rows); 6 is the held coercion.
+// (a temp's definition deleted), 7 to 11 (`unrelatedMapControl`, `otherAgainControl`,
+// `nulEqNoNullableControl`, `nicheKindControl` both ways); the dual emit must report 3 (a byte
+// added to the lowering), 4 (a span row dropped) and 5 (its element-read rows); 6 the held coercion.
 export function irShadowCorrupt(k: i32) {
   ibCorrupt = k
   return 0
@@ -5001,10 +5008,13 @@ function narrowedLocalRead(
     ib.irReadAgain[ix] = sg
     return irBLetTemp(b, sg, ix, rep)
   }
-  // A box local narrowed to a `boolean | null` or `string | null` niche (legacy's `niche` arm).
+  // A box local narrowed to a `boolean | null` or `string | null` niche, or a list's, closure's or
+  // map's `A | null` (legacy's `niche` arm).
   if arm == "niche" {
     const nk = nicheReadKindAt(ix, ibFnIx)
-    if nk != 1 && nk != 2 { return irBMiss("narrowed read niche kind") }
+    if nk != 1 && nk != 2 && nicheReadRefOf(ix, ibFnIx) == "" {
+      return irBMiss("narrowed read niche kind")
+    }
     if !heldAsBox(ib.irVars[v].vRep) {
       return irBMiss("narrowed read niche cell")
     }
@@ -14993,6 +15003,24 @@ function nulEqNoNullableControl() {
   return 0
 }
 
+// The niche read's failing controls (`irShadowCorrupt(10)`, `(11)`): each reference niche read's
+// kind moved to another shape's, forward (list, closure, map) or back, which rule 2 must refuse.
+function nicheKindControl(back: boolean) {
+  for n in ib.irNodes {
+    if !(n is SLet) { continue }
+    const r = n.lRhs
+    if !(r is RNicheRead) || r.nrKind == 1 || r.nrKind == 2 { continue }
+    const isMap = r.nrKind == NICHE_NUL_MAP
+    const isFn = r.nrKind == 11
+    if back {
+      r.nrKind = if isMap { 11 } else if isFn { 7 } else { NICHE_NUL_MAP }
+    } else {
+      r.nrKind = if isMap { 7 } else if isFn { NICHE_NUL_MAP } else { 11 }
+    }
+  }
+  return 0
+}
+
 // The inner rep of nullable rep `r`, or -1.
 function repOfNulInner(r: i32): i32 {
   const n = repNodeAt(r)
@@ -15004,6 +15032,7 @@ function corrupt() {
   if ibCorrupt == 7 { unrelatedMapControl() }
   if ibCorrupt == 8 { otherAgainControl() }
   if ibCorrupt == 9 { nulEqNoNullableControl() }
+  if ibCorrupt == 10 || ibCorrupt == 11 { nicheKindControl(ibCorrupt == 11) }
   if ibCorrupt == 1 && ib.irVars.length > 0 {
     const v = ib.irVars[0]
     const other = if repPrim(v.vRep) == "bool" { repNodeOfTy(TY_I32) } else { ibBool }
