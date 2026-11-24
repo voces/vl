@@ -35,7 +35,8 @@ host_ok() {
     local out
     out="$(VL_STD="$PWD/std" VL_NO_CACHE=1 VL_IR_STRICT=0 VL_FAULT_INJECT_CLAIMED=corrupt-validate-bytes \
       VL_COMPILER_WASM=build/vl-compiler.wasm "$VL" run "$d/t.vl" 2>&1)"
-    case "$out" in *"used the legacy emitter"*3) ;; *) rc=1 ;; esac
+    case "$out" in *"used the legacy emitter"*) ;; *) rc=1 ;; esac
+    [ "$(printf '%s\n' "$out" | tail -n 1)" = 3 ] || rc=1
     VL_STD="$PWD/std" VL_NO_CACHE=1 VL_IR_STRICT=1 VL_FAULT_INJECT_CLAIMED=corrupt-validate-bytes \
       VL_COMPILER_WASM=build/vl-compiler.wasm "$VL" run "$d/t.vl" > /dev/null 2>&1
     [ $? -eq 70 ] || rc=1
