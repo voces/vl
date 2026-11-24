@@ -110,6 +110,7 @@ import {
   PushRecv,
   RBoxNarrow,
   RCall,
+  RCallRef,
   RGetField,
   RGlobalGet,
   RListSlice,
@@ -1404,10 +1405,6 @@ function fitShadowVar(n: IsExpr, ix: i32, p: EmptyFitPlan): i32 {
   const rn = nodeAt(r)
   if !(rn is Ident) { return -1 }
   const pl = listFitShadowPlanOf(ix, p.efRecvTy, p.efDepth, ibFnIx)
-  if pl == 2 {
-    irBMiss("is empty fit shadow grow")
-    return -1
-  }
   if pl < 0 {
     irBMiss("is empty fit shadow refused")
     return -1
@@ -4321,7 +4318,12 @@ let cellHeapMemo: {[string]: i32} = Map()
 
 function cellHeapOf(d: i32, rep: i32): i32 {
   if recHeapOf(rep) >= 0 || globalCellKind(d) != "struct" { return -1 }
-  const row = globalCellStructIdx(d)
+  return rowHeapFor(rep, globalCellStructIdx(d))
+}
+
+// The heap of struct row `row` for heapless record rep `rep` read off it, where `rep`'s fields lower
+// alike with, or widen to, the row's own; -1 otherwise.
+function rowHeapFor(rep: i32, row: i32): i32 {
   const h = structRowHeap(row)
   const rr = repNodeOfTy(slotRowTyOf(row))
   if h < 0 || rr < 0 || recHeapOf(rr) != h { return -1 }
@@ -4423,6 +4425,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     return capturedStrRecovered(b, fe, name, ix, rep)
   }
   const cr = capRepFor(fe, name, if unbox { -1 } else { rep })
+  if cr == rep { noteCapHeap(fe, name, rep) }
   // A nullable capture read at the member the checker narrowed it to: the capture at its own rep.
   const na: NullNarrowArm = if cr != rep && !unbox { nullNarrowArmOf(ix, cr, rep) } else { "none" }
   const ak = if unbox && heldAsBox(cr) { identUnboxAtomOf(ix, ibFnIx) } else { -1 }
@@ -4492,6 +4495,30 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if boxed { return irBLetTemp(b, { sgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
+}
+
+// Notes the heap of the struct row legacy's capture `name` of `fe` is stored at
+// (`captureValStructIdx`) for the record rep `rep` it is read at, where that rep has none, as
+// `noteCellHeap` does for a global's cell.
+function noteCapHeap(fe: i32, name: string, rep: i32) {
+  if !(repNodeAt(rep) is RRecord) { return 0 }
+  const key = "c"
+    + i32ToStr(fe)
+    + ":"
+    + name
+    + ":"
+    + i32ToStr(rep)
+    + ":"
+    + i32ToStr(repTyOf(rep))
+  const memo = cellHeapMemo[key] ?? -2
+  const h = if memo != -2 { memo } else { capHeapOf(fe, name, rep) }
+  cellHeapMemo[key] = h
+  return irRecHeapNoteOne(ib, rep, h)
+}
+
+function capHeapOf(fe: i32, name: string, rep: i32): i32 {
+  if recHeapOf(rep) >= 0 || captureValKind(fe, name) != "struct" { return -1 }
+  return rowHeapFor(rep, captureValStructIdx(fe, name))
 }
 
 // Captured box `o` read at member `rep` on legacy's `unbox` arm: unboxed at atom kind `ak`
@@ -5830,6 +5857,7 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     crArgs: args,
     crVoid: isVoid,
     crDrop: !isVoid,
+    crNever: callEndsNever(ix),
   }
   return r
 }
@@ -6003,7 +6031,13 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
     const atRep = arm == "box" || arm == "armUnbox" || arm == "nulArm" || asIs
     const bx = if atRep { closureParamRep(f, i) } else { -1 }
     if atRep && bx < 0 { return missRhs("closure box parameter rep") }
-    const a = if wt >= 0 { deliver(b, c.callArgs[i], repNodeOfTy(wt), wt) } else if bx >= 0 && !asIs { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else if arm == "atomToStr" { closureArgAtomStr(b, c.callArgs[i], f, i) } else { irBExpr(b, c.callArgs[i]) }
+    // A `null` literal on the general arm is built at the parameter's rep, the null `nullOwnAt`
+    // names there, as legacy's `emitNullLitNode` writes it.
+    const nl = if wt < 0
+      && bx < 0
+      && arm == "general"
+      && nodeAt(unwrapParen(c.callArgs[i])) is NullLit { closureParamRep(f, i) } else { -1 }
+    const a = if wt >= 0 { deliver(b, c.callArgs[i], repNodeOfTy(wt), wt) } else if bx >= 0 && !asIs { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else if arm == "atomToStr" { closureArgAtomStr(b, c.callArgs[i], f, i) } else if nl >= 0 { deliver(b, c.callArgs[i], nl, -1) } else { irBExpr(b, c.callArgs[i]) }
     if ibMiss != "" { return missRhs("argument") }
     if ifBelowLead(b, at, "short-circuit closure argument") {
       return missRhs("short-circuit closure argument")
@@ -6030,6 +6064,24 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
     crArgs: args,
     crVoid: sigKeyRetIsVoid(key),
     crDrop: closureCallDrops(c, ix),
+    crNever: callEndsNever(ix),
+  }
+  return r
+}
+
+// Call statement `n`'s right-hand side as legacy's statement ladder writes it: a closure call
+// through a member or expression callee goes to `emitCallRef`, not `emitCall`, so no
+// `unreachable` follows it even when it never returns.
+function stmtCallRefNever(rhs: Rhs, n: Call): Rhs {
+  if !(rhs is RCallRef) || !rhs.crNever || n.callFn < 0 { return rhs }
+  if nodeAt(n.callFn) is Ident { return rhs }
+  const r: Rhs = {
+    crFn: rhs.crFn,
+    crSig: rhs.crSig,
+    crArgs: rhs.crArgs,
+    crVoid: rhs.crVoid,
+    crDrop: rhs.crDrop,
+    crNever: false,
   }
   return r
 }
@@ -8488,6 +8540,7 @@ function unionNulStagedEq(
       ucNul: true,
       ucAgain: again,
       ucStage: st,
+      ucOtherAgain: false,
       ucAt: ix,
     },
     ix,
@@ -8755,15 +8808,24 @@ function unionConcreteEq(
     && o.ov < ib.irVars.length
     && ib.irVars[o.ov].vKind == "temp"
     && recvReadsAgain(unwrapParen(otherIx))
+  // A null leg reads the operand ahead of the box, so its temp follows a box the builder read as
+  // a variable.
+  const boxVar = bx is OVar
+    && bx.ov >= 0
+    && bx.ov < ib.irVars.length
+    && ib.irVars[bx.ov].vKind != "temp"
+  const otherAgain = nul && atUse && boxVar
   if (
     (b.length != at || !(o is OVar || o is OImm || o is OStr))
     && !(atUse && !nul)
+    && !otherAgain
   ) {
     return irBMiss("union compare operand")
   }
-  // A null leg reads its operand twice, so a parameter or local.
+  // A null leg reads its operand twice: a parameter or local, or a read written again.
   if (
     nul
+    && !otherAgain
     && (!(o is OVar)
       || o.ov < 0
       || o.ov >= ib.irVars.length
@@ -8787,6 +8849,7 @@ function unionConcreteEq(
       ucNul: nul,
       ucAgain: readAgain,
       ucStage: 0,
+      ucOtherAgain: otherAgain,
       ucAt: ix,
     },
     ix,
@@ -9876,8 +9939,11 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   if boxOut != heldAsBox(rep) { return irBMiss("coalesce box result rep") }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
-  // Its value stays on the stack from here, so no temp an operand before it built may wait.
-  if endsInTemp(b) { return irBMiss("coalesce box after an operand") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait,
+  // unless the lowering writes that temp below the tag test (`coalArmStagesLeads`).
+  if endsInTemp(b) && !coalArmStagesLeads(arm) {
+    return irBMiss("coalesce box after an operand")
+  }
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
   if !heldAsBox(irBOpRep(l)) { return irBMiss("coalesce box operand rep") }
@@ -12029,17 +12095,17 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 }
 
 // An assignment of `null` the checker types `null` (`asgValueArmOf` "nullLit"): the store, then
-// the literal's own null again, as `emitAsgValueOf` writes it.
+// the null its destination holds, as `emitAsgValueOf` writes it.
 function assignValueNullLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   // The store is a statement, so no temp an operand before it built may wait across it.
   if endsInTemp(b) { return irBMiss("assignment value lit after an operand") }
   assignTo(b, n, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
-  // Legacy writes the literal's own null (`emitNullAt`), whatever rep the assignment's `null` has.
+  // The null is the assignment's own (`emitNullAt` at the assignment), not the cell's (D17090).
   const lit = unwrapParen(n.binRight)
-  const own = nullOwnAt(lit, ibFnIx)
-  // The `null` unit holds the bottom ref alone; a literal whose own null is a cell's typed one
-  // (a string's, a sentinel) is not that value, so it misses rather than fail the verifier.
+  const own = nullOwnAt(ix, ibFnIx)
+  // The `null` unit holds the bottom ref alone; an assignment whose own null is a typed one (a
+  // string's, a sentinel) is not that value, so it misses rather than fail the verifier.
   if repPrim(rep) == "null" && own != NULL_OWN_NONE {
     return irBMiss("assignment value nullLit rep")
   }
@@ -12132,6 +12198,13 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
     const lv = liftWriteVar(t.identName, w)
     const v = if lv >= 0 { lv } else { irBDeclVar(d) }
     if v < 0 { return skip("assignment coercion") }
+    // Legacy declares a `null` local storing an assignment of `null` apart from the IR's locals.
+    if (
+      repPrim(ib.irVars[v].vRep) == "null"
+      && asgYieldsNullLit(unwrapParen(n.binRight))
+    ) {
+      return skip("store of an assignment of null into a null local")
+    }
     const src = deliver(b, n.binRight, ib.irVars[v].vRep, -1)
     if ibMiss != "" { return 0 }
     if irBOpRep(src) != ib.irVars[v].vRep { return skip("assignment coercion") }
@@ -13289,7 +13362,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       irBNode(b, { dpV: v }, -1, ibNoValue, ix)
       return 0
     }
-    irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
+    irBNode(b, { efRhs: stmtCallRefNever(rhs, n) }, -1, ibNoValue, ix)
     return 0
   }
   // A discarded value legacy does not write: a bare function name or an inert literal.
