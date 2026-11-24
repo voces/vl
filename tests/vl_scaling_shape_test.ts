@@ -36,11 +36,14 @@
 // The CPU readings quoted
 // beside individual pairs below predate fuel grading.
 
-import { ROOT, VL, exists } from "./support/tree.ts";
+import { exists, ROOT, VL } from "./support/tree.ts";
 
-const COMPILER = Deno.env.get("VL_SCALING_COMPILER") ?? `${ROOT}/build/vl-compiler.wasm`;
+const COMPILER = Deno.env.get("VL_SCALING_COMPILER") ??
+  `${ROOT}/build/vl-compiler.wasm`;
 const ENABLED = exists(VL) && exists(COMPILER);
-if (!ENABLED) console.warn("[scaling-shape] skipped — missing vl binary or seed wasm.");
+if (!ENABLED) {
+  console.warn("[scaling-shape] skipped — missing vl binary or seed wasm.");
+}
 
 // `$VL_SCALING_SHARD=k/n` runs every n-th registered case starting at the k-th, so ci.yml's
 // cost matrix can split the file across jobs; unset runs them all. Every grade is a fuel or
@@ -49,7 +52,11 @@ const SHARD = (() => {
   const spec = Deno.env.get("VL_SCALING_SHARD") ?? "1/1";
   const m = spec.match(/^(\d+)\/(\d+)$/);
   const k = m ? Number(m[1]) : 0, n = m ? Number(m[2]) : 0;
-  if (!(n >= 1 && k >= 1 && k <= n)) throw new Error(`VL_SCALING_SHARD must be k/n with 1 <= k <= n, got ${spec}`);
+  if (!(n >= 1 && k >= 1 && k <= n)) {
+    throw new Error(
+      `VL_SCALING_SHARD must be k/n with 1 <= k <= n, got ${spec}`,
+    );
+  }
   return { k, n };
 })();
 let registered = 0;
@@ -62,7 +69,9 @@ const shardTest = (def: Deno.TestDefinition) => {
 // asymmetry the extra declarations introduce and lift the cheaper arm clear of the
 // process-start floor, so the ratio stays a ratio rather than becoming a budget.
 const fill = (out: string[], i: number, n: number) => {
-  for (let j = 0; j < n; j++) out.push(`acc = acc + ${(i + j) % 13} * ${j % 7} - ${j % 5}`);
+  for (let j = 0; j < n; j++) {
+    out.push(`acc = acc + ${(i + j) % 13} * ${j % 7} - ${j % 5}`);
+  }
 };
 
 // ── the pairs ────────────────────────────────────────────────────────────────
@@ -99,7 +108,9 @@ const genFamilyFunctions = (nf: number, ns: number): string =>
 // scans every call in the arena for them is functions x calls.
 const genParamFieldCalls = (n: number): string => {
   const o: string[] = ["type Box = { get: () => i32 }"];
-  for (let i = 0; i < n; i++) o.push(`function f${i}(b: Box): i32 { return b.get() + ${i % 13} }`);
+  for (let i = 0; i < n; i++) {
+    o.push(`function f${i}(b: Box): i32 { return b.get() + ${i % 13} }`);
+  }
   o.push("const bx: Box = { get: () => 3 }", "let acc = 0");
   for (let i = 0; i < n; i++) o.push(`acc = acc + f${i}(bx)`);
   o.push("print(acc)");
@@ -127,13 +138,24 @@ const genClosureArgCalls = (n: number): string => {
 // another (D4942), `list` hands a list literal of its parameter on (D4942).
 type HofShape = "copy" | "rewrite" | "global" | "list";
 const genHofBodies = (n: number, shape: HofShape): string => {
-  const o: string[] = ["let H = 4", "let G = H", "function sink(v: i32): i32 { return v + 1 }"];
-  o.push("function sinkL(v: i32[]): i32 { return v.length }", "function hook(f: (ix: i32) => i32): i32 { return f(1) }");
+  const o: string[] = [
+    "let H = 4",
+    "let G = H",
+    "function sink(v: i32): i32 { return v + 1 }",
+  ];
+  o.push(
+    "function sinkL(v: i32[]): i32 { return v.length }",
+    "function hook(f: (ix: i32) => i32): i32 { return f(1) }",
+  );
   for (let i = 0; i < n; i++) {
     o.push(`function f${i}(x: i32): i32 {`);
     if (shape === "copy") o.push("  let y = G", "  return sink(y)");
-    if (shape === "rewrite") o.push("  let y = G", `  if x > ${i} { y = H }`, "  return sink(y)");
-    if (shape === "global") o.push(`  if x > ${i} { G = H }`, "  return sink(G)");
+    if (shape === "rewrite") {
+      o.push("  let y = G", `  if x > ${i} { y = H }`, "  return sink(y)");
+    }
+    if (shape === "global") {
+      o.push(`  if x > ${i} { G = H }`, "  return sink(G)");
+    }
     if (shape === "list") o.push(`  return sinkL([x, x + 1, x + ${i}])`);
     o.push("}");
   }
@@ -148,11 +170,15 @@ const genHofBodies = (n: number, shape: HofShape): string => {
 // width differs; a signature key re-derived per call is calls x width x width.
 const genSigWidthCalls = (n: number, w: number, wide: boolean): string => {
   const o: string[] = [
-    "type Wide = { " + Array.from({ length: w }, (_, i) => `f${i}: f64`).join(", ") + " }",
+    "type Wide = { " +
+    Array.from({ length: w }, (_, i) => `f${i}: f64`).join(", ") +
+    " }",
     "type Narrow = { f0: f64 }",
     'function f(p: Wide): string { return "a" }',
     'function g(p: Narrow): string { return "a" }',
-    "const qw: Wide = { " + Array.from({ length: w }, (_, i) => `f${i}: ${i}.5`).join(", ") + " }",
+    "const qw: Wide = { " +
+    Array.from({ length: w }, (_, i) => `f${i}: ${i}.5`).join(", ") +
+    " }",
     "const qn: Narrow = { f0: 1.5 }",
     'let acc = ""',
   ];
@@ -170,7 +196,10 @@ const genTypes = (n: number, k: number): string => {
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) {
     const t = i % m;
-    o.push(`let a${i}: S${t} = { v${t}: ${i % 97} }`, `acc = acc + a${i}.v${t}`);
+    o.push(
+      `let a${i}: S${t} = { v${t}: ${i % 97} }`,
+      `acc = acc + a${i}.v${t}`,
+    );
     fill(o, i, 1);
   }
   o.push("print(acc)");
@@ -182,12 +211,19 @@ const genUnions = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = [];
   for (let i = 0; i < m; i++) {
-    o.push(`type A${i} = { p${i}: i32 }`, `type B${i} = { q${i}: string }`, `type U${i} = A${i} | B${i}`);
+    o.push(
+      `type A${i} = { p${i}: i32 }`,
+      `type B${i} = { q${i}: string }`,
+      `type U${i} = A${i} | B${i}`,
+    );
   }
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) {
     const t = i % m;
-    o.push(`let u${i}: U${t} = { p${t}: ${i % 97} }`, `if u${i} is A${t} { acc = acc + u${i}.p${t} }`);
+    o.push(
+      `let u${i}: U${t} = { p${t}: ${i % 97} }`,
+      `if u${i} is A${t} { acc = acc + u${i}.p${t} }`,
+    );
     fill(o, i, 1);
   }
   o.push("print(acc)");
@@ -208,7 +244,9 @@ const genLitSets = (n: number, k: number): string => {
     );
   }
   o.push("let acc = 0");
-  for (let i = 0; i < n; i++) o.push(`acc = acc + f${i}(g${i}(${i % 2 === 0}))`);
+  for (let i = 0; i < n; i++) {
+    o.push(`acc = acc + f${i}(g${i}(${i % 2 === 0}))`);
+  }
   o.push("print(acc)");
   return o.join("\n") + "\n";
 };
@@ -218,7 +256,10 @@ const genLitSets = (n: number, k: number): string => {
 // `n` value-position writes to a wider name, each a binding of its own, at module scope or in
 // one function. D2398 moves each ahead of its binding and keys the start function's order.
 const genValueWrites = (n: number, inFn: boolean): string => {
-  const o: string[] = ["function h(i: i32): i32 { return i }", "let a: f64 = 0"];
+  const o: string[] = [
+    "function h(i: i32): i32 { return i }",
+    "let a: f64 = 0",
+  ];
   if (inFn) o.push("function main() {");
   const pad = inFn ? "  " : "";
   for (let i = 0; i < n; i++) o.push(`${pad}const y${i} = (a = h(${i}))`);
@@ -231,7 +272,11 @@ const genValueWrites = (n: number, inFn: boolean): string => {
 const genArmBodies = (n: number): string => {
   const o: string[] = ["let t = 0"];
   for (let i = 0; i < n; i++) {
-    o.push(`function f${i}(c: boolean) {`, "  if c {} else { t = t + 1 }", "  match t { 1 => {} _ => {} }");
+    o.push(
+      `function f${i}(c: boolean) {`,
+      "  if c {} else { t = t + 1 }",
+      "  match t { 1 => {} _ => {} }",
+    );
     o.push("  if c { @L { t } } else { t = t + 2 }");
     o.push("  const o = if c { a: t } else { a: t + 2 }", "  t = t + o.a", "}");
   }
@@ -242,7 +287,9 @@ const genArmBodies = (n: number): string => {
 const genCallSites = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = [];
-  for (let i = 0; i < n; i++) o.push(`function g${i}(x: i32): i32 { return x + ${i % 13} }`);
+  for (let i = 0; i < n; i++) {
+    o.push(`function g${i}(x: i32): i32 { return x + ${i % 13} }`);
+  }
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) {
     o.push(`acc = acc + g${i % m}(${i % 5})`);
@@ -258,7 +305,11 @@ const genExports = (n: number, k: number): string => {
   const o: string[] = [];
   for (let i = 0; i < n; i++) {
     const ex = i % k === 0 ? "export " : "";
-    o.push(`${ex}function f${i}(x: i32): i32 { return if x > ${i} { x * ${i} + f${i > 0 ? i - 1 : 0}(x - 1) } else { x + ${i} } }`);
+    o.push(
+      `${ex}function f${i}(x: i32): i32 { return if x > ${i} { x * ${i} + f${
+        i > 0 ? i - 1 : 0
+      }(x - 1) } else { x + ${i} } }`,
+    );
   }
   return o.join("\n") + "\n";
 };
@@ -270,9 +321,15 @@ const genExports = (n: number, k: number): string => {
 const genCallbacks = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = [];
-  for (let i = 0; i < n; i++) o.push(`function cb${i}(x: i32): i32 { return x + ${i % 13} }`);
+  for (let i = 0; i < n; i++) {
+    o.push(`function cb${i}(x: i32): i32 { return x + ${i % 13} }`);
+  }
   for (let i = 0; i < m; i++) {
-    o.push(`function hof${i}(fn${i}: (i32) => i32, x: i32): i32 { return fn${i}(x) + ${i % 7} }`);
+    o.push(
+      `function hof${i}(fn${i}: (i32) => i32, x: i32): i32 { return fn${i}(x) + ${
+        i % 7
+      } }`,
+    );
   }
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) {
@@ -292,9 +349,15 @@ const genGetterCallees = (n: number, k: number): string => {
   const o: string[] = ["type V = new { n: i32 }"];
   for (let i = 0; i < n; i++) {
     o.push(`function k${i}(x: i32): i32 { return x * ${(i % 5) + 2} }`);
-    o.push(`function h${i}(x: i32): i32 { return if x > ${i % 11} { k${i}(x) } else { x + 1 } }`);
+    o.push(
+      `function h${i}(x: i32): i32 { return if x > ${
+        i % 11
+      } { k${i}(x) } else { x + 1 } }`,
+    );
   }
-  for (let i = 0; i < n; i++) o.push(`get g${i}(self: V): i32 { return h${i % m}(self.n) }`);
+  for (let i = 0; i < n; i++) {
+    o.push(`get g${i}(self: V): i32 { return h${i % m}(self.n) }`);
+  }
   o.push("const v: V = { n: 3 }", "let acc = 0");
   for (let i = 0; i < n; i++) o.push(`acc = acc + v.g${i}`);
   // Keeps every helper reached, so neither arm drops declarations the other emits.
@@ -323,7 +386,9 @@ const genClosures = (n: number, k: number): string => {
 const genPins = (n: number, many: boolean): string => {
   const o: string[] = many ? ["function idg<T>(x: T): T x"] : [];
   for (let i = 0; i < n; i++) o.push(`type P${i} = { w${i}: i32 }`);
-  if (!many) for (let i = 0; i < n; i++) o.push(`function idm${i}(x: P${i}): P${i} x`);
+  if (!many) {
+    for (let i = 0; i < n; i++) o.push(`function idm${i}(x: P${i}): P${i} x`);
+  }
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) {
     o.push(`let p${i}: P${i} = { w${i}: ${i % 97} }`);
@@ -340,7 +405,11 @@ const genPins = (n: number, many: boolean): string => {
 const genFirstInsts = (n: number, many: boolean): string => {
   const o: string[] = [];
   for (let i = 0; i < n; i++) {
-    o.push(many ? `function g${i}<T>(x: T): T { return x }` : `function g${i}(x: i32): i32 { return x }`);
+    o.push(
+      many
+        ? `function g${i}<T>(x: T): T { return x }`
+        : `function g${i}(x: i32): i32 { return x }`,
+    );
   }
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) o.push(`acc = acc + g${i}(${i % 97})`);
@@ -352,15 +421,28 @@ const genFirstInsts = (n: number, many: boolean): string => {
 // and `n` generics instantiated once each, against the same `n` written at `i32`. Only the
 // many arm mints instances, so a whole-program return inference re-run per instance reads as
 // n x u here, which is the shape of a test file importing a game's whole module graph.
-const genInstsBesideInferred = (n: number, u: number, many: boolean): string => {
+const genInstsBesideInferred = (
+  n: number,
+  u: number,
+  many: boolean,
+): string => {
   const o: string[] = ["type Row = { id: i32, name: string, w: f64 }"];
   for (let i = 0; i < u; i++) {
     o.push(`function plain${i}(r: Row, k: i32) {`, "  let acc = k");
-    for (let j = 0; j < 6; j++) o.push(`  acc = acc + ${(i + j) % 13} * ${j % 7} - ${j % 5}`);
-    o.push(`  return if acc > ${i % 50} { r.name + "${i}" } else { r.name }`, "}");
+    for (let j = 0; j < 6; j++) {
+      o.push(`  acc = acc + ${(i + j) % 13} * ${j % 7} - ${j % 5}`);
+    }
+    o.push(
+      `  return if acc > ${i % 50} { r.name + "${i}" } else { r.name }`,
+      "}",
+    );
   }
   for (let i = 0; i < n; i++) {
-    o.push(many ? `function g${i}<T>(x: T, r: Row) { return [x] }` : `function g${i}(x: i32, r: Row) { return [x] }`);
+    o.push(
+      many
+        ? `function g${i}<T>(x: T, r: Row) { return [x] }`
+        : `function g${i}(x: i32, r: Row) { return [x] }`,
+    );
   }
   o.push(`const row: Row = { id: 1, name: "r", w: 0.5 }`, "let tot = 0");
   for (let i = 0; i < u; i++) o.push(`tot = tot + plain${i}(row, ${i}).length`);
@@ -407,14 +489,21 @@ const genCovar = (n: number, cov: number): string => {
 // MODULES: `mods` files of `per` functions each, every function `body` statements long,
 // all of them imported and called by one main. Holding `mods * per` fixed makes the two
 // arms the same program cut into a different number of files — they emit the same bytes.
-const writeModules = (dir: string, mods: number, per: number, body: number): string => {
+const writeModules = (
+  dir: string,
+  mods: number,
+  per: number,
+  body: number,
+): string => {
   Deno.mkdirSync(dir, { recursive: true });
   for (let j = 0; j < mods; j++) {
     const o: string[] = [];
     for (let t = 0; t < per; t++) {
       const i = j * per + t;
       o.push(`export function h${i}(x: i32): i32 {`, "  let v = x");
-      for (let s = 0; s < body; s++) o.push(`  v = v + ${(i + s) % 13} * x - ${s % 7}`);
+      for (let s = 0; s < body; s++) {
+        o.push(`  v = v + ${(i + s) % 13} * x - ${s % 7}`);
+      }
       o.push("  return v", "}");
     }
     Deno.writeTextFileSync(`${dir}/mod${j}.vl`, o.join("\n") + "\n");
@@ -440,7 +529,10 @@ const genAdoptedLists = (nl: number, per: number): string => {
   for (let k = 0; k < nl; k++) {
     o.push(`const il${k} = [{ f: ${k % 13} }]`);
     for (let j = 0; j < per; j++) {
-      o.push(`const ic${k}_${j}: I[] = il${k}`, `print((il${k}[0].f ?? 0) + ${j % 7})`);
+      o.push(
+        `const ic${k}_${j}: I[] = il${k}`,
+        `print((il${k}[0].f ?? 0) + ${j % 7})`,
+      );
     }
   }
   o.push("print(i.f)");
@@ -452,8 +544,15 @@ const genAdoptedLists = (nl: number, per: number): string => {
 const genAdoptedListsFn = (nf: number): string => {
   const o = ["const i: { f: i32 } = { f: 4 }", "type I = { f: i64 | null }"];
   for (let k = 0; k < nf; k++) {
-    o.push(`function h${k}(): i32 {`, `  const il = [{ f: ${k % 13} }]`, "  const ic: I[] = il");
-    o.push("  return if (il[0].f ?? 0) > 5 { ic.length + 1 } else { ic.length }", "}");
+    o.push(
+      `function h${k}(): i32 {`,
+      `  const il = [{ f: ${k % 13} }]`,
+      "  const ic: I[] = il",
+    );
+    o.push(
+      "  return if (il[0].f ?? 0) > 5 { ic.length + 1 } else { ic.length }",
+      "}",
+    );
   }
   o.push("let acc = 0");
   for (let k = 0; k < nf; k++) o.push(`acc = acc + h${k}()`);
@@ -464,9 +563,19 @@ const genAdoptedListsFn = (nf: number): string => {
 // D2933's same-name twin: `nf` functions, each binding its own record literal `r` and handing an
 // alias of it to a declared record of the same field names, so each literal is re-seated.
 const genReseatedRecordsFn = (nf: number): string => {
-  const o = ["type J = { f: i32 | null }", "type I = { f: i32 }", "function use(j: J): i32 { return j.f ?? 0 }"];
+  const o = [
+    "type J = { f: i32 | null }",
+    "type I = { f: i32 }",
+    "function use(j: J): i32 { return j.f ?? 0 }",
+  ];
   for (let k = 0; k < nf; k++) {
-    o.push(`function h${k}(): i32 {`, `  const r = { f: ${k % 13} }`, "  const q = r", "  return use(q) + r.f", "}");
+    o.push(
+      `function h${k}(): i32 {`,
+      `  const r = { f: ${k % 13} }`,
+      "  const q = r",
+      "  return use(q) + r.f",
+      "}",
+    );
   }
   o.push("let acc = 0");
   for (let k = 0; k < nf; k++) o.push(`acc = acc + h${k}()`);
@@ -478,10 +587,22 @@ const genReseatedRecordsFn = (nf: number): string => {
 // call from three `return`s, over a record literal a declared record of its field names could
 // re-seat, so a use walk that followed each call once per path would read 3^k calls.
 const genReturnChain = (k: number): string => {
-  const o = ["type J = { f: i32 | null }", "type I = { f: i32 }", "const r = { f: 7 }", "function g0(n: i32) { return r }"];
+  const o = [
+    "type J = { f: i32 | null }",
+    "type I = { f: i32 }",
+    "const r = { f: 7 }",
+    "function g0(n: i32) { return r }",
+  ];
   for (let i = 1; i <= k; i++) {
-    o.push(`function g${i}(n: i32) {`, `  if n > 2 { return g${i - 1}(n - 1) }`);
-    o.push(`  if n > 1 { return g${i - 1}(n - 2) }`, `  return g${i - 1}(n)`, "}");
+    o.push(
+      `function g${i}(n: i32) {`,
+      `  if n > 2 { return g${i - 1}(n - 1) }`,
+    );
+    o.push(
+      `  if n > 1 { return g${i - 1}(n - 2) }`,
+      `  return g${i - 1}(n)`,
+      "}",
+    );
   }
   o.push(`print(g${k}(3).f)`);
   return o.join("\n") + "\n";
@@ -519,24 +640,42 @@ const spawn = async (
   extra: Record<string, string> = {},
 ): Promise<Cost> => {
   const t0 = Date.now();
-  const env: Record<string, string> = { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, ...extra };
+  const env: Record<string, string> = {
+    RUST_BACKTRACE: "0",
+    NO_COLOR: "1",
+    VL_STD: `${ROOT}/std`,
+    ...extra,
+  };
   if (fuel) env.VL_FUEL = "1";
   // Windows has no `times` that sees a native child's CPU: cpu-times.ps1 prints the same line.
   const win = Deno.build.os === "windows";
-  const { code, stdout, stderr } = await new Deno.Command(win ? "powershell" : "/bin/sh", {
-    args: win
-      ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", `${ROOT}/tests/support/cpu-times.ps1`, VL, ...argv]
-      : ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
-    stdout: "piped",
-    stderr: "piped",
-    env,
-  }).output();
+  const { code, stdout, stderr } = await new Deno.Command(
+    win ? "powershell" : "/bin/sh",
+    {
+      args: win
+        ? [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          `${ROOT}/tests/support/cpu-times.ps1`,
+          VL,
+          ...argv,
+        ]
+        : ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
+      stdout: "piped",
+      stderr: "piped",
+      env,
+    },
+  ).output();
   const wall = (Date.now() - t0) / 1000;
   const err = new TextDecoder().decode(stderr);
   if (code !== 0) throw new Error(`vl ${what} failed: ${err.slice(0, 400)}`);
   const m = err.match(/^\[fuel\] guest: (\d+)$/m);
   if (fuel && !m) {
-    throw new Error(`vl ${what} printed no \`[fuel]\` line: this host predates $VL_FUEL; rebuild scripts/vl-host`);
+    throw new Error(
+      `vl ${what} printed no \`[fuel]\` line: this host predates $VL_FUEL; rebuild scripts/vl-host`,
+    );
   }
   const a = err.match(/^\[alloc\] guest: (\d+)$/m);
   return {
@@ -560,19 +699,31 @@ const build = async (src: string, out: string): Promise<Cost> => {
     const dir = await Deno.makeTempDir({ prefix: "vl_scale_warm_" });
     try {
       Deno.writeTextFileSync(`${dir}/w.vl`, "print(1)\n");
-      return await spawn("the warm-up build", ["build", `${dir}/w.vl`, "-o", `${dir}/w.wasm`, "--compiler", COMPILER], true, {
-        VL_COMPILE_GC: "null",
-      });
+      return await spawn(
+        "the warm-up build",
+        ["build", `${dir}/w.vl`, "-o", `${dir}/w.wasm`, "--compiler", COMPILER],
+        true,
+        {
+          VL_COMPILE_GC: "null",
+        },
+      );
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
   })();
   await nullWarm;
-  const c = await spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER], true, {
-    VL_COMPILE_GC: "null",
-  });
+  const c = await spawn(
+    `build on ${src}`,
+    ["build", src, "-o", out, "--compiler", COMPILER],
+    true,
+    {
+      VL_COMPILE_GC: "null",
+    },
+  );
   if (!(c.alloc > 0)) {
-    throw new Error(`vl build on ${src} printed no \`[alloc]\` line: this host predates it; rebuild scripts/vl-host`);
+    throw new Error(
+      `vl build on ${src} printed no \`[alloc]\` line: this host predates it; rebuild scripts/vl-host`,
+    );
   }
   return c;
 };
@@ -582,7 +733,13 @@ const build = async (src: string, out: string): Promise<Cost> => {
 const RUN_FLOOR = 0.05;
 const VERBOSE = Deno.env.get("VL_SCALING_VERBOSE") === "1";
 
-const fail = (axis: string, bar: number, note: string, reading: string, why: string): never => {
+const fail = (
+  axis: string,
+  bar: number,
+  note: string,
+  reading: string,
+  why: string,
+): never => {
   throw new Error(
     `${axis}: the many-entity arm cost ${reading} for the same work reshaped (bar ${bar}) — ` +
       `something is being re-derived per ${axis} entity. ${note} Profile it with ` +
@@ -598,7 +755,9 @@ const builtBySrc = new Map<string, Promise<Cost>>();
 const buildOnce = async (src: string, out: string): Promise<Cost> => {
   const text = Deno.readTextFileSync(src);
   if (text.includes('from "./')) return await build(src, out);
-  const sum = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+  const sum = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)),
+  );
   const key = Array.from(sum, (b) => b.toString(16).padStart(2, "0")).join("");
   let c = builtBySrc.get(key);
   if (!c) {
@@ -613,24 +772,46 @@ const buildPair = async (
   axis: string,
   mk: (dir: string) => Promise<[string, string]> | [string, string],
 ): Promise<[Cost, Cost]> => {
-  const dir = await Deno.makeTempDir({ prefix: `vl_scale_${axis.replace(/[^\w-]+/g, "_")}_` });
+  const dir = await Deno.makeTempDir({
+    prefix: `vl_scale_${axis.replace(/[^\w-]+/g, "_")}_`,
+  });
   try {
     const [manySrc, oneSrc] = await mk(dir);
-    return await Promise.all([buildOnce(manySrc, `${dir}/many.wasm`), buildOnce(oneSrc, `${dir}/one.wasm`)]);
+    return await Promise.all([
+      buildOnce(manySrc, `${dir}/many.wasm`),
+      buildOnce(oneSrc, `${dir}/one.wasm`),
+    ]);
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
 };
 
 // A compile pair graded on the ratio of its two arms' guest fuel.
-const gradeFuel = (axis: string, bar: number, note: string, m: Cost, o: Cost): number => {
-  if (!(m.fuel > 0 && o.fuel > 0)) throw new Error(`${axis}: an arm read no fuel (${m.fuel}, ${o.fuel})`);
+const gradeFuel = (
+  axis: string,
+  bar: number,
+  note: string,
+  m: Cost,
+  o: Cost,
+): number => {
+  if (!(m.fuel > 0 && o.fuel > 0)) {
+    throw new Error(`${axis}: an arm read no fuel (${m.fuel}, ${o.fuel})`);
+  }
   const ratio = m.fuel / o.fuel;
-  const reading = `${m.fuel.toExponential(3)} fuel against ${o.fuel.toExponential(3)} ` +
-    `(ratio ${ratio.toFixed(3)}; ${m.cpu.toFixed(2)}s / ${o.cpu.toFixed(2)}s cpu)`;
+  const reading =
+    `${m.fuel.toExponential(3)} fuel against ${o.fuel.toExponential(3)} ` +
+    `(ratio ${ratio.toFixed(3)}; ${m.cpu.toFixed(2)}s / ${
+      o.cpu.toFixed(2)
+    }s cpu)`;
   if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
   if (ratio > bar) {
-    fail(axis, bar, note, reading, "(The ratio is of guest fuel, a count, so box load cannot move it.)");
+    fail(
+      axis,
+      bar,
+      note,
+      reading,
+      "(The ratio is of guest fuel, a count, so box load cannot move it.)",
+    );
   }
   return ratio;
 };
@@ -648,13 +829,16 @@ const grade = async (
 ): Promise<void> => {
   const ms = [await many()], os = [await one()];
   const least = (xs: Cost[], f: (c: Cost) => number) => Math.min(...xs.map(f));
-  const ratio = () => least(ms, (c) => c.cpu) / Math.max(least(os, (c) => c.cpu), floor);
+  const ratio = () =>
+    least(ms, (c) => c.cpu) / Math.max(least(os, (c) => c.cpu), floor);
   if (ratio() > bar) {
     ms.push(await many());
     os.push(await one());
   }
   const say = (xs: Cost[]) =>
-    `${least(xs, (c) => c.cpu).toFixed(2)}s cpu (${least(xs, (c) => c.wall).toFixed(2)}s wall)`;
+    `${least(xs, (c) => c.cpu).toFixed(2)}s cpu (${
+      least(xs, (c) => c.wall).toFixed(2)
+    }s wall)`;
   const reading = `${say(ms)} against ${say(os)} (ratio ${ratio().toFixed(2)})`;
   if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
   if (ratio() > bar) {
@@ -686,7 +870,12 @@ const twoFiles = (dir: string, many: string, one: string): [string, string] => {
   return [`${dir}/many.vl`, `${dir}/one.vl`];
 };
 
-const axis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
+const axis = (
+  name: string,
+  bar: number,
+  note: string,
+  mk: (d: string) => [string, string],
+) =>
   shardTest({
     name: `scaling shape: ${name}`,
     ignore: !ENABLED,
@@ -753,10 +942,26 @@ const hofAxis = (shape: HofShape, bar: number, note: string) =>
     note,
     (d) => twoFiles(d, genHofBodies(2000, shape), genHofBodies(500, shape)),
   );
-hofAxis("copy", 5.1, "The place classes (`eplBuild`, `eplReach`, compiler/emit_elab.vl) are re-walking a slot per query (D4942).");
-hofAxis("list", 5.1, "`eplSlotCallRecs` (compiler/emit_elab.vl) is scanning every call per slot query (D4942).");
-hofAxis("rewrite", 5.1, "`monoSubtreeHolds` or `monoTopFrameOf` (compiler/emit_mono.vl) is walking the program per write (D4942).");
-hofAxis("global", 5.1, "`monoTopFnUnnamed` (compiler/emit_mono.vl) is walking the program per module-scope function (D4942).");
+hofAxis(
+  "copy",
+  5.1,
+  "The place classes (`eplBuild`, `eplReach`, compiler/emit_elab.vl) are re-walking a slot per query (D4942).",
+);
+hofAxis(
+  "list",
+  5.1,
+  "`eplSlotCallRecs` (compiler/emit_elab.vl) is scanning every call per slot query (D4942).",
+);
+hofAxis(
+  "rewrite",
+  5.1,
+  "`monoSubtreeHolds` or `monoTopFrameOf` (compiler/emit_mono.vl) is walking the program per write (D4942).",
+);
+hofAxis(
+  "global",
+  5.1,
+  "`monoTopFnUnnamed` (compiler/emit_mono.vl) is walking the program per module-scope function (D4942).",
+);
 
 // D15630's two pairs. A list parameter's delivery query in the mono pass followed each caller's
 // argument back up the call graph, unmemoised, to depth 8: a recursive walker with six self-calls
@@ -773,21 +978,48 @@ const genHofGate = (o: string[]) =>
 const genWalkerCalls = (k: number, rec: boolean): string => {
   const o: string[] = [];
   genHofGate(o);
-  o.push("function leaf(n: i32, out: ((t: i32) => i32)[]) {", "  out.push(inc)", "}");
-  o.push("function walk(n: i32, out: ((t: i32) => i32)[]) {", "  out.push(inc)", `  if n > ${k} {`);
-  for (let i = 1; i <= k; i++) o.push(`    ${rec ? "walk" : "leaf"}(n - ${i}, out)`);
+  o.push(
+    "function leaf(n: i32, out: ((t: i32) => i32)[]) {",
+    "  out.push(inc)",
+    "}",
+  );
+  o.push(
+    "function walk(n: i32, out: ((t: i32) => i32)[]) {",
+    "  out.push(inc)",
+    `  if n > ${k} {`,
+  );
+  for (let i = 1; i <= k; i++) {
+    o.push(`    ${rec ? "walk" : "leaf"}(n - ${i}, out)`);
+  }
   o.push("  }", "}");
-  o.push("const fs: ((t: i32) => i32)[] = []", `walk(${k + 3}, fs)`, "print(fs.length)");
+  o.push(
+    "const fs: ((t: i32) => i32)[] = []",
+    `walk(${k + 3}, fs)`,
+    "print(fs.length)",
+  );
   return o.join("\n") + "\n";
 };
-const genLayeredPushes = (w: number, l: number, chain: boolean, fns = false): string => {
+const genLayeredPushes = (
+  w: number,
+  l: number,
+  chain: boolean,
+  fns = false,
+): string => {
   const o: string[] = [];
   genHofGate(o);
   const ty = fns ? "((t: i32) => i32)[]" : "i32[]";
   for (let i = 0; i < l; i++) {
     for (let j = 0; j < w; j++) {
-      o.push(`function f${i}_${j}(xs: ${ty}) {`, `  const ys: ${ty} = []`, `  xs.push(${fns ? "inc" : j})`);
-      if (i + 1 < l) for (let k = 0; k < w; k++) o.push(`  f${i + 1}_${k}(${chain ? "xs" : "ys"})`);
+      o.push(
+        `function f${i}_${j}(xs: ${ty}) {`,
+        `  const ys: ${ty} = []`,
+        `  xs.push(${fns ? "inc" : j})`,
+      );
+      if (i + 1 < l) {
+        for (let k = 0; k < w; k++) {
+          o.push(`  f${i + 1}_${k}(${chain ? "xs" : "ys"})`);
+        }
+      }
       o.push("}");
     }
   }
@@ -804,7 +1036,8 @@ axis(
   "a list parameter handed down layers of callers",
   2.5,
   "The place classes (`eplBuild`, compiler/emit_elab.vl) are uniting a value whose type holds no function (D15630).",
-  (d) => twoFiles(d, genLayeredPushes(3, 7, true), genLayeredPushes(3, 7, false)),
+  (d) =>
+    twoFiles(d, genLayeredPushes(3, 7, true), genLayeredPushes(3, 7, false)),
 );
 // D15631's pair: the same layers handing down a list of functions, which the type test cannot
 // skip. Fuel reads 2.74 with the nested query's memo, and 61.6 on the D15630 compiler (2.0 G).
@@ -812,7 +1045,12 @@ axis(
   "a function list parameter handed down layers of callers",
   3.5,
   "The place classes (`eplBuild`, `eplReach`, compiler/emit_elab.vl) are re-walking a chain of callers per query (D15631).",
-  (d) => twoFiles(d, genLayeredPushes(3, 7, true, true), genLayeredPushes(3, 7, false, true)),
+  (d) =>
+    twoFiles(
+      d,
+      genLayeredPushes(3, 7, true, true),
+      genLayeredPushes(3, 7, false, true),
+    ),
 );
 
 // Lane HS's second pair: 2,000 calls through a 64-field record signature against a one-field
@@ -823,19 +1061,32 @@ axis(
   "signature width x calls",
   4.3,
   "`sigKeyOfTy` or `structIndexOfTypeName` (compiler/emit_sig_tokens.vl, compiler/emit_shape_rows.vl) is re-deriving per call instead of reading its `tyRegGenNow` memo.",
-  (d) => twoFiles(d, genSigWidthCalls(2000, 64, true), genSigWidthCalls(2000, 64, false)),
+  (d) =>
+    twoFiles(
+      d,
+      genSigWidthCalls(2000, 64, true),
+      genSigWidthCalls(2000, 64, false),
+    ),
 );
 
 // D2150's pair: a registry lookup that scans every registered set made the many arm
 // quadratic in the sets; the member-set index keeps it linear. Fuel reads 1.74, and a scan of
 // the union registry planted in `luPosOfTexts` reads 5.79.
-axis("literal-union sets", 2.5, "A literal-union lookup is scanning the union registry.", (d) =>
-  twoFiles(d, genLitSets(1500, 1), genLitSets(1500, 20)));
+axis(
+  "literal-union sets",
+  2.5,
+  "A literal-union lookup is scanning the union registry.",
+  (d) => twoFiles(d, genLitSets(1500, 1), genLitSets(1500, 20)),
+);
 
 // Fuel reads 1.28. A per-declaration scan of the program's statements, planted at the type
 // registration, reads 5.37 here and 4.01 with six filler statements per use.
-axis("types", 2.8, "A per-declaration cost is scaling with the type table.", (d) =>
-  twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
+axis(
+  "types",
+  2.8,
+  "A per-declaration cost is scaling with the type table.",
+  (d) => twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)),
+);
 
 // D11270's pair, at one filler statement per use: six fillers diluted the per-union cost to
 // a 2.31 reading while the compiler was quadratic in distinct unions (4.06 at one). With the
@@ -928,9 +1179,14 @@ const genConstChain = (depth: number): string => {
     o.push(`const ${p}0 = ${a0}`);
     // The chain holds its value: an exact constant past 64 bits is refused where it is read, and
     // one that grows is computed at its full width, which is not what this axis measures.
-    for (let i = 1; i <= depth; i++) o.push(`const ${p}${i} = ${p}${i - 1} * 3 - ${p}${i - 1} * 2`);
+    for (let i = 1; i <= depth; i++) {
+      o.push(`const ${p}${i} = ${p}${i - 1} * 3 - ${p}${i - 1} * 2`);
+    }
   }
-  o.push(`function g() { print(A${depth}) print(F${depth}) print(L${depth}) }`, "g()");
+  o.push(
+    `function g() { print(A${depth}) print(F${depth}) print(L${depth}) }`,
+    "g()",
+  );
   return o.join("\n") + "\n";
 };
 
@@ -949,7 +1205,9 @@ const genRecordChainPin = (depth: number, pinned: boolean): string => {
   const o = ["type L0 = {a: i32}"];
   for (let i = 1; i <= depth; i++) o.push(`type L${i} = {x: L${i - 1}}`);
   o.push("function id<T>(x: T | string): T | string { return x }");
-  o.push(`const v: L${depth} = ${"{x: ".repeat(depth)}{a: 1}${"}".repeat(depth)}`);
+  o.push(
+    `const v: L${depth} = ${"{x: ".repeat(depth)}{a: 1}${"}".repeat(depth)}`,
+  );
   o.push(pinned ? `const r = id<L${depth}>(v) as! L${depth}` : "const r = v");
   o.push(`print(r${".x".repeat(depth)}.a)`);
   return o.join("\n") + "\n";
@@ -969,17 +1227,30 @@ axis(
 const genDiamond = (n: number, diamond: boolean): string => {
   const r = (a: string, b: string) => (diamond ? a : b);
   const o = ["type A0 = {x: i32}"];
-  for (let i = 1; i <= n; i++) o.push(`type A${i} = {l: A${i - 1}, r: ${r(`A${i - 1}`, "i32")}}`);
+  for (let i = 1; i <= n; i++) {
+    o.push(`type A${i} = {l: A${i - 1}, r: ${r(`A${i - 1}`, "i32")}}`);
+  }
   o.push("const a0: A0 = {x: 1}");
-  for (let i = 1; i <= n; i++) o.push(`const a${i}: A${i} = {l: a${i - 1}, r: ${r(`a${i - 1}`, "1")}}`);
+  for (let i = 1; i <= n; i++) {
+    o.push(`const a${i}: A${i} = {l: a${i - 1}, r: ${r(`a${i - 1}`, "1")}}`);
+  }
   const fn = `((x: A${n}) => i32) | null`;
-  o.push(`function g(m: {[string]: ${fn}}): i32 { return 1 }`, `const m: {[string]: ${fn}} = Map()`);
+  o.push(
+    `function g(m: {[string]: ${fn}}): i32 { return 1 }`,
+    `const m: {[string]: ${fn}} = Map()`,
+  );
   o.push(`function h(ys: (${fn})[]): i32 { return ys.length }`);
   o.push(`const ys: (${fn})[] = [null, (x: A${n}): i32 => 20]`);
   o.push(`function mk(x: i32): A${n} {`, "  const b0 = {x: x}");
-  for (let i = 1; i < n; i++) o.push(`  const b${i} = {l: b${i - 1}, r: ${r(`b${i - 1}`, "x")}}`);
+  for (let i = 1; i < n; i++) {
+    o.push(`  const b${i} = {l: b${i - 1}, r: ${r(`b${i - 1}`, "x")}}`);
+  }
   o.push(`  return {l: b${n - 1}, r: ${r(`b${n - 1}`, "x")}}`, "}");
-  o.push(`print(g(m) + h(ys) + h([null, (x: A${n}): i32 => 20]) + mk(5)${".l".repeat(n)}.x)`);
+  o.push(
+    `print(g(m) + h(ys) + h([null, (x: A${n}): i32 => 20]) + mk(5)${
+      ".l".repeat(n)
+    }.x)`,
+  );
   return o.join("\n") + "\n";
 };
 
@@ -995,20 +1266,37 @@ axis(
 // and an un-annotated `Map()` holding it. Fuel reads 1.17, 3.41, 3.42 and 1.30; master
 // `0f0face1e` read 366, 88.5, 151 and, at depth 8, 36.5.
 type DiamondUse = "fnAlias" | "eq" | "eqListLeaf" | "inferredMap";
-const genDiamondUse = (use: DiamondUse, n: number, diamond: boolean): string => {
+const genDiamondUse = (
+  use: DiamondUse,
+  n: number,
+  diamond: boolean,
+): string => {
   const r = (a: string, b: string) => (diamond ? a : b);
   const listLeaf = use == "eqListLeaf";
-  const o = [listLeaf ? "type A0 = {x: i32[], n: i32 | null}" : "type A0 = {x: i32}"];
-  for (let i = 1; i <= n; i++) o.push(`type A${i} = {l: A${i - 1}, r: ${r(`A${i - 1}`, "i32")}}`);
+  const o = [
+    listLeaf ? "type A0 = {x: i32[], n: i32 | null}" : "type A0 = {x: i32}",
+  ];
+  for (let i = 1; i <= n; i++) {
+    o.push(`type A${i} = {l: A${i - 1}, r: ${r(`A${i - 1}`, "i32")}}`);
+  }
   if (use == "fnAlias") {
-    o.push(`type FF = (x: i32) => A${n}`, `type GG = (a: A${n}) => i32`, "type R = {f: FF, g: GG}");
+    o.push(
+      `type FF = (x: i32) => A${n}`,
+      `type GG = (a: A${n}) => i32`,
+      "type R = {f: FF, g: GG}",
+    );
     o.push("const fs: FF[] = []", "print(fs.length + 1)");
     return o.join("\n") + "\n";
   }
-  o.push(listLeaf ? "const a0: A0 = {x: [5], n: null}" : "const a0: A0 = {x: 5}");
-  for (let i = 1; i <= n; i++) o.push(`const a${i}: A${i} = {l: a${i - 1}, r: ${r(`a${i - 1}`, "1")}}`);
-  if (use == "eq" || listLeaf) o.push(`print(a${n} == a${n})`, `print(a${n} != a${n})`);
-  else {
+  o.push(
+    listLeaf ? "const a0: A0 = {x: [5], n: null}" : "const a0: A0 = {x: 5}",
+  );
+  for (let i = 1; i <= n; i++) {
+    o.push(`const a${i}: A${i} = {l: a${i - 1}, r: ${r(`a${i - 1}`, "1")}}`);
+  }
+  if (use == "eq" || listLeaf) {
+    o.push(`print(a${n} == a${n})`, `print(a${n} != a${n})`);
+  } else {
     o.push("const m = Map()", `m["k"] = a${n}`, 'const v = m["k"]');
     o.push(`if v != null { print(v${".l".repeat(n)}.x) }`);
   }
@@ -1047,8 +1335,12 @@ axis(
 
 // 1.09 / 0.97 / 1.13 at 6,000. At 3,000 fuel reads 1.00, and an arena scan planted on each
 // distinct identifier's first check reads 3.24.
-axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
-  twoFiles(d, genCallSites(3000, 1), genCallSites(3000, 20)));
+axis(
+  "call sites",
+  2.5,
+  "Callee resolution is scaling with the number of callees.",
+  (d) => twoFiles(d, genCallSites(3000, 1), genCallSites(3000, 20)),
+);
 
 // The entry file's export table: deduping the staged names and resolving each one's target
 // scanned per export. Fuel reads 1.01; master `4179e4b36` read 4.23 here, and 8x the fuel at
@@ -1065,15 +1357,24 @@ axis(
 // per commit: a key is an absolute path, so that ratio also grew with the length of $TMPDIR
 // (4.15 under an 80-character one). One statement per function keeps that scan the arm's main
 // cost: planted again it reads 5.12 here, and 1.66 with thirty.
-axis("modules", 2.5, "The module merge is scaling with the file count.", (d) => [
-  writeModules(`${d}/many`, 400, 2, 1),
-  writeModules(`${d}/one`, 200, 4, 1),
-]);
+axis(
+  "modules",
+  2.5,
+  "The module merge is scaling with the file count.",
+  (d) => [
+    writeModules(`${d}/many`, 400, 2, 1),
+    writeModules(`${d}/one`, 200, 4, 1),
+  ],
+);
 
 // Fuel reads 1.64, so the bar is the family default. `fnStmtsPosOf` (compiler/emit_capture_frames.vl)
 // is the scan that once made this axis super-linear: `fnStmts` walked once per closure.
-axis("closures", 2.5, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
-  twoFiles(d, genClosures(3000, 1), genClosures(3000, 20)));
+axis(
+  "closures",
+  2.5,
+  "`fnStmtsPosOf` scans `fnStmts` once per closure.",
+  (d) => twoFiles(d, genClosures(3000, 1), genClosures(3000, 20)),
+);
 
 // 2.06 / 1.03 / 1.92, stable over three runs (1.92 / 1.89 / 1.97) and holding at load 57.
 // D1514's axis, and the one the whole family was blind to: `anonLeafCloSlotMark` asks
@@ -1128,7 +1429,12 @@ axis(
   "generic instances beside inferred returns",
   2.5,
   "`monoRegisterInstance` (compiler/emit_mono.vl) is re-running the return inference per minted instance instead of once at the end of the walk.",
-  (d) => twoFiles(d, genInstsBesideInferred(100, 200, true), genInstsBesideInferred(100, 200, false)),
+  (d) =>
+    twoFiles(
+      d,
+      genInstsBesideInferred(100, 200, true),
+      genInstsBesideInferred(100, 200, false),
+    ),
 );
 
 // 0.78 / 0.91 / 0.86, against 36.51 / 2.82 / 12.95 on the pre-D1657 compiler — the axis the
@@ -1168,7 +1474,8 @@ axis(
   "narrowed module bindings",
   2.8,
   "A top-level function is asking about every narrowed module binding, not only the ones it reads (D2529; its residual per-binding cost is D14562).",
-  (d) => twoFiles(d, genNarrowedGlobals(600, true), genNarrowedGlobals(600, false)),
+  (d) =>
+    twoFiles(d, genNarrowedGlobals(600, true), genNarrowedGlobals(600, false)),
 );
 
 // A CALL CYCLE UNDER A NARROWED PATH. `k` functions each calling the next at two sites, the last
@@ -1178,12 +1485,27 @@ axis(
 const genWriteCycle = (k: number, cycle: boolean): string => {
   const o = ["type R = {v: i32 | null}", "const o: R = {v: 1}"];
   for (let i = 0; i < k - 1; i++) {
-    o.push(`function f${i}(n: i32): i32 {`, "  if n <= 0 { return 0 }", `  return f${i + 1}(n - 1) + f${i + 1}(n - 2)`, "}");
+    o.push(
+      `function f${i}(n: i32): i32 {`,
+      "  if n <= 0 { return 0 }",
+      `  return f${i + 1}(n - 1) + f${i + 1}(n - 2)`,
+      "}",
+    );
   }
-  o.push(`function f${k - 1}(n: i32): i32 {`, "  o.v = 2", "  if n <= 0 { return 0 }");
+  o.push(
+    `function f${k - 1}(n: i32): i32 {`,
+    "  o.v = 2",
+    "  if n <= 0 { return 0 }",
+  );
   o.push(`  return f${cycle ? 0 : k - 1}(n - 1)`, "}");
   o.push("function main(): i32 {", "  if o.v != null {", "    const r = f0(3)");
-  o.push("    if o.v != null { return o.v + r }", "  }", "  return 0", "}", "print(main())");
+  o.push(
+    "    if o.v != null { return o.v + r }",
+    "  }",
+    "  return 0",
+    "}",
+    "print(main())",
+  );
   return o.join("\n") + "\n";
 };
 
@@ -1202,10 +1524,25 @@ const genParamWriteCycle = (k: number, cycle: boolean): string => {
     o.push(`function f${i}(p: R, n: i32): i32 {`, "  if n <= 0 { return 0 }");
     o.push(`  return f${i + 1}(p, n - 1) + f${i + 1}(p, n - 2)`, "}");
   }
-  o.push(`function f${k - 1}(p: R, n: i32): i32 {`, "  p.v = 2", "  if n <= 0 { return 0 }");
+  o.push(
+    `function f${k - 1}(p: R, n: i32): i32 {`,
+    "  p.v = 2",
+    "  if n <= 0 { return 0 }",
+  );
   o.push(`  return f${cycle ? 0 : k - 1}(p, n - 1)`, "}");
-  o.push("function main(): i32 {", "  const o: R = {v: 1}", "  if o.v != null {", "    const r = f0(o, 3)");
-  o.push("    if o.v != null { return o.v + r }", "  }", "  return 0", "}", "print(main())");
+  o.push(
+    "function main(): i32 {",
+    "  const o: R = {v: 1}",
+    "  if o.v != null {",
+    "    const r = f0(o, 3)",
+  );
+  o.push(
+    "    if o.v != null { return o.v + r }",
+    "  }",
+    "  return 0",
+    "}",
+    "print(main())",
+  );
   return o.join("\n") + "\n";
 };
 
@@ -1213,7 +1550,8 @@ axis(
   "parameter call cycle under a narrowed path",
   2.0,
   "A parameter write summary on a cycle is being recomputed per path to it instead of iterated once over its component — `fnWriteEffects` / `weEffectsRounds` (compiler/check_write_effects.vl).",
-  (d) => twoFiles(d, genParamWriteCycle(14, true), genParamWriteCycle(14, false)),
+  (d) =>
+    twoFiles(d, genParamWriteCycle(14, true), genParamWriteCycle(14, false)),
 );
 
 // UN-ANNOTATED CALLBACK LAMBDAS. `n` lambdas `(g) => g(out)`, each called once with a
@@ -1233,7 +1571,9 @@ const genCallbackLambdas = (n: number, oneFn: boolean): string => {
   ];
   if (oneFn) o.push("  const out = [{ r: 3 }]");
   for (let i = 0; i < n; i++) {
-    if (oneFn) o.push(`  const ap${i} = (g) => g(out)`, `  print(ap${i}(lenC))`);
+    if (oneFn) {
+      o.push(`  const ap${i} = (g) => g(out)`, `  print(ap${i}(lenC))`);
+    }
   }
   o.push("}", "main()");
   for (let i = 0; i < n && !oneFn; i++) {
@@ -1253,7 +1593,8 @@ axis(
   "un-annotated callback lambdas per function",
   2.5,
   "The lambda's calls are being found by a scope walk per lambda rather than off `dslEnsure`'s per-scope index (D2748).",
-  (d) => twoFiles(d, genCallbackLambdas(120, true), genCallbackLambdas(120, false)),
+  (d) =>
+    twoFiles(d, genCallbackLambdas(120, true), genCallbackLambdas(120, false)),
 );
 
 // CAPTURED NARROWED LOCALS. One function narrows `n` nullable locals by assignment and makes a
@@ -1278,7 +1619,12 @@ axis(
   "captured narrowed locals",
   1.3,
   "A closure is re-walking its frame per captured name (D2529).",
-  (d) => twoFiles(d, genNarrowedCaptures(800, true), genNarrowedCaptures(800, false)),
+  (d) =>
+    twoFiles(
+      d,
+      genNarrowedCaptures(800, true),
+      genNarrowedCaptures(800, false),
+    ),
 );
 
 // CALLED CAPTURED NARROWED LOCALS. `n` closures over narrowed nullable locals, each called once,
@@ -1305,7 +1651,12 @@ axis(
   "called captured narrowed locals",
   1.5,
   "A call of a closure in one frame is re-scanning every narrowing or closure the frame holds (D5950).",
-  (d) => twoFiles(d, genCalledNarrowedCaptures(400, 1), genCalledNarrowedCaptures(400, 20)),
+  (d) =>
+    twoFiles(
+      d,
+      genCalledNarrowedCaptures(400, 1),
+      genCalledNarrowedCaptures(400, 20),
+    ),
 );
 
 // `n` calls handing one record to a function that reads a parameter field `n` times and calls
@@ -1314,10 +1665,21 @@ axis(
 // the record at its own type. Without a memo per (parameter, widened slots) the wide arm is
 // calls x uses (D2060).
 const genRecordCovar = (n: number, wide: boolean): string => {
-  const o = [`type P = { x: ${wide ? "i32 | string" : "i32"}, n: i32 }`, "function g(p: P, k: i32): i32 {", "  let s = 0"];
+  const o = [
+    `type P = { x: ${wide ? "i32 | string" : "i32"}, n: i32 }`,
+    "function g(p: P, k: i32): i32 {",
+    "  let s = 0",
+  ];
   for (let i = 0; i < n; i++) o.push("  s = s + p.n");
   o.push("  if k > 0 { s = s + g(p, k - 1) }");
-  o.push("  return s", "}", "let acc = 0", "function main() {", "  const q = { x: 1, n: 1 }", "  let t = 0");
+  o.push(
+    "  return s",
+    "}",
+    "let acc = 0",
+    "function main() {",
+    "  const q = { x: 1, n: 1 }",
+    "  let t = 0",
+  );
   for (let i = 0; i < n; i++) o.push("  t = t + g(q, 1)");
   o.push("  print(t)", "}", "main()", "print(acc)");
   return o.join("\n") + "\n";
@@ -1341,10 +1703,20 @@ axis(
 // the temps are bound: `same` redeclares the same names in every block, `unique` gives each
 // block its own, and `hoisted` declares them once at function scope and assigns them. The
 // fifth temp alternates `f64` and `i32`, so same-named slots of two reps interleave.
-const genSiblingBlocks = (n: number, temps: "same" | "unique" | "hoisted"): string => {
+const genSiblingBlocks = (
+  n: number,
+  temps: "same" | "unique" | "hoisted",
+): string => {
   const o = ["let g = 3", "function f(a: i32): i32 {", "  let acc = 0"];
   if (temps === "hoisted") {
-    o.push("  let m = 0", "  let x = 0", "  let y = 0", "  let r = 0", "  let vf = 0.0", "  let vi = 0");
+    o.push(
+      "  let m = 0",
+      "  let x = 0",
+      "  let y = 0",
+      "  let r = 0",
+      "  let vf = 0.0",
+      "  let vi = 0",
+    );
   }
   for (let i = 0; i < n; i++) {
     const s = temps === "unique" ? `_${i}` : "";
@@ -1352,7 +1724,9 @@ const genSiblingBlocks = (n: number, temps: "same" | "unique" | "hoisted"): stri
     const v = temps === "hoisted" ? (i % 2 ? "vf" : "vi") : `v${s}`;
     o.push(
       `  { ${d}m${s} = a + g + ${i}; ${d}x${s} = m${s} * 3; ${d}y${s} = x${s} - acc; ` +
-        `${d}r${s} = y${s} ^ m${s}; acc = acc + r${s}; ${d}${v} = ${i % 2 ? "1.5" : i}; print(${v}) }`,
+        `${d}r${s} = y${s} ^ m${s}; acc = acc + r${s}; ${d}${v} = ${
+          i % 2 ? "1.5" : i
+        }; print(${v}) }`,
     );
   }
   o.push("  return acc", "}", "print(f(7))");
@@ -1369,7 +1743,12 @@ axis(
   "sibling blocks redeclaring locals",
   2.5,
   "`dupScanRun` is sweeping once per same-named slot, or `declaredSlotOf` is scanning the frame (D2090).",
-  (d) => twoFiles(d, genSiblingBlocks(1250, "same"), genSiblingBlocks(1250, "hoisted")),
+  (d) =>
+    twoFiles(
+      d,
+      genSiblingBlocks(1250, "same"),
+      genSiblingBlocks(1250, "hoisted"),
+    ),
 );
 
 // 0.63 / 0.65 / 0.97 at 2,500 blocks, against master's 168 s / 0.59 s at 4,000: a frame of
@@ -1379,7 +1758,12 @@ axis(
   "locals per function",
   2.5,
   "A per-read lookup is scanning every local of the frame — `declaredSlotOf`, `capIsBound` (D2090).",
-  (d) => twoFiles(d, genSiblingBlocks(1250, "unique"), genSiblingBlocks(1250, "hoisted")),
+  (d) =>
+    twoFiles(
+      d,
+      genSiblingBlocks(1250, "unique"),
+      genSiblingBlocks(1250, "hoisted"),
+    ),
 );
 
 // `genSiblingBlocks` with five temps whose reps alternate on their OWN periods (2, 3, 5, 7,
@@ -1389,7 +1773,9 @@ const genSiblingReps = (n: number, temps: "same" | "hoisted"): string => {
   const periods = [2, 3, 5, 7, 11];
   const o = ["function f(a: i32): i32 {", "  let acc = 0"];
   if (temps === "hoisted") {
-    for (let j = 0; j < periods.length; j++) o.push(`  let t${j}f = 0.0`, `  let t${j}i = 0`);
+    for (let j = 0; j < periods.length; j++) {
+      o.push(`  let t${j}f = 0.0`, `  let t${j}i = 0`);
+    }
   }
   for (let i = 0; i < n; i++) {
     const parts: string[] = [];
@@ -1414,7 +1800,8 @@ axis(
   "same-named locals of several reps",
   2.5,
   "`dupScanRun` is sweeping once per slot position or class tuple rather than per class (D2309).",
-  (d) => twoFiles(d, genSiblingReps(1250, "same"), genSiblingReps(1250, "hoisted")),
+  (d) =>
+    twoFiles(d, genSiblingReps(1250, "same"), genSiblingReps(1250, "hoisted")),
 );
 
 // A value-union declared once, then `n` top-level statements (so `startStmts` holds `n`
@@ -1424,7 +1811,13 @@ axis(
 // `parentLetOfAt`'s whole per-function plan once per top-level statement, on every such
 // miss, instead of gating the search on the cheap memoized "bound nowhere" answer first.
 const genTopStmtsUnionMiss = (n: number, many: boolean): string => {
-  const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  return "s"', "}"];
+  const o = [
+    "type U = i32 | string",
+    "function g(x: i32): U {",
+    "  if x % 2 == 0 { return x }",
+    '  return "s"',
+    "}",
+  ];
   if (many) {
     for (let i = 0; i < n; i++) o.push(`print(${i})`);
   } else {
@@ -1434,7 +1827,11 @@ const genTopStmtsUnionMiss = (n: number, many: boolean): string => {
   }
   o.push("function h(): i32 {", "  let t = 0");
   for (let i = 0; i < n; i++) {
-    o.push(`  const f${i} = g`, `  const r${i} = f${i}(${i})`, `  if r${i} is i32 { t = t + r${i} }`);
+    o.push(
+      `  const f${i} = g`,
+      `  const r${i} = f${i}(${i})`,
+      `  if r${i} is i32 { t = t + r${i} }`,
+    );
   }
   o.push("  return t", "}", "print(h())");
   return o.join("\n") + "\n";
@@ -1444,7 +1841,12 @@ axis(
   "top-level statements before a union-name miss",
   2.5,
   "`startBlockLetRowOfAt` is rebuilding `parentLetOfAt`'s plan once per top-level statement on every miss (D2326).",
-  (d) => twoFiles(d, genTopStmtsUnionMiss(3000, true), genTopStmtsUnionMiss(3000, false)),
+  (d) =>
+    twoFiles(
+      d,
+      genTopStmtsUnionMiss(3000, true),
+      genTopStmtsUnionMiss(3000, false),
+    ),
 );
 
 // `n` sibling blocks each shadowing `v`, all closed, then `n` reads of the OUTER `v` — the
@@ -1459,9 +1861,16 @@ axis(
 // on every one of the `n` reads. At 3,000 fuel reads 2.67, an arena scan planted on every
 // `let` reads 7.87, and stepping to the previous sibling instead of `plSortedSkip` 6.79.
 const genManyClosedSiblingReads = (n: number, many: boolean): string => {
-  const o = ["type U = i32 | string", "function h(): i32 {", "  let t = 0", "  let v = 1"];
+  const o = [
+    "type U = i32 | string",
+    "function h(): i32 {",
+    "  let t = 0",
+    "  let v = 1",
+  ];
   const shadows = many ? n : 1;
-  for (let i = 0; i < shadows; i++) o.push(`  { const v = ${i}`, `    t = t + v }`);
+  for (let i = 0; i < shadows; i++) {
+    o.push(`  { const v = ${i}`, `    t = t + v }`);
+  }
   for (let i = 0; i < n; i++) o.push("  t = t + v");
   o.push("  return t", "}", "print(h())");
   return o.join("\n") + "\n";
@@ -1471,7 +1880,12 @@ axis(
   "reads after many closed sibling shadows",
   3.4,
   "`plBestDupAt` is stepping past every closed sibling instead of jumping via `plSortedSkip` (D2326).",
-  (d) => twoFiles(d, genManyClosedSiblingReads(3000, true), genManyClosedSiblingReads(3000, false)),
+  (d) =>
+    twoFiles(
+      d,
+      genManyClosedSiblingReads(3000, true),
+      genManyClosedSiblingReads(3000, false),
+    ),
 );
 
 // `n` top-level `if true` blocks, each declaring `const u` and a closure reading it — the
@@ -1483,7 +1897,13 @@ axis(
 // compile, and a ratio against it is a budget. Linear reads 4 and quadratic 16; at 1,500 blocks
 // against 375 it reads 5.35, and with `startBlockLetRowOfSid`'s memo disabled 14.71.
 const genManyCapturedSiblingBlocks = (n: number, many: boolean): string => {
-  const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  return "s"', "}"];
+  const o = [
+    "type U = i32 | string",
+    "function g(x: i32): U {",
+    "  if x % 2 == 0 { return x }",
+    '  return "s"',
+    "}",
+  ];
   const blocks = many ? n : 1;
   for (let i = 0; i < blocks; i++) {
     o.push(
@@ -1505,7 +1925,12 @@ axis(
   "many distinct captured sibling blocks",
   8.9,
   "`startBlockLetRowOfSid` re-scans every start statement per DISTINCT sid (D2326).",
-  (d) => twoFiles(d, genManyCapturedSiblingBlocks(1500, true), genManyCapturedSiblingBlocks(375, true)),
+  (d) =>
+    twoFiles(
+      d,
+      genManyCapturedSiblingBlocks(1500, true),
+      genManyCapturedSiblingBlocks(375, true),
+    ),
 );
 
 // `n` loops walking one name, each binding a copy of its loop variable that a closure
@@ -1517,7 +1942,13 @@ axis(
 const genLoopCaptures = (n: number): string => {
   const o = ["function run(xs: i32[]) {"];
   for (let i = 0; i < n; i++) {
-    o.push("  for q in xs {", "    const c = q", "    const f = () => c", "    print(f())", "  }");
+    o.push(
+      "  for q in xs {",
+      "    const c = q",
+      "    const f = () => c",
+      "    print(f())",
+      "  }",
+    );
   }
   o.push("}", "run([1])");
   return o.join("\n") + "\n";
@@ -1539,7 +1970,9 @@ const genCapturedNarrowings = (n: number, writer: boolean): string => {
   const o = ['let g: string | null = "ab"'];
   if (writer) o.push("function setG() { return g = null }");
   o.push("function f(): i32 {", "  let t = 0", "  if g != null {");
-  for (let i = 0; i < n; i++) o.push(`    const c${i} = (): i32 => g.length`, `    t = t + c${i}()`);
+  for (let i = 0; i < n; i++) {
+    o.push(`    const c${i} = (): i32 => g.length`, `    t = t + c${i}()`);
+  }
   o.push("  }", "  return t", "}", "print(f())");
   return o.join("\n") + "\n";
 };
@@ -1550,7 +1983,12 @@ axis(
   "closures under a narrowing some function may end",
   1.8,
   "A closure made under a narrowing re-walks its enclosing body, or a call scans every capture record (D2402).",
-  (d) => twoFiles(d, genCapturedNarrowings(1600, true), genCapturedNarrowings(1600, false)),
+  (d) =>
+    twoFiles(
+      d,
+      genCapturedNarrowings(1600, true),
+      genCapturedNarrowings(1600, false),
+    ),
 );
 
 // One `match` of `n` arms, each reading the module global `k`, written as a closure's body or
@@ -1559,7 +1997,11 @@ axis(
 // arm clears `FLOOR` and the reading stays a ratio.
 const genLongBody = (n: number, closure: boolean): string => {
   const o = ["const k = 1000"];
-  o.push(closure ? "const g = (y: i32) => match y {" : "function g(y: i32): i32 {\n  return match y {");
+  o.push(
+    closure
+      ? "const g = (y: i32) => match y {"
+      : "function g(y: i32): i32 {\n  return match y {",
+  );
   for (let i = 0; i < n; i++) o.push(`  ${i} => k + ${i % 97}`);
   o.push("  _ => -1", "}");
   if (!closure) o.push("}");
@@ -1589,7 +2031,9 @@ const genCallBlocks = (n: number, fns: number): string => {
   const o = ["let g = 3", "function h(x: i32): i32 { return x * 2 + g }"];
   for (let f = 0; f < fns; f++) {
     o.push(`function f${f}(a: i32): i32 {`, "  let acc = 0");
-    for (let i = 0; i < per; i++) o.push(`  { const m = h(a + ${i}) + g; acc = acc + m }`);
+    for (let i = 0; i < per; i++) {
+      o.push(`  { const m = h(a + ${i}) + g; acc = acc + m }`);
+    }
     o.push("  return acc", "}");
   }
   o.push("let acc = 0");
@@ -1616,7 +2060,9 @@ const genFrameLocals = (n: number, fns: number): string => {
   const o = ["let g = 3"];
   for (let f = 0; f < fns; f++) {
     o.push(`function f${f}(a: i32): i32 {`, "  let acc = 0");
-    for (let i = 0; i < per; i++) o.push(`  const m${i} = a + ${i}`, `  acc = acc + m${i} * g`);
+    for (let i = 0; i < per; i++) {
+      o.push(`  const m${i} = a + ${i}`, `  acc = acc + m${i} * g`);
+    }
     o.push("  return acc", "}");
   }
   o.push("let acc = 0");
@@ -1671,11 +2117,17 @@ axis(
 // `stmts` bindings of a `depth`-deep nest of if-expressions in the THEN arm, against
 // `stmts * depth` one-level ones: the same `if` nodes either way, only how deep they sit.
 const genIfNest = (stmts: number, depth: number, nested: boolean): string => {
-  const o = ["function t(): boolean { return 1 == 1 }", "function f(a: i32): i32 {", "  let acc = 0"];
+  const o = [
+    "function t(): boolean { return 1 == 1 }",
+    "function f(a: i32): i32 {",
+    "  let acc = 0",
+  ];
   const n = nested ? stmts : stmts * depth;
   for (let i = 0; i < n; i++) {
     let s = `a + ${i % 13}`;
-    for (let k = 0; k < (nested ? depth : 1); k++) s = `if t() { ${s} } else { 2 }`;
+    for (let k = 0; k < (nested ? depth : 1); k++) {
+      s = `if t() { ${s} } else { 2 }`;
+    }
     o.push(`  const v${i} = ${s}`, `  acc = acc + v${i}`);
   }
   o.push("  return acc", "}", "print(f(1))");
@@ -1704,7 +2156,10 @@ const genConcatChains = (chains: number, len: number): string => {
   ];
   for (let i = 0; i < chains; i++) {
     for (const v of ["a", "b", "c"]) {
-      o.push(`  const ${v}${i} = ${Array(len).fill(v).join(" + ")}`, `  acc = acc + ${v}${i}.length`);
+      o.push(
+        `  const ${v}${i} = ${Array(len).fill(v).join(" + ")}`,
+        `  acc = acc + ${v}${i}.length`,
+      );
     }
   }
   o.push("  return acc", "}", "print(f())");
@@ -1728,8 +2183,20 @@ axis(
 // and trapped past about 600 terms; the arithmetic classifiers now memoise per node.
 const genOperatorChains = (n: number): string => {
   const o: string[] = [];
-  for (const [f, ty, arg] of [["i", "i32", "1"], ["g", "f32", "0.25"], ["d", "f64", "0.5"], ["l", "i64", "3"], ["s", "string", '"ab"']]) {
-    o.push(`function ${f}(a: ${ty}): ${ty} {`, `  return ${Array(n).fill("a").join(" + ")}`, "}");
+  for (
+    const [f, ty, arg] of [
+      ["i", "i32", "1"],
+      ["g", "f32", "0.25"],
+      ["d", "f64", "0.5"],
+      ["l", "i64", "3"],
+      ["s", "string", '"ab"'],
+    ]
+  ) {
+    o.push(
+      `function ${f}(a: ${ty}): ${ty} {`,
+      `  return ${Array(n).fill("a").join(" + ")}`,
+      "}",
+    );
     o.push(f === "s" ? `print(${f}(${arg}).length)` : `print(${f}(${arg}))`);
   }
   // The same chains as the operand of a comparison, a condition and a `&&`, where the parser's
@@ -1745,7 +2212,7 @@ const genOperatorChains = (n: number): string => {
     `function clt(a: f64) { return ${c} < 0.5 }`,
     "print(clt(0.5))",
     `function cseq(a: string) { return ${c} == \"x\" }`,
-    "print(cseq(\"x\"))",
+    'print(cseq("x"))',
   );
   return o.join("\n") + "\n";
 };
@@ -1764,12 +2231,17 @@ axis(
 // once per classification.
 const genArrayLiterals = (n: number): string => {
   const o: string[] = [];
-  const els = (f: (i: number) => string) => Array.from({ length: n }, (_, i) => f(i)).join(", ");
+  const els = (f: (i: number) => string) =>
+    Array.from({ length: n }, (_, i) => f(i)).join(", ");
   o.push(`const a: i32[] = [${els((i) => `${(i * 7919) % 2001 - 1000}`)}]`);
   o.push(`const b = [${els((i) => `${i % 97}.5`)}]`);
   o.push(`const c: i64[] = [${els((i) => `${i * 3}`)}]`);
   o.push(`function mk() {\n  return [${els((i) => `{ k: ${i % 89} }`)}]\n}`);
-  o.push("print(a[a.length - 1] + mk()[1].k)", "print(b[3])", "print(c[c.length - 1])");
+  o.push(
+    "print(a[a.length - 1] + mk()[1].k)",
+    "print(b[3])",
+    "print(c[c.length - 1])",
+  );
   return o.join("\n") + "\n";
 };
 
@@ -1785,13 +2257,19 @@ axis(
 const genGenericChain = (depth: number, calleeFirst: boolean): string => {
   const fns: string[] = [];
   for (let i = 0; i < depth; i++) {
-    const body = [`function g${i}<T>(x: T) {`, "  const a: i32 = x + 1", "  takes(x * 2)", "  print(x - a)"];
+    const body = [
+      `function g${i}<T>(x: T) {`,
+      "  const a: i32 = x + 1",
+      "  takes(x * 2)",
+      "  print(x - a)",
+    ];
     if (i + 1 < depth) body.push(`  g${i + 1}(x)`);
     body.push("}");
     fns.push(body.join("\n"));
   }
   if (calleeFirst) fns.reverse();
-  return ["function takes(n: i32) { print(n) }", ...fns, "g0(3)"].join("\n") + "\n";
+  return ["function takes(n: i32) { print(n) }", ...fns, "g0(3)"].join("\n") +
+    "\n";
 };
 
 // D3062's ORDER pair: one chain declared callee-first against caller-first. Each order's
@@ -1840,7 +2318,11 @@ axis(
 // the one before it, so the solve must carry the answer down the whole chain. Fuel reads 3.97,
 // so the bar is 1.25x that.
 const genLiteralChain = (n: number): string => {
-  const o = ["function big() { return 3000000000 }", "let a0 = 0", "a0 = big()"];
+  const o = [
+    "function big() { return 3000000000 }",
+    "let a0 = 0",
+    "a0 = big()",
+  ];
   for (let i = 1; i < n; i++) o.push(`let a${i} = 0`, `a${i} = a${i - 1}`);
   o.push(`print(a${n - 1} + a0)`);
   return o.join("\n") + "\n";
@@ -1865,7 +2347,11 @@ const genSeqJoins = (n: number): string => {
     "  let x = nn(k)",
   ];
   for (let i = 0; i < n; i++) {
-    o.push(`  x = nn(k - ${i % 3})`, `  if x == null { x = ${i % 7} } else { x = x + 1 }`, "  acc = acc + x");
+    o.push(
+      `  x = nn(k - ${i % 3})`,
+      `  if x == null { x = ${i % 7} } else { x = x + 1 }`,
+      "  acc = acc + x",
+    );
   }
   o.push("  return acc", "}", "print(f(1))");
   return o.join("\n") + "\n";
@@ -1883,7 +2369,12 @@ const genNestedJoins = (n: number): string => {
   ];
   for (let i = 0; i < n; i++) {
     const pad = "  ".repeat(i + 1);
-    o.push(`${pad}x = nn(k - ${i % 3})`, `${pad}if x == null { x = ${i % 7} }`, `${pad}acc = acc + x`, `${pad}if c {`);
+    o.push(
+      `${pad}x = nn(k - ${i % 3})`,
+      `${pad}if x == null { x = ${i % 7} }`,
+      `${pad}acc = acc + x`,
+      `${pad}if c {`,
+    );
   }
   for (let i = n - 1; i >= 0; i--) o.push(`${"  ".repeat(i + 1)}}`);
   o.push("  return acc", "}", "print(f(1, true))");
@@ -1915,17 +2406,29 @@ axis(
 // Each link once asked about every link below it, a walk to the chain's end: 2,000 links in
 // one chain against twenty chains of 100 read 4.16 (`return` arms) and 9.13 (an `if`
 // expression) on master `69525dd17`, and 1.02 / 1.02 once the walks were memoised.
-const genElseIfChains = (shape: "return" | "value", nf: number, n: number): string => {
+const genElseIfChains = (
+  shape: "return" | "value",
+  nf: number,
+  n: number,
+): string => {
   const o: string[] = [];
   const links = n / nf;
   for (let f = 0; f < nf; f++) {
     o.push(`function f${f}(x: i32): i32 {`);
     const arms: string[] = [];
     for (let i = 0; i < links; i++) {
-      arms.push(shape === "return" ? `if x == ${i} { return ${i + f} }` : `if x == ${i} { ${i + f} }`);
+      arms.push(
+        shape === "return"
+          ? `if x == ${i} { return ${i + f} }`
+          : `if x == ${i} { ${i + f} }`,
+      );
     }
     const last = shape === "return" ? "{ return -1 }" : "{ -1 }";
-    o.push(shape === "return" ? `  ${arms.join(" else ")} else ${last}` : `  const r = ${arms.join(" else ")} else ${last}`);
+    o.push(
+      shape === "return"
+        ? `  ${arms.join(" else ")} else ${last}`
+        : `  const r = ${arms.join(" else ")} else ${last}`,
+    );
     if (shape === "value") o.push("  return r");
     o.push("}");
   }
@@ -1939,14 +2442,24 @@ axis(
   "else-if chain length, returning arms",
   2.0,
   "A link of an `else if` chain is walking every link below it (`listJoinWidenCheck` or `valueLitState`, compiler/check_program.vl or check_nj_join.vl).",
-  (d) => twoFiles(d, genElseIfChains("return", 1, 2000), genElseIfChains("return", 20, 2000)),
+  (d) =>
+    twoFiles(
+      d,
+      genElseIfChains("return", 1, 2000),
+      genElseIfChains("return", 20, 2000),
+    ),
 );
 
 axis(
   "else-if chain length, an if expression",
   2.0,
   "A link of an `else if` chain is walking every link below it (`listJoinWidenCheck` or `valueLitState`, compiler/check_program.vl or check_nj_join.vl).",
-  (d) => twoFiles(d, genElseIfChains("value", 1, 2000), genElseIfChains("value", 20, 2000)),
+  (d) =>
+    twoFiles(
+      d,
+      genElseIfChains("value", 1, 2000),
+      genElseIfChains("value", 20, 2000),
+    ),
 );
 
 // D3407: a `+` chain over a type parameter, one generic of `n` terms against `nf` generics of
@@ -1955,7 +2468,11 @@ axis(
 const genGenericPlusChains = (nf: number, n: number): string => {
   const o: string[] = [];
   for (let f = 0; f < nf; f++) {
-    o.push(`function g${f}<T>(a: T): T {`, `  return ${Array(n / nf).fill("a").join(" + ")}`, "}");
+    o.push(
+      `function g${f}<T>(a: T): T {`,
+      `  return ${Array(n / nf).fill("a").join(" + ")}`,
+      "}",
+    );
   }
   for (let f = 0; f < nf; f++) o.push(`print(g${f}(${f}))`);
   return o.join("\n") + "\n";
@@ -2016,7 +2533,11 @@ shardTest({
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_scale_strappend_" });
     try {
-      const [manySrc, oneSrc] = twoFiles(dir, genAppendLoop(40000), genJoinBuild(40000));
+      const [manySrc, oneSrc] = twoFiles(
+        dir,
+        genAppendLoop(40000),
+        genJoinBuild(40000),
+      );
       await grade(
         "string append loop",
         2.5,
@@ -2072,7 +2593,7 @@ shardTest({
       await grade(
         "module-global string append loop",
         2.5,
-        "40,000 appends to a TOP-LEVEL `let s = \"\"` against the same string built " +
+        '40,000 appends to a TOP-LEVEL `let s = ""` against the same string built ' +
           "through std's builder: the accumulator lowering (`strAccScanStart` / " +
           "`emitStrAccAppend`, compiler/wasmEmit.vl) stopped reaching the start function, so " +
           "every append allocates an exact-fit backing and copies the whole prefix again. " +
@@ -2131,7 +2652,11 @@ shardTest({
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_scale_pstrappend_" });
     try {
-      const [manySrc, oneSrc] = twoFiles(dir, genPlaceAppendLoop(20000), genPlaceJoinBuild(20000));
+      const [manySrc, oneSrc] = twoFiles(
+        dir,
+        genPlaceAppendLoop(20000),
+        genPlaceJoinBuild(20000),
+      );
       await grade(
         "place string append loop",
         2.5,
@@ -2169,7 +2694,11 @@ axis(
 // reads 23.5.
 const genShadowedCallee = (n: number, shadow: boolean): string => {
   const b = shadow ? "w" : "v";
-  const o = ["function w(): i32 { return 1 }", "function g(): i32 {", "  let acc = 0"];
+  const o = [
+    "function w(): i32 { return 1 }",
+    "function g(): i32 {",
+    "  let acc = 0",
+  ];
   o.push(`  if acc > 5 {\n    const ${b} = 3\n    acc = acc + ${b}\n  }`);
   o.push(`  for ${b} in [1, 2] { acc = acc + ${b} }`);
   for (let i = 0; i < n; i++) o.push(`  acc = acc + w() * ${i % 97}`);
@@ -2181,7 +2710,8 @@ axis(
   "calls under a same-named binding",
   2.5,
   "A call's shadow test is walking the frame body per call (`chainShadowsAt`, D2289).",
-  (d) => twoFiles(d, genShadowedCallee(2500, true), genShadowedCallee(2500, false)),
+  (d) =>
+    twoFiles(d, genShadowedCallee(2500, true), genShadowedCallee(2500, false)),
 );
 
 // `fns` functions of `arms` sibling blocks, each binding its function's one list name to a
@@ -2196,7 +2726,12 @@ const genListLits = (fns: number, arms: number, annotated: boolean): string => {
   for (let f = 0; f < fns; f++) {
     o.push(`function f${f}(n: i32): i32[] {`);
     for (let a = 0; a < arms; a++) {
-      o.push(`  if n == ${a} {`, `    const out${f}${t} = [n, n + ${a}]`, `    return out${f}`, "  }");
+      o.push(
+        `  if n == ${a} {`,
+        `    const out${f}${t} = [n, n + ${a}]`,
+        `    return out${f}`,
+        "  }",
+      );
     }
     o.push(`  const out${f}${t} = [n]`, `  return out${f}`, "}");
   }
@@ -2221,7 +2756,12 @@ const genInferredCallees = (n: number, annotated: boolean): string => {
   const t = annotated ? ": i32[]" : "";
   const o = ["type U = i32 | string"];
   for (let f = 0; f < n; f++) {
-    o.push(`function f${f}(n: i32)${t} {`, `  const out: i32[] = [n, ${f % 13}]`, "  return out", "}");
+    o.push(
+      `function f${f}(n: i32)${t} {`,
+      `  const out: i32[] = [n, ${f % 13}]`,
+      "  return out",
+      "}",
+    );
   }
   o.push("function main() {", "  let acc = 0");
   for (let f = 0; f < n; f++) o.push(`  acc = acc + f${f}(${f % 5}).length`);
@@ -2233,7 +2773,12 @@ axis(
   "calls to inferred-return callees",
   2.5,
   "Asking about an inferred-return callee rebuilt the calling function's let plan (`plEnsure`, compiler/emit_base.vl; D2687).",
-  (d) => twoFiles(d, genInferredCallees(3000, false), genInferredCallees(3000, true)),
+  (d) =>
+    twoFiles(
+      d,
+      genInferredCallees(3000, false),
+      genInferredCallees(3000, true),
+    ),
 );
 
 // `fns` functions each binding an un-annotated list `out`, beside one function that assigns
@@ -2268,7 +2813,8 @@ axis(
   "a list name shared across functions",
   2.0,
   "An un-annotated list const's store scan walked its name's occurrences in every function (`constStoresForeignList`, D2688).",
-  (d) => twoFiles(d, genSharedListName(1200, true), genSharedListName(1200, false)),
+  (d) =>
+    twoFiles(d, genSharedListName(1200, true), genSharedListName(1200, false)),
 );
 
 // `n` generics that each call every other one at `<T>`, as one cycle or as a chain (a call to
@@ -2279,7 +2825,10 @@ const genGenericCycle = (n: number, cycle: boolean): string => {
   const o: string[] = [];
   for (let i = 0; i < n; i++) {
     o.push(`function h${i}(n: i32): boolean { return n > 0 }`);
-    o.push(`function f${i}<T>(u: T | null, n: i32): boolean {`, "  if n <= 0 { return u == null }");
+    o.push(
+      `function f${i}<T>(u: T | null, n: i32): boolean {`,
+      "  if n <= 0 { return u == null }",
+    );
     for (let j = 0; j < n; j++) {
       if (j === i) continue;
       const call = cycle || j > i ? `f${j}<T>(u, n - 1)` : `h${j}(n - 1)`;
@@ -2309,7 +2858,10 @@ const genGenericClique = (n: number, clique: boolean): string => {
   const o: string[] = [];
   for (let i = 0; i < n; i++) {
     o.push(`function h${i}(n: i32): boolean { return n > 0 }`);
-    o.push(`function f${i}<T>(u: T | null, n: i32): boolean {`, "  if n <= 0 { return u == null }");
+    o.push(
+      `function f${i}<T>(u: T | null, n: i32): boolean {`,
+      "  if n <= 0 { return u == null }",
+    );
     for (let j = 0; j < n; j++) {
       if (j === i) continue;
       const call = clique ? `f${j}<T>(u, n - 1)` : `h${j}(n - 1)`;
@@ -2336,7 +2888,9 @@ axis(
 // 3,000 bindings (2.49 here). Aliases are super-linear on their own, so a many/one pair over
 // them would carry that debt; this pair holds the name's own price near 1.
 const genNamedFnAliases = (named: boolean): string => {
-  const o: string[] = [named ? "type G = (fn: i32) => i32" : "type G = (i32) => i32"];
+  const o: string[] = [
+    named ? "type G = (fn: i32) => i32" : "type G = (i32) => i32",
+  ];
   for (let i = 0; i < 3000; i++) o.push(`type A${i} = i32`);
   for (let i = 0; i < 3000; i++) o.push(`const x${i}: A${i} = ${i}`);
   o.push("print(x0)");
@@ -2357,12 +2911,23 @@ axis(
 // behind a small entry file) filled the heap and trapped the compiler, exit 70 (D3737). These
 // pairs grade the `[alloc]` line, the bytes a null-collector compile allocated, and are GROWTH
 // pairs: `n` against `n/4`, so linear reads under 4 (a fixed cost rides on both arms).
-const gradeAlloc = (axis: string, bar: number, note: string, m: Cost, o: Cost): number => {
+const gradeAlloc = (
+  axis: string,
+  bar: number,
+  note: string,
+  m: Cost,
+  o: Cost,
+): number => {
   if (!(m.alloc > 0 && o.alloc > 0)) {
-    throw new Error(`${axis}: an arm printed no \`[alloc]\` line (${m.alloc}, ${o.alloc}): rebuild scripts/vl-host`);
+    throw new Error(
+      `${axis}: an arm printed no \`[alloc]\` line (${m.alloc}, ${o.alloc}): rebuild scripts/vl-host`,
+    );
   }
   const ratio = m.alloc / o.alloc;
-  const reading = `${(m.alloc / 2 ** 20).toFixed(1)} MiB allocated against ${(o.alloc / 2 ** 20).toFixed(1)} MiB ` +
+  const reading =
+    `${(m.alloc / 2 ** 20).toFixed(1)} MiB allocated against ${
+      (o.alloc / 2 ** 20).toFixed(1)
+    } MiB ` +
     `(ratio ${ratio.toFixed(3)})`;
   if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
   if (ratio > bar) {
@@ -2388,7 +2953,12 @@ const gradeAllocPair = async (
   return gradeAlloc(axis, bar, note, m, o);
 };
 
-const allocAxis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
+const allocAxis = (
+  name: string,
+  bar: number,
+  note: string,
+  mk: (d: string) => [string, string],
+) =>
   shardTest({
     name: `scaling shape: ${name}`,
     ignore: !ENABLED,
@@ -2400,7 +2970,11 @@ const allocAxis = (name: string, bar: number, note: string, mk: (d: string) => [
 // One pair graded on fuel AND allocation, where both axes compile the same two programs. Both
 // verdicts are taken before either throws, so a red on one never hides the other.
 type Bar = { name: string; bar: number; note: string };
-const gradeBoth = async (fuel: Bar, alloc: Bar, mk: (d: string) => [string, string]): Promise<string[]> => {
+const gradeBoth = async (
+  fuel: Bar,
+  alloc: Bar,
+  mk: (d: string) => [string, string],
+): Promise<string[]> => {
   const [m, o] = await buildPair(fuel.name, mk);
   const red: string[] = [];
   const verdicts = [
@@ -2416,7 +2990,11 @@ const gradeBoth = async (fuel: Bar, alloc: Bar, mk: (d: string) => [string, stri
   }
   return red;
 };
-const fuelAllocAxis = (fuel: Bar, alloc: Bar, mk: (d: string) => [string, string]) =>
+const fuelAllocAxis = (
+  fuel: Bar,
+  alloc: Bar,
+  mk: (d: string) => [string, string],
+) =>
   shardTest({
     name: `scaling shape: ${fuel.name}; ${alloc.name}`,
     ignore: !ENABLED,
@@ -2430,9 +3008,19 @@ const fuelAllocAxis = (fuel: Bar, alloc: Bar, mk: (d: string) => [string, string
 // symbol-id space grows with `n` as well.
 const genPerFunction = (n: number, unit: (u: number) => string[]): string => {
   const o: string[] = [];
-  for (let f = 0; f < n; f++) o.push(`function f${f}(n: i32): i32 {`, "  let t = n", ...unit(f), "  return t", "}");
+  for (let f = 0; f < n; f++) {
+    o.push(
+      `function f${f}(n: i32): i32 {`,
+      "  let t = n",
+      ...unit(f),
+      "  return t",
+      "}",
+    );
+  }
   o.push("let acc = 0");
-  for (let f = 0; f < Math.min(n, 40); f++) o.push(`acc = acc + f${f}(${f % 5})`);
+  for (let f = 0; f < Math.min(n, 40); f++) {
+    o.push(`acc = acc + f${f}(${f % 5})`);
+  }
   o.push("print(acc)");
   return o.join("\n") + "\n";
 };
@@ -2457,7 +3045,8 @@ allocAxis(
   "allocation: loop variables across functions",
   4.5,
   "A per-function table indexed by symbol id is being replaced rather than cleared (`plBuildLetMap`, compiler/emit_base.vl).",
-  (d) => twoFiles(d, genPerFunction(4000, loopUnit), genPerFunction(1000, loopUnit)),
+  (d) =>
+    twoFiles(d, genPerFunction(4000, loopUnit), genPerFunction(1000, loopUnit)),
 );
 
 // D3737: the same for the duplicate-binding heads. Reads 2.85; master `7529a4ea6` read 5.87.
@@ -2465,7 +3054,8 @@ allocAxis(
   "allocation: duplicate bindings across functions",
   4.5,
   "A per-function table indexed by symbol id is being replaced rather than cleared (`plBuildLetMap`, compiler/emit_base.vl).",
-  (d) => twoFiles(d, genPerFunction(4000, dupUnit), genPerFunction(1000, dupUnit)),
+  (d) =>
+    twoFiles(d, genPerFunction(4000, dupUnit), genPerFunction(1000, dupUnit)),
 );
 
 // D3737: the inline-shape intern's re-entrancy memo, keyed by the shape spelling's symbol id,
@@ -2484,9 +3074,15 @@ fuelAllocAxis(
   {
     name: "allocation: nested inline record types across functions",
     bar: 4.5,
-    note: "The inline-shape memo (`internInlineShapeTy`, compiler/emit_classify.vl) is being regrown per intern.",
+    note:
+      "The inline-shape memo (`internInlineShapeTy`, compiler/emit_classify.vl) is being regrown per intern.",
   },
-  (d) => twoFiles(d, genPerFunction(2000, shapeUnit), genPerFunction(500, shapeUnit)),
+  (d) =>
+    twoFiles(
+      d,
+      genPerFunction(2000, shapeUnit),
+      genPerFunction(500, shapeUnit),
+    ),
 );
 
 // D3739: a fresh `const` at the top level asks which names the whole program uses other than as
@@ -2495,7 +3091,12 @@ fuelAllocAxis(
 const genTopFreshConsts = (n: number): string => {
   const o: string[] = [];
   for (let f = 0; f < n; f++) {
-    o.push(`function f${f}(n: i32): i32 {`, "  const p = { v: n }", "  return p.v + 1", "}");
+    o.push(
+      `function f${f}(n: i32): i32 {`,
+      "  const p = { v: n }",
+      "  return p.v + 1",
+      "}",
+    );
     o.push("if true {", `  const a = { v: f${f}(1) }`, "  print(a.v)", "}");
   }
   return o.join("\n") + "\n";
@@ -2535,8 +3136,17 @@ allocAxis(
 // compile fuel reads 1.49. A table keyed by call path instead of by instance walks the chain
 // exponentially.
 const genFnFlowChain = (n: number): string => {
-  const o = ["let g = (x: i32): i32 => x", "function h0(f, x: i32): i32 { return f(x) }"];
-  for (let i = 1; i < n; i++) o.push(`function h${i}(f, x: i32): i32 { return h${i - 1}(f, x) + h${i - 1}(f, x + 1) }`);
+  const o = [
+    "let g = (x: i32): i32 => x",
+    "function h0(f, x: i32): i32 { return f(x) }",
+  ];
+  for (let i = 1; i < n; i++) {
+    o.push(
+      `function h${i}(f, x: i32): i32 { return h${i - 1}(f, x) + h${
+        i - 1
+      }(f, x + 1) }`,
+    );
+  }
   o.push(
     "function pa(f, n: i32): i32 {",
     "  if n <= 0 {",
@@ -2559,8 +3169,16 @@ const genFnFlowOne = (n: number): string => {
     "function run(f, n: i32): i32 {",
     "  let acc = 0",
   ];
-  for (let i = 1; i < n; i++) o.push(`  acc = acc + h0(f, ${i}) + h0(f, ${i + 1})`);
-  o.push("  g = f", "  return acc", "}", "print(run((x: i32): i32 => x + 1, 3))", "print(g(1))");
+  for (let i = 1; i < n; i++) {
+    o.push(`  acc = acc + h0(f, ${i}) + h0(f, ${i + 1})`);
+  }
+  o.push(
+    "  g = f",
+    "  return acc",
+    "}",
+    "print(run((x: i32): i32 => x + 1, 3))",
+    "print(g(1))",
+  );
   return o.join("\n") + "\n";
 };
 
@@ -2604,7 +3222,11 @@ shardTest({
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_scale_control_" });
     try {
-      const [badSrc, okSrc] = twoFiles(dir, genNestedLoop(22000, 22000), genNestedLoop(22000, 1));
+      const [badSrc, okSrc] = twoFiles(
+        dir,
+        genNestedLoop(22000, 22000),
+        genNestedLoop(22000, 1),
+      );
       let red = "";
       try {
         await grade(
@@ -2637,9 +3259,18 @@ shardTest({
 // list, pushes a local one and writes a module `let`, is a site for the flow table's class
 // merge and for the walk's frame questions. 1,600 functions against 400, so linear reads 4.
 const genGenericProgram = (n: number): string => {
-  const o = ["let G: i32[] = [1, 2, 3]", "let T = 0", "function id<V>(v: V): V { return v }"];
+  const o = [
+    "let G: i32[] = [1, 2, 3]",
+    "let T = 0",
+    "function id<V>(v: V): V { return v }",
+  ];
   for (let i = 0; i < n; i++) {
-    o.push(`function f${i}(): i32 {`, "  const a = G[0]", "  const xs: i32[] = []", "  xs.push(a)");
+    o.push(
+      `function f${i}(): i32 {`,
+      "  const a = G[0]",
+      "  const xs: i32[] = []",
+      "  xs.push(a)",
+    );
     o.push("  T = T + 1", `  return xs[0] + ${i}`, "}");
   }
   o.push("let s = 0");
@@ -2690,13 +3321,25 @@ axis(
 // One function returning a union of `n` declared record types from `n` returns, called `n` times.
 const genRecordUnionReturns = (n: number): string => {
   const o: string[] = [];
-  for (let k = 0; k < n; k++) o.push(`type R${k} = { tag: "r${k}", v${k}: i32 }`);
-  o.push(`type U = ${Array.from({ length: n }, (_, k) => `R${k}`).join(" | ")}`);
+  for (let k = 0; k < n; k++) {
+    o.push(`type R${k} = { tag: "r${k}", v${k}: i32 }`);
+  }
+  o.push(
+    `type U = ${Array.from({ length: n }, (_, k) => `R${k}`).join(" | ")}`,
+  );
   o.push("function mk(i: i32): U {");
-  for (let k = 0; k < n; k++) o.push(`  if i == ${k} { return { tag: "r${k}", v${k}: ${k} } }`);
+  for (let k = 0; k < n; k++) {
+    o.push(`  if i == ${k} { return { tag: "r${k}", v${k}: ${k} } }`);
+  }
   o.push(`  return { tag: "r0", v0: 0 }`, "}");
   o.push("function show(u: U): string { return u.tag }");
-  o.push("let i = 0", `while i < ${n} {`, "  print(show(mk(i)))", "  i = i + 1", "}");
+  o.push(
+    "let i = 0",
+    `while i < ${n} {`,
+    "  print(show(mk(i)))",
+    "  i = i + 1",
+    "}",
+  );
   return o.join("\n") + "\n";
 };
 
@@ -2707,6 +3350,47 @@ axis(
   9.0,
   "Each return compares every arm with every row of its union (`unionArmRowsOfTys`, compiler/emit_local_slots.vl), or re-dedupes the running union's members (`joinTysInto`, compiler/check_relate_core.vl) or tests every pair for a Set/map clash (`setMapRecordClashMsg`).",
   (d) => twoFiles(d, genRecordUnionReturns(64), genRecordUnionReturns(16)),
+);
+
+// Receiver overloading within one module (receiver-overloading-intra-module-proposal.md §8): a
+// library declaring `sets` two-candidate sets, the rest of its 280 `self`-functions one-candidate,
+// every one reached from `main` by the type-bound rung. Both arms hold the same functions and
+// calls; 140 sets against 35, so a per-call scan over a module's sets is what separates them.
+const writeOverloadSets = (dir: string, sets: number): string => {
+  Deno.mkdirSync(dir, { recursive: true });
+  const total = 140;
+  const o = ["export type A = { a: i32 }", "export type B = { b: i32 }"];
+  for (let i = 0; i < total; i++) {
+    const [na, nb] = i < sets ? [`op${i}`, `op${i}`] : [`opa${i}`, `opb${i}`];
+    o.push(
+      `export function ${na}(self: A, k: i32) { return self.a + k * ${i % 7} }`,
+    );
+    o.push(
+      `export function ${nb}(self: B, k: i32) { return self.b - k * ${i % 5} }`,
+    );
+  }
+  Deno.writeTextFileSync(`${dir}/lib.vl`, o.join("\n") + "\n");
+  const main = [
+    'import { A, B } from "./lib"',
+    "const x: A = { a: 1 }",
+    "const y: B = { b: 2 }",
+    "let acc = 0",
+  ];
+  for (let i = 0; i < total; i++) {
+    const [na, nb] = i < sets ? [`op${i}`, `op${i}`] : [`opa${i}`, `opb${i}`];
+    main.push(`acc = acc + x.${na}(${i % 3}) + y.${nb}(${i % 4})`);
+  }
+  main.push("print(acc)");
+  Deno.writeTextFileSync(`${dir}/main.vl`, main.join("\n") + "\n");
+  return `${dir}/main.vl`;
+};
+axis(
+  "receiver-overload sets in one module",
+  2.5,
+  "A member call looks its name up among the module's sets (`ovSetOf`, compiler/ast.vl) or its exported scope rows (`ufcsExportedScopeIn`) by a scan; key them by (module, name) once.",
+  (
+    d,
+  ) => [writeOverloadSets(`${d}/many`, 140), writeOverloadSets(`${d}/one`, 35)],
 );
 
 // THE FUEL AND ALLOCATION GRADERS' CONTROL. The same program at 20x the statements against 1x:
@@ -2722,7 +3406,8 @@ const genStatements = (n: number): string => {
 };
 
 shardTest({
-  name: "scaling shape: control — twenty times the work reds the fuel and the allocation grader",
+  name:
+    "scaling shape: control — twenty times the work reds the fuel and the allocation grader",
   ignore: !ENABLED,
   fn: async () => {
     const note = "unreachable: the control exists to fail.";
@@ -2735,14 +3420,18 @@ shardTest({
       throw new Error(
         "the fuel control did not red: 2,000 statements against 100 of the same came in under " +
           `2.5x the guest fuel. The fuel reading has stopped measuring, so every compile axis ` +
-          `above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
+          `above is worth nothing — fix the grader, not this case. (${
+            red || "no error"
+          })`,
       );
     }
     if (!red.includes("allocation control: the many-entity arm")) {
       throw new Error(
         "the allocation control did not red: 2,000 statements against 100 of the same came in " +
           "under 2.5x the bytes allocated. The `[alloc]` reading has stopped measuring, so every " +
-          `allocation axis above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
+          `allocation axis above is worth nothing — fix the grader, not this case. (${
+            red || "no error"
+          })`,
       );
     }
   },

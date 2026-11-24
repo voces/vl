@@ -15,6 +15,7 @@ import {
   OVar,
   Opnd,
   PStaged,
+  RAfterEffects,
   RArmSite,
   RArmUnbox,
   RAsTail,
@@ -288,6 +289,14 @@ function opRep(o: Opnd): i32 {
     OImm => o.oiRep
     OStr => o.osRep
   }
+}
+
+// A record compare side's value rep: operand `o`'s, or, with an index (`ix`), its list's element's.
+function eqSideRep(o: Opnd, ix: Opnd[]): i32 {
+  const r = opRep(o)
+  if ix.length == 0 { return r }
+  const n = repNodeAt(r)
+  return if n is RList { n.rlsElem } else { r }
 }
 
 // A map operation's receiver: global `sym` of a map rep, or, where `sym` is -1, a variable `loc`
@@ -766,6 +775,15 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RAfterEffects => {
+      for e in r.aeEff { use(e, at) }
+      use(r.aeV, at)
+      // The effects are dropped; the value is the default's, at its own rep.
+      if opRep(r.aeV) != dst {
+        return fail(2, at, "a value after effects is not at its value's rep")
+      }
+      0
+    }
     RAsTail => {
       use(r.akV, at)
       // The member test reads a staged scalar: an atom id, or a numeric literal's base.
@@ -1086,6 +1104,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         }
       } else if own == 0 && repPrim(dst) == "null" {
         // The `null` unit's one value is the bottom ref.
+      } else if own == 0 && d is RNullable && d.rnDisc != 1 {
+        return fail(2, at, "the bottom ref is no sentinel's or box's null")
       } else if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
         return fail(
           2,
@@ -1724,11 +1744,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if repIsScalar(opRep(r.seL)) || repIsScalar(opRep(r.seR)) {
         return fail(2, at, "a record compare's operands are references")
       }
-      // The guarded compare tests each side's null; one side at least can be null.
+      // The guarded compare tests each side's null, an element side's at its list's element rep;
+      // one side at least can be null.
       if (
         r.seNul
-        && !(repNodeAt(opRep(r.seL)) is RNullable)
-        && !(repNodeAt(opRep(r.seR)) is RNullable)
+        && !(repNodeAt(eqSideRep(r.seL, r.seLIx)) is RNullable)
+        && !(repNodeAt(eqSideRep(r.seR, r.seRIx)) is RNullable)
       ) {
         return fail(2, at, "a nullable record compare has a nullable operand")
       }
@@ -1780,7 +1801,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       while i < r.soArgs.length {
         const idx = (r.soOp == "slice"
           || r.soOp == "charcode"
-          || r.soOp == "cpat")
+          || r.soOp == "cpat"
+          || r.soOp == "charbound")
           && i > 0
         const want = if r.soOp == "fromcp" || idx { vfI32 } else { vfStr }
         if opRep(r.soArgs[i]) != want {
@@ -3054,7 +3076,8 @@ function simdCheck(r: RSimd, dst: i32, at: i32) {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RArmSite |
+    RAfterEffects |
+      RArmSite |
       RArmUnbox |
       RAsTail |
       RAsUnion |
@@ -3270,10 +3293,11 @@ function boxLeadsWhy(f: IrFn): string {
 function mapGetDstOk(val: i32, dst: i32): boolean {
   if dst == val { return true }
   const n = repNodeAt(dst)
-  // Narrowed, a value that is itself a ref niche reads as the record inside it.
+  // Narrowed, a value that is itself a ref niche reads as the record inside it, and an atom's
+  // `-1` niche as the bare atom.
   const v = repNodeAt(val)
   return n is RNullable && n.rnInner == val
-    || v is RNullable && v.rnDisc == 1 && v.rnInner == dst
+    || v is RNullable && (v.rnDisc == 1 || v.rnDisc == 3) && v.rnInner == dst
 }
 
 export let irBoundsRuleHook: (f: IrFn) => string = boundsNone

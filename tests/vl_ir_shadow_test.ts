@@ -217,6 +217,42 @@ Deno.test({
   },
 });
 
+// A nullable record compare's element side banks the element-read rows of its null tests and
+// fields: with them dropped (control 5) the row's spans count reds.
+Deno.test({
+  name: "ir shadow: a nullable record compare's element side banks its element-read rows",
+  ignore,
+  fn: () => {
+    const row = fileRows.find((r) => r.file.endsWith("/nullable-record-compare-element-side.vl"));
+    if (row === undefined) throw new Error("want the nullable-record-compare-element-side row, got none");
+    gradeRow(row);
+    reds(() => gradeRow(row, DIVERGENCES, 5), "spans");
+  },
+});
+
+// Verifier rule 2's nullable-compare pair: an element side counts at its list's element rep, so a
+// bare record against a nullable element verifies; a compare with no nullable side, marked
+// nullable (`irShadowCorrupt(9)`), is refused.
+Deno.test({
+  name: "ir shadow: a nullable record compare needs a nullable side, an element side's at its element rep",
+  ignore,
+  fn: () => {
+    const held = "type C = { r: i32 }\nfunction f(xs: (C | null)[], y: C) { return y == xs[0] }\n" +
+      "print(f([{ r: 1 }], { r: 1 }))\n";
+    const ok = run(held, true);
+    if (failures(ok.rows).length > 0 || ok.rows.get("matched") !== 1) {
+      throw new Error(`want f matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const bare = "type C = { r: i32 }\nfunction f(xs: C[], y: C) { return y == xs[0] }\n" +
+      "print(f([{ r: 1 }], { r: 1 }))\n";
+    const { rows } = run(bare, true, 9);
+    const want = "a nullable record compare has a nullable operand";
+    if (!failures(rows).some((k) => k.includes(want))) {
+      throw new Error(`want a fail row naming "${want}", got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A record compare's element side over a place receiver banks the element-read rows legacy's
 // own root writes at each field: with them dropped (control 5) the row's spans count reds.
 Deno.test({
@@ -1685,6 +1721,8 @@ Deno.test({
       "map-read-out-unwritten": 5,
       "shared-read-of-temp": 2,
       "map-read-mv-into-wrong-out": 2,
+      "null-none-into-bool-niche": 2,
+      "null-none-into-ref-niche": 0,
       "nul-ref-of-i32": 2,
       "nul-ref-of-non-null-list": 2,
       "nul-ref-list-into-i32": 2,
@@ -1754,6 +1792,8 @@ Deno.test({
       "atom-tower-zero-reads": 2,
       "atom-staged-of-i32": 2,
       "map-get-boxed-scalar-into-bool": 2,
+      "map-get-atom-niche-narrowed": 0,
+      "map-get-atom-niche-into-string": 2,
       "field-coalesce-of-i32-receiver": 2,
       "bool-join-coalesce-of-i32": 2,
       "trunc-sat-operand-off-plan": 2,
@@ -1818,6 +1858,8 @@ Deno.test({
       "asg-unwiden-non-null-of-record": 2,
       "map-print-of-i32": 0,
       "map-print-of-string": 2,
+      "after-effects-at-value-rep": 0,
+      "after-effects-off-value-rep": 2,
       "null-of-plain": 0,
       "null-of-place-with-read": 0,
       "null-of-read-off-place": 2,
@@ -3259,7 +3301,8 @@ Deno.test({
 
 // A lone-literal field filled from a binding of that literal, built at a parameter's row that
 // keeps the field as its atom: the binding's member id (`atom_sole`) is an atom typed at the
-// literal, which rule 3 admits (`loneLitAtom`). The callee's own row read stays a named miss.
+// literal, which rule 3 admits (`loneLitAtom`). The callee reads the field at its atom, which its
+// `print` decodes.
 const LONE_LIT_ATOM_ARG: string[] = [
   "function show(r: { f: \"a\", g: i32 }) { print(r.f) }\nfunction h(x: \"a\") {\n  show({ f: x, g: 1 })\n}\nh(\"a\")\n",
   "function show(r: { f: \"a\" }) { print(r.f) }\nfunction h(x: \"a\") {\n  show({ f: x })\n}\nh(\"a\")\n",
@@ -3275,8 +3318,8 @@ Deno.test({
       if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
       const fails = failures(rows);
       if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
-      if ((rows.get("matched") ?? 0) < 1 || (rows.get("uncovered member record") ?? 0) !== 1) {
-        throw new Error(`want h matched and show a named member-record miss, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      if ((rows.get("matched") ?? 0) < 2 || rows.has("uncovered member record")) {
+        throw new Error(`want h and show matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
       }
     }
   },
