@@ -36,7 +36,27 @@ None new.
 
 ## Readings (fixpoint seeds on both sides, master 992d11c7)
 
-READINGS
+Functions with no blocker, `VL_IR_SHADOW=4`: tests/cases 79,489 -> 79,508; distilled corpus 45,555
+-> 45,556. `null test nullty operand` (sole): tests/cases 18 -> 1, corpus 1 -> 0 (the 3 corpus cells
+still carrying it ride with `map read default rep`, IR-M1's). No program loses a function.
+
+| program | change |
+| --- | ---: |
+| `soundness/list-callback-at-kept-maker-build-runs.vl` | +5 |
+| `lists/annotated-callback-over-built-list.vl` | +3 |
+| `lists/callback-over-field-of-built-list.vl` | +2 |
+| `lists/same-elems-result-in-literal.vl` | +2 |
+| `structs/map-callback-record-result-over-built-list.vl` | +2 |
+| `null/nullty-null-test-callback-param-at-stored-row.vl` (new witness) | +2 |
+| `lists/map-identity-callback-over-built-list.vl` | +1 |
+| `closures/bundle-record-held-in-a-record-field.vl` | +1 |
+| `narrowing/record-is-narrows-non-literal-field-runs.vl` | +1 |
+| corpus `b000418` | +1 |
+
+What stays: `lists/callback-nested-capture-over-built-list.vl`'s captured parameter (it has no bound
+variable in the nested closure, and `capture binding` refuses that function first); 3 functions at
+`narrowed read` (N7's) where a parameter read is a delivery (`show(y)`, `return y`), which this
+step leaves unchanged.
 
 Witness: `tests/cases/null/nullty-null-test-callback-param-at-stored-row.vl` (an annotated lambda,
 a named function, a test after a constant field, a closure `let`); it prints `1 true true 2 0 5`
