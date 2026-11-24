@@ -1747,6 +1747,8 @@ Deno.test({
       "atom-decode-nullable-into-nullable-string": 0,
       "captured-atom-param-decoded-at-string": 0,
       "captured-atom-param-typed-as-string": 3,
+      "get-of-list": 0,
+      "get-index-of-string": 2,
       "bytes-of-string": 0,
       "bytes-of-i32": 2,
       "opt-read-of-i32": 2,
