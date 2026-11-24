@@ -175,6 +175,7 @@ import {
   RListSlice,
   RListStage,
   RLitArms,
+  RMaFoldInit,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -204,6 +205,7 @@ import {
   ROptRead,
   RPrimOp,
   RPrint,
+  RPrintOpen,
   RRawOp,
   RRecCopyPure,
   RRecordFitIs,
@@ -257,6 +259,7 @@ import {
   SSetField,
   SSwitch,
   STrap,
+  armUnboxRoute,
   coalArmStagesLeads,
   irFnNew,
   irNoTailEffHas,
@@ -341,6 +344,7 @@ import {
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
+  MemAddrPlan,
   armSiteWrite,
   arrCopyBacking,
   arrCopyPlanOf,
@@ -414,6 +418,7 @@ import {
   emitMapGetScalarBoxTail,
   emitMapGetTail,
   emitMapNew,
+  emitNarrowedArmUnboxTo,
   emitNarrowedMapReadTail,
   emitNicheReadTail,
   emitNullOwn,
@@ -513,7 +518,7 @@ import {
   mapValuesAreKeys,
   memAccessPlanOf,
   memAccessTail,
-  memAddrPlanOf,
+  memAddrPlanWith,
   memOpIsVoid,
   memOpPlanOf,
   memOpTail,
@@ -527,6 +532,7 @@ import {
   nulNicheEqWhy,
   nulNoneBoxHead,
   nulNoneBoxTail,
+  nulStructEqGuardTail,
   nulTestAtomTail,
   nulTestBoolTail,
   nulTestBoxTagTail,
@@ -561,6 +567,7 @@ import {
   printNulBoolTail,
   printNulStrOpen,
   printNulStrTail,
+  printScalarMapTail,
   printScalarTail,
   printStrTail,
   printUnionTail,
@@ -606,6 +613,7 @@ import {
   strToAtomTexts,
   strToAtomWideTail,
   structEqEnter,
+  structEqLeave,
   structEqRoots,
   structEqStagesLeft,
   structEqStagesRight,
@@ -793,6 +801,7 @@ import {
   emitFnSpanKind,
   emitFnSpanNode,
   emitFnSpanStart,
+  emitSoftMsg,
   fbEagerScratch,
   fbFrameParams,
   fnStmts,
@@ -801,6 +810,7 @@ import {
   gCellIdx,
   gHelpF64Rem,
   gImports,
+  gTestClaimRefusal,
   liKinds,
   listIdxScratchBase,
   localIsRef,
@@ -880,6 +890,15 @@ let lwRowOpenTemp: {[i32]: i32} = Map()
 
 export function irLMiss(why: string) {
   if lwMiss == "" { lwMiss = why }
+  return 0
+}
+
+// A refusal a shared legacy helper raises while a claim lowers (`emitSoftMsg`, recorded only
+// inside a claim seam) is the claim's miss, so it declines and legacy writes the unit.
+function softMiss(name: string) {
+  if emitSoftMsg != "" {
+    irLMiss("a legacy helper refused in `" + name + "`: " + emitSoftMsg)
+  }
   return 0
 }
 
@@ -1179,6 +1198,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMapEq => mapEq(r)
     RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
+    RPrintOpen => irLMiss("print open value")
     RNumUnionBin => numUnionBin(r)
     RNumUnionConvert => {
       // Legacy stashes the box one dispatch level deeper, then converts at its member.
@@ -1356,6 +1376,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListNewDefault => listNewDefault(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
+    RMaFoldInit => maFoldInit(r)
     RAtomic => atomic(r)
     RTruncSat => truncSat(r)
     RMemOp => memOp(r)
@@ -2540,19 +2561,25 @@ function plainVarLocal(o: Opnd): i32 {
   return s
 }
 
-// `RArmUnbox`: the box, then the table's cast to the read's arm record (`emitArmUnboxAtCell`).
+// `RArmUnbox`: the box, then the table's cast to the read's arm record (`emitArmUnboxAtCell`). An
+// assignment's box takes its destination's (`emitNarrowedArmUnboxTo`), where legacy's position casts.
 function armUnbox(r: RArmUnbox) {
   irLOpnd(r.uaV)
-  if r.uaDst >= 0 {
-    if emitRecordArmsUnboxTo(recHeapOf(r.uaDst), r.uaAt, lw.irAt) < 0 {
-      return irLMiss("record arms unbox heap")
+  return match armUnboxRoute(r) {
+    "asg" => emitNarrowedArmUnboxTo(recHeapOf(r.uaDst), r.uaAt, lw.irAt)
+    "recordArms" => {
+      if emitRecordArmsUnboxTo(recHeapOf(r.uaDst), r.uaAt, lw.irAt) < 0 {
+        return irLMiss("record arms unbox heap")
+      }
+      0
     }
-    return 0
+    "arm" => {
+      if emitArmUnboxAtCell(r.uaAt, lw.irAt, r.uaCellNul) < 0 {
+        return irLMiss("arm unbox heap")
+      }
+      0
+    }
   }
-  if emitArmUnboxAtCell(r.uaAt, lw.irAt, r.uaCellNul) < 0 {
-    return irLMiss("arm unbox heap")
-  }
-  return 0
 }
 
 // `RBoxNarrow` of a ref list or map arm: the box, then legacy's payload cast to the container,
@@ -2649,11 +2676,11 @@ function simd(r: RSimd) {
   const row = simdCallRow(c)
   if !(f is Ident) || row < 0 { return irLMiss("simd node") }
   if simdRowIsMem(row) {
-    const ap = memAddrPlanOf(c, simdMemBase(row), lw.irAt)
-    if ap.maArm != "const" && ap.maArm != "rest" {
+    const ap = irAddrPlan(c, simdMemBase(row))
+    if ap.maArm != "const" && ap.maArm != "rest" && ap.maArm != "fold" {
       return irLMiss("simd memory plan")
     }
-    for a in r.sdArgs { irLOpnd(a) }
+    addrOpnds(r.sdArgs, ap)
     return simdMemTail(row, ap.maOff)
   }
   for a in r.sdArgs { irLOpnd(a) }
@@ -2670,12 +2697,51 @@ function memAccess(r: RMemAccess) {
   const f = nodeAt(c.callFn)
   if !(f is Ident) { return irLMiss("memory access node") }
   const p = memAccessPlanOf(f.identName)
-  const ap = memAddrPlanOf(c, p.mxBase, lw.irAt)
-  if p.mxOp < 0 || (ap.maArm != "const" && ap.maArm != "rest") {
+  const ap = irAddrPlan(c, p.mxBase)
+  if (
+    p.mxOp < 0
+    || ap.maArm != "const" && ap.maArm != "rest" && ap.maArm != "fold"
+  ) {
     return irLMiss("memory access plan")
   }
-  for o in r.mmArgs { irLOpnd(o) }
+  addrOpnds(r.mmArgs, ap)
   return memAccessTail(p, ap.maOff)
+}
+
+// The address plan of memory call `c` (`base` declared operands) over the fold rows the builder
+// derived (`irMaDecl`), as `memAddrPlanOf` answers it over legacy's own.
+function irAddrPlan(c: Call, base: i32): MemAddrPlan {
+  return memAddrPlanWith(
+    c,
+    base,
+    lw.irAt,
+    { mfDecl: lw.irMaDecl, mfSlot: lw.irMaSlot, mfK: lw.irMaK },
+  )
+}
+
+// An access's operands along plan `ap`: on the `fold` arm its address is the fold's local, read in
+// place of the binding the builder named, which holds that local plus the plan's offset.
+function addrOpnds(args: Opnd[], ap: MemAddrPlan) {
+  let i = 0
+  while i < args.length {
+    if i == 0 && ap.maArm == "fold" {
+      fbLocalGet(ap.maRest)
+    } else {
+      irLOpnd(args[i])
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// `RMaFoldInit` as `emitMemConstFoldLet` writes it: the bounded part, teed into its fold local,
+// then plus the folded constant.
+function maFoldInit(r: RMaFoldInit) {
+  irLOpnd(r.mfiV)
+  fbLocalTee(r.mfiSlot)
+  fbI32Const(r.mfiK as% i32)
+  fbI32Bin(0x6a)
+  return 0
 }
 
 // `RAtomic`: legacy's atomic arm in `emitAtomicIntrinsic`'s order: the address the builder took
@@ -2686,9 +2752,11 @@ function atomic(r: RAtomic) {
   const pl = atomicPlanOf(c)
   if pl.apFail != "" { return irLMiss("atomic plan") }
   if pl.apBase == 0 { return atomicTail(pl.apRow, 0) }
-  const ap = memAddrPlanOf(c, pl.apBase, lw.irAt)
-  if ap.maArm != "const" && ap.maArm != "rest" { return irLMiss("atomic plan") }
-  for o in r.amArgs { irLOpnd(o) }
+  const ap = irAddrPlan(c, pl.apBase)
+  if ap.maArm != "const" && ap.maArm != "rest" && ap.maArm != "fold" {
+    return irLMiss("atomic plan")
+  }
+  addrOpnds(r.amArgs, ap)
   return atomicTail(pl.apRow, ap.maOff)
 }
 
@@ -3123,6 +3191,15 @@ function framesPop(k: i32) {
   return 0
 }
 
+// `RPrintOpen`: legacy's two blocks a nullable string's or boolean's print opens before its
+// operand, each an open frame until the opened `RPrint` closes them.
+function printOpen(r: RPrintOpen) {
+  if r.poArm == 1 { printNulBoolOpen() } else { printNulStrOpen() }
+  lwFrames.push(-1)
+  lwFrames.push(-1)
+  return 0
+}
+
 // `RPrint`: the argument, then legacy's tail for the arm `printArmOf` names, a string stream or
 // one scalar print import.
 function printOp(r: RPrint) {
@@ -3130,6 +3207,21 @@ function printOp(r: RPrint) {
   const c = nodeAt(r.pnAt)
   if !(c is Call) || c.callArgs.length != 1 { return irLMiss("print node") }
   const arm = printArmOf(c.callArgs[0], lw.irAt)
+  // A print an `RPrintOpen` opened before its operand's statements writes only the operand and
+  // the tail, and closes the two frames the open pushed.
+  if r.pnOpened >= 0 {
+    if (
+      r.pnOpened
+      != (if arm == "nulBool" { 1 } else if arm == "nulStr" { 0 } else { -1 })
+    ) {
+      return irLMiss("print open arm")
+    }
+    irLOpnd(r.pnV)
+    const rc = if r.pnOpened == 1 { printNulBoolTail() } else { printNulStrTail() }
+    lwFrames.pop()
+    lwFrames.pop()
+    return rc
+  }
   if arm == "nulStr" {
     printNulStrOpen()
     irLOpnd(r.pnV)
@@ -3253,6 +3345,11 @@ function mapGet(r: RMapGet) {
   if !(nd is Index) { return irLMiss("map get node") }
   if r.mtSym >= 0 && userGlobalReadClass(r.mtSym, lwGlobalCtx) != "plain" {
     return irLMiss("map get of a global not read plainly")
+  }
+  // `print`'s read: the probe, then the value or `null` printed (`printScalarMapTail`).
+  if r.mtPrint >= 0 {
+    mapProbeHead(nd.idxArr, r.mtSym, r.mtNonNull, r.mtLoc, r.mtKey)
+    return printScalarMapTail(r.mtPrint)
   }
   // `as!`'s read: the probe, then its trap on a miss and the stored value.
   if r.mtTrap {
@@ -3817,11 +3914,24 @@ function structEq(r: RStructEq) {
   if plan.erL.epSlot == -2 || plan.erR.epSlot == -2 {
     return irLMiss("record compare element place")
   }
+  if r.seNul && (lE || rE) {
+    return irLMiss("nullable record compare element place")
+  }
   const saved = structEqEnter()
   if lS { irLOpnd(r.seL) }
   if rS { irLOpnd(r.seR) }
   structEqPlaceSkip(lG, rG, r)
   const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
+  // Two nullable records' compare: the nullness guard and the fields, then `!=`'s `i32.eqz`, as
+  // `emitNulNicheEqBin` writes it after the guarded block.
+  if r.seNul {
+    if nulStructEqGuardTail(n.binLeft, n.binRight, roots, row, fnIx) < 0 {
+      return irLMiss("nullable record compare fields")
+    }
+    structEqLeave(saved)
+    if n.binOp == "!=" { fbI32Eqz() }
+    return 0
+  }
   if structEqTail(n, row, roots, saved, fnIx, plan) < 0 {
     return irLMiss("record compare fields")
   }
@@ -4439,6 +4549,15 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
+      if r is RPrintOpen {
+        irLSettle(pending)
+        return printOpen(r)
+      }
+      if r is RMapGet && r.mtPrint >= 0 {
+        mapGet(r)
+        irLSettle(pending)
+        return 0
+      }
       if r is RListCopy {
         listCopy(r)
         irLSettle(pending)
@@ -4581,22 +4700,28 @@ function optRead(r: ROptRead) {
   if arm != "nonNull" {
     irLOpnd(r.orV)
     fbRefIsNull()
-    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r) }
+    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r, true) }
     emitOptLinkNullClose(r.orAt, lw.irAt)
     emitOptLeafHead(r.orAt, lw.irAt)
+    optReadBase(r, true)
+  } else {
+    optReadBase(r, false)
   }
-  optReadBase(r)
   emitOptLeafTail(r.orAt, lw.irAt)
   return 0
 }
 
-// The optional read's base as `emitOptChainValue` pushes an unstaged one: its niche recovered.
-function optReadBase(r: ROptRead) {
-  irLOpnd(r.orV)
+// The optional read's base as `emitOptChainValue` pushes an unstaged one, `again` once the null
+// test has read it (a temp's read written again, `opndAgain`): its niche recovered.
+function optReadBase(r: ROptRead, again: boolean) {
   const m = nodeAt(r.orAt)
-  if m is OptMember && exprNullableRefNiche(m.omObj, lw.irAt) {
-    fbRefAsNonNull()
+  if !(m is OptMember) { return irLMiss("optional read node") }
+  if again {
+    if opndAgain(r.orV, m.omObj) < 0 { return -1 }
+  } else {
+    irLOpnd(r.orV)
   }
+  if exprNullableRefNiche(m.omObj, lw.irAt) { fbRefAsNonNull() }
   return 0
 }
 
@@ -5812,6 +5937,7 @@ export function irLowerFragment(
   const at = cur.length
   lwReset(f, ctx, cur)
   fragmentBody(f.irBody, out)
+  softMiss(f.irName)
   if lwSinkFired > 0 { irLMiss("fragment return") }
   if ctrlDepth != depth0 { irLMiss("fragment control depth") }
   const why = lwMiss
@@ -5904,7 +6030,14 @@ export function irLowerClaim(
   out: u8[],
 ): string {
   const callees0 = dfeCallee.length
+  if gTestClaimRefusal == 1 {
+    emitFail("emitProgram: test claim refusal before the body")
+  }
   const got = entry(f, ctx)
+  if gTestClaimRefusal == 2 {
+    emitFail("emitProgram: test claim refusal after the body")
+  }
+  softMiss(f.irName)
   if lwMiss != "" {
     while dfeCallee.length > callees0 { dfeCallee.pop() }
     // Legacy lowers the function in its place, from the empty lazy frame `fbBeginFunc` left.
@@ -5947,6 +6080,7 @@ export function irLowerEqHelper(f: IrFn, out: u8[]): string {
   // The lazy frame grows from empty, as `fbBeginFunc` left it; the shadow's follows legacy's.
   fbResetLazyFrame()
   lowerBody(f, lwGlobalCtx)
+  softMiss(f.irName)
   if lwPushed.length > 0 { irLMiss("push never consumed") }
   if lwMiss != "" {
     fbResetLazyFrame()
@@ -5978,6 +6112,7 @@ export function irLowerHelper(f: IrFn, out: u8[]): string {
   if !f.irHelper { return "not a helper" }
   fnUses.unionSink = false
   lowerBody(f, lwGlobalCtx)
+  softMiss(f.irName)
   const runs: i32[] = []
   let slot = f.irParams.length
   for v in f.irVars {

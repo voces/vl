@@ -1153,6 +1153,7 @@ import {
   atomEqSlotOfKind,
   eqKindIsRecord,
   eqRowFieldCount,
+  eqRowFieldElemTyIx,
   eqRowFieldKind,
   eqRowHeapIdx,
   eqRowOfVariant,
@@ -8180,8 +8181,16 @@ function listGetStageSave(): i32[] {
   return sv
 }
 
+// `emitPop`'s `.get` opening, for the IR's lowering of the same call: the markers saved, then
+// `callIx`'s operands marked as `emitPopGo` marks them. `listGetStageRestore` closes it.
+export function listGetStageEnter(callIx: i32): i32[] {
+  const sv = listGetStageSave()
+  listGetStageMark(callIx)
+  return sv
+}
+
 // Put back what `listGetStageSave` took.
-function listGetStageRestore(sv: i32[]) {
+export function listGetStageRestore(sv: i32[]) {
   listGetIdxStagedIx = sv[0]
   listGetIdxStagedSet = sv[1] == 1
   listGetRecvStagedIx = sv[2]
@@ -10452,7 +10461,7 @@ function exprRecordArmsAt(exprIx: i32, fnIx: i32, heapIdx: i32): boolean {
 // `exprIx` is narrowed to `X | null`. Emitted after the value, so the box is already on the
 // stack. A negative `heapIdx` emits nothing: a destination whose table slot never resolved has
 // no cast target, and `ref.cast -1` would put a garbage heap index in the module.
-function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32, fnIx: i32) {
+export function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32, fnIx: i32) {
   if !armUnboxCastOwed(heapIdx, exprIx, fnIx) { return 0 }
   armSrcShadowNote(heapIdx, exprIx, fnIx)
   return emitArmUnboxCast(heapIdx, armUnboxNullable(exprIx, fnIx))
@@ -16284,18 +16293,24 @@ function emitPrintScalarMapRead(argIx: i32, k: i32, fnIx: i32) {
   const e = nodeAt(unwrapParen(argIx))
   if e is Index {
     if emitMapPrep(e.idxArr, e.idxIndex, fnIx) < 0 { return -1 }
-    pushMapScr(5) // entry
-    fbIf(64)      // void
-    pushMapScalarHit()
-    if emitPrintScalarSink(k) < 0 { return -1 }
-    fbElse()
-    emitPrintNullWord()
-    fbEnd()
-    return 0
+    return printScalarMapTail(k)
   }
   return emitFail(
     "emitProgram: scalar map-read print over an operand that is not an index read",
   )
+}
+
+// After a scalar map read's probe: the stored value through its kind `k`'s sink on a hit, the
+// word `null` on a miss.
+export function printScalarMapTail(k: i32): i32 {
+  pushMapScr(5) // entry
+  fbIf(64)      // void
+  pushMapScalarHit()
+  if emitPrintScalarSink(k) < 0 { return -1 }
+  fbElse()
+  emitPrintNullWord()
+  fbEnd()
+  return 0
 }
 
 // How `==`/`!=` node `e` compares a bare scalar-valued map read (D2466): both reads of one kind
@@ -22182,35 +22197,8 @@ export function nulNicheEqNullTail(): i32 {
 function emitNulStructEq(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    // Asks the same two namespaces as the non-null dispatch, in the same order (niche rung
-    // first) — asking only the struct one is how the nullable half drifts out of the
-    // non-null half's capability. `siFound` is load-bearing, not decoration: an eq row is
-    // `>= 0` for a struct and `< 0` for a variant, so `-1` is variant row 0 and cannot double as "no answer".
-    let si = -1
-    let siFound = false
-    const nvi = binEqNulVariantRow(binIx, fnIx)
-    if nvi >= 0 {
-      si = eqRowOfVariant(nvi)
-      siFound = true
-    }
-    if !siFound {
-      const nsSi = structIndexOfExpr(e.binLeft, fnIx)
-      if nsSi >= 0 {
-        si = nsSi
-        siFound = true
-      }
-    }
-    if !siFound {
-      // One side nullable over a variant record, the other that record bare: one variant row.
-      const lnv = nulVariantIdxOfExpr(e.binLeft, fnIx)
-      const pv = if lnv >= 0 { lnv } else { nulVariantIdxOfExpr(e.binRight, fnIx) }
-      const bare = if lnv >= 0 { e.binRight } else { e.binLeft }
-      if pv >= 0 && eqConcreteVariantRow(bare, fnIx) == pv {
-        si = eqRowOfVariant(pv)
-        siFound = true
-      }
-    }
-    if !siFound {
+    const si = nulStructEqRowOf(binIx, fnIx)
+    if si == NUL_STRUCT_EQ_NO_ROW {
       return emitFail("emitProgram: struct equality over a non-struct operand")
     }
     const savedL = eqStashL
@@ -22223,10 +22211,47 @@ function emitNulStructEq(binIx: i32, fnIx: i32) {
   return emitFail("emitProgram: expected a nullable-struct equality")
 }
 
+// What `nulStructEqRowOf` answers where no namespace names a row: no eq row is this low.
+export const NUL_STRUCT_EQ_NO_ROW = -1000000
+
+// The eq row nullable-record compare `binIx` reads its fields through, or `NUL_STRUCT_EQ_NO_ROW`.
+// Legacy and the IR share it.
+export function nulStructEqRowOf(binIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(binIx)
+  if !(e is BinExpr) { return NUL_STRUCT_EQ_NO_ROW }
+  // Asks the same two namespaces as the non-null dispatch, in the same order (niche rung
+  // first) — asking only the struct one is how the nullable half drifts out of the
+  // non-null half's capability. An eq row is `>= 0` for a struct and `< 0` for a variant.
+  const nvi = binEqNulVariantRow(binIx, fnIx)
+  if nvi >= 0 { return eqRowOfVariant(nvi) }
+  const nsSi = structIndexOfExpr(e.binLeft, fnIx)
+  if nsSi >= 0 { return nsSi }
+  // One side nullable over a variant record, the other that record bare: one variant row.
+  const lnv = nulVariantIdxOfExpr(e.binLeft, fnIx)
+  const pv = if lnv >= 0 { lnv } else { nulVariantIdxOfExpr(e.binRight, fnIx) }
+  const bare = if lnv >= 0 { e.binRight } else { e.binLeft }
+  if pv >= 0 && eqConcreteVariantRow(bare, fnIx) == pv {
+    return eqRowOfVariant(pv)
+  }
+  return NUL_STRUCT_EQ_NO_ROW
+}
+
 // `emitNulStructEq`'s guard and compare at eq row `si`, over roots staged once (`structEqStage`).
 function emitNulStructEqAt(lIx: i32, rIx: i32, si: i32, fnIx: i32) {
   const roots = structEqStage(lIx, rIx, si, fnIx)
   if roots[0] == -1 { return -1 }
+  return nulStructEqGuardTail(lIx, rIx, roots, si, fnIx)
+}
+
+// After the roots of a nullable-record compare at eq row `si`: `0` where the sides disagree on
+// nullness, `1` where both are null, else the field-wise compare. Legacy and the IR share it.
+export function nulStructEqGuardTail(
+  lIx: i32,
+  rIx: i32,
+  roots: i32[],
+  si: i32,
+  fnIx: i32,
+) {
   const lRoot = roots[0]
   const rRoot = roots[1]
   fbBlock(127) // block i32 — $out
@@ -22251,6 +22276,13 @@ function emitNulStructEqAt(lIx: i32, rIx: i32, si: i32, fnIx: i32) {
     return -1
   }
   fbEnd()
+  return 0
+}
+
+// The stash slots `structEqEnter` saved, restored after a compare that is not `structEqTail`'s.
+export function structEqLeave(saved: i32[]) {
+  eqStashL = saved[0]
+  eqStashR = saved[1]
   return 0
 }
 
@@ -22744,7 +22776,7 @@ function emitStructEqFieldAt(
     // level: tag first, then the arm the tag selects, reading the two boxes off a field
     // path instead of off two operands. Columns are resolved first, so an arm set the
     // core cannot serve declines before any byte is written and reaches the loud refusal below (D1290).
-    const bxTy = sFieldElemTyIxAt(si, fi)
+    const bxTy = eqRowFieldElemTyIx(si, fi)
     if bxTy >= 0 {
       const bxArms: i32[] = []
       const bxVis: i32[] = []
@@ -23469,6 +23501,12 @@ function emitStrIsCharBoundary(callIx: i32, fnIx: i32) {
   return emitFail("emitProgram: expected a string isCharBoundary call")
 }
 
+// `s.bytes()` over its receiver on the stack. Legacy and the IR share it.
+export function strBytesTail() {
+  fbCall(helpStrBytesFn())
+  return 0
+}
+
 // Lower `s.bytes()` — one call into `__str_bytes__`, which `array.copy`s the view's byte
 // range into a fresh `u8[]`. The helper's functype mints the packed pair.
 function emitStrBytes(callIx: i32, fnIx: i32) {
@@ -23484,8 +23522,7 @@ function emitStrBytes(callIx: i32, fnIx: i32) {
     const callee = nodeAt(c.callFn)
     if callee is Member {
       if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
-      fbCall(helpStrBytesFn())
-      return 0
+      return strBytesTail()
     }
     return emitFail(
       "emitProgram: string .bytes receiver is not a member access",
@@ -24176,9 +24213,13 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   if p.ijArm == "atom" {
     return if ifJoinDropsNulAtom(ifIx, fnIx, "atom") { "string drops null atom" } else { "" }
   }
+  const rk = p.ijRef.rjKind
+  // A join at a record's own row is legacy's reference join, a narrowed arm unboxed in its arm.
+  if p.ijArm == "ref" && rk != null && joinKindIsRecord(rk) {
+    return "ref " + rk
+  }
   // A union join with no render name takes a later rung in legacy; the IR lowers no union join.
   if exprUnion(ifIx, fnIx) { return "union" }
-  const rk = p.ijRef.rjKind
   if rk != null { return "ref " + rk }
   if ifJoinDropsNulAtom(ifIx, fnIx, "scalar") {
     return "string drops null atom"
@@ -27566,7 +27607,7 @@ function memConstFoldRest(a: BinExpr, fnIx: i32): i32 {
 // or -1 when the whole initializer is already constant (nothing to preserve at runtime) or
 // matches neither shape. `emitLetDeclStmt` and `maFoldCandidateCount` share this one answer,
 // since a deviation between them is unsound.
-function memConstFoldShapeK(initIx: i32, fnIx: i32): i64 {
+export function memConstFoldShapeK(initIx: i32, fnIx: i32): i64 {
   const ix = unwrapParen(initIx)
   if ix < 0 || ix >= P.nodes.length { return -1 }
   if memAddrConst(ix, fnIx) >= 0 { return -1 }
@@ -27582,7 +27623,7 @@ function memConstFoldShapeK(initIx: i32, fnIx: i32): i64 {
 
 // The bounded operand `memConstFoldShapeK` found, or -1 when it found none — a second, cheap
 // re-derivation rather than a two-value return, since VL has no tuple type here.
-function memConstFoldShapeRest(initIx: i32, fnIx: i32): i32 {
+export function memConstFoldShapeRest(initIx: i32, fnIx: i32): i32 {
   const ix = unwrapParen(initIx)
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const e = nodeAt(ix)
@@ -27593,7 +27634,7 @@ function memConstFoldShapeRest(initIx: i32, fnIx: i32): i32 {
 // True when `initIx`'s top-level shape is a `+` at all — the one cheap, non-recursive check
 // every caller of `memConstFoldShapeK` runs first, so the real (`memAddrConst`/`memAddrBound`)
 // analysis is skipped for the vast majority of `const`s, which are never address sums.
-function mfShapeIsSum(initIx: i32): boolean {
+export function mfShapeIsSum(initIx: i32): boolean {
   const ix = unwrapParen(initIx)
   if ix < 0 || ix >= P.nodes.length { return false }
   const e = nodeAt(ix)
@@ -27653,15 +27694,20 @@ function maFoldRowOfDecl(declIx: i32): i32 {
   return -1
 }
 
-// The fold table's row for the `Ident` read at `ix`, or -1 — through the slot the read's own
-// declaration names, so a shadowed name in a nested block can never match an outer
+// The row of fold declarations `decls` for the `Ident` read at `ix`, or -1 — through the slot the
+// read's own declaration names, so a shadowed name in a nested block can never match an outer
 // declaration's row.
-function maFoldRowOf(ix: i32): i32 {
+function maFoldRowIn(ix: i32, decls: i32[]): i32 {
   const slot = declaredSlotOf(ix)
   if slot < 0 || slot >= localDeclIx.length { return -1 }
   const decl = localDeclIx[slot]
   if decl < 0 { return -1 }
-  return maFoldRowOfDecl(decl)
+  let i = 0
+  while i < decls.length {
+    if decls[i] == decl { return i }
+    i = i + 1
+  }
+  return -1
 }
 
 // Emits a qualifying `const`'s initializer: push the bounded part, tee it into this
@@ -27735,7 +27781,27 @@ function memAddrAt(arm: MemAddrArm, rest: i32, off: i64): MemAddrPlan {
   return { maArm: arm, maRest: rest, maOff: off }
 }
 
+// A function's declaration-time address-fold rows: each qualifying `const`'s node, the wasm local
+// its bounded part is kept in, and the constant it folds out.
+export type MaFoldRows = { mfDecl: i32[], mfSlot: i32[], mfK: i64[] }
+
 export function memAddrPlanOf(c: Call, base: i32, fnIx: i32): MemAddrPlan {
+  return memAddrPlanWith(
+    c,
+    base,
+    fnIx,
+    { mfDecl: maFoldDeclIx, mfSlot: maFoldWasmSlot, mfK: maFoldK },
+  )
+}
+
+// `memAddrPlanOf` over fold rows `rows`: legacy's own table, or the rows the IR derives before
+// legacy has written the function.
+export function memAddrPlanWith(
+  c: Call,
+  base: i32,
+  fnIx: i32,
+  rows: MaFoldRows,
+): MemAddrPlan {
   let off: i64 = 0
   if c.callArgs.length == base + 1 {
     off = memOffsetConstValue(c.callArgs[1], fnIx)
@@ -27756,11 +27822,11 @@ export function memAddrPlanOf(c: Call, base: i32, fnIx: i32): MemAddrPlan {
   }
   const a = nodeAt(addr)
   if a is Ident {
-    const mf = maFoldRowOf(addr)
+    const mf = maFoldRowIn(addr, rows.mfDecl)
     if mf >= 0 {
-      const k = maFoldK[mf]
+      const k = rows.mfK[mf]
       if k + off <= MEM_OFFSET_MAX {
-        return memAddrAt("fold", maFoldWasmSlot[mf], k + off)
+        return memAddrAt("fold", rows.mfSlot[mf], k + off)
       }
     }
   }
@@ -28979,8 +29045,8 @@ export type PrintArm = "nulNone"
 // The arm `print` takes for argument `argIx` in function `fnIx`, in `emitCallCorePrint`'s order.
 export function printArmOf(argIx: i32, fnIx: i32): PrintArm {
   // The `null` type has no arm to select, and every classifier below reads a rep this value
-  // lacks (D1576).
-  if exprIsNulNone(argIx, fnIx) { return "nulNone" }
+  // lacks (D1576); an assignment of `null` yields that unit, not the cell's null (D17118).
+  if boxOperandIsNulNone(argIx, fnIx) { return "nulNone" }
   // A bare `null` literal names no cell for that classifier to read (D17093).
   const pnLit = unwrapParen(argIx)
   if pnLit >= 0 && pnLit < P.nodes.length && nodeAt(pnLit) is NullLit {
@@ -32619,7 +32685,7 @@ export function popScalarTail(
 
 // A `.get` of a view reads its refreshed snapshot (D3028, D3041): sync the scalar view of
 // kind `popEk` or the ref view behind receiver `recvIx` whose wrapper is in local `lIdx`.
-function emitListGetViewSync(
+export function emitListGetViewSync(
   lIdx: i32,
   popEk: VKind | null,
   recvIx: i32,
@@ -38455,8 +38521,8 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
 // box, a record, or an `i32`, string, byte or record list, each read whole into the loop variable.
 function forInElemPlain(ek: VKind): boolean {
   return match ek {
-    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" => true
-    "map" | "f64list" | "f32" | "nullist" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
+    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" | "nulbool" | "f32" => true
+    "map" | "f64list" | "nullist" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
   }
 }
 
@@ -41646,7 +41712,7 @@ export function nullReadDstOwnOf(exprIx: i32, fnIx: i32): i32 {
   if dt is TyNullable {
     if dt.nInner < 0 { return -1 }
   }
-  if dk == "union" { return NULL_OWN_BOX }
+  if dk == "union" { return -1 }
   return nullOwnOfTy(dst)
 }
 
@@ -44011,7 +44077,8 @@ function emitDirectArgValue(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
 function emitDirectArgUnbox(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
   const cVi = sd.cVi
   if cVi >= 0 {
-    if exprUnion(arg, fnIx) {
+    // An `if` joined at a record's row unboxes each arm itself, so its value is no box (D17115).
+    if exprUnion(arg, fnIx) && !ifJoinsAtRecord(arg, fnIx) {
       if variantHasCrossTagFits(cVi, arg, fnIx) {
         return emitFailCrossTagDelivery(arg, cVi)
       }

@@ -71,6 +71,7 @@ import {
   RListSlice,
   RListStage,
   RLitArms,
+  RMaFoldInit,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -100,6 +101,7 @@ import {
   ROptRead,
   RPrimOp,
   RPrint,
+  RPrintOpen,
   RRawOp,
   RRecCopyPure,
   RRecordFitIs,
@@ -165,6 +167,7 @@ import {
   irSigOf,
   mapBoxReadsAt,
   mapNicheReadsAt,
+  mapWalkElemRep,
   repHeldAsI32,
   repNullRefFits,
 } from "./ir"
@@ -195,6 +198,7 @@ import {
   recFieldsWiden,
   recRetag,
   recSubRetag,
+  recValRetag,
   repBoolNiche,
   repBoxCore,
   repIsNoValue,
@@ -536,6 +540,12 @@ function pushRecvOpnd(r: RListPush, at: i32): Opnd {
   return v
 }
 
+// Whether map value rep `val` is a scalar `print`'s map-read arm streams.
+function mapPrintScalar(val: i32): boolean {
+  const p = repPrim(val)
+  return p == "i32" || p == "i64" || p == "f32" || p == "f64"
+}
+
 // The receiver stage node `id` is, or null.
 function stageAt(id: i32): RListStage | null {
   if id < 0 || id >= vf.irNodes.length { return null }
@@ -672,6 +682,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if !rec { return fail(2, at, "an arm unbox lands at a record") }
       if r.uaDst >= 0 && r.uaDst != dst {
         return fail(2, at, "a record arms unbox lands at the record it names")
+      }
+      if r.uaAsg && r.uaDst < 0 {
+        return fail(2, at, "an assignment's arm unbox names its destination")
       }
       0
     }
@@ -924,6 +937,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RMemAccess => memAccessCheck(r, dst, at)
+    RMaFoldInit => maFoldInitCheck(r, dst, at)
     RAtomic => atomicCheck(r, dst, at)
     RTruncSat => truncSatCheck(r, dst, at)
     RMemOp => {
@@ -1005,6 +1019,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         && !recRetag(opRep(r.rgV), dst)
         && !cloFieldRetag(r.rgV, dst, at)
         && !plainRecordsLowerAlike(opRep(r.rgV), dst)
+        && !(r.rgV is OVar && recValRetag(vf, r.rgV.ov, opRep(r.rgV), dst))
         && !recFieldsWiden(opRep(r.rgV), dst, vf.irRecHeap)
         && !recSubRetag(opRep(r.rgV), dst, vf.irRecHeap, vf.irRecSub)
         && !repNullRefFits(opRep(r.rgV), dst)
@@ -1358,8 +1373,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RListPop => {
       use(r.lqV, at)
+      uses(r.lqIx, at)
       if !(repNodeAt(opRep(r.lqV)) is RList) {
         return fail(2, at, "a pop of a non-list")
+      }
+      // A `.get`'s one index is an i32.
+      if (
+        r.lqIx.length > 1
+        || (r.lqIx.length == 1 && opRep(r.lqIx[0]) != vfI32)
+      ) {
+        return fail(2, at, "a list get's index is one i32")
       }
       // A value pop leaves the element, its i32 niche, or its null box.
       const el = kidAt(opRep(r.lqV), 0)
@@ -1534,6 +1557,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 { return fail(2, at, "a print statement has no value") }
       0
     }
+    RPrintOpen => if dst >= 0 { fail(2, at, "a print's opening blocks have no value") } else { 0 }
     RMapNew => {
       if dst >= 0 && !(repNodeAt(dst) is RMap) {
         return fail(2, at, "an empty map of a non-map rep")
@@ -1562,6 +1586,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(2, at, "a map get of a receiver that is no map")
       }
       const m = repNodeAt(mapRecvRep(r.mtSym, r.mtLoc))
+      // `print`'s read prints a scalar value and yields nothing.
+      if r.mtPrint >= 0 {
+        if !(m is RMap) || !mapPrintScalar(m.rmVal) || dst >= 0 {
+          return fail(
+            2,
+            at,
+            "a map read print is of a scalar value and yields nothing",
+          )
+        }
+        return 0
+      }
       // A union value's narrowed read is unboxed to its member's scalar (`narrowedMapReadOf`).
       const unboxed = irFactIntOf(vf, at, 0) == 1 && repPrim(dst) != null
       // A union value's read is its box, `null` one more tag of it.
@@ -1679,6 +1714,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if repIsScalar(opRep(r.seL)) || repIsScalar(opRep(r.seR)) {
         return fail(2, at, "a record compare's operands are references")
       }
+      // The guarded compare tests each side's null; one side at least can be null.
+      if (
+        r.seNul
+        && !(repNodeAt(opRep(r.seL)) is RNullable)
+        && !(repNodeAt(opRep(r.seR)) is RNullable)
+      ) {
+        return fail(2, at, "a nullable record compare has a nullable operand")
+      }
       for ixs in [r.seLIx, r.seRIx] {
         for o in ixs {
           if repPrim(opRep(o)) != "i32" {
@@ -1715,6 +1758,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           return fail(2, at, "a code-point list is a list of i32s")
         }
         return 0
+      }
+      // A string's bytes are a fresh list of u8s.
+      if r.soOp == "bytes" && dst >= 0 {
+        const bl = repNodeAt(dst)
+        if !(bl is RList) || repPrim(bl.rlsElem) != "u8" {
+          return fail(2, at, "a string's bytes are a list of u8s")
+        }
       }
       let i = 0
       while i < r.soArgs.length {
@@ -2248,11 +2298,46 @@ function nested(body: i32[]) {
     stmt(id, prev)
     prev = id
   }
+  printOpenPairs(body)
   while vfDefLog.length > nDefs {
     const d = vfDefLog.pop() ?? -1
     if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
   }
   return 0
+}
+
+// Fails rule 10 where body `body`'s print opens do not pair (`printOpenPairsWhy`): its own frame,
+// so the recursive body walk carries no slot for it.
+function printOpenPairs(body: i32[]) {
+  const po = printOpenPairsWhy(body)
+  if po != "" { fail(10, -1, po) }
+  return 0
+}
+
+// Why body `body`'s print opens (`RPrintOpen`) do not pair, or "": each is closed later in the same
+// body by the one print whose `pnOpened` is its arm, with no other print, `return` or branch
+// between them, and no print claims an open that is not there.
+function printOpenPairsWhy(body: i32[]): string {
+  let open = -1
+  for id in body {
+    const n = vf.irNodes[id]
+    if n is SEffect && n.efRhs is RPrintOpen {
+      if open >= 0 { return "a print's blocks open inside another's" }
+      open = n.efRhs.poArm
+    } else if n is SEffect && n.efRhs is RPrint {
+      const o = n.efRhs.pnOpened
+      if o >= 0 && o != open {
+        return "an opened print has no open of its arm before it"
+      }
+      if o < 0 && open >= 0 {
+        return "a print's open is closed by another print"
+      }
+      open = -1
+    } else if open >= 0 && (n is SReturn || n is SBr) {
+      return "a print's open is left before its print"
+    }
+  }
+  return if open >= 0 { "a print's open is never closed" } else { "" }
 }
 
 // Whether `out` is held in a box: a value `if` written at a box (`siAtDst`) writes one, and each
@@ -2511,20 +2596,21 @@ function stmt(id: i32, prev: i32) {
         er = if repPrim(ln.rlsElem) == "u8" { vfI32 } else { ln.rlsElem }
       }
       if opRep(n.xfList) == vfStr { er = vfI32 }
-      // A map walks its keys or values, each an i32 or a string.
-      if (
-        (n.xfMap >= 0 || recvMap)
-        && n.xfVar >= 0
-        && n.xfVar < vf.irVars.length
-      ) {
-        const vr = vf.irVars[n.xfVar].vRep
-        if vr == vfI32 || vr == vfStr { er = vr }
+      // A map walks its keys or values into an i32 or a string, or at the rep its receiver's map
+      // stores them at: the global's own rep, or the receiver operand's (`mapWalkElemRep`).
+      if (n.xfMap >= 0 || recvMap) {
+        const mrep = if n.xfMap >= 0 { irGlobalRepOf(vf, n.xfMap) } else { opRep(n.xfList) }
+        er = mapWalkElemRep(mrep, n.xfVals)
+        if n.xfVar >= 0 && n.xfVar < vf.irVars.length {
+          const vr = vf.irVars[n.xfVar].vRep
+          if vr == vfI32 || vr == vfStr { er = vr }
+        }
       }
       if n.xfVar < 0 || n.xfVar >= vf.irVars.length || er < 0 {
         return fail(
           2,
           id,
-          "a walk is not of a list or a string into a variable",
+          "a walk is not of a list, a string or a map into a variable",
         )
       }
       if vf.irVars[n.xfVar].vKind != "local" || vf.irVars[n.xfVar].vRep != er {
@@ -2815,6 +2901,19 @@ function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
   return 0
 }
 
+// A declaration-time address fold's initializer: an i32 bounded part, kept in a declared wasm
+// local, and an i32 value.
+function maFoldInitCheck(r: RMaFoldInit, dst: i32, at: i32) {
+  use(r.mfiV, at)
+  if opRep(r.mfiV) != vfI32 || r.mfiSlot < 0 {
+    return fail(2, at, "an address fold keeps an i32 in a declared local")
+  }
+  if dst >= 0 && dst != vfI32 {
+    return fail(2, at, "an address fold is an i32")
+  }
+  return 0
+}
+
 // A function-value compare's two operands at closure reps, and its 0/1 answer a bool.
 function closureEqCheck(r: RClosureEq, dst: i32, at: i32) {
   use(r.cqL, at)
@@ -2995,6 +3094,7 @@ function rhsReadsList(r: Rhs): boolean {
       RListSlice |
       RListStage |
       RLitArms |
+      RMaFoldInit |
       RMakeClo |
       RMakeList |
       RMakeRec |
@@ -3024,6 +3124,7 @@ function rhsReadsList(r: Rhs): boolean {
       ROptRead |
       RPrimOp |
       RPrint |
+      RPrintOpen |
       RRawOp |
       RRecCopyPure |
       RRecordFitIs |
@@ -3260,6 +3361,7 @@ export function irVerify(f: IrFn): IrVerdict {
     stmt(id, prev)
     prev = id
   }
+  printOpenPairs(f.irBody)
   // Rule 8, the bounds checks, is the list builder's (`ir_verify_bounds.vl`).
   if vfRule == 0 {
     const b = irBoundsRuleHook(f)
