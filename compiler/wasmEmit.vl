@@ -5105,18 +5105,10 @@ function emitListEmptyFitIs(isIx: i32, fnIx: i32): i32 {
       if p.efArm == "shadow" {
         const sh = listFitShadowSet(isIx, p.efRecvTy, p.efDepth, fnIx)
         if sh < 1 { return sh }
-        const rv = nodeAt(unwrapParen(nd.isObj))
-        if sh == 2 && rv is Ident {
-          grow = listFitGrowRow(unwrapParen(nd.isObj), isVarTyIxOf(isIx), fnIx)
-        }
+        if sh == 2 { grow = listFitGrowOf(isIx, fnIx) }
       }
       if p.efRepWhy != "" { return emitFailAt(p.efRepWhy, isIx) }
-      // An arm that pushes tests only until its `K[]` is stored (`listFitGrowFill`).
-      if grow >= 0 {
-        fbLocalGet(fitGrowLocal[grow])
-        fbRefIsNull()
-        fbIf(127) // i32
-      }
+      if grow >= 0 { listFitGrowOpen(grow) }
       if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
       emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
       if grow >= 0 { return if listFitGrowFill(grow) < 0 { -1 } else { 1 } }
@@ -5629,9 +5621,28 @@ function listFitGrowHolds(loc: i32): boolean {
   return false
 }
 
+// The grow row of pushing `is K[]` test `isIx` over a named receiver (`listFitGrowRow`), or -1.
+export function listFitGrowOf(isIx: i32, fnIx: i32): i32 {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) { return -1 }
+  const r = unwrapParen(nd.isObj)
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return -1 }
+  return listFitGrowRow(r, isVarTyIxOf(isIx), fnIx)
+}
+
+// A pushing arm tests only until its `K[]` is stored: the test runs inside an `if` on grow row
+// `row`'s local being null (`listFitGrowFill` closes it).
+export function listFitGrowOpen(row: i32) {
+  if row < 0 || row >= fitGrowLocal.length { return -1 }
+  fbLocalGet(fitGrowLocal[row])
+  fbRefIsNull()
+  fbIf(127) // i32
+  return 0
+}
+
 // With the test's answer on the stack inside the `if` `emitListEmptyFitIs` opened on a null
 // `fitGrowLocal[row]`, stores a fresh `K[]` there when it fits; a set local answers 1 untested.
-function listFitGrowFill(row: i32): i32 {
+export function listFitGrowFill(row: i32): i32 {
   const kt = tyAt(fitGrowTy[row])
   if !(kt is TyArray) { return emitFail(LIST_FIT_SHADOW_MSG) }
   const heaps: i32[] = []
@@ -5656,26 +5667,50 @@ function listFitGrowFill(row: i32): i32 {
 // `name.length` outside the arm of an `is K[]` that pushes onto `name`: the `K[]` once a test
 // has fitted, the receiver's own list before. 0 when `m` is not such a read, 1 when emitted.
 function emitListFitGrowLen(m: Member, memIx: i32, fnIx: i32): i32 {
-  const o = nodeAt(m.memObj)
-  if !(o is Ident) { return 0 }
-  if listFitShadowRead(o.identName, m.memObj, fnIx) >= 0 { return 0 }
-  const g = listFitGrowRow(m.memObj, -1, fnIx)
+  const g = listFitGrowLenRowOf(m, fnIx)
   if g < 0 { return 0 }
+  listFitGrowLenOpen(g)
+  if emitArrLen(memIx, fnIx) < 0 { return -1 }
+  listFitGrowLenClose(g)
+  return 1
+}
+
+// The grow row whose `K[]` read `m`, a `name.length` outside the region, answers once filled
+// (`emitListFitGrowLen`), or -1.
+export function listFitGrowLenRowOf(m: Member, fnIx: i32): i32 {
+  const o = nodeAt(m.memObj)
+  if !(o is Ident) { return -1 }
+  if listFitShadowRead(o.identName, m.memObj, fnIx) >= 0 { return -1 }
+  const g = listFitGrowRow(m.memObj, -1, fnIx)
+  if g < 0 { return -1 }
   const kt = tyAt(fitGrowTy[g])
-  if !(kt is TyArray) { return 0 }
+  if !(kt is TyArray) { return -1 }
   const heaps: i32[] = []
-  const kind = listFitElemKind(tyElemOf(kt), heaps)
-  if kind == null { return 0 }
+  return if listFitElemKind(tyElemOf(kt), heaps) == null { -1 } else { g }
+}
+
+// Before the receiver's own length: an `if` on grow row `g`'s local still being null.
+export function listFitGrowLenOpen(g: i32) {
+  if g < 0 || g >= fitGrowLocal.length { return -1 }
   fbLocalGet(fitGrowLocal[g])
   fbRefIsNull()
   fbIf(127) // i32
-  if emitArrLen(memIx, fnIx) < 0 { return -1 }
+  return 0
+}
+
+// After the receiver's own length: else the grow row `g`'s `K[]` length, closing the `if`.
+export function listFitGrowLenClose(g: i32) {
+  if g < 0 || g >= fitGrowTy.length || g >= fitGrowLocal.length { return -1 }
+  const kt = tyAt(fitGrowTy[g])
+  const heaps: i32[] = []
+  const kind = if kt is TyArray { listFitElemKind(tyElemOf(kt), heaps) } else { null }
+  if kind == null { return -1 }
   fbElse()
   fbLocalGet(fitGrowLocal[g])
   fbRefAsNonNull()
   emitListLenOnStack(kind, heaps[0])
   fbEnd()
-  return 1
+  return 0
 }
 
 // The wrapper of the empty `K[]` (pushed onto `tyOut`) a closure's read of capture `name` stands
