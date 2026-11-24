@@ -45,5 +45,12 @@ Hook 2 refuses after the whole body is lowered, the latest point a lowering can 
 | `ir-identity.sh --cases` | identical 7842, fail-both 68, differ 0, expected divergence 2 |
 | `ir-identity.sh --claimless` | identical 14462, differ 0 |
 | `ir-parity.vl --pop refusals` | 94 programs: same 4, differs 0, build-fails(both) 90 |
-| `ir-parity.vl` over the 6,106 matrix refusals | MATRIX |
+| `ir-parity.vl` over the 6,106 matrix refusals | base: same 8, differs 1, both refuse 6,093, off refuses 4. This PR: same 8, differs 0, both refuse 6,094, off refuses 4. Per program, 1 moved (`map-of-hole-fns-pushed-onto-map-list_argument_unann`, differs to both refusing with legacy's message) and 6,105 are unchanged |
 | emitter-state audit | 7/7, 0 never-cleared |
+| phase-state `hidden` in emit_state.vl | 11 → 12, `emitSoftMsg` scoped in `softEnd` (queue ruling: the save and restore is chosen; the census misses `emitSoftFail`, saved through a struct literal, so the true count is 13) |
+
+`ir-parity.vl`'s `firstError` now skips the one line a host prints before legacy's refusal when a
+claim declined (`vl: note: an IR claim refused inside `…), matched by that exact prefix. Without the
+skip, a refusal with no source position compared the note against legacy's line. Control:
+`hole-fn-map-in-record-field_argument_unann`, which is `differs` with the old harness and
+`build-fails(both)` (`Error: emit error`) with the new one.
