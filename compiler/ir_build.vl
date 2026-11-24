@@ -1,6 +1,6 @@
 import { recFieldTyOf } from "./emit_rec_field_codes"
 import {
-  liftedFnCaptures,
+  identityOperandUnboxes,
   listFitShadowPlanOf,
   listFitShadowReadsRow,
   listFitShadowSameTy,
@@ -92,7 +92,6 @@ import {
   hasNamedArgs,
   i32ToStr,
   nodeAt,
-  nodeChildren,
   nodeChildrenPush,
   spreadArgOf,
 } from "./ast"
@@ -168,6 +167,7 @@ import {
   irSpanNote,
   irSpanNoteKind,
   irVarNew,
+  mapWalkElemRep,
   repNullRefFits,
   sIf,
 } from "./ir"
@@ -627,6 +627,7 @@ import {
   RRaw,
   RRecord,
   RUnsup,
+  askRecordHeapNone,
   repClosureOfReps,
   repDescRet,
   repDescTy,
@@ -1413,14 +1414,7 @@ function fitShadowVar(n: IsExpr, ix: i32, p: EmptyFitPlan): i32 {
     irBMiss("is empty fit shadow refused")
     return -1
   }
-  const fd = nodeAt(ibFnIx)
-  if (
-    liftedFnCaptures(rn.identName, ibFnIx)
-    || fd is FuncDecl && closureReadsName(fd.fnBody, rn.identName, false)
-  ) {
-    irBMiss("is empty fit shadow capture")
-    return -1
-  }
+
   const kTy = listFitShadowTyOf(ix)
   const recv = localIndexOf(ibFnIx, r)
   let i = 0
@@ -1445,18 +1439,6 @@ function fitShadowVar(n: IsExpr, ix: i32, p: EmptyFitPlan): i32 {
   ibFitShRecv.push(recv)
   ibFitShVar.push(v)
   return v
-}
-
-// Whether a function nested in the tree at `ix` reads `name` (`inner` once inside one).
-function closureReadsName(ix: i32, name: string, inner: boolean): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = nodeAt(ix)
-  if n is FuncDecl { return closureReadsName(n.fnBody, name, true) }
-  if inner && n is Ident && n.identName == name { return true }
-  for k in nodeChildren(ix) {
-    if closureReadsName(k, name, inner) { return true }
-  }
-  return false
 }
 
 // The `shadow` arm variable read `ix` of `n` takes in place of its binding, as legacy's
@@ -4305,16 +4287,16 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   return irBMiss("read of " + n.identName)
 }
 
-// Notes a struct cell's heap (`globalCellStructIdx`, a nullable cell's its record's) for the record
-// rep `rep` it is read at, where
-// that rep's type has no heap of its own and its fields lower alike with, or widen to, the cell
-// row's own; a second cell of that rep on another heap unnotes it.
+// Notes a struct cell's heap (`globalCellStructIdx`; a nullable cell uses its record's) for the
+// record rep `rep` it is read at, where that rep's type has no heap of its own and its fields lower
+// alike with, or widen to, the cell row's own; a second cell of that rep on another heap unnotes it.
 function noteCellHeap(d: i32, rep: i32) {
   if !(repNodeAt(rep) is RRecord) { return 0 }
   const key = i32ToStr(d) + ":" + i32ToStr(rep) + ":" + i32ToStr(repTyOf(rep))
   const memo = cellHeapMemo[key] ?? -2
   const h = if memo != -2 { memo } else { cellHeapOf(d, rep) }
   cellHeapMemo[key] = h
+  if h >= 0 { askRecordHeapNone(repTyOf(rep)) }
   return irRecHeapNoteOne(ib, rep, h)
 }
 
@@ -4560,6 +4542,7 @@ function noteCapHeap(fe: i32, name: string, rep: i32) {
   const memo = cellHeapMemo[key] ?? -2
   const h = if memo != -2 { memo } else { capHeapOf(fe, name, rep) }
   cellHeapMemo[key] = h
+  if h >= 0 { askRecordHeapNone(repTyOf(rep)) }
   return irRecHeapNoteOne(ib, rep, h)
 }
 
@@ -6234,6 +6217,13 @@ export function irBStageLeads(
   // A receiver stage, and a `??` along an arm that stages nothing, is written in place, below
   // which the lowering stages nothing. A literal's order stash sets its fields below them.
   if listStageFrom(b, at) || coalBoxFrom(b, at, false) { return false }
+  // A store the operand makes (an assignment as its value) is a statement, which the lowering
+  // writes above an earlier operand read at its use, so that read would see the stored value;
+  // an earlier temp cannot wait across it either.
+  if storeFrom(b, at) {
+    irBMiss("store after an operand")
+    return false
+  }
   const coal = coalBoxFrom(b, at, true)
   const stash = stashSetFrom(b, at)
   if !valuedIfFrom(b, at) && !coal && !stash || opndsAreTemps(args) {
@@ -6339,20 +6329,20 @@ function stashSetFrom(b: i32[], at: i32): boolean {
   return false
 }
 
+// Whether node `n` is a store statement: to a local, a global, a field, an element or a cell.
+function storeAt(n: IrNode): boolean {
+  return n is SAssign
+    || n is SGlobalSet
+    || n is SSetField
+    || n is SListSet
+    || n is SCellSet
+}
+
 // Whether operands built into `b` from `at` on hold a store statement.
 function storeFrom(b: i32[], at: i32): boolean {
   let i = at
   while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if (
-      n is SAssign
-      || n is SGlobalSet
-      || n is SSetField
-      || n is SListSet
-      || n is SCellSet
-    ) {
-      return true
-    }
+    if storeAt(ib.irNodes[b[i]]) { return true }
     i = i + 1
   }
   return false
@@ -6401,14 +6391,17 @@ function valuedIfFrom(b: i32[], at: i32): boolean {
 }
 
 // `ifBelowLead` for a node whose operands `leads`, written before those from `at`, are all
-// temps the lowering stages below the `if` (`opndsAreTemps`): then no miss.
+// temps the lowering stages below the `if` (`opndsAreTemps`): then no miss, unless the later
+// operands store, which no earlier temp can wait across.
 export function ifBelowLeadOf(
   b: i32[],
   at: i32,
   why: string,
   leads: Opnd[],
 ): boolean {
-  if opndsAreTemps(leads) && !inPlaceFrom(b, at) { return false }
+  if opndsAreTemps(leads) && !inPlaceFrom(b, at) && !storeFrom(b, at) {
+    return false
+  }
   return ifBelowLead(b, at, why)
 }
 
@@ -6429,6 +6422,7 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
       n is SIf && n.siOut >= 0
       || n is SCoalBox
       || n is SEffect && n.efRhs is RStashSet
+      || storeAt(n)
     ) {
       irBMiss(why)
       return true
@@ -7467,6 +7461,27 @@ function closureEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("function compare operand rep")
   }
   return irBLetTemp(b, { cqL: l, cqR: r, cqAt: ix }, ix, rep)
+}
+
+// A reference identity on legacy's `identRef` route: each operand as `emitExpr` builds it, the
+// payload read and `ref.eq` the lowering's (`RIdentityEq`).
+function identityEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  if repPrim(rep) != "bool" { return irBMiss("identity compare result rep") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  const at = b.length
+  const r = irBExpr(b, n.binRight)
+  if ibMiss != "" { return r }
+  if ifBelowLeadOf(b, at, "identity compare right operand", [l]) { return r }
+  // An operand legacy reads by its box's payload must be the box; a read narrowed out of a
+  // union's storage is built at its member, which legacy does not push.
+  if (
+    identityOperandUnboxes(n.binLeft, ibFnIx) && !heldAsBox(irBOpRep(l))
+    || identityOperandUnboxes(n.binRight, ibFnIx) && !heldAsBox(irBOpRep(r))
+  ) {
+    return irBMiss("identity compare narrowed box operand")
+  }
+  return irBLetTemp(b, { ieL: l, ieR: r, ieAt: ix }, ix, rep)
 }
 
 // A `==`/`!=` legacy writes on its `structEq` or `variantEq` route (`emitStructEq` over the route's
@@ -11567,6 +11582,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     ) {
       return atomCompare(b, n, ix, rep)
     }
+    // `===`/`!==` over references is legacy's identity (`emitIdentityBin`).
+    if n.binIdent != 0 && eqRouteOf(n, ix, ibFnIx) == "identRef" {
+      return identityEq(b, n, ix, rep)
+    }
     if (
       operandWhy(n.binLeft) == STR_OPERAND
       || operandWhy(n.binRight) == STR_OPERAND
@@ -12490,6 +12509,14 @@ function mapRecvRepOk(r: i32, mr: i32): boolean {
     && exprNullableMap(mr, ibFnIx)
 }
 
+// Whether map walk iterable `iter` is a `.values()` call; a bare map and `.keys()` walk keys.
+function mapWalkReadsValues(iter: i32): boolean {
+  const e = nodeAt(unwrapParen(iter))
+  if !(e is Call) || e.callFn < 0 { return false }
+  const c = nodeAt(e.callFn)
+  return c is Member && c.memProp == "values"
+}
+
 // A `for` statement along legacy's walk (`forInPlainWhy`, a hoisted one included): the list
 // once, its element variable at the declared slot, and the body. Every other walk is a named miss.
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
@@ -12541,10 +12568,14 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   if lpr != null && lpr == "str" { er = repNodeOfTy(TY_I32) }
   if mr >= 0 { er = repNodeOfTy(forInElemTyOf(n.fiIter, ibFnIx)) }
   if er < 0 { return skip("for in operand coercion") }
-  // A map walks its keys or values into an i32 or a string, the verifier's rule; any other is
-  // legacy's.
+  // A map walks its keys or values into an i32 or a string, or at the rep its receiver's map
+  // stores them at, the verifier's rule: the map's value (`rmVal`), or its key type's.
+  const vals = mr >= 0 && mapWalkReadsValues(n.fiIter)
   if mr >= 0 && er != repNodeOfTy(TY_I32) && repPrim(er) != "str" {
-    return skip("for in map element")
+    const mrep = if g >= 0 { irGlobalRepOf(ib, g) } else { irBOpRep(l) }
+    if er != mapWalkElemRep(mrep, vals) {
+      return skip("for in map element rep")
+    }
   }
   const v = irBLoopVar(n.fiDecl1, er, repTyOf(er))
   if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
@@ -12589,6 +12620,7 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
       xfCont: cont,
       xfMap: g,
       xfMapNonNull: mr >= 0 && globalReadRecovers(sidOfNode(mr), mr, ibFnIx),
+      xfVals: vals,
     },
     -1,
     ibNoValue,
