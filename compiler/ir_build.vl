@@ -344,6 +344,7 @@ import {
   holeBoxTyAt,
   hostCallNamed,
   hostCallPlanOf,
+  idxStoreNullUnitUnstamped,
   idxStoreOtherWhy,
   idxStoreSiteBoxes,
   ifExprJoinVt,
@@ -4909,6 +4910,20 @@ function narrowedLocalRead(
 ): Opnd {
   const o: Opnd = { ov: v }
   const arm = identReadArmOf(n, ix, ibFnIx, false)
+  // A string cell narrowed to a literal set reads, where legacy decodes no atom
+  // (`exprIsLitAtom`), as the string it holds: a `string | null` through its recover.
+  const own = ib.irVars[v].vRep
+  if (
+    arm == "local"
+    && repNodeAt(rep) is RAtom
+    && (repPrim(own) == "str" || strNullable(own))
+    && !exprIsLitAtom(ix, ibFnIx)
+  ) {
+    if repPrim(own) == "str" { return o }
+    const src: Rhs = { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) }
+    ib.irReadAgain[ix] = src
+    return irBLetTempTy(b, src, ix, repNodeOfTy(TY_STR), TY_STR)
+  }
   const ba = boxNarrowArmOf(ix, ib.irVars[v].vRep, rep, arm)
   if ba == "variant" {
     return irBLetTemp(
@@ -4970,11 +4985,12 @@ function narrowedLocalRead(
   if cell && atomNullable(ib.irVars[v].vRep) && repPrim(rep) == "str" {
     return o
   }
-  // A read narrowed to `null` whose storage read is its null (`nullReadOwnAt`) is the local.
+  // A read narrowed to `null` whose storage read is its null (`nullReadOwnAt`) is the local:
+  // seated, or any read whose destination holds no null of its own, as legacy's past-null arm.
   if (
-    cell
-    && arm == "nullread"
+    arm == "nullread"
     && identReadArmOf(n, ix, ibFnIx, true) == "local"
+    && (cell || nullReadOwnAt(ix) == NULL_READ_STORED)
   ) {
     return o
   }
@@ -6938,6 +6954,11 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     op = "charcode"
   } else if exprIsStrMethod(ix, ibFnIx, "cpAt") && c.callArgs.length == 1 {
     op = "cpat"
+  } else if (
+    exprIsStrMethod(ix, ibFnIx, "isCharBoundary")
+    && c.callArgs.length == 1
+  ) {
+    op = "charbound"
   } else if exprIsStrMethod(ix, ibFnIx, "bytes") && c.callArgs.length == 0 {
     op = "bytes"
   } else if exprIsStrIndexOf(ix, ibFnIx) && c.callArgs.length == 1 {
@@ -12626,9 +12647,10 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if ibMiss != "" { return irBMiss(ibMiss) }
   const m = asgReReadEnter(ix)
   // A field or element target is read again whole, its receiver and index included. A global's
-  // re-read is seated (`cell`): its atom cell's id is the read, which `widenTo` below decodes.
+  // or an atom local's re-read is seated (`cell`): its cell's id is the read `widenTo` decodes.
   const rr = if uw >= 0 { repNodeOfTy(heldTy(exprTyOf(n.binLeft))) } else { rep }
-  const o = if t is Ident { identRead(b, t, n.binLeft, rr, globalTarget(n.binLeft)) } else { irBExpr(b, n.binLeft) }
+  const seat = if uw >= 0 { globalTarget(n.binLeft) } else { asgReReadSeated(n.binLeft) }
+  const o = if t is Ident { identRead(b, t, n.binLeft, rr, seat) } else { irBExpr(b, n.binLeft) }
   asgReReadLeave(m)
   if uw >= 0 {
     if ibMiss != "" { return o }
@@ -12639,8 +12661,12 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     }
     return irBLetTemp(b, { uwV: o, uwOp: uw, uwAt: ix }, ix, rep)
   }
-  // The cell's atom re-read at a `string` assignment is decoded, as legacy widens it (`widenTo`).
-  const w = if ibMiss == "" && atomAtStr(irBOpRep(o), rep) { widenTo(b, o, ix, rep, -1) } else { o }
+  // The cell's atom re-read at a `string` assignment is decoded, as legacy widens it (`widenTo`),
+  // a local `K | null` cell's included: the assigned member is no `null` (`atomToStr` checks).
+  const r0 = irBOpRep(o)
+  const nulLocal = t is Ident && !globalTarget(n.binLeft) && atomNullable(r0)
+  const dec = atomAtStr(r0, rep) || nulLocal && repPrim(rep) == "str"
+  const w = if ibMiss == "" && dec { widenTo(b, o, ix, rep, -1) } else { o }
   if ibMiss == "" && irBOpRep(w) != rep {
     return irBMiss("assignment value re-read rep")
   }
@@ -12666,6 +12692,19 @@ function assignValueNullLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 }
 
 // Whether identifier `ix` names a module global's `let`, not a local or a capture.
+// Whether the re-read of assignment target `ix` is seated: a global, or a local already held at a
+// cell of an atom or a `K | null`, which legacy's `emitExpr` reads as the cell's id. It asks the
+// local the store just wrote, minting none: a captured cell is held elsewhere.
+function asgReReadSeated(ix: i32): boolean {
+  if globalTarget(ix) { return true }
+  const d = identDeclOf(ix)
+  if d < 0 || !(nodeAt(d) is LetDecl) { return false }
+  const v = ibDeclVar[d] ?? -1
+  return v >= 0
+    && (repNodeAt(ib.irVars[v].vRep) is RAtom
+    || atomNullable(ib.irVars[v].vRep))
+}
+
 function globalTarget(ix: i32): boolean {
   const d = identDeclOf(ix)
   return d >= 0
@@ -12799,6 +12838,10 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   }
   const st = idxStorePlanOf(t, ibFnIx)
   if st == null { return skip("store plan") }
+  // Legacy writes an unstamped unit into a `null[]` as its sentinel, apart from the value's emit.
+  if idxStoreNullUnitUnstamped(t.idxArr, n.binRight, ibFnIx) {
+    return skip("store null unit sentinel")
+  }
   const why = idxStoreOtherWhy(st, n.binRight, ibFnIx)
   if why != "" { return skip(why) }
   const site = idxStoreSiteBoxes(st, n.binRight, ibFnIx)
