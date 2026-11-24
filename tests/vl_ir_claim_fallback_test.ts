@@ -31,7 +31,8 @@ const vl = (cmd: string[], env: Record<string, string> = {}) => {
   const out = new Deno.Command(VL, {
     args: [...cmd, "--compiler", COMPILER],
     cwd: ROOT,
-    env: { VL_STD: `${ROOT}/std`, VL_NO_CACHE: "1", RUST_BACKTRACE: "0", ...env },
+    // Non-strict unless a case asks: gate.sh and CI export VL_IR_STRICT=1, and the child inherits it.
+    env: { VL_STD: `${ROOT}/std`, VL_NO_CACHE: "1", RUST_BACKTRACE: "0", VL_IR_STRICT: "0", ...env },
     stdout: "piped",
     stderr: "piped",
   }).outputSync();
