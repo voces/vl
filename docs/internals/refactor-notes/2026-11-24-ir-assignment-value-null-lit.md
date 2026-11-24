@@ -17,10 +17,14 @@ writes the same thing: `assignTo`, then `RNullOf` at the literal's `nullOwnAt`. 
   binding as `assignment initialiser of a null-typed binding (D17088)`. Legacy writes such a
   binding's initialiser as a bare `null` and drops the store; that is D17088, a clause-1 fix of
   its own, not coverage to match.
-- No rep guard on the literal. `asgYieldsNullLit` requires the assignment's type to be `null`, so
-  its rep is the `null` unit's. Legacy writes the literal's own null there whatever that null is,
-  and `RNullOf` lowers through the same `emitNullOwn`. A guard on the rep would have no failing
-  program, so it was dropped rather than kept untested.
+- A literal whose own null is not the bottom ref misses as `assignment value nullLit rep`.
+  `asgYieldsNullLit` makes the assignment's rep the `null` unit's, and the verifier admits only
+  the bottom ref there (`RNullOf`, rule 2). Legacy writes the cell's typed null (a string's, a
+  sentinel) in that place. The control rows: the four lambdas of
+  `closures/capture-nullable-closure-null-write.vl` and of
+  `closures/null-result-closure-writes-cell.vl` that write a captured `string | null`,
+  `boolean | null` or list cell, and two in the read-back case below. Each misses under that
+  name; before the guard each failed the verifier's rule 2.
 
 ## Read-back
 
