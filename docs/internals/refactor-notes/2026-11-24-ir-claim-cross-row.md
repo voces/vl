@@ -39,3 +39,13 @@ The whole of `cases` was 0 red too, so the sample is a cost choice, not a known 
 | a `$VL` wrapper that adds a stdout line to the IR-on run (`--run-all`) | rc 1, `differs`, `off runs; stdout line 2: skew` | — |
 | a `$VL` wrapper that fails the IR-off run | rc 0 | rc 1 |
 | the row on master `0790f095` | rc 0, 0 red | — |
+
+## Memory
+
+Each `ir-parity.vl` row builds its own claimless compiler, a self-compile. Peak RSS of the whole
+process tree, sampled every 0.2 s: the claimless build alone 4,147 MiB, `ir claim refusals`
+4,312 MiB, `ir claim cross` 4,329 MiB. `gate.sh`'s `row_mem` held neither row, so each was budgeted
+at its 200 MiB default, and a gate that launched both beside the other rows hit an OOM kill and
+three 60 s build timeouts in `ir claim refusals` (rc 3). Both rows are budgeted at 4,400 MiB now.
+Building the claimless compiler once per gate and handing it to both rows would save one of the two
+self-compiles (41 CPU-s and 4 GiB); it is not done here.
