@@ -158,6 +158,9 @@ const selfTestIds: string[] = [
   "dead-return-after-never-call",
   "never-call-value-at-consumer-rep",
   "dead-never-temp-at-consumer-rep",
+  "identity-eq-of-records",
+  "identity-eq-of-string",
+  "identity-eq-of-i32",
   "dead-never-bound-to-non-temp",
   "returning-call-temp-typed-never",
   "never-call-value-into-bool",
@@ -173,6 +176,10 @@ const selfTestIds: string[] = [
   "walk-pair-map-value-off-type",
   "walk-pair-string-index",
   "walk-pair-string-index-of-bool",
+  "walk-map-value-record",
+  "walk-map-value-off-rep",
+  "walk-map-key-i32",
+  "walk-map-key-off-rep",
   "rep-typed-thunk-forwards",
   "rep-typed-thunk-forwards-env",
   "rep-typed-result-not-thunk",
@@ -181,6 +188,8 @@ const selfTestIds: string[] = [
   "eq-helper-into-bool",
   "map-scalar-join-of-i32",
   "map-scalar-join-of-string",
+  "map-print-of-i32",
+  "map-print-of-string",
 ]
 
 // Rule 1 for a result typed by its rep (`irRetFromRep`): `thunk(env, p) { t = call f0(p); return
@@ -309,6 +318,26 @@ function caseFn(id: string): IrFn {
     irGlobalNote(f, 0, boolr)
     f.irBody.push(node(f, { gsSym: 0, gsSrc: v(p) }, none))
   }
+  // Rule 2: an identity compare (`RIdentityEq`) holds over two records into a bool; one over a
+  // string or an i32, which have no identity, is refused.
+  if id == "identity-eq-of-records" || id == "identity-eq-of-string" {
+    const ot = mkObjTy(["a"], [TY_I32])
+    const orep = repNodeOfTy(ot)
+    const sr = repNodeOfTy(TY_STR)
+    const str = id == "identity-eq-of-string"
+    const l = if str { irVarNew(f, sr, TY_STR, "local", 1) } else { irVarNew(f, orep, ot, "local", 1) }
+    const r = if str { irVarNew(f, sr, TY_STR, "local", 2) } else { irVarNew(f, orep, ot, "local", 2) }
+    const g = irVarNew(f, boolr, TY_BOOL, "temp", -1)
+    f.irBody.push(
+      node(f, { lDst: g, lRhs: { ieL: v(l), ieR: v(r), ieAt: -1 } }, boolr),
+    )
+  }
+  if id == "identity-eq-of-i32" {
+    const g = irVarNew(f, boolr, TY_BOOL, "temp", -1)
+    f.irBody.push(
+      node(f, { lDst: g, lRhs: { ieL: v(p), ieR: v(p), ieAt: -1 } }, boolr),
+    )
+  }
   // Rule 2: a compare helper (`REqHelp`) compares two records into an i32; one of an i32, or into
   // a bool, is refused.
   if id.slice(0, 10) == "eq-helper-" {
@@ -358,6 +387,34 @@ function caseFn(id: string): IrFn {
     f.irBody.push(node(f, { lDst: g, lRhs: gf }, at))
     f.irBody.push(node(f, { dpV: v(g) }, none))
   }
+  // Rule 2 for a map walk's variable: it binds the receiver map's value for a values walk, or its
+  // key type's rep for a keys walk, or an i32 or a string; a `boolean` is refused in either.
+  if id.slice(0, 9) == "walk-map-" {
+    const ot = mkObjTy(["c0", "c1"], [TY_I32, TY_I32])
+    const onKeys = id.slice(0, 13) == "walk-map-key-"
+    const mt = mkMapTy(TY_I32, ot, 0)
+    const recv = irVarNew(f, repNodeOfTy(mt), mt, "local", 1)
+    const k = if id == "walk-map-value-record" { irVarNew(f, repNodeOfTy(ot), ot, "local", 2) } else if id == "walk-map-key-i32" { irVarNew(f, i32r, TY_I32, "local", 2) } else { irVarNew(f, boolr, TY_BOOL, "local", 2) }
+    const body: i32[] = []
+    f.irBody.push(
+      node(
+        f,
+        {
+          xfList: v(recv),
+          xfVar: k,
+          xfVar2: -1,
+          xfBody: body,
+          xfAt: -1,
+          xfBrk: 7,
+          xfCont: 8,
+          xfMap: -1,
+          xfMapNonNull: false,
+          xfVals: !onKeys,
+        },
+        none,
+      ),
+    )
+  }
   // Rule 2 and 3 for a walk's second name: a map walk binds its value at its type's rep, any rep;
   // one held at a rep its type does not name breaks rule 3. A string walk's is an i32 index, and
   // one of a `boolean` is refused.
@@ -383,6 +440,7 @@ function caseFn(id: string): IrFn {
           xfCont: 8,
           xfMap: -1,
           xfMapNonNull: false,
+          xfVals: false,
         },
         none,
       ),
@@ -821,8 +879,28 @@ function caseFn(id: string): IrFn {
       mtBox: 1,
       mtRow: false,
       mtTrap: false,
+      mtPrint: -1,
     }
     f.irBody.push(node(f, { lDst: bt, lRhs: g }, boolr))
+  }
+  // Rule 2: `print`'s map read (`mtPrint`) prints a scalar value; one of a `string`-valued map is
+  // refused, one of an `i32`-valued map holds.
+  if id == "map-print-of-i32" || id == "map-print-of-string" {
+    const vt = if id == "map-print-of-i32" { TY_I32 } else { TY_STR }
+    const mt = mkMapTy(TY_I32, vt, 0)
+    const mv = irVarNew(f, repNodeOfTy(mt), mt, "local", 1)
+    const g: Rhs = {
+      mtSym: -1,
+      mtNonNull: false,
+      mtLoc: v(mv),
+      mtKey: v(p),
+      mtAt: -1,
+      mtBox: -1,
+      mtRow: false,
+      mtTrap: false,
+      mtPrint: 0,
+    }
+    f.irBody.push(node(f, { efRhs: g }, repNodeOfTy(TY_NEVER)))
   }
   // Rule 2: a scalar join (`RMapGetOr` form 7) boxes a scalar map value into a union's box; one of
   // a `string`-valued map is refused, one of an `i32`-valued map holds.

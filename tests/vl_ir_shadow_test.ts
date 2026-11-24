@@ -1755,6 +1755,9 @@ Deno.test({
       "never-call-value-at-consumer-rep": 0,
       "dead-never-temp-at-consumer-rep": 0,
       "dead-never-bound-to-non-temp": 3,
+      "identity-eq-of-records": 0,
+      "identity-eq-of-string": 2,
+      "identity-eq-of-i32": 2,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
       "union-cast-of-box": 0,
@@ -1769,8 +1772,14 @@ Deno.test({
       "walk-pair-map-value-off-type": 3,
       "walk-pair-string-index": 0,
       "walk-pair-string-index-of-bool": 2,
+      "walk-map-value-record": 0,
+      "walk-map-value-off-rep": 2,
+      "walk-map-key-i32": 0,
+      "walk-map-key-off-rep": 2,
       "map-scalar-join-of-i32": 0,
       "map-scalar-join-of-string": 2,
+      "map-print-of-i32": 0,
+      "map-print-of-string": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
