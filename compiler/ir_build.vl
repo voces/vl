@@ -10,6 +10,7 @@ import { asExprNumCastDomain } from "./emit_union_casts"
 import { nulAtomWidenTexts } from "./emit_lit_atoms"
 import {
   objLitBuildVariantRow,
+  popRecvIsList,
   rangeConstIs,
   rangeConstVal,
 } from "./emit_plan_list"
@@ -773,6 +774,8 @@ import {
   cloLiftWriteSlot,
   emitErr,
   emitFailed,
+  emitSoftFail,
+  emitSoftMsg,
   fRecRetTy,
   fRetKind,
   fRetStructIdx,
@@ -855,6 +858,7 @@ import {
 import { isVoidTy, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
+  listGetIdxReReadable,
   optChainStagesRecv,
   sFieldTgtStructIdx,
   structIndexOfTy,
@@ -1033,17 +1037,58 @@ function claimable(): boolean {
   return true
 }
 
+// The soft-refusal scope one claim seam opens: the enclosing scope, restored when it closes, so a
+// seam nested in another (a const cell inside a claimed body) never hardens its caller's.
+type Soft = { sfWas: boolean, sfMsg: string }
+
+function softBegin(): Soft {
+  const s: Soft = { sfWas: emitSoftFail, sfMsg: emitSoftMsg }
+  emitSoftFail = true
+  emitSoftMsg = ""
+  return s
+}
+
+// Closes scope `s`, answering the refusal a shared legacy helper raised inside it, or "".
+function softEnd(s: Soft): string {
+  const m = emitSoftMsg
+  emitSoftFail = s.sfWas
+  emitSoftMsg = s.sfMsg
+  return m
+}
+
+// Whether a helper refused while this claim built: the claim declines before it writes a byte.
+function softRefused(what: string): boolean {
+  if emitSoftMsg == "" { return false }
+  count(
+    "claim fell back: "
+      + what
+      + "a legacy helper refused in `"
+      + ib.irName
+      + "`: "
+      + emitSoftMsg,
+  )
+  return true
+}
+
 // The claim seam, before legacy lowers the function at `fnIx` (`fnStmts` slot `fnPos`): when the
 // builder covers it and every node is claimed, the lowering writes its code entry onto `out` and
 // this answers true, so legacy does not run. Armed, legacy always runs and the shadow checks it.
 export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
+  const s = softBegin()
+  const ok = claimFn(fnIx, fnPos, out)
+  softEnd(s)
+  return ok
+}
+
+function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   const gen = repNodeGen()
   const minted = synthMintCount()
   ibClaimBuild = true
   const built = build(fnIx, fnPos)
   ibClaimBuild = false
+  if softRefused("") { return false }
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
@@ -1084,11 +1129,24 @@ export function irClaimStart(
   out: u8[],
 ): boolean {
   if !irStartClaimOn() { return false }
+  const s = softBegin()
+  const ok = claimStart(order, orderGi, poolFill, out)
+  softEnd(s)
+  return ok
+}
+
+function claimStart(
+  order: i32[],
+  orderGi: i32[],
+  poolFill: boolean,
+  out: u8[],
+): boolean {
   const gen = repNodeGen()
   const minted = synthMintCount()
   ibClaimBuild = true
   const built = buildStart(order, orderGi, poolFill)
   ibClaimBuild = false
+  if softRefused("start ") { return false }
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
@@ -6817,6 +6875,13 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if m.memProp == "pop" && c.callArgs.length == 0 {
     return popValueRhs(b, m, ix)
   }
+  if (
+    m.memProp == "get"
+    && c.callArgs.length == 1
+    && popRecvIsList(m.memObj, ibFnIx)
+  ) {
+    return getValueRhs(b, c, m, ix)
+  }
   if m.memProp == "has" && c.callArgs.length == 1 && exprMap(m.memObj, ibFnIx) {
     return mapHasRhs(b, m.memObj, c.callArgs[0], ix)
   }
@@ -6850,6 +6915,8 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     op = "charcode"
   } else if exprIsStrMethod(ix, ibFnIx, "cpAt") && c.callArgs.length == 1 {
     op = "cpat"
+  } else if exprIsStrMethod(ix, ibFnIx, "bytes") && c.callArgs.length == 0 {
+    op = "bytes"
   } else if exprIsStrIndexOf(ix, ibFnIx) && c.callArgs.length == 1 {
     op = if m.memProp == "includes" { "includes" } else { "indexof" }
   } else if !exprIsStrMethod(ix, ibFnIx, "slice") {
@@ -7262,7 +7329,27 @@ function popValueRhs(b: i32[], m: Member, ix: i32): Rhs {
   if !(repNodeAt(irBOpRep(v)) is RList) {
     return missRhs("pop operand coercion")
   }
-  const r: Rhs = { lqV: v, lqAt: ix }
+  const r: Rhs = { lqV: v, lqIx: [], lqAt: ix }
+  return r
+}
+
+// A list `.get(i)` on legacy's arm, `.pop`'s body with a bound (`emitPop`): the receiver, then the
+// index, which legacy writes from the call twice, so only an index it re-reads in place is taken.
+function getValueRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  if popAnyPlanOf(ix, ibFnIx) == null { return missRhs("method get") }
+  if !listGetIdxReReadable(c.callArgs[0]) { return missRhs("get index staged") }
+  const v = irBExpr(b, m.memObj)
+  if ibMiss != "" { return missRhs("method operand") }
+  if !(repNodeAt(irBOpRep(v)) is RList) {
+    return missRhs("get operand coercion")
+  }
+  const at = b.length
+  const i = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return missRhs("method operand") }
+  if b.length != at || irBOpRep(i) != repNodeOfTy(TY_I32) {
+    return missRhs("get index operand")
+  }
+  const r: Rhs = { lqV: v, lqIx: [i], lqAt: ix }
   return r
 }
 
@@ -7307,7 +7394,7 @@ function popStmt(b: i32[], c: Call, ix: i32) {
   const v = irBExpr(b, f.memObj)
   if ibMiss != "" { return 0 }
   if !(repNodeAt(irBOpRep(v)) is RList) { return skip("pop operand coercion") }
-  irBNode(b, { efRhs: { lqV: v, lqAt: ix } }, -1, ibNoValue, ix)
+  irBNode(b, { efRhs: { lqV: v, lqIx: [], lqAt: ix } }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -14383,7 +14470,16 @@ export function irLowerConstCell(gi: i32, gst: i32, probe: boolean): string {
 // The claim seam for global `gi`'s constant initializer: unarmed and every node in a claimed family,
 // the IR writes it and this answers true, so legacy does not; armed, legacy always runs.
 export function irClaimConstCell(gi: i32, gst: i32): boolean {
-  if ibArmed || irLowerConstCell(gi, gst, false) != "" { return false }
+  if ibArmed { return false }
+  const s = softBegin()
+  const why = irLowerConstCell(gi, gst, false)
+  softEnd(s)
+  if why != "" {
+    if why.indexOf("a legacy helper refused in ") == 0 {
+      count("claim fell back: const cell " + why)
+    }
+    return false
+  }
   count("claimed const cell")
   return true
 }
@@ -14843,7 +14939,16 @@ function thunkRetTy(ty: i32, r: i32): i32 {
 // in a claimed family, the lowering writes its code entry onto `out` and this answers true.
 export function irClaimThunk(fe: i32, out: u8[]): boolean {
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
-  if buildThunk(fe) != "" || !claimable() { return false }
+  const s = softBegin()
+  const ok = claimThunk(fe, out)
+  softEnd(s)
+  return ok
+}
+
+function claimThunk(fe: i32, out: u8[]): boolean {
+  const built = buildThunk(fe)
+  if softRefused("thunk ") { return false }
+  if built != "" || !claimable() { return false }
   corrupt()
   if irBVerify(ib).vfRule != 0 { return thunkFellBack("verifier") }
   const why = irLowerHelper(ib, out)
@@ -14921,7 +15026,16 @@ function buildEqHelp(si: i32): string {
 // it: when it builds and every node is in a claimed family, its code entry goes onto `out`.
 export function irClaimEqHelp(si: i32, out: u8[]): boolean {
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
-  if buildEqHelp(si) != "" || !claimable() { return false }
+  const s = softBegin()
+  const ok = claimEqHelp(si, out)
+  softEnd(s)
+  return ok
+}
+
+function claimEqHelp(si: i32, out: u8[]): boolean {
+  const built = buildEqHelp(si)
+  if softRefused("eq helper ") { return false }
+  if built != "" || !claimable() { return false }
   corrupt()
   if irBVerify(ib).vfRule != 0 { return eqHelpFellBack("verifier") }
   const why = irLowerEqHelper(ib, out)
