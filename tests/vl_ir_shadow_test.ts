@@ -1796,6 +1796,8 @@ Deno.test({
       "map-scalar-join-of-string": 2,
       "map-print-of-i32": 0,
       "map-print-of-string": 2,
+      "after-effects-at-value-rep": 0,
+      "after-effects-off-value-rep": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {

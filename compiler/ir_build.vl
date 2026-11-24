@@ -9964,9 +9964,13 @@ function coalesce(
   }
   // A `null`-typed operand runs for its effect alone, then the default is the value.
   if arm == "nulnone" {
-    const e = nulNoneEffect(b, n.binLeft, ix)
+    const effs: Opnd[] = []
+    const e = nulNoneEffect(b, n.binLeft, ix, effs)
     if ibMiss != "" { return e }
-    return coalAsBuilt(b, n.binRight, rep, arm)
+    const d = coalAsBuilt(b, n.binRight, rep, arm)
+    if ibMiss != "" || effs.length == 0 { return d }
+    // The left's effects are written where the value is read, as legacy writes the whole `??`.
+    return irBLetTemp(b, { aeEff: effs, aeV: d, aeAt: ix }, ix, rep)
   }
   // A hole's map read is legacy's null-test `if` too (`coalHoleMapIfOf`).
   if arm == "holeMap" {
@@ -10027,24 +10031,29 @@ function coalMapScalarJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 
 // A `null`-typed operand `x` run for its effect, as legacy's `emitNulNoneForEffect` writes it:
 // nothing for a `null` or a name, the receiver of a `?.`, both sides of a `??`, else the value
-// built and dropped. An if-expression is a miss.
-function nulNoneEffect(b: i32[], x: i32, ix: i32): Opnd {
+// built and dropped here, or where `sink` is given, pushed onto it for its reader to drop. An
+// if-expression is a miss.
+function nulNoneEffect(b: i32[], x: i32, ix: i32, sink: Opnd[] | null): Opnd {
   const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
   if nulNoneWritesNothing(x) { return none }
   const u = unwrapParen(x)
   if u < 0 { return irBMiss("coalesce nulnone effect") }
   const n = nodeAt(u)
   if n is IfStmt { return irBMiss("coalesce nulnone effect if") }
-  if n is OptMember { return nulNoneEffect(b, n.omObj, ix) }
+  if n is OptMember { return nulNoneEffect(b, n.omObj, ix, sink) }
   const co = plainCoalesceAt(u)
   if co != null {
-    const l = nulNoneEffect(b, co.binLeft, ix)
+    const l = nulNoneEffect(b, co.binLeft, ix, sink)
     if ibMiss != "" { return l }
-    return nulNoneEffect(b, co.binRight, ix)
+    return nulNoneEffect(b, co.binRight, ix, sink)
   }
   const v = irBExpr(b, u)
   if ibMiss != "" { return v }
-  irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  if sink == null {
+    irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  } else {
+    sink.push(v)
+  }
   return none
 }
 
@@ -15204,7 +15213,7 @@ function nulNonePayload(b: i32[], x: i32, rep: i32): Opnd {
   }
   const co = plainCoalesceAt(u)
   if co != null {
-    const l = nulNoneEffect(b, co.binLeft, u)
+    const l = nulNoneEffect(b, co.binLeft, u, null)
     if ibMiss != "" { return l }
     return nulNonePayload(b, co.binRight, rep)
   }
@@ -15212,7 +15221,7 @@ function nulNonePayload(b: i32[], x: i32, rep: i32): Opnd {
     assign(b, n, u)
     if ibMiss != "" { return irBMiss(ibMiss) }
   } else {
-    const e = nulNoneEffect(b, u, u)
+    const e = nulNoneEffect(b, u, u, null)
     if ibMiss != "" { return e }
   }
   return repTemp(b, { nuAt: u, nuOwn: NULL_OWN_NONE }, u, rep)
