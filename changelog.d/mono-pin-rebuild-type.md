@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **A generic body's index into a member call's result reads at the element's type.** `xs.rev()[0]` inside a generic function is one example; the parenthesised and variable-index spellings are others. When a generic was instantiated, the pass that turns a member call into a direct call rebuilt the nodes around that call without a type. Legacy then read the index as `i32`, which produced an invalid module at `f64` and `i64` elements (D17240), and the IR could not claim it (`rep ?`). A rebuilt node now takes its template's type for that instance. A `??` over a field read of another `??` in a function with an un-annotated parameter (D16962) also now runs.
