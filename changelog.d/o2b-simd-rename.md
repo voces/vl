@@ -1,0 +1,3 @@
+## Testing
+
+- **`std:simd` operations are methods keyed on the receiver's shape (receiver overloading, #9946):** `minU8x16`/`addSatI16x8`/`ltF32x4`/… become `min`/`addSat`/`lt`/… per shape, `select` is keyed on the value (`a.select(m, b)`, D3), the mask ops are `and`/`or`/`xor`/`andNot`/`not`/`anyTrue`/`allTrue`/`bitmask` on the mask, `widenLow`/`widenHigh`, and `narrowSatToU8x16`/`narrowSatToI16x8`/`narrowSatToU16x8` name only the target. `splat*`, `load*`/`store*` and `f32x4` keep their suffix. Breaking for callers of the old names; pass an operation as a value through a lambda. A refused member call on a receiver overload names the plain name, never `select@F32x4`.
