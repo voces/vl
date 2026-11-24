@@ -29,7 +29,26 @@ None new.
 
 ## Readings (fixpoint seeds on both sides, master 6bf25409)
 
-READINGS
+Each arm is measured with `VL_IR_SHADOW=4 vl check --codegen --compiler <that arm's seed>`. The base
+seed is built from `git archive 6bf25409`; both seeds are fixpoints.
+
+- Functions with no blocker:
+  - tests/cases: 84,457 -> 84,458. The one gained is the new witness's `keys` (+1).
+  - distilled corpus: 46,897 -> 46,897.
+- `for in map element rep`: tests/cases 1 -> 0; corpus 0.
+- No program loses a function.
+- Identity:
+  - `--names`: identical 9,433, differ 0; the self-compile is identical.
+  - `--cases`: identical 7,977, differ 0; witnesses 72 same.
+  - `--claimless`: identical 14,473, differ 0.
+- Mode 3: corpus and self-compile identical.
+- The `tests/cases` A/B: identical 7,698, differ 0.
+- Armed self-compile: 20,608 covered = verified = matched on both seeds.
+- Armed tests/cases: the candidate covers 84,458 and the base 84,457. On both seeds the same 11
+  functions mismatch (`prefix or locals`), so this change does not cause them.
+- L2 self-compile fuel: +0.02% on base 6bf25409 (127,340,865,657 -> 127,370,574,240).
+- Late demands 10 of 10; late tag rows 315 of 315.
+- rep-fuzz exact; regress: no runs lost; self ir misses 0.
 
 ## Position sweep (Q58)
 
