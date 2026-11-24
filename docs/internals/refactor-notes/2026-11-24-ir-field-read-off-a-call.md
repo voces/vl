@@ -28,9 +28,10 @@ byte-identical claimed and claimless.
 
 ## Left open
 
-- A module binding of the field (`const r = mk2(inc0).r; r.f(5)`) keeps `field read coercion`:
-  the global's cell is typed open. It is the remaining `@start` miss of
-  `hole-fn-in-nested-maker-record-read-inline.vl`.
+- A module binding of the field (`const r = mk2(inc0).r; r.f(5)`) keeps `field read coercion`,
+  unchanged from base; its cause is not established. It is the remaining `@start` miss of
+  `hole-fn-in-nested-maker-record-read-inline.vl`. Of the six cells, the one that declines by a
+  different name is this change's own fixture (`shared member callee kid`, its `?.` lines).
 - `mk(inc0)?.r.f(3)` and `mkn(inc0, true)?.r.f(3)` decline by name (`shared member callee kid`,
   `open temp type`).
 - Found while probing, on master and claimless alike, filed separately: a nullable record of a
