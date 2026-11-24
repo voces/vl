@@ -37,6 +37,12 @@ host_ok() {
 # `$TMPDIR`, deleted on exit, copied over the worktree's own target in place of the symlink.
 # The shared target is never built into (CLAUDE.md); the coordinator rebuilds it after a merge.
 host_check() {
+  # The probe compiles with the seed; with none there is no reading, and the host is not judged.
+  if [ ! -f build/vl-compiler.wasm ]; then
+    echo "agent-setup: no seed at build/vl-compiler.wasm, so the host cannot be checked;" >&2
+    echo "  build one (bash scripts/refresh-compiler.sh, or scripts/agent-setup.sh without --host-check)" >&2
+    return 1
+  fi
   if host_ok; then
     echo "agent-setup: host ok (\`VL_IR_SHADOW=6\` prints \`[ir]\` rows)"
     return 0
