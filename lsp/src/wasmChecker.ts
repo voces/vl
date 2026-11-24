@@ -33,7 +33,14 @@ import type { ModuleReader } from "../../compiler/coreTypes.ts";
 // the test that keeps them agreeing; the two TS ones used to be hand-maintained
 // twins and had silently lost the `export { … } from "…"` arm.
 import { needsModules } from "../../compiler/moduleGate.ts";
-import { FELL_BACK, needsClaimsOff, withClaimsOff } from "./claimFallback.ts";
+import {
+  engineRefusal,
+  fellBackLine,
+  invalidHeadline,
+  needsClaimsOff,
+  refusedNote,
+  withClaimsOff,
+} from "./claimFallback.ts";
 import { columnMap } from "./utf16Columns.ts";
 
 /**
@@ -2289,20 +2296,23 @@ export const createWasmChecker = (
     const bytes = moduleBytes(exp);
     if (!needsClaimsOff(exp, bytes)) return { bytes, diagnostics };
     // A claimed module the engine refuses: compiled again with claims off, legacy's answer is
-    // the result — its refusal, or its bytes with a warning (`claimFallback.ts`).
+    // the result — its refusal with a note, or its bytes with a warning (`claimFallback.ts`).
+    // Located first: the rebuild replaces the spans the claimed compile recorded.
+    const where = invalidHeadline(exp, engineRefusal(bytes), entryKey);
+    const at = where.line !== undefined && where.file === entryKey
+      ? { line: where.line - 1, character: where.col ?? 0 }
+      : { line: 0, character: 0 };
+    const said = (message: string, severity: VLDiagnostic["severity"]): VLDiagnostic =>
+      ({ message, severity, range: { start: at, end: at }, source: "vital" });
     staged = undefined;
     await ensureStaged(exp, source, entryKey, read);
     const legacy = withClaimsOff(exp, () => exp.compileSrc());
     staged = undefined;
     const legacyDiags = readDiags(exp, source);
-    if (legacy !== 0) return { bytes: undefined, diagnostics: legacyDiags };
-    const warning: VLDiagnostic = {
-      message: FELL_BACK,
-      severity: "warning",
-      range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
-      source: "vital",
-    };
-    return { bytes: moduleBytes(exp), diagnostics: [...legacyDiags, warning] };
+    if (legacy !== 0) {
+      return { bytes: undefined, diagnostics: [...legacyDiags, said(refusedNote(where.headline), "info")] };
+    }
+    return { bytes: moduleBytes(exp), diagnostics: [...legacyDiags, said(fellBackLine(where.headline), "warning")] };
   };
 
   const moduleBytes = (exp: Exports): Uint8Array => {

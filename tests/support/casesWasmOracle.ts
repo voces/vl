@@ -90,7 +90,7 @@ import { runWasm, VLRuntimeError } from "./runWasm.ts";
 import { needsModules } from "../../compiler/moduleGate.ts";
 import { isStdKey } from "../../lsp/src/editorText.ts";
 import { isDisplayableType } from "../../lsp/src/typeFeatures.ts";
-import { needsClaimsOff, withClaimsOff } from "../../lsp/src/claimFallback.ts";
+import { engineRefusal, invalidHeadline, needsClaimsOff, withClaimsOff } from "../../lsp/src/claimFallback.ts";
 
 const CASES_DIR = new URL("../cases/", import.meta.url);
 const STD_DIR = new URL("../../std/", import.meta.url);
@@ -285,12 +285,14 @@ const driveCase = (
   let rc = emit ? exp.compileSrc() : exp.checkSrc();
   // A claimed module the engine refuses is compiled again with claims off (`claimFallback.ts`).
   // Strict, as every gate is: legacy's refusal stands, and legacy building it is the claim's bug.
-  if (emit && rc === 0 && needsClaimsOff(exp, moduleBytes(exp))) {
+  const claimed = emit && rc === 0 ? moduleBytes(exp) : undefined;
+  if (claimed !== undefined && needsClaimsOff(exp, claimed)) {
+    const where = invalidHeadline(exp, engineRefusal(claimed), entryKey);
     stageCase(exp, entryKey, src, isModule);
     rc = withClaimsOff(exp, () => exp.compileSrc());
     if (rc === 0) {
       throw new Error(
-        `${entryKey}: an IR claim produced an invalid module, and the legacy emitter builds the program (strict)`,
+        `${where.headline}\nan IR claim produced an invalid module, and the legacy emitter builds the program (strict)`,
       );
     }
   }

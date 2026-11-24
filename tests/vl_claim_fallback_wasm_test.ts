@@ -50,7 +50,8 @@ Deno.test({
   ignore,
   fn: async () => {
     const { bytes, diagnostics } = await createWasmChecker(fresh).compile(CONTROL, "main.vl", noSiblings);
-    if (bytes !== undefined || !diagnostics.some((d) => d.message.includes(REFUSAL))) {
+    const note = "an IR claim wrote an invalid module (main.vl:9:1: the emitted module failed to validate inside the module's top-level code: ";
+    if (bytes !== undefined || !diagnostics.some((d) => d.message.includes(REFUSAL)) || !diagnostics.some((d) => d.message.startsWith(note))) {
       throw new Error(`want no bytes and legacy's refusal, got ${bytes?.length} bytes and ${JSON.stringify(diagnostics.map((d) => d.message))}`);
     }
   },
@@ -62,15 +63,26 @@ Deno.test({
   fn: async () => {
     const exp = fresh();
     let compiles = 0;
-    // The first, claimed, module gains a stray trailing byte; the claims-off rebuild's does not.
+    // In the first, claimed, module `f`'s `local.get 0; i32.const 1; i32.add` becomes
+    // `local.get 0; drop; drop; i32.add`: a stack underflow inside `f`. The rebuild's is untouched.
+    let hit = -1;
     const patched: Exports = {
       ...exp,
-      compileSrc: () => (compiles++, exp.compileSrc()),
-      rbyteLen: () => exp.rbyteLen() + (compiles === 1 ? 1 : 0),
-      rbyteAt: (i: number) => (i < exp.rbyteLen() ? exp.rbyteAt(i) : 0xff),
+      compileSrc: () => (compiles++, hit = -1, exp.compileSrc()),
+      rbyteAt: (i: number) => {
+        if (compiles !== 1) return exp.rbyteAt(i);
+        if (hit < 0) {
+          const b = bytesOf(exp);
+          hit = b.findIndex((_, k) => [0x20, 0, 0x41, 1, 0x6a].every((v, j) => b[k + j] === v));
+        }
+        return hit >= 0 && (i === hit + 2 || i === hit + 3) ? 0x1a : exp.rbyteAt(i);
+      },
     };
-    const { bytes, diagnostics } = await createWasmChecker(() => patched).compile("print(1 + 2)\n", "main.vl", noSiblings);
-    if (bytes === undefined || !WebAssembly.validate(bytes as Uint8Array<ArrayBuffer>) || !diagnostics.some((d) => d.message === FELL_BACK)) {
+    const src = Deno.readTextFileSync(`${ROOT}/tests/ir-claim-fallback/claimed-and-valid.vl`);
+    const { bytes, diagnostics } = await createWasmChecker(() => patched).compile(src, "main.vl", noSiblings);
+    const line = "main.vl:2:10: the emitted module failed to validate inside `f`: ";
+    const fell = diagnostics.some((d) => d.message.startsWith(line) && d.message.endsWith(`: ${FELL_BACK}`));
+    if (bytes === undefined || !WebAssembly.validate(bytes as Uint8Array<ArrayBuffer>) || !fell) {
       throw new Error(`want legacy's valid bytes and the fallback warning, got ${bytes?.length} bytes and ${JSON.stringify(diagnostics.map((d) => d.message))}`);
     }
   },
