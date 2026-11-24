@@ -55,4 +55,20 @@ stay invalid on master and head, filed as D17360 and D17361.
 
 ## Readings
 
-READINGS
+Base 8328c904b and head 21a2aaeda, each built in its own tree, fixpoint seeds:
+
+| reading | result |
+| --- | --- |
+| legacy A/B: tests/cases non-`@error` and capability probes, 9,699 programs | 7 moved, all `rc 70 → 0`: the seven `let-copy-of-fn-record-*` witnesses |
+| `ir-identity --names` (distilled corpus and self-compile) | 9,433 identical, differ 0; self-compile identical |
+| mode-6 | corpus 0 prepost differs in 86,258 rows; tests/cases 1 in 70,577, the `error-` case the same on base |
+| `--cases` / `--claimless` | 7,992 / 14,474 identical, differ 0 |
+| L2 self-compile fuel | +0.05%; the fuel pair is output-identical |
+| rep-fuzz, D17047, regress.vl | exact; identical; 0 runs → not-runs, 0 → silent |
+| A/B IR coverage | covered 84,669 → 84,670, mismatch/fail 22 → 22 |
+
+After the cap sentinel and a merge of master, on the final tree with a host built from 6bf25409
+(sha256 `7fc163af…0dca`): fixpoint; `gate.sh --fast` passed; `--cases` 8,038 and `--names` 9,433
+identical, differ 0; self-compile identical; `check-filed-witnesses --strict` 0 MOVED.
+
+Past the cap: 15 copies deep prints 6; 17 copies deep is an invalid module, as on master (D17362).
