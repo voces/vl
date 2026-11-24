@@ -88,11 +88,21 @@ timed_out() {
 # it; `<module>` names everything outside the function bodies.
 BASELINE=${IR_DIVERGENCE_BASELINE:-scripts/ir-divergence-baseline.txt}
 WASM_DIS=${WASM_DIS:-$PWD/node_modules/.bin/wasm-dis}
+# The baseline key of file $1: an inventory witness, written under $T/wit/inv<k>/<id>/, is its row's
+# file (`--claimless` extracts witnesses to a fresh temp dir each run).
+bkey() {
+  case "$1" in
+    "$T"/wit/inv1/*) local r=${1#"$T"/wit/inv1/}; echo "docs/internals/inventory/${r%%/*}.md" ;;
+    "$T"/wit/inv2/*) local r=${1#"$T"/wit/inv2/}; echo "docs/internals/inventory-2/${r%%/*}.md" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 # A listed divergence is read through the disassembler; without it the byte differ of a listed
 # program would read as a plain differ, so the run stops at the first one instead.
 need_dis() {
   [ -x "$WASM_DIS" ] && return 0
-  [ -f "$BASELINE" ] && awk -F '\t' -v f="$1" '$1 == f { hit = 1 } END { exit !hit }' "$BASELINE" || return 0
+  [ -f "$BASELINE" ] && awk -F '\t' -v f="$(bkey "$1")" '$1 == f { hit = 1 } END { exit !hit }' "$BASELINE" || return 0
   echo "ir-identity: $WASM_DIS is not executable, so the listed divergence of $1 cannot be read;" >&2
   echo "  link the main checkout's node_modules into this tree, or set \$WASM_DIS" >&2
   exit 2
@@ -118,7 +128,7 @@ fn_differs() {
 # Whether file $1's byte differ (wasm $2 vs $3) is an expected divergence; prints its reason. With
 # $SEED_A and $SEED_B set, both sides are rebuilt with `--names` so the functions carry names.
 expected_divergence() {
-  [ -f "$BASELINE" ] && awk -F '\t' -v f="$1" '$1 == f { hit = 1 } END { exit !hit }' "$BASELINE" || return 1
+  [ -f "$BASELINE" ] && awk -F '\t' -v f="$(bkey "$1")" '$1 == f { hit = 1 } END { exit !hit }' "$BASELINE" || return 1
   local a=$2 b=$3 fn unlisted=""
   if [ -n "${SEED_A:-}" ] && [ -n "${SEED_B:-}" ]; then
     a=$T/na.wasm; b=$T/nb.wasm
@@ -128,7 +138,7 @@ expected_divergence() {
   fn_differs "$a" "$b" > "$T/fd" || return 1
   [ -s "$T/fd" ] || { echo "no function differs under --names"; return 1; }
   while read -r fn; do
-    awk -F '\t' -v f="$1" -v g="$fn" '$1 == f && $2 == g { hit = 1 } END { exit !hit }' "$BASELINE" \
+    awk -F '\t' -v f="$(bkey "$1")" -v g="$fn" '$1 == f && $2 == g { hit = 1 } END { exit !hit }' "$BASELINE" \
       || unlisted="$unlisted $fn"
   done < "$T/fd"
   if [ -n "$unlisted" ]; then echo "unlisted:$unlisted"; return 1; fi
