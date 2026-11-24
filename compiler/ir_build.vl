@@ -4065,6 +4065,9 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !narrowed
       && !stored
       && repStoresAs(rep, cellRep)
+    // A record type no struct row records, read at it, reads the cell at the row its initializer
+    // stored, as a local's (`rowlessLetTy`).
+    const rowTy = if cellRep != rep && !narrowed && !stored { globalRowlessTy(d, cellRep, rep) } else { -1 }
     // A closure cell read where its type leaves a closure part open or fills one is the same
     // closure struct, retagged.
     const holed = cellRep != rep
@@ -4094,10 +4097,14 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !alike
       && !member
       && !atomId
+      && rowTy < 0
     ) {
       return irBMiss("global read coercion")
     }
-    if stored { return globalStoredRead(b, g, d, ix, cellRep) }
+    if stored {
+      return globalStoredRead(b, g, ix, cellRep, heldTy(letBindTy(d, -1)))
+    }
+    if rowTy >= 0 { return globalStoredRead(b, g, ix, cellRep, rowTy) }
     const gm = irGlobalReadMiss(g, ibGlobalCtx())
     if gm != "" { return irBMiss(gm) }
     const sid = sidOfNode(ix)
@@ -4143,14 +4150,22 @@ function globalReadTy(d: i32, ix: i32, rep: i32): i32 {
   return if ht >= 0 && repNodeOfTy(ht) == rep { ht } else { ty }
 }
 
-// Read `ix` of global `g` (declaration `d`) as its cell stores it: rep `cellRep`, typed at the
-// binding's own type, as legacy's `global.get` reads it.
+// The record type of the struct row global `d`'s cell holds at rep `cellRep`, where the read at
+// `rep` is typed at a record no struct row records; else -1.
+function globalRowlessTy(d: i32, cellRep: i32, rep: i32): i32 {
+  const st = heldTy(scopeTyAt(d, -1))
+  if rep != repNodeOfTy(st) { return -1 }
+  return rowlessStoredTy(st, rep, repTyOf(cellRep))
+}
+
+// Read `ix` of global `g` as its cell stores it: rep `cellRep`, typed at `ty`, the
+// binding's own type or its row's, as legacy's `global.get` reads it.
 function globalStoredRead(
   b: i32[],
   g: i32,
-  d: i32,
   ix: i32,
   cellRep: i32,
+  ty: i32,
 ): Opnd {
   const gm = irGlobalReadMiss(g, ibGlobalCtx())
   if gm != "" { return irBMiss(gm) }
@@ -4160,7 +4175,7 @@ function globalStoredRead(
     ggNn: -1,
   }
   ib.irReadAgain[ix] = gr
-  return irBLetTempTy(b, gr, ix, cellRep, heldTy(letBindTy(d, -1)))
+  return irBLetTempTy(b, gr, ix, cellRep, ty)
 }
 
 // Capture `n` read at `rep` on legacy's `capture` arm (`emitCapturedRead`): a lifted function's
@@ -4795,7 +4810,7 @@ function globalHolderTy(d: i32): i32 {
 // Notes global `g`'s rep `rep` in `ib`, with its declaration `d`'s storage-row type
 // (`letBindTy`), which the verifier checks a read off the checked type's rep against.
 function globalNoteAt(g: i32, d: i32, rep: i32) {
-  const st = letBindTy(d, -1)
+  const st = globalStoreTy(d, rep)
   if irGlobalRepOf(ib, g) < 0 {
     irGlobalStoreNote(ib, g, st)
   } else if irGlobalStoreTyOf(ib, g) != st {
@@ -4804,6 +4819,15 @@ function globalNoteAt(g: i32, d: i32, rep: i32) {
   }
   irGlobalNote(ib, g, rep)
   return 0
+}
+
+// The storage-row type of global `d` noted at rep `rep`: its binding's (`letBindTy`), or where
+// that is a record no struct row records, the row legacy declares the cell at, `rep`'s record.
+function globalStoreTy(d: i32, rep: i32): i32 {
+  const st = letBindTy(d, -1)
+  const ht = heldTy(st)
+  const rt = rowlessStoredTy(ht, repNodeOfTy(ht), repTyOf(rep))
+  return if rt >= 0 { rt } else { st }
 }
 
 // The rep a global held at type `ty` takes; -1 when it is no scalar.
@@ -10274,7 +10298,13 @@ function tagCallee(b: i32[], f: i32): Opnd {
       && fnValueFeOf(n, sidOfNode(f), f, ibFnIx) < 0
       && globalRep(g, d) != exprRepOf(f)
     ) {
-      return globalStoredRead(b, g, d, f, globalRep(g, d))
+      return globalStoredRead(
+        b,
+        g,
+        f,
+        globalRep(g, d),
+        heldTy(letBindTy(d, -1)),
+      )
     }
   }
   if n is Ident && identReadArmOf(n, f, ibFnIx, false) == "capture" {
@@ -11273,8 +11303,9 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   assignTo(b, n, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
   const m = asgReReadEnter(ix)
-  // A field or element target is read again whole, its receiver and index included.
-  const o = if t is Ident { identRead(b, t, n.binLeft, rep, false) } else { irBExpr(b, n.binLeft) }
+  // A field or element target is read again whole, its receiver and index included. A global's
+  // re-read is seated (`cell`): its atom cell's id is the read, which `widenTo` below decodes.
+  const o = if t is Ident { identRead(b, t, n.binLeft, rep, globalTarget(n.binLeft)) } else { irBExpr(b, n.binLeft) }
   asgReReadLeave(m)
   // The cell's atom re-read at a `string` assignment is decoded, as legacy widens it (`widenTo`).
   const w = if ibMiss == "" && atomAtStr(irBOpRep(o), rep) { widenTo(b, o, ix, rep, -1) } else { o }
@@ -11282,6 +11313,15 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("assignment value re-read rep")
   }
   return w
+}
+
+// Whether identifier `ix` names a module global's `let`, not a local or a capture.
+function globalTarget(ix: i32): boolean {
+  const d = identDeclOf(ix)
+  return d >= 0
+    && nodeAt(d) is LetDecl
+    && localIndexOf(ibFnIx, ix) < 0
+    && globalIndexOfSid(sidOfNode(ix)) >= 0
 }
 
 // An assignment whose value is its right side's number literal (`asgValueArmOf` "lit"): the
