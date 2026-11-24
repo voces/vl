@@ -32,7 +32,9 @@ New test cases:
 - A field read straight off the join (`(if x is A { x } else { d }).v`) is refused by legacy at
   emit on master: D17108, filed from the sweep.
 - A record parameter or a nested call taking the join is check-clean invalid wasm on master:
-  D17115, filed from the sweep; the IR declines that position until the row closes.
+  D17115, filed from the sweep and legacy's to fix. The IR declines that position with the miss
+  `argument union if at a record (D17115)`, which disappears when the legacy fix lands; lifting the
+  decline and putting the sweep's `pParam` and `pNested` positions back is the follow-up.
 - An unbox arm that is a maker call, not a narrowed local, misses as `ref if arm unbox shape`
   (`records/value-if-of-maker-call-and-literal-at-declared-record*.vl`,
   `records/maker-calls-in-two-joins-at-declared-record.vl`).
