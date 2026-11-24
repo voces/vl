@@ -28,7 +28,14 @@ When the box is not parked, the operand is built first, as legacy reads it first
 | D17065's grids: uncovered union-compare rows | 88 | 50 |
 | D17068's grid: uncovered or mismatch rows | 0 | 0 |
 | the 4 witnesses: uncovered union-compare rows | 8 | 2 (`atomNoNull`, `boolField`: below) |
-| self-compile IR misses | 0 | READINGS_SELF |
+| self-compile IR misses | 0 | 0 |
+
+## The grids, as named sets
+
+D17065's grids (144 cells) and D17068's (252) are now named sets in
+`scripts/silent-sweep/distilled/named/` (`d17065_*`, `d17068_*`), with their coordinates in
+`scripts/silent-sweep/census/d17065-union-compare-grid.json` and `d17068-union-compare-grid.json`.
+All 396 `runs`, so `regress.vl` reds if a later change stops one running.
 
 ## Left in the class (free, small items, one list per mechanism)
 
