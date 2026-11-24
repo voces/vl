@@ -637,9 +637,12 @@ import {
   liftWbEnd,
   listFitStoodIn,
   listFitStoodTy,
+  listGetDepth,
+  listGetIdxOwner,
   listGetIdxSlot,
   listGetIdxStagedIx,
   listGetIdxStagedSet,
+  listGetRecvOwner,
   listGetRecvSlot,
   listGetRecvStagedIx,
   listGetRecvStagedSet,
@@ -1415,6 +1418,7 @@ import {
 } from "./emit_union_atoms"
 import {
   SCRATCH_BY_BOTH,
+  SCRATCH_BY_KEY,
   asExprHoleNumOpt,
   asExprHoleNumSad,
   asExprNumCastDomain,
@@ -8182,6 +8186,7 @@ function listGetStageSave(): i32[] {
   sv.push(if listGetIdxStagedSet { 1 } else { 0 })
   sv.push(listGetRecvStagedIx)
   sv.push(if listGetRecvStagedSet { 1 } else { 0 })
+  sv.push(listGetDepth)
   return sv
 }
 
@@ -8199,6 +8204,7 @@ export function listGetStageRestore(sv: i32[]) {
   listGetIdxStagedSet = sv[1] == 1
   listGetRecvStagedIx = sv[2]
   listGetRecvStagedSet = sv[3] == 1
+  listGetDepth = sv[4]
   return 0
 }
 
@@ -8210,19 +8216,49 @@ function listGetStageMark(callIx: i32) {
   if c is Call {
     const callee = nodeAt(unwrapParen(c.callFn))
     if callee is Member {
-      if !optRecvReReadable(callee.memObj) {
+      const stagesRecv = !optRecvReReadable(callee.memObj)
+      const stagesIdx = c.callArgs.length == 1
+        && !listGetIdxReReadable(c.callArgs[0])
+      // A call that stages takes the next depth's slots; one that stages nothing takes none.
+      if stagesRecv || stagesIdx { listGetDepth = listGetDepth + 1 }
+      if stagesRecv {
         listGetRecvStagedIx = unwrapParen(callee.memObj)
         listGetRecvStagedSet = false
       }
-      if c.callArgs.length == 1 {
-        if !listGetIdxReReadable(c.callArgs[0]) {
-          listGetIdxStagedIx = unwrapParen(c.callArgs[0])
-          listGetIdxStagedSet = false
-        }
+      if stagesIdx {
+        listGetIdxStagedIx = unwrapParen(c.callArgs[0])
+        listGetIdxStagedSet = false
       }
     }
   }
   return 0
+}
+
+// The index stash of the `.get` at the current staging depth: depth 1's eager slot, a deeper
+// one's own lazy slot (code 54).
+function listGetIdxSlotNow(): i32 {
+  if listGetDepth <= 1 { return listGetIdxSlot }
+  return scratchSlot(54, "list", listGetDepth, SCRATCH_BY_KEY)
+}
+
+// The receiver stash of the `.get` at the current staging depth (code 55 past depth 1).
+function listGetRecvSlotNow(): i32 {
+  if listGetDepth <= 1 { return listGetRecvSlot }
+  return scratchSlot(55, "list", listGetDepth, SCRATCH_BY_KEY)
+}
+
+// Record `ix` as the node depth `listGetDepth`'s stash in `owners` holds.
+function listGetOwnerSet(owners: i32[], ix: i32) {
+  while owners.length < listGetDepth { owners.push(-1) }
+  owners[listGetDepth - 1] = ix
+  return 0
+}
+
+// Whether depth `listGetDepth`'s stash in `owners` still holds `ix`: a nested staging call that
+// took the same depth would have overwritten it.
+function listGetOwnerHolds(owners: i32[], ix: i32): boolean {
+  if listGetDepth < 1 || listGetDepth > owners.length { return false }
+  return owners[listGetDepth - 1] == ix
 }
 
 // Push a `.get` index: the i32 stash when this call staged it, teed in on the first read,
@@ -8232,14 +8268,21 @@ function emitListGetIdx(idxIx: i32, fnIx: i32) {
     return emitExpr(idxIx, fnIx)
   }
   if listGetIdxStagedSet {
-    fbLocalGet(listGetIdxSlot)
+    if !listGetOwnerHolds(listGetIdxOwner, listGetIdxStagedIx) {
+      return emitFailAt(
+        "emitProgram: `.get` index stash overwritten by a nested `.get`",
+        idxIx,
+      )
+    }
+    fbLocalGet(listGetIdxSlotNow())
     return 0
   }
   if !fnUses.listGet {
     return emitFailAt("emitProgram: `.get` operand stash not reserved", idxIx)
   }
   if emitExpr(idxIx, fnIx) < 0 { return -1 }
-  fbLocalTee(listGetIdxSlot)
+  fbLocalTee(listGetIdxSlotNow())
+  listGetOwnerSet(listGetIdxOwner, listGetIdxStagedIx)
   listGetIdxStagedSet = true
   return 0
 }
@@ -8252,14 +8295,21 @@ function emitListGetRecv(objIx: i32, fnIx: i32, heap: i32) {
     return svSyncRecv(objIx, fnIx)
   }
   if listGetRecvStagedSet {
-    fbLocalGet(listGetRecvSlot)
+    if !listGetOwnerHolds(listGetRecvOwner, listGetRecvStagedIx) {
+      return emitFailAt(
+        "emitProgram: `.get` receiver stash overwritten by a nested `.get`",
+        objIx,
+      )
+    }
+    fbLocalGet(listGetRecvSlotNow())
   } else {
     if !fnUses.listGet {
       return emitFailAt("emitProgram: `.get` operand stash not reserved", objIx)
     }
     if emitExpr(objIx, fnIx) < 0 { return -1 }
     svSyncRecv(objIx, fnIx)
-    fbLocalTee(listGetRecvSlot)
+    fbLocalTee(listGetRecvSlotNow())
+    listGetOwnerSet(listGetRecvOwner, listGetRecvStagedIx)
     listGetRecvStagedSet = true
   }
   fbRefCast(heap)
@@ -11040,10 +11090,12 @@ export type UnionEqNulPlan = {
   unOpStaged: boolean,
 }
 
-// The null-leg plan of box `boxIx` against `otherIx`; `unLeg` 0 where another arm writes it.
+// The null-leg plan of box `boxIx` against `otherIx`, `opLeft` where the operand is the compare's
+// left side; `unLeg` 0 where another arm writes it.
 export function unionEqNulPlanOf(
   boxIx: i32,
   otherIx: i32,
+  opLeft: boolean,
   fnIx: i32,
 ): UnionEqNulPlan {
   const none: UnionEqPlan = { uqKind: -1, uqTag: -1 }
@@ -11066,7 +11118,7 @@ export function unionEqNulPlanOf(
   if !hasArm { return no }
   const nul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
   const boxNul = unionSetHasNullTy(uname, bty)
-  const opStaged = !unionEqOperandOk(otherIx)
+  const opStaged = nulOperandStaged(boxIx, otherIx, opLeft)
   let leg = 0
   if eak == 2 && nul && !exprNulLitUnion(otherIx, fnIx) { leg = 3 }
   if eak == 1 && nul && boxNul { leg = 2 }
@@ -11083,6 +11135,20 @@ export function unionEqNulPlanOf(
     unBoxStaged: !unionEqOperandOk(boxIx),
     unOpStaged: opStaged,
   }
+}
+
+// Whether a null-leg operand is read once into its slot: it is no place, or it is left of a box
+// with effects, which may write it (D17116).
+function nulOperandStaged(boxIx: i32, otherIx: i32, opLeft: boolean): boolean {
+  if !unionEqOperandOk(otherIx) { return true }
+  return opLeft && !exprEffectFree(unwrapParen(boxIx))
+}
+
+// Whether a union compare's sides must each be read once in source order: the operand has effects,
+// or it is left of a box with effects, which may write it (D17068, D17116).
+function unionEqSideMoves(boxIx: i32, otherIx: i32, opLeft: boolean): boolean {
+  if !exprEffectFree(unwrapParen(otherIx)) { return true }
+  return opLeft && !exprEffectFree(unwrapParen(boxIx))
 }
 
 // After a null-leg operand: its null test at leg `leg` (1 a `K | null` id, 2 the `boolean | null`
@@ -11151,7 +11217,7 @@ function emitUnionConcreteEq(
   const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
   // An operand with effects runs whatever the box holds: both sides are read once, in source
   // order, ahead of the tag test (D17068).
-  const pp = unionEqStagedPlanOf(boxIx, otherIx, fnIx)
+  const pp = unionEqStagedPlanOf(boxIx, otherIx, !boxLeft, fnIx)
   if pp.uqKind >= 0 {
     return emitUnionEqStaged(boxIx, otherIx, pp, isNe, boxLeft, fnIx)
   }
@@ -11261,7 +11327,7 @@ function emitUnionConcreteEq(
   // otherwise, where the widened operand is non-null (D3347).
   const nulOther = eak == 2 && exprNulLitUnion(otherIx, fnIx)
   // A `K | null` operand that is no place is read once, as its id, into its own slot (D17066).
-  const atomStage = nulOther && !unionEqOperandOk(otherIx)
+  const atomStage = nulOther && nulOperandStaged(boxIx, otherIx, !boxLeft)
   // A nullable string at the instance (`T` pinned to `string | null`) equals the box's null when
   // it is null, read raw for the test; present, it compares as the string below.
   const nulStrOperand = eak == 2
@@ -11269,14 +11335,14 @@ function emitUnionConcreteEq(
     && !exprNulLitUnion(otherIx, fnIx)
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
   // A nullable string operand that is no place is read once, into its own slot (`opStage`).
-  const opStage = nulStrOperand && !unionEqOperandOk(otherIx)
+  const opStage = nulStrOperand && nulOperandStaged(boxIx, otherIx, !boxLeft)
   const nulStrOther = nulStrOperand
   // The `boolean | null` niche's null is the value 2 (D2260); an operand that is no place is
   // read once, into its own slot (`boolStage`).
   const nulBoolOther = eak == 1
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
     && boxNul
-  const boolStage = nulBoolOther && !unionEqOperandOk(otherIx)
+  const boolStage = nulBoolOther && nulOperandStaged(boxIx, otherIx, !boxLeft)
   const staged = eqOnce && (nulOther || nulStrOther || nulBoolOther)
   if eqOnce && !staged {
     return emitFail(
@@ -11414,15 +11480,17 @@ function emitUnionEqStaged(
   return unionEqStagedTail(qp, isNe, fnIx)
 }
 
-// The plan of a union `==` whose operand has effects, read with the box once each in source order
-// (`emitUnionEqStaged`); `uqKind` -1 where another arm writes it.
+// The plan of a union `==` read with the box once each in source order (`emitUnionEqStaged`):
+// its operand has effects, or is left of a box with effects (`opLeft`), which may write it. `uqKind`
+// -1 where another arm writes it.
 export function unionEqStagedPlanOf(
   boxIx: i32,
   otherIx: i32,
+  opLeft: boolean,
   fnIx: i32,
 ): UnionEqPlan {
   const no: UnionEqPlan = { uqKind: -1, uqTag: -1 }
-  if exprEffectFree(unwrapParen(otherIx)) { return no }
+  if !unionEqSideMoves(boxIx, otherIx, opLeft) { return no }
   const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
   if qp.uqKind >= 0 { return qp }
   return unionEqStashPlanOf(boxIx, otherIx, fnIx)
@@ -23904,6 +23972,12 @@ export function fnTagLeafEmitted(ix: i32, fnIx: i32): i32 {
   const id = fnTagLeafId(ix)
   if id < 0 || monoTokenReturnedFe(ix, fnIx) >= 0 { return -1 }
   return id
+}
+
+// Whether `emitExpr` writes `ix` as a null-unit place read (`emitNulNoneRead`). Legacy and the IR
+// share it.
+export function nulUnitPlaceReadAt(ix: i32, fnIx: i32): boolean {
+  return ix >= 0 && placePrePathWhy(ix, fnIx) == "pre-path null unit read"
 }
 
 // `emitExpr`'s null-unit and niche reads of a place or method call `ix`, or "".
@@ -38541,11 +38615,12 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
 }
 
 // The element kinds the IR's walk binds as legacy's does: an `i32`, a string, a value union's
-// box, a record, or an `i32`, string, byte or record list, each read whole into the loop variable.
+// box, a record, or an `i32`, `i64`, `f64`, string, byte (or nullable byte) or record list, each
+// read whole into the loop variable.
 function forInElemPlain(ek: VKind): boolean {
   return match ek {
-    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" | "nulbool" | "f32" => true
-    "map" | "f64list" | "nullist" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
+    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" | "nulbool" | "f32" | "f64list" | "i64list" | "nulu8list" => true
+    "map" | "nullist" | "nulreflist" | "nulclosure" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulmap" | "nulnone" | "v128" => false
   }
 }
 
