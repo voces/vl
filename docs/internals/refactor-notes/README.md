@@ -8,6 +8,7 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-24-legacy-record-join-compare-operand](2026-11-24-legacy-record-join-compare-operand.md): A record-joined value `if` compares as its record (2026-11-24, lane IR-N5, D17132)
 - [2026-11-24-ir-union-if-record-join](2026-11-24-ir-union-if-record-join.md): A value `if` joined at a record's row is legacy's reference join, its narrowed arm unboxed (2026-11-24, lane IR-N5)
 - [2026-11-24-ir-union-compare-null-leg-reread](2026-11-24-ir-union-compare-null-leg-reread.md): IR: a null-leg union compare's field or global operand, read again (2026-11-24, lane N10)
 - [2026-11-24-ir-union-compare-atom-place](2026-11-24-ir-union-compare-atom-place.md): IR: a `K | null` place operand on a union compare's null leg (2026-11-24, lane N10)
