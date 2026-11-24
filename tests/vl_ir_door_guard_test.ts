@@ -213,8 +213,8 @@ print(f())
   },
 });
 
-// A local the fragment never declared takes its rep from the type; legacy's cell here is the
-// literal set's atom (D14757). The fragment must miss, not write the atom into a string list.
+// Legacy's cell here is the literal set's atom (D14757), where the variable is declared too
+// (`letAtomCellTy`). The fragment must miss, not write the atom into a string list.
 Deno.test({
   name: "ir door: a local whose legacy cell is not its type's rep misses",
   ignore,
@@ -228,7 +228,8 @@ function main(c: boolean) {
 }
 main(true)
 `);
-    if ((r.get("node-in array: miss atom cell local rep") ?? 0) < 1) {
+    const missed = [...r.keys()].filter((k) => k.startsWith("node-in array: miss"));
+    if (missed.length < 1) {
       throw new Error(`want the atom cell's read to miss, got ${show(r)}`);
     }
     const differ = [...r.keys()].filter((k) => k.startsWith("node-in array: differ"));
