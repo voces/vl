@@ -4382,6 +4382,12 @@ function cboxLitCopy(ix: i32) {
 // list type is recorded under `key`, the binding whose reads become `c[0]`. A scalar annotation
 // takes its array form so the list classifies as the matching list type (`[0.0]` builds an
 // f64 list); an un-annotated cell is the list of its init's recorded type.
+// Whether `t` is a never-filled `let x = null` hole, `TyNullable(-1)`, which is `null` (D1576).
+function tyIsUnfilledNullHole(t: i32): boolean {
+  const n = tyAt(t)
+  return n is TyNullable && n.nInner < 0
+}
+
 function cboxBoxLet(ix: i32, key: i32) {
   const n = nodeAt(ix)
   if !(n is LetDecl) { return 0 }
@@ -4416,9 +4422,13 @@ function cboxBoxLet(ix: i32, key: i32) {
     // An init that read another cell is already `c[0]`, untyped, its read's type banked aside.
     let initTy = nodeTyIxOf(n.letInit)
     if initTy < 0 && n.letInit >= 0 { initTy = cboxReadTy[n.letInit] ?? -1 }
-    // A `null` whose hole a later write filled holds that write's `T | null` (D2421).
+    // A `null` whose hole a later write filled holds that write's `T | null` (D2421); one no
+    // write filled is the `null` type, whose cell is a `null[]` as an annotated one's (D17222).
     const hty = letNullHoleFilledTy(ix)
     if hty >= 0 { initTy = hty }
+    if hty < 0 && initTy >= 0 && tyIsUnfilledNullHole(initTy) {
+      initTy = TY_NULL
+    }
     // A binding read as a tagged set holds an id, whichever member seeds it.
     const lr = fnLetReadTyOf(ix)
     if lr >= 0 && fnTagTyIsTagged(lr) { initTy = lr }
@@ -4784,7 +4794,9 @@ function cboxWalkIdent(ix: i32, n: Ident, boxed: i32[]): i32 {
     const cellTy = cboxCellTy[bd] ?? -1
     if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
     const rd = mkIndex(cell, mkNumTyped("0", -1, TY_I32), -1)
-    const rty = nodeTyIxOf(ix)
+    // A never-filled `let x = null` is read at the `null` type, as its `null[]` cell holds it.
+    const rty0 = nodeTyIxOf(ix)
+    const rty = if rty0 >= 0 && tyIsUnfilledNullHole(rty0) { TY_NULL } else { rty0 }
     if (cboxVecCells[bd] ?? 0) == 1 {
       if cboxStoreTarget { return rd }
       nodeTyRecord(rd, cboxElemTyOfCell(cellTy))
@@ -4868,6 +4880,11 @@ function cboxWalkBin(ix: i32, n: BinExpr, boxed: i32[]): i32 {
     const elemTy = tyArrayElemIx(cboxCellTy[leftDecl] ?? -1)
     if n.binOp == "??" || !tyIsLitUnionOrLit(elemTy) {
       nodeTyRecord(unwrapParen(n.binLeft), elemTy)
+    }
+    // A write into a never-filled `let x = null`'s cell yields the `null` it stored (D17221).
+    const at = nodeTyIxOf(ix)
+    if n.binOp == "=" && at >= 0 && tyIsUnfilledNullHole(at) {
+      nodeTyRecord(ix, TY_NULL)
     }
   }
   return ix
