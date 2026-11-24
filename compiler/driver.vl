@@ -241,10 +241,13 @@ import {
   mkProgram,
   mkStr,
   nodeToks,
+  opDeclOpOf,
   ovCandText,
   ovCandsText,
+  ovDeclPlain,
   ovFnHead,
   ovHeadsOverlap,
+  ovLocalCount,
   ovPlainAdd,
   ovPrimClass,
   ovSetAdd,
@@ -710,6 +713,11 @@ let modRwCalleeIx = -1
 // Uses of an overloaded name the rewrite found, raised only when the set itself is legal:
 // the node, its set row, and whether it is a plain call (else a function value).
 let modOvUseIx: i32[] = []
+// Every module's receiver-overloaded declarations the parser minted (`ovMintLocalSets`), by
+// `module:plain` name: the minted spellings, before the merge suffix.
+let modMintSets: {[string]: string[]} = Map()
+// Whether the set check runs over a single-source program (no module table).
+let modOvSingle = false
 let modOvUseRow: i32[] = []
 let modOvUseCall: boolean[] = []
 // The mangled name of every top-level free `self`-function across all modules, for the
@@ -1091,7 +1099,8 @@ function progBindsAmbientName(): boolean {
 // that binds one is walked once with only those rows. A program that binds none is untouched.
 function ambientRenameSingle(root: i32): i32 {
   ambTopRenamed = []
-  if !progBindsAmbientName() { return 0 }
+  const ovSets = singleMintedSets(root)
+  if !progBindsAmbientName() && !ovSets { return 0 }
   modRenameClear()
   modSelfFnReset()
   const r = nodeAt(root)
@@ -1115,13 +1124,60 @@ function ambientRenameSingle(root: i32): i32 {
       }
     }
   }
+  if ovSets { singleOvRows(root) }
+  modOvSingle = ovSets
   modShadow = []
   modShadowTo = []
   modTyShadow = []
   modRwMod = -1
+  if ovSets { modRwMod = 0 }
   modAmbMod = 0
   modRwStmt(root)
+  modRwMod = -1
   modSelfFnReset()
+  if !ovSets { return 0 }
+  const before = P.diags.length
+  const roots: i32[] = [root]
+  modCheckOverloads(roots)
+  modOvSingle = false
+  return P.diags.length - before
+}
+
+// Whether the single-source program declares a receiver-overload set (`ovMintLocalSets`).
+function singleMintedSets(root: i32): boolean {
+  const r = nodeAt(root)
+  if r is Program {
+    for si in r.progStmts {
+      const st = nodeAt(si)
+      if st is FuncDecl {
+        if ovDeclPlain(st.fnName) != st.fnName && opDeclOpOf(st.fnName) == "" {
+          return true
+        }
+      }
+    }
+  }
+  return false
+}
+
+// The single-source half of the merge's set formation: each minted candidate binds its plain
+// name, and the sets bank as module 0's (`modNoteOverloads`).
+function singleOvRows(root: i32): i32 {
+  modMintSets = Map()
+  const r = nodeAt(root)
+  if r is Program {
+    for si in r.progStmts {
+      const st = nodeAt(si)
+      if st is FuncDecl {
+        const plain = ovDeclPlain(st.fnName)
+        if plain != st.fnName && opDeclOpOf(st.fnName) == "" {
+          modRenamePush(st.fnName, st.fnName)
+          modRenamePush(plain, st.fnName)
+          modSelfFnAdd(st.fnName)
+        }
+      }
+    }
+  }
+  modNoteOverloads(0)
   return 0
 }
 
@@ -1183,7 +1239,7 @@ function compileSrcOnce(): i32 {
   if vcParseBlocked() { return 1 }
   constLetsAfterParse()
   // No vcEpBank: only a check's tree is replayed by the lint, and a compile never is.
-  ambientRenameSingle(root)
+  if ambientRenameSingle(root) != 0 && vcParseBlocked() { return 1 }
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
   checkProgram(root)
@@ -1318,7 +1374,7 @@ function checkSrcOnce(): i32 {
   if vcParseBlocked() { return 1 }
   // Banked for the lint that pairs with this check; a compile has no lint to serve.
   vcEpBank(vcSource(), root)
-  ambientRenameSingle(root)
+  if ambientRenameSingle(root) != 0 && vcParseBlocked() { return 1 }
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
   checkProgram(root)
@@ -2078,7 +2134,7 @@ export function checkSrcSym(): i32 {
   if vcParseBlocked() { return 1 }
   // Banked for the lint that pairs with this check; a compile has no lint to serve.
   vcEpBank(vcSource(), root)
-  ambientRenameSingle(root)
+  if ambientRenameSingle(root) != 0 && vcParseBlocked() { return 1 }
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
   checkProgram(root)
@@ -2537,7 +2593,9 @@ export function scopeAt(line: i32, col: i32): i32 {
   while ij < impMod.length {
     if impMod[ij] == 0 && impLocal[ij] != "" && impName[ij] != "" {
       const dd = modIndexOfKey(impKey[ij])
-      if dd >= 0 { okDep[modMergedTargetOf(dd, impName[ij])] = 1 }
+      if dd >= 0 {
+        for tg in modImportTargets(dd, impName[ij]) { okDep[tg] = 1 }
+      }
     }
     ij = ij + 1
   }
@@ -4661,6 +4719,49 @@ function modMergedTargetOf(m: i32, name: string): string {
   const o = modExportOrigin(m, name)
   return o.oName + modSuffixOf(o.oMod)
 }
+// The merged names module `m`'s public `name` binds an importer to: its one declaration, or
+// every member of the receiver-overload set it declares under that name.
+function modImportTargets(m: i32, name: string): string[] {
+  const o = modExportOrigin(m, name)
+  const out: string[] = []
+  const minted = modMintSets[i32ToStr(o.oMod) + ":" + o.oName] ?? []
+  if minted.length == 0 {
+    out.push(o.oName + modSuffixOf(o.oMod))
+    return out
+  }
+  for mn in minted { out.push(mn + modSuffixOf(o.oMod)) }
+  return out
+}
+// `name` when module `m` minted no set under the plain name `name`, else "" (a set's members
+// never equal their plain name).
+function modMintKey(m: i32, name: string): string {
+  if (modMintSets[i32ToStr(m) + ":" + name] ?? []).length > 0 { return "" }
+  return name
+}
+// Fills `modMintSets` from every module's top-level functions.
+function modMintCollect(roots: i32[]): i32 {
+  modMintSets = Map()
+  let o = 0
+  while o < roots.length && o < modOrder.length {
+    const r = nodeAt(roots[o])
+    if r is Program {
+      for si in r.progStmts {
+        const st = nodeAt(si)
+        if st is FuncDecl {
+          const plain = ovDeclPlain(st.fnName)
+          if plain != st.fnName && opDeclOpOf(st.fnName) == "" {
+            const key = i32ToStr(modOrder[o]) + ":" + plain
+            const have = modMintSets[key] ?? []
+            if !strListHas(have, st.fnName) { have.push(st.fnName) }
+            modMintSets[key] = have
+          }
+        }
+      }
+    }
+    o = o + 1
+  }
+  return 0
+}
 // The declaring module and source name behind module `m`'s public `name`, by the same chase.
 type ModOrigin = { oMod: i32, oName: string }
 function modExportOrigin(m: i32, name: string): ModOrigin {
@@ -5031,6 +5132,7 @@ function modRewriteAll(roots: i32[]) {
   // program-scoped merge state and refilled by the collect pass below.
   modBuiltinTyTargets = []
   modCanonTo = Map()
+  modMintCollect(roots)
   modCollectSelfFns(roots)
   let o2 = 0
   while o2 < modOrder.length {
@@ -7896,6 +7998,11 @@ function modBuildRename(m: i32, root: i32): i32 {
         // whether the two may coexist at all.
         const base = modDeclBase(ss[si], nm)
         modRenamePush(base, base + suffix)
+        // A minted receiver overload also binds its plain name, so the set forms as an import's
+        // does (`modNoteOverloads`).
+        if st is FuncDecl && modMintKey(m, ovDeclPlain(base)) == "" {
+          modRenamePush(ovDeclPlain(base), base + suffix)
+        }
         // D1571 — a `type` declaration that took a BUILTIN name is the one row that may
         // rewrite that name in type position. Registered on the TARGET, so an IMPORT of it
         // needs no kind of its own: the import row renames onto this same `base$mN`.
@@ -7935,7 +8042,9 @@ function modBuildRename(m: i32, root: i32): i32 {
       // target is the chased declaration, not the flat `impName[ij]$mdd` (which
       // would rewrite every reference onto a name the merge never defines).
       if dd >= 0 {
-        modRenamePush(impLocal[ij], modMergedTargetOf(dd, impName[ij]))
+        for tg in modImportTargets(dd, impName[ij]) {
+          modRenamePush(impLocal[ij], tg)
+        }
       }
     }
   }
@@ -7982,7 +8091,7 @@ function modCollectSelfFns(roots: i32[]): i32 {
                 modSelfFnAdd(sfMangled)
                 // D1230's registry, filled from the one walk that already has
                 // both halves: the module index and its rename map.
-                modNoteUfcsImportCand(m, sfBase, sfMangled)
+                modNoteUfcsImportCand(m, ovDeclPlain(sfBase), sfMangled)
               }
             }
           }
@@ -8077,7 +8186,9 @@ function modOvImpRow(m: i32, name: string, target: string): i32 {
   while ii < impMod.length {
     if impMod[ii] == m && impLocal[ii] == name && impName[ii] != "" {
       const dd = modIndexOfKey(impKey[ii])
-      if dd >= 0 && modMergedTargetOf(dd, impName[ii]) == target { return ii }
+      if dd >= 0 && strListHas(modImportTargets(dd, impName[ii]), target) {
+        return ii
+      }
     }
     ii = ii + 1
   }
@@ -8108,6 +8219,28 @@ function modNoteOverloads(m: i32): i32 {
   }
   return 0
 }
+// The fix a refused re-export of set `row` names: an alias when its candidates come from
+// different modules, else importing from the declaring module directly.
+function ovReExpFix(row: i32, local: string): string {
+  if ovSpecsDistinct(row) {
+    return "rename the one to re-export (`export { " + local + " as … } from`)"
+  }
+  return "import `" + local + "` from the module that declares the set instead"
+}
+// Whether every candidate of set `row` comes from a different module (its own included).
+function ovSpecsDistinct(row: i32): boolean {
+  const sp = ovSetSpecs[row]
+  let i = 0
+  while i < sp.length {
+    let j = i + 1
+    while j < sp.length {
+      if sp[i] == sp[j] { return false }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return true
+}
 // A plain call or a value use of an overloaded name. The local declaration answers a plain
 // call (lexical scope); any other use is refused once the set is known to be legal.
 function modOvNoteUse(identIx: i32, callIx: i32, name: string): i32 {
@@ -8115,7 +8248,10 @@ function modOvNoteUse(identIx: i32, callIx: i32, name: string): i32 {
   if strListHas(modShadow, name) { return 0 }
   const row = ovSetOf(modRwMod, name)
   if row < 0 { return 0 }
-  if callIx >= 0 && ovSetSpecs[row][0] == "" { return ovPlainAdd(callIx, row) }
+  // Lexical scope answers a plain call only when the module declares one candidate itself.
+  if callIx >= 0 && ovLocalCount(row) == 1 && ovSetSpecs[row][0] == "" {
+    return ovPlainAdd(callIx, row)
+  }
   modOvUseIx.push(identIx)
   modOvUseRow.push(row)
   modOvUseCall.push(callIx >= 0)
@@ -8236,18 +8372,21 @@ function modCheckOverloads(roots: i32[]): i32 {
   // the binding site a refusal points at.
   const decls: {[string]: i32} = Map()
   let o = 0
-  while o < roots.length && o < modOrder.length {
+  while o < roots.length && (modOvSingle || o < modOrder.length) {
+    let sfx = ""
+    if !modOvSingle { sfx = modSuffixOf(modOrder[o]) }
     const r = nodeAt(roots[o])
     if r is Program {
       for si in r.progStmts {
         const st = nodeAt(si)
-        if st is FuncDecl { fnDecls[st.fnName] = si }
+        if st is FuncDecl {
+          fnDecls[st.fnName] = si
+          if ovDeclPlain(st.fnName) != st.fnName { decls[st.fnName] = si }
+        }
         if st is TypeDecl { tyDecls[modDeclBase(si, st.tdName)] = si }
         if st is UnionDecl { tyDecls[modDeclBase(si, st.udName)] = si }
         const tk = declNameTokOf(si)
-        if tk >= 0 && tk < P.toks.length {
-          decls[P.toks[tk].text + modSuffixOf(modOrder[o])] = si
-        }
+        if tk >= 0 && tk < P.toks.length { decls[P.toks[tk].text + sfx] = si }
       }
     }
     o = o + 1
@@ -8258,7 +8397,7 @@ function modCheckOverloads(roots: i32[]): i32 {
     row = row + 1
   }
   let re = 0
-  while re < reExpMod.length {
+  while re < reExpMod.length && !modOvSingle {
     const rr = ovSetOf(reExpMod[re], reExpLocal[re])
     if rr >= 0 && !ovSetBad[rr] {
       P.diags.push(
@@ -8269,9 +8408,8 @@ function modCheckOverloads(roots: i32[]): i32 {
             + reExpLocal[re]
             + "`: here it names "
             + ovCandsText(rr)
-            + ", and a module exports one function per name — rename the one to re-export (`export { "
-            + reExpLocal[re]
-            + " as … } from`)",
+            + ", and a module exports one function per name — "
+            + ovReExpFix(rr, reExpLocal[re]),
           at: modTokAt(reExpMod[re], reExpNameLine[re], reExpNameCol[re]),
         },
       )
@@ -8287,6 +8425,9 @@ function modCheckOverloads(roots: i32[]): i32 {
       if modOvUseCall[u] {
         what = ", and a plain call does not choose between them"
       }
+      // An `as` alias separates candidates only when no two come from one module.
+      let alt = ", or rename one with `as` on its import"
+      if !ovSpecsDistinct(ur) { alt = "" }
       P.diags.push(
         {
           msg: "`"
@@ -8296,7 +8437,8 @@ function modCheckOverloads(roots: i32[]): i32 {
             + what
             + " — call it as a method, `x."
             + nm
-            + "(…)`, which picks by the receiver's type, or rename one with `as` on its import",
+            + "(…)`, which picks by the receiver's type"
+            + alt,
           at: nodeToks[modOvUseIx[u]],
         },
       )
@@ -8516,14 +8658,26 @@ function modOvDupDiag(
   const specs = ovSetSpecs[row]
   let how = "imports it from both \"" + specs[i] + "\" and \"" + specs[j] + "\""
   if specs[i] == "" || specs[j] == "" { how = "both imports and declares it" }
+  let key = ""
+  if m >= 0 && m < modKeys.length { key = modKeys[m] }
   let msg = "Duplicate binding \""
     + nm
     + "\": module \""
-    + modKeys[m]
+    + key
     + "\" "
     + how
     + " — rename one (`as` on the import)"
-  if !notFns {
+  if !notFns && specs[i] == "" && specs[j] == "" {
+    ovFnHead[ovSetCands[row][i]] = heads[i]
+    ovFnHead[ovSetCands[row][j]] = heads[j]
+    msg = "redeclared "
+      + nm
+      + ": "
+      + ovCandText(row, i)
+      + " and "
+      + ovCandText(row, j)
+      + " overlap, and same-named functions in one module coexist only when their first parameters differ in kind"
+  } else if !notFns {
     ovFnHead[ovSetCands[row][i]] = heads[i]
     ovFnHead[ovSetCands[row][j]] = heads[j]
     msg = msg

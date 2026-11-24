@@ -9844,6 +9844,23 @@ export function nulNoneBoxTail() {
   return 0
 }
 
+// Whether a store of `rhs` into the `null[]` at `arrIx` writes the unit with no sentinel of its
+// own: a `null` literal stamped with no niche, an assignment or call `boxOperandIsNulNone` names,
+// or a read of one whose destination names no null (D17300).
+export function idxStoreNullUnitUnstamped(
+  arrIx: i32,
+  rhs: i32,
+  fnIx: i32,
+): boolean {
+  if !arrElemIsNullUnitAt(arrIx, fnIx) { return false }
+  const u = unwrapParen(rhs)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = nodeAt(u)
+  if n is NullLit { return nullOwnAt(u, fnIx) == NULL_OWN_NONE }
+  if !boxOperandIsNulNone(rhs, fnIx) { return false }
+  return n is BinExpr || n is Call || nullReadDstOwnOf(u, fnIx) < 0
+}
+
 // Whether `exprIx` reaches a box or a niche slot as the `null` unit: a value `exprIsNulNone` names,
 // or an assignment of `null`, whose value is the unit and not the cell's own null (D17090).
 export function boxOperandIsNulNone(exprIx: i32, fnIx: i32): boolean {
@@ -23565,43 +23582,49 @@ function emitStrIsCharBoundary(callIx: i32, fnIx: i32) {
     if callee is Member {
       if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
       if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-      const hs = stashStrRecvIdx()
-      // i == len — the end of the VIEW, never of the backing.
-      fbLocalGet(listIdxScratchBase)
-      fbLocalGet(hs)
-      fbStrLen()
-      fbI32Bin(70) // 0x46 i32.eq
-      fbIf(127)    // if (result i32)
-      fbI32Const(1)
-      fbElse()
-      // In range? (one unsigned compare covers negative and past-len.)
-      fbLocalGet(listIdxScratchBase)
-      fbLocalGet(hs)
-      fbStrLen()
-      fbI32Bin(73)  // 0x49 i32.lt_u
-      fbIf(127)
-      fbLocalGet(hs)
-      fbStrBack()
-      fbLocalGet(hs)
-      fbStrStart()
-      fbLocalGet(listIdxScratchBase)
-      fbI32Bin(106) // i32.add
-      fbArrayGet(sBackTy())
-      fbI32Const(192)
-      fbI32Bin(113) // i32.and
-      fbI32Const(128)
-      fbI32Bin(71)  // 0x47 i32.ne
-      fbElse()
-      fbI32Const(0)
-      fbEnd()
-      fbEnd()
-      return 0
+      return strIsCharBoundaryTail()
     }
     return emitFail(
       "emitProgram: string .isCharBoundary receiver is not a member access",
     )
   }
   return emitFail("emitProgram: expected a string isCharBoundary call")
+}
+
+// After `s.isCharBoundary(i)`'s receiver and offset: true at the view's end, false outside it,
+// else whether byte `i` is not a continuation byte. Legacy and the IR share it.
+export function strIsCharBoundaryTail(): i32 {
+  const hs = stashStrRecvIdx()
+  // i == len — the end of the VIEW, never of the backing.
+  fbLocalGet(listIdxScratchBase)
+  fbLocalGet(hs)
+  fbStrLen()
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(127)    // if (result i32)
+  fbI32Const(1)
+  fbElse()
+  // In range? (one unsigned compare covers negative and past-len.)
+  fbLocalGet(listIdxScratchBase)
+  fbLocalGet(hs)
+  fbStrLen()
+  fbI32Bin(73)  // 0x49 i32.lt_u
+  fbIf(127)
+  fbLocalGet(hs)
+  fbStrBack()
+  fbLocalGet(hs)
+  fbStrStart()
+  fbLocalGet(listIdxScratchBase)
+  fbI32Bin(106) // i32.add
+  fbArrayGet(sBackTy())
+  fbI32Const(192)
+  fbI32Bin(113) // i32.and
+  fbI32Const(128)
+  fbI32Bin(71)  // 0x47 i32.ne
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  fbEnd()
+  return 0
 }
 
 // `s.bytes()` over its receiver on the stack. Legacy and the IR share it.
@@ -31398,6 +31421,11 @@ function emitIdxStoreValue(
     // monomorphized instance's target classifies off the generic's shared node and
     // falls through to the string-widen arm, storing a ref into an i32 backing.
     if emitExpr(a.binRight, fnIx) < 0 { return -1 }
+  } else if idxStoreNullUnitUnstamped(arrIx, a.binRight, fnIx) {
+    // A `null[]` cell holds only the sentinel 2, which a `null` the checker never delivered here
+    // (a capture cell's rewritten store) carries no stamp for (D17300).
+    if emitNulNoneForEffect(a.binRight, fnIx) < 0 { return -1 }
+    fbI32Const(2)
   } else if (
     arrElemIsNulBoolAt(arrIx, fnIx)
     || arrElemIsNullUnitAt(arrIx, fnIx)
