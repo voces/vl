@@ -4300,6 +4300,8 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     }
     const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
     if !atOwn {
+      // Legacy reads a capture again from the environment.
+      ib.irReadAgain[ix] = ev
       return irBLetTempTy(b, ev, ix, cr, capReadTy(fe, name, ix, cr))
     }
     const own = irBLetTempTy(b, ev, ix, cr, cty)
@@ -4583,23 +4585,13 @@ function narrowedLocalRead(
   }
   // A list read's overrides (`identListOverrideOf`) are asked at the lowering, which holds them.
   const na = if arm == "local" { nullNarrowArmOf(ix, ib.irVars[v].vRep, rep) } else { "none" }
-  if na == "held" {
-    return irBLetTempTy(
-      b,
-      { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) },
-      ix,
-      rep,
-      recoveredReadTyOf(heldTy(exprTyOf(ix))),
-    )
-  }
   if na == "miss" { return irBMiss("nullable read recover") }
-  if na == "plain" {
-    return irBLetTemp(
-      b,
-      { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) },
-      ix,
-      rep,
-    )
+  // A recovered read is the local's again, as a compare reading its box twice writes it.
+  if na == "held" || na == "plain" {
+    const rc: Rhs = { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) }
+    ib.irReadAgain[ix] = rc
+    if na == "plain" { return irBLetTemp(b, rc, ix, rep) }
+    return irBLetTempTy(b, rc, ix, rep, recoveredReadTyOf(heldTy(exprTyOf(ix))))
   }
   if ba == "atom" {
     const ak = identUnboxAtomOf(ix, ibFnIx)
@@ -4619,7 +4611,12 @@ function narrowedLocalRead(
     ib.irReadAgain[ix] = cr
     return irBLetTemp(b, cr, ix, rep)
   }
-  if ba == "box" { return irBLetTemp(b, { sgV: o }, ix, rep) }
+  // A union box narrowed to a smaller union is the same box; a compare reads it again.
+  if ba == "box" {
+    const sg: Rhs = { sgV: o }
+    ib.irReadAgain[ix] = sg
+    return irBLetTemp(b, sg, ix, rep)
+  }
   // A box local narrowed to a `boolean | null` or `string | null` niche (legacy's `niche` arm).
   if arm == "niche" {
     const nk = nicheReadKindAt(ix, ibFnIx)
