@@ -13,11 +13,13 @@ import {
   OStr,
   OVar,
   Opnd,
+  RStage,
   RTagStash,
   Rhs,
   SCoalBox,
   SEffect,
   SIf,
+  SLet,
   StrOp,
   repPrim,
   repWhat,
@@ -340,8 +342,10 @@ function armSiteRead(b: i32[], ix: i32, rep: i32): Opnd {
   const recv = armSiteRecv(ix)
   if recv < 0 || recv >= P.nodes.length { return irBMiss("arm site receiver") }
   const named = nodeAt(recv) is Ident
-  const v = irBExpr(b, recv)
-  if missed(v) { return irBMiss("arm site receiver") }
+  const v0 = irBExpr(b, recv)
+  if missed(v0) { return irBMiss("arm site receiver") }
+  // A narrowed name read as the same box (`RStage`) is that name: legacy's arms re-read the name.
+  const v = if named { stagedVar(b, v0) } else { v0 }
   if named && !(v is OVar && readsAgain(v)) {
     return irBMiss("arm site operand")
   }
@@ -357,6 +361,18 @@ function armSiteRead(b: i32[], ix: i32, rep: i32): Opnd {
   }
   const r: Rhs = { asOps: ops, asAt: ix, asStash: !named }
   return irBLetTempTy(b, r, ix, rep, repTyOf(rep))
+}
+
+// Operand `o`, or the variable it stages where the last node of `b` is its `RStage` over a
+// re-readable variable: that node is dropped, and the variable read in its place.
+function stagedVar(b: i32[], o: Opnd): Opnd {
+  if !(o is OVar) || b.length == 0 { return o }
+  const nd = irBFn().irNodes[b[b.length - 1]]
+  if !(nd is SLet) || nd.lDst != o.ov { return o }
+  const r = nd.lRhs
+  if !(r is RStage) || !readsAgain(r.sgV) { return o }
+  b.pop()
+  return r.sgV
 }
 
 // Whether operand `o` reads the same where it is written again: an immediate, or a variable's read.
@@ -674,12 +690,13 @@ function buildStrBin(b: i32[], ix: i32, rep: i32): Opnd {
   for p in parts {
     const from = b.length
     // A literal-union atom part decodes to its member string, as legacy's `emitStrValue` widens
-    // it (`exprIsLitAtom`), through the delivery's atom decode, which names a `K | null` part's
-    // miss; its rep must agree, except a read of an atom cell narrowed past its members.
+    // it (`exprIsLitAtom`), through the delivery's atom decode; its rep must be an atom, except a
+    // read of an atom cell narrowed past its members. Any other part is built as legacy's
+    // `emitExpr` writes it, whatever its type's rep, and must arrive a string.
     const litAtom = exprIsLitAtom(p, fnIx)
     const pr = repNodeOfTy(nodeTyAt(p, fnIx))
     const atomRep = repNodeAt(pr) is RAtom || atomNullable(pr)
-    if litAtom != atomRep && !(litAtom && partReadsAtomCell(p, fnIx)) {
+    if litAtom && !atomRep && !partReadsAtomCell(p, fnIx) {
       return irBMiss("string atom part route")
     }
     // A dead `never` part is legacy's `unreachable` in place, delivered at the string it stands for.
