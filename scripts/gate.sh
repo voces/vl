@@ -32,6 +32,8 @@ case "$PWD" in */.claude/worktrees/*) [ "${GATE_IN_WORKTREE:-0}" = 1 ] || [[ " $
 # "toString is not exported" read from the main repo's pre-rename std, while the
 # same command with VL_STD pinned passed). Callers may still override.
 export VL_STD="${VL_STD:-$PWD/std}"
+# An invalid IR-claimed module is a loud rc 70 in every row, never legacy's fallback bytes.
+export VL_IR_STRICT=1
 # scripts/compat/ stands in for a GNU tool a host lacks (macOS has no `timeout`). It goes LAST
 # on PATH, so wherever the real tool exists (Linux, CI) it still wins and nothing changes.
 export PATH="$PATH:$PWD/scripts/compat"
@@ -413,6 +415,10 @@ run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shado
 run "ir shadow cases"          "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --cases --prepost
 # The shipped claim, disarmed: a claimed function emits the IR's bytes, so any fallback reds.
 run "ir claims"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --claims
+# A claim never skips a refusal legacy raises: every program legacy refuses at emit (`@emit-error`
+# cases, tests/ir-claim-fallback, the emit_reject witnesses) is refused alike with claims on and
+# off, strict, held at 0 differs (coordinator ruling 2026-11-24). About 57 CPU-s.
+run "ir claim refusals"        "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop refusals --out "$LOGS/ir-claim-refusals.tsv"
 
 # THE OOM WATCH. A kill the kernel made during the run fails the gate, whatever the rows read:
 # a test that expected a failure, or a grader that reads a refusal, takes a killed child for one.

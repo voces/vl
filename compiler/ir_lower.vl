@@ -8,7 +8,7 @@ import { blockHasContinueFor } from "./emit_query"
 import { fnEnvIdxOf } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
 import { printUnionPlan } from "./emit_fn_scans"
-import { sharedFieldRecvSlot } from "./emit_union_casts"
+import { armIdxSlot, sharedFieldRecvSlot } from "./emit_union_casts"
 import { mapRecvScalarBoxKindIn, mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
@@ -738,6 +738,9 @@ import {
   fbRefIfOpenType,
   fitRecvLegacy,
   fitRecvReadHook,
+  listFitGrowFill,
+  listFitGrowOf,
+  listFitGrowOpen,
   listFitIsPlanOf,
   listFitShadowHolds,
   listFitShadowLocalOf,
@@ -1924,16 +1927,23 @@ function listEmpty(r: RListEmpty) {
     return irLMiss("list empty plan")
   }
   // The arm's empty `K[]` is stored first, and its local is the region's variable.
+  // A pushing arm's (`listFitShadowSet` 2) tests only until its grow row's `K[]` is stored.
+  let grow = -1
   if shadow {
-    if listFitShadowSet(r.leAt, p.efRecvTy, p.efDepth, lw.irAt) != 1 {
-      return irLMiss("list fit shadow store")
-    }
+    const sh = listFitShadowSet(r.leAt, p.efRecvTy, p.efDepth, lw.irAt)
+    if sh == 2 { grow = listFitGrowOf(r.leAt, lw.irAt) }
+    if sh != 1 && grow < 0 { return irLMiss("list fit shadow store") }
     const loc = listFitShadowLocalOf(r.leAt, lw.irAt)
     if loc < 0 { return irLMiss("list fit shadow local") }
     lw.irVars[r.leFit].vSlot = loc
   }
+  if grow >= 0 { listFitGrowOpen(grow) }
   irLOpnd(r.leV)
-  return emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
+  emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
+  if grow >= 0 && listFitGrowFill(grow) < 0 {
+    return irLMiss("list fit grow fill")
+  }
+  return 0
 }
 
 // Whether `RLitArms` `r` over `is` node `n` is still the test legacy writes: its literal arm, or
@@ -2426,14 +2436,16 @@ function nicheRead(r: RNicheRead) {
 }
 
 // `RArmSite`: legacy's tag chain (`armSiteWrite`) over the box: a named variable's local, or the
-// value set into legacy's receiver stash; the index or key a variable's local, an immediate or a
-// string literal. An element read's row is banked around it as legacy's is.
+// value set into legacy's receiver stash; the index or key a variable's local, an immediate, a
+// string literal, or an effect-free index set once into its stash (`armIdxSlot`). An element
+// read's row is banked around it as legacy's is.
 function armSite(r: RArmSite) {
   if r.asOps.length < 1 || r.asOps.length > 2 {
     return irLMiss("arm site operands")
   }
   let il = ARM_IDX_NODE
   let ii = 0
+  let once = false
   if r.asOps.length == 2 {
     const ix = r.asOps[1]
     if ix is OImm && repPrim(ix.oiRep) == "i32" {
@@ -2441,12 +2453,20 @@ function armSite(r: RArmSite) {
       ii = ix.oiBits as% i32
     } else if ix is OStr {
       il = ARM_IDX_STR
+    } else if ix is OVar && isTemp(ix.ov) {
+      once = true
     } else {
       il = plainVarLocal(ix)
       if il < 0 { return irLMiss("arm site index") }
     }
   }
   const from = irLIndexFrom(r.asAt, lwBuf.length)
+  // An index the builder admitted as built once is set into its stash ahead of the chain (Q57).
+  if once {
+    il = armIdxSlot()
+    irLOpnd(r.asOps[1])
+    fbLocalSet(il)
+  }
   let bl = -1
   if r.asStash {
     // Legacy takes the stash before it writes the box, so the box's own scratch locals follow it.
@@ -3588,14 +3608,16 @@ function unionNulEq(r: RUnionConcreteEq, boxIx: i32, otherIx: i32): i32 {
   if boxSt { parkedOr(true, r.ucBox) }
   else if boxAgain(r, boxIx) < 0 { return -1 }
   unionEqPayloadTail(qp)
+  // The plain arm's operand: read again, read in place, or from its slot; a `K | null` id is
+  // then decoded to its member string, as `emitUnionEqOther` writes it.
   if r.ucOtherAgain {
     if opndAgain(r.ucOther, otherIx) < 0 { return -1 }
   } else if !opSt {
     irLOpnd(r.ucOther)
   } else {
     fbLocalGet(unionEqNulOpSlot(leg))
-    if leg == 1 && unionEqAtomOperandTail(otherIx, lw.irAt) < 0 { return -1 }
   }
+  if leg == 1 && unionEqAtomOperandTail(otherIx, lw.irAt) < 0 { return -1 }
   if unionEqNulEndTail(qp, leg == 1 || leg == 3, r.ucNe, lw.irAt) < 0 {
     return -1
   }
