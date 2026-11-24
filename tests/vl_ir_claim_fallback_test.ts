@@ -186,3 +186,29 @@ Deno.test({
     }
   },
 });
+
+// The compile cache keys on `$VL_TEST_CLAIM_REFUSAL` (every non-inert `VL_*` is keyed): a repeat of
+// a plain build is a hit, and the hooked build of the same source misses and prints its fallback.
+Deno.test({
+  name: "ir claim fallback: the compile cache does not reuse a build made without the claim-refusal hook",
+  ignore,
+  fn: () => {
+    const tmp = Deno.makeTempDirSync();
+    try {
+      const cached = { VL_NO_CACHE: "", VL_CACHE_DIR: `${tmp}/cache`, VL_COMPILE_CACHE: "1", VL_COMPILE_CACHE_TRACE: "1" };
+      const traced = (err: string) => err.split("\n").filter((l) => l.startsWith("vl: compile cache ")).join(" | ");
+      for (const want of ["miss", "hit"]) {
+        const r = vl(["build", VALID, "-o", `${tmp}/plain.wasm`], cached);
+        if (r.code !== 0 || r.err.includes(SOFT_FELL) || !traced(r.err).includes(want)) {
+          throw new Error(`want a plain build rc 0, cache ${want}, no fallback; got rc ${r.code}, "${traced(r.err)}":\n${r.err}`);
+        }
+      }
+      const h = vl(["build", VALID, "-o", `${tmp}/hook.wasm`], { ...cached, VL_TEST_CLAIM_REFUSAL: "1" });
+      if (h.code !== 0 || !h.err.includes(SOFT_FELL) || !traced(h.err).includes("miss") || traced(h.err).includes("hit")) {
+        throw new Error(`want the hooked build a cache miss printing the fallback line, got rc ${h.code}, "${traced(h.err)}":\n${h.err}`);
+      }
+    } finally {
+      Deno.removeSync(tmp, { recursive: true });
+    }
+  },
+});
