@@ -1732,6 +1732,8 @@ Deno.test({
       "pop-or-default-never-call": 0,
       "dead-return-after-never-call": 0,
       "never-call-value-at-consumer-rep": 0,
+      "dead-never-temp-at-consumer-rep": 0,
+      "dead-never-bound-to-non-temp": 3,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
       "never-closure-call-value-at-consumer-rep": 0,
@@ -3258,6 +3260,24 @@ Deno.test({
       if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
         throw new Error(`want the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
       }
+    }
+  },
+});
+
+// A record global held at its storage row where its checked rep has no heap (D17087), a field that
+// row keeps as a union box read at the plain rep through legacy's unbox: the start matches.
+const HEAPLESS_GLOBAL_AT_ROW = "type V = { y: i32, x: i32 | string }\nfunction poke(self: V): i32 { return 1 }\nfunction g<T>(v: T): i32 { return v.poke() }\nconst i = { y: 2, x: 9 }\nprint(g(i))\nprint(i.x + 1)\n";
+Deno.test({
+  name: "ir shadow: a heapless record global is held at its storage row, its boxed field unboxed",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(HEAPLESS_GLOBAL_AT_ROW, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    const miss = [...rows.keys()].filter((k) => k.startsWith("start uncovered"));
+    if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+      throw new Error(`want the start matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
