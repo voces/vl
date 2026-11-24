@@ -13033,3 +13033,35 @@ and the IR has to write the same bytes to claim the function. An operand of anot
 named miss rather than a copy of legacy's conversion. An f64 one after the `unreachable` is
 legacy's own invalid module (D17064), and per the ruling of 2026-11-22 above, legacy changes and
 the IR does not reproduce it.
+
+## An invalid claimed module is rebuilt with IR claims off (2026-11-24, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-24**, on IR-P1's pre-review. A unit the IR claims never runs
+legacy's lowering, so a refusal legacy would raise there (`emitFail`) never fires, and the claim's
+module can fail validation where legacy would have refused (D17094, D17095, D17096).
+
+What the host does with a claimed module the engine refuses (`claims_off_rebuild`, `scripts/vl-host`):
+
+- It rebuilds the unit with claims off.
+- If legacy refuses, that refusal is the build's answer (rc 1), with one note naming the claim, in
+  every mode.
+- If legacy writes a valid module, a normal build ships legacy's bytes with one stderr line naming
+  the function. Under `$VL_IR_STRICT=1`, which `gate.sh`, CI, `ir-identity.sh` and `ir-parity.vl`
+  set, the build fails as an invalid module (rc 70), so no IR defect hides behind the fallback.
+- A fallen-back result is never stored in the compile cache.
+
+**Why.**
+- **The exact guard was refused.** It would run legacy's lowering for every claimed unit as well.
+  That costs between the shipped build and the armed shadow, and the armed shadow is +18.5% of
+  self-compile guest fuel (149.0G against 125.8G). It would also turn the four
+  `hole-fn-value-unresolved-read_declared_generic_*` matrix programs, which a claim legitimately runs
+  where legacy refuses (each prints the template's 4), into refusals: `runs → not-runs`.
+- **The fallback costs nothing on a valid build**: no guest fuel and no byte change. It closes the
+  silent class, check-clean invalid wasm, whatever the refusal site.
+- **The population measured on master** (seed against `ir-identity.sh --build-claimless`):
+  - 0 escapes over 20,539 tests/cases, corpus and probe programs;
+  - 0 claimed invalid modules over 93,094 generated capability-matrix programs.
+- **Held at zero** by the gate row `ir claim refusals` (`ir-parity.vl --pop refusals`).
+- **The fallback leaves at I8** (ir-design-2026-11.md, after the step table).
+- **Still open:** the TS hosts (LSP, playground, the V8 corpus oracle) take the claimed bytes without
+  the fallback. They follow in a separate PR.
