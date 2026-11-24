@@ -3275,12 +3275,24 @@ function declRowLetTy(d: i32, rep: i32): i32 {
 // Whether local `v`, declared at `d` and not yet used, takes its initializer's rep `built` as its
 // storage row, the D14434 binding column's (`letBindTy`), as legacy's cell does; `v` is retyped.
 function localStoredAt(v: i32, d: i32, built: i32): boolean {
-  const st = heldTy(letBindTy(d, ibFnIx))
-  if st < 0 || repNodeOfTy(st) != built { return false }
+  const bt = heldTy(letBindTy(d, ibFnIx))
+  const st = if bt >= 0 && repNodeOfTy(bt) == built { bt } else { localSlotRecordTy(d, built) }
+  if st < 0 { return false }
   ib.irVars[v].vRep = built
   ib.irVars[v].vTy = st
   ibDeclRowSeen = true
   return true
+}
+
+// The record type of the struct row legacy declares `let` `d`'s local at (`irSlotRowTy`), where
+// its rep is record rep `built`; else -1.
+function localSlotRecordTy(d: i32, built: i32): i32 {
+  if !(repNodeAt(built) is RRecord) || d < 0 || !(nodeAt(d) is LetDecl) {
+    return -1
+  }
+  const s = declaredSlotOfDecl(d)
+  const rt = if s >= 0 { irSlotRowTy(declaredIndexAt(ibFnIx, s)) } else { -1 }
+  return if rt >= 0 && !irTyOpen(rt) && repNodeOfTy(rt) == built { rt } else { -1 }
 }
 
 // Whether local `v`, declared at `d`, holds its storage row while read `ix` is typed at its
@@ -11072,11 +11084,37 @@ function mapGetOrUnionMiss(
   return ""
 }
 
+// The rep map read `??` `ix` yields at, `rep` its type's: where that type's struct row records
+// another record, whose rep is the map's value rep `vr`, the value legacy holds there (the
+// storage-key row D14890 keeps the type's own rep beside); else `rep`.
+function mapReadStoredRep(ix: i32, rep: i32, vr: i32): i32 {
+  if (
+    vr < 0
+    || vr == rep
+    || !(repNodeAt(rep) is RRecord)
+    || !(repNodeAt(vr) is RRecord)
+  ) {
+    return rep
+  }
+  const t = nodeTyAt(ix, ibFnIx)
+  const si = if t >= 0 { structIndexOfTy(t) } else { -1 }
+  if si < 0 || si >= sTyIx.length || sTyIx[si] == t { return rep }
+  return if repNodeOfTy(sTyIx[si]) == vr { vr } else { rep }
+}
+
+// The type `mapReadStoredRep`'s row records for read `ix`, or -1.
+function mapReadStoredTy(ix: i32): i32 {
+  const t = nodeTyAt(ix, ibFnIx)
+  const si = if t >= 0 { structIndexOfTy(t) } else { -1 }
+  return if si >= 0 && si < sTyIx.length { sTyIx[si] } else { -1 }
+}
+
 // `g[k] ?? d` along legacy's helper route, its plain `i32` read or its plain mv slot read
 // (`mapGetOrArmOf`, `mapGetOrMvPlain`): a map global read plainly and a key written as itself
 // (`mapKeyArmOf`); the helper's miss holds an i32 default, and a plain read's miss arm a default
 // that computes nothing ahead of the read.
-function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
+  let rep = repIn
   const lhsIx = unwrapParen(n.binLeft)
   if lhsIx < 0 { return irBMiss("map read") }
   const rd = nodeAt(lhsIx)
@@ -11139,6 +11177,8 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     ka == "i64",
   )
   if rcv == null { return irBMiss(ibMiss) }
+  // A record no row records, read off a map holding it at its storage row, is that row's record.
+  rep = mapReadStoredRep(ix, rep, mapValRepOf(rcvMapRep(rcv)))
   // The default is written in the miss arm: in place there, or as the body a fused read's arm holds.
   const db: i32[] = []
   const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
@@ -11183,6 +11223,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
         prForm: form,
       },
       rcv.mkLoc,
+      if rep != repIn { mapReadStoredTy(ix) } else { -1 },
     )
   }
   for id in db { b.push(id) }
@@ -11195,6 +11236,8 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     mgForm: form,
     mgDef: dv,
   }
+  // Held at the storage row it is read from, typed at that row's record (`mapReadStoredRep`).
+  if rep != repIn { return irBLetTempTy(b, r, ix, rep, mapReadStoredTy(ix)) }
   return irBLetTemp(b, r, ix, rep)
 }
 
@@ -11327,8 +11370,9 @@ function mapGetOrBox(
   rep: i32,
   mp: MapProbe,
   loc: Opnd,
+  outTy: i32,
 ): Opnd {
-  const ty = outTyOf(ix, rep)
+  const ty = if outTy >= 0 { outTy } else { outTyOf(ix, rep) }
   if irTyOpen(ty) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
   irBNode(db, { asDst: t, asSrc: dv }, -1, ibNoValue, ix)
