@@ -28,9 +28,11 @@ import {
   askRecordHeap,
   repNodeAt,
   repNodeKids,
+  repNodeOfTy,
   repRecordFieldNames,
   repRecordKidOf,
   repTyOf,
+  tyMapKeyOf,
 } from "./emit_rep"
 
 // An operand: a variable, an immediate of a primitive rep, or an interned string.
@@ -137,11 +139,25 @@ export type RBoxNarrow = {
   bnAtom: i32,
   bnCon: i32,
 }
-// A box narrowed to a record arm, or with `uaDst` (else -1) a union whose arms are all records
-// stored at that record rep's heap, unboxed at a record destination as `emitArmUnboxCast` writes it.
-// `uaAt` is the read; `uaCellNul` a binding whose cell is a nullable arm, which legacy casts to as a
-// nullable ref whatever the value's own nullability (`emitLetDelivery`).
-export type RArmUnbox = { uaV: Opnd, uaAt: i32, uaCellNul: boolean, uaDst: i32 }
+// A box unboxed at a record destination as `emitArmUnboxCast` writes it, cast as `armUnboxRoute` says.
+// `uaAt` is the read; `uaDst` (else -1) the record a union of records or an assignment's box (`uaAsg`)
+// lands at; `uaCellNul` a binding whose cell is a nullable arm, which legacy casts to as a nullable
+// ref whatever the value's own nullability (`emitLetDelivery`).
+export type RArmUnbox = {
+  uaV: Opnd,
+  uaAt: i32,
+  uaCellNul: boolean,
+  uaDst: i32,
+  uaAsg: boolean,
+}
+
+// How `RArmUnbox` `r` is cast: an assignment's box at its destination's heap ("asg"), a union of
+// records at `uaDst`'s heap ("recordArms"), else a narrowed read at its arm record's ("arm").
+export type ArmUnboxRoute = "asg" | "recordArms" | "arm"
+export function armUnboxRoute(r: RArmUnbox): ArmUnboxRoute {
+  if r.uaAsg { return "asg" }
+  return if r.uaDst >= 0 { "recordArms" } else { "arm" }
+}
 // A read `asAt` through a box of lists or maps (an element, `.length`, `.has` or `.get`),
 // written by legacy's tag chain (`armSiteWrite`) per arm: `asOps` the box, then its index or key,
 // none for a `.length`; `asStash` the box is held in legacy's receiver stash, not re-read by name.
@@ -233,6 +249,9 @@ export type RMemAccess = {
   mmBase: i32,
   mmPrim: string,
 }
+// A declaration-time address fold's initializer (`emitMemConstFoldLet`): bounded part `mfiV`, kept
+// in wasm local `mfiSlot` by a tee, plus constant `mfiK`, the binding's own value.
+export type RMaFoldInit = { mfiV: Opnd, mfiSlot: i32, mfiK: i64 }
 // An atomic intrinsic at call node `amAt` over its address and value operands, as the builder
 // planned it: `amBase` operands (0 a fence), operand `k >= 1` at prim `amValPrims[k]`, and a
 // result at `amResPrim` ("" for none).
@@ -372,6 +391,9 @@ export type RListEq = { qeL: Opnd, qeR: Opnd, qeAt: i32 }
 // A function-value `==`/`!=` at node `cqAt` on legacy's `closure` route over closures `cqL` and
 // `cqR`: identity, written by `closureEqTail`.
 export type RClosureEq = { cqL: Opnd, cqR: Opnd, cqAt: i32 }
+// A reference identity `===`/`!==` at node `ieAt` on legacy's `identRef` route over `ieL` and
+// `ieR`: each operand, a union box by its payload (`identityOperandTail`), then `ref.eq`.
+export type RIdentityEq = { ieL: Opnd, ieR: Opnd, ieAt: i32 }
 // The `+` of two lists at concat node `ljAt`, written by legacy's concat (`listCatTail`) after each
 // operand's own recovery (`listCatOperandTail`).
 export type RListCat = { ljL: Opnd, ljR: Opnd, ljAt: i32 }
@@ -490,10 +512,10 @@ export type RMapGetOr = {
   mgForm: i32,
   mgDef: Opnd,
 }
-// A bare `m[k]` at Index node `mtAt`: global `mtSym` (recovered for `mtNonNull`) or, at -1, receiver
-// `mtLoc`, and key `mtKey`, by legacy's arm (`mapGetArmOf`). A box plan read carries its atom kind
-// `mtBox`, else -1; `mtRow` where legacy banks the element-read row (its union-valued binding arm
-// does not); `mtTrap` traps on a missing key, as `as!`'s read does (`emitAsMapProbeTrap`).
+// A bare `m[k]` at Index `mtAt`: global `mtSym` (recovered for `mtNonNull`) or receiver `mtLoc`, key
+// `mtKey`, by `mapGetArmOf`. `mtBox` the box plan's atom kind (else -1); `mtRow` where legacy banks
+// the element-read row; `mtTrap` traps on a miss (`emitAsMapProbeTrap`); `mtPrint` (a scalar kind,
+// else -1) prints the read (`print`'s `mapScalar` arm).
 export type RMapGet = {
   mtSym: i32,
   mtNonNull: boolean,
@@ -503,6 +525,7 @@ export type RMapGet = {
   mtBox: i32,
   mtRow: boolean,
   mtTrap: boolean,
+  mtPrint: i32,
 }
 // `m.keys()` or, under `miVals`, `m.values()` at call `miAt` over map variable `miV`, which legacy's
 // writer reads three times (`mapListStep`): a fresh list of the live entries.
@@ -644,6 +667,7 @@ export type Rhs = RArmSite
   | RHandPick
   | RHolderPick
   | RHoleOptBox
+  | RIdentityEq
   | RInitProgress
   | RJoinNull
   | RListCat
@@ -664,6 +688,7 @@ export type Rhs = RArmSite
   | RListSlice
   | RListStage
   | RLitArms
+  | RMaFoldInit
   | RMakeClo
   | RMakeList
   | RMakeRec
@@ -759,7 +784,7 @@ export type SRangeLoop = {
 // The plain walk of `for` statement `xfAt` over `xfList` into `xfVar` (`forInPlainWhy`): legacy's
 // loop around `xfBody`, `break` to `xfBrk` and `continue` to `xfCont`. A map walk reads map global
 // `xfMap` (recovered for `xfMapNonNull`), `xfList` then an unread immediate; with `xfMap` -1 a map
-// walk's `xfList` is its receiver, at a map rep.
+// walk's `xfList` is its receiver, at a map rep. `xfVals`: a map walk reads values, not keys.
 export type SForIn = {
   xfList: Opnd,
   xfVar: i32,
@@ -770,6 +795,7 @@ export type SForIn = {
   xfCont: i32,
   xfMap: i32,
   xfMapNonNull: boolean,
+  xfVals: boolean,
 }
 // `siElseKw`: the source wrote a live `else`, which legacy writes even when its arm is empty.
 // `siJoin`, `siJoinNul`: a reference join decided for this `if` (a chain's head's, as
@@ -1007,6 +1033,11 @@ export type IrFn = {
   // The plain field reads the builder built, by the read's node: its object read again, then the
   // field. With `irReadVar` and `irReadAgain`, how the loop prologue reads its receivers.
   irReadField: {[i32]: i32},
+  // The declaration-time address-fold rows the builder derived, in legacy's order: each qualifying
+  // `const`'s node, the wasm local holding its bounded part, and its folded constant.
+  irMaDecl: i32[],
+  irMaSlot: i32[],
+  irMaK: i64[],
   // The call temps legacy writes with its tail-call cursor disarmed (a tag dispatch's arm), so a
   // `return` of one keeps `call; return`.
   irNoTail: i32[],
@@ -1089,6 +1120,9 @@ export function irFnNew(at: i32, name: string): IrFn {
     irReadElem: Map(),
     irLitReads: 0,
     irReadField: Map(),
+    irMaDecl: [],
+    irMaSlot: [],
+    irMaK: [],
   }
   return f
 }
@@ -1334,6 +1368,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RHandPick |
       RHolderPick |
       RHoleOptBox |
+      RIdentityEq |
       RInitProgress |
       RJoinNull |
       RListCat |
@@ -1354,6 +1389,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RListSlice |
       RListStage |
       RLitArms |
+      RMaFoldInit |
       RMakeClo |
       RMakeList |
       RMakeRec |
@@ -1458,6 +1494,18 @@ export function repBoolNiche(r: i32): boolean {
 export function repNullRefFits(src: i32, dst: i32): boolean {
   const d = repNodeAt(dst)
   return repPrim(src) == "null" && d is RNullable && d.rnDisc == 1
+}
+
+// The rep a walk of map rep `m` (or a nullable map) binds: its value (`rmVal`) for a values walk,
+// else its key type's; -1 when `m` is no map.
+export function mapWalkElemRep(m: i32, vals: boolean): i32 {
+  const n = repNodeAt(m)
+  const c = if n is RNullable { n.rnInner } else { m }
+  const cn = repNodeAt(c)
+  if !(cn is RMap) { return -1 }
+  if vals { return cn.rmVal }
+  const kt = tyMapKeyOf(repTyOf(c))
+  return if kt >= 0 { repNodeOfTy(kt) } else { -1 }
 }
 
 // The union box rep `r` holds: the box under any boxed nullables (discipline 4, whose `null` is
@@ -1675,6 +1723,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListNewDefault => [r.ldLen]
     RListCopy => r.lcArgs
     RMemAccess => r.mmArgs
+    RMaFoldInit => [r.mfiV]
     RAtomic => r.amArgs
     RTruncSat => [r.tsV]
     RMemOp => r.moArgs
@@ -1743,6 +1792,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RUnionNumCrossEq => [r.ncBox, r.ncOther]
     RListEq => [r.qeL, r.qeR]
     RClosureEq => [r.cqL, r.cqR]
+    RIdentityEq => [r.ieL, r.ieR]
     RListCat => [r.ljL, r.ljR]
     RCoerce => [r.cvV]
     RMakeClo => r.mcEnv
@@ -1808,6 +1858,7 @@ function rhsText(r: Rhs): string {
     RListNewDefault => "list_new_default(" + opndText(r.ldLen) + ")"
     RListCopy => "list_copy(" + opndsText(r.lcArgs) + ")"
     RMemAccess => "mem_access(" + opndsText(r.mmArgs) + ")"
+    RMaFoldInit => "ma_fold_init(" + opndText(r.mfiV) + ", " + i32ToStr(r.mfiSlot) + ")"
     RAtomic => "atomic(" + opndsText(r.amArgs) + ")"
     RTruncSat => "trunc_sat(" + opndText(r.tsV) + ")"
     RMemOp => "mem_op(" + opndsText(r.moArgs) + ")"
@@ -1857,6 +1908,7 @@ function rhsText(r: Rhs): string {
       + " @"
       + i32ToStr(r.uaAt)
       + (if r.uaCellNul { " cellnul" } else { "" })
+      + (if r.uaAsg { " asg" } else { "" })
     RUnionConcreteEq => "union.eqc "
       + (if r.ucStash { "stash " } else { "" })
       + (if r.ucNul { "nul " } else { "" })
@@ -1870,6 +1922,7 @@ function rhsText(r: Rhs): string {
     RUnionNumCrossEq => "union.eqx " + opndText(r.ncBox) + " " + opndText(r.ncOther)
     RListEq => "list.eq " + opndText(r.qeL) + " " + opndText(r.qeR)
     RClosureEq => "closure_eq(" + opndText(r.cqL) + ", " + opndText(r.cqR) + ")"
+    RIdentityEq => "identity_eq(" + opndText(r.ieL) + ", " + opndText(r.ieR) + ")"
     RListCat => "list.cat " + opndText(r.ljL) + " " + opndText(r.ljR)
     RCoerce => "coerce " + opndText(r.cvV)
     RMapOp => "map." + r.mpOp + "(" + opndsText(r.mpArgs) + ")"
@@ -2196,6 +2249,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RDeadNullTest |
       REqHelp |
       RHoleOptBox |
+      RIdentityEq |
       RJoinNull |
       RLitArms |
       RNulNicheEq |
@@ -2288,6 +2342,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RFnId |
       RTagOf => "other"
     RAtomic |
+      RMaFoldInit |
       RMemAccess |
       RMemOp |
       RSimd |

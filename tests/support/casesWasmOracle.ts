@@ -90,6 +90,7 @@ import { runWasm, VLRuntimeError } from "./runWasm.ts";
 import { needsModules } from "../../compiler/moduleGate.ts";
 import { isStdKey } from "../../lsp/src/editorText.ts";
 import { isDisplayableType } from "../../lsp/src/typeFeatures.ts";
+import { engineRefusal, invalidHeadline, needsClaimsOff, withClaimsOff } from "../../lsp/src/claimFallback.ts";
 
 const CASES_DIR = new URL("../cases/", import.meta.url);
 const STD_DIR = new URL("../../std/", import.meta.url);
@@ -265,6 +266,14 @@ const hintsOfCase = (
  * Returns the rc, the structured diagnostics, and (rc 0 under compile) the
  * emitted bytes.
  */
+/** The module the last clean compile wrote. */
+const moduleBytes = (exp: Exports): Uint8Array => {
+  const n = exp.rbyteLen();
+  const bytes = new Uint8Array(n);
+  for (let i = 0; i < n; i++) bytes[i] = exp.rbyteAt(i);
+  return bytes;
+};
+
 const driveCase = (
   exp: Exports,
   entryKey: string,
@@ -273,7 +282,20 @@ const driveCase = (
   isModule: boolean,
 ): { rc: number; diags: WasmDiag[]; bytes?: Uint8Array; redun: LintDiag[] } => {
   stageCase(exp, entryKey, src, isModule);
-  const rc = emit ? exp.compileSrc() : exp.checkSrc();
+  let rc = emit ? exp.compileSrc() : exp.checkSrc();
+  // A claimed module the engine refuses is compiled again with claims off (`claimFallback.ts`).
+  // Strict, as every gate is: legacy's refusal stands, and legacy building it is the claim's bug.
+  const claimed = emit && rc === 0 ? moduleBytes(exp) : undefined;
+  if (claimed !== undefined && needsClaimsOff(exp, claimed)) {
+    const where = invalidHeadline(exp, engineRefusal(claimed), entryKey);
+    stageCase(exp, entryKey, src, isModule);
+    rc = withClaimsOff(exp, () => exp.compileSrc());
+    if (rc === 0) {
+      throw new Error(
+        `${where.headline}\nan IR claim produced an invalid module, and the legacy emitter builds the program (strict)`,
+      );
+    }
+  }
   // rc 0 means no diagnostics (the Rust host reads them only on failure) —
   // and the instance is shared across cases, so don't trust `diagCount` on a
   // success: a stale emit failure could still be sitting in its store.
@@ -296,12 +318,7 @@ const driveCase = (
     ...readIsval(exp),
     ...readExpInf(exp),
   ];
-  let bytes: Uint8Array | undefined;
-  if (emit && rc === 0) {
-    const n = exp.rbyteLen();
-    bytes = new Uint8Array(n);
-    for (let i = 0; i < n; i++) bytes[i] = exp.rbyteAt(i);
-  }
+  const bytes = emit && rc === 0 ? moduleBytes(exp) : undefined;
   if (emit && rc === 3) {
     // The emit-failure store resets only at `emitProgram`'s start, so a failed
     // emit would leak its message into every later case's diagnostics on this

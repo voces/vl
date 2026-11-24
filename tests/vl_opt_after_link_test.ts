@@ -89,7 +89,7 @@ const FLAVOUR_READERS = [
   // `--low-memory-unused` (only with `-O`) folds an address's constant into the memarg.
   "wasmEmit:emitLowMemAccessorCall gLowMemUnused",
   "wasmEmit:lowMemFoldsCallee gLowMemUnused",
-  "wasmEmit:memAddrPlanOf gLowMemUnused",
+  "wasmEmit:memAddrPlanWith gLowMemUnused",
 ];
 const FLAVOUR_GLOBALS = ["gOptimized", "gLowMemUnused"];
 // The one function that reads the program-wide facts into an artifact's key (`LinkFacts`,

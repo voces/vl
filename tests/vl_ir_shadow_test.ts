@@ -1680,6 +1680,8 @@ Deno.test({
       "arm-unbox-of-i32": 2,
       "record-arms-unbox-at-its-record": 0,
       "record-arms-unbox-at-another-record": 2,
+      "asg-arm-unbox-at-its-record": 0,
+      "asg-arm-unbox-without-dest": 2,
       "box-list-retag-into-i32-list": 2,
       "list-of-lists-retag-into-nullable-lists": 0,
       "list-of-lists-retag-into-other-lists": 2,
@@ -1755,6 +1757,9 @@ Deno.test({
       "never-call-value-at-consumer-rep": 0,
       "dead-never-temp-at-consumer-rep": 0,
       "dead-never-bound-to-non-temp": 3,
+      "identity-eq-of-records": 0,
+      "identity-eq-of-string": 2,
+      "identity-eq-of-i32": 2,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
       "union-cast-of-box": 0,
@@ -1769,8 +1774,14 @@ Deno.test({
       "walk-pair-map-value-off-type": 3,
       "walk-pair-string-index": 0,
       "walk-pair-string-index-of-bool": 2,
+      "walk-map-value-record": 0,
+      "walk-map-value-off-rep": 2,
+      "walk-map-key-i32": 0,
+      "walk-map-key-off-rep": 2,
       "map-scalar-join-of-i32": 0,
       "map-scalar-join-of-string": 2,
+      "map-print-of-i32": 0,
+      "map-print-of-string": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -1792,6 +1803,19 @@ Deno.test({
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
+    // An arm unbox routes on its `uaAsg` flag, never on its read's node kind: a record arms unbox over an
+    // assignment node still takes the record arms cast.
+    if (exp.irArmUnboxRouteSelfTest(0) !== 1) throw new Error("want a record arms unbox over an assignment node routed recordArms");
+    if (exp.irArmUnboxRouteSelfTest(1) !== 1) throw new Error("want an uaAsg unbox routed asg");
+    if (exp.irArmUnboxRouteSelfTest(2) !== 1) throw new Error("want an unbox naming no destination routed arm");
+    // A staged root reads above a run of roots on the stack, never above a value that is no root
+    // (`rootsFloor`, D17089): the floor cannot hide a real order violation.
+    for (const [k, want, what] of [[0, 1, "above a run of roots"], [1, 0, "above a non-root"], [2, 0, "above a non-root over a root"]] as const) {
+      const got = exp.irStageFloorSelfTest(k);
+      if (got !== want) throw new Error(`stage floor ${what}: want ${want}, got ${got}`);
+    }
+    // A door fragment lowered while a root is staged gives the staging's root run back.
+    if (exp.irRootRunFrameSelfTest() !== 1) throw new Error("want the fragment frame to restore the root run");
     // A fit tail that misses leaves legacy's receiver read in place (`fitRecvReadHook`).
     if (exp.irFitTailSelfTest() !== 1) throw new Error("want the fit hook restored after a miss");
     // Each kind legacy's descriptor names alone maps to a type that describes back at that kind.
