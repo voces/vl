@@ -24,6 +24,7 @@ import { pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
 import {
   capCellTargetOf,
   exprNullableRefNiche,
+  nulVariantIdxOfExpr,
   optChainStructIdxOf,
 } from "./emit_classify"
 import {
@@ -685,6 +686,7 @@ import {
   narrowedBoxVariantPlain,
   narrowedFieldPlain,
   narrowedVariantRepIs,
+  nulVariantFieldPlain,
   numIsPlanOf,
   structFieldPlain,
   tagIsArmOf,
@@ -698,6 +700,7 @@ import {
 } from "./emit_plan_null"
 import {
   NulTestArm,
+  binNulNameTestOf,
   binNulTestOf,
   coalArmOf,
   coalResultKindOf,
@@ -1923,8 +1926,11 @@ function nulTestOpArm(r: RNulTest): NulTestArm | null {
   if n is IsExpr { return nulTestArmOf(n.isObj, lw.irAt, r.ntInvert, true) }
   if !(n is BinExpr) { return null }
   const bt = binNulTestOf(n)
-  if bt == null { return null }
-  return nulTestArmOf(bt.bnRef, lw.irAt, r.ntInvert, false)
+  if bt != null { return nulTestArmOf(bt.bnRef, lw.irAt, r.ntInvert, false) }
+  // A name read typed `null` against a nullable tests the other operand (`binNulNameTestOf`).
+  const nt = binNulNameTestOf(n, lw.irAt)
+  if nt == null { return null }
+  return nulTestArmOf(nt.bnRef, lw.irAt, r.ntInvert, false)
 }
 
 // `RNulTest`: the operand, then legacy's tail for the arm `nulTestArmOf` names: the atom
@@ -2423,16 +2429,26 @@ function sharedField(r: RGetField, m: Member) {
 // The plain field index member read `at` reads, or -1.
 function fieldIdxAt(at: i32, m: Member): i32 {
   const fnIx = lw.irAt
-  return if exprVariantIndex(m.memObj, fnIx) >= 0 { variantFieldPlain(at, fnIx) } else { structFieldPlain(at, fnIx) }
+  if exprVariantIndex(m.memObj, fnIx) >= 0 {
+    return variantFieldPlain(at, fnIx)
+  }
+  const sf = structFieldPlain(at, fnIx)
+  return if sf >= 0 { sf } else { nulVariantFieldPlain(at, fnIx) }
 }
 
 // After a plain field read's object: the field, and the read's recovery.
 function fieldTail(at: i32, m: Member) {
   const fnIx = lw.irAt
   const vi = exprVariantIndex(m.memObj, fnIx)
-  const idx = fieldIdxAt(at, m)
+  const sf = if vi < 0 { structFieldPlain(at, fnIx) } else { -1 }
+  const idx = if vi >= 0 { variantFieldPlain(at, fnIx) } else if sf >= 0 { sf } else { nulVariantFieldPlain(at, fnIx) }
   if idx < 0 { return irLMiss("field shape") }
-  if vi >= 0 {
+  // A narrowed `V | null` receiver, read non-null as `emitMemNulVariantRead` reads it.
+  const nvi = if vi < 0 && sf < 0 { nulVariantIdxOfExpr(m.memObj, fnIx) } else { -1 }
+  if nvi >= 0 {
+    fbRefAsNonNull()
+    variantFieldTail(nvi, idx, at, fnIx)
+  } else if vi >= 0 {
     variantFieldTail(vi, idx, at, fnIx)
     if variantUnionBoxTail(vi, idx, at, fnIx) < 0 {
       return irLMiss("field unbox")
@@ -3894,8 +3910,11 @@ function structEq(r: RStructEq) {
   const rS = structEqStagesRight(n.binRight)
   const lE = r.seLIx.length > 0
   const rE = r.seRIx.length > 0
-  const lG = !lS && !lE && structEqPlaceSide(r.seL)
-  const rG = !rS && !rE && structEqPlaceSide(r.seR)
+  // A nullable compare's non-nullable side is legacy's expression root, never a null-tested local.
+  const lB = r.seNul && !(repNodeAt(opRepOf(r.seL)) is RNullable)
+  const rB = r.seNul && !(repNodeAt(opRepOf(r.seR)) is RNullable)
+  const lG = !lS && !lE && (structEqPlaceSide(r.seL) || lB)
+  const rG = !rS && !rE && (structEqPlaceSide(r.seR) || rB)
   const lLoc = if lS || lE || lG { -1 } else { structEqSideLocal(r.seL) }
   const rLoc = if rS || rE || rG { -1 } else { structEqSideLocal(r.seR) }
   if !lS && !lE && !lG && lLoc < 0 || !rS && !rE && !rG && rLoc < 0 {
