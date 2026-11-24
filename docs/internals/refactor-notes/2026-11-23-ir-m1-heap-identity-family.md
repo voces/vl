@@ -159,5 +159,5 @@ Readings (base master 89ce9eefe, head 5b6b71edc, fixpoint seeds):
 - Per mechanism: the storage-row hold (1) alone moves a start out of its coercion class into the
   stored-row field read, where (2) is what lets it build. Measured on the D17087 witness: (1) alone
   takes it from `argument coercion` to `field read of a stored row's box`; (1) and (2) take it to
-  matched. (2) alone admits nothing new: its receiver is held at a storage row only where (1), or
-  an existing holder, put it there. The two ship together for that reason.
+  matched. (2) alone was not measured: an existing storage-row holder (D14426) may reach it too, so
+  the per-class rows above are the pair's reading, not (1)'s or (2)'s alone.
