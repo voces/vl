@@ -116,6 +116,7 @@ import { RC_MAP } from "./emit_start_block"
 import { declaredSlotOfDecl, sFieldIndex } from "./emit_struct_order"
 import {
   IrFn,
+  IrNode,
   OImm,
   OStr,
   OVar,
@@ -426,6 +427,7 @@ import {
   emitNullOwn,
   emitNullRetTail,
   emitOmittedFieldNull,
+  emitPrintNullWord,
   emitRangeRolledHead,
   emitRangeRolledTail,
   emitRecordArmsUnboxTo,
@@ -3265,6 +3267,8 @@ function printOp(r: RPrint) {
   const c = nodeAt(r.pnAt)
   if !(c is Call) || c.callArgs.length != 1 { return irLMiss("print node") }
   const arm = printArmOf(c.callArgs[0], lw.irAt)
+  // A `null`-typed argument's effect is the builder's own nodes; the print is the word alone.
+  if arm == "nulNone" { return emitPrintNullWord() }
   // A print an `RPrintOpen` opened before its operand's statements writes only the operand and
   // the tail, and closes the two frames the open pushed.
   if r.pnOpened >= 0 {
@@ -4518,6 +4522,54 @@ function mapFilterDropped(r: RMapFilter, pending: i32[]): i32 {
 
 function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
   if id < 0 || id >= lw.irNodes.length { return irLMiss("no node") }
+  const ops = storeLeadOpnds(lw.irNodes[id], armOut)
+  if ops.length == 0 || pending.length == 0 {
+    return nodeNow(id, pending, tail, armOut)
+  }
+  // An earlier operand's temps reach the stack before the store, as legacy writes that operand
+  // first; they wait below it for their reader, as below a valued `if`.
+  const roots = stageLeadOf(ops, pending)
+  if lwMiss != "" { return 0 }
+  if roots.length == 0 { return nodeNow(id, pending, tail, armOut) }
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length - liveCountIn(pending)
+  nodeNow(id, pending, tail, armOut)
+  liveNeutral()
+  lwFloor = lwFloors.pop() ?? 0
+  for v in roots { pending.push(v) }
+  return 0
+}
+
+// The operands of store statement `n`, which an earlier operand's pending temps may wait below;
+// none for any other node, and none for an arm's write of its valued `if`'s out, which reads them.
+function storeLeadOpnds(n: IrNode, armOut: i32): Opnd[] {
+  return match n {
+    SAssign => if armOut >= 0 && n.asDst == armOut { [] } else { [n.asSrc] }
+    SGlobalSet => [n.gsSrc]
+    SSetField => [n.sfV, n.sfSrc]
+    SListSet => [n.lsV, n.lsIx, n.lsSrc]
+    SBlock |
+      SBoundsCheck |
+      SBr |
+      SCellSet |
+      SCoalBox |
+      SDrop |
+      SEffect |
+      SForIn |
+      SIf |
+      SIntSwitch |
+      SLet |
+      SLoop |
+      SRangeLoop |
+      SRawOp |
+      SReturn |
+      SSwitch |
+      STrap => []
+  }
+}
+
+function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
+  if id < 0 || id >= lw.irNodes.length { return irLMiss("no node") }
   const n = lw.irNodes[id]
   match n {
     SLet => {
@@ -4948,12 +5000,17 @@ function noRoots(): i32[] {
 // in definition order, as legacy writes that operand first; each root stays on the stack for its
 // one reader after the `if`, and `pending` keeps the condition's temps. Returns the roots.
 function stageLead(c: Opnd, pending: i32[]): i32[] {
+  return stageLeadOf([c], pending)
+}
+
+// `stageLead` below a node that reads operands `cs`.
+function stageLeadOf(cs: Opnd[], pending: i32[]): i32[] {
   const roots: i32[] = []
   if pending.length == 0 { return roots }
   // Keyed by the pending temps alone: every valued `if` of a function asks, so it costs theirs.
   const inCond: {[i32]: boolean} = Map()
   const readBy: {[i32]: boolean} = Map()
-  condTemps(c, inCond)
+  for c in cs { condTemps(c, inCond) }
   // A temp another pending temp's definition reads is written inside that one, not staged.
   for v in pending {
     if v >= 0 && v < lwStackVal.length && !lwStackVal[v] {
