@@ -34,8 +34,14 @@ through `irHoistRecv`, which writes the global's `global.get` or the field's rec
 | Q58 sweep (`union-eq-null-leg-reread-operand-positions.vl`, `VL_IR_SHADOW=6`) | 108 positions: 9 positions × field and global × `==` and `!=` × three operand kinds (`string \| null` against a box with and without `null`, `boolean \| null`); base 108 miss, head 108 matched; output identical on both seeds |
 | `ir-identity.sh <base> <head> --names` | identical 9433, differ 0, built under one only 0; self-compile identical |
 | `ir-identity.sh --cases` | identical 7762, fail under both 68, differ 0; witnesses same 61, differ 0 |
+| `ir-identity.sh --claimless` | identical 14453, differ 0 |
 | legacy A/B (tests/cases + probes) | 7,830 programs, 0 moved |
-| shadow row `union-compare-null-leg-reread-operand.vl` | head 66 covered = matched; base 62, 4 `union compare operand` |
+| L2 self-compile fuel per PR | +0.00% on 125,340,108,945 |
+| late demands / late tag rows | 9 (baseline 9) / 307 (baseline 307, 0 gone) |
+| `self ir misses` | 0 (baseline 0) |
+| `lint-self`, `gate.sh --fast` | clean, passed |
+| IR tests / `vl_deep_nesting_test.ts` | 525 passed / 8 passed, 0 failed |
+| shadow row `union-compare-null-leg-reread-operand.vl` | head 5 covered = matched; base 1, 4 `union compare operand` |
 
 In the sweep, a box `null` against an operand `null` answers on the null leg (`T` where the union
 has `null`, `f` where it has not), and a string or bool against itself answers on the plain arm.
