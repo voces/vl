@@ -344,6 +344,29 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 - any differ under `ir-identity.sh --claimless` or `--cases`;
 - a shipping door that bypasses `claimable()` (ir-design §10.2).
 
+## A chosen divergence (Q57)
+
+Q57 (coordinator ruling) lets an IR lane write bytes legacy would not, when matching legacy would
+cost more than about two hours. Byte identity cannot prove such a function, so behaviour does:
+
+- The lane adds one line per diverging function to `scripts/ir-divergence-baseline.txt`:
+  `<program>\t<function>\t<mechanism>\t<PR>`, the function as a `--names` build spells it
+  (`f@1`), `<module>` for anything outside the function bodies.
+- `scripts/ir-identity.sh` then prints `expected divergence <program> (<functions>)` for that
+  program and passes it, but only when every function whose body differs is listed for it. An
+  unlisted function or program still reds as `DIFF`.
+- `vl run scripts/ir-parity.vl` is the proof. It builds each program with the IR on (the seed) and
+  off (the `CLAIMED`-empty twin), runs both, and compares stdout, exit code and trap message.
+  Any `differs` or one-sided `build-fails` reds, and so does a byte differ the baseline does not
+  list (`--behaviour-only` drops that last check, for after the I8 cutover drops byte identity).
+  A listed divergence must still behave alike.
+- The READY quotes the parity summary line over the three default populations (distilled cells,
+  `tests/cases`, capability probes), with the diverging programs among them, or `--files`
+  naming them when no population holds one. It also quotes `ir-identity.sh --cases` showing the
+  `expected divergence` rows.
+
+The queue's vetoes are unchanged: an unlisted differ under `ir-identity.sh` is still a veto.
+
 ## Folds
 
 About every 25 merges the coordinator folds `changelog.d/` (`scripts/changelog-fold.vl`,
