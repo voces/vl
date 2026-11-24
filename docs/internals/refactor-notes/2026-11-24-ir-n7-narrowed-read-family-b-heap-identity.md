@@ -2,7 +2,7 @@
 
 Family B of the `narrowed read` remainder (#9952 covered A, F and C/D) is a seated record → record
 read of a callback parameter over a list whose element row differs from the parameter's row. The
-queue ruled it goes to IR-M1, behind D17180/D17363: nothing retags by shape.
+queue ruled it goes to IR-M1, behind its queued heap-identity items: nothing retags by shape.
 
 | tests/cases program | functions |
 |---|---|
