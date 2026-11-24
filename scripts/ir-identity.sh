@@ -35,6 +35,8 @@
 # fan-out (default 4); $VL defaults to the checkout's host. Temp files live under $TMPDIR and are removed on exit.
 set -euo pipefail
 export VL=${VL:-$PWD/scripts/vl-host/target/release/vl}
+# An invalid IR-claimed module is rc 70, never legacy's fallback bytes, so no differ hides behind it.
+export VL_IR_STRICT=1
 T=$(mktemp -d)
 # The build logs of every file that was not identical (a differ or a timeout) outlive the run,
 # under $IR_IDENTITY_KEEP (default $TMPDIR/ir-identity-keep/<run>/), so a reading can be explained.
