@@ -175,7 +175,7 @@ function wat(root: string, n: number): string {
 }
 
 /** `--compare` of `t/ok.vl` built to two modules whose `$f@1` differs, under `baseline`. */
-function diverged(baseline: string) {
+function diverged(baseline: string, dis: string = DIS) {
   const root = Deno.makeTempDirSync();
   try {
     const b = `${root}/baseline.txt`;
@@ -192,11 +192,12 @@ function diverged(baseline: string) {
     }
     const out = new Deno.Command("bash", {
       args: [SCRIPT, "--compare", list, a, c],
-      env: { IR_IDENTITY_KEEP: `${root}/keep`, IR_DIVERGENCE_BASELINE: b, WASM_DIS: DIS },
+      env: { IR_IDENTITY_KEEP: `${root}/keep`, IR_DIVERGENCE_BASELINE: b, WASM_DIS: dis },
       stdout: "piped",
       stderr: "piped",
     }).outputSync();
-    return { code: out.code, text: new TextDecoder().decode(out.stdout) };
+    const dec = new TextDecoder();
+    return { code: out.code, text: dec.decode(out.stdout), err: dec.decode(out.stderr) };
   } finally {
     Deno.removeSync(root, { recursive: true });
   }
@@ -220,5 +221,14 @@ Deno.test({ name: "ir-identity --compare: a differ in a program the baseline doe
   const r = diverged("t/other.vl\tf@1\ttest mechanism\t#0\n");
   if (r.code !== 1 || !r.text.includes("DIFF t/ok.vl\n")) {
     throw new Error(`want t/ok.vl to red, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+// Without the disassembler a listed program's functions cannot be compared, and it would read as a
+// plain differ with no reason: the script stops before building instead.
+Deno.test({ name: "ir-identity: a listed divergence with no wasm-dis stops loudly", ignore: noBinaryen }, () => {
+  const r = diverged("t/ok.vl\tf@1\ttest mechanism\t#0\n", "/nonexistent/wasm-dis");
+  if (r.code !== 2 || !r.err.includes("/nonexistent/wasm-dis is not executable")) {
+    throw new Error(`want exit 2 naming the missing wasm-dis, got exit ${r.code}:\n${r.text}${r.err}`);
   }
 });
