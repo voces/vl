@@ -217,6 +217,42 @@ Deno.test({
   },
 });
 
+// A nullable record compare's element side banks the element-read rows of its null tests and
+// fields: with them dropped (control 5) the row's spans count reds.
+Deno.test({
+  name: "ir shadow: a nullable record compare's element side banks its element-read rows",
+  ignore,
+  fn: () => {
+    const row = fileRows.find((r) => r.file.endsWith("/nullable-record-compare-element-side.vl"));
+    if (row === undefined) throw new Error("want the nullable-record-compare-element-side row, got none");
+    gradeRow(row);
+    reds(() => gradeRow(row, DIVERGENCES, 5), "spans");
+  },
+});
+
+// Verifier rule 2's nullable-compare pair: an element side counts at its list's element rep, so a
+// bare record against a nullable element verifies; a compare with no nullable side, marked
+// nullable (`irShadowCorrupt(9)`), is refused.
+Deno.test({
+  name: "ir shadow: a nullable record compare needs a nullable side, an element side's at its element rep",
+  ignore,
+  fn: () => {
+    const held = "type C = { r: i32 }\nfunction f(xs: (C | null)[], y: C) { return y == xs[0] }\n" +
+      "print(f([{ r: 1 }], { r: 1 }))\n";
+    const ok = run(held, true);
+    if (failures(ok.rows).length > 0 || ok.rows.get("matched") !== 1) {
+      throw new Error(`want f matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const bare = "type C = { r: i32 }\nfunction f(xs: C[], y: C) { return y == xs[0] }\n" +
+      "print(f([{ r: 1 }], { r: 1 }))\n";
+    const { rows } = run(bare, true, 9);
+    const want = "a nullable record compare has a nullable operand";
+    if (!failures(rows).some((k) => k.includes(want))) {
+      throw new Error(`want a fail row naming "${want}", got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A record compare's element side over a place receiver banks the element-read rows legacy's
 // own root writes at each field: with them dropped (control 5) the row's spans count reds.
 Deno.test({
