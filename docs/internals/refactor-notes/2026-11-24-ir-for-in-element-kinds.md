@@ -46,8 +46,9 @@ Of the 30 base functions, 29 are claimed, by origin cases 23, distilled 1, probe
   matched; the two other uncovered rows are `expression if valtype` and `narrowed read niche kind`.
   `cmp` and `wasm-dis` identical, claimed against legacy: the nullable-list witness, the map and
   the nulclosure sweeps.
-- The nulclosure sweep leaves out the union-parameter position, which [D17380](../inventory/D17380.md)
-  makes invalid wasm on master.
+- The nulclosure sweep's union-parameter position was invalid wasm on master
+  ([D17380](../inventory/D17380.md), closed by S2); it is back in the sweep, runs, and is
+  claimless-identical, its narrowed read missing as `narrowed read niche kind`.
 - The legacy diff is `forInElemPlain`'s two arms; `git grep forInElemPlain` names one caller,
   `forInPlainWhy`.
 - Fuel: per PR +0.00%; the pair is L2 126989572761 against base 126989461559.
