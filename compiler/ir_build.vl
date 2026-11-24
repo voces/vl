@@ -573,6 +573,7 @@ import {
   boxTyNameAt,
   coerceKindAt,
   fnCloCoerceAtNode,
+  ifJoinsAtRecord,
   instTyOrSelf,
   listCopyAtNode,
   narrowedArmNeedsUnbox,
@@ -725,6 +726,7 @@ import {
   holderRecordTy,
   identIsEnvCapture,
   letArmCellRow,
+  letAtomCellTy,
   letBindIsAtom,
   letBindRep,
   letBindRepClaims,
@@ -3124,6 +3126,12 @@ export function irBDeclVar(d: i32): i32 {
     && letBindIsAtom(d, ibFnIx)
     && !(repNodeAt(rep) is RAtom || atomNullable(rep))
   ) {
+    // Held at the type legacy's cell holds (`letAtomCellTy`), the literal set a join of consts keeps.
+    const at = letAtomCellTy(d, ibFnIx)
+    const ar = if at >= 0 { repNodeOfTy(heldTy(at)) } else { -1 }
+    if ar >= 0 && (repNodeAt(ar) is RAtom || atomNullable(ar)) {
+      return declVarAt(d, ar, heldTy(at))
+    }
     irBMiss("atom cell local rep")
     return -1
   }
@@ -3446,6 +3454,11 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   }
   const ty = rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
+  // A union-typed join legacy writes at its destination's row names no row of its own: its out
+  // would declare a local of no interned shape (D4645's module-scope spelling).
+  if rj.rjSlot < 0 && exprUnion(ix, ibFnIx) {
+    return irBMiss("union if record join row")
+  }
   return refIfLink(b, n, ix, rep, ty, kind, rj.rjSlot, false)
 }
 
@@ -3705,7 +3718,7 @@ function refIfArm(
 ): i32[] {
   const body: i32[] = []
   const arm = refIfArmOf(blockIx, ibFnIx, kind, slot, nul)
-  if arm != "plain" && arm != "atomStr" && arm != "null" {
+  if arm != "plain" && arm != "atomStr" && arm != "null" && arm != "unbox" {
     irBMiss("ref if arm " + arm)
     return body
   }
@@ -3722,6 +3735,15 @@ function refIfArm(
   if arm == "null" {
     const z = repTemp(body, { jnKind: kind, jnSlot: slot }, tv, rep)
     irBNode(body, { asDst: t, asSrc: z }, -1, ibNoValue, blockIx)
+    return body
+  }
+  // A narrowed read of a union is its box, recovered at the join's record in the arm (D17026).
+  if arm == "unbox" {
+    const u = if armUnboxOwed(tv, rep) { armUnboxTemp(body, tv, rep, repTyOf(rep), false) } else if recordArmsUnboxOwed(tv, rep) { recordArmsUnboxTemp(body, tv, rep, repTyOf(rep)) } else { irBMiss("ref if arm unbox shape") }
+    if ibMiss == "" && irBOpRep(u) != rep { irBMiss("ref if arm unbox rep") }
+    if ibMiss == "" {
+      irBNode(body, { asDst: t, asSrc: u }, -1, ibNoValue, blockIx)
+    }
     return body
   }
   // An atom arm in a `string` join decodes to its member string (`emitAtomToStr`), from the atom
@@ -5544,6 +5566,15 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         i = i + 1
         continue
       }
+      // A union-typed value `if` joined at a record's row is coerced by legacy's argument path as
+      // the union, not the record join a binding takes (D17115), so the IR does not claim it.
+      if (
+        repNodeAt(pr) is RRecord
+        && ifJoinsAtRecord(c.callArgs[i], ibFnIx)
+        && exprUnion(c.callArgs[i], ibFnIx)
+      ) {
+        return missRhs("argument union if at a record (D17115)")
+      }
       // An argument the checker records no box at is boxed at its parameter's union, legacy's
       // direct-call floor (`directArgUnionTyOf`).
       const fl = if heldAsBox(pr) && !boxOwedAt(c.callArgs[i], ibFnIx) { directArgUnionTyOf(pos, i) } else { -1 }
@@ -6284,6 +6315,12 @@ function inPlaceFrom(b: i32[], at: i32): boolean {
     || receiverStageFrom(b, at)
 }
 
+// `inPlaceFrom` less a `??` that writes the temps staged before it below its tag test
+// (`coalArmStagesLeads`), as a valued `if` does.
+function inPlaceUnstagedFrom(b: i32[], at: i32): boolean {
+  return coalBoxFrom(b, at, false) || receiverStageFrom(b, at)
+}
+
 // Whether operands built into `b` from `at` on hold a push receiver's stage, which the lowering
 // writes with nothing pending below it.
 function receiverStageFrom(b: i32[], at: i32): boolean {
@@ -6390,7 +6427,7 @@ export function ifBelowLeadOf(
   why: string,
   leads: Opnd[],
 ): boolean {
-  if opndsAreTemps(leads) && !inPlaceFrom(b, at) && !storeFrom(b, at) {
+  if opndsAreTemps(leads) && !inPlaceUnstagedFrom(b, at) && !storeFrom(b, at) {
     return false
   }
   return ifBelowLead(b, at, why)
@@ -7157,7 +7194,8 @@ function mapSetStageLeads(
     irBMiss("map store value store")
     return false
   }
-  if !valuedIfFrom(b, vAt) || inPlaceFrom(b, vAt) {
+  const stagingCoal = coalBoxFrom(b, vAt, true)
+  if !valuedIfFrom(b, vAt) && !stagingCoal || inPlaceUnstagedFrom(b, vAt) {
     return !ifBelowLead(b, keyAt, why)
   }
   if exprNullableMap(recv, ibFnIx) {
@@ -9095,6 +9133,23 @@ function rawFieldRepOf(ix: i32): i32 {
   const ks = repNodeKids(r)
   if k < 0 || k >= ks.length || ks[k] == exprRepOf(u) { return -1 }
   return ks[k]
+}
+
+// Whether `ix` reads a local legacy holds as an atom (`letAtomCellTy`) whose own type is no atom.
+function atomCellWidened(ix: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is Ident) { return false }
+  const d = identDeclOf(u)
+  if (
+    d < 0
+    || d >= P.nodes.length
+    || !(nodeAt(d) is LetDecl)
+    || letAtomCellTy(d, ibFnIx) < 0
+  ) {
+    return false
+  }
+  const r = repNodeOfTy(heldTy(scopeTyAt(d, ibFnIx)))
+  return !(repNodeAt(r) is RAtom || atomNullable(r))
 }
 
 // The value of atom operand `ix`, which must build at an atom rep or its `K | null`.
@@ -11676,6 +11731,14 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     const bt = binNulTestOf(n)
     if bt != null { return nulTest(b, n, bt, ix, rep) }
     if n.binOp == "??" { return coalesce(b, n, ix, rep, cell) }
+    // Legacy declares a string compare's locals for a side the checker typed `string` and holds as
+    // an atom, which no IR compare route declares; it misses rather than move those bytes.
+    if (
+      (n.binOp == "==" || n.binOp == "!=")
+      && (atomCellWidened(n.binLeft) || atomCellWidened(n.binRight))
+    ) {
+      return irBMiss("compare of a joined const atom")
+    }
     // A union box against a concrete operand is legacy's union compare, by legacy's own route.
     if (
       (n.binOp == "==" || n.binOp == "!=")
@@ -11754,13 +11817,18 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
         return scalarMapEq(b, n, ix, rep)
       }
     }
-    // A bare scalar map read compared plainly: legacy may write the probe's compare there
-    // (`scalarMapEqPlanOf`, asked as it writes), so the IR does not guess the operator's.
+    // A compare over a bare scalar map read (`scalarMapEqPlanOf` asks the same, so no other operand
+    // can take legacy's probe route) reads the probe's compare where legacy routes it there
+    // (`eqRouteOf`), whatever the operands' reps: a narrowed read has no compound block.
     if (
       (n.binOp == "==" || n.binOp == "!=")
       && (mapReadScalarBoxKind(n.binLeft, ibFnIx) >= 0
         || mapReadScalarBoxKind(n.binRight, ibFnIx) >= 0)
     ) {
+      if eqRouteOf(n, ix, ibFnIx) == "scalarMap" {
+        return scalarMapEq(b, n, ix, rep)
+      }
+      // Guard: legacy's route and the IR's disagree; miss rather than ship the operator's bytes.
       return irBMiss("scalar map compare route")
     }
     const p = binPrimOp(n.binOp, opUnsigned(n.binLeft))
@@ -14966,6 +15034,53 @@ function startItemOrd(node: i32, gi: i32): i32 {
   return -1
 }
 
+// Global `gi`'s `null`-typed initializer `init`, as `emitNulNoneBoxPayload` writes it, then the
+// store; an if-expression is a named miss.
+function globalInitNulNone(b: i32[], gi: i32, gst: i32, init: i32): i32 {
+  const rep = globalRep(gi, gst)
+  if rep < 0 { return skip("global initializer rep") }
+  const src = nulNonePayload(b, init, rep)
+  if ibMiss != "" { return 0 }
+  const gm = irGlobalWriteMiss(gi, ibGlobalCtx())
+  if gm != "" { return skip(gm) }
+  irBNode(b, { gsSym: gi, gsSrc: src }, -1, ibNoValue, gst)
+  return 0
+}
+
+// A `null`-typed value `x` at rep `rep` as `emitNulNoneLeafPayload` writes it: a call's own value,
+// `a ?? b` as `a` for effect then `b`'s payload, an assignment yielding `null` then the bottom
+// null, and anything else run for effect (`nulNoneEffect`) then the bottom `ref.null none`.
+function nulNonePayload(b: i32[], x: i32, rep: i32): Opnd {
+  const u = unwrapParen(x)
+  if u < 0 || u >= P.nodes.length {
+    return irBMiss("global initializer nulnone node")
+  }
+  const n = nodeAt(u)
+  if n is IfStmt { return irBMiss("global initializer nulnone if") }
+  if n is Call {
+    const v = irBExpr(b, u)
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != rep {
+      return irBMiss("global initializer nulnone call rep")
+    }
+    return v
+  }
+  const co = plainCoalesceAt(u)
+  if co != null {
+    const l = nulNoneEffect(b, co.binLeft, u)
+    if ibMiss != "" { return l }
+    return nulNonePayload(b, co.binRight, rep)
+  }
+  if asgYieldsNullLit(u) && n is BinExpr {
+    assign(b, n, u)
+    if ibMiss != "" { return irBMiss(ibMiss) }
+  } else {
+    const e = nulNoneEffect(b, u, u)
+    if ibMiss != "" { return e }
+  }
+  return repTemp(b, { nuAt: u, nuOwn: NULL_OWN_NONE }, u, rep)
+}
+
 // Global `gi`'s initializer, at statement `gst`, written as legacy's plain arm writes it: the
 // value delivered at the cell's rep, then its store.
 function globalInit(b: i32[], gi: i32, gst: i32) {
@@ -14999,6 +15114,7 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
     irBNode(b, { gsSym: gi, gsSrc: mv }, -1, ibNoValue, gst)
     return 0
   }
+  if arm == "nulnone" { return globalInitNulNone(b, gi, gst, g.letInit) }
   if arm != "plain" && arm != "widen" && arm != "variant" {
     return skip("global initializer " + arm)
   }
