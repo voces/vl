@@ -9,7 +9,7 @@ import { fnEnvIdxOf } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
-import { mapRecvTyIn } from "./emit_ty_canon"
+import { mapRecvScalarBoxKindIn, mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
 import {
@@ -140,6 +140,7 @@ import {
   RCoalAtomStr,
   RCoalStr,
   RCoerce,
+  RDeadNever,
   RDeadNullTest,
   REnvDrop,
   REnvGet,
@@ -499,6 +500,7 @@ import {
   mapRecvKeyTail,
   mapRecvRefTail,
   mapRecvShapeOf,
+  mapScalarJoinOpen,
   mapSetTail,
   mapSizeTail,
   mapUnionUnboxTail,
@@ -685,6 +687,7 @@ import {
 import {
   NulTestArm,
   binNulTestOf,
+  coalArmOf,
   coalResultKindOf,
   coalesceNulStrStaysNullable,
   nulTestArmOf,
@@ -1220,6 +1223,11 @@ function rhs(r: Rhs, tail: boolean) {
     }
     ROptRead => optRead(r)
     RToBox => boxOp(r)
+    RDeadNever => {
+      // Legacy's `emitExpr` writes `unreachable` for the value, and its consumer goes on.
+      leaf()
+      fbUnreachable()
+    }
     RHoleOptBox => {
       // Legacy writes the box's tag, then the operand's plain cast, then the two boxes.
       leaf()
@@ -1645,8 +1653,9 @@ function stashIfBoxHead(id: i32) {
   if !lwIfHeadBuilt { stashIfHeadsNote() }
   const at = lwIfHeadAt.get(out) ?? -1
   if at >= 0 && !i32ListHas(lwBoxHeadAt, at) { return stashBoxHead(at) }
-  // A valued `if`'s box head follows the operands staged ahead of it (`valuedIfOpen`).
-  if n is SCoalBox { joinBoxHead(out, false) }
+  // A valued `if`'s box head follows the operands staged ahead of it (`valuedIfOpen`), as does a
+  // `??`'s that stages them (`coalBox`).
+  if n is SCoalBox && !coalArmStagesLeads(n.cbArm) { joinBoxHead(out, false) }
   return 0
 }
 
@@ -3108,6 +3117,20 @@ function mapGetOr(r: RMapGetOr) {
   if lhsIx < 0 { return irLMiss("map read node") }
   const rd = nodeAt(lhsIx)
   if !(rd is Index) { return irLMiss("map read node") }
+  // The scalar join: the probe, the hit boxed at its own arm, the boxed default, the `end`.
+  if r.mgForm == 7 {
+    if coalArmOf(e, r.mgAt, fnIx) != "mapScalarJoin" {
+      return irLMiss("map read route")
+    }
+    if r.mgSym >= 0 && userGlobalReadClass(r.mgSym, lwGlobalCtx) != "plain" {
+      return irLMiss("map read of a global not read plainly")
+    }
+    mapProbeHead(rd.idxArr, r.mgSym, r.mgNonNull, r.mgLoc, r.mgKey)
+    mapScalarJoinOpen(mapRecvScalarBoxKindIn(rd.idxArr, fnIx))
+    irLOpnd(r.mgDef)
+    fbEnd()
+    return 0
+  }
   const rk = coalResultKindOf(r.mgAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
   const want = mapGetOrFormArm(r.mgForm, arm)
@@ -4839,8 +4862,10 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
   // An earlier operand's temps are written below the operand, as a valued `if` stages them.
-  const roots = if coalArmStagesLeads(n.cbArm) { stageLead(n.cbL, pending) } else { noRoots() }
+  const stages = coalArmStagesLeads(n.cbArm)
+  const roots = if stages { stageLead(n.cbL, pending) } else { noRoots() }
   if lwMiss != "" { return -1 }
+  if stages { joinBoxHead(t, true) }
   lwFloors.push(lwFloor)
   lwFloor = lwLive.length - liveCountIn(pending)
   const ba = coalValBoxArm(n.cbArm)
