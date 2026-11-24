@@ -13,6 +13,9 @@ which missed as `union if rep` (19 functions and a start in tests/cases).
   own row (`joinKindIsRecord`) ahead of the `exprUnion` fallback.
 - `refIfArm` builds the `unbox` arm: the narrowed box recovered at the join's record through the
   existing `RArmUnbox` temp (`armUnboxTemp`, or `recordArmsUnboxTemp` for a union of records).
+- The direct-call argument at a record parameter is declined (`argument union if at a record`):
+  legacy coerces it there as the union box and writes invalid wasm (D17115), which the IR must
+  not silently fix.
 
 The ablation needs both: the routing alone moves the 19 functions to `ref if arm unbox`; the arm
 alone moves nothing.
@@ -21,13 +24,15 @@ New test cases:
 - `unions/record-join-unboxes-narrowed-arm-from-a-box.vl`: the box holds an `A` built apart from
   the literal arm's, so a field only that record carries shows which one arrived.
 - `unions/record-join-unboxes-narrowed-arm-in-each-position.vl`, the position sweep: a
-  parameter and a union parameter, a nested call, a return, a binding, an `if` arm, a `??`
-  operand, a record-literal field, a concatenation and an interpolation hole.
+  union parameter, a return, a binding, an `if` arm, a `??` operand, a record-literal field, a
+  concatenation and an interpolation hole.
 
 ## Not in this change
 
 - A field read straight off the join (`(if x is A { x } else { d }).v`) is refused by legacy at
   emit on master: D17108, filed from the sweep.
+- A record parameter or a nested call taking the join is check-clean invalid wasm on master:
+  D17115, filed from the sweep; the IR declines that position until the row closes.
 - An unbox arm that is a maker call, not a narrowed local, misses as `ref if arm unbox shape`
   (`records/value-if-of-maker-call-and-literal-at-declared-record*.vl`,
   `records/maker-calls-in-two-joins-at-declared-record.vl`).
