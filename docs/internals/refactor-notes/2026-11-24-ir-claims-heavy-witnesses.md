@@ -40,3 +40,36 @@ two land in different chunks of the fan-out:
 
 A census for new heavy programs is the chunk-peak measurement above. Rerun it when a filed
 witness grows, and add what it finds to the list.
+
+## The `row_mem` audit (coordinator)
+
+The full gate ran one row at a time (`GATE_MAX_PAR=1`) with the whole tree's RSS sampled every 0.5
+s, so each reading is the row alone. Rows under 100 MiB are omitted. Every row the reading put
+above its estimate is raised to the reading rounded up. None is lowered: a generous estimate
+costs wall time, a short one an OOM kill.
+
+| row | peak MiB | `row_mem` before | after |
+| --- | --- | --- | --- |
+| `deno task test` | ≤ 4,205 (the reading includes the gate's seed build; the full `deno task test` alone is 4,893) | 1,400 | **4,300** |
+| `ci-native` | 4,621 | 4,000 | **4,800** |
+| `self-compile pair` | 4,190 | 4,700 | 4,700 |
+| `lint-self + fmt` | 3,455 | 2,400 | **3,600** |
+| `late demands` | 439 | 500 | 500 |
+| `self ir misses` | 4,268 | 1,600 | **4,400** |
+| `phase state` | 423 | 200 (the default) | **500** |
+| `plumb-shape cost` | 520 | 1,400 | 1,400 |
+| `kind-ladder sets` | 403 | 800 | 800 |
+| `dead-export budget` | 392 | 600 | 600 |
+| `render-parse budget` | 135 | 600 | 600 |
+| `scaling shape` | 927 | 900 | **1,000** |
+| `rep-fuzz` | 1,010 | 1,600 | 1,600 |
+| `filed witnesses` | 9,330 | 8,000 | **9,600** |
+| `inventory refs` | 356 | 400 | 400 |
+| `capability probes` | 376 | 800 | 800 |
+| `conflict markers`, `splice scan`, `seed size`, `no-python` | 105 to 181 | 200 (the default) | 200 |
+| `lsp suites (ci list)` | 988 | 1,100 | 1,100 |
+| `distilled corpus` | 4,693 | 1,700 | **4,800** |
+| `ir shadow` | 1,424 | 1,300 | **1,600** |
+| `ir shadow cases` | 1,520 | 1,300 | **1,600** |
+| `ir claims` | 4,536 | 200 (the default) | **4,600** |
+| `ir claim refusals`, `ir claim cross` | 4,340, 4,346 | 4,400 | 4,600 |

@@ -131,26 +131,27 @@ mem_budget_mb() {
   local b=$(( avail - total / 10 - 1024 )); [ "$b" -gt 0 ] || b=1
   echo "$b"
 }
-# Peak RSS of each row's whole process tree, measured 2026-11-07 on 4 cores and 15 GiB with
-# the gate fanned out (the worst of two runs, rounded up). `filed witnesses` is a cold run;
-# `self-compile pair` builds two self-compiles at ~4 GiB each unless the build handed it one.
+# Peak RSS of each row's whole process tree with the row running alone, on 4 cores and 15 GiB,
+# rounded up (refactor-notes/2026-11-24-ir-claims-heavy-witnesses.md). `filed witnesses` is a cold
+# run; `self-compile pair` builds two self-compiles at ~4 GiB each unless the build handed it one.
 row_mem() {
   case "$1" in
-    "filed witnesses") echo 8000 ;;
-    "ci-native") echo 4000 ;;
+    "filed witnesses") echo 9600 ;;
+    "ci-native") echo 4800 ;;
     "self-compile pair") [ -n "${SELF_COMPILE_PAIR:-}" ] && echo 1400 || echo 4700 ;;
-    "lint-self + fmt") echo 2400 ;;
-    "distilled corpus") echo 1700 ;;
+    "lint-self + fmt") echo 3600 ;;
+    "distilled corpus") echo 4800 ;;
     "rep-fuzz") echo 1600 ;;
-    "deno task test"|"plumb-shape cost") echo 1400 ;;
-    "ir shadow"|"ir shadow cases") echo 1300 ;;
+    "deno task test") echo 4300 ;;
+    "plumb-shape cost") echo 1400 ;;
+    "ir shadow"|"ir shadow cases") echo 1600 ;;
     "ir shadow suite") echo 600 ;;
     "lsp suites (ci list)") echo 1100 ;;
-    "scaling shape") echo 900 ;;
+    "scaling shape") echo 1000 ;;
     "capability probes"|"kind-ladder sets") echo 800 ;;
     "dead-export budget"|"render-parse budget") echo 600 ;;
-    "late demands") echo 500 ;;
-    "self ir misses") echo 1600 ;;
+    "late demands"|"phase state") echo 500 ;;
+    "self ir misses") echo 4400 ;;
     "ir claims"|"ir claim refusals"|"ir claim cross") echo 4600 ;;
     "lsp typecheck"|"inventory refs") echo 400 ;;
     *) echo 200 ;;
