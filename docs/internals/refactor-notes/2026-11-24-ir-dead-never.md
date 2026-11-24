@@ -27,7 +27,23 @@ Swapping either expected rule (0 ↔ 3) reds the shadow suite.
 
 ## Readings
 
-READINGS
+Master 34f66267 → head, fixpoint seeds:
+- ir-i8 census `pre-path dead never`: distilled 6 → 0 (d16261 named cells); tests/cases
+  4 → 0 functions.
+- IR shadow, functions covered, verified and matched: tests/cases 79,465 → 79,471 of 80,755; corpus
+  45,546 → 45,552 of 45,678.
+- tests/cases fully IR-only: 6,003 of 7,169 → 6,004 of 7,170 (the new trap case is one).
+- Identity: names, cases and claimless all show 0 differ.
+- L2 self-compile fuel: +0.48% on the base's own L2.
+
+One never instance per consumer kind is byte-identical on both seeds. Each writes `unreachable` in
+the value's place, and its consumer's code goes on:
+- drop: `(drop (unreachable))`;
+- call argument: the call is itself dead, `(return (unreachable))`;
+- member receiver: `print(z.f())` is `(call $__print_i32__ (unreachable))`;
+- concat operand: `(call $__str_concat__ (global.get …) (unreachable))`.
+
+None writes a conversion after `unreachable`.
 
 ## Legacy tails the IR calls
 
