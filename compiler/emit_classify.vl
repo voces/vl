@@ -3215,16 +3215,18 @@ export function asgYieldsNullLit(asgIx: i32): boolean {
   return tyPrimNameOf(nodeTyIxOf(asgIx)) == "null"
 }
 
-// True if assignment `asgIx` in `fnIx` writes the `null` literal into a name whose type is the
-// never-filled `let x = null` hole (`TyNullable(-1)`, which is `null`): the value is the unit
-// (D17120). A closure's captured name is excluded; its write is D17300's.
+// True if assignment `asgIx` in `fnIx` writes the `null` unit (the literal, or a value
+// `exprIsNulNone` names, D17162) into a name whose type is the never-filled `let x = null` hole
+// (`TyNullable(-1)`, which is `null`): the value is the unit (D17120). A closure's captured name
+// is excluded; its write is D17300's.
 export function asgYieldsNulHole(asgIx: i32, fnIx: i32): boolean {
   if asgIx < 0 || asgIx >= P.nodes.length { return false }
   const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
   if a.binOp != "=" || a.binCompound != "" { return false }
   const r = unwrapParen(a.binRight)
-  if r < 0 || !(nodeAt(r) is NullLit) { return false }
+  if r < 0 || r >= P.nodes.length { return false }
+  if !(nodeAt(r) is NullLit) && !exprIsNulNone(r, fnIx) { return false }
   const l = nodeAt(unwrapParen(a.binLeft))
   if !(l is Ident) || identIsEnvCapture(fnIx, l.identName) { return false }
   const ty = nodeTyIxOf(asgIx)
@@ -6460,9 +6462,19 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   // A `K | null` niche place holds the atom of the member written, which its re-read yields
   // (D16343).
   if exprNulLitUnion(a.binLeft, fnIx) { return true }
+  if asgLitUnionMemberReRead(asgIx, fnIx) { return true }
   // A place wider than the right side is re-read and taken back to the right side's rep, as a
   // name's is (D14820).
   return asgReadUnwidenOp(asgIx, fnIx) >= 0
+}
+
+// Whether the write at `asgIx` stores one member of a literal-union place, typed as that lone
+// literal: the place holds the member's atom, which its re-read yields (D17340).
+export function asgLitUnionMemberReRead(asgIx: i32, fnIx: i32): boolean {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) || a.binOp != "=" || a.binCompound != "" { return false }
+  return tyIsLitUnion(nodeTyAt(a.binLeft, fnIx))
+    && tyIsBareStrLit(nodeTyAt(asgIx, fnIx))
 }
 
 // True if the statement at `stmtIx` is a bare value expression usable as an implicit
@@ -10375,13 +10387,10 @@ export function luArmIndexReads(ix: i32, fnIx: i32): boolean {
 export function armSiteReads(ix: i32, fnIx: i32): boolean {
   const recv = armSiteRecv(ix)
   if recv < 0 { return false }
-  // The receiver is a name; for an index or `.length`, a call whose result is a box of lists only
-  // (D17102); for `.length`, an element read that is itself one. One no name is read once.
+  // The receiver is a name, a call whose result is such a box (D17102, D17443), or (for `.length`)
+  // an element read that is itself one; a receiver that is no name is read once into the stash.
   const named = nodeAt(recv) is Ident && exprUnion(recv, fnIx)
-  const called = !(nodeAt(ix) is Call)
-    && nodeAt(recv) is Call
-    && exprUnion(recv, fnIx)
-    && ctnArmsAllLists(nodeTyAt(recv, fnIx))
+  const called = nodeAt(recv) is Call && exprUnion(recv, fnIx)
   if (
     !named
     && !called
@@ -10390,17 +10399,6 @@ export function armSiteReads(ix: i32, fnIx: i32): boolean {
     return false
   }
   return ctnArmsAt(nodeTyAt(recv, fnIx)).length > 0
-}
-
-// Whether every container arm of union `ty` is a list: a call receiver's arms are read through the
-// list override alone, which a map arm's reads do not consult (D17443).
-function ctnArmsAllLists(ty: i32): boolean {
-  const arms = ctnArmsAt(ty)
-  if arms.length == 0 { return false }
-  for m in arms {
-    if m < 0 || !(tyAt(m) is TyArray) { return false }
-  }
-  return true
 }
 
 // Whether such a read leaves the element union's box: its rep is a union box, not the string
@@ -13434,6 +13432,11 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   }
   if e is Call {
     if e.callFn < 0 { return -1 }
+    // A call an arm of a union of maps overrides reads as that arm's map (D17443).
+    if luOvOn != 0 {
+      const ov = luOvTyOf(exprIx)
+      if ov >= 0 && tyAt(ov) is TyMap { return mapArmShapeOfTy(ov) }
+    }
     const callee = nodeAt(e.callFn)
     if callee is Ident {
       if callee.identName == "Set" {
