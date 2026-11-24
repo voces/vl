@@ -1,0 +1,3 @@
+## Infrastructure (Track F)
+
+- **A behavioural oracle for the IR (Q57):** `vl run scripts/ir-parity.vl` builds each program with the IR on (the seed) and off (its `CLAIMED`-empty twin), runs both, and compares stdout, exit code and trap message. It covers the distilled cells, `tests/cases` and the capability probes, or `--files`/`--from`, and writes one row per program. A chosen divergence is listed in `scripts/ir-divergence-baseline.txt` (`program\tfunction\tmechanism\tPR`, empty today). `scripts/ir-identity.sh` reports a listed function's byte differ as `expected divergence` and passes it, while any other differ still reds. `ir-identity.sh --build-claimless` writes the claimless compiler on its own.
