@@ -868,6 +868,7 @@ import { forInBindTy } from "./check_leaf_steps"
 import {
   listGetIdxReReadable,
   optChainStagesRecv,
+  optRecvReReadable,
   sFieldTgtStructIdx,
   structIndexOfTy,
 } from "./emit_atom_kinds"
@@ -10090,6 +10091,7 @@ function coalesce(
   if arm == "chain" { return coalChain(b, n, ix, rep) }
   if arm == "niche" { return coalNiche(b, n, ix, rep) }
   if arm == "popOr" { return coalPopOr(b, n, ix, rep) }
+  if arm == "listGetOr" { return coalListGetOr(b, n, ix, rep) }
   // A map read joining a union is legacy's synthesized null-test `if` (`coalNullTestIf`), built
   // as the valued `if` it is.
   if arm == "mapJoinIf" {
@@ -10271,6 +10273,63 @@ function coalPopOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
       cbL: l,
       cbLB: [],
       cbArm: "popOr",
+      cbNull: nb,
+      cbOut: t,
+      cbAt: ix,
+      cbMap: null,
+    },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// The fused `xs.get(i) ?? d` over a scalar list (legacy's `emitListGetOr`): its shared head reads
+// the receiver and the index twice from the call, so only operands it re-reads in place are
+// taken; the default is built into the `else` arm at the element rep, as `coalPopOr`'s.
+function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const c = nodeAt(unwrapParen(n.binLeft))
+  if !(c is Call) || c.callFn < 0 || c.callArgs.length != 1 {
+    return irBMiss("coalesce listGetOr call")
+  }
+  const m = nodeAt(c.callFn)
+  if !(m is Member) { return irBMiss("coalesce listGetOr call") }
+  if !optRecvReReadable(m.memObj) || !listGetIdxReReadable(c.callArgs[0]) {
+    return irBMiss("coalesce listGetOr staged operand")
+  }
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce listGetOr after an operand") }
+  const l = irBExpr(b, m.memObj)
+  if ibMiss != "" { return l }
+  const ln = repNodeAt(irBOpRep(l))
+  if !(ln is RList) || ln.rlsElem != rep {
+    return irBMiss("coalesce listGetOr result rep")
+  }
+  const at = b.length
+  const i = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return i }
+  if b.length != at || irBOpRep(i) != repNodeOfTy(TY_I32) {
+    return irBMiss("coalesce listGetOr index operand")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  if !coalNeverDefault(nb, n.binRight, rep) {
+    const d = irBExpr(nb, n.binRight)
+    if ibMiss != "" { return d }
+    if irBOpRep(d) != rep { return irBMiss("listGetOr default conversion") }
+    irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  }
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  irBNode(
+    b,
+    {
+      cbL: l,
+      cbLB: [],
+      cbArm: "listGetOr",
       cbNull: nb,
       cbOut: t,
       cbAt: ix,
