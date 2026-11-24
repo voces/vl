@@ -51,7 +51,7 @@ export type PrimOp = "add" | "sub" | "mul" | "div" | "divu" | "rem" | "remu" | "
   | "ge" | "geu" | "neg" | "not"
 export type MapOp = "has" | "set" | "delete" | "keys" | "size"
 // `site` joins an append site's chain into its buffer, `soAt` the assignment; `acc` appends
-// the parts after a proven accumulator to it, as a statement.
+// the parts after a proven accumulator to it, as a statement. `bytes` copies into a fresh `u8[]`.
 // `fromcp` builds a string from one i32 code point, `fromcps` from a local i32 list it reads twice.
 // `indexof` and `includes` search the receiver for a string needle; `charcode` reads one unit.
 export type StrOp = "concat"
@@ -70,6 +70,7 @@ export type StrOp = "concat"
   | "includes"
   | "charcode"
   | "cpat"
+  | "bytes"
 export type CastFail = "trap" | "null"
 
 // The right-hand side of an `SLet`; the result rep is its destination's.
@@ -412,9 +413,10 @@ export type RListPushMany = { pmV: Opnd, pmL: Opnd, pmAt: i32 }
 // The receiver `rsgV` of push call `rsgAt`, staged into that push's frame slot ahead of a value
 // that writes a valued `if`; a statement, named by exactly one later push.
 export type RListStage = { rsgV: Opnd, rsgAt: i32 }
-// A `.pop()` statement on list `lqV`, its call `lqAt`: the element is taken and dropped, and an
-// empty list is left as it is. A statement only: as a value a pop is `T | null`.
-export type RListPop = { lqV: Opnd, lqAt: i32 }
+// A `.pop()` on list `lqV`, its call `lqAt`: the element is taken, and an empty list is left as
+// it is. With an index in `lqIx`, a `.get(i)`: the element at `i` read under the bound, the list
+// untouched; legacy writes the index from the call itself, twice (`pushTakeCond`).
+export type RListPop = { lqV: Opnd, lqIx: Opnd[], lqAt: i32 }
 // A `.clear()` statement on list `lkV`, its call `lkAt`: the length is zeroed, the backing kept.
 export type RListClear = { lkV: Opnd, lkAt: i32 }
 // `RMapFilter`'s operands: the list, the callback, then the captures it builds the callback from.
@@ -498,7 +500,11 @@ export type RSimd = {
   sdResPrim: string,
 }
 // A `print` statement at call `pnAt` of argument `pnV`, written by legacy's tail for its arm.
-export type RPrint = { pnV: Opnd, pnAt: i32 }
+export type RPrint = { pnV: Opnd, pnAt: i32, pnOpened: i32 }
+// The blocks legacy opens before a nullable string's (`poArm` 0) or boolean's (1) `print` operand
+// (`printNulStrOpen`), placed before the operand's statements; the `RPrint` whose `pnOpened` is
+// that arm closes them. `pnOpened` is -1 for a print that opens its own.
+export type RPrintOpen = { poArm: i32 }
 // `m[k] ?? d` at `??` node `mgAt`: map global `mgSym` (recovered for `mgNonNull`), else receiver
 // `mgLoc`, key `mgKey`; by `mgForm` the default goes to `__map_get_<row>__`'s miss (0), or is `mgDef`
 // in the miss arm of the probe's `i32` read (1), mv slot read (2), `scalar | null` union value's
@@ -720,6 +726,7 @@ export type Rhs = RArmSite
   | ROptRead
   | RPrimOp
   | RPrint
+  | RPrintOpen
   | RRawOp
   | RRecCopyPure
   | RRecordFitIs
@@ -971,6 +978,8 @@ export type IrFn = {
   irGlobalAt: {[i32]: i32},
   // The heap the builder noted for each record rep a hole retag compares (`irRecHeapNote`).
   irRecHeap: {[i32]: i32},
+  // The struct heap a struct literal's record temp is built at (`irVarHeapNote`).
+  irVarHeap: {[i32]: i32},
   // The retag nodes the builder noted as a closure stored at a record field legacy writes plainly,
   // whose closure kid another row on the same heap typed (`irCloFieldRetagNote`).
   irCloFieldRetag: {[i32]: boolean},
@@ -1090,6 +1099,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irGlobalRep: [],
     irGlobalAt: Map(),
     irRecHeap: Map(),
+    irVarHeap: Map(),
     irCloFieldRetag: Map(),
     irPushRecv: Map(),
     irGlobalStoreTy: Map(),
@@ -1224,6 +1234,17 @@ export function irCloFieldRetagAt(f: IrFn, id: i32): boolean {
 // Notes retag node `id` as a closure stored at a plainly written record field.
 export function irCloFieldRetagNote(f: IrFn, id: i32) {
   f.irCloFieldRetag[id] = true
+  return 0
+}
+
+// The struct heap record temp `v` is built at (`irVarHeapNote`), or -1 for none.
+export function irVarHeapOf(f: IrFn, v: i32): i32 {
+  return f.irVarHeap[v] ?? -1
+}
+
+// Notes record temp `v` as built at struct heap `h`, whatever heap its rep notes.
+export function irVarHeapNote(f: IrFn, v: i32, h: i32) {
+  if h >= 0 { f.irVarHeap[v] = h }
   return 0
 }
 
@@ -1421,6 +1442,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       ROptRead |
       RPrimOp |
       RPrint |
+      RPrintOpen |
       RRawOp |
       RRecCopyPure |
       RRecordFitIs |
@@ -1734,7 +1756,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListPush => pushOpnds(r)
     RListPushMany => [r.pmV, r.pmL]
     RListStage => [r.rsgV]
-    RListPop => [r.lqV]
+    RListPop => opndsCat([r.lqV], r.lqIx)
     RListClear => [r.lkV]
     RMapFilter => mapFilterOpnds(r)
     RListSlice => opndsCat([r.scV], r.scArgs)
@@ -1748,6 +1770,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMapEq => [r.mqLoc, r.mqKey, r.mqOther]
     RMapIter => [r.miV]
     RPrint => [r.pnV]
+    RPrintOpen => []
     RStrOp => r.soArgs
     RStructEq => opndsCat([r.seL, r.seR], opndsCat(r.seLIx, r.seRIx))
     REqHelp => [r.ehL, r.ehR]
@@ -1869,7 +1892,7 @@ function rhsText(r: Rhs): string {
     RListPush => "push " + pushRecvText(r.lpV) + " " + opndText(r.lpX)
     RListPushMany => "push_many " + opndText(r.pmV) + " " + opndText(r.pmL)
     RListStage => "stage_recv " + opndText(r.rsgV)
-    RListPop => "pop " + opndText(r.lqV)
+    RListPop => if r.lqIx.length == 0 { "pop " + opndText(r.lqV) } else { "get " + opndText(r.lqV) + ", " + opndsText(r.lqIx) }
     RListClear => "clear " + opndText(r.lkV)
     RMapFilter => "mapfilter "
       + opndText(r.hfV)
@@ -1937,6 +1960,7 @@ function rhsText(r: Rhs): string {
       + opndText(r.msVal)
       + ")"
     RPrint => "print " + opndText(r.pnV)
+    RPrintOpen => "print_open " + i32ToStr(r.poArm)
     RCoalStr => "coalesce " + opndText(r.czL) + " " + opndText(r.czD)
     RCoalAtomStr => "coalesce atom " + opndText(r.zaL) + " " + opndText(r.zaD)
     RTagStash => "tag stash " + opndText(r.tgsV)
@@ -2279,7 +2303,10 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RUnionStage |
       RUnionStagedEq |
       RUnionVariantEq => "scalar"
-    RCall | RCallHost | RPrint => "call"
+    RCall |
+      RCallHost |
+      RPrint |
+      RPrintOpen => "call"
     RGlobalGet | RInitProgress => "global"
     RCoerce |
       RListCat |
@@ -2669,6 +2696,28 @@ export function recRowRetag(src: i32, dst: i32, hs: {[i32]: i32}): boolean {
   return repsLowerAlike(src, dst, hs) || recFieldsWiden(src, dst, hs)
 }
 
+// Whether record temp `v` at plain record rep `src`, built at a struct heap (`irVarHeapOf`) its rep
+// notes none of, stands at plain record rep `dst` on that heap: fields lower alike by name over the
+// heaps noted in `f`. The note is the temp's own, so it says nothing of another value of `src`.
+export function recValRetag(f: IrFn, v: i32, src: i32, dst: i32): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  const h = irVarHeapOf(f, v)
+  if (
+    !(a is RRecord)
+    || !(d is RRecord)
+    || a.rrVariant
+    || d.rrVariant
+    || src == dst
+    || h < 0
+    || heapNotedOr(f.irRecHeap, src) >= 0
+  ) {
+    return false
+  }
+  return h == heapNotedOr(f.irRecHeap, dst)
+    && fieldsLowerAlike(src, dst, [src], [dst], f.irRecHeap)
+}
+
 // Rep `r`'s heap as noted in `hs`, else its own (`recHeapOf`); -1 for none or a conflicting note.
 function heapNotedOr(hs: {[i32]: i32}, r: i32): i32 {
   const n = hs[r] ?? -1
@@ -2823,9 +2872,8 @@ export function repsLowerAlike(a: i32, b: i32, hs: {[i32]: i32}): boolean {
 }
 
 // Notes in `hs` the struct heap (`recHeapOf`) of each record rep reachable from rep `r`, as the
-// builder's IR fact that `repsLowerAlike` reads.
+// builder's IR fact that `repsLowerAlike` reads. A rep already noted still has its kids walked.
 export function recHeapsNote(hs: {[i32]: i32}, r: i32) {
-  if (hs[r] ?? -1) >= 0 { return 0 }
   const todo: i32[] = [r]
   const seen: {[i32]: boolean} = Map()
   while todo.length > 0 {

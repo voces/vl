@@ -8181,8 +8181,16 @@ function listGetStageSave(): i32[] {
   return sv
 }
 
+// `emitPop`'s `.get` opening, for the IR's lowering of the same call: the markers saved, then
+// `callIx`'s operands marked as `emitPopGo` marks them. `listGetStageRestore` closes it.
+export function listGetStageEnter(callIx: i32): i32[] {
+  const sv = listGetStageSave()
+  listGetStageMark(callIx)
+  return sv
+}
+
 // Put back what `listGetStageSave` took.
-function listGetStageRestore(sv: i32[]) {
+export function listGetStageRestore(sv: i32[]) {
   listGetIdxStagedIx = sv[0]
   listGetIdxStagedSet = sv[1] == 1
   listGetRecvStagedIx = sv[2]
@@ -23493,6 +23501,12 @@ function emitStrIsCharBoundary(callIx: i32, fnIx: i32) {
   return emitFail("emitProgram: expected a string isCharBoundary call")
 }
 
+// `s.bytes()` over its receiver on the stack. Legacy and the IR share it.
+export function strBytesTail() {
+  fbCall(helpStrBytesFn())
+  return 0
+}
+
 // Lower `s.bytes()` — one call into `__str_bytes__`, which `array.copy`s the view's byte
 // range into a fresh `u8[]`. The helper's functype mints the packed pair.
 function emitStrBytes(callIx: i32, fnIx: i32) {
@@ -23508,8 +23522,7 @@ function emitStrBytes(callIx: i32, fnIx: i32) {
     const callee = nodeAt(c.callFn)
     if callee is Member {
       if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
-      fbCall(helpStrBytesFn())
-      return 0
+      return strBytesTail()
     }
     return emitFail(
       "emitProgram: string .bytes receiver is not a member access",
@@ -24200,9 +24213,13 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   if p.ijArm == "atom" {
     return if ifJoinDropsNulAtom(ifIx, fnIx, "atom") { "string drops null atom" } else { "" }
   }
+  const rk = p.ijRef.rjKind
+  // A join at a record's own row is legacy's reference join, a narrowed arm unboxed in its arm.
+  if p.ijArm == "ref" && rk != null && joinKindIsRecord(rk) {
+    return "ref " + rk
+  }
   // A union join with no render name takes a later rung in legacy; the IR lowers no union join.
   if exprUnion(ifIx, fnIx) { return "union" }
-  const rk = p.ijRef.rjKind
   if rk != null { return "ref " + rk }
   if ifJoinDropsNulAtom(ifIx, fnIx, "scalar") {
     return "string drops null atom"
@@ -29028,8 +29045,8 @@ export type PrintArm = "nulNone"
 // The arm `print` takes for argument `argIx` in function `fnIx`, in `emitCallCorePrint`'s order.
 export function printArmOf(argIx: i32, fnIx: i32): PrintArm {
   // The `null` type has no arm to select, and every classifier below reads a rep this value
-  // lacks (D1576).
-  if exprIsNulNone(argIx, fnIx) { return "nulNone" }
+  // lacks (D1576); an assignment of `null` yields that unit, not the cell's null (D17118).
+  if boxOperandIsNulNone(argIx, fnIx) { return "nulNone" }
   // A bare `null` literal names no cell for that classifier to read (D17093).
   const pnLit = unwrapParen(argIx)
   if pnLit >= 0 && pnLit < P.nodes.length && nodeAt(pnLit) is NullLit {
@@ -32668,7 +32685,7 @@ export function popScalarTail(
 
 // A `.get` of a view reads its refreshed snapshot (D3028, D3041): sync the scalar view of
 // kind `popEk` or the ref view behind receiver `recvIx` whose wrapper is in local `lIdx`.
-function emitListGetViewSync(
+export function emitListGetViewSync(
   lIdx: i32,
   popEk: VKind | null,
   recvIx: i32,
@@ -38504,8 +38521,8 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
 // box, a record, or an `i32`, string, byte or record list, each read whole into the loop variable.
 function forInElemPlain(ek: VKind): boolean {
   return match ek {
-    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" => true
-    "map" | "f64list" | "f32" | "nullist" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
+    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" | "nulbool" | "f32" => true
+    "map" | "f64list" | "nullist" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
   }
 }
 
@@ -41695,7 +41712,7 @@ export function nullReadDstOwnOf(exprIx: i32, fnIx: i32): i32 {
   if dt is TyNullable {
     if dt.nInner < 0 { return -1 }
   }
-  if dk == "union" { return NULL_OWN_BOX }
+  if dk == "union" { return -1 }
   return nullOwnOfTy(dst)
 }
 

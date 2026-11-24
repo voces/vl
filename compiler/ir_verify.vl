@@ -100,6 +100,7 @@ import {
   ROptRead,
   RPrimOp,
   RPrint,
+  RPrintOpen,
   RRawOp,
   RRecCopyPure,
   RRecordFitIs,
@@ -196,6 +197,7 @@ import {
   recFieldsWiden,
   recRetag,
   recSubRetag,
+  recValRetag,
   repBoolNiche,
   repBoxCore,
   repIsNoValue,
@@ -999,6 +1001,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         && !recRetag(opRep(r.rgV), dst)
         && !cloFieldRetag(r.rgV, dst, at)
         && !plainRecordsLowerAlike(opRep(r.rgV), dst)
+        && !(r.rgV is OVar && recValRetag(vf, r.rgV.ov, opRep(r.rgV), dst))
         && !recFieldsWiden(opRep(r.rgV), dst, vf.irRecHeap)
         && !recSubRetag(opRep(r.rgV), dst, vf.irRecHeap, vf.irRecSub)
         && !repNullRefFits(opRep(r.rgV), dst)
@@ -1341,8 +1344,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RListPop => {
       use(r.lqV, at)
+      uses(r.lqIx, at)
       if !(repNodeAt(opRep(r.lqV)) is RList) {
         return fail(2, at, "a pop of a non-list")
+      }
+      // A `.get`'s one index is an i32.
+      if (
+        r.lqIx.length > 1
+        || (r.lqIx.length == 1 && opRep(r.lqIx[0]) != vfI32)
+      ) {
+        return fail(2, at, "a list get's index is one i32")
       }
       // A value pop leaves the element, its i32 niche, or its null box.
       const el = kidAt(opRep(r.lqV), 0)
@@ -1517,6 +1528,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 { return fail(2, at, "a print statement has no value") }
       0
     }
+    RPrintOpen => if dst >= 0 { fail(2, at, "a print's opening blocks have no value") } else { 0 }
     RMapNew => {
       if dst >= 0 && !(repNodeAt(dst) is RMap) {
         return fail(2, at, "an empty map of a non-map rep")
@@ -1717,6 +1729,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           return fail(2, at, "a code-point list is a list of i32s")
         }
         return 0
+      }
+      // A string's bytes are a fresh list of u8s.
+      if r.soOp == "bytes" && dst >= 0 {
+        const bl = repNodeAt(dst)
+        if !(bl is RList) || repPrim(bl.rlsElem) != "u8" {
+          return fail(2, at, "a string's bytes are a list of u8s")
+        }
       }
       let i = 0
       while i < r.soArgs.length {
@@ -2250,11 +2269,46 @@ function nested(body: i32[]) {
     stmt(id, prev)
     prev = id
   }
+  printOpenPairs(body)
   while vfDefLog.length > nDefs {
     const d = vfDefLog.pop() ?? -1
     if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
   }
   return 0
+}
+
+// Fails rule 10 where body `body`'s print opens do not pair (`printOpenPairsWhy`): its own frame,
+// so the recursive body walk carries no slot for it.
+function printOpenPairs(body: i32[]) {
+  const po = printOpenPairsWhy(body)
+  if po != "" { fail(10, -1, po) }
+  return 0
+}
+
+// Why body `body`'s print opens (`RPrintOpen`) do not pair, or "": each is closed later in the same
+// body by the one print whose `pnOpened` is its arm, with no other print, `return` or branch
+// between them, and no print claims an open that is not there.
+function printOpenPairsWhy(body: i32[]): string {
+  let open = -1
+  for id in body {
+    const n = vf.irNodes[id]
+    if n is SEffect && n.efRhs is RPrintOpen {
+      if open >= 0 { return "a print's blocks open inside another's" }
+      open = n.efRhs.poArm
+    } else if n is SEffect && n.efRhs is RPrint {
+      const o = n.efRhs.pnOpened
+      if o >= 0 && o != open {
+        return "an opened print has no open of its arm before it"
+      }
+      if o < 0 && open >= 0 {
+        return "a print's open is closed by another print"
+      }
+      open = -1
+    } else if open >= 0 && (n is SReturn || n is SBr) {
+      return "a print's open is left before its print"
+    }
+  }
+  return if open >= 0 { "a print's open is never closed" } else { "" }
 }
 
 // Whether `out` is held in a box: a value `if` written at a box (`siAtDst`) writes one, and each
@@ -3040,6 +3094,7 @@ function rhsReadsList(r: Rhs): boolean {
       ROptRead |
       RPrimOp |
       RPrint |
+      RPrintOpen |
       RRawOp |
       RRecCopyPure |
       RRecordFitIs |
@@ -3276,6 +3331,7 @@ export function irVerify(f: IrFn): IrVerdict {
     stmt(id, prev)
     prev = id
   }
+  printOpenPairs(f.irBody)
   // Rule 8, the bounds checks, is the list builder's (`ir_verify_bounds.vl`).
   if vfRule == 0 {
     const b = irBoundsRuleHook(f)

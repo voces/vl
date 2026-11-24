@@ -1698,6 +1698,9 @@ Deno.test({
       "record-retag-field-other-valtype": 2,
       "record-retag-two-noted-heaps": 2,
       "record-retag-one-noted-heap": 0,
+      "value-retag-built-heap": 0,
+      "value-retag-other-heap": 2,
+      "value-retag-field-other-valtype": 2,
       "width-retag-noted-leading": 0,
       "width-retag-field-not-leading": 2,
       "width-retag-pair-unnoted": 2,
@@ -1751,6 +1754,10 @@ Deno.test({
       "plain-records-compared-nullable": 2,
       "captured-atom-param-decoded-at-string": 0,
       "captured-atom-param-typed-as-string": 3,
+      "get-of-list": 0,
+      "get-index-of-string": 2,
+      "bytes-into-i32-list": 2,
+      "bytes-of-i32": 2,
       "opt-read-of-i32": 2,
       "dead-return-after-returning-call": 5,
       "pop-or-default-returning-call": 5,
@@ -1764,6 +1771,11 @@ Deno.test({
       "identity-eq-of-i32": 2,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
+      "print-open-pair": 0,
+      "print-open-unclosed": 10,
+      "print-opened-unopened": 10,
+      "print-open-arm-mismatch": 10,
+      "print-open-left-by-return": 10,
       "union-cast-of-box": 0,
       "union-cast-of-boxed-nullable": 0,
       "union-cast-of-niche-nullable": 2,
@@ -2733,8 +2745,8 @@ print(nullable(null))
 // A map store whose value is a short-circuit (a valued `if`): legacy writes the receiver and key,
 // then the value. A global receiver (staged as its read), a local and a parameter, with a
 // variable, a call-result or a literal key, are staged below the `if`, covered and matched; so are
-// values that run a map op of the same or of another shape. A boxed `??` value stays legacy's, by
-// name.
+// values that run a map op of the same or of another shape, and a boxed binding's `??`, whose tag
+// test the staged leads sit below (`coalArmStagesLeads`).
 Deno.test({
   name: "ir shadow: a map store of a short-circuit value stages its receiver and key below the if",
   ignore,
@@ -2771,11 +2783,8 @@ print(gi["k"] ?? 0)
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
-      throw new Error(`want key, glob, loc, par, other and lit covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if (rows.get("uncovered map store short-circuit operand") !== 1) {
-      throw new Error(`want boxed left to legacy by name, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 7 || rows.get("covered") !== 7) {
+      throw new Error(`want key, glob, loc, par, other, boxed and lit covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
