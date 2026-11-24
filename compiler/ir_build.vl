@@ -651,6 +651,7 @@ import {
 import {
   narrowedNulLitPinBoxKey,
   nulNicheRecoverOwed,
+  retNeedsNonNullRecover,
 } from "./emit_value_sites"
 import {
   armSiteReads,
@@ -12940,7 +12941,8 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   const n0 = b.length
   if retRefusedWhy(last, ibFnIx) != "" { return skip("return refused") }
   const v = retDelivered(b, last)
-  if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
+  if ibMiss != "" { return 0 }
+  if irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])
   return 0
@@ -12973,7 +12975,22 @@ function retDelivered(b: i32[], arg: i32): Opnd {
   if ibMiss == "" && fu >= 0 && irBOpRep(v) != r {
     return boxTempIn(b, v, arg, r, -1, fu)
   }
-  return v
+  return retRecover(b, v, arg)
+}
+
+// Returned value `v` of `arg` at the result's rep where legacy's plain return writes a
+// `ref.as_non_null` after it (`retNeedsNonNullRecover`): a nullable value whose inner rep is the
+// result's. Any other value as it stands.
+function retRecover(b: i32[], v: Opnd, arg: i32): Opnd {
+  if ibMiss != "" { return v }
+  const r = ib.irRetRep
+  const vn = repNodeAt(irBOpRep(v))
+  if !(vn is RNullable) || vn.rnInner != r { return v }
+  const fn = nodeAt(ibFnIx)
+  const fp = if fn is FuncDecl && fn.fnRet < 0 { fnStmtsPosOf(ibFnIx) } else { -1 }
+  if !retNeedsNonNullRecover(arg, ibFnIx, fp) { return v }
+  const rc: Rhs = { rcV: v, rcAt: arg, rcNn: 1 }
+  return irBLetTempTy(b, rc, arg, r, ib.irRetTy)
 }
 
 // A value `if` in tail position (legacy's `emitIfTail`): the statement `if` with each arm's last
@@ -13068,8 +13085,9 @@ function tailArm(blockIx: i32): i32[] {
     skip("return refused")
     return body
   }
-  const v = deliver(body, last, ib.irRetRep, -1)
-  if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
+  const v = retRecover(body, deliver(body, last, ib.irRetRep, -1), last)
+  if ibMiss != "" { return body }
+  if irBOpRep(v) != ib.irRetRep {
     skip("tail coercion")
     return body
   }
