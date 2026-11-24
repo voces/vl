@@ -960,6 +960,7 @@ import {
   asgReReadEnter,
   asgReReadLeave,
   asgReadUnwidenOp,
+  asgYieldsNulHole,
   asgYieldsNullLit,
   assignTargetReReads,
   binMixHardF64,
@@ -1711,6 +1712,7 @@ import {
   unionBoxTyOfRead,
 } from "./emit_plan_coerce"
 import {
+  BinNulTest,
   CoalArm,
   CoalBoxArm,
   CoalNulRefArm,
@@ -1720,6 +1722,7 @@ import {
   NULL_OWN_NONE,
   NULL_OWN_STR,
   NullRet,
+  binNulNameTestOf,
   binNulTestOf,
   coalArmOf,
   coalBoxArmOf,
@@ -19391,7 +19394,7 @@ function refListReadAt(
   const rlHz = refListHoistOf(nd, rslot)
   const elem = place.epKind == "elem"
   if rlHz < 0 {
-    if elem { fbLocalGet(place.epSlot) }
+    if elem && place.epSlot >= 0 { fbLocalGet(place.epSlot) }
     else if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
     // A NULLABLE ref-array receiver (`t: i32[][] | null`, kind 18, narrowed) reads `(ref null …)` —
     // recover non-null before `struct.get` (the `if t != null` guard makes this safe).
@@ -21913,10 +21916,10 @@ function lcatBaseOfRep(kind: i32, slot: i32) {
   return lcatBases[i]
 }
 
-// Where a struct compare's field chain reads each side's root from: `expr` the operand node
-// itself, legacy's (`EQ_ROOTS_EXPR`); `local` local `epSlot`; `elem` the operand's ref list
-// element read over receiver local `epSlot` and index local `epIdx`, or immediate `epImm` where
-// `epIdx` is -1. Each `elem` read writes its element-read row into `epRows` as node, from, to.
+// Where a struct compare's field chain reads each side's root: `expr` the operand node (legacy's);
+// `local` local `epSlot`; `elem` a ref list element read over receiver local `epSlot` (its
+// expression where -1) and index local `epIdx` or immediate `epImm` (`epIdx` -1). Each `elem`
+// read writes its element-read row into `epRows` as node, from, to.
 export type EqRootKind = "expr" | "local" | "elem"
 export type EqRootPlace = {
   epKind: EqRootKind,
@@ -29046,7 +29049,12 @@ export type PrintArm = "nulNone"
 export function printArmOf(argIx: i32, fnIx: i32): PrintArm {
   // The `null` type has no arm to select, and every classifier below reads a rep this value
   // lacks (D1576); an assignment of `null` yields that unit, not the cell's null (D17118).
-  if boxOperandIsNulNone(argIx, fnIx) { return "nulNone" }
+  if (
+    boxOperandIsNulNone(argIx, fnIx)
+    || asgYieldsNulHole(unwrapParen(argIx), fnIx)
+  ) {
+    return "nulNone"
+  }
   // A bare `null` literal names no cell for that classifier to read (D17093).
   const pnLit = unwrapParen(argIx)
   if pnLit >= 0 && pnLit < P.nodes.length && nodeAt(pnLit) is NullLit {
@@ -43421,6 +43429,7 @@ export type EqRoute = "identMixed"
   | "atomFold"
   | "atomStatic"
   | "atomIds"
+  | "nulName"
   | "nulNone"
   | "noLowering"
   | "gRepUnresolved"
@@ -43446,6 +43455,8 @@ export function eqRouteOf(e: BinExpr, exprIx: i32, fnIx: i32): EqRoute {
   const lNull = nodeAt(unwrapParen(l)) is NullLit
   const rNull = nodeAt(unwrapParen(r)) is NullLit
   if lNull && rNull { return "nullNull" }
+  const nn = binNulNameTestOf(e, fnIx)
+  if nn != null && nulTestArmClaims(nn, fnIx) { return "nulName" }
   if scalarMapEqPlanOf(e, fnIx).smArm != "none" { return "scalarMap" }
   // A literal-union operand is no union box here: `exprUnion` also claims a `K`-annotated binding.
   if !lNull && !rNull {
@@ -43501,6 +43512,11 @@ function atomEqRouteOf(arm: AtomEqArm): EqRoute | null {
 function nulTestClaims(e: BinExpr, fnIx: i32): boolean {
   const bt = binNulTestOf(e)
   if bt == null { return false }
+  return nulTestArmClaims(bt, fnIx)
+}
+
+// Whether the null test of `bt`'s operand has an arm that writes it (`emitNulIsNullTest`).
+function nulTestArmClaims(bt: BinNulTest, fnIx: i32): boolean {
   return match nulTestArmOf(bt.bnRef, fnIx, bt.bnInvert, false) {
     "none" => false
     "instMap" => instMapIsNullReadOf(bt.bnRef, fnIx).length == 2
@@ -43525,6 +43541,7 @@ function emitEqRoute(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     "unionLeft" => emitUnionConcreteEq(l, r, ne, true, fnIx)
     "unionRight" => emitUnionConcreteEq(r, l, ne, false, fnIx)
     "atomFold" | "atomStatic" | "atomIds" => emitAtomEqByPlan(e, fnIx)
+    "nulName" => emitNulNameTestBin(e, fnIx)
     "nulNone" => emitNulNoneEq(e, fnIx)
     "noLowering" => emitFail("emitProgram: `" + e.binOp + "` over this operand rep has no lowering")
     "gRepUnresolved" => emitFail(
@@ -43630,6 +43647,29 @@ function emitNulTestBin(e: BinExpr, fnIx: i32): i32 {
       "emitProgram: internal: eqRouteOf and its writer disagree (null test ladder declined)",
     )
   }
+  return 0
+}
+
+// A non-literal `null` against an operand that may hold `null`: that operand's null test
+// (`binNulNameTestOf`), with the `null` side run for its effect in source order.
+function emitNulNameTestBin(e: BinExpr, fnIx: i32): i32 {
+  const bt = binNulNameTestOf(e, fnIx)
+  if bt == null {
+    return emitFail(
+      "emitProgram: internal: eqRouteOf and its writer disagree (null name test with no operand)",
+    )
+  }
+  const nulLeft = bt.bnRef == e.binRight
+  const nulSide = if nulLeft { e.binLeft } else { e.binRight }
+  if nulLeft && emitNulNoneForEffect(nulSide, fnIx) < 0 { return -1 }
+  const bnt = emitNulIsNullTest(bt.bnRef, fnIx, bt.bnInvert, false)
+  if bnt < 0 { return -1 }
+  if bnt == 0 {
+    return emitFail(
+      "emitProgram: internal: eqRouteOf and its writer disagree (null name test ladder declined)",
+    )
+  }
+  if !nulLeft && emitNulNoneForEffect(nulSide, fnIx) < 0 { return -1 }
   return 0
 }
 

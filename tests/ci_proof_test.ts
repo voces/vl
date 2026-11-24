@@ -49,6 +49,8 @@ const LOCAL: Record<string, string> = {
     "no ci.yml job runs the shipped IR claim over the distilled corpus",
   "ir claim refusals":
     "no ci.yml job builds the programs legacy refuses at emit claimed and claimless (`ir-parity.vl --pop refusals`)",
+  "ir claim cross":
+    "no ci.yml job builds and runs the probes, pins and a cases sample claimed and claimless (`ir-parity.vl --cross`)",
 };
 
 // What ci.yml must run for each covered row: fragments of the same command, on the seed.

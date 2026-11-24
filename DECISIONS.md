@@ -13094,3 +13094,13 @@ refusal a program sees.
 - Each seam saves and restores the enclosing scope, so a nested seam never hardens its caller.
 - On a build that succeeds today no helper refuses mid-claim, so no byte can move.
 - The fallback leaves at I8 (ir-design-2026-11.md, after the step table).
+
+**Conditions the merge queue set on the decline (queue ruling, 2026-11-24, before #9888 merged):** the seam saves and restores the enclosing scope, never sets then clears; it does not reset the module writer in soft mode; the declining unit is `cmp`-identical to a claimless build of it; a refusal outside a claim still latches hard; the refusal a program reports is legacy's; the native and TS note texts are identical. The save and restore is a dynamic scope, so the phase-state census's `emit_state` hidden count rose 11 → 12, accepted with its baseline in #9888 (queue ruling, option A; a depth counter that hid the scope from the census was refused; the census does not match a save through a struct literal, so the true count is 13).
+
+**The playground carries G3 too** (coordinator ruling, 2026-11-24): users meet it directly, so its Run takes the same three outcomes and the same tests as the LSP and the V8 oracle, as a follow-up in lane IR-P1.
+
+## Q57 does not permit losing a deliberate codegen property (2026-11-24, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-24.** Q57 lets the IR's bytes differ from legacy's where the difference is incidental. It does not permit losing a deliberate codegen property (address folding, bounds-check elision, unboxing, a tail form) even where guest fuel cannot see the loss. So lane IR-N8's memory address fold was ported byte-identically (#9870, option A) rather than accepted as a Q57 divergence, and lane IR-M1's heap identity 4b route B, which would have allocated a closure where legacy writes a direct function tag, was refused (#9881 took route A).
+
+**A named price is not a lost property.** #9841's arm-site operand built once ahead of the chain costs about two local operations per executed arm read, with run fuel unmeasured; the queue read it as a price within Q57, recorded in its refactor note, not a lost property.
