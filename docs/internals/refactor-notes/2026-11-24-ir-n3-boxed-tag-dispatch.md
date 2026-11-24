@@ -29,7 +29,28 @@ in one body: a node between would land above the head. Failing control: the self
 
 ## Grading — the position matrices
 
-MEASUREMENTS
+Two committed templates, graded on fixpoint seeds (base master fd2d6cd6e, built in its own tree at
+that commit; candidate in the lane's tree), 70 graded cells each (two_instances skipped):
+
+| template | `capability-matrix.vl --before/--after` | shadow mode 4, before → after | mode 1 after |
+|---|---|---|---|
+| `optional-call-through-hole-fn-field` | runs 72 of 74 both; 0 runs → not-runs | 68 cells `rep ?` (56 start, 12 functions) → none; 4 `optional read staged` unchanged | 168 covered, 168 matched |
+| `optional-call-effect-order-under-box` | runs 68 of 70 both; 0 runs → not-runs | 68 cells `rep ?` → none | 302 covered, 302 matched |
+
+The two `array_element` un-annotated cells of each are check-refused under both seeds (D17133). In
+the effect-order template the key's and the argument's logs read `kn` once per evaluation, in that
+order, in every position. Shadow mode 6 over every kept cell: no order row. The kept cells and the
+origin programs below are claimless-identical under both seeds (149 identical, 4 fail under both,
+differ 0).
+
+Origins of `boxed tag dispatch`, each the same shape (a dispatch's value into a leading box), each
+now covered and matched: tests/cases `closures/{generic-record-written-into-map-through-param-read-
+through-optional, hole-fn-generic-in-map-called-at-two-types, hole-fn-in-unannotated-map-read-back,
+hole-fn-record-in-map-after-same-shaped-literal, untagged-choice-handed-back-through-generic-to-
+wider-result}` and corpus `named/d15199_run_{function_field,no_write}`.
+
+Found on the way: D17180 (`get()?.f(4)` on an un-annotated function's result, a clause-1 emit reject
+on both seeds); the effect template reads its receiver through a logging key instead.
 
 ## Legacy tails the IR calls
 
@@ -37,4 +58,10 @@ MEASUREMENTS
 
 ## Measured (fixpoint seeds on both sides)
 
-PROOF
+Base master fd2d6cd6e (`base44`) against the candidate (`fxbtd`), each a fixpoint after one refresh:
+byte A/B 20,727 programs, 0 moved, 0 rc-differ; tests/cases A/B identical 7,678, differ 0; mode 3
+corpus differ 0, mode 3 self byte-identical; `ir-identity --names` self-compile identical, `--cases`
+differ 0, `--claimless` identical 14,472, differ 0; corpus shadow 46,893 matched, 0 order rows;
+tests/cases mode 1 covered and matched +1 function, +4 start bodies (`uncovered boxed tag dispatch` 1 →
+0, `start uncovered rep ?` 8 → 0, 3 to `shared member callee kid`, 1 to `method get`); self ir misses 0;
+self-compile guest fuel on the base tree 126,891,355,906 → 126,912,717,492 (+0.02%), per-PR L2 +0.11%.
