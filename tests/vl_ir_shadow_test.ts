@@ -104,14 +104,71 @@ const fileRows: FileRow[] = [...(() => {
   .sort()
   .map((f) => parseRow(`tests/ir-shadow-rows/${f}`, Deno.readTextFileSync(`${ROWS_DIR}/${f}`)));
 
+// A divergence Q57 lets a lane choose: `scripts/ir-divergence-baseline.txt` lists it as
+// `program\tfunction\tmechanism\tPR`, the function as a `--names` build spells it (`f@1`).
+const DIVERGENCE_FILE = `${ROOT}/scripts/ir-divergence-baseline.txt`;
+
+/** A `--names` function name as a detail row spells it: no `@<module>` suffix, the start `@start`. */
+const shadowName = (fn: string) => {
+  const n = fn.replace(/@\d+$/, "");
+  return n === "__start__" ? "@start" : n;
+};
+
+/** Each listed program's functions, as detail rows spell them. */
+const parseDivergences = (text: string) => {
+  const out = new Map<string, Set<string>>();
+  for (const line of text.split("\n")) {
+    if (line === "" || line.startsWith("#")) continue;
+    const f = line.split("\t");
+    if (f.length !== 4) throw new Error(`${DIVERGENCE_FILE}: not four tab-separated fields: ${line}`);
+    out.set(f[0], (out.get(f[0]) ?? new Set()).add(shadowName(f[1])));
+  }
+  return out;
+};
+
+const DIVERGENCES = parseDivergences(exists(DIVERGENCE_FILE) ? Deno.readTextFileSync(DIVERGENCE_FILE) : "");
+
+/** A row a chosen divergence accounts for: a byte mismatch, or the claim rule's fail for one. */
+const bytesRow = (k: string) =>
+  k.includes("bytes") && (k.startsWith("mismatch ") || k.startsWith("fail a claimable function did not match: "));
+
+/**
+ * A listed program's rows without its byte mismatches, and how many functions those were, when
+ * the detail compile (`irShadowArm(2)`) names every one and each is listed for it; else it throws
+ * naming the function, or the mismatches it could not name. Other programs' rows pass unchanged.
+ */
+const subtractDivergence = (row: FileRow, rows: Map<string, number>, listed: Set<string> | undefined, corrupt: number) => {
+  const bytes = [...rows.keys()].filter(bytesRow);
+  if (listed === undefined || bytes.length === 0) return { rows, expected: 0 };
+  const want = bytes.filter((k) => k.startsWith("mismatch ")).reduce((n, k) => n + rows.get(k)!, 0);
+  const named = new Map<string, number>();
+  for (const [k, n] of run(row.src, 2, corrupt).rows) {
+    const head = k.split("\n")[0];
+    const at = head.lastIndexOf(" in ");
+    if (!head.startsWith("detail ") || !head.slice(7, at).includes("bytes")) continue;
+    const fn = head.slice(at + 4);
+    named.set(fn, (named.get(fn) ?? 0) + n);
+  }
+  const unlisted = [...named.keys()].filter((fn) => !listed.has(fn));
+  if (unlisted.length > 0) {
+    throw new Error(`${row.file}: a byte mismatch in a function the divergence baseline does not list: ${unlisted.join(", ")}`);
+  }
+  const got = [...named.values()].reduce((a, b) => a + b, 0);
+  if (got !== want) throw new Error(`${row.file}: ${want} byte mismatches, the detail compile names ${got} (at most 3 a class)`);
+  const fns = bytes.filter((k) => k.startsWith("mismatch ") && !k.startsWith("mismatch start ")).reduce((n, k) => n + rows.get(k)!, 0);
+  return { rows: new Map([...rows].filter(([k]) => !bytesRow(k))), expected: fns };
+};
+
 /** Grades one file row's armed compile against its expectations and the standing three. */
-const gradeRow = (row: FileRow) => {
-  const { rc, rows } = run(row.src, true);
+const gradeRow = (row: FileRow, listing = DIVERGENCES, corrupt = 0) => {
+  const armed = run(row.src, true, corrupt);
+  const { rc } = armed;
+  const { rows, expected } = subtractDivergence(row, armed.rows, listing.get(row.file), corrupt);
   const got = JSON.stringify([...rows]);
   if (rc !== 0) throw new Error(`${row.file}: want compileSrc rc 0, got ${rc}`);
   const fails = failures(rows);
   if (fails.length > 0) throw new Error(`${row.file}: want no failure, got:\n${fails.join("\n")}`);
-  if ((rows.get("matched") ?? 0) !== (rows.get("covered") ?? 0)) {
+  if ((rows.get("matched") ?? 0) + expected !== (rows.get("covered") ?? 0)) {
     throw new Error(`${row.file}: want every covered function matched, got ${got}`);
   }
   for (const { key, op, n } of row.counts) {
@@ -125,6 +182,40 @@ const gradeRow = (row: FileRow) => {
 };
 
 for (const row of fileRows) Deno.test({ name: row.name, ignore, fn: () => gradeRow(row) });
+
+// The divergence subtraction's controls. `irShadowCorrupt(3)` adds a byte to every lowering, so
+// each covered function (and the start body) is a byte mismatch: listed, the row passes. Unlisted,
+// or with one function left out, it reds. A spans mismatch (control 4) reds even when listed.
+const DIVERGED: FileRow = {
+  file: "tests/ir-shadow-rows/divergence-control.vl",
+  name: "ir shadow: divergence control",
+  counts: [],
+  absent: [],
+  src: "function f(x: i32): i32 { return x + 1 }\nfunction g(x: i32): i32 { return x * 2 }\n" +
+    "function h(x: i32): i32 { return x - 3 }\nprint(f(2))\nprint(g(3))\nprint(h(4))\n",
+};
+const listing = (...fns: string[]) =>
+  parseDivergences(fns.map((fn) => `${DIVERGED.file}\t${fn}\tcontrol\t#0\n`).join(""));
+const reds = (f: () => void, want: string) => {
+  try {
+    f();
+  } catch (e) {
+    if ((e as Error).message.includes(want)) return;
+    throw new Error(`want a red containing "${want}", got: ${(e as Error).message}`);
+  }
+  throw new Error(`want a red containing "${want}", got a pass`);
+};
+
+Deno.test({
+  name: "ir shadow: a listed divergence passes, and an unlisted one reds",
+  ignore,
+  fn: () => {
+    gradeRow(DIVERGED, listing("f@1", "g@1", "h@1", "__start__@1"), 3);
+    reds(() => gradeRow(DIVERGED, listing(), 3), "did not match: bytes");
+    reds(() => gradeRow(DIVERGED, listing("f@1", "g@1", "__start__@1"), 3), "does not list: h");
+    reds(() => gradeRow(DIVERGED, listing("f@1", "g@1", "h@1", "__start__@1"), 4), "did not match: spans");
+  },
+});
 
 // The tripwire: a row name is one row, inline or in a file, never both and never two files.
 Deno.test({
@@ -3138,6 +3229,30 @@ Deno.test({
       const bad = [...rows.keys()].filter((k) => k.includes("record field null rep"));
       if (bad.length > 0 || (rows.get("start matched") ?? 0) < 1) {
         throw new Error(`want the start matched with no record field null rep miss, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
+    }
+  },
+});
+
+// A record with no row of its own on its storage row's heap (`recHeapOf`), stood at a record whose
+// field is nullable over its own or where its own is `null` (`recFieldsWiden`), and a global read
+// noting its cell's heap: each start builds, verifies and matches.
+const HEAP_IDENTITY_1: string[] = [
+  "type J = { f: i32 }\ntype K = { j: J | null }\nfunction mk() { return { j: { f: 4 } } }\nconst _k: K = mk()\nconst y = mk()\nprint(y.j.f)\n",
+  "type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nconst go = [1].length > 0\nconst __c = mk2()\nconst __f = () => {\n  const v = __c\n  print(v.f)\n}\n__f()\n",
+];
+Deno.test({
+  name: "ir shadow: a rowless record on its storage row's heap widens to a nullable field",
+  ignore,
+  fn: () => {
+    for (const src of HEAP_IDENTITY_1) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const miss = [...rows.keys()].filter((k) => k.startsWith("start uncovered"));
+      if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
       }
     }
   },
