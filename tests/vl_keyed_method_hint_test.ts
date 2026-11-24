@@ -94,6 +94,58 @@ const CASES: { name: string; line: string; want: string }[] = [
   },
 ];
 
+// V1/V2's value spellings and near misses through std:simd: a function value or a call whose
+// argument count no candidate takes keeps master's text; the one call that would run gains the hint.
+const SIMD =
+  'import { splatF32, splatU8 } from "std:simd"\nconst a = splatF32(1.0)\nconst b = splatF32(2.0)';
+const SIMD_CASES: { name: string; line: string; want: string }[] = [
+  {
+    name: "a retired name as a function value keeps master's import note",
+    line: "const f = ltF32x4",
+    want:
+      "undeclared identifier 'ltF32x4'; did you mean 'F32x4'? — `F32x4` is exported by \"std:simd\"; add it to the existing `import { … } from \"std:simd\"`",
+  },
+  {
+    name: "a retired name with no near type as a function value gets no hint",
+    line: "const f = addSatU8x16",
+    want: "undeclared identifier 'addSatU8x16'",
+  },
+  {
+    name: "a retired member read as a value gets no hint",
+    line: "const g = a.ltF32x4",
+    want: "member access '.ltF32x4' on non-object F32x4",
+  },
+  {
+    name:
+      "a retired member call whose argument count no candidate takes gets no hint",
+    line: "print(a.ltF32x4())",
+    want: "member access '.ltF32x4' on non-object F32x4",
+  },
+  {
+    name:
+      "the near-miss call replaces master's type note with the method (a deliberate supersession)",
+    line: "print(ltF32x4(a, b).anyTrue())",
+    want:
+      "undeclared identifier 'ltF32x4'; did you mean `a.lt(b)`, the `lt` that takes `F32x4`?",
+  },
+];
+for (const k of SIMD_CASES) {
+  Deno.test({
+    name: `keyed-method hint (std:simd): ${k.name}`,
+    ignore: !ENABLED,
+    async fn() {
+      const got = await errorsOf(`${SIMD}\n${k.line}`);
+      if (got.length !== 1 || got[0] !== k.want) {
+        throw new Error(
+          `want exactly [${JSON.stringify(k.want)}], got ${
+            JSON.stringify(got)
+          }`,
+        );
+      }
+    },
+  });
+}
+
 for (const k of CASES) {
   Deno.test({
     name: `keyed-method hint: ${k.name}`,
