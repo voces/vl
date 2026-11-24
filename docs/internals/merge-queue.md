@@ -306,6 +306,35 @@ For the queue:
   A mechanical tree comparison cannot see a semantic conflict: #9778 added a fifth `coalesce`
   parameter while master's #9771 added 4-argument calls, both merged textually clean, and the
   merged compiler did not typecheck (coordinator ruling, 2026-11-23).
+- **Q58.** Every READY that adds or widens an IR claim carries an armed position sweep: the
+  claimed value as a call argument (at a scalar and at a union parameter), a nested call argument,
+  a concat operand, an interpolation hole, a `return`, a `let`/`const` initializer, an `if` arm, a
+  `??` operand and a record field. Each program builds under `VL_IR_SHADOW=6`, runs, and is
+  identical to `ir-identity.sh --claimless`; the READY names the sweep's paths and the verifier
+  re-runs it. A red position is pinned; a red already on master is filed as a clause-1 row and
+  fixed express. Trains in flight on 2026-11-24 were held to the earlier bar (coordinator ruling,
+  2026-11-24). Grading (queue ruling, coordinator-approved, 2026-11-24, BROADCAST #24): "matched"
+  means no covered function mismatches or fails the verifier. A position function uncovered under
+  both seeds, in a class the PR does not touch, is not red when the program runs and is
+  claimless-identical, and the note names that class. A position that fails to run, or differs
+  from claimless, is always red and is filed clause-1, whoever owns its class.
+- **Q59.** A verifier may make a stated one-line control edit (a failing control for a probe) only
+  in an isolated `git archive` scratch build, never in the worktree or `build/`; it `cmp`s `build/`
+  before and after and deletes the scratch build (queue ruling, 2026-11-24).
+- **Q60.** Each worktree starts with master's `scripts/agent-setup.sh --host-check`, run before
+  the fixpoints, never the candidate tree's copy: a candidate's own copy can pass a host that
+  master's guest protocol needs rebuilt (queue ruling, 2026-11-24, BROADCAST #21).
+- **Q61.** Guest fuel is a deterministic count: the same seed building the same tree gives the
+  same number every time, so a fuel reading has no noise floor. A READY and a verifier quote
+  exact counts (queue ruling, 2026-11-24).
+- **Q62.** A legacy clause-1 red that a Q58 sweep finds and that is not tied to the finding lane's
+  own change goes to the soundness lane S2, which files and fixes it express (coordinator ruling,
+  2026-11-24).
+- **Q63.** `gate.sh --fast` runs neither `tests/vl_ir_door_guard_test.ts` nor
+  `tests/vl_emitter_state_audit_test.ts`, so a lane runs both directly before every READY and
+  quotes them. A train went red on both in its full gate after a green fast tier: a new module
+  `let` no reset clears, and door guards still pinning a miss the PR removed (queue ruling,
+  2026-11-24).
 
 ### Squash artifacts and Q3 members
 
@@ -347,7 +376,8 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 ## A chosen divergence (Q57)
 
 Q57 (coordinator ruling) lets an IR lane write bytes legacy would not, when matching legacy would
-cost more than about two hours. Byte identity cannot prove such a function, so behaviour does:
+cost more than about two hours. The queue or the coordinator acks the divergence and its cost
+before the lane relies on it. Byte identity cannot prove such a function, so behaviour does:
 
 - The lane adds one line per diverging function to `scripts/ir-divergence-baseline.txt`:
   `<program>\t<function>\t<mechanism>\t<PR>`, the function as a `--names` build spells it
