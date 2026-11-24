@@ -21,6 +21,8 @@ The ablation needs both: the routing alone moves the 19 functions to `ref if arm
 alone moves nothing.
 
 New test cases:
+- `unions/union-if-record-join-unannotated-binding.vl`: the un-annotated binding at module and
+  function scope, which the claim declines.
 - `unions/record-join-unboxes-narrowed-arm-from-a-box.vl`: the box holds an `A` built apart from
   the literal arm's, so a field only that record carries shows which one arrived.
 - `unions/record-join-unboxes-narrowed-arm-in-each-position.vl`, the position sweep: a
@@ -34,7 +36,10 @@ New test cases:
 - A union-typed join with no row of its own (`rjSlot` -1), as at an un-annotated module-scope
   binding (D4645's witness), is declined as `union if record join row`: legacy writes it straight
   into the global at the binding's row, and the IR's out local would have no interned shape. The
-  claimless comparison over the inventory witnesses caught it.
+  claimless comparison over the inventory witnesses caught it; the function-scope spelling failed
+  the same way. `unions/union-if-record-join-unannotated-binding.vl` pins both.
+- A claim that refuses at emit where legacy runs is a failure the claims-off fallback does not
+  catch: it covers an invalid module only (G3).
 - A record parameter or a nested call taking the join is check-clean invalid wasm on master:
   D17115, filed from the sweep and legacy's to fix. The IR declines that position with the miss
   `argument union if at a record (D17115)`, which disappears when the legacy fix lands; lifting the
