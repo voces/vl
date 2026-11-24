@@ -26,6 +26,13 @@ closed by the one print of its arm, with no other print, `return` or branch betw
 Five keyed self-tests: `print-open-pair` 0; `print-open-unclosed`, `print-opened-unopened`,
 `print-open-arm-mismatch`, `print-open-left-by-return` 10.
 
+The pairing check runs from its own frame (`printOpenPairs`), not inline in the verifier's recursive
+body walk (`nested`): an inline local there grew every recursion level, and the deep-nesting
+labelled-loop case lost its 940 KB stack margin.
+
+FREE, from #9869's verify: a map walk whose element is a union value stops at the named miss
+`for in map element rep` (V9's probe; no tests/cases or corpus program).
+
 ## Legacy tails the IR calls
 
 `printNulStrOpen` / `printNulBoolOpen` (now from `RPrintOpen`) and their tails, as before.
