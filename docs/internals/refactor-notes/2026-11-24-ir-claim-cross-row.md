@@ -49,3 +49,13 @@ at its 200 MiB default, and a gate that launched both beside the other rows hit 
 three 60 s build timeouts in `ir claim refusals` (rc 3). Both rows are budgeted at 4,400 MiB now.
 Building the claimless compiler once per gate and handing it to both rows would save one of the two
 self-compiles (41 CPU-s and 4 GiB); it is not done here.
+
+## Cold compilers under the build timeout
+
+A compiler's first use compiles its 7 MB module to native code and caches it: 14.6 s wall and
+33 CPU-s cold on a quiet box, 0.02 s warm. `ir-parity.vl` workers time each build at 60 s. Under
+load (8 to 10 on 4 cores), every cold compile was killed before it stored, so every build compiled
+cold again: in one gate both parity rows timed out on 96 of 99 claimless builds at about 3,000 CPU-s
+each. Control with a private `$VL_SEED_CACHE_DIR`: a cold build killed at 5 s (rc 124) left the
+next build still cold (13.5 s), and one untimed build made it warm (0.02 s). `ir-parity.vl` now
+builds a one-line program with each compiler, untimed, before it fans out.
