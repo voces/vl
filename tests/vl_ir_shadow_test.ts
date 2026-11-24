@@ -1821,6 +1821,8 @@ Deno.test({
       "asg-unwiden-non-null-of-record": 2,
       "map-print-of-i32": 0,
       "map-print-of-string": 2,
+      "after-effects-at-value-rep": 0,
+      "after-effects-off-value-rep": 2,
       "null-of-plain": 0,
       "null-of-place-with-read": 0,
       "null-of-read-off-place": 2,

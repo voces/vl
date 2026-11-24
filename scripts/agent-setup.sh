@@ -78,7 +78,16 @@ host_check() {
   echo "agent-setup: host rebuilt into this worktree's own target (remove the worktree to drop it)"
 }
 
+# The disassembler `ir-identity.sh` reads a listed divergence with: without it each reads as a differ.
+disasm_check() {
+  [ -x node_modules/.bin/wasm-dis ] && return 0
+  echo "agent-setup: node_modules/.bin/wasm-dis is not executable here, so ir-identity cannot read" >&2
+  echo "  a listed divergence; link it: ln -s \"$MAIN/node_modules\" node_modules" >&2
+  return 1
+}
+
 if [ "${1:-}" = "--host-check" ]; then
+  disasm_check || exit 1
   host_check
   exit $?
 fi
@@ -86,6 +95,7 @@ fi
 [ -d "$MAIN/node_modules" ] || { echo "agent-setup: no node_modules at $MAIN (run npm ci there)" >&2; exit 1; }
 [ -e node_modules ] || ln -s "$MAIN/node_modules" node_modules
 [ -e scripts/vl-host/target ] || ln -s "$MAIN/scripts/vl-host/target" scripts/vl-host/target
+disasm_check
 bash scripts/refresh-compiler.sh
 host_check
 echo "agent-setup: ready (vl: $VL, seed: build/vl-compiler.wasm)"
