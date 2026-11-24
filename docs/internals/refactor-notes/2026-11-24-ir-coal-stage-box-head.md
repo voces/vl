@@ -22,10 +22,12 @@ Base 86dd79148, both seeds fixpoints.
   All 16 build invalid wasm on base. On head all 16 run, with output identical to a claimless
   compiler. `nulBoolJoin` (whose box writes no head) and the unboxed `f + plain(rc ?? d)` ran on
   base and still run (8 more cells).
-- Escape: modes 1 and 6 report `fail a claimable function did not match` on the witness. No corpus
-  cell or tests/cases program had the shape, so the armed shadow never saw it.
+- Escape: the verifier flags the witness (`fail a claimable function did not match`, modes 1 and
+  6). A production build emits claims without the shadow, and no armed population (corpus,
+  tests/cases, capability probes) had the shape.
 
-Pins: `tests/cases/null/coalesce-boxed-argument-after-a-lead-{concat,interpolation,argument}.vl`.
+Pins: `tests/cases/null/coalesce-boxed-argument-after-a-lead-{concat,interpolation,argument}.vl`
+(the 16), and `...-controls.vl` (the 8).
 Row: `tests/ir-shadow-rows/coalesce-staged-arm-boxed-after-a-lead.vl` (9 functions fail on base;
 all match on head).
 
