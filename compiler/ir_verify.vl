@@ -70,6 +70,7 @@ import {
   RListSlice,
   RListStage,
   RLitArms,
+  RMaFoldInit,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -520,6 +521,12 @@ function pushRecvOpnd(r: RListPush, at: i32): Opnd {
   return v
 }
 
+// Whether map value rep `val` is a scalar `print`'s map-read arm streams.
+function mapPrintScalar(val: i32): boolean {
+  const p = repPrim(val)
+  return p == "i32" || p == "i64" || p == "f32" || p == "f64"
+}
+
 // The receiver stage node `id` is, or null.
 function stageAt(id: i32): RListStage | null {
   if id < 0 || id >= vf.irNodes.length { return null }
@@ -656,6 +663,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if !rec { return fail(2, at, "an arm unbox lands at a record") }
       if r.uaDst >= 0 && r.uaDst != dst {
         return fail(2, at, "a record arms unbox lands at the record it names")
+      }
+      if r.uaAsg && r.uaDst < 0 {
+        return fail(2, at, "an assignment's arm unbox names its destination")
       }
       0
     }
@@ -908,6 +918,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RMemAccess => memAccessCheck(r, dst, at)
+    RMaFoldInit => maFoldInitCheck(r, dst, at)
     RAtomic => atomicCheck(r, dst, at)
     RTruncSat => truncSatCheck(r, dst, at)
     RMemOp => {
@@ -1536,6 +1547,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(2, at, "a map get of a receiver that is no map")
       }
       const m = repNodeAt(mapRecvRep(r.mtSym, r.mtLoc))
+      // `print`'s read prints a scalar value and yields nothing.
+      if r.mtPrint >= 0 {
+        if !(m is RMap) || !mapPrintScalar(m.rmVal) || dst >= 0 {
+          return fail(
+            2,
+            at,
+            "a map read print is of a scalar value and yields nothing",
+          )
+        }
+        return 0
+      }
       // A union value's narrowed read is unboxed to its member's scalar (`narrowedMapReadOf`).
       const unboxed = irFactIntOf(vf, at, 0) == 1 && repPrim(dst) != null
       // A union value's read is its box, `null` one more tag of it.
@@ -1652,6 +1674,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       uses(r.seRIx, at)
       if repIsScalar(opRep(r.seL)) || repIsScalar(opRep(r.seR)) {
         return fail(2, at, "a record compare's operands are references")
+      }
+      // The guarded compare tests each side's null; one side at least can be null.
+      if (
+        r.seNul
+        && !(repNodeAt(opRep(r.seL)) is RNullable)
+        && !(repNodeAt(opRep(r.seR)) is RNullable)
+      ) {
+        return fail(2, at, "a nullable record compare has a nullable operand")
       }
       for ixs in [r.seLIx, r.seRIx] {
         for o in ixs {
@@ -2790,6 +2820,19 @@ function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
   return 0
 }
 
+// A declaration-time address fold's initializer: an i32 bounded part, kept in a declared wasm
+// local, and an i32 value.
+function maFoldInitCheck(r: RMaFoldInit, dst: i32, at: i32) {
+  use(r.mfiV, at)
+  if opRep(r.mfiV) != vfI32 || r.mfiSlot < 0 {
+    return fail(2, at, "an address fold keeps an i32 in a declared local")
+  }
+  if dst >= 0 && dst != vfI32 {
+    return fail(2, at, "an address fold is an i32")
+  }
+  return 0
+}
+
 // A function-value compare's two operands at closure reps, and its 0/1 answer a bool.
 function closureEqCheck(r: RClosureEq, dst: i32, at: i32) {
   use(r.cqL, at)
@@ -2969,6 +3012,7 @@ function rhsReadsList(r: Rhs): boolean {
       RListSlice |
       RListStage |
       RLitArms |
+      RMaFoldInit |
       RMakeClo |
       RMakeList |
       RMakeRec |
