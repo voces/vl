@@ -3334,3 +3334,23 @@ Deno.test({
     }
   },
 });
+
+// A `T | null` global (a nullable struct cell) read narrowed at its record's heapless rep takes
+// its cell row's heap, so a binding of it at that row's record builds and reads both fields.
+const NULLABLE_CELL_HEAP: string[] = ["type J = { f: i32 | null, g: i32 }\nfunction mk2() { return { f: null, g: 7 } }\nconst dA: J = mk2()\nconst __m = Map()\n__m[\"k\"] = mk2()\nconst __mv = __m[\"k\"]\nif __mv != null {\n  const v = __mv\n  print(v.g)\n  print(v.f ?? 3)\n}\n", "type J = { f: i32 | null, g: i32 }\nfunction mk2() { return { f: null, g: 11 } }\nconst dA: J = mk2()\nconst __m = Map()\n__m.set(\"k\", mk2())\nconst __mv = __m.get(\"k\")\nif __mv != null {\n  const v = __mv\n  print(v.g + 1)\n  print(v.f ?? 4)\n}\n"];
+Deno.test({
+  name: "ir shadow: a nullable struct cell's narrowed read takes its record row's heap",
+  ignore,
+  fn: () => {
+    for (const src of NULLABLE_CELL_HEAP) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const miss = [...rows.keys()].filter((k) => k.includes("uncovered"));
+      if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
+    }
+  },
+});
