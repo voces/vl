@@ -3247,7 +3247,8 @@ Deno.test({
 
 // A lone-literal field filled from a binding of that literal, built at a parameter's row that
 // keeps the field as its atom: the binding's member id (`atom_sole`) is an atom typed at the
-// literal, which rule 3 admits (`loneLitAtom`). The callee's own row read stays a named miss.
+// literal, which rule 3 admits (`loneLitAtom`). The callee reads the field at its atom, which its
+// `print` decodes.
 const LONE_LIT_ATOM_ARG: string[] = [
   "function show(r: { f: \"a\", g: i32 }) { print(r.f) }\nfunction h(x: \"a\") {\n  show({ f: x, g: 1 })\n}\nh(\"a\")\n",
   "function show(r: { f: \"a\" }) { print(r.f) }\nfunction h(x: \"a\") {\n  show({ f: x })\n}\nh(\"a\")\n",
@@ -3263,8 +3264,8 @@ Deno.test({
       if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
       const fails = failures(rows);
       if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
-      if ((rows.get("matched") ?? 0) < 1 || (rows.get("uncovered member record") ?? 0) !== 1) {
-        throw new Error(`want h matched and show a named member-record miss, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      if ((rows.get("matched") ?? 0) < 2 || rows.has("uncovered member record")) {
+        throw new Error(`want h and show matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
       }
     }
   },
