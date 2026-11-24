@@ -191,3 +191,15 @@ Readings (base batch 2a 3977fec35 = master 1db11290 in compiler, head 7736511f3,
   positions are uncovered under both seeds in classes this note does not touch (`argument
   coercion`, `string operand after another`, `return coercion`, `assignment coercion`, `ref if
   arm rep`, `coalesce nulRef default rep`, `object field coercion`).
+
+## Batch 2b part 2: a nullable struct cell's heap
+
+D1's two d16132 cells `d16132_map_set_unann` and `d16132_map_value_unann` read no map at the
+miss: `const v = __mv` reads the top-level `{f: null} | null` global narrowed under
+`if __mv != null`. `noteCellHeap` ran there, but `cellHeapOf` took only a `struct` cell; this is
+a `nulstruct` cell, whose `globalCellStructIdx` is its record's row (row 0, heap 0, the binding's
+`J$m…` rep). `cellHeapOf` now takes `struct` or `nulstruct`; the row-match guard and memo stand.
+- Both cells: `start uncovered declaration coercion` → start matched; print `null` on both seeds.
+- Witnesses with a non-null field beside the null one print `7 3` and `12 4` on both seeds.
+- Neighbours unchanged under both seeds: an un-narrowed read of the nullable global (`false 7`)
+  and a nullable global whose row does not match (`10`) are matched on base and head alike.
