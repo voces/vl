@@ -35,8 +35,8 @@ lowering writes it after `global.set`, as `emitUserGlobalSet` does.
 - `tests/cases/globals/guarded-write-trap-via-closure.vl` and `guarded-write-trap-recursion.vl`:
   a write before init through a closure and through a recursion cycle traps. `vl run` reports
   "`n` written before its initializer ran (line 11), via a closure" and "(line 9), via a",
-  identical on both seeds, with exit code 1. The wasm tier's `@trap` sees the guard's trap as an array bound, so the files assert the
-  trap; the text is the native host's.
+  identical on both seeds, with exit code 1. The wasm tier's `@trap` sees the guard's trap as an
+  array bound, so the files assert the trap; the text is the native host's.
 - `tests/ir-shadow-rows/guarded-global-write.vl`.
 
 ## Readings (base 467ffe33, fixpoint seeds on both sides)
