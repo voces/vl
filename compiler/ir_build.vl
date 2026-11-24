@@ -172,6 +172,7 @@ import {
   sIf,
 } from "./ir"
 import {
+  RUnionConcreteEq,
   boxListRetag,
   boxMapRetag,
   cloHoleRetag,
@@ -263,6 +264,7 @@ import {
   asWrapArmOf,
   asgValueArmOf,
   atomHookArmOf,
+  atomRecordAt,
   atomStrPlanOf,
   atomicCallNamed,
   atomicPlanOf,
@@ -694,6 +696,7 @@ import {
   exprIsNulNone,
   exprIsStrMethod,
   exprMap,
+  exprNulLitUnion,
   exprNullableMap,
   exprUnion,
   fnBundleRetSigs,
@@ -1085,10 +1088,10 @@ export function irClaimStart(
   return true
 }
 
-// The shadow's failing controls: 0 none; 1 swaps the first variable's rep and 2 deletes the first
-// temp's definition, which the verifier must refuse, on the shadow and the claim path alike; 3 adds
-// a byte to the lowering, 4 drops a span row and 5 its element-read rows, which the dual emit must
-// report; 6 the held coercion, 7 a map join's out at another map's rep (`unrelatedMapControl`).
+// The shadow's failing controls: 0 none; the verifier must refuse 1 (a variable's rep swapped), 2
+// (a temp's definition deleted), 7 (`unrelatedMapControl`) and 8 (`otherAgainControl`); the dual
+// emit must report 3 (a byte added to the lowering), 4 (a span row dropped) and 5 (its element-read
+// rows); 6 is the held coercion.
 export function irShadowCorrupt(k: i32) {
   ibCorrupt = k
   return 0
@@ -2534,7 +2537,7 @@ function boxTestTagOf(
 }
 
 // Whether rep `r` is a literal-union atom's `K | null` (discipline 3): the id, or a sentinel.
-export function atomNullable(r: i32): boolean {
+function atomNullable(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RNullable && n.rnDisc == 3
 }
@@ -2563,7 +2566,7 @@ function boolNullable(r: i32): boolean {
 }
 
 // Whether rep `r` is a nullable boxed as a union is (discipline 4): `{tag, payload}`.
-function boxedNullable(r: i32): boolean {
+export function boxedNullable(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RNullable && n.rnDisc == 4
 }
@@ -4301,7 +4304,8 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   return irBMiss("read of " + n.identName)
 }
 
-// Notes a struct cell's heap (`globalCellStructIdx`) for the record rep `rep` it is read at, where
+// Notes a struct cell's heap (`globalCellStructIdx`, a nullable cell's its record's) for the record
+// rep `rep` it is read at, where
 // that rep's type has no heap of its own and its fields lower alike with, or widen to, the cell
 // row's own; a second cell of that rep on another heap unnotes it.
 function noteCellHeap(d: i32, rep: i32) {
@@ -4317,7 +4321,8 @@ function noteCellHeap(d: i32, rep: i32) {
 let cellHeapMemo: {[string]: i32} = Map()
 
 function cellHeapOf(d: i32, rep: i32): i32 {
-  if recHeapOf(rep) >= 0 || globalCellKind(d) != "struct" { return -1 }
+  const k = globalCellKind(d)
+  if recHeapOf(rep) >= 0 || k != "struct" && k != "nulstruct" { return -1 }
   return rowHeapFor(rep, globalCellStructIdx(d))
 }
 
@@ -4426,6 +4431,9 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   }
   const cr = capRepFor(fe, name, if unbox { -1 } else { rep })
   if cr == rep { noteCapHeap(fe, name, rep) }
+  // A capture of a binding legacy holds as an atom, read at a string, is that atom, decoded.
+  const ar = if !unbox && cr != rep { captureAtomCellRep(fe, name, ix, rep) } else { -1 }
+  if ar >= 0 { return capturedAtomDecoded(b, fe, name, ix, ar, rep) }
   // A nullable capture read at the member the checker narrowed it to: the capture at its own rep.
   const na: NullNarrowArm = if cr != rep && !unbox { nullNarrowArmOf(ix, cr, rep) } else { "none" }
   const ak = if unbox && heldAsBox(cr) { identUnboxAtomOf(ix, ibFnIx) } else { -1 }
@@ -4495,6 +4503,44 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if boxed { return irBLetTemp(b, { sgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
+}
+
+// The atom rep capture `name` of `fe` is held at where its read `ix` at plain string `rep` reads
+// a binding legacy holds as the atom (`exprIsLitAtom`), else -1. The `K | null` niche misses.
+function captureAtomCellRep(fe: i32, name: string, ix: i32, rep: i32): i32 {
+  if repPrim(rep) != "str" || strNullable(rep) || !exprIsLitAtom(ix, ibFnIx) {
+    return -1
+  }
+  if exprNulLitUnion(ix, ibFnIx) {
+    irBMiss("capture atom niche")
+    return -1
+  }
+  const ty = atomRecordAt(ix, ibFnIx)
+  const ar = if ty >= 0 { repNodeOfTy(ty) } else { -1 }
+  if ar < 0 || !(repNodeAt(ar) is RAtom) { return -1 }
+  return if capRepFor(fe, name, ar) == ar { ar } else { -1 }
+}
+
+// Capture `name` of `fe`, held at atom rep `ar`, read at string `rep`: the environment's field or
+// the lifted function's parameter, decoded to its member string (`RAtomStr`).
+function capturedAtomDecoded(
+  b: i32[],
+  fe: i32,
+  name: string,
+  ix: i32,
+  ar: i32,
+  rep: i32,
+): Opnd {
+  const aty = atomRecordAt(ix, ibFnIx)
+  if !cloLifted(fe) {
+    const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
+    return atomToStr(b, irBLetTempTy(b, ev, ix, ar, aty), ix, rep)
+  }
+  const v = liftCapVarAt(fe, name, ar, aty)
+  if v < 0 || ib.irVars[v].vRep != ar { return irBMiss("capture binding") }
+  ib.irReadVar[ix] = v
+  const o: Opnd = { ov: v }
+  return atomToStr(b, o, ix, rep)
 }
 
 // Notes the heap of the struct row legacy's capture `name` of `fe` is stored at
@@ -4656,11 +4702,16 @@ function capLoopTyOf(fe: i32, name: string): i32 {
 // captured `for-in` variable has no rep yet. One held at its read's rep, not its binding type's
 // (a shared cell), is typed at that rep.
 function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
+  return liftCapVarAt(fe, name, readRep, -1)
+}
+
+// `liftCapVar`, its parameter typed `atTy` where that is not -1.
+function liftCapVarAt(fe: i32, name: string, readRep: i32, atTy: i32): i32 {
   const w = 1 + captureSlotOf(name, ibFnIx)
   const known = paramVarAt(w)
   if known >= 0 { return known }
   const r = capRepFor(fe, name, readRep)
-  const bty = capTyOf(fe, name)
+  const bty = if atTy >= 0 { atTy } else { capTyOf(fe, name) }
   const ty = if readRep < 0 && bty < 0 { capLoopTyOf(fe, name) } else { bty }
   if ty < 0 && r < 0 { return -1 }
   const vty = if ty >= 0 && (r < 0 || repNodeOfTy(ty) == r) { ty } else { repTyOf(r) }
@@ -5917,6 +5968,12 @@ function sharedFieldCallee(b: i32[], m: Member, at: i32): Opnd {
   const r = if ot >= 0 { repNodeOfTy(ot) } else { -1 }
   const si = structIndexOfExpr(m.memObj, ibFnIx)
   const fi = if si >= 0 { sFieldIndex(si, m.memProp) } else { -1 }
+  // A nullable record receiver (a `?.` on an un-annotated parameter) is read by legacy off the
+  // nullable reference the chain tested; the verifier admits no field read of a nullable.
+  const rn = repNodeAt(r)
+  if rn is RNullable && repNodeAt(rn.rnInner) is RRecord {
+    return irBMiss("shared member callee nullable receiver")
+  }
   if !(repNodeAt(r) is RRecord) || fi < 0 {
     return irBMiss("shared member callee row")
   }
@@ -5987,7 +6044,7 @@ function holderCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   }
   const pk = holderPickOf(ix, ibFnIx)
   // A holder captured whole is read at the record its capture holds (`capTyOf`).
-  const v = if calleeIsCapture(c.callFn) { bundleCaptureRead(b, c.callFn) } else { irBExpr(b, c.callFn) }
+  const v = if calleeIsCapture(c.callFn) { bundleCaptureRead(b, c.callFn) } else { holderRecordOf(b, c.callFn) }
   if ibMiss != "" { return missRhs("holder callee") }
   const crep = repNodeOfTy(pk.bpTy)
   if !(repNodeAt(crep) is RClosure) { return missRhs("holder member rep") }
@@ -8835,7 +8892,7 @@ function unionConcreteEq(
   }
   const orn = repNodeAt(irBOpRep(o))
   // Off the null leg a `boolean | null` operand is its niche's i32, which no bool payload's 2 equals.
-  const want = if nul { if k == 2 { strNullable(irBOpRep(o)) } else { boolNullable(irBOpRep(o)) } } else if wt >= 0 { irBOpRep(o) == repNodeOfTy(wt) } else if k == 11 { orn is RClosure } else if lwh >= 0 { orn is RList } else if k == 2 { repPrim(irBOpRep(o)) == "str" } else if k == 1 { irBOpRep(o) == ibBool || boolNullable(irBOpRep(o)) } else { repPrim(irBOpRep(o)) == "i32" }
+  const want = if nul { if np.unLeg == 1 { atomNullable(irBOpRep(o)) } else if k == 2 { strNullable(irBOpRep(o)) } else { boolNullable(irBOpRep(o)) } } else if wt >= 0 { irBOpRep(o) == repNodeOfTy(wt) } else if k == 11 { orn is RClosure } else if lwh >= 0 { orn is RList } else if k == 2 { repPrim(irBOpRep(o)) == "str" } else if k == 1 { irBOpRep(o) == ibBool || boolNullable(irBOpRep(o)) } else { repPrim(irBOpRep(o)) == "i32" }
   if !want { return irBMiss("union compare operand rep") }
   const readAgain = again && !stash
   return irBLetTemp(
@@ -8997,13 +9054,13 @@ function nulTest(
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
 }
 
-// The operand of null test arm `arm` over `ref`: a box's tag test reads the box legacy compares,
-// a union-box global narrowed to a rep that is no box as its cell stores it, and any other read
-// at its cell, a read narrowed past one of the box's members included.
+// The operand of null test arm `arm` over `ref`: a box's tag test reads the box legacy compares, a
+// union-box global narrowed to a rep that is no box as its cell stores it, a binding holding a
+// returned record (`globalHolderTy`) as its nullable cell, and any other read at its cell.
 function nulTestOperand(b: i32[], arm: NulTestArm, ref: i32): Opnd {
   const r = unwrapParen(ref)
   if (
-    arm == "boxTag"
+    (arm == "boxTag" || arm == "nullRef")
     && r >= 0
     && r < P.nodes.length
     && nodeAt(r) is Ident
@@ -9014,12 +9071,28 @@ function nulTestOperand(b: i32[], arm: NulTestArm, ref: i32): Opnd {
     const cr = globalRep(g, d)
     const st = heldTy(letBindTy(d, -1))
     if (
-      cr >= 0
+      arm == "boxTag"
+      && cr >= 0
       && heldAsBox(cr)
       && !heldAsBox(exprRepOf(r))
       && cr == globalTyRep(st)
     ) {
       return globalStoredRead(b, g, r, cr, st)
+    }
+    const ht = if arm == "nullRef" && cr >= 0 { globalHolderTy(d) } else { -1 }
+    // The cell holds the record, or `null` beside it where the binding's value is a map read.
+    const cn = repNodeAt(cr)
+    const hr = if ht >= 0 { repNodeOfTy(ht) } else { -1 }
+    const held = hr >= 0 && (hr == cr || cn is RNullable && cn.rnInner == hr)
+    if held && refNullable(cr) && exprRepOf(r) != cr {
+      globalHeldNote(g)
+      return globalStoredRead(
+        b,
+        g,
+        r,
+        cr,
+        if hr == cr { ht } else { repTyOf(cr) },
+      )
     }
   }
   return if arm == "boxTag" { exprAt(b, ref, true) } else { irBExpr(b, ref) }
@@ -9939,8 +10012,11 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   if boxOut != heldAsBox(rep) { return irBMiss("coalesce box result rep") }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
-  // Its value stays on the stack from here, so no temp an operand before it built may wait.
-  if endsInTemp(b) { return irBMiss("coalesce box after an operand") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait,
+  // unless the lowering writes that temp below the tag test (`coalArmStagesLeads`).
+  if endsInTemp(b) && !coalArmStagesLeads(arm) {
+    return irBMiss("coalesce box after an operand")
+  }
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
   if !heldAsBox(irBOpRep(l)) { return irBMiss("coalesce box operand rep") }
@@ -11012,20 +11088,23 @@ function tagCallee(b: i32[], f: i32): Opnd {
     const fe = fnStmtsPosOf(ibFnIx)
     const cr = capRepOf(fe, n.identName)
     const d = identDeclOf(f)
-    if (
-      cr >= 0
-      && cr != exprRepOf(f)
-      && !cloLifted(fe)
-      && d >= 0
-      && nodeAt(d) is LetDecl
-    ) {
-      return irBLetTempTy(
-        b,
-        { evSlot: captureSlotOf(n.identName, ibFnIx), evAt: f },
-        f,
-        cr,
-        heldTy(letBindTy(d, -1)),
-      )
+    if cr >= 0 && cr != exprRepOf(f) && d >= 0 && nodeAt(d) is LetDecl {
+      const ty = heldTy(letBindTy(d, -1))
+      if !cloLifted(fe) {
+        return irBLetTempTy(
+          b,
+          { evSlot: captureSlotOf(n.identName, ibFnIx), evAt: f },
+          f,
+          cr,
+          ty,
+        )
+      }
+      // A lifted function holds the id as its own parameter after its environment.
+      const v = liftCapVarAt(fe, n.identName, cr, ty)
+      if v < 0 || ib.irVars[v].vRep != cr { return irBMiss("capture binding") }
+      ib.irReadVar[f] = v
+      const o: Opnd = { ov: v }
+      return o
     }
   }
   return irBExpr(b, f)
@@ -13042,13 +13121,52 @@ function blockCut(b: i32[]): boolean {
   return n is STrap && n.tpWhy == TRAP_BLOCK_CUT
 }
 
+// Notes global `g` held whole as its record (`irGlobalHeld`), as `globalRep` notes a holder's cell.
+function globalHeldNote(g: i32) {
+  if g < 0 { return 0 }
+  ib.irGlobalHeld[g] = true
+  return 0
+}
+
+// The record a bundle holder `f` holds, which a pick reads a member of: a global holding it beside
+// `null` (a map read) is read narrowed to the record, its recover legacy's `ref.as_non_null`.
+function holderRecordOf(b: i32[], f: i32): Opnd {
+  const r = unwrapParen(f)
+  if r >= 0 && r < P.nodes.length && nodeAt(r) is Ident && globalTarget(r) {
+    const d = identDeclOf(r)
+    const g = globalIndexOfSid(sidOfNode(r))
+    const cr = globalRep(g, d)
+    const ht = globalHolderTy(d)
+    const hr = if ht >= 0 { repNodeOfTy(ht) } else { -1 }
+    const cn = repNodeAt(cr)
+    if (
+      hr >= 0
+      && cn is RNullable
+      && cn.rnInner == hr
+      && repNodeAt(hr) is RRecord
+    ) {
+      const gm = irGlobalReadMiss(g, ibGlobalCtx())
+      if gm != "" { return irBMiss(gm) }
+      const gr: Rhs = {
+        ggSym: g,
+        ggNonNull: globalReadRecovers(sidOfNode(r), r, ibFnIx),
+        ggNn: 0,
+      }
+      ib.irReadAgain[r] = gr
+      globalHeldNote(g)
+      return irBLetTempTy(b, gr, r, hr, ht)
+    }
+  }
+  return irBExpr(b, f)
+}
+
 // `let` `ix` (variable `v`) initialised with a bundle holder's read: the holder's record, then the
 // member the binding's type names (`RHolderPick`), at the binding's rep and type.
 function holderPickLet(b: i32[], n: LetDecl, ix: i32, v: i32): i32 {
   if !(repNodeAt(ib.irVars[v].vRep) is RClosure) {
     return skip("holder pick binding rep")
   }
-  const rec = exprAt(b, n.letInit, false)
+  const rec = holderRecordOf(b, n.letInit)
   if ibMiss != "" { return 0 }
   if !(repNodeAt(irBOpRep(rec)) is RRecord) {
     return skip("holder pick record")
@@ -14124,6 +14242,20 @@ function unrelatedMapControl() {
   return 0
 }
 
+// The operand re-read's failing control (`irShadowCorrupt(8)`): a union compare off the null leg
+// marked as reading its operand again, which the verifier must refuse.
+function otherAgainControl() {
+  for n in ib.irNodes {
+    if !(n is SLet) { continue }
+    const r = n.lRhs
+    if r is RUnionConcreteEq && !r.ucNul {
+      r.ucOtherAgain = true
+      return 0
+    }
+  }
+  return 0
+}
+
 // The inner rep of nullable rep `r`, or -1.
 function repOfNulInner(r: i32): i32 {
   const n = repNodeAt(r)
@@ -14133,6 +14265,7 @@ function repOfNulInner(r: i32): i32 {
 // The failing control: breaks `ib` in the way `ibCorrupt` names.
 function corrupt() {
   if ibCorrupt == 7 { unrelatedMapControl() }
+  if ibCorrupt == 8 { otherAgainControl() }
   if ibCorrupt == 1 && ib.irVars.length > 0 {
     const v = ib.irVars[0]
     const other = if repPrim(v.vRep) == "bool" { repNodeOfTy(TY_I32) } else { ibBool }

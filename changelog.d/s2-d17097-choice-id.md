@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **D17097, D17098 closed:** a choice of un-annotated functions called through an open parameter, and handed to a parameter whose function type admits each member's result, runs. This covers handing it directly (`useK(g)`, `useK2(7, g)`, a `K | null` parameter) and through a generic identity (`useK(id(g))`, `id(id(g))`, `fst(g, 1)`). The check now decides such a set and builds its adapter where it used to be left to the decision after the elaboration. The elaboration also keeps a tagged set handed to a bare type parameter at the set, as the monomorphizer pins it. Neighbours filed: D17099, D17100, D17101.
