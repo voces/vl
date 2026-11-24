@@ -227,6 +227,7 @@ import {
   ObjLitArm,
   PrintArm,
   StructFieldArm,
+  UnionEqNulPlan,
   VariantFieldArm,
   VariantIsArm,
   VariantRowArm,
@@ -8145,6 +8146,116 @@ function unionSideOf(ix: i32): boolean {
   return heldAsBox(repNodeOfTy(nodeTyAt(ix, ibFnIx)))
 }
 
+// A union compare on the null legs with a side that is no place, as legacy stages it: the level
+// opened, an operand left of a staged box parked first, a staged box parked, then the legs over
+// the rest (`unionNulEq`).
+function unionNulStagedEq(
+  b: i32[],
+  n: BinExpr,
+  boxIx: i32,
+  otherIx: i32,
+  np: UnionEqNulPlan,
+  ix: i32,
+  rep: i32,
+  swap: boolean,
+): Opnd {
+  if rep != ibBool { return irBMiss("union compare rep") }
+  const leg = np.unLeg
+  const boxSt = np.unBoxStaged
+  const opSt = np.unOpStaged
+  const opFirst = swap && boxSt && opSt
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  const k = np.unPlan.uqKind
+  let st = 0
+  if boxSt { st = st + 1 }
+  if opSt { st = st + 2 }
+  if opFirst { st = st + 4 }
+  irBNode(
+    b,
+    { efRhs: { usOp: 4, usV: none, usKind: st & 1, usAt: ix } },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  // The legs read the operand ahead of a box that is not parked, so it is built first.
+  let o = none
+  if opFirst || !boxSt {
+    o = nulLegOperand(b, otherIx, leg)
+    if ibMiss != "" { return o }
+  }
+  if opFirst {
+    irBNode(
+      b,
+      { efRhs: { usOp: 5, usV: o, usKind: leg, usAt: ix } },
+      -1,
+      ibNoValue,
+      ix,
+    )
+  }
+  const bx = irBExpr(b, boxIx)
+  if ibMiss != "" { return bx }
+  if !heldAsBox(irBOpRep(bx)) { return irBMiss("union staged compare box") }
+  let again = false
+  if boxSt {
+    irBNode(
+      b,
+      { efRhs: { usOp: 6, usV: bx, usKind: k, usAt: ix } },
+      -1,
+      ibNoValue,
+      ix,
+    )
+  } else if !(bx is OVar) || bx.ov < 0 || bx.ov >= ib.irVars.length {
+    return irBMiss("union compare box")
+  } else if ib.irVars[bx.ov].vKind == "temp" {
+    if !recvReadsAgain(unwrapParen(boxIx)) {
+      return irBMiss("union compare box")
+    }
+    again = true
+  }
+  if boxSt && !opFirst {
+    o = nulLegOperand(b, otherIx, leg)
+    if ibMiss != "" { return o }
+  }
+  if !opFirst {
+    const place = o is OVar
+      && o.ov >= 0
+      && o.ov < ib.irVars.length
+      && ib.irVars[o.ov].vKind != "temp"
+    if !opSt && !place { return irBMiss("union compare null operand") }
+  }
+  let bOp = bx
+  if boxSt { bOp = none }
+  let oOp = o
+  if opFirst { oOp = none }
+  return irBLetTemp(
+    b,
+    {
+      ucBox: bOp,
+      ucOther: oOp,
+      ucNe: n.binOp == "!=",
+      ucSwap: swap,
+      ucStash: false,
+      ucNul: true,
+      ucAgain: again,
+      ucStage: st,
+      ucAt: ix,
+    },
+    ix,
+    rep,
+  )
+}
+
+// The null legs' operand at leg `leg`, at the rep its null test reads (1 a `K | null` id, 2 the
+// `boolean | null` niche, 3 a nullable string).
+function nulLegOperand(b: i32[], otherIx: i32, leg: i32): Opnd {
+  const o = irBExpr(b, otherIx)
+  if ibMiss != "" { return o }
+  const r = irBOpRep(o)
+  const ok = if leg == 1 { atomNullable(r) } else if leg == 2 { boolNullable(r) } else { strNullable(r) }
+  if !ok { return irBMiss("union compare null operand rep") }
+  return o
+}
+
 // A union box against a concrete operand (`eqRouteOf`'s `unionLeft`/`unionRight`, `swap` the
 // latter) on legacy's plain plan: the box a variable read twice, the operand at the arm's rep.
 // A union compare whose operand has effects, as `emitUnionEqStaged` writes it: its level opened,
@@ -8344,6 +8455,10 @@ function unionConcreteEq(
   const nulBox = if qp0.uqKind < 0 { boxIx } else { -1 }
   const np = unionEqNulPlanOf(nulBox, otherIx, ibFnIx)
   const nul = np.unLeg > 0
+  // A side of the null legs that is no place is parked once, as legacy stages it (D17065).
+  if nul && (np.unBoxStaged || np.unOpStaged) {
+    return unionNulStagedEq(b, n, boxIx, otherIx, np, ix, rep, swap)
+  }
   const stash = qp0.uqKind < 0 && !nul
   let qp = qp0
   if nul { qp = np.unPlan }
@@ -8420,6 +8535,7 @@ function unionConcreteEq(
       ucStash: stash,
       ucNul: nul,
       ucAgain: readAgain,
+      ucStage: 0,
       ucAt: ix,
     },
     ix,
