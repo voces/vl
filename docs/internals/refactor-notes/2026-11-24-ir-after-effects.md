@@ -34,3 +34,13 @@ constant default, and an argument, return, `let` or list-element consumer, match
 read the call trace for `n() ?? g()`, a compare's left, a call receiver, a tail return, a chain and
 a global initializer. `u?.tags ?? g()` is a loud emit reject on master, filed as D17422 and out of
 this change.
+
+## The same walk at a `null` cell's store (D17220; unfiled: D17220)
+
+An assignment into a `null` cell is written by legacy's `nulnone` store (the local arm and D1576's
+global twin) as `emitNulNoneForEffect(rhs)` and then `ref.null none`. The IR's `assignToGo`
+delivered the value itself: `local.set 0 (call $same …)` against legacy's
+`drop (call $same …); local.set 0 (ref.null none)`. `storeValue` now builds a `null` cell's value as
+`nulNoneEffect` in its drop form, then `RNullOf` of the bottom null. The store reads the value at
+once, so no `RAfterEffects` is needed. A `let` initializer already did this (`letIsNulNone`).
+Matrix cells `null_cell_*`: a global and a local store of a call, a field read and a `??`.
