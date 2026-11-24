@@ -28,7 +28,19 @@ Swapping either expected rule reds the shadow suite.
 
 ## Readings
 
-READINGS
+Master 4435b3e3 → head, fixpoint seeds:
+- ir-i8 census `capture binding`: tests/cases 5 → 3 functions, distilled 0 → 0, witnesses
+  2 → 2; no claimed function lost in any population. The three left are D16789's nested callback
+  captures and the two witnesses D16789's and D17084's.
+- Identity: names 9,433, cases 7,762 and claimless 14,453 identical, 0 differ; A/B 7,824 same.
+- L2 self-compile fuel: +0.02% on the base's own L2; the head seed on the base tree, +0.0000002%.
+
+The Q58 sweep (`tests/ir-shadow-rows/capture-atom-cell-positions.vl`,
+`capture-tag-adapter-positions.vl`) reads the captured atom at nine string positions and
+interpolation, and delivers the choice to a closed function type at a binding, an `if` arm, a
+field and a return. Every claimed position matches and prints as claimless. It found two rows on
+master in the choice family: [D17097](../inventory/D17097.md), the choice handed through a
+generic (invalid wasm), and [D17098](../inventory/D17098.md), the direct argument refused.
 
 ## Legacy tails the IR calls
 
