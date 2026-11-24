@@ -1745,6 +1745,8 @@ Deno.test({
       "coal-atom-str-default-off-rep": 2,
       "atom-decode-nullable-into-string": 2,
       "atom-decode-nullable-into-nullable-string": 0,
+      "nullable-records-compared-nullable": 0,
+      "plain-records-compared-nullable": 2,
       "captured-atom-param-decoded-at-string": 0,
       "captured-atom-param-typed-as-string": 3,
       "opt-read-of-i32": 2,
