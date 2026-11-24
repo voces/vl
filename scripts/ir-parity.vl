@@ -1,14 +1,14 @@
-// Behavioural parity of the IR: each program is built twice from one tree, by the shipped seed
-// (IR on) and by its `CLAIMED`-empty twin (IR off, `ir-identity.sh --build-claimless`), and both
-// modules are run; stdout, exit code and trap message must agree.
+// Behavioural parity of the IR: each program is built by the shipped seed (IR on) and by its
+// `CLAIMED`-empty twin (IR off, `ir-identity.sh --build-claimless`); both run and must agree.
 //
-//     vl run scripts/ir-parity.vl -- [--seed P] [--claimless P] [--pop cells,cases,probes|refusals]
-//         [--files F...] [--from LIST] [--out F] [--run-all] [--behaviour-only]
+//     vl run scripts/ir-parity.vl -- [--seed P] [--claimless P] [--pop cells,cases,probes,pins|
+//         refusals] [--sample N] [--files F...] [--from LIST] [--out F] [--run-all] [--cross]
 //
-// Rows are `program\tverdict\tdetail`, one per program, in `--out` (default
-// `build/ir-parity.tsv`). Byte-identical modules are `same` unrun unless `--run-all`. Exit 1 on a
-// `differs`, a one-sided `build-fails`, or a byte differ `ir-divergence-baseline.txt` does not list
-// (`--behaviour-only` passes that one); exit 3 on a timeout. `$JOBS` chunks at a time (default 4).
+// Rows `program\tverdict\tdetail` go to `--out` (default `build/ir-parity.tsv`); byte-identical
+// modules are `same` unrun unless `--run-all`. Exit 1 on a `differs`, a one-sided `build-fails` or
+// an unlisted byte differ (`ir-divergence-baseline.txt`; `--behaviour-only` passes it), and with
+// `--cross` only where IR on fails to build or runs otherwise where IR off ran clean; 3 on a
+// timeout. `--sample N` keeps a fixed 1-in-N of `cases`. `$JOBS` chunks at once (default 4).
 // Run it from the checkout root.
 
 import { programArgs } from "std:args"
@@ -34,6 +34,7 @@ import {
   writeText,
 } from "./lib/corpus"
 import { norm } from "./lib/census-grade"
+import { fnvFeed } from "./lib/witness-cache"
 
 const SELF = "scripts/ir-parity.vl"
 const BASELINE = "scripts/ir-divergence-baseline.txt"
@@ -92,6 +93,15 @@ function casesPop(): string[] {
   return out
 }
 
+// The pinned position sweeps (Q58) and shadow-row programs under `tests/ir-shadow-rows`.
+function pinsPop(): string[] {
+  const out: string[] = []
+  for n in cellsIn("tests/ir-shadow-rows") {
+    out.push("tests/ir-shadow-rows/" + n + ".vl")
+  }
+  return out
+}
+
 function probesPop(): string[] {
   const out: string[] = []
   for n in cellsIn("scripts/capability-probes") {
@@ -138,6 +148,18 @@ function refusalsPop(seed: string, tmp: string): string[] {
   return out
 }
 
+// `--sample N`: the files whose path hashes to 0 mod `n` (FNV-1a), so the subset is fixed for a
+// file and a new file joins or not without moving the others. `n` below 2 keeps every file.
+function sampled(files: string[], n: i32): string[] {
+  if n < 2 { return files }
+  const out: string[] = []
+  for f in files {
+    const r = fnvFeed(-3750763034362895579, f.bytes()) % (n as i64)
+    if r == 0 { out.push(f) }
+  }
+  return out
+}
+
 function population(
   args: readonly string[],
   seed: string,
@@ -161,14 +183,16 @@ function population(
     if p == "cells" {
       got = cellsPop()
     } else if p == "cases" {
-      got = casesPop()
+      got = sampled(casesPop(), parseI32(argOr(args, "--sample", "1")) ?? 1)
     } else if p == "probes" {
       got = probesPop()
+    } else if p == "pins" {
+      got = pinsPop()
     } else if p == "refusals" {
       got = refusalsPop(seed, tmp)
     } else {
       die(
-        "ir-parity: --pop takes cells, cases, probes and refusals, not \{p}",
+        "ir-parity: --pop takes cells, cases, probes, pins and refusals, not \{p}",
         2,
       )
     }
@@ -323,7 +347,9 @@ function parity(c: Ctx, f: string, k: string): string {
   }
   if ra.how != rb.how { parts.push(clean(ra.how) + " vs " + clean(rb.how)) }
   if ra.out != rb.out { parts.push(clean(firstDiff(ra.out, rb.out))) }
-  if parts.length > 0 { return "differs\t" + join(parts, "; ") }
+  // `off runs`: claimless ran clean, so the shipped side is the worse one (`--cross` reds on it).
+  const lead = if rb.rc == 0 && rb.how == "ok" { "off runs; " } else { "" }
+  if parts.length > 0 { return "differs\t" + lead + join(parts, "; ") }
   const how = if ra.how == "ok" { "" } else { ", " + clean(ra.how) }
   if ident { return "same\tbytes, ran" + how }
   return "same\tbehaviour" + how
@@ -400,6 +426,27 @@ function main(args: readonly string[]) {
       die("ir-parity: cannot build the claimless compiler\n\{b.out}\{b.err}", 2)
     }
   }
+  // Each compiler's compiled form is cached on first use, untimed here: a cold first use costs
+  // about 15 s wall, and under load the workers' 60 s build timeout killed every cold compile
+  // before it was stored, so every build compiled cold again and timed out.
+  writeText(tmp + "/warm.vl", "print(1)\n")
+  for c in [seed, off] {
+    const h = spawn(
+      vl,
+      [
+        "build",
+        tmp + "/warm.vl",
+        "--compiler",
+        c,
+        "-o",
+        tmp + "/warm.wasm",
+      ],
+    )
+    if h.code != 0 {
+      spawn("rm", ["-rf", tmp])
+      die("ir-parity: cannot warm the compiler \{c}\n\{h.out}\{h.err}", 2)
+    }
+  }
   const worker = tmp + "/worker.wasm"
   const w = spawn(
     vl,
@@ -463,6 +510,7 @@ function main(args: readonly string[]) {
   sort(rows, (a: string, b: string) => a < b)
   const base = listed(BASELINE)
   const loose = hasFlag(args, "--behaviour-only")
+  const cross = hasFlag(args, "--cross")
   const n: Map<string, i32> = Map()
   let red = false
   let slow = false
@@ -478,11 +526,22 @@ function main(args: readonly string[]) {
       } else {
         d = d + ", unlisted divergence"
         count(n, "unlisted divergence")
-        if !loose { red = true }
+        if !loose && !cross { red = true }
       }
     }
     count(n, v)
-    if v == "differs" || v == "build-fails(on)" || v == "build-fails(off)" {
+    if cross {
+      if (
+        v == "build-fails(on)"
+        || v == "differs" && startsWith(d, "off runs; ")
+      ) {
+        red = true
+      }
+    } else if (
+      v == "differs"
+      || v == "build-fails(on)"
+      || v == "build-fails(off)"
+    ) {
       red = true
     }
     if startsWith(v, "timeout") { slow = true }
