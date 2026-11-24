@@ -27,7 +27,22 @@ result's rep and type at that row. A struct literal among its fields at another 
 
 ## Readings
 
-READINGS
+Fixpoint seeds both sides; each census arm in a tree at its own commit (base master `864119c9`).
+
+- Census: 0 claimed functions lost in self, cases, distilled, probes or witnesses. `return
+  coercion` misses: distilled 2 → 1 (`d15214_plain_inner` claimed; `d15293` left), cases 4 → 5 and
+  witnesses 2 → 3 (the committed nested-twin cell and D17385's witness, both the named miss).
+- The matrix (`tests/cases/functions/return-literal-twin-*.vl`, 13 files): `record` and `generic`
+  move from `return coercion` to matched; `nested` is the named miss; `map`, `closure`, `list`,
+  `in-list` and every `: K`-annotated control are unchanged. Claimless-identical, `identical 13`;
+  `cmp` and `wasm-dis` identical, claimed against legacy, on `record`, `generic` and `nested`.
+- A returned literal at another row than the result's takes the existing path, unchanged
+  (`maps/wider-record-fn-result-set-with-own-record-declared.vl` and its sibling stay matched).
+- Identity: names `identical 9433, differ 0`, self-compile identical; cases `identical 8128,
+  differ 0`; claimless `identical 14502, differ 0` (claimless compiler sha256 `2e06ea2d…921a`,
+  built in `fe4da73d`, `compiler/` clean); legacy A/B `8195 same`, empty.
+- The compiler diff is `ir_build.vl` alone; no legacy file moves.
+- Fuel: per PR −0.00%; the pair is L2 128574676074 against base 128598744269.
 
 ## Legacy tails the IR calls
 
