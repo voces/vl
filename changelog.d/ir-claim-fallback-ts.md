@@ -1,0 +1,3 @@
+## Infrastructure (Track F)
+
+- **The TS hosts take the claims-off fallback too:** the LSP's `compile` (the playground's Run path) and the V8 corpus oracle compile a claimed module the engine refuses again with IR claims off (`lsp/src/claimFallback.ts`). The LSP answers with legacy's refusal, or with legacy's bytes and the warning "IR claim produced an invalid module; used the legacy emitter". The oracle is strict, as a gate: legacy's refusal stands, and a module legacy builds is an error naming the claim. `vl check --codegen` (the CLI pump, which `selfhost_native_align_test.ts` grades `@emit-error` through) still reports the claimed module invalid, and follows separately.
