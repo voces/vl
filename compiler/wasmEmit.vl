@@ -8491,9 +8491,19 @@ export function emitNicheReadTail(exprIx: i32, ak: i32, fnIx: i32) {
   if ak == 1 {
     fbIf(127) // 0x04 if, 0x7f i32 result blocktype
     fbI32Const(2) // the null sentinel
-  } else {
+  } else if ak == 2 {
     fbIfRefNul(sTy(), true) // if (result (ref null $sTypeIdx))
     fbRefNull(sTy())
+  } else {
+    // A list's niche is its nullable wrapper; `emitUnionUnboxTail` casts the payload to it.
+    const lw = listWrapHeapOfKind(ak)
+    if lw < 0 {
+      return emitFail(
+        "emitProgram: a nullable list read out of a box has no wrapper",
+      )
+    }
+    fbIfRefNul(lw, true)
+    fbRefNull(lw)
   }
   fbElse()
   fbLocalGet(st)
@@ -10876,6 +10886,8 @@ export type UnionEqNulPlan = {
   unPlan: UnionEqPlan,
   unLeg: i32,
   unBoxNul: boolean,
+  unBoxStaged: boolean,
+  unOpStaged: boolean,
 }
 
 // The null-leg plan of box `boxIx` against `otherIx`; `unLeg` 0 where another arm writes it.
@@ -10885,8 +10897,14 @@ export function unionEqNulPlanOf(
   fnIx: i32,
 ): UnionEqNulPlan {
   const none: UnionEqPlan = { uqKind: -1, uqTag: -1 }
-  const no: UnionEqNulPlan = { unPlan: none, unLeg: 0, unBoxNul: false }
-  if !unionEqOperandOk(boxIx) || !unionEqOperandOk(otherIx) { return no }
+  const no: UnionEqNulPlan = {
+    unPlan: none,
+    unLeg: 0,
+    unBoxNul: false,
+    unBoxStaged: false,
+    unOpStaged: false,
+  }
+  if boxIx < 0 || otherIx < 0 { return no }
   const unr: i32[] = []
   const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
   const usid = msSetOfUnionBox(boxIx, fnIx)
@@ -10898,13 +10916,22 @@ export function unionEqNulPlanOf(
   if !hasArm { return no }
   const nul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
   const boxNul = unionSetHasNullTy(uname, bty)
+  const opStaged = !unionEqOperandOk(otherIx)
   let leg = 0
   if eak == 2 && nul && !exprNulLitUnion(otherIx, fnIx) { leg = 3 }
   if eak == 1 && nul && boxNul { leg = 2 }
+  // A `K | null` operand is decoded from its slot, so only a staged one (D17066).
+  if eak == 2 && exprNulLitUnion(otherIx, fnIx) && opStaged { leg = 1 }
   if leg == 0 { return no }
   const tag = unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], fnIx))
   const p: UnionEqPlan = { uqKind: eak, uqTag: tag }
-  return { unPlan: p, unLeg: leg, unBoxNul: boxNul }
+  return {
+    unPlan: p,
+    unLeg: leg,
+    unBoxNul: boxNul,
+    unBoxStaged: !unionEqOperandOk(boxIx),
+    unOpStaged: opStaged,
+  }
 }
 
 // After a null-leg operand: its null test at leg `leg` (1 a `K | null` id, 2 the `boolean | null`
@@ -11106,9 +11133,9 @@ function emitUnionConcreteEq(
     )
   }
   // The slots of this nesting level, so a compare inside a staged side takes its own (D17068).
-  const lvl = unionEqStageDepth * 100000
-  const bs = if staged { unionEqOperandSlot(lvl + 6) } else { -1 }
-  unionEqStageDepth = unionEqStageDepth + 1
+  unionEqNulStageOpen(staged)
+  const lvl = (unionEqStageDepth - 1) * 100000
+  const bs = if staged { unionEqNulBoxSlot() } else { -1 }
   // An operand left of a staged box is read first, into its slot (D17068).
   const opFirst = !boxLeft && staged && (opStage || boolStage || atomStage)
   if opFirst {
@@ -11164,9 +11191,7 @@ function emitUnionConcreteEq(
     fbLocalGet(unionEqOperandSlot(lvl + 1))
   } else if atomStage {
     fbLocalGet(unionEqOperandSlot(lvl + 1))
-    if atomStrTail(atomStrPlanOf(otherIx, fnIx, otherIx == coerceHeld)) < 0 {
-      return -1
-    }
+    if unionEqAtomOperandTail(otherIx, fnIx) < 0 { return -1 }
   } else if emitUnionEqOther(otherIx, eak, fnIx) < 0 {
     return -1
   }
@@ -11186,6 +11211,30 @@ function emitUnionConcreteEq(
 }
 
 let unionEqStageDepth = 0
+
+// Opens the null legs' level: its box slot where the box is staged, then one level deeper.
+export function unionEqNulStageOpen(staged: boolean): i32 {
+  const lvl = unionEqStageDepth * 100000
+  if staged { unionEqOperandSlot(lvl + 6) }
+  unionEqStageDepth = unionEqStageDepth + 1
+  return 0
+}
+
+// The open null-leg level's operand slot for leg `leg` (3 a string ref, else an i32).
+export function unionEqNulOpSlot(leg: i32): i32 {
+  const key = if leg == 3 { 0 } else { 1 }
+  return unionEqOperandSlot((unionEqStageDepth - 1) * 100000 + key)
+}
+
+// The open null-leg level's box slot.
+export function unionEqNulBoxSlot(): i32 {
+  return unionEqOperandSlot((unionEqStageDepth - 1) * 100000 + 6)
+}
+
+// After a `K | null` operand's id read back: its decode to the member string (D17066).
+export function unionEqAtomOperandTail(otherIx: i32, fnIx: i32): i32 {
+  return atomStrTail(atomStrPlanOf(otherIx, fnIx, otherIx == coerceHeld))
+}
 
 // A union `==` on plan `qp` whose operand has effects: the box and the operand each read once into
 // a slot of this nesting level, `boxLeft` first where the box is the left side, then the plan's tails.
@@ -29739,6 +29788,7 @@ export function callRefArgPlain(
     || arm == "widenF32"
     || arm == "box"
     || arm == "atom"
+    || arm == "atomToStr"
   ) {
     return true
   }
@@ -29746,8 +29796,13 @@ export function callRefArgPlain(
   if arm == "armUnbox" {
     return callRefArmUnboxPlan(ckey, i, a, fnIx) != "crossTag"
   }
+  // A nullable scalar list parameter takes the list as it is, nullable or not: the non-null
+  // recover writes nothing for it.
   if arm == "scalarList" {
-    return k != null && !isNulScalarListKind(k) && plainListArg(a, fnIx)
+    if k != null && isNulScalarListKind(k) {
+      return !narrowedArmNeedsUnbox(a, fnIx)
+    }
+    return k != null && plainListArg(a, fnIx)
   }
   if arm != "general" { return false }
   if tyIsLitUnion(nodeTyAt(a, fnIx)) { return false }
@@ -41753,13 +41808,13 @@ export function armSiteWrite(
       "emitProgram: a union-of-lists element read has no element union box",
     )
   }
-  const nd = nodeAt(idxIx)
   const outer = idxSpanNode
   idxSpanNode = idxIx
-  // An operand stands for the read's index node; the node itself leaves the writer's state alone.
-  const opnd = ixLocal != ARM_IDX_NODE && nd is Index
-  if opnd && nd is Index {
-    armIdxNode = nd.idxIndex
+  // An operand stands for the read's index or key; the node itself leaves the writer's state alone.
+  const on = armSiteOpndNode(idxIx)
+  const opnd = ixLocal != ARM_IDX_NODE && on >= 0
+  if opnd {
+    armIdxNode = on
     armIdxLocal = ixLocal
     armIdxImm = ixImm
   }
@@ -41767,6 +41822,19 @@ export function armSiteWrite(
   if opnd { armIdxNode = -1 }
   idxSpanNode = outer
   return r
+}
+
+// The child of arm-site read `site` its operand stands for: an index or a `.has` / `.get` key, -1
+// for a `.length`.
+export function armSiteOpndNode(site: i32): i32 {
+  if site < 0 || site >= P.nodes.length { return -1 }
+  const n = nodeAt(site)
+  return match n {
+    Index => n.idxIndex
+    Call => if n.callArgs.length == 1 { n.callArgs[0] } else { -1 }
+    // A `.length` has no operand, and no other node is an arm-site read (`armSiteRecv`).
+    Member | NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => -1
+  }
 }
 
 // The index node an `armSiteWrite` operand stands for, and that operand; -1 outside one.

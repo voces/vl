@@ -2,7 +2,7 @@
 
 | Mechanism | Change | blocker class, tests/cases functions, before → after |
 |---|---|---|
-| narrowed read | `nulTest`'s `boxTag` arm reads its operand at its cell (`exprAt`), and `narrowedLocalRead` returns a seated read of a box cell on the plain `local` arm as it stands (`heldAsBox`), as legacy's D3172 desugar of `x ?? d` tests and copies the box | `narrowed read` 21 → 14 |
+| narrowed read | `nulTestOperand`'s `boxTag` arm reads any operand but #9798's narrowed union-box global at its cell (`exprAt`), and `narrowedLocalRead` returns a seated read of a box cell on the plain `local` arm as it stands (`heldAsBox`), as legacy's D3172 desugar of `x ?? d` tests and copies the box | `narrowed read` 21 → 14 |
 | string atom part route (direction A) | `buildStrBin` refuses only an atom-literal part whose rep is no atom; a part that is not `exprIsLitAtom` is built by `irBExpr` whatever its type's rep, as legacy's `emitStrValue` sends it to `emitExpr`, and the existing `string operand coercion` check still refuses one not built as a string | `string atom part route` 24 → 8; `string operand coercion` 2 → 2 |
 
 Witness: `tests/cases/literal-unions/atom-part-concat-positions.vl`. A literal-union value is
