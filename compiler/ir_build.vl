@@ -10,6 +10,7 @@ import { asExprNumCastDomain } from "./emit_union_casts"
 import { nulAtomWidenTexts } from "./emit_lit_atoms"
 import {
   objLitBuildVariantRow,
+  popRecvIsList,
   rangeConstIs,
   rangeConstVal,
 } from "./emit_plan_list"
@@ -857,6 +858,7 @@ import {
 import { isVoidTy, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
+  listGetIdxReReadable,
   optChainStagesRecv,
   sFieldTgtStructIdx,
   structIndexOfTy,
@@ -6372,9 +6374,10 @@ function inPlaceFrom(b: i32[], at: i32): boolean {
 }
 
 // `inPlaceFrom` less a `??` that writes the temps staged before it below its tag test
-// (`coalArmStagesLeads`), as a valued `if` does.
+// (`coalArmStagesLeads`), as a valued `if` does, and less a literal's order stash, whose fields
+// it sets below them too.
 function inPlaceUnstagedFrom(b: i32[], at: i32): boolean {
-  return coalBoxFrom(b, at, false) || receiverStageFrom(b, at)
+  return coalBoxFrom(b, at, false) || listStageFrom(b, at)
 }
 
 // Whether operands built into `b` from `at` on hold a push receiver's stage, which the lowering
@@ -6873,6 +6876,13 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if m.memProp == "pop" && c.callArgs.length == 0 {
     return popValueRhs(b, m, ix)
   }
+  if (
+    m.memProp == "get"
+    && c.callArgs.length == 1
+    && popRecvIsList(m.memObj, ibFnIx)
+  ) {
+    return getValueRhs(b, c, m, ix)
+  }
   if m.memProp == "has" && c.callArgs.length == 1 && exprMap(m.memObj, ibFnIx) {
     return mapHasRhs(b, m.memObj, c.callArgs[0], ix)
   }
@@ -6906,6 +6916,8 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     op = "charcode"
   } else if exprIsStrMethod(ix, ibFnIx, "cpAt") && c.callArgs.length == 1 {
     op = "cpat"
+  } else if exprIsStrMethod(ix, ibFnIx, "bytes") && c.callArgs.length == 0 {
+    op = "bytes"
   } else if exprIsStrIndexOf(ix, ibFnIx) && c.callArgs.length == 1 {
     op = if m.memProp == "includes" { "includes" } else { "indexof" }
   } else if !exprIsStrMethod(ix, ibFnIx, "slice") {
@@ -7318,7 +7330,27 @@ function popValueRhs(b: i32[], m: Member, ix: i32): Rhs {
   if !(repNodeAt(irBOpRep(v)) is RList) {
     return missRhs("pop operand coercion")
   }
-  const r: Rhs = { lqV: v, lqAt: ix }
+  const r: Rhs = { lqV: v, lqIx: [], lqAt: ix }
+  return r
+}
+
+// A list `.get(i)` on legacy's arm, `.pop`'s body with a bound (`emitPop`): the receiver, then the
+// index, which legacy writes from the call twice, so only an index it re-reads in place is taken.
+function getValueRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  if popAnyPlanOf(ix, ibFnIx) == null { return missRhs("method get") }
+  if !listGetIdxReReadable(c.callArgs[0]) { return missRhs("get index staged") }
+  const v = irBExpr(b, m.memObj)
+  if ibMiss != "" { return missRhs("method operand") }
+  if !(repNodeAt(irBOpRep(v)) is RList) {
+    return missRhs("get operand coercion")
+  }
+  const at = b.length
+  const i = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return missRhs("method operand") }
+  if b.length != at || irBOpRep(i) != repNodeOfTy(TY_I32) {
+    return missRhs("get index operand")
+  }
+  const r: Rhs = { lqV: v, lqIx: [i], lqAt: ix }
   return r
 }
 
@@ -7363,7 +7395,7 @@ function popStmt(b: i32[], c: Call, ix: i32) {
   const v = irBExpr(b, f.memObj)
   if ibMiss != "" { return 0 }
   if !(repNodeAt(irBOpRep(v)) is RList) { return skip("pop operand coercion") }
-  irBNode(b, { efRhs: { lqV: v, lqAt: ix } }, -1, ibNoValue, ix)
+  irBNode(b, { efRhs: { lqV: v, lqIx: [], lqAt: ix } }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -7672,9 +7704,6 @@ function structEqOpAt(
   }
   // A bare record beside a nullable one is legacy's same guard over a non-null side, written
   // with locals the IR does not declare: a named miss until it does.
-  if nul && (!refNullable(irBOpRep(l)) || !refNullable(irBOpRep(r))) {
-    return irBMiss("nullable record eq bare side")
-  }
   return irBLetTemp(
     b,
     {

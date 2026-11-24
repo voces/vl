@@ -51,7 +51,7 @@ export type PrimOp = "add" | "sub" | "mul" | "div" | "divu" | "rem" | "remu" | "
   | "ge" | "geu" | "neg" | "not"
 export type MapOp = "has" | "set" | "delete" | "keys" | "size"
 // `site` joins an append site's chain into its buffer, `soAt` the assignment; `acc` appends
-// the parts after a proven accumulator to it, as a statement.
+// the parts after a proven accumulator to it, as a statement. `bytes` copies into a fresh `u8[]`.
 // `fromcp` builds a string from one i32 code point, `fromcps` from a local i32 list it reads twice.
 // `indexof` and `includes` search the receiver for a string needle; `charcode` reads one unit.
 export type StrOp = "concat"
@@ -70,6 +70,7 @@ export type StrOp = "concat"
   | "includes"
   | "charcode"
   | "cpat"
+  | "bytes"
 export type CastFail = "trap" | "null"
 
 // The right-hand side of an `SLet`; the result rep is its destination's.
@@ -412,9 +413,10 @@ export type RListPushMany = { pmV: Opnd, pmL: Opnd, pmAt: i32 }
 // The receiver `rsgV` of push call `rsgAt`, staged into that push's frame slot ahead of a value
 // that writes a valued `if`; a statement, named by exactly one later push.
 export type RListStage = { rsgV: Opnd, rsgAt: i32 }
-// A `.pop()` statement on list `lqV`, its call `lqAt`: the element is taken and dropped, and an
-// empty list is left as it is. A statement only: as a value a pop is `T | null`.
-export type RListPop = { lqV: Opnd, lqAt: i32 }
+// A `.pop()` on list `lqV`, its call `lqAt`: the element is taken, and an empty list is left as
+// it is. With an index in `lqIx`, a `.get(i)`: the element at `i` read under the bound, the list
+// untouched; legacy writes the index from the call itself, twice (`pushTakeCond`).
+export type RListPop = { lqV: Opnd, lqIx: Opnd[], lqAt: i32 }
 // A `.clear()` statement on list `lkV`, its call `lkAt`: the length is zeroed, the backing kept.
 export type RListClear = { lkV: Opnd, lkAt: i32 }
 // `RMapFilter`'s operands: the list, the callback, then the captures it builds the callback from.
@@ -1754,7 +1756,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListPush => pushOpnds(r)
     RListPushMany => [r.pmV, r.pmL]
     RListStage => [r.rsgV]
-    RListPop => [r.lqV]
+    RListPop => opndsCat([r.lqV], r.lqIx)
     RListClear => [r.lkV]
     RMapFilter => mapFilterOpnds(r)
     RListSlice => opndsCat([r.scV], r.scArgs)
@@ -1890,7 +1892,7 @@ function rhsText(r: Rhs): string {
     RListPush => "push " + pushRecvText(r.lpV) + " " + opndText(r.lpX)
     RListPushMany => "push_many " + opndText(r.pmV) + " " + opndText(r.pmL)
     RListStage => "stage_recv " + opndText(r.rsgV)
-    RListPop => "pop " + opndText(r.lqV)
+    RListPop => if r.lqIx.length == 0 { "pop " + opndText(r.lqV) } else { "get " + opndText(r.lqV) + ", " + opndsText(r.lqIx) }
     RListClear => "clear " + opndText(r.lkV)
     RMapFilter => "mapfilter "
       + opndText(r.hfV)
@@ -2870,9 +2872,8 @@ export function repsLowerAlike(a: i32, b: i32, hs: {[i32]: i32}): boolean {
 }
 
 // Notes in `hs` the struct heap (`recHeapOf`) of each record rep reachable from rep `r`, as the
-// builder's IR fact that `repsLowerAlike` reads.
+// builder's IR fact that `repsLowerAlike` reads. A rep already noted still has its kids walked.
 export function recHeapsNote(hs: {[i32]: i32}, r: i32) {
-  if (hs[r] ?? -1) >= 0 { return 0 }
   const todo: i32[] = [r]
   const seen: {[i32]: boolean} = Map()
   while todo.length > 0 {
