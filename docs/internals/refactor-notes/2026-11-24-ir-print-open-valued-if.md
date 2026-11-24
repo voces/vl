@@ -39,7 +39,28 @@ FREE, from #9869's verify: a map walk whose element is a union value stops at th
 
 ## Readings (fixpoint seeds on both sides, master f080c966)
 
-READINGS
+Each arm measured with `VL_IR_SHADOW=4 vl check --codegen --compiler <that arm's seed>`, the base
+seed built from `git archive f080c966`. Functions with no blocker: tests/cases 82,159 -> 82,179;
+distilled corpus 46,879 -> 46,885. `print nulStr of a valued if`: tests/cases 17 -> 0, corpus 4 -> 0;
+`print nulBool of a valued if`: tests/cases 3 -> 0, corpus 2 -> 0 (all sole). No program loses a
+function.
+
+| program | change |
+| --- | ---: |
+| `generics/hole-join-at-nullable-string-pin.vl` | +5 |
+| `strings/print-nullable-valued-if-opens-before-operand.vl` (new witness) | +5 |
+| `strings/optional-builtin-method-on-nullable-receiver.vl` | +3 |
+| `generics/hole-join-literal-at-literal-union-pin.vl` | +2 |
+| `generics/list-param-join-nullable-element.vl` | +1 |
+| `literal-unions/null-arm-string-join.vl` | +1 |
+| `literal-unions/nullable-atom-string-join-direct.vl` | +1 |
+| `literal-unions/nullable-atom-string-join-generic.vl` | +1 |
+| `literal-unions/nullable-atom-widening-at-two-instances.vl` | +1 |
+| corpus `d3281_join_{hole,tp}_{ABn,Kn}_non_print` | +1 each |
+| corpus `d3469_set_body` | +2 |
+
+The 12 armed tests/cases mismatches (`prefix or locals`, one `stack value read out of order`) are
+the same on both seeds: master's, not this change.
 
 ## Witnesses and the position sweep (Q58)
 
