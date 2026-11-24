@@ -8,4 +8,5 @@ the bytes the IR builds through `deliver`. The decline is removed; nothing repla
 
 New test coverage: `unions/record-join-unboxes-narrowed-arm-in-each-position.vl` regains the record
 parameter (`pParam`) and nested call (`pNested`) positions; `unions/value-if-narrowed-arm-into-record-param.vl`
-(#9878's witness) is fully claimed.
+(#9878's witness) is fully claimed; `unions/value-if-narrowed-arm-into-record-param-nested-and-generic.vl`
+adds the argument through a nested call and through a generic identity.
