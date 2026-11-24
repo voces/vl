@@ -167,6 +167,7 @@ import {
   irSpanNote,
   irSpanNoteKind,
   irVarNew,
+  mapWalkElemRep,
   repNullRefFits,
   sIf,
 } from "./ir"
@@ -238,6 +239,8 @@ import {
   GlobalCtx,
   IntSwitchPlan,
   MapSetValArm,
+  MemAddrPlan,
+  NUL_STRUCT_EQ_NO_ROW,
   ObjLitArm,
   PrintArm,
   StructFieldArm,
@@ -377,13 +380,17 @@ import {
   mapUnboxTailTy,
   memAccessCallNamed,
   memAccessPlanOf,
-  memAddrPlanOf,
+  memAddrPlanWith,
   memCallArg,
+  memConstFoldShapeK,
+  memConstFoldShapeRest,
   memOpCallNamed,
   memOpPlanOf,
+  mfShapeIsSum,
   nulNicheBoxTagOf,
   nulNicheEqWhy,
   nulNoneWritesNothing,
+  nulStructEqRowOf,
   nullReadDstOwnOf,
   numCastKindOf,
   numCastKindTy,
@@ -670,6 +677,7 @@ import {
   storageReadLeave,
 } from "./emit_elab"
 import {
+  mapReadScalarBoxKind,
   narrowedNulLitPinBoxKey,
   nulNicheRecoverOwed,
   retNeedsNonNullRecover,
@@ -678,6 +686,7 @@ import {
   armSiteReads,
   asgReReadEnter,
   asgReReadLeave,
+  asgReadNode,
   asgReadUnwidenOp,
   asgYieldsNullLit,
   boxedFieldUnionTyOf,
@@ -773,6 +782,8 @@ import {
   globalStmtOrd,
   liFrameRestore,
   liFrameSave,
+  localIsRef,
+  maFoldScratchBase,
   monoGen,
   monoInstFe,
   monoInstOrig,
@@ -3219,36 +3230,6 @@ function declVarAt(d: i32, rep: i32, ty: i32): i32 {
 function localVarAt(w: i32): i32 {
   if w < 0 { return -1 }
   return ib.irLocalAt[w] ?? -1
-}
-
-// Whether the shadowed list test at `condIx` (`decidedIsShadowed`) is a pushing arm's, whose grow
-// row (`listFitShadowPlanOf` 2) the region reads.
-function decidedIsGrowShadowed(condIx: i32): boolean {
-  if !decidedIsShadowed(condIx) { return false }
-  let ix = unwrapParen(condIx)
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const c = nodeAt(ix)
-  if c is Unary { ix = unwrapParen(c.unArg) }
-  const p = emptyFitPlanOf(ix, ibFnIx)
-  return p.efArm != "shadow"
-    || listFitShadowPlanOf(ix, p.efRecvTy, p.efDepth, ibFnIx) == 2
-}
-
-// Whether the `is` (or `!is`) at `condIx` is a list test whose plan reads an arm's empty list
-// through a narrowed region's shadow (`emptyFitPlanOf`'s `shadow` arm, or a shadowed row).
-function decidedIsShadowed(condIx: i32): boolean {
-  let ix = unwrapParen(condIx)
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const c = nodeAt(ix)
-  if c is Unary { ix = unwrapParen(c.unArg) }
-  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is IsExpr) { return false }
-  const p = emptyFitPlanOf(ix, ibFnIx)
-  if p.efArm == "shadow" { return true }
-  if p.efArm != "union" { return false }
-  for r in emptyFitArmsPlanOf(ix, ibFnIx, p.efRecvTy).eaRows {
-    if r.erShadow { return true }
-  }
-  return false
 }
 
 // Whether condition `condIx`, built onto `b` from length `at`, is the bare constant `is` legacy's
@@ -6488,7 +6469,7 @@ function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
 // immediate 0) or `rest` arm (its node), then a store's vector. Every other address arm is a miss.
 function simdMemRhs(b: i32[], c: Call, ix: i32, row: i32): Rhs {
   const base = simdMemBase(row)
-  const ap = memAddrPlanOf(c, base, ibFnIx)
+  const ap = irBAddrPlan(c, base)
   const at = b.length
   const args: Opnd[] = []
   match ap.maArm {
@@ -6497,7 +6478,8 @@ function simdMemRhs(b: i32[], c: Call, ix: i32, row: i32): Rhs {
       args.push(z)
     }
     "rest" => args.push(irBExpr(b, ap.maRest))
-    "bad" | "lma" | "fold" | "wide" => {
+    "fold" => args.push(foldAddrRead(b, c))
+    "bad" | "lma" | "wide" => {
       return missRhs("simd memory address " + ap.maArm)
     }
   }
@@ -6863,6 +6845,40 @@ function isPopStmt(c: Call): boolean {
   return f is Member && f.memProp == "pop"
 }
 
+// `print(m[k])` over a scalar-valued map read (`print`'s `mapScalar` arm): the receiver and key,
+// then the probe and its value or `null` (`emitPrintScalarMapRead`).
+function printMapScalar(b: i32[], argIx: i32, ix: i32) {
+  const k = mapReadScalarBoxKind(argIx, ibFnIx)
+  const ai = unwrapParen(argIx)
+  if k < 0 || ai < 0 || ai >= P.nodes.length { return skip("print mapScalar") }
+  const rd = nodeAt(ai)
+  if !(rd is Index) { return skip("print mapScalar node") }
+  const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
+  const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
+  if ka != "plain" && ka != "i64" { return skip("print mapScalar key " + ka) }
+  const rk = mapRecvKeyOf(
+    b,
+    rd.idxArr,
+    rd.idxIndex,
+    "print mapScalar receiver",
+    ka == "i64",
+  )
+  if rk == null { return skip(ibMiss) }
+  const r: Rhs = {
+    mtSym: rk.mkSym,
+    mtNonNull: rk.mkNonNull,
+    mtLoc: rk.mkLoc,
+    mtKey: rk.mkKey,
+    mtAt: ai,
+    mtBox: -1,
+    mtRow: false,
+    mtTrap: false,
+    mtPrint: k,
+  }
+  irBNode(b, { efRhs: r }, -1, ibNoValue, ix)
+  return 0
+}
+
 // Whether call `c` is the `print` builtin, legacy's own arm: one argument, a callee no
 // declaration owns, and no pinned template hole.
 function isPrintStmt(c: Call): boolean {
@@ -6878,6 +6894,7 @@ function isPrintStmt(c: Call): boolean {
 // argument at that arm's rep. Every other arm is a named miss.
 function printStmt(b: i32[], c: Call, ix: i32) {
   const arm = printArmOf(c.callArgs[0], ibFnIx)
+  if arm == "mapScalar" { return printMapScalar(b, c.callArgs[0], ix) }
   const want = printArmRep(arm)
   if want == "" { return skip("print " + arm) }
   // A `K | null` read out of a wider box converts to the niche first, which the IR does not build.
@@ -7503,6 +7520,19 @@ function identityEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // (`structEqStagesLeft`/`Right`) must be a variable, read from its local. A field or index place
 // re-read is a named miss.
 function structEqOp(b: i32[], n: BinExpr, ix: i32, rep: i32, row: i32): Opnd {
+  return structEqOpAt(b, n, ix, rep, row, false)
+}
+
+// `structEqOp`, `nul` the nullable records' guarded compare (`emitNulStructEq`), which reads no
+// operand at a ref list element place.
+function structEqOpAt(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  row: i32,
+  nul: boolean,
+): Opnd {
   if repPrim(rep) != "bool" { return irBMiss("record compare result rep") }
   const lS = structEqStagesLeft(n.binLeft, n.binRight)
   const rS = structEqStagesRight(n.binRight)
@@ -7523,9 +7553,25 @@ function structEqOp(b: i32[], n: BinExpr, ix: i32, rep: i32, row: i32): Opnd {
   const rIx: Opnd[] = []
   if ls.length > 1 { lIx.push(ls[1]) }
   if rs.length > 1 { rIx.push(rs[1]) }
+  if nul && (lIx.length > 0 || rIx.length > 0) {
+    return irBMiss("nullable record eq element place")
+  }
+  // A bare record beside a nullable one is legacy's same guard over a non-null side, written
+  // with locals the IR does not declare: a named miss until it does.
+  if nul && (!refNullable(irBOpRep(l)) || !refNullable(irBOpRep(r))) {
+    return irBMiss("nullable record eq bare side")
+  }
   return irBLetTemp(
     b,
-    { seL: l, seR: r, seAt: ix, seRow: row, seLIx: lIx, seRIx: rIx },
+    {
+      seL: l,
+      seR: r,
+      seAt: ix,
+      seRow: row,
+      seLIx: lIx,
+      seRIx: rIx,
+      seNul: nul,
+    },
     ix,
     rep,
   )
@@ -7630,6 +7676,12 @@ function structEqVarOpnd(o: Opnd): boolean {
 // built again, as legacy writes it again. A nullable record's compare is a named miss.
 function nulNicheEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const why = nulNicheEqWhy(ix, ibFnIx)
+  // Two nullable records compare field-wise under a nullness guard (`emitNulStructEq`).
+  if why == "nullable record eq" {
+    const row = nulStructEqRowOf(ix, ibFnIx)
+    if row == NUL_STRUCT_EQ_NO_ROW { return irBMiss("nullable record eq row") }
+    return structEqOpAt(b, n, ix, rep, row, true)
+  }
   if why != "" { return irBMiss(why) }
   if repPrim(rep) != "bool" { return irBMiss("nullable eq result rep") }
   const l = eqOperandRaw(b, n.binLeft)
@@ -9296,6 +9348,28 @@ function arrNewDefault(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { ldLen: len, ldAt: ix }, ix, rep)
 }
 
+// The address plan of memory call `c` (`base` declared operands) over the fold rows this function
+// has derived (`foldLetAt`), as `memAddrPlanOf` answers it over legacy's own table.
+function irBAddrPlan(c: Call, base: i32): MemAddrPlan {
+  return memAddrPlanWith(
+    c,
+    base,
+    ibFnIx,
+    { mfDecl: ib.irMaDecl, mfSlot: ib.irMaSlot, mfK: ib.irMaK },
+  )
+}
+
+// A `fold` arm's address: the folded binding's own read, which the lowering writes as its fold
+// local at the plan's offset; anything but a local's plain read is a miss.
+function foldAddrRead(b: i32[], c: Call): Opnd {
+  const a = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return a }
+  if !(a is OVar) || a.ov < 0 || ib.irVars[a.ov].vKind != "local" {
+    return irBMiss("memory address fold read")
+  }
+  return a
+}
+
 // A linear-memory load or store of an i32 as legacy's arm writes it (`memAccessPlanOf`): the
 // address along `memAddrPlanOf`'s `const` arm (an immediate 0) or `rest` arm (its node), then a
 // store's value. A widened store value and every other address arm are named misses.
@@ -9307,7 +9381,7 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !(f is Ident) { return missRhs("memory access callee") }
   const p = memAccessPlanOf(f.identName)
   if p.mxOp < 0 || p.mxAlign < 0 { return missRhs("memory access width") }
-  const ap = memAddrPlanOf(c, p.mxBase, ibFnIx)
+  const ap = irBAddrPlan(c, p.mxBase)
   const at = b.length
   const args: Opnd[] = []
   match ap.maArm {
@@ -9316,7 +9390,8 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
       args.push(z)
     }
     "rest" => args.push(irBExpr(b, ap.maRest))
-    "bad" | "lma" | "fold" | "wide" => {
+    "fold" => args.push(foldAddrRead(b, c))
+    "bad" | "lma" | "wide" => {
       return missRhs("memory address " + ap.maArm)
     }
   }
@@ -9361,7 +9436,7 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
     }
     return r
   }
-  const ap = memAddrPlanOf(c, pl.apBase, ibFnIx)
+  const ap = irBAddrPlan(c, pl.apBase)
   const at = b.length
   match ap.maArm {
     "const" => {
@@ -9369,7 +9444,8 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
       args.push(z)
     }
     "rest" => args.push(irBExpr(b, ap.maRest))
-    "bad" | "lma" | "fold" | "wide" => {
+    "fold" => args.push(foldAddrRead(b, c))
+    "bad" | "lma" | "wide" => {
       return missRhs("memory address " + ap.maArm)
     }
   }
@@ -10783,6 +10859,7 @@ function mapGetAt(
     mtBox: box,
     mtRow: row,
     mtTrap: trap,
+    mtPrint: -1,
   }
   if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
   if box < 0 && tempTy >= 0 { return irBLetTempTy(b, r, ix, rep, tempTy) }
@@ -11379,10 +11456,31 @@ function armUnboxOwed(ix: i32, dst: i32): boolean {
   return dst >= 0
     && au >= 0
     && au < P.nodes.length
-    && nodeAt(au) is Ident
     && recordRepOrNull(dst)
     && narrowedArmNeedsUnbox(ix, ibFnIx)
-    && narrowedArmTyAt(au, ibFnIx) >= 0
+    && (nodeAt(au) is Ident && narrowedArmTyAt(au, ibFnIx) >= 0
+    || asgBoxRep(au) >= 0)
+}
+
+// The box rep of assignment `ix` used as a value, where legacy's value is its target's re-read
+// (`asgReadNode`) and that is a union box (`exprUnion`): the target's own rep; -1 for any other node.
+function asgBoxRep(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if (
+    !(n is BinExpr)
+    || n.binOp != "="
+    || asgValueArmOf(ix, ibFnIx) != "reRead"
+  ) {
+    return -1
+  }
+  if (
+    asgReadNode(ix, ibFnIx) != unwrapParen(n.binLeft)
+    || !exprUnion(ix, ibFnIx)
+  ) {
+    return -1
+  }
+  const r = exprRepOf(n.binLeft)
+  return if r >= 0 && heldAsBox(r) { r } else { -1 }
 }
 
 // Whether `ix` is a union of records each stored at record destination `dst`'s heap, which the
@@ -11403,7 +11501,13 @@ function recordArmsUnboxTemp(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   const ut = if dstTy >= 0 && repNodeOfTy(dstTy) == dst { dstTy } else { repTyOf(dst) }
   return irBLetTempTy(
     b,
-    { uaV: v, uaAt: unwrapParen(ix), uaCellNul: false, uaDst: dst },
+    {
+      uaV: v,
+      uaAt: unwrapParen(ix),
+      uaCellNul: false,
+      uaDst: dst,
+      uaAsg: false,
+    },
     ix,
     dst,
     ut,
@@ -11420,12 +11524,20 @@ function armUnboxTemp(
   cellNul: boolean,
 ): Opnd {
   const au = unwrapParen(ix)
-  const bo = irBBoxLocal(b, au)
+  // An assignment's re-read box (`asgBoxRep`) is cast at the destination's heap (`uaAsg`).
+  const asg = asgBoxRep(au) >= 0
+  const bo = if asg { exprAt(b, au, true) } else { irBBoxLocal(b, au) }
   if ibMiss != "" { return bo }
   const ut = if dstTy >= 0 && primRepOfTy(dstTy) == dst { dstTy } else { repTyOf(dst) }
   return irBLetTempTy(
     b,
-    { uaV: bo, uaAt: au, uaCellNul: cellNul, uaDst: -1 },
+    {
+      uaV: bo,
+      uaAt: au,
+      uaCellNul: cellNul,
+      uaDst: if asg { dst } else { -1 },
+      uaAsg: asg,
+    },
     ix,
     dst,
     ut,
@@ -11495,7 +11607,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   // A `??` map read whose own type has no rep (a link legacy mints) is at the map's value rep,
   // where legacy's `mapGetOr` arm writes it.
   const cr = if own < 0 && !nv && pr < 0 && br < 0 { openCoalMapRep(ix) } else { -1 }
-  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else { own }
+  // An assignment whose value legacy re-reads off a union-box target is that box (`asgBoxRep`).
+  const xr = if own >= 0 && n is BinExpr { asgBoxRep(ix) } else { -1 }
+  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else if xr >= 0 { xr } else { own }
   // A direct call whose own type has no rep is at its callee's result rep.
   if rep < 0 && n is Call && !nv { return openCallValue(b, n, ix) }
   if rep < 0 {
@@ -11644,6 +11758,15 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       if eqRouteOf(n, ix, ibFnIx) == "scalarMap" {
         return scalarMapEq(b, n, ix, rep)
       }
+    }
+    // A bare scalar map read compared plainly: legacy may write the probe's compare there
+    // (`scalarMapEqPlanOf`, asked as it writes), so the IR does not guess the operator's.
+    if (
+      (n.binOp == "==" || n.binOp == "!=")
+      && (mapReadScalarBoxKind(n.binLeft, ibFnIx) >= 0
+        || mapReadScalarBoxKind(n.binRight, ibFnIx) >= 0)
+    ) {
+      return irBMiss("scalar map compare route")
     }
     const p = binPrimOp(n.binOp, opUnsigned(n.binLeft))
     if p == null || n.binIdent != 0 { return irBMiss("operator " + n.binOp) }
@@ -12104,7 +12227,7 @@ function optFieldTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
 }
 
 // A standalone `?.` over one link and an unstaged base (`ROptRead`), as `emitOptMemberValueGo`
-// writes it along `optLeafArmOf`: the base is a variable read twice, which owes no recover.
+// writes it along `optLeafArmOf`: the base is a read the lowering writes again, owing no recover.
 function optRead(b: i32[], n: OptMember, ix: i32, rep: i32): Opnd {
   if exprIsNulNone(ix, ibFnIx) { return irBMiss("optional read of null") }
   if optLeafArmOf(ix, ibFnIx) == "fail" { return irBMiss("optional read arm") }
@@ -12121,7 +12244,9 @@ function optRead(b: i32[], n: OptMember, ix: i32, rep: i32): Opnd {
   if rep != repNodeOfTy(ty) { return irBMiss("optional read rep") }
   const r = irBExpr(b, n.omObj)
   if ibMiss != "" { return r }
-  if !(r is OVar) || r.ov < 0 || ib.irVars[r.ov].vKind == "temp" {
+  if !(r is OVar) || r.ov < 0 { return irBMiss("optional read base") }
+  // Legacy reads an unstaged base again after its null test, so a temp's read must re-read alike.
+  if ib.irVars[r.ov].vKind == "temp" && !recvReadsAgain(base) {
     return irBMiss("optional read base")
   }
   return irBLetTempTy(b, { orV: r, orAt: ix, orTag: -1 }, ix, rep, ty)
@@ -12204,6 +12329,11 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if arm == "lit" { return assignValueLit(b, n, ix, rep) }
   if arm == "nullLit" { return assignValueNullLit(b, n, ix, rep) }
   if arm != "reRead" { return irBMiss("assignment value " + arm) }
+  // The store between an operand already built and the box's re-read would put that operand out of
+  // stack order, as `assignValueLit`'s would.
+  if asgBoxRep(ix) >= 0 && endsInTemp(b) {
+    return irBMiss("assignment value box after an operand")
+  }
   if asgReadUnwidenOp(ix, ibFnIx) >= 0 {
     return irBMiss("assignment value unwiden")
   }
@@ -12540,6 +12670,14 @@ function mapRecvRepOk(r: i32, mr: i32): boolean {
     && exprNullableMap(mr, ibFnIx)
 }
 
+// Whether map walk iterable `iter` is a `.values()` call; a bare map and `.keys()` walk keys.
+function mapWalkReadsValues(iter: i32): boolean {
+  const e = nodeAt(unwrapParen(iter))
+  if !(e is Call) || e.callFn < 0 { return false }
+  const c = nodeAt(e.callFn)
+  return c is Member && c.memProp == "values"
+}
+
 // A `for` statement along legacy's walk (`forInPlainWhy`, a hoisted one included): the list
 // once, its element variable at the declared slot, and the body. Every other walk is a named miss.
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
@@ -12591,10 +12729,14 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   if lpr != null && lpr == "str" { er = repNodeOfTy(TY_I32) }
   if mr >= 0 { er = repNodeOfTy(forInElemTyOf(n.fiIter, ibFnIx)) }
   if er < 0 { return skip("for in operand coercion") }
-  // A map walks its keys or values into an i32 or a string, the verifier's rule; any other is
-  // legacy's.
+  // A map walks its keys or values into an i32 or a string, or at the rep its receiver's map
+  // stores them at, the verifier's rule: the map's value (`rmVal`), or its key type's.
+  const vals = mr >= 0 && mapWalkReadsValues(n.fiIter)
   if mr >= 0 && er != repNodeOfTy(TY_I32) && repPrim(er) != "str" {
-    return skip("for in map element")
+    const mrep = if g >= 0 { irGlobalRepOf(ib, g) } else { irBOpRep(l) }
+    if er != mapWalkElemRep(mrep, vals) {
+      return skip("for in map element rep")
+    }
   }
   const v = irBLoopVar(n.fiDecl1, er, repTyOf(er))
   if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
@@ -12639,6 +12781,7 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
       xfCont: cont,
       xfMap: g,
       xfMapNonNull: mr >= 0 && globalReadRecovers(sidOfNode(mr), mr, ibFnIx),
+      xfVals: vals,
     },
     -1,
     ibNoValue,
@@ -13027,10 +13170,6 @@ function ifChain(b: i32[], ix: i32) {
     } else if k == 1 && guardEndsBlockWith(cur, k, ibFnIx) {
       return skip("decided is guard ends block")
     }
-    // A decided list test whose arm pushes keeps legacy's grow row, which a constant never fills.
-    if k >= 0 && decidedIsGrowShadowed(n.ifCond) {
-      return skip("decided is fit shadow grow")
-    }
     const th = nodeAt(n.ifThen)
     const thenB: i32[] = []
     if ifThenIsDead(n) {
@@ -13270,6 +13409,45 @@ function reserveEnds(ix: i32): boolean {
   return hit
 }
 
+// The constant a `const` declaration `ix` folds out of its later memory addresses, or -1: legacy's
+// own checks in `emitLetPlainInit`'s order, over an i32 local of a function.
+function foldLetK(n: LetDecl, ix: i32): i64 {
+  if ibFnIx < 0 || n.letKw != "const" || !mfShapeIsSum(n.letInit) { return -1 }
+  const slot = declaredSlotOfDecl(ix)
+  if slot < 0 || slot >= localIsRef.length || localIsRef[slot] != "i32" {
+    return -1
+  }
+  return memConstFoldShapeK(n.letInit, ibFnIx)
+}
+
+// Declaration `ix` of `v` folding constant `k`: its bounded part teed into the fold local legacy
+// reserves for it, one per declaration in the order the body first writes them, plus `k`.
+function foldLetAt(b: i32[], n: LetDecl, ix: i32, v: i32, k: i64) {
+  const rest = memConstFoldShapeRest(n.letInit, ibFnIx)
+  if rest < 0 { return skip("address fold split") }
+  let row = 0
+  while row < ib.irMaDecl.length && ib.irMaDecl[row] != ix { row = row + 1 }
+  if row == ib.irMaDecl.length {
+    if row >= fnMemAddrFoldCount { return skip("address fold slot") }
+    ib.irMaDecl.push(ix)
+    ib.irMaSlot.push(maFoldScratchBase + row)
+    ib.irMaK.push(k)
+  }
+  const i32r = repNodeOfTy(TY_I32)
+  const rv = deliver(b, rest, i32r, TY_I32)
+  if ibMiss != "" { return 0 }
+  if irBOpRep(rv) != i32r { return skip("address fold operand") }
+  const t = irBLetTemp(
+    b,
+    { mfiV: rv, mfiSlot: ib.irMaSlot[row], mfiK: k },
+    ix,
+    i32r,
+  )
+  if ib.irVars[v].vRep != i32r { return skip("address fold binding rep") }
+  irBNode(b, { asDst: v, asSrc: t }, -1, ibNoValue, ix)
+  return 0
+}
+
 function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if ibMiss != "" { return 0 }
   const n = nodeAt(ix)
@@ -13342,6 +13520,9 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if pa >= 0 { return letIfArms(b, n.letInit, v, pa) }
     // Legacy's own binding arm reads a union-valued map's box past `emitExpr`, banking no
     // element-read row (`letNulMapReadUnionBox`).
+    // A `const` legacy keeps the bounded part of for later memory addresses (`emitLetPlainInit`).
+    const mk = foldLetK(n, ix)
+    if mk >= 0 { return foldLetAt(b, n, ix, v, mk) }
     const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(b, unwrapParen(n.letInit), ib.irVars[v].vRep, -1, false, -1, false) } else if letCellNulArmUnbox(ix, n.letInit, ib.irVars[v].vRep) { armUnboxTemp(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy, true) } else if letIsArmCell(ix) { variantCoerced(
       b,
       n.letInit,
@@ -13697,9 +13878,6 @@ function tailIf(b: i32[], ix: i32) {
   // Another constant `is` legacy decides off its bytes (`emitGuardCond`): a `false` writes no
   // then arm, a `true` no `else`.
   const k = if !decided && c is OImm && bareConstIs(c, n.ifCond, b, cat) { if c.oiBits != 0 { 1 } else { 0 } } else { -1 }
-  if k >= 0 && decidedIsGrowShadowed(n.ifCond) {
-    return skip("decided is fit shadow grow")
-  }
   const thenB = if decided || k == 0 { [] } else { tailArm(n.ifThen) }
   // An else-less link writes no `else` (`emitIfLinkTail`); what falls through is its caller's pad.
   const elseB: i32[] = []
@@ -13784,11 +13962,6 @@ function build(fnIx: i32, fnPos: i32): string {
   if !(fn is FuncDecl) { return "not a function" }
   ibReset(fnIx, fn.fnName, fnPos)
   if fn.fnTyParams.length > 0 { return "template" }
-  // Legacy keeps a qualifying `const`'s bounded part in a scratch local from its declaration and
-  // reads it at every memory address it folds; its count is decided before either path runs.
-  if fnMemAddrFoldCount > 0 && !censusGoesOn("memory address fold") {
-    return "memory address fold"
-  }
   ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
   ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
   const none = repIsNoValue(ib.irRetRep)
