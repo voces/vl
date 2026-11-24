@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: a union-box field read off a value narrowed to its variant, as a nullable, byte-identical to legacy.** Where legacy reads the field's box and writes no unbox after it, the IR now takes the read at a boxed nullable riding that same box (`boxedNullable`), not only at a plain box, so `if u is A { print(u.x ?? -1) }` over an `i64 | null`, record-or-null or closure-or-null field is built. `narrowed field unbox rep` falls from 17 tests/cases functions to 0; a boxed nullable on another box is refused as `narrowed field unbox nullable disc`, which fires nowhere.
