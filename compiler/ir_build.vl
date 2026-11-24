@@ -779,6 +779,7 @@ import {
   cloLiftWriteCapAt,
   cloLiftWriteCount,
   cloLiftWriteSlot,
+  coalLinkChainOf,
   emitErr,
   emitFailed,
   emitSoftFail,
@@ -1241,6 +1242,8 @@ let ibReservePushes: i32[][] = []
 // The fully unrolled range loops being built, by `ForRange`, and the constant each copy's
 // variable reads, innermost last. Stacks, not a map: a map delete anywhere in the compiler makes
 // every map it builds dearer.
+// By the null-test `if` of a minted `??` link's `holeMap` arm, the link's type (`chainLinkTy`).
+let ibLinkIfTy: {[i32]: i32} = Map()
 let ibRangeImmAt: i32[] = []
 let ibRangeImmVal: i32[] = []
 let ibBool = -1
@@ -2784,6 +2787,17 @@ function openCoalMapTy(ix: i32): i32 {
   return if inner >= 0 { inner } else { mt }
 }
 
+// The type of `??` link `ix` the chain re-association minted, its chain's (`coalLinkChainOf`); of a
+// minted link's `holeMap` null test, the link's (`ibLinkIfTy`); -1 for any other node.
+function chainLinkTy(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if n is BinExpr && n.binOp == "??" {
+    const ch = coalLinkChainOf(ix)
+    return if ch >= 0 { exprTyOf(ch) } else { -1 }
+  }
+  return ibLinkIfTy[ix] ?? -1
+}
+
 // The rep of `openCoalMapTy`'s type, or -1.
 function openCoalMapRep(ix: i32): i32 {
   const t = openCoalMapTy(ix)
@@ -2913,6 +2927,11 @@ export function exprTyOf(ix: i32): i32 {
   }
   if ix < 0 || ix >= P.nodes.length { return t }
   const n = nodeAt(ix)
+  // A `??` link a chain's re-association minted, or its `holeMap` null test, is of its chain's type.
+  if t < 0 && (n is BinExpr || n is IfStmt) {
+    const lt = chainLinkTy(ix)
+    if lt >= 0 { return lt }
+  }
   // A field typed open of a receiver the IR builds closed is of that field's type there.
   if n is Member && irTyOpen(t) {
     const ft = builtFieldTy(n)
@@ -10109,9 +10128,14 @@ function coalesce(
     // The left's effects are written where the value is read, as legacy writes the whole `??`.
     return irBLetTemp(b, { aeEff: effs, aeV: d, aeAt: ix }, ix, rep)
   }
-  // A hole's map read is legacy's null-test `if` too (`coalHoleMapIfOf`).
+  // A hole's map read is legacy's null-test `if` too (`coalHoleMapIfOf`), a minted link's of the
+  // link's type, which it carries none of.
   if arm == "holeMap" {
-    const v = irBExpr(b, coalHoleMapIfOf(n, ix, ibFnIx))
+    const hi = coalHoleMapIfOf(n, ix, ibFnIx)
+    if coalLinkChainOf(unwrapParen(ix)) >= 0 && nodeTyAt(hi, ibFnIx) < 0 {
+      ibLinkIfTy[hi] = exprTyOf(ix)
+    }
+    const v = irBExpr(b, hi)
     if ibMiss != "" { return v }
     if irBOpRep(v) != rep { return irBMiss("coalesce holeMap rep") }
     return v
@@ -14395,6 +14419,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   lbPlanDrop(null)
   ibRangeImmAt = []
   ibRangeImmVal = []
+  ibLinkIfTy = Map()
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
   ibOwnDecls = Map()
