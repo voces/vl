@@ -31,6 +31,10 @@ New test cases:
 
 - A field read straight off the join (`(if x is A { x } else { d }).v`) is refused by legacy at
   emit on master: D17108, filed from the sweep.
+- A union-typed join with no row of its own (`rjSlot` -1), as at an un-annotated module-scope
+  binding (D4645's witness), is declined as `union if record join row`: legacy writes it straight
+  into the global at the binding's row, and the IR's out local would have no interned shape. The
+  claimless comparison over the inventory witnesses caught it.
 - A record parameter or a nested call taking the join is check-clean invalid wasm on master:
   D17115, filed from the sweep and legacy's to fix. The IR declines that position with the miss
   `argument union if at a record (D17115)`, which disappears when the legacy fix lands; lifting the
