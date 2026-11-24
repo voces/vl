@@ -164,3 +164,30 @@ Readings (base master 89ce9eefe, head 5b6b71edc, fixpoint seeds):
 - Correction (V5's verify of #9818): the named cells alone read 8,462 → 8,462, unchanged; the
   quick A/B's 14,972 → 14,979 is tests/cases and the named cells together, so the +7 is all
   tests/cases. V5 attributes it 6 to the storage-row hold and 1 to the stored-row box unbox.
+
+## Batch 2b part 1: a capture's environment row heap
+
+`captureRead` notes the heap of the struct row legacy stores the capture at
+(`captureValStructIdx`, where `captureValKind` is a struct) for a heapless record read rep
+(`noteCapHeap`), through the cell note's row-match guard, now shared as `rowHeapFor`; one answer
+per rep, memoised per program.
+
+Readings (base batch 2a 3977fec35 = master 1db11290 in compiler, head 7736511f3, fixpoint seeds):
+- Named cells alone: covered, verified and matched 41,563 → 41,567; `declaration coercion` 4 → 0
+  (d16132_{block_bare,block_if,block_while,fn_body}_capture_unann). tests/cases unchanged: A/B
+  covered 76,728 → 76,728, start 6,913 → 6,913, mismatch/fail 0; census 6,045 of 7,175 on both.
+  The three block cells keep `start uncovered closure env capture` (N7's class), as on base.
+- The `rowHeapFor` fold is byte-neutral for the existing paths: 17 programs (batch 1's cells,
+  D17047's witness, the D17087 witness, batch 2a's Q58 sweep, overload-pick-reads-only-delivery)
+  build byte-identical under the 2a and 2b seeds.
+- Identity `--cases` 7,755, `--claimless` 14,453, `--names` 9,433: differ 0; self-compile
+  identical; mode 6 corpus differs 0 of 86,287, cases 1 (the pre-existing own refusal).
+- rep-fuzz exact; fuel pair 124,988,908,629 → 124,988,908,629 (the note never fires in the
+  self-compile); `self ir misses` 0; deep nesting 8 passed.
+- Witnesses, one per frame shape (block, if, while, fn body), read `v.f` and print 5, 6, 7, 8
+  under both seeds; a `let` reassigned before the closure runs prints 9 and matches.
+- Q58: 11 positions of the capture inside the closure. Output and `ir-identity --claimless`
+  identical 11, differ 0. The `const` initializer (the claim) and a union argument match; nine
+  positions are uncovered under both seeds in classes this note does not touch (`argument
+  coercion`, `string operand after another`, `return coercion`, `assignment coercion`, `ref if
+  arm rep`, `coalesce nulRef default rep`, `object field coercion`).
