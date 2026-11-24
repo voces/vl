@@ -18,8 +18,11 @@ Corpus: b000017, b000057, b000058 and b000418 are matched; b000498 keeps `array 
 coercion` (D1's).
 
 New test case: `unions/rowless-literal-at-variant-arm-in-each-position.vl` (a binding returned in
-the `null`, value and `i64` arms, a direct return, an argument, a list element, a record field).
+the `null`, value and `i64` arms, a direct return, an argument, a list element, a record field, a
+`let`, a reassigned binding, a captured one, one delivered at a nullable arm).
 
 ## Not in this change
 
 - A maker whose result reaches no arm consumer keeps `return coercion`.
+- A captured arm cell returned through its lambda (`return g()`) misses as `tail coercion`, on
+  master too.
