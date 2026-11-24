@@ -26,6 +26,9 @@ Base 334f6958, both seeds fixpoints.
   (scalar and union parameter), nested argument, binary operator, `+` operand, interpolation hole,
   record field, array element and `==`. Base: 24 wrong. Head: 0 wrong, and none with a lowered
   mismatch.
+- Price: no existing tests/cases function declines. Two `start` bodies move class, from
+  `assignment value unwiden` and `assignment value parked` to `start: store after an operand` (the
+  queue's V5 reading; #9866's body counted these 2 starts as 4 functions).
 - D17110: the invisible siblings (a callee or literal reordered past a store to another cell) now
   decline as well.
 
