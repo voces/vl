@@ -120,6 +120,7 @@ import {
   OStr,
   OVar,
   Opnd,
+  RAfterEffects,
   RArmSite,
   RArmUnbox,
   RAsTail,
@@ -1296,6 +1297,13 @@ function rhs(r: Rhs, tail: boolean) {
       atomStrTail(atomStrPlanOf(r.sxAt, lw.irAt, false))
     }
     RAtomEq => atomEq(r)
+    RAfterEffects => {
+      for e in r.aeEff {
+        irLOpnd(e)
+        fbDrop()
+      }
+      irLOpnd(r.aeV)
+    }
     RAsTail => {
       irLOpnd(r.akV)
       if asLitTail(r.akAt, lw.irAt) < 0 { return irLMiss("literal cast tail") }
@@ -5517,6 +5525,7 @@ function ret(n: SReturn, pending: i32[]) {
     retExtra()
     return fbReturnOp()
   }
+  if retAfterEffectsTail(n.rtV, pending) { return 0 }
   // A call retagged into its `K | null` is the same i32, so legacy tail-calls it too.
   const outer = retagOf(n.rtV)
   const inner = if outer >= 0 { retagOperand(outer) } else { n.rtV }
@@ -5538,6 +5547,32 @@ function ret(n: SReturn, pending: i32[]) {
   }
   cond(n.rtV, pending)
   return sinkExit()
+}
+
+// Whether returned `v` is a call after effects (`RAfterEffects`), now written as legacy writes it:
+// the effects dropped, then the call in its tail form.
+function retAfterEffectsTail(v: Opnd, pending: i32[]): boolean {
+  if !(v is OVar) || !isTemp(v.ov) { return false }
+  const r0 = tempRhs(v.ov)
+  if !(r0 is RAfterEffects) { return false }
+  const iv = r0.aeV
+  if !(iv is OVar) || callTemp(iv) < 0 || irNoTailHas(lw, iv.ov) {
+    return false
+  }
+  takeUse(v.ov)
+  lwSeq = []
+  for e in r0.aeEff {
+    irLOpnd(e)
+    fbDrop()
+  }
+  takeUse(iv.ov)
+  const r = tempRhs(iv.ov)
+  if r is RCall { call(r, true) }
+  if r is RCallRef { callRef(r, true) }
+  lwSeq.push(iv.ov)
+  lwSeq.push(v.ov)
+  irLSettle(pending)
+  return true
 }
 
 // A returned value already written exits as `emitUnionRetSink` writes it: a function taking the
