@@ -7,9 +7,8 @@ initializer ran (D2654). Legacy's `emitUserGlobalSet` writes the value, then
 `irGlobalWriteMiss` named it, and `SGlobalSet`'s "guard" arm was a miss.
 
 - `irGlobalWriteMiss` takes "guard" as "plain" does (a minted global is the IR's).
-- `SGlobalSet`'s "guard" arm writes the value, `emitInitGuard(sym, "written")`, `global.set`, then
-  the bit where `initBitOf` has one, in legacy's order. The guarded read's arm already calls the
-  same guard with "read".
+- `SGlobalSet`'s "guard" arm writes the value, `emitInitGuard(sym, "written")`, then `global.set`,
+  in legacy's order. The guarded read's arm already calls the same guard with "read".
 
 No builder or legacy change. The verifier has no rule for the guard: the IR holds no guard node,
 and the lowering takes the class from `userGlobalWriteClass`, as legacy does, so a guard-class
@@ -17,8 +16,10 @@ write cannot lose its guard.
 
 `write-before-init-traps::setN` on both seeds: the value (`i32.const 99` into the scratch), then
 the guard (`global.get` of the assigned flag, `i32.lt_s`, `call $__init_fail__`), then
-`global.set`. No guarded global in the census programs or the sweep carries an init bit; the
-lowering writes it after `global.set`, as `emitUserGlobalSet` does.
+`global.set`. No guarded write has an assigned bit to set: `initGuardNeeded` makes a write
+guard-class only for a global with an initializer, and an assigned bit goes only to a global
+without one. The arm names that pairing as a miss (`guarded global write init bit`) rather than
+writing an unwitnessed bit.
 
 ## Legacy tails the IR calls
 
