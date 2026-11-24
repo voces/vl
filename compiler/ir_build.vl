@@ -1,4 +1,11 @@
 import { recFieldTyOf } from "./emit_rec_field_codes"
+import {
+  liftedFnCaptures,
+  listFitShadowPlanOf,
+  listFitShadowReadsRow,
+  listFitShadowSameTy,
+  listFitShadowTyOf,
+} from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import { nulAtomWidenTexts } from "./emit_lit_atoms"
 import {
@@ -84,6 +91,7 @@ import {
   hasNamedArgs,
   i32ToStr,
   nodeAt,
+  nodeChildren,
   nodeChildrenPush,
   spreadArgOf,
 } from "./ast"
@@ -324,7 +332,8 @@ import {
   holeBoxTyAt,
   hostCallNamed,
   hostCallPlanOf,
-  idxStorePlainWhy,
+  idxStoreOtherWhy,
+  idxStoreSiteBoxes,
   ifExprJoinVt,
   ifExprPlainWhy,
   ifExprShapeWhy,
@@ -532,6 +541,7 @@ import {
   binNulTestOf,
   coalArmOf,
   coalBoxArmOf,
+  coalMapRecvOf,
   coalNicheArmOf,
   coalNulRefArmOf,
   coalResultKindOf,
@@ -544,6 +554,7 @@ import {
   nullOwnAt,
 } from "./emit_plan_null"
 import {
+  boxDstTyOf,
   boxOwedAt,
   boxTyNameAt,
   coerceKindAt,
@@ -578,6 +589,7 @@ import {
   litArmsReadsOf,
   litIsBoxLexes,
   litMemberEqArmOf,
+  mapScalarJoinBoxes,
   narrowedMapReadOf,
   retRefusedWhy,
   spreadRunLit,
@@ -586,6 +598,7 @@ import {
 } from "./wasmEmit"
 import {
   mapReadScalarBoxKindIn,
+  mapRecvScalarBoxKindIn,
   mapRecvTyIn,
   nodeTyInOf,
   readContainerTyAt,
@@ -661,6 +674,7 @@ import {
   asgReReadEnter,
   asgReReadLeave,
   asgReadUnwidenOp,
+  asgYieldsNullLit,
   boxedFieldUnionTyOf,
   callIsArrSlice,
   capCellTargetOf,
@@ -1124,6 +1138,11 @@ let ibLoopCont: i32[] = []
 // The result binding of each break label whose frame carries a loop value.
 let ibLvOf: {[i32]: i32} = Map()
 let ibLabelN = 0
+// The `shadow` arm rows built so far (`fitShadowVar`): name, `K`, receiver local and variable.
+let ibFitShName: string[] = []
+let ibFitShTy: i32[] = []
+let ibFitShRecv: i32[] = []
+let ibFitShVar: i32[] = []
 // `ifChain`'s answer for a guard that ends its block; `stmt` writes the cut behind it.
 const IF_CUTS_BLOCK = -9
 // The statements whose end closes a list reserve region the body opened (`reserve.open`), and
@@ -1359,7 +1378,9 @@ function isEmptyFit(
   p: EmptyFitPlan,
 ): Opnd {
   if p.efArm == "union" { return isEmptyFitArms(b, n, ix, rep, p) }
-  if p.efArm != "loop" { return irBMiss("is empty fit " + p.efArm) }
+  const fit = if p.efArm == "shadow" { fitShadowVar(n, ix, p) } else { -1 }
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  if p.efArm != "loop" && fit < 0 { return irBMiss("is empty fit " + p.efArm) }
   if p.efRepWhy != "" { return irBMiss("is empty fit rep") }
   if rep != ibBool { return irBMiss("is result rep") }
   const v = irBExpr(b, n.isObj)
@@ -1367,7 +1388,91 @@ function isEmptyFit(
   if !(repNodeAt(irBOpRep(v)) is RList) {
     return irBMiss("is empty fit operand rep")
   }
-  return irBLetTemp(b, { leV: v, leAt: ix }, ix, rep)
+  return irBLetTemp(b, { leV: v, leAt: ix, leFit: fit }, ix, rep)
+}
+
+// The variable a `shadow` arm's region reads `xs` as (`listFitShadowSet`): one per name, `K` and
+// receiver local, made at the first such test in build order, which is legacy's emit order. Its
+// slot is the scratch local the lowering's store allocates. A pushing arm or a closure's
+// capture is a miss.
+function fitShadowVar(n: IsExpr, ix: i32, p: EmptyFitPlan): i32 {
+  const r = unwrapParen(n.isObj)
+  if r < 0 || r >= P.nodes.length { return -1 }
+  const rn = nodeAt(r)
+  if !(rn is Ident) { return -1 }
+  const pl = listFitShadowPlanOf(ix, p.efRecvTy, p.efDepth, ibFnIx)
+  if pl == 2 {
+    irBMiss("is empty fit shadow grow")
+    return -1
+  }
+  if pl < 0 {
+    irBMiss("is empty fit shadow refused")
+    return -1
+  }
+  const fd = nodeAt(ibFnIx)
+  if (
+    liftedFnCaptures(rn.identName, ibFnIx)
+    || fd is FuncDecl && closureReadsName(fd.fnBody, rn.identName, false)
+  ) {
+    irBMiss("is empty fit shadow capture")
+    return -1
+  }
+  const kTy = listFitShadowTyOf(ix)
+  const recv = localIndexOf(ibFnIx, r)
+  let i = 0
+  while i < ibFitShName.length {
+    if (
+      ibFitShName[i] == rn.identName
+      && listFitShadowSameTy(ibFitShTy[i], kTy)
+      && ibFitShRecv[i] == recv
+    ) {
+      return ibFitShVar[i]
+    }
+    i = i + 1
+  }
+  const fr = repNodeOfTy(kTy)
+  if !(repNodeAt(fr) is RList) {
+    irBMiss("is empty fit shadow rep")
+    return -1
+  }
+  const v = irVarNew(ib, fr, kTy, "local", -1)
+  ibFitShName.push(rn.identName)
+  ibFitShTy.push(kTy)
+  ibFitShRecv.push(recv)
+  ibFitShVar.push(v)
+  return v
+}
+
+// Whether a function nested in the tree at `ix` reads `name` (`inner` once inside one).
+function closureReadsName(ix: i32, name: string, inner: boolean): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is FuncDecl { return closureReadsName(n.fnBody, name, true) }
+  if inner && n is Ident && n.identName == name { return true }
+  for k in nodeChildren(ix) {
+    if closureReadsName(k, name, inner) { return true }
+  }
+  return false
+}
+
+// The `shadow` arm variable read `ix` of `n` takes in place of its binding, as legacy's
+// `listFitShadowRow` redirects it: the same name and receiver local, typed as the arm's list.
+function fitShadowReadVar(n: Ident, ix: i32): i32 {
+  if ibFitShName.length == 0 { return -1 }
+  const recv = localIndexOf(ibFnIx, unwrapParen(ix))
+  if recv < 0 { return -1 }
+  let i = 0
+  while i < ibFitShName.length {
+    if (
+      ibFitShName[i] == n.identName
+      && ibFitShRecv[i] == recv
+      && listFitShadowReadsRow(ibFitShTy[i], ix, ibFnIx)
+    ) {
+      return ibFitShVar[i]
+    }
+    i = i + 1
+  }
+  return -1
 }
 
 // `recv is <literal type>` at the `litArms` rung, along `litIsArmOf`'s arm as `emitIsTestLitArms`
@@ -3515,11 +3620,6 @@ function unionIfArm(
     }
     return body
   }
-  // An arm that is itself a `??` legacy writes as one chain, not as a nested join of its own.
-  if plainCoalesceAt(tv) != null && heldAsBox(rep) {
-    irBMiss("union if arm coalesce chain")
-    return body
-  }
   const x0 = floorDeliver(body, tv, rep, uty)
   // An arm the checker recorded no box for is boxed into the join's union here, as legacy's
   // `emitUnionIfValue` boxes each arm (`emitUnionBoxArg`).
@@ -3985,6 +4085,15 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   if captureSlotOf(n.identName, ibFnIx) >= 0 {
     return captureRead(b, n, ix, rep)
   }
+  // A read in a `shadow` arm's region is the arm's empty list (`fitShadowVar`).
+  const fv = fitShadowReadVar(n, ix)
+  if fv >= 0 {
+    if ib.irVars[fv].vRep != rep {
+      return irBMiss("is empty fit shadow read rep")
+    }
+    const fo: Opnd = { ov: fv }
+    return fo
+  }
   const w = localIndexOf(ibFnIx, ix)
   // A walk's element is its loop's; a fragment inside a walk it did not build reads the element's
   // legacy slot, as a `let` it did not build, and its locals are checked against legacy's cells.
@@ -4334,6 +4443,8 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     }
     const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
     if !atOwn {
+      // Legacy reads a capture again from the environment.
+      ib.irReadAgain[ix] = ev
       return irBLetTempTy(b, ev, ix, cr, capReadTy(fe, name, ix, cr))
     }
     const own = irBLetTempTy(b, ev, ix, cr, cty)
@@ -4489,7 +4600,8 @@ function capLoopTyOf(fe: i32, name: string): i32 {
 
 // The parameter variable of the lifted function `fe` being built for its capture `name`, at
 // `capRepFor`'s rep for a first read at `readRep` (-1 for none), made at its first use; -1 when a
-// captured `for-in` variable has no rep yet.
+// captured `for-in` variable has no rep yet. One held at its read's rep, not its binding type's
+// (a shared cell), is typed at that rep.
 function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
   const w = 1 + captureSlotOf(name, ibFnIx)
   const known = paramVarAt(w)
@@ -4498,7 +4610,8 @@ function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
   const bty = capTyOf(fe, name)
   const ty = if readRep < 0 && bty < 0 { capLoopTyOf(fe, name) } else { bty }
   if ty < 0 && r < 0 { return -1 }
-  const v = irVarNew(ib, r, if ty >= 0 { ty } else { repTyOf(r) }, "param", w)
+  const vty = if ty >= 0 && (r < 0 || repNodeOfTy(ty) == r) { ty } else { repTyOf(r) }
+  const v = irVarNew(ib, r, vty, "param", w)
   ib.irParams.push(v)
   return v
 }
@@ -4643,7 +4756,12 @@ function narrowedLocalRead(
     ib.irReadAgain[ix] = cr
     return irBLetTemp(b, cr, ix, rep)
   }
-  if ba == "box" { return irBLetTemp(b, { sgV: o }, ix, rep) }
+  // A union box narrowed to a smaller union is the same box; a compare reads it again.
+  if ba == "box" {
+    const sg: Rhs = { sgV: o }
+    ib.irReadAgain[ix] = sg
+    return irBLetTemp(b, sg, ix, rep)
+  }
   // A box local narrowed to a `boolean | null` or `string | null` niche (legacy's `niche` arm).
   if arm == "niche" {
     const nk = nicheReadKindAt(ix, ibFnIx)
@@ -7469,14 +7587,24 @@ export function deliverStr(b: i32[], ix: i32): Opnd {
   return deliver(b, ix, repNodeOfTy(TY_STR), TY_STR)
 }
 
-// Element `e` of a union-row list literal, built for its box: a `null` literal has no value of its
-// own, so the box writer writes the null tag alone, as `deliver` hands it a `null`.
+// Value `e` a union list's element is built from for its box (a literal's element, a store's value):
+// a `null` literal has no value of its own, so the box writer writes the null tag alone.
 function unionElemValue(b: i32[], e: i32): Opnd {
   if nodeAt(unwrapParen(e)) is NullLit {
     const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
     return none
   }
   return irBExpr(b, e)
+}
+
+// Whether `ix` is a list literal with a record literal among its elements.
+function listLitHoldsObjLit(ix: i32): boolean {
+  const n = nodeAt(unwrapParen(ix))
+  if !(n is ArrayLit) { return false }
+  for e in n.arrElems {
+    if nodeAt(unwrapParen(e)) is ObjLit { return true }
+  }
+  return false
 }
 
 // Whether rep `r` is a record or a nullable record.
@@ -9349,8 +9477,54 @@ function coalesce(
     if irBOpRep(v) != rep { return irBMiss("coalesce holeMap rep") }
     return v
   }
+  if arm == "mapScalarJoin" { return coalMapScalarJoin(b, n, ix, rep) }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
+}
+
+// `m[k] ?? d` over a scalar-valued map joining a union, as `emitMapGetOrScalarJoin` writes it: the
+// probe, a hit's scalar boxed at its own arm, and `d` boxed into the union in the miss arm.
+function coalMapScalarJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const lhsIx = unwrapParen(n.binLeft)
+  if lhsIx < 0 { return irBMiss("map read") }
+  const rd = nodeAt(lhsIx)
+  if !(rd is Index) || coalMapRecvOf(n) != rd.idxArr {
+    return irBMiss("coalesce mapScalarJoin call")
+  }
+  const ak = mapRecvScalarBoxKindIn(rd.idxArr, ibFnIx)
+  if ak < 0 || !mapScalarJoinBoxes(n, ak, ibFnIx) {
+    return irBMiss("coalesce mapScalarJoin row")
+  }
+  if !heldAsBox(rep) { return irBMiss("coalesce mapScalarJoin rep") }
+  const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
+  const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
+  if ka != "plain" && ka != "i64" { return irBMiss("map key " + ka) }
+  const rcv = mapRecvKeyOf(
+    b,
+    rd.idxArr,
+    rd.idxIndex,
+    "map read receiver",
+    ka == "i64",
+  )
+  if rcv == null { return irBMiss(ibMiss) }
+  const db: i32[] = []
+  const dv = deliver(db, n.binRight, rep, boxDstTyOf(n.binRight, ibFnIx))
+  if ibMiss != "" { return dv }
+  if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
+  if !defaultSelfContained(db, 0, dv) {
+    return irBMiss("coalesce mapScalarJoin default computes")
+  }
+  for id in db { b.push(id) }
+  const r: Rhs = {
+    mgSym: rcv.mkSym,
+    mgNonNull: rcv.mkNonNull,
+    mgLoc: rcv.mkLoc,
+    mgKey: rcv.mkKey,
+    mgAt: ix,
+    mgForm: 7,
+    mgDef: dv,
+  }
+  return irBLetTemp(b, r, ix, rep)
 }
 
 // A `null`-typed operand `x` run for its effect, as legacy's `emitNulNoneForEffect` writes it:
@@ -10985,10 +11159,30 @@ function armUnboxTemp(
   )
 }
 
+// A place or method-call read whose storage is the `null` unit, as legacy's `emitNulNoneRead`
+// writes it: the read for its effects, dropped, then its destination's null (`nullOwnAt`).
+function nulUnitPlaceRead(b: i32[], ix: i32, cell: boolean): Opnd {
+  // An element read stays a miss: built here, its read's span is not the one legacy's `emitIndex`
+  // records.
+  if nodeAt(unwrapParen(ix)) is Index {
+    return irBMiss("null unit element read span")
+  }
+  const own = nullOwnAt(ix, ibFnIx)
+  const r = exprRepOf(ix)
+  if own < 0 || r < 0 || !nullOwnRepFits(own, r) {
+    return irBMiss("null unit read rep")
+  }
+  const v = exprAtPre(b, ix, cell, "")
+  if ibMiss != "" { return v }
+  irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  return repTemp(b, { nuAt: ix, nuOwn: own }, ix, r)
+}
+
 // `exprAt` past the pre-path, whose answer for `ix` is `pre`.
 function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   if pre == "pre-path tag leaf" { return tagLeaf(ix) }
   if pre == "pre-path tag dispatch" { return tagDispatch(b, ix) }
+  if pre == "pre-path null unit read" { return nulUnitPlaceRead(b, ix, cell) }
   if pre != "" { return irBMiss(pre) }
   const n = nodeAt(ix)
   if n is Paren { return exprAt(b, n.parInner, cell) }
@@ -11720,6 +11914,7 @@ function siteBuilt(n0: i32, ix: i32): boolean {
 function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const arm = asgValueArmOf(ix, ibFnIx)
   if arm == "lit" { return assignValueLit(b, n, ix, rep) }
+  if arm == "nullLit" { return assignValueNullLit(b, n, ix, rep) }
   if arm != "reRead" { return irBMiss("assignment value " + arm) }
   if asgReadUnwidenOp(ix, ibFnIx) >= 0 {
     return irBMiss("assignment value unwiden")
@@ -11741,6 +11936,24 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("assignment value re-read rep")
   }
   return w
+}
+
+// An assignment of `null` the checker types `null` (`asgValueArmOf` "nullLit"): the store, then
+// the literal's own null again, as `emitAsgValueOf` writes it.
+function assignValueNullLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  // The store is a statement, so no temp an operand before it built may wait across it.
+  if endsInTemp(b) { return irBMiss("assignment value lit after an operand") }
+  assignTo(b, n, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  // Legacy writes the literal's own null (`emitNullAt`), whatever rep the assignment's `null` has.
+  const lit = unwrapParen(n.binRight)
+  const own = nullOwnAt(lit, ibFnIx)
+  // The `null` unit holds the bottom ref alone; a literal whose own null is a cell's typed one
+  // (a string's, a sentinel) is not that value, so it misses rather than fail the verifier.
+  if repPrim(rep) == "null" && own != NULL_OWN_NONE {
+    return irBMiss("assignment value nullLit rep")
+  }
+  return repTemp(b, { nuAt: lit, nuOwn: own }, ix, rep)
 }
 
 // Whether identifier `ix` names a module global's `let`, not a local or a capture.
@@ -11846,8 +12059,9 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
   return 0
 }
 
-// `xs[i] = v` that legacy writes as the plain store (`idxStorePlainWhy`): receiver, index and
-// value in source order, then the store, whose guard runs after the value.
+// `xs[i] = v` that legacy writes as the plain store (`idxStoreOtherWhy`): receiver, index and
+// value in source order, then the store, whose guard runs after the value. A union list's value that
+// owes no box is boxed at the site's union (`idxStoreSiteBoxes`), as legacy's `emitUnionBoxArg`.
 function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   // Legacy writes a store through a box of list arms per arm before any other plan.
   if armIndexWriteArmsOf(t, ibFnIx).length > 0 {
@@ -11859,8 +12073,14 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   }
   const st = idxStorePlanOf(t, ibFnIx)
   if st == null { return skip("store plan") }
-  const why = idxStorePlainWhy(st, n.binRight, ibFnIx)
+  const why = idxStoreOtherWhy(st, n.binRight, ibFnIx)
   if why != "" { return skip(why) }
+  const site = idxStoreSiteBoxes(st, n.binRight, ibFnIx)
+  // A nested list's literal holding a record literal: legacy banks the store's element-read row from
+  // its receiver, the lowering from the record's own read, so the rows disagree.
+  if st.nestSlot >= 0 && listLitHoldsObjLit(n.binRight) {
+    return skip("store element record literal")
+  }
   const vat = b.length
   const v = irBExpr(b, t.idxArr)
   const at = b.length
@@ -11870,7 +12090,7 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   // A packed list's element is stored as a plain i32, which its backing truncates.
   const er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const xat = b.length
-  const x = deliver(b, n.binRight, er, -1)
+  const x = if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
   if ibMiss != "" { return 0 }
   if ifBelowLeadIn(b, at, xat, "store short-circuit operand") { return 0 }
   if repPrim(irBOpRep(i)) != "i32" || irBOpRep(x) != er {
@@ -12731,6 +12951,11 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     // An uninitialized binding writes nothing, as legacy's `emitLetDeclStmt` writes nothing: its
     // local's default covers it, and a reference one is declared nullable (`localUnset`).
     if n.letInit < 0 { return 0 }
+    // Legacy writes an unannotated `null` binding's assignment initialiser as a bare `null`, its
+    // store lost (D17088), so the IR keeps it loud rather than match it.
+    if n.letType < 0 && asgYieldsNullLit(unwrapParen(n.letInit)) {
+      return skip("assignment initialiser of a null-typed binding (D17088)")
+    }
     // Legacy may build a `[]` its pushes follow at its final size, through locals (D3623).
     const lr = if pos >= 0 { listReserveScan(n, sibs, pos, ibFnIx) } else { null }
     // The lowering opens a reserve over a function's body only (`reserveOpen`).
@@ -13257,6 +13482,10 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibLoopCont = []
   ibLvOf = Map()
   ibLabelN = 0
+  ibFitShName = []
+  ibFitShTy = []
+  ibFitShRecv = []
+  ibFitShVar = []
   ibBool = repNodeOfTy(TY_BOOL)
   return 0
 }
@@ -14151,6 +14380,10 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibLoopCont = []
   ibLvOf = Map()
   ibLabelN = 0
+  ibFitShName = []
+  ibFitShTy = []
+  ibFitShRecv = []
+  ibFitShVar = []
   ibBool = repNodeOfTy(TY_BOOL)
   ibNoValue = repNodeOfTy(TY_NEVER)
   if !repIsNoValue(ibNoValue) { return "no void rep" }
