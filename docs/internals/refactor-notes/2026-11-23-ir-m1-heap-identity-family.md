@@ -191,3 +191,26 @@ Readings (base batch 2a 3977fec35 = master 1db11290 in compiler, head 7736511f3,
   positions are uncovered under both seeds in classes this note does not touch (`argument
   coercion`, `string operand after another`, `return coercion`, `assignment coercion`, `ref if
   arm rep`, `coalesce nulRef default rep`, `object field coercion`).
+
+## Batch 2b part 2: a nullable struct cell's heap
+
+D1's two d16132 cells `d16132_map_set_unann` and `d16132_map_value_unann` read no map at the
+miss: `const v = __mv` reads the top-level `{f: null} | null` global narrowed under
+`if __mv != null`. `noteCellHeap` ran there, but `cellHeapOf` took only a `struct` cell; this is
+a `nulstruct` cell, whose `globalCellStructIdx` is its record's row (row 0, heap 0, the binding's
+`J$m…` rep). `cellHeapOf` now takes `struct` or `nulstruct`; the row-match guard and memo stand.
+- Both cells: `start uncovered declaration coercion` → start matched; print `null` on both seeds.
+- Witnesses with a non-null field beside the null one print `7 3` and `12 4` on both seeds.
+- Neighbours unchanged under both seeds: an un-narrowed read of the nullable global (`false 7`)
+  and a nullable global whose row does not match (`10`) are matched on base and head alike.
+- Committed programs (Q58 addendum): witnesses `tests/cases/globals/heap-nullable-cell-narrowed-
+  {two-fields,set-get}.vl` (base `declaration coercion` → head clean); neighbours `…-unnarrowed-
+  read.vl` and `…-row-mismatch.vl` (unchanged on both seeds); the sweep `…-q58-{arg_record,
+  arg_union,arg_nested,return,if_arm,coalesce,record_field}.vl`, every one runs and is unchanged
+  on both seeds but `record_field`, whose uncovered row moves from `object field coercion` to
+  `field read coercion`. The concat, interpolation, `const` and `let` initializer positions are
+  D17103's reds (invalid wasm or a failed emit under both seeds and claimless), not `@run` cases.
+- V1's annotated capture neighbour (`const v: J = __c` in the closure) is committed as
+  `tests/cases/closures/heap-capture-annotated-binding-{fn-body,block}.vl`: measured here it is
+  no `declaration coercion` miss on either seed in any of four frame shapes; the block frames keep
+  only `start uncovered closure env capture` (N7's class).
