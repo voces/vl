@@ -85,8 +85,6 @@ timed_out() {
 # listed program is an `expected divergence` when every function whose body differs is listed for
 # it; `<module>` names everything outside the function bodies.
 BASELINE=${IR_DIVERGENCE_BASELINE:-scripts/ir-divergence-baseline.txt}
-# `wasm-dis` from the native release `$VL_BINARYEN` names when set (CI's jobs without node_modules), else npm's.
-WASM_DIS=${WASM_DIS:-${VL_BINARYEN:+$VL_BINARYEN/wasm-dis}}
 WASM_DIS=${WASM_DIS:-$PWD/node_modules/.bin/wasm-dis}
 
 # Each function of wasm $1 on one line, `name\tbody`, and `<module>\trest`, sorted by name.
