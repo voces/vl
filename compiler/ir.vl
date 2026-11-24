@@ -282,6 +282,9 @@ export type RToBox = { bxV: Opnd, bxAt: i32, bxTy: i32, bxFree: boolean }
 // `u as? N` over a type parameter boxing scalar `hxV` at cast node `hxAt` (`holeOptShapeOf`'s
 // "box"), whose tag legacy writes ahead of the operand (`holeOptBoxHead`, `holeOptBoxTail`).
 export type RHoleOptBox = { hxV: Opnd, hxAt: i32 }
+// The value of node `dnAt`, which a dead arm's `never` read feeds (`exprReadsDeadNever`): no value
+// reaches it, so legacy writes `unreachable` in its place and its consumer's code goes on (D16006).
+export type RDeadNever = { dnAt: i32 }
 // Atom `rgV` as the `K | null` (discipline 3) that holds it: the same i32, so no bytes.
 export type RRetag = { rgV: Opnd }
 // Atom `sxV`, or its `K | null`, as the string, or `string | null`, legacy's atom decode writes
@@ -427,8 +430,9 @@ export type RTagStash = { tgsV: Opnd }
 // The kept set id is member id `tgiId` (`tagIsTail`).
 export type RTagIs = { tgiId: i32 }
 // `leV`, a list, tested empty at every depth down to the arm `is` test `leAt` names, as legacy's
-// `emitListEmptyLoop` walks it (`emptyFitPlanOf`): a bool.
-export type RListEmpty = { leV: Opnd, leAt: i32 }
+// `emitListEmptyLoop` walks it (`emptyFitPlanOf`): a bool. A `shadow` arm's test first stores
+// the arm's empty `K[]` in variable `leFit` (`listFitShadowSet`), which the region reads; else -1.
+export type RListEmpty = { leV: Opnd, leAt: i32, leFit: i32 }
 // Box variable `lfV` tested at each list arm of `is` test `lfAt` whose elements never meet the
 // tested type (`emptyFitArmsPlanOf`): the arm's tag, then its list's emptiness, or'd: a bool.
 export type RListEmptyArms = { lfV: Opnd, lfAt: i32 }
@@ -472,7 +476,7 @@ export type RPrint = { pnV: Opnd, pnAt: i32 }
 // `m[k] ?? d` at `??` node `mgAt`: map global `mgSym` (recovered for `mgNonNull`), else receiver
 // `mgLoc`, key `mgKey`; by `mgForm` the default goes to `__map_get_<row>__`'s miss (0), or is `mgDef`
 // in the miss arm of the probe's `i32` read (1), mv slot read (2), `scalar | null` union value's
-// scalar (3), a ref niche's null (4) or a nullable union's box (5) (`mapGetOrArmOf` and its arms).
+// scalar (3), ref niche's null (4), nullable union's box (5), sentinel (6), or boxed union join (7).
 export type RMapGetOr = {
   mgSym: i32,
   mgNonNull: boolean,
@@ -551,6 +555,9 @@ export type RFnId = { fiMember: i32 }
 // The interned id of the one member of a literal place at node `asAt`, written for it by legacy's
 // atom hook (`strToAtomArmOf`'s `sole`); the place is not read.
 export type RAtomSole = { asAt: i32 }
+// Legacy's `nullty` null test (`emitDeadNullTest`): operand `dnV` built for its effect and dropped,
+// then the test's constant `dnBits`, in the operand's place.
+export type RDeadNullTest = { dnV: Opnd, dnBits: i64 }
 // Legacy's atom tower over a literal place at node `saAt` (`strToAtomArmOf`'s `chain`): each
 // member's id, then the place's string read `saReads[i]` tested against member `i`, last first.
 export type RStrToAtom = { saReads: Opnd[], saAt: i32 }
@@ -621,6 +628,8 @@ export type Rhs = RArmSite
   | RCoalAtomStr
   | RCoalStr
   | RCoerce
+  | RDeadNever
+  | RDeadNullTest
   | REnvDrop
   | REnvGet
   | REqHelp
@@ -1293,6 +1302,8 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RCoalAtomStr |
       RCoalStr |
       RCoerce |
+      RDeadNever |
+      RDeadNullTest |
       REnvDrop |
       REnvGet |
       REqHelp |
@@ -1681,6 +1692,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RCoalAtomStr => [r.zaL, r.zaD]
     RToBox => [r.bxV]
     RHoleOptBox => [r.hxV]
+    RDeadNever => []
     RRetag => [r.rgV]
     RAtomStr => [r.sxV]
     RNullOf => []
@@ -1716,6 +1728,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMakeClo => r.mcEnv
     RFnId => []
     RAtomSole => []
+    RDeadNullTest => [r.dnV]
     RAtomWide => [r.awV]
     RStrToAtom => r.saReads
     RStrToAtomStaged => [r.zsV]
@@ -1795,6 +1808,7 @@ function rhsText(r: Rhs): string {
     RNumCast => "cast " + opndText(r.ncV)
     RToBox => "box " + opndText(r.bxV)
     RHoleOptBox => "hole opt box " + opndText(r.hxV)
+    RDeadNever => "dead never"
     RAtomStr => "atomstr " + opndText(r.sxV)
     RRetag => "retag " + opndText(r.rgV)
     RNullOf => "null"
@@ -1883,6 +1897,10 @@ function rhsText(r: Rhs): string {
     RMakeClo => "closure f" + i32ToStr(r.mcFn) + "(" + opndsText(r.mcEnv) + ")"
     RFnId => "fn_id " + i32ToStr(r.fiMember)
     RAtomSole => "atom_sole @" + i32ToStr(r.asAt)
+    RDeadNullTest => "dead_null_test("
+      + opndText(r.dnV)
+      + ") "
+      + (if r.dnBits == 1 { "true" } else { "false" })
     RAtomWide => "atom_wide(" + opndText(r.awV) + ")"
     RStrToAtom => "str_to_atom(" + opndsText(r.saReads) + ")"
     RStrToAtomStaged => "str_to_atom_staged(" + opndText(r.zsV) + ")"
@@ -2149,6 +2167,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RClosureEq |
       RCoalAtomStr |
       RCoalStr |
+      RDeadNever |
+      RDeadNullTest |
       REqHelp |
       RHoleOptBox |
       RJoinNull |
