@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage: a null test of a `null`-typed value with any operand, byte-identical to legacy.** As legacy's `emitDeadNullTest` writes it, a field operand is read raw at its storage row and dropped, any other operand is built for its effect and dropped, then the constant; a field read off a built value follows the row the value is stored in. `null test nullty operand` falls from 14 to 4 corpus and 22 to 16 tests/cases functions (a field off a parameter or global held at an unnamed row stays refused); a map-default read whose value the map's own rep does not yet carry is refused by name (`map read mv value rep`) rather than at the verifier.
