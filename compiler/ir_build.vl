@@ -150,6 +150,7 @@ import {
   irNodeFamily,
   irNodeNew,
   irRecHeapNote,
+  irRecHeapNoteOne,
   irRecHeapOf,
   irSigNote,
   irSigOf,
@@ -168,7 +169,9 @@ import {
   listRetagHole,
   mapBoxReadsAt,
   mapNicheReadsAt,
+  recFieldsWiden,
   recHeapOf,
+  recHeapsNote,
   recRetag,
   recRowRetag,
   recSubAdmit,
@@ -816,7 +819,7 @@ import {
   sFieldTgtStructIdx,
   structIndexOfTy,
 } from "./emit_atom_kinds"
-import { recordHeapOfTy } from "./emit_shape_intern"
+import { recordHeapOfTy, structRowHeap } from "./emit_shape_intern"
 import { RC_MAP, RC_REF_LIST, letBindingUnionTy } from "./emit_start_block"
 import {
   TY_BOOL,
@@ -1077,6 +1080,7 @@ export function irShadowArmed(): boolean { return ibArmed }
 export function irShadowBegin() {
   ibRowKey = []
   ibRowN = []
+  cellHeapMemo = Map()
   return 0
 }
 
@@ -4155,12 +4159,41 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       return irBLetTempTy(b, gr, ix, cellRep, at)
     }
     if member { return irBLetTempTy(b, gr, ix, cellRep, gh) }
+    noteCellHeap(d, rep)
     return irBLetTempTy(b, gr, ix, rep, globalReadTy(d, ix, rep))
   }
   if dn is FuncDecl && repNodeAt(rep) is RClosure {
     return cloValue(b, ix, rep, heldTy(exprTyOf(ix)))
   }
   return irBMiss("read of " + n.identName)
+}
+
+// Notes a struct cell's heap (`globalCellStructIdx`) for the record rep `rep` it is read at, where
+// that rep's type has no heap of its own and its fields lower alike with, or widen to, the cell
+// row's own; a second cell of that rep on another heap unnotes it.
+function noteCellHeap(d: i32, rep: i32) {
+  if !(repNodeAt(rep) is RRecord) { return 0 }
+  const key = i32ToStr(d) + ":" + i32ToStr(rep) + ":" + i32ToStr(repTyOf(rep))
+  const memo = cellHeapMemo[key] ?? -2
+  const h = if memo != -2 { memo } else { cellHeapOf(d, rep) }
+  cellHeapMemo[key] = h
+  return irRecHeapNoteOne(ib, rep, h)
+}
+
+// Each (global, rep, type) answer `cellHeapOf` gave in this program's emit (`irShadowBegin`).
+let cellHeapMemo: {[string]: i32} = Map()
+
+function cellHeapOf(d: i32, rep: i32): i32 {
+  if recHeapOf(rep) >= 0 || globalCellKind(d) != "struct" { return -1 }
+  const row = globalCellStructIdx(d)
+  const h = structRowHeap(row)
+  const rr = repNodeOfTy(slotRowTyOf(row))
+  if h < 0 || rr < 0 || recHeapOf(rr) != h { return -1 }
+  const hs: {[i32]: i32} = Map()
+  hs[rep] = h
+  recHeapsNote(hs, rr)
+  if !repsLowerAlike(rep, rr, hs) && !recFieldsWiden(rep, rr, hs) { return -1 }
+  return h
 }
 
 // A `string | null` capture read where its type bears no null: its slot, then the `ref.as_non_null`
