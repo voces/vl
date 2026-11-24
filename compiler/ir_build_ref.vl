@@ -21,10 +21,11 @@ import {
   SIf,
   SLet,
   StrOp,
+  coalArmStagesLeads,
   repPrim,
   repWhat,
 } from "./ir"
-import { unwrapParen } from "./emit_base"
+import { exprEffectFree, unwrapParen } from "./emit_base"
 import {
   letBindIsAtom,
   letBindIsNulAtom,
@@ -185,12 +186,15 @@ function refRepOk(r: i32, _ty: i32): boolean {
 
 function missed(o: Opnd): boolean { return o is OVar && o.ov < 0 }
 
-// Whether a tagged call's stash or a valued `if` is among the receiver nodes `b` holds from `at`:
-// legacy writes the receiver, of any expression, inside the element read it receives.
+// Whether a tagged call's stash, a valued `if` or a staging `??` is among the receiver nodes `b`
+// holds from `at`: legacy writes the receiver, of any expression, inside the element read it
+// receives.
 function receiverStmtLeads(f: IrFn, b: i32[], at: i32): boolean {
   let j = at
   while j < b.length {
-    if tagStashAt(f, b[j]) || valuedIfAt(f, b[j]) { return true }
+    if tagStashAt(f, b[j]) || valuedIfAt(f, b[j]) || stagingCoalAt(f, b[j]) {
+      return true
+    }
     j = j + 1
   }
   return false
@@ -206,6 +210,13 @@ function tagStashAt(f: IrFn, id: i32): boolean {
 function valuedIfAt(f: IrFn, id: i32): boolean {
   const n = f.irNodes[id]
   return n is SIf && n.siOut >= 0
+}
+
+// Whether node `id` is a `??` that writes the operands staged before it below its `if`
+// (`coalArmStagesLeads`), as a valued `if` does.
+function stagingCoalAt(f: IrFn, id: i32): boolean {
+  const n = f.irNodes[id]
+  return n is SCoalBox && coalArmStagesLeads(n.cbArm)
 }
 
 // Legacy's row spans a whole element read `ix`, a receiver a fused coalesce, a valued `if` or a
@@ -354,9 +365,15 @@ function armSiteRead(b: i32[], ix: i32, rep: i32): Opnd {
   if on >= 0 {
     const i = irBExpr(b, on)
     if missed(i) { return irBMiss("index operand") }
-    // A map arm's key is written as its literal: a plain string key needs no conversion.
+    // A map arm's key is written as its literal: a plain string key needs no conversion. An index
+    // that calls and writes nothing is built once ahead of the chain, where legacy writes it again
+    // in the one arm that runs (Q57: the same value, read before the tag test).
     const lit = i is OStr && i.osAt == on
-    if !readsAgain(i) && !lit { return irBMiss("arm site operand") }
+    const once = !readsAgain(i)
+      && !lit
+      && exprEffectFree(on)
+      && repPrim(irBOpRep(i)) == "i32"
+    if !readsAgain(i) && !lit && !once { return irBMiss("arm site operand") }
     ops.push(i)
   }
   const r: Rhs = { asOps: ops, asAt: ix, asStash: !named }
