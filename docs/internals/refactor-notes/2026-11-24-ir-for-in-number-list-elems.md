@@ -23,7 +23,19 @@ None new.
 
 ## Readings (fixpoint seeds on both sides, base #9892's head 4d4ca865)
 
-READINGS
+Each arm measured with `VL_IR_SHADOW=4 vl check --codegen --compiler <that arm's seed>`, the base
+seed built from `git archive 4d4ca865` (#9892's head). Functions with no blocker: tests/cases 83,899
+-> 83,908; distilled corpus 46,884 -> 46,884 (no corpus cell). `for in element f64list` 4 sole ->
+0, `i64list` -> 0, the `nulu8list` start -> 0. No program loses a function.
+
+| tests/cases program | change |
+| --- | ---: |
+| `lists/for-in-number-list-elements.vl` (new witness) | +4 |
+| `arrays/nested-array-for-in.vl` | +2 |
+| `generics/generic-nested-list-literal-pin.vl` | +2 |
+| `maps/forin-list-valued-values.vl` | +1 |
+
+The 11 armed tests/cases mismatches are the same on both seeds: master's, not this change.
 
 ## Witnesses and the position sweep (Q58)
 
