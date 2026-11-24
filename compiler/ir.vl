@@ -4,6 +4,7 @@
 // `emit_rep.vl` tree node (`repNodeOfTy`), valid only within the rebuild epoch that produced it,
 // and a type a checker arena index. Conversions arrive as one coercion node with `coercionAt`
 // (step I3).
+import { i32ListHas } from "./listutil"
 import { i32ToStr } from "./ast"
 import { RefJoin } from "./emit_plan_if_join"
 import { recordHeapOfTy, recordHeapSubOf } from "./emit_shape_intern"
@@ -133,11 +134,11 @@ export type RBoxNarrow = {
   bnAtom: i32,
   bnCon: i32,
 }
-// A box value narrowed to a record arm, unboxed at a record destination as legacy's
-// `emitArmUnboxCast` writes it after the box: the payload cast to the arm's heap, `uaAt` the read.
-// `uaCellNul`: the destination is a binding whose cell is a nullable arm, which legacy casts to as
-// a nullable ref whatever the value's own nullability (`emitLetDelivery`).
-export type RArmUnbox = { uaV: Opnd, uaAt: i32, uaCellNul: boolean }
+// A box narrowed to a record arm, or with `uaDst` (else -1) a union whose arms are all records
+// stored at that record rep's heap, unboxed at a record destination as `emitArmUnboxCast` writes it.
+// `uaAt` is the read; `uaCellNul` a binding whose cell is a nullable arm, which legacy casts to as a
+// nullable ref whatever the value's own nullability (`emitLetDelivery`).
+export type RArmUnbox = { uaV: Opnd, uaAt: i32, uaCellNul: boolean, uaDst: i32 }
 // An element read `asAt` through a union-of-lists box variable `asV`, written by legacy's tag chain
 // (`armSiteWrite`) per arm with `asIx`, a variable or an immediate, as its index.
 export type RArmSite = { asV: Opnd, asIx: Opnd, asAt: i32 }
@@ -250,8 +251,15 @@ export type RTruncSat = {
 // A memory-management intrinsic at call node `moAt` over its i32 operands (`memOpPlanOf`).
 export type RMemOp = { moArgs: Opnd[], moAt: i32 }
 // `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on;
-// `lgStored` where the builder built it at its storage (`isStorageRead`).
-export type RListGet = { lgV: Opnd, lgIx: Opnd, lgAt: i32, lgStored: boolean }
+// `lgStored` where the builder built it at its storage (`isStorageRead`). `lgAgain`: the read as
+// `irHoistRecv` writes it once more, a temp operand read again, not taken.
+export type RListGet = {
+  lgV: Opnd,
+  lgIx: Opnd,
+  lgAt: i32,
+  lgStored: boolean,
+  lgAgain: boolean,
+}
 // `llAt`: the `.length` `Member` node, which legacy's hoist and view decisions key on.
 export type RListLen = { llV: Opnd, llAt: i32 }
 // `nwV`, of number kind `nwSrc`, widened to kind `nwDst` at delivery node `nwAt` (kinds as
@@ -259,7 +267,9 @@ export type RListLen = { llV: Opnd, llAt: i32 }
 export type RNumWiden = { nwV: Opnd, nwSrc: i32, nwDst: i32, nwAt: i32 }
 // A standalone `?.` at node `orAt` over the chain base `orV`, read twice: its null test and leaf
 // head, then the base as non-null and the leaf's tail, as `emitOptMemberValueGo` writes them.
-export type ROptRead = { orV: Opnd, orAt: i32 }
+// With `orTag` at least 0, `orAt` is an `is` over `x?.f`, a record's box field, which legacy's
+// `optField` arm writes as that null test, then the field's tag compared with `orTag`.
+export type ROptRead = { orV: Opnd, orAt: i32, orTag: i32 }
 // A numeric `as` at cast node `ncAt` over operand `ncV`, built at the kind `numCastKindOf`
 // names; legacy's `numCastTail` writes the conversion, and an `as!`'s test and trap.
 export type RNumCast = { ncV: Opnd, ncAt: i32 }
@@ -320,6 +330,30 @@ export type RUnionConcreteEq = {
   ucAt: i32,
 }
 export type RUnionEq = { ueL: Opnd, ueR: Opnd, ueNe: boolean, ueAt: i32 }
+// A union box `uvBox` against the record `uvOther` at `uvAt` (`uvSwap`: the box on the right), on
+// legacy's variant door.
+// A union box `ncBox` against the number `ncOther` of kind `ncKind` at `ncAt` (`ncSwap`: the box on
+// the right), on legacy's cross-width door: each number arm compared at the wider kind.
+export type RUnionNumCrossEq = {
+  ncBox: Opnd,
+  ncOther: Opnd,
+  ncKind: i32,
+  ncNe: boolean,
+  ncSwap: boolean,
+  ncAt: i32,
+}
+// One step of a staged union compare at `usAt` (`emitUnionEqStaged`, arm kind `usKind`): `usOp` 0
+// opens its level, 1 parks the box `usV`, 2 parks the operand `usV`, 3 closes the level.
+export type RUnionStage = { usOp: i32, usV: Opnd, usKind: i32, usAt: i32 }
+// A staged union compare's value at `uqsAt`: the plan's tails over the parked sides.
+export type RUnionStagedEq = { uqsNe: boolean, uqsSwap: boolean, uqsAt: i32 }
+export type RUnionVariantEq = {
+  uvBox: Opnd,
+  uvOther: Opnd,
+  uvNe: boolean,
+  uvSwap: boolean,
+  uvAt: i32,
+}
 // The `==` (or `!=`) of two lists at compare node `qeAt`, written by legacy's list compare
 // (`listEqTail`) after each operand's own recovery (`listEqOperandTail`).
 export type RListEq = { qeL: Opnd, qeR: Opnd, qeAt: i32 }
@@ -543,6 +577,9 @@ export type RResultPick = { rkV: Opnd, rkAt: i32, rkFe: i32 }
 // The member closure argument `hpI` (node `hpArg`) of direct call `hpAt` hands of the bundle record
 // `hpV` it reads, as `bundleMemberPickOf` (legacy's `emitBundleMemberPick`) names it.
 export type RHandPick = { hpV: Opnd, hpAt: i32, hpArg: i32, hpI: i32 }
+// The member annotated binding `hkAt` takes of the bundle holder record `hkV` its initializer
+// `hkArg` reads, as legacy's `emitTypedHolderInit` picks it (`typedHolderMember`).
+export type RHolderPick = { hkV: Opnd, hkAt: i32, hkArg: i32 }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
 // reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing. `tag64`
@@ -587,6 +624,7 @@ export type Rhs = RArmSite
   | RGetField
   | RGlobalGet
   | RHandPick
+  | RHolderPick
   | RHoleOptBox
   | RInitProgress
   | RJoinNull
@@ -662,6 +700,10 @@ export type Rhs = RArmSite
   | RTruncSat
   | RUnionConcreteEq
   | RUnionEq
+  | RUnionNumCrossEq
+  | RUnionStage
+  | RUnionStagedEq
+  | RUnionVariantEq
   | RVariantChain
   | RVariantDiscrim
 
@@ -1244,6 +1286,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RGetField |
       RGlobalGet |
       RHandPick |
+      RHolderPick |
       RHoleOptBox |
       RInitProgress |
       RJoinNull |
@@ -1319,6 +1362,10 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RTruncSat |
       RUnionConcreteEq |
       RUnionEq |
+      RUnionNumCrossEq |
+      RUnionStage |
+      RUnionStagedEq |
+      RUnionVariantEq |
       RVariantChain |
       RVariantDiscrim => false
   }
@@ -1643,6 +1690,10 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RNumIs => [r.niV]
     RUnionConcreteEq => [r.ucBox, r.ucOther]
     RUnionEq => [r.ueL, r.ueR]
+    RUnionVariantEq => [r.uvBox, r.uvOther]
+    RUnionStage => [r.usV]
+    RUnionStagedEq => []
+    RUnionNumCrossEq => [r.ncBox, r.ncOther]
     RListEq => [r.qeL, r.qeR]
     RClosureEq => [r.cqL, r.cqR]
     RListCat => [r.ljL, r.ljR]
@@ -1662,6 +1713,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RBundlePick => [r.bpV]
     RResultPick => [r.rkV]
     RHandPick => [r.hpV]
+    RHolderPick => [r.hkV]
     RRawOp => r.rwArgs
     RRel => []
     RStage => [r.sgV]
@@ -1722,7 +1774,9 @@ function rhsText(r: Rhs): string {
       + ")"
     RListSlice => "slice " + opndText(r.scV) + ", " + opndsText(r.scArgs)
     RNumWiden => "widen " + opndText(r.nwV)
-    ROptRead => "opt_read " + opndText(r.orV)
+    ROptRead => "opt_read "
+      + opndText(r.orV)
+      + (if r.orTag >= 0 { " is tag " + i32ToStr(r.orTag) } else { "" })
     RNumCast => "cast " + opndText(r.ncV)
     RToBox => "box " + opndText(r.bxV)
     RHoleOptBox => "hole opt box " + opndText(r.hxV)
@@ -1756,6 +1810,10 @@ function rhsText(r: Rhs): string {
       + " "
       + opndText(r.ucOther)
     RUnionEq => "union.eq " + opndText(r.ueL) + " " + opndText(r.ueR)
+    RUnionVariantEq => "union.eqv " + opndText(r.uvBox) + " " + opndText(r.uvOther)
+    RUnionStage => "union.stage " + i32ToStr(r.usOp) + " " + opndText(r.usV)
+    RUnionStagedEq => "union.eqs"
+    RUnionNumCrossEq => "union.eqx " + opndText(r.ncBox) + " " + opndText(r.ncOther)
     RListEq => "list.eq " + opndText(r.qeL) + " " + opndText(r.qeR)
     RClosureEq => "closure_eq(" + opndText(r.cqL) + ", " + opndText(r.cqR) + ")"
     RListCat => "list.cat " + opndText(r.ljL) + " " + opndText(r.ljR)
@@ -1831,6 +1889,7 @@ function rhsText(r: Rhs): string {
     RBundlePick => "bundle pick " + opndText(r.bpV)
     RResultPick => "result pick " + opndText(r.rkV)
     RHandPick => "hand pick " + opndText(r.hpV)
+    RHolderPick => "holder pick " + opndText(r.hkV)
     RGlobalGet => "global " + i32ToStr(r.ggSym) + (if r.ggNonNull { " nonnull" } else { "" })
   }
 }
@@ -2099,7 +2158,11 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RTagStash |
       RToBox |
       RUnionConcreteEq |
-      RUnionEq => "scalar"
+      RUnionEq |
+      RUnionNumCrossEq |
+      RUnionStage |
+      RUnionStagedEq |
+      RUnionVariantEq => "scalar"
     RCall | RCallHost | RPrint => "call"
     RGlobalGet | RInitProgress => "global"
     RCoerce |
@@ -2157,6 +2220,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       REnvDrop |
       REnvGet |
       RHandPick |
+      RHolderPick |
       RMakeClo |
       RResultPick => "closure"
     RCellGet |
@@ -2329,8 +2393,8 @@ export function ifCondLetAt(f: IrFn, b: i32[], i: i32): boolean {
   return c is OVar && c.ov == l.lDst
 }
 
-// Whether a list at rep `src` is the list at rep `dst` as it stands: the same record elements, one
-// side's possibly `| null`, which one ref list holds (its backing is already nullable).
+// Whether a list at rep `src` is the list at rep `dst` as it stands: the same record, list or map
+// elements, one side's possibly `| null`, which one ref list holds (its backing is already nullable).
 export function listRetag(src: i32, dst: i32): boolean {
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
@@ -2409,13 +2473,27 @@ function repFillsHole(f: IrFn, src: i32, dst: i32, inClo: boolean): boolean {
       && a.rcVoid == d.rcVoid
       && repsFillHoles(f, a.rcParams, d.rcParams, true)
       && repFillsHole(f, a.rcRet, d.rcRet, true)
+    // Every union lowers to the one box, its tags program-global, so two unions of one member set
+    // in either order are one value.
+    RBox => a is RBox && sameArmSet(a.rbArms, d.rbArms)
     RAtom |
-      RBox |
       RMap |
       RNoValue |
       RPrim |
       RRaw => false
   }
+}
+
+// Whether arm lists `a` and `b` hold the same arms, in any order.
+function sameArmSet(a: i32[], b: i32[]): boolean {
+  if a.length != b.length { return false }
+  for x in a {
+    if !i32ListHas(b, x) { return false }
+  }
+  for y in b {
+    if !i32ListHas(a, y) { return false }
+  }
+  return true
 }
 
 // Whether each of reps `src` fills the hole of the same-placed rep of `dst`.
@@ -2685,18 +2763,19 @@ export function recHeapOf(r: i32): i32 {
   return recordHeapOfTy(repTyOf(r))
 }
 
-// The record rep of list element `e`, under a `| null`, or -1.
+// The record, list or map rep of list element `e`, under a `| null`, or -1.
 function recElemCore(e: i32): i32 {
   const n = repNodeAt(e)
   if n == null { return -1 }
   return match n {
-    RRecord => e
-    RNullable => if repNodeAt(n.rnInner) is RRecord { n.rnInner } else { -1 }
+    RRecord | RList | RMap => e
+    RNullable => {
+      const i = repNodeAt(n.rnInner)
+      if i is RRecord || i is RList || i is RMap { n.rnInner } else { -1 }
+    }
     RAtom |
       RBox |
       RClosure |
-      RList |
-      RMap |
       RNoValue |
       RPrim |
       RRaw |

@@ -5615,7 +5615,7 @@ function emitListFitGrowLen(m: Member, memIx: i32, fnIx: i32): i32 {
 // in with, or -1 (D4935): only an `is K[]` fitting an empty list of other elements types it so. A
 // read at a type parameter's list takes the region's `K[]` when `anyPos` or delivered whole. Two
 // record lists are not told apart, since rows of one shape alias.
-function listFitCaptureStandIn(
+export function listFitCaptureStandIn(
   name: string,
   exprIx: i32,
   fnIx: i32,
@@ -6808,6 +6808,23 @@ export function isArmTagOf(isIx: i32, nd: IsExpr, fnIx: i32): i32 {
   return isArmTagOfTyAt(isArmPatTy(isIx, nd, fnIx), nd.isObj, fnIx)
 }
 
+// After an `optField` receiver's null test: `false` for a null receiver, else the receiver.
+export function optFieldIsOpen() {
+  fbIf(127)
+  fbI32Const(0)
+  fbElse()
+  return 0
+}
+
+// After the non-null receiver of struct row `si`: field `prop`'s box and its tag compared with
+// `tag`, closing `optFieldIsOpen`'s `if`.
+export function optFieldIsTail(si: i32, prop: string, tag: i32) {
+  fbStructGet(sHeapIdx[si], sFieldIndex(si, prop))
+  boxTagIsTail(tag)
+  fbEnd()
+  return 0
+}
+
 // The box-tag arm `arm` of `is` test `isIx`; 1 once written, -1 on failure.
 function emitIsTestArmTag(isIx: i32, ndv: IsExpr, fnIx: i32, arm: TagIsArm) {
   const patTy = isArmPatTy(isIx, ndv, fnIx)
@@ -6887,13 +6904,9 @@ function emitIsTestArmTag(isIx: i32, ndv: IsExpr, fnIx: i32, arm: TagIsArm) {
       const sv = optRecvStageSave()
       optRecvStageMark(vrecv.omObj)
       if emitOptChainIsNull(vrecv.omObj, fnIx) < 0 { return -1 }
-      fbIf(127)
-      fbI32Const(0)
-      fbElse()
+      optFieldIsOpen()
       if emitOptChainValue(vrecv.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[si], sFieldIndex(si, vrecv.omProp))
-      boxTagIsTail(armTag)
-      fbEnd()
+      optFieldIsTail(si, vrecv.omProp, armTag)
       optRecvStageRestore(sv)
       1
     }
@@ -10238,6 +10251,13 @@ function emitUnionIfArm(
   if b is Block {
     const tv = ifArmValueExpr(blockIx)
     if tv >= 0 {
+      // A hole's map read `??` with no type of its own joins into the same box as its null-test
+      // `if`, each arm boxed at its own member, not boxed whole at one member's tag (D17085).
+      const hm = untypedHoleMapCoalIf(tv, fnIx)
+      if hm >= 0 {
+        if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        return emitIfArmClose(emitUnionIfValue(unionName, unionTy, hm, fnIx))
+      }
       if tailIsValueOrNever(tv, fnIx) {
         if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
         // The if-value's result is the union box (the blocktype), so a concrete-variant arm — a
@@ -10262,6 +10282,18 @@ function emitUnionIfArm(
     return ifArmNoValueFail("union if-expression arm", blockIx)
   }
   return emitFail("emitProgram: union if-expression arm is not a block")
+}
+
+// The null-test `if` of a hole's map read `??` at `tv` whose result has no type of its own, as a
+// re-associated chain's minted inner link has none, else -1.
+export function untypedHoleMapCoalIf(tv: i32, fnIx: i32): i32 {
+  const co = plainCoalesceAt(tv)
+  if co == null { return -1 }
+  const u = unwrapParen(tv)
+  if coalArmOf(co, u, fnIx) != "holeMap" { return -1 }
+  const rt = coalResultTyOf(u, fnIx)
+  if rt >= 0 && rt < T.tys.length && !(tyAt(rt) is TyVar) { return -1 }
+  return coalHoleMapIfOf(co, u, fnIx)
 }
 
 // ── the narrowed-arm delivery unbox (D1031) ──────────────────────────────────
@@ -10291,6 +10323,29 @@ function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32, fnIx: i32) {
   if !armUnboxCastOwed(heapIdx, exprIx, fnIx) { return 0 }
   armSrcShadowNote(heapIdx, exprIx, fnIx)
   return emitArmUnboxCast(heapIdx, armUnboxNullable(exprIx, fnIx))
+}
+
+// The unbox `emitArmDelivery` writes after union value `exprIx` at a slot of heap `heapIdx` where
+// every arm is a record stored there (`exprRecordArmsAt`, D16321): its payload cast to the heap.
+// -1 with nothing written where it owes none.
+export function emitRecordArmsUnboxTo(
+  heapIdx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  if !exprRecordArmsAt(exprIx, fnIx, heapIdx) { return -1 }
+  return emitNarrowedArmUnboxTo(heapIdx, exprIx, fnIx)
+}
+
+// Whether union value `exprIx` owes the cast `emitRecordArmsUnboxTo` writes at record heap
+// `heapIdx`: every arm a record stored there, and the value a box the table delivers unboxed.
+export function recordArmsUnboxOwedAt(
+  heapIdx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): boolean {
+  return exprRecordArmsAt(exprIx, fnIx, heapIdx)
+    && narrowedArmNeedsUnbox(exprIx, fnIx)
 }
 
 // Whether a value `narrowedArmNeedsUnbox` owes is a box to cast to `heapIdx`. A union of records is
@@ -10917,12 +10972,10 @@ function emitUnionConcreteEq(
   // The plain arm: the box read twice, the operand once, through the plan the IR writes too.
   const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
   // An operand with effects runs whatever the box holds: both sides are read once, in source
-  // order, ahead of the tag test (D17068). The IR claims only an operand it reads in place.
-  if !exprEffectFree(unwrapParen(otherIx)) {
-    const pp = if qp.uqKind >= 0 { qp } else { unionEqStashPlanOf(boxIx, otherIx, fnIx) }
-    if pp.uqKind >= 0 {
-      return emitUnionEqStaged(boxIx, otherIx, pp, isNe, boxLeft, fnIx)
-    }
+  // order, ahead of the tag test (D17068).
+  const pp = unionEqStagedPlanOf(boxIx, otherIx, fnIx)
+  if pp.uqKind >= 0 {
+    return emitUnionEqStaged(boxIx, otherIx, pp, isNe, boxLeft, fnIx)
   }
   if qp.uqKind >= 0 {
     unionEqHead()
@@ -11144,24 +11197,75 @@ function emitUnionEqStaged(
   boxLeft: boolean,
   fnIx: i32,
 ): i32 {
+  if unionEqStageOpen(qp.uqKind) < 0 { return -1 }
+  let rc = 0
+  if boxLeft {
+    rc = emitExpr(boxIx, fnIx)
+    if rc >= 0 { unionEqStageSetBox() }
+  }
+  if rc >= 0 { rc = emitUnionEqOther(otherIx, qp.uqKind, fnIx) }
+  if rc >= 0 { unionEqStageSetOther(qp.uqKind) }
+  if rc >= 0 && !boxLeft {
+    rc = emitExpr(boxIx, fnIx)
+    if rc >= 0 { unionEqStageSetBox() }
+  }
+  unionEqStageClose()
+  if rc < 0 { return -1 }
+  return unionEqStagedTail(qp, isNe, fnIx)
+}
+
+// The plan of a union `==` whose operand has effects, read with the box once each in source order
+// (`emitUnionEqStaged`); `uqKind` -1 where another arm writes it.
+export function unionEqStagedPlanOf(
+  boxIx: i32,
+  otherIx: i32,
+  fnIx: i32,
+): UnionEqPlan {
+  const no: UnionEqPlan = { uqKind: -1, uqTag: -1 }
+  if exprEffectFree(unwrapParen(otherIx)) { return no }
+  const qp = unionConcreteEqPlanOf(boxIx, otherIx, fnIx)
+  if qp.uqKind >= 0 { return qp }
+  return unionEqStashPlanOf(boxIx, otherIx, fnIx)
+}
+
+// Opens a staged compare at arm kind `k`: this level's operand and box slots, in that order, then
+// one level deeper for a compare nested in a side. -1 where the kind has no slot.
+export function unionEqStageOpen(k: i32): i32 {
+  const lvl = unionEqStageDepth * 100000
+  if unionEqStagedOperandSlot(k, lvl) < 0 { return -1 }
+  unionEqOperandSlot(lvl + 6)
+  unionEqStageDepth = unionEqStageDepth + 1
+  return 0
+}
+
+// After the staged compare's box: parked in the open level's box slot.
+export function unionEqStageSetBox(): i32 {
+  fbLocalSet(unionEqOperandSlot((unionEqStageDepth - 1) * 100000 + 6))
+  return 0
+}
+
+// After the staged compare's operand at kind `k`: parked in the open level's operand slot.
+export function unionEqStageSetOther(k: i32): i32 {
+  fbLocalSet(unionEqStagedOperandSlot(k, (unionEqStageDepth - 1) * 100000))
+  return 0
+}
+
+// Closes the staged compare's level.
+export function unionEqStageClose(): i32 {
+  unionEqStageDepth = unionEqStageDepth - 1
+  return 0
+}
+
+// After a staged compare's sides are parked: the plan's tails over this level's slots.
+export function unionEqStagedTail(
+  qp: UnionEqPlan,
+  isNe: boolean,
+  fnIx: i32,
+): i32 {
   const lvl = unionEqStageDepth * 100000
   const os = unionEqStagedOperandSlot(qp.uqKind, lvl)
   if os < 0 { return -1 }
   const bs = unionEqOperandSlot(lvl + 6)
-  unionEqStageDepth = unionEqStageDepth + 1
-  let rc = 0
-  if boxLeft {
-    rc = emitExpr(boxIx, fnIx)
-    if rc >= 0 { fbLocalSet(bs) }
-  }
-  if rc >= 0 { rc = emitUnionEqOther(otherIx, qp.uqKind, fnIx) }
-  if rc >= 0 { fbLocalSet(os) }
-  if rc >= 0 && !boxLeft {
-    rc = emitExpr(boxIx, fnIx)
-    if rc >= 0 { fbLocalSet(bs) }
-  }
-  unionEqStageDepth = unionEqStageDepth - 1
-  if rc < 0 { return -1 }
   fbLocalGet(bs)
   unionEqTagTail(qp)
   fbLocalGet(bs)
@@ -11278,30 +11382,70 @@ function emitUnionConcreteVariantEq(
   isNe: boolean,
   fnIx: i32,
 ) {
+  const vi = concreteVariantRowOf(otherIx, fnIx)
+  if vi < 0 { return -1 }
+  unionVariantEqHead(vi)
+  // Both operands ride the wasm stack until both are computed, and only then are they parked.
+  // The scratch slots are shared per function, so a union `==` nested inside `otherIx` re-uses
+  // them; a stack value cannot be reached that way, and no user code runs after the second.
+  if emitExpr(boxIx, fnIx) < 0 { return -1 }
+  if emitExpr(otherIx, fnIx) < 0 { return -1 }
+  return unionVariantEqTail(vi, otherIx, isNe, fnIx)
+}
+
+// The arm row a union `==` against the concrete record `otherIx` compares at, or -1 where its
+// tables do not cover it: a row they do not cover must decline, never read out of bounds.
+function concreteVariantRowOf(otherIx: i32, fnIx: i32): i32 {
   const vi = eqConcreteVariantRow(otherIx, fnIx)
   if vi < 0 { return -1 }
-  // The same four parallel-table bounds the struct union compare takes before it writes a byte,
-  // for the same reason: a variant row the emitter's tables do not cover must DECLINE, never
-  // read out of bounds (`emitFail does not halt`).
-  if vi >= uVarRow.length { return -1 }
-  if vi >= uTags.length { return -1 }
-  if vi >= uFieldStart.length { return -1 }
-  if vi >= uFieldCount.length { return -1 }
+  if vi >= uVarRow.length || vi >= uTags.length { return -1 }
+  if vi >= uFieldStart.length || vi >= uFieldCount.length { return -1 }
   if !variantFieldsComparable(vi) { return -1 }
+  return vi
+}
+
+// The arm row of a union `==` legacy writes on its variant door (`emitUnionConcreteVariantEq`):
+// an operand with no atom kind, or a union the value-union gate refuses; -1 for another arm.
+export function unionEqVariantRowOf(boxIx: i32, otherIx: i32, fnIx: i32): i32 {
+  const unr: i32[] = []
+  const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
+  const usid = msSetOfUnionBox(boxIx, fnIx)
+  const eak = unionEqAtomKindOf(
+    otherIx,
+    usid,
+    unionBoxTyOfRead(boxIx, fnIx),
+    fnIx,
+  )
+  if eak >= 0 {
+    let has = unionEqArmPresent(usid, valueAtomNameOfKind(eak), eak)
+    if !has && eak == 2 && msSetTakesAtomAsStr(usid) { has = true }
+    const gate = isValueUnionOfSet(usid, unr[1])
+      || unionCarriesLitUnionArmOfSet(usid, unr[1])
+      || has
+    if uname != "" && gate { return -1 }
+  }
+  return concreteVariantRowOf(otherIx, fnIx)
+}
+
+// Before a variant compare's operands: its stash and the arm row's operand slot, in legacy's order.
+export function unionVariantEqHead(vi: i32): i32 {
+  unionEqStashSlot()
+  unionEqArmSlot(vi + 1024)
+  return 0
+}
+
+// After the box and the record operand on the stack: both parked, a nullable operand's null
+// against the box's null tag, then the arm's tag and its fields compared (`emitVariantFieldsEq`).
+export function unionVariantEqTail(
+  vi: i32,
+  otherIx: i32,
+  isNe: boolean,
+  fnIx: i32,
+): i32 {
   const sl = unionEqStashSlot()
   const ar = unionEqArmSlot(vi + 1024)
-  // Both operands ride the wasm stack until both are computed, and only then are they parked.
-  // The three scratch slots here are shared per function, not per site, so a union `==` nested
-  // inside `otherIx` re-enters this function and re-uses the same slots. A stack value cannot be
-  // reached that way, and after the second operand lands no user code runs before the compare.
-  if emitExpr(boxIx, fnIx) < 0 { return -1 }
   // A nullable record at the instance is read raw, and its null equals the box's null arm.
   const otherNul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
-  if otherNul {
-    if emitExpr(otherIx, fnIx) < 0 { return -1 }
-  } else if emitExpr(otherIx, fnIx) < 0 {
-    return -1
-  }
   fbLocalSet(ar) // pops the concrete operand, leaving the box on top
   fbLocalSet(sl)
   if otherNul {
@@ -11439,24 +11583,92 @@ function emitUnionConcreteNumCross(
   u: i32,
   fnIx: i32,
 ): i32 {
-  const kinds: i32[] = []
   const tys: i32[] = []
   if !(u >= 0 && unionMemberTysOfRow(u, tys)) {
     if !unionTyMemberTys(tyPeelNul(unionBoxTyOfRead(boxIx, fnIx)), tys) {
       return emitFail(UNION_NUM_CROSS_NO_TYS_MSG)
     }
   }
-  for t in tys { kinds.push(boxAtomKindOfMemberTy(t)) }
+  const kas = numCrossKindsOf(tys, eak)
+  if kas.length == 0 { return 0 }
+  unionNumCrossHead(eak)
+  if emitExpr(boxIx, fnIx) < 0 { return -1 }
+  unionNumCrossBoxTail()
+  if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
+  return if unionNumCrossTail(kas, eak, isNe) < 0 { -1 } else { 1 }
+}
+
+// The box's number arm kinds of member types `tys` that compare with kind `eak` at a wider kind.
+function numCrossKindsOf(tys: i32[], eak: i32): i32[] {
   const kas: i32[] = []
-  for ka in kinds {
+  for t in tys {
+    const ka = boxAtomKindOfMemberTy(t)
     if ka != eak && numEqOpOfKind(wideKindOf(ka, eak)) >= 0 { kas.push(ka) }
   }
-  if kas.length == 0 { return 0 }
+  return kas
+}
+
+// The number arm kinds legacy's cross-width door (`emitUnionConcreteNumCross`) compares box
+// `boxIx` against `otherIx` at, past the value-union gate with no arm of the operand's kind; empty
+// for any other arm.
+export function unionNumCrossKindsOf(
+  boxIx: i32,
+  otherIx: i32,
+  fnIx: i32,
+): i32[] {
+  const none: i32[] = []
+  const unr: i32[] = []
+  const uname = unionNameRowOfExpr(boxIx, fnIx, unr)
+  const usid = msSetOfUnionBox(boxIx, fnIx)
+  const eak = unionEqAtomKindOf(
+    otherIx,
+    usid,
+    unionBoxTyOfRead(boxIx, fnIx),
+    fnIx,
+  )
+  if eak < 0 || uname == "" { return none }
+  let has = unionEqArmPresent(usid, valueAtomNameOfKind(eak), eak)
+  if !has && eak == 2 && msSetTakesAtomAsStr(usid) { has = true }
+  if has { return none }
+  if (
+    !isValueUnionOfSet(usid, unr[1])
+    && !unionCarriesLitUnionArmOfSet(usid, unr[1])
+  ) {
+    return none
+  }
+  const tys: i32[] = []
+  if !(unr[0] >= 0 && unionMemberTysOfRow(unr[0], tys)) {
+    if !unionTyMemberTys(tyPeelNul(unionBoxTyOfRead(boxIx, fnIx)), tys) {
+      return none
+    }
+  }
+  return numCrossKindsOf(tys, eak)
+}
+
+// The value-atom kind the operand of a union compare of box `boxIx` against `otherIx` is read at.
+export function unionEqOperandKindOf(boxIx: i32, otherIx: i32, fnIx: i32): i32 {
+  const usid = msSetOfUnionBox(boxIx, fnIx)
+  return unionEqAtomKindOf(otherIx, usid, unionBoxTyOfRead(boxIx, fnIx), fnIx)
+}
+
+// Before a cross-width compare's operands: its box slot and its operand slot at kind `eak`.
+export function unionNumCrossHead(eak: i32): i32 {
+  unionAsBoxSlot()
+  numCrossEqSlot(eak)
+  return 0
+}
+
+// After the cross-width compare's box: parked before the operand is read.
+export function unionNumCrossBoxTail(): i32 {
+  fbLocalSet(unionAsBoxSlot())
+  return 0
+}
+
+// After the operand at kind `eak`: parked, then each arm of `kas` tested and compared at the wider
+// kind, any other arm unequal, and `!=`'s negation.
+export function unionNumCrossTail(kas: i32[], eak: i32, isNe: boolean): i32 {
   const bs = unionAsBoxSlot()
   const os = numCrossEqSlot(eak)
-  if emitExpr(boxIx, fnIx) < 0 { return -1 }
-  fbLocalSet(bs)
-  if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
   fbLocalSet(os)
   for ka in kas {
     fbLocalGet(bs)
@@ -11477,7 +11689,7 @@ function emitUnionConcreteNumCross(
   fbI32Const(0)
   for _ka in kas { fbEnd() }
   if isNe { fbI32Eqz() }
-  return 1
+  return 0
 }
 
 // The kind two number kinds compare at: the one the other widens to, or -1 when neither does.
@@ -29544,6 +29756,10 @@ export function callRefArgPlain(
     return !narrowedArmNeedsUnbox(a, fnIx) && !exprNullableRecord(a, fnIx)
   }
   if k == "closure" { return !exprNulClosure(a, fnIx) }
+  // A nullable string, closure or map parameter takes the argument as it is, nullable or not:
+  // `emitNonNullParamRecover` writes nothing for it.
+  if k == "nulstr" || k == "nulclosure" { return true }
+  if k == "nulmap" { return !narrowedArmNeedsUnbox(a, fnIx) }
   if (
     k == "list"
     || k == "strlist"
