@@ -1685,6 +1685,8 @@ Deno.test({
       "map-read-out-unwritten": 5,
       "shared-read-of-temp": 2,
       "map-read-mv-into-wrong-out": 2,
+      "null-none-into-bool-niche": 2,
+      "null-none-into-ref-niche": 0,
       "nul-ref-of-i32": 2,
       "nul-ref-of-non-null-list": 2,
       "nul-ref-list-into-i32": 2,
