@@ -22,7 +22,8 @@
 // `--cases` runs the armed shadow over every `tests/cases` program instead, against
 // `ir-shadow-cases-baseline.txt`, which also holds that population's verifier failures. In both
 // populations a `bytes` class is never baselined: a claimable function whose bytes differ ships
-// them.
+// them, unless `scripts/ir-divergence-baseline.txt` lists it for that program (Q57), which prints
+// `expected divergence`. `--files` builds only the programs it names.
 
 import { IoError, readTextFile, writeTextFile } from "std:fs"
 import { programArgs } from "std:args"
@@ -39,6 +40,7 @@ const BASELINE = "scripts/silent-sweep/distilled/ir-shadow-baseline.txt"
 const CASES_BASELINE = "scripts/silent-sweep/distilled/ir-shadow-cases-baseline.txt"
 const FALLBACKS = "scripts/silent-sweep/distilled/claims-fallbacks.txt"
 const ORDER_BASELINE = "scripts/silent-sweep/distilled/ir-prepost-baseline.txt"
+const DIVERGENCE = "scripts/ir-divergence-baseline.txt"
 const ORDER = "prepost"
 const PREFIX = "[ir] "
 const CHUNK = 200
@@ -93,6 +95,7 @@ type Measured = {
   cells: i32,
   seen: Map<string, boolean>,
   broken: string[],
+  held: Map<string, Row[]>,
 }
 
 function bump(rows: Row[], key: string, n: i32) {
@@ -120,7 +123,12 @@ type Keying = "none" | "every row" | "fallback rows" | "order rows"
 // Adds the `[ir] <path>: <n>\t<row>` lines of one chunk's stderr into `m`, keyed by `keying`. A
 // verifier failure's row carries its function's IR on the lines after it; only its first line is
 // the class.
-function addRows(m: Measured, text: string, keying: Keying) {
+function addRows(
+  m: Measured,
+  text: string,
+  keying: Keying,
+  hold: Map<string, string[]>,
+) {
   let last = ""
   for line in split(text, "\n") {
     if !startsWith(line, PREFIX) { continue }
@@ -140,6 +148,12 @@ function addRows(m: Measured, text: string, keying: Keying) {
       || keying == "fallback rows"
       && startsWith(row, "claim fell back")
       || keying == "order rows" && startsWith(row, ORDER)
+    if !keyed && hold[path] != null {
+      const h = m.held[path] ?? []
+      bump(h, row, n ?? 0)
+      m.held[path] = h
+      continue
+    }
     bump(m.rows, if keyed { path + "\t" + row } else { row }, n ?? 0)
   }
   return 0
@@ -152,7 +166,17 @@ function measure(
   jobs: string,
   mode: string,
   keying: Keying,
+  hold: Map<string, string[]>,
 ): Measured {
+  const m: Measured = {
+    rows: [],
+    cells: 0,
+    seen: Map(),
+    broken: [],
+    held: Map(),
+  }
+  // No programs is no fan-out: an empty chunk would run `vl check` over the whole tree.
+  if paths.length == 0 { return m }
   const vl = envOr("VL", "scripts/vl-host/target/release/vl")
   const root = makeTempDir()
   const chunks: string[] = []
@@ -174,7 +198,6 @@ function measure(
     "sh",
     fanOutArgv(root + "/chunks", jobs, ["sh", "-c", sh, vl, seed]),
   )
-  const m: Measured = { rows: [], cells: 0, seen: Map(), broken: [] }
   if x.code != 0 {
     spawn("rm", ["-rf", root])
     die("ir-shadow: the chunk fan-out failed (rc=\{x.code})\n\{x.err}", 2)
@@ -183,7 +206,7 @@ function measure(
     const rc = parseI32(trim(readOr(f + ".rc")))
     // 0 and 1 are `vl check` grading the chunk; anything else is the chunk not finishing.
     if rc != 0 && rc != 1 { m.broken.push(f + " (rc=\{toString(rc ?? -1)})") }
-    addRows(m, readOr(f + ".err"), keying)
+    addRows(m, readOr(f + ".err"), keying, hold)
   }
   spawn("rm", ["-rf", root])
   return m
@@ -514,7 +537,7 @@ function orderCheck(
   for p in paths {
     if !(m.seen[p] ?? false) { rowless.push(p) }
   }
-  const plain = measure(rowless, seed, envOr("JOBS", "4"), "1", "none")
+  const plain = measure(rowless, seed, envOr("JOBS", "4"), "1", "none", Map())
   for b in plain.broken { print("ir-shadow: chunk did not finish: \{b}") }
   let red = plain.broken.length > 0
   let lost = 0
@@ -567,23 +590,130 @@ function orderCheck(
   return red
 }
 
+// ── chosen divergences (Q57) ─────────────────────────────────────────────────────
+
+// The programs `--files` names, up to the next flag; [] builds the usual population.
+function filesArg(args: readonly string[]): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < args.length && args[i] != "--files" { i = i + 1 }
+  i = i + 1
+  while i < args.length && !startsWith(args[i], "--") {
+    out.push(args[i])
+    i = i + 1
+  }
+  return out
+}
+
+// A `--names` function name as a detail row spells it: no `@<module>` suffix, the start `@start`.
+function shadowName(fn: string): string {
+  let n = fn
+  const at = lastIndexOf(n, "@")
+  if at > 0 && parseI32(n.slice(at + 1, n.length)) != null {
+    n = n.slice(0, at)
+  }
+  return if n == "__start__" { "@start" } else { n }
+}
+
+// Each program `ir-divergence-baseline.txt` lists, with its functions as detail rows spell them.
+function divergences(): Map<string, string[]> {
+  const out: Map<string, string[]> = Map()
+  const text = readTextFile(envOr("IR_DIVERGENCE_BASELINE", DIVERGENCE))
+  if text is IoError { return out }
+  for line in split(text, "\n") {
+    if line == "" || startsWith(line, "#") { continue }
+    const f = split(line, "\t")
+    if f.length != 4 {
+      die("ir-shadow: \{DIVERGENCE}: not four tab-separated fields: \{line}", 2)
+    }
+    const fns = out[f[0]] ?? []
+    fns.push(shadowName(f[1]))
+    out[f[0]] = fns
+  }
+  return out
+}
+
+// A row a chosen divergence accounts for: a byte mismatch, or the claim rule's fail for one.
+function bytesRow(key: string): boolean {
+  return bytesClass(key)
+    && (startsWith(key, "mismatch ")
+    || startsWith(key, "fail a claimable function did not match: "))
+}
+
+// Folds each listed program's held rows back into `m`, except its byte mismatches when the detail
+// build (`$VL_IR_SHADOW=2`) names every one, each a function listed for it: those print as
+// `expected divergence`. Otherwise they fold back too, so the byte check below reds on them.
+function subtract(m: Measured, hold: Map<string, string[]>, seed: string) {
+  const need: string[] = []
+  for p, rows in m.held {
+    let any = false
+    for r in rows { any = any || bytesRow(r.key) }
+    if any { need.push(p) }
+  }
+  sort(need, (a: string, b: string) => a < b)
+  const d = if need.length > 0 { measure(need, seed, envOr("JOBS", "4"), "2", "every row", Map()) } else { m }
+  for b in d.broken { m.broken.push(b) }
+  for p, rows in m.held {
+    let want = 0
+    for r in rows {
+      if bytesRow(r.key) && startsWith(r.key, "mismatch ") { want = want + r.n }
+    }
+    const listed = hold[p] ?? []
+    const named: string[] = []
+    const unlisted: string[] = []
+    let got = 0
+    for r in d.rows {
+      if !startsWith(r.key, p + "\tdetail ") { continue }
+      const row = r.key.slice(p.length + 1, r.key.length)
+      const at = lastIndexOf(row, " in ")
+      if !bytesClass(row.slice(7, at)) { continue }
+      const fn = row.slice(at + 4, row.length)
+      got = got + r.n
+      if indexOf(named, fn) < 0 { named.push(fn) }
+      if indexOf(listed, fn) < 0 && indexOf(unlisted, fn) < 0 {
+        unlisted.push(fn)
+      }
+    }
+    const ok = want > 0 && got == want && unlisted.length == 0
+    if ok {
+      print("ir-shadow: expected divergence \{p} (\{join(named, ", ")})")
+    } else if want > 0 && unlisted.length > 0 {
+      print(
+        "ir-shadow: \{p}: a byte mismatch in a function the divergence baseline does not list: \{join(unlisted, ", ")}",
+      )
+    } else if want > 0 {
+      print(
+        "ir-shadow: \{p}: \{toString(want)} byte mismatches, the detail build names \{toString(got)} (it names at most 3 a class)",
+      )
+    }
+    for r in rows {
+      if !ok || !bytesRow(r.key) { bump(m.rows, r.key, r.n) }
+    }
+  }
+  return 0
+}
+
 function main(args: readonly string[]) {
   const seed = argOr(args, "--seed", "build/vl-compiler.wasm")
   const cases = hasFlag(args, "--cases")
-  const paths = if cases { casesPaths() } else { corpus() }
+  const files = filesArg(args)
+  const paths = if files.length > 0 { files } else if cases { casesPaths() } else { corpus() }
   if paths.length == 0 { die("ir-shadow: no programs to build", 2) }
   const census = hasFlag(args, "--blockers")
   const claims = hasFlag(args, "--claims")
   const prepost = hasFlag(args, "--prepost")
   const mode = if census { "4" } else if claims { "5" } else if prepost { "6" } else { "1" }
+  const hold: Map<string, string[]> = if census || claims { Map() } else { divergences() }
   const m = measure(
     paths,
     seed,
     envOr("JOBS", "4"),
     mode,
     if prepost { "order rows" } else { "none" },
+    hold,
   )
   for b in m.broken { print("ir-shadow: chunk did not finish: \{b}") }
+  subtract(m, hold, seed)
   if claims {
     const want = loadFallbacks()
     const x = measure(
@@ -592,11 +722,19 @@ function main(args: readonly string[]) {
       envOr("JOBS", "4"),
       mode,
       "every row",
+      Map(),
     )
     for b in x.broken { print("ir-shadow: chunk did not finish: \{b}") }
     const root = makeTempDir()
     const wit = witnessPaths(root, seed)
-    const w = measure(wit, seed, envOr("JOBS", "4"), mode, "fallback rows")
+    const w = measure(
+      wit,
+      seed,
+      envOr("JOBS", "4"),
+      mode,
+      "fallback rows",
+      Map(),
+    )
     spawn("rm", ["-rf", root])
     for b in w.broken { print("ir-shadow: chunk did not finish: \{b}") }
     for r in w.rows {
