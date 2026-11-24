@@ -5105,18 +5105,10 @@ function emitListEmptyFitIs(isIx: i32, fnIx: i32): i32 {
       if p.efArm == "shadow" {
         const sh = listFitShadowSet(isIx, p.efRecvTy, p.efDepth, fnIx)
         if sh < 1 { return sh }
-        const rv = nodeAt(unwrapParen(nd.isObj))
-        if sh == 2 && rv is Ident {
-          grow = listFitGrowRow(unwrapParen(nd.isObj), isVarTyIxOf(isIx), fnIx)
-        }
+        if sh == 2 { grow = listFitGrowOf(isIx, fnIx) }
       }
       if p.efRepWhy != "" { return emitFailAt(p.efRepWhy, isIx) }
-      // An arm that pushes tests only until its `K[]` is stored (`listFitGrowFill`).
-      if grow >= 0 {
-        fbLocalGet(fitGrowLocal[grow])
-        fbRefIsNull()
-        fbIf(127) // i32
-      }
+      if grow >= 0 { listFitGrowOpen(grow) }
       if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
       emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
       if grow >= 0 { return if listFitGrowFill(grow) < 0 { -1 } else { 1 } }
@@ -5629,9 +5621,28 @@ function listFitGrowHolds(loc: i32): boolean {
   return false
 }
 
+// The grow row of pushing `is K[]` test `isIx` over a named receiver (`listFitGrowRow`), or -1.
+export function listFitGrowOf(isIx: i32, fnIx: i32): i32 {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) { return -1 }
+  const r = unwrapParen(nd.isObj)
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return -1 }
+  return listFitGrowRow(r, isVarTyIxOf(isIx), fnIx)
+}
+
+// A pushing arm tests only until its `K[]` is stored: the test runs inside an `if` on grow row
+// `row`'s local being null (`listFitGrowFill` closes it).
+export function listFitGrowOpen(row: i32) {
+  if row < 0 || row >= fitGrowLocal.length { return -1 }
+  fbLocalGet(fitGrowLocal[row])
+  fbRefIsNull()
+  fbIf(127) // i32
+  return 0
+}
+
 // With the test's answer on the stack inside the `if` `emitListEmptyFitIs` opened on a null
 // `fitGrowLocal[row]`, stores a fresh `K[]` there when it fits; a set local answers 1 untested.
-function listFitGrowFill(row: i32): i32 {
+export function listFitGrowFill(row: i32): i32 {
   const kt = tyAt(fitGrowTy[row])
   if !(kt is TyArray) { return emitFail(LIST_FIT_SHADOW_MSG) }
   const heaps: i32[] = []
@@ -5656,26 +5667,50 @@ function listFitGrowFill(row: i32): i32 {
 // `name.length` outside the arm of an `is K[]` that pushes onto `name`: the `K[]` once a test
 // has fitted, the receiver's own list before. 0 when `m` is not such a read, 1 when emitted.
 function emitListFitGrowLen(m: Member, memIx: i32, fnIx: i32): i32 {
-  const o = nodeAt(m.memObj)
-  if !(o is Ident) { return 0 }
-  if listFitShadowRead(o.identName, m.memObj, fnIx) >= 0 { return 0 }
-  const g = listFitGrowRow(m.memObj, -1, fnIx)
+  const g = listFitGrowLenRowOf(m, fnIx)
   if g < 0 { return 0 }
+  listFitGrowLenOpen(g)
+  if emitArrLen(memIx, fnIx) < 0 { return -1 }
+  listFitGrowLenClose(g)
+  return 1
+}
+
+// The grow row whose `K[]` read `m`, a `name.length` outside the region, answers once filled
+// (`emitListFitGrowLen`), or -1.
+export function listFitGrowLenRowOf(m: Member, fnIx: i32): i32 {
+  const o = nodeAt(m.memObj)
+  if !(o is Ident) { return -1 }
+  if listFitShadowRead(o.identName, m.memObj, fnIx) >= 0 { return -1 }
+  const g = listFitGrowRow(m.memObj, -1, fnIx)
+  if g < 0 { return -1 }
   const kt = tyAt(fitGrowTy[g])
-  if !(kt is TyArray) { return 0 }
+  if !(kt is TyArray) { return -1 }
   const heaps: i32[] = []
-  const kind = listFitElemKind(tyElemOf(kt), heaps)
-  if kind == null { return 0 }
+  return if listFitElemKind(tyElemOf(kt), heaps) == null { -1 } else { g }
+}
+
+// Before the receiver's own length: an `if` on grow row `g`'s local still being null.
+export function listFitGrowLenOpen(g: i32) {
+  if g < 0 || g >= fitGrowLocal.length { return -1 }
   fbLocalGet(fitGrowLocal[g])
   fbRefIsNull()
   fbIf(127) // i32
-  if emitArrLen(memIx, fnIx) < 0 { return -1 }
+  return 0
+}
+
+// After the receiver's own length: else the grow row `g`'s `K[]` length, closing the `if`.
+export function listFitGrowLenClose(g: i32) {
+  if g < 0 || g >= fitGrowTy.length || g >= fitGrowLocal.length { return -1 }
+  const kt = tyAt(fitGrowTy[g])
+  const heaps: i32[] = []
+  const kind = if kt is TyArray { listFitElemKind(tyElemOf(kt), heaps) } else { null }
+  if kind == null { return -1 }
   fbElse()
   fbLocalGet(fitGrowLocal[g])
   fbRefAsNonNull()
   emitListLenOnStack(kind, heaps[0])
   fbEnd()
-  return 1
+  return 0
 }
 
 // The wrapper of the empty `K[]` (pushed onto `tyOut`) a closure's read of capture `name` stands
@@ -8695,6 +8730,15 @@ export function refArrayUnionUnboxTail(exprIx: i32, fnIx: i32) {
 // so a push keeps the plain cast and traps loudly instead (D4949).
 let listCastForPush = false
 
+// Sets or clears `listCastForPush` around a `.push` receiver's write, as `pushRecvLocal` does.
+export function pushRecvCastSet(on: boolean) {
+  listCastForPush = on
+  return 0
+}
+
+// Whether `listCastForPush` is set, for a caller that restores it after `pushRecvCastSet`.
+export function pushRecvCastOn(): boolean { return listCastForPush }
+
 // Whether reading receiver `recvIx` unboxes a list arm, the read `listPayloadCastTail` casts and
 // `listCastForPush` makes strict: a narrowed binding, field or element, at the receiver or inside
 // it (a call's callee receiver or argument, an operand, an element). Any other shape answers true,
@@ -9436,7 +9480,7 @@ function emitUnionCoerceUnder(
   // value in the payload slot instead of a fresh `ref.null none`: `nullref` is an `anyref`, so
   // it rides the slot the null tag leaves unread and a call's side effects still happen. The
   // binding twin of `emitUnionBoxArg`'s arm, which is the argument boundary's.
-  if exprIsNulNone(exprIx, fnIx) {
+  if boxOperandIsNulNone(exprIx, fnIx) {
     nulNoneBoxHead()
     if emitNulNoneBoxPayload(exprIx, fnIx) < 0 { return -1 }
     nulNoneBoxTail()
@@ -9706,6 +9750,12 @@ export function nulNoneBoxTail() {
   return 0
 }
 
+// Whether `exprIx` reaches a box or a niche slot as the `null` unit: a value `exprIsNulNone` names,
+// or an assignment of `null`, whose value is the unit and not the cell's own null (D17090).
+export function boxOperandIsNulNone(exprIx: i32, fnIx: i32): boolean {
+  return exprIsNulNone(exprIx, fnIx) || asgYieldsNullLit(unwrapParen(exprIx))
+}
+
 // The payload of a null-tagged box holding a `null`-typed value: the value itself when
 // evaluating it can have effects (a call), and a fresh `ref.null none` otherwise. The slot is
 // unread under the null tag, so its only job is to be an `anyref` — which is why an ident read
@@ -9936,7 +9986,7 @@ function emitUnionBoxArg(
   const hp = holeBoxPlanOf(exprIx, unionTy, fnIx)
   if !unionBoxArgLadders(hp, unionTy, exprIx, fnIx) {
     // The shadow notes the coerce the ladder's value rungs are reached through, as legacy did.
-    const viaCoerce = !exprIsNulNone(exprIx, fnIx)
+    const viaCoerce = !boxOperandIsNulNone(exprIx, fnIx)
     if viaCoerce && boxDstShadowArmed() {
       boxDstShadowNote(
         "coerce",
@@ -9988,7 +10038,7 @@ function unionBoxArgLadders(
 // Whether `emitUnionBoxArgGo` writes `exprIx` by its union-valued map read rung: not a `null`, and
 // a read of a map whose value is a union.
 function unionBoxArgGoMapRead(exprIx: i32, fnIx: i32): boolean {
-  if exprIsNulNone(exprIx, fnIx) { return false }
+  if boxOperandIsNulNone(exprIx, fnIx) { return false }
   const rd = nodeAt(unwrapParen(exprIx))
   if !(rd is Index) || !exprMap(rd.idxArr, fnIx) { return false }
   const sh = mapShapeOfExpr(rd.idxArr, fnIx)
@@ -10026,7 +10076,7 @@ function emitUnionBoxArgGo(
   // every other value union reps as `{tag, anyref}`, so a `nullref` result cannot ride the cell
   // raw and must not be boxed as its own arm either — the classifier below reads a Call's kind,
   // finds none, and boxes it as an i32. The payload is the value: `nullref` is an `anyref`.
-  if exprIsNulNone(exprIx, fnIx) {
+  if boxOperandIsNulNone(exprIx, fnIx) {
     nulNoneBoxHead()
     if emitNulNoneBoxPayload(exprIx, fnIx) < 0 { return -1 }
     nulNoneBoxTail()
@@ -16817,7 +16867,7 @@ export function mapSetValArmOf(
   if atomVal && vn is NullLit { return "atomNull" }
   if nulBoolVal {
     if vn is NullLit { return "boolNull" }
-    if exprIsNulNone(valIx, fnIx) { return "boolNulNone" }
+    if boxOperandIsNulNone(valIx, fnIx) { return "boolNulNone" }
   }
   // A literal-union atom into a string-valued map widens to its member string: the vals element
   // is a string ref while the atom's rep is an i32 id.
@@ -28955,6 +29005,11 @@ export function printArmOf(argIx: i32, fnIx: i32): PrintArm {
   // The `null` type has no arm to select, and every classifier below reads a rep this value
   // lacks (D1576).
   if exprIsNulNone(argIx, fnIx) { return "nulNone" }
+  // A bare `null` literal names no cell for that classifier to read (D17093).
+  const pnLit = unwrapParen(argIx)
+  if pnLit >= 0 && pnLit < P.nodes.length && nodeAt(pnLit) is NullLit {
+    return "nulNone"
+  }
   // A nullable ref niche whose other arm has no printed form (a record, a list, a map, a
   // closure) can print only as `null`, whatever narrowed it there (D3498).
   const pnNiche = exprNulNicheKind(argIx, fnIx)
@@ -30328,7 +30383,7 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   ) {
     return ""
   }
-  if cloTailRefusal(callIx, fnIx) != "" || callEndsNever(callIx) { return "" }
+  if cloTailRefusal(callIx, fnIx) != "" { return "" }
   if fnTagArmsAt(callIx, emitTagSetAt(callIx, fnIx)).length > 0 { return "" }
   if holderRecordSigs(d, fnIx).length > 0 { return "" }
   // Routed as `emitCallCoreUserFn` routes it; a bundle parameter is `bundleCallRefPlainKey`'s.
@@ -38424,8 +38479,8 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
 // box, a record, or an `i32`, string, byte or record list, each read whole into the loop variable.
 function forInElemPlain(ek: VKind): boolean {
   return match ek {
-    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "i64" | "f64" | "closure" => true
-    "map" | "nulvariant" | "f64list" | "f32" | "nullist" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
+    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" => true
+    "map" | "f64list" | "f32" | "nullist" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
   }
 }
 
@@ -43079,7 +43134,8 @@ function emitAsgValueOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     "lit" => emitAsgLitAs(exprIx, asgLitWidth(exprIx, fnIx), fnIx)
     "nullLit" => {
       if emitAssign(exprIx, fnIx) < 0 { return -1 }
-      emitExpr(e.binRight, fnIx)
+      // The value is the `null` unit delivered where the assignment is read, not the cell's null.
+      emitNullAt(exprIx, fnIx)
     }
     "reRead" => emitAsgValue(exprIx, fnIx, asgReadUnwidenOp(exprIx, fnIx))
     "parked" => {
