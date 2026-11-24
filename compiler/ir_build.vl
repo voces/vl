@@ -249,6 +249,7 @@ import {
   asWrapArmOf,
   asgValueArmOf,
   atomHookArmOf,
+  atomRecordAt,
   atomStrPlanOf,
   atomicCallNamed,
   atomicPlanOf,
@@ -673,6 +674,7 @@ import {
   exprIsNulNone,
   exprIsStrMethod,
   exprMap,
+  exprNulLitUnion,
   exprNullableMap,
   exprUnion,
   fnBundleRetSigs,
@@ -4254,6 +4256,9 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     return capturedStrRecovered(b, fe, name, ix, rep)
   }
   const cr = capRepFor(fe, name, if unbox { -1 } else { rep })
+  // A capture of a binding legacy holds as an atom, read at a string, is that atom, decoded.
+  const ar = if !unbox && cr != rep { captureAtomCellRep(fe, name, ix, rep) } else { -1 }
+  if ar >= 0 { return capturedAtomDecoded(b, fe, name, ix, ar, rep) }
   // A nullable capture read at the member the checker narrowed it to: the capture at its own rep.
   const na: NullNarrowArm = if cr != rep && !unbox { nullNarrowArmOf(ix, cr, rep) } else { "none" }
   const ak = if unbox && heldAsBox(cr) { identUnboxAtomOf(ix, ibFnIx) } else { -1 }
@@ -4321,6 +4326,35 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if boxed { return irBLetTemp(b, { sgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
+}
+
+// The atom rep capture `name` of `fe` is held at where its read `ix` at plain string `rep` reads
+// a binding legacy holds as the atom (`exprIsLitAtom`), else -1. The `K | null` niche misses.
+function captureAtomCellRep(fe: i32, name: string, ix: i32, rep: i32): i32 {
+  if repPrim(rep) != "str" || strNullable(rep) || !exprIsLitAtom(ix, ibFnIx) { return -1 }
+  if exprNulLitUnion(ix, ibFnIx) {
+    irBMiss("capture atom niche")
+    return -1
+  }
+  const ty = atomRecordAt(ix, ibFnIx)
+  const ar = if ty >= 0 { repNodeOfTy(ty) } else { -1 }
+  if ar < 0 || !(repNodeAt(ar) is RAtom) { return -1 }
+  return if capRepFor(fe, name, ar) == ar { ar } else { -1 }
+}
+
+// Capture `name` of `fe`, held at atom rep `ar`, read at string `rep`: the environment's field or
+// the lifted function's parameter, decoded to its member string (`RAtomStr`).
+function capturedAtomDecoded(b: i32[], fe: i32, name: string, ix: i32, ar: i32, rep: i32): Opnd {
+  const aty = atomRecordAt(ix, ibFnIx)
+  if !cloLifted(fe) {
+    const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
+    return atomToStr(b, irBLetTempTy(b, ev, ix, ar, aty), ix, rep)
+  }
+  const v = liftCapVarAt(fe, name, ar, aty)
+  if v < 0 || ib.irVars[v].vRep != ar { return irBMiss("capture binding") }
+  ib.irReadVar[ix] = v
+  const o: Opnd = { ov: v }
+  return atomToStr(b, o, ix, rep)
 }
 
 // Captured box `o` read at member `rep` on legacy's `unbox` arm: unboxed at atom kind `ak`
@@ -4457,11 +4491,16 @@ function capLoopTyOf(fe: i32, name: string): i32 {
 // `capRepFor`'s rep for a first read at `readRep` (-1 for none), made at its first use; -1 when a
 // captured `for-in` variable has no rep yet.
 function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
+  return liftCapVarAt(fe, name, readRep, -1)
+}
+
+// `liftCapVar`, its parameter typed `atTy` where that is not -1.
+function liftCapVarAt(fe: i32, name: string, readRep: i32, atTy: i32): i32 {
   const w = 1 + captureSlotOf(name, ibFnIx)
   const known = paramVarAt(w)
   if known >= 0 { return known }
   const r = capRepFor(fe, name, readRep)
-  const bty = capTyOf(fe, name)
+  const bty = if atTy >= 0 { atTy } else { capTyOf(fe, name) }
   const ty = if readRep < 0 && bty < 0 { capLoopTyOf(fe, name) } else { bty }
   if ty < 0 && r < 0 { return -1 }
   const v = irVarNew(ib, r, if ty >= 0 { ty } else { repTyOf(r) }, "param", w)
