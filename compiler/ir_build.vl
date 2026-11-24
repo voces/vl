@@ -177,6 +177,7 @@ import {
   sIf,
 } from "./ir"
 import {
+  RStructEq,
   RUnionConcreteEq,
   boxListRetag,
   boxMapRetag,
@@ -313,6 +314,7 @@ import {
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
   elseLessUnionIfWhy,
+  eqElemNullTestOk,
   eqOperandDecodes,
   eqRouteOf,
   exprPrePathPastCoerce,
@@ -344,6 +346,7 @@ import {
   holeBoxTyAt,
   hostCallNamed,
   hostCallPlanOf,
+  idxStoreNullUnitUnstamped,
   idxStoreOtherWhy,
   idxStoreSiteBoxes,
   ifExprJoinVt,
@@ -646,6 +649,7 @@ import {
   repNodeAt,
   repNodeGen,
   repNodeKids,
+  repNodeOfNullUnit,
   repNodeOfTy,
   repRawOf,
   repRecordKidOf,
@@ -1167,9 +1171,9 @@ function claimStart(
 }
 
 // The shadow's failing controls: 0 none; the verifier must refuse 1 (a variable's rep swapped), 2
-// (a temp's definition deleted), 7 (`unrelatedMapControl`) and 8 (`otherAgainControl`); the dual
-// emit must report 3 (a byte added to the lowering), 4 (a span row dropped) and 5 (its element-read
-// rows); 6 is the held coercion.
+// (a temp's definition deleted), 7, 8 and 9 (`unrelatedMapControl`, `otherAgainControl`,
+// `nulEqNoNullableControl`); the dual emit must report 3 (a byte added to the lowering), 4 (a span
+// row dropped) and 5 (its element-read rows); 6 is the held coercion.
 export function irShadowCorrupt(k: i32) {
   ibCorrupt = k
   return 0
@@ -2867,9 +2871,23 @@ export function irBOpenLocalReadRep(ix: i32): i32 {
   return if valueRep(r, ib.irVars[v].vTy) { r } else { -1 }
 }
 
+// The type field read `n` is built at where its receiver is a call or a field the IR builds at a
+// closed record type (`exprTyOf`): that field's kid type in it, or -1.
+function builtFieldTy(n: Member): i32 {
+  const o = unwrapParen(n.memObj)
+  if o < 0 || !(nodeAt(o) is Call || nodeAt(o) is Member) { return -1 }
+  const rt = exprTyOf(o)
+  if rt < 0 || irTyOpen(rt) { return -1 }
+  const r = repNodeOfTy(rt)
+  if !(repNodeAt(r) is RRecord) { return -1 }
+  const k = repRecordKidOf(r, rt, n.memProp)
+  const ft = if k >= 0 { repTyOf(repNodeKids(r)[k]) } else { -1 }
+  return if ft >= 0 && !irTyOpen(ft) { ft } else { -1 }
+}
+
 // `ix`'s type: its callee's result for an untyped call of a declaration (an operator a generic
 // instance rewrote to its overload), else its recorded type.
-function exprTyOf(ix: i32): i32 {
+export function exprTyOf(ix: i32): i32 {
   // An assignment's re-read of its target is of the value just stored, as legacy's `readTyHere`.
   const ra = asgReReadOf(ix)
   if ra >= 0 {
@@ -2895,6 +2913,11 @@ function exprTyOf(ix: i32): i32 {
   }
   if ix < 0 || ix >= P.nodes.length { return t }
   const n = nodeAt(ix)
+  // A field typed open of a receiver the IR builds closed is of that field's type there.
+  if n is Member && irTyOpen(t) {
+    const ft = builtFieldTy(n)
+    if ft >= 0 { return ft }
+  }
   // A direct call typed open, or typed at the closure its callee returns a bundle record for
   // (`fnRetHeldAsBundle`), is of its callee's result as the IR holds it (`resultTy`).
   if t >= 0 && !(n is Call && (irTyOpen(t) || bundleCallOf(n, ix, t))) {
@@ -4909,6 +4932,20 @@ function narrowedLocalRead(
 ): Opnd {
   const o: Opnd = { ov: v }
   const arm = identReadArmOf(n, ix, ibFnIx, false)
+  // A string cell narrowed to a literal set reads, where legacy decodes no atom
+  // (`exprIsLitAtom`), as the string it holds: a `string | null` through its recover.
+  const own = ib.irVars[v].vRep
+  if (
+    arm == "local"
+    && repNodeAt(rep) is RAtom
+    && (repPrim(own) == "str" || strNullable(own))
+    && !exprIsLitAtom(ix, ibFnIx)
+  ) {
+    if repPrim(own) == "str" { return o }
+    const src: Rhs = { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) }
+    ib.irReadAgain[ix] = src
+    return irBLetTempTy(b, src, ix, repNodeOfTy(TY_STR), TY_STR)
+  }
   const ba = boxNarrowArmOf(ix, ib.irVars[v].vRep, rep, arm)
   if ba == "variant" {
     return irBLetTemp(
@@ -4970,11 +5007,12 @@ function narrowedLocalRead(
   if cell && atomNullable(ib.irVars[v].vRep) && repPrim(rep) == "str" {
     return o
   }
-  // A read narrowed to `null` whose storage read is its null (`nullReadOwnAt`) is the local.
+  // A read narrowed to `null` whose storage read is its null (`nullReadOwnAt`) is the local:
+  // seated, or any read whose destination holds no null of its own, as legacy's past-null arm.
   if (
-    cell
-    && arm == "nullread"
+    arm == "nullread"
     && identReadArmOf(n, ix, ibFnIx, true) == "local"
+    && (cell || nullReadOwnAt(ix) == NULL_READ_STORED)
   ) {
     return o
   }
@@ -6938,6 +6976,11 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     op = "charcode"
   } else if exprIsStrMethod(ix, ibFnIx, "cpAt") && c.callArgs.length == 1 {
     op = "cpat"
+  } else if (
+    exprIsStrMethod(ix, ibFnIx, "isCharBoundary")
+    && c.callArgs.length == 1
+  ) {
+    op = "charbound"
   } else if exprIsStrMethod(ix, ibFnIx, "bytes") && c.callArgs.length == 0 {
     op = "bytes"
   } else if exprIsStrIndexOf(ix, ibFnIx) && c.callArgs.length == 1 {
@@ -7726,7 +7769,11 @@ function structEqOpAt(
   const rIx: Opnd[] = []
   if ls.length > 1 { lIx.push(ls[1]) }
   if rs.length > 1 { rIx.push(rs[1]) }
-  if nul && (lIx.length > 0 || rIx.length > 0) {
+  if (
+    nul
+    && (lIx.length > 0 && !eqElemNullTestOk(n.binLeft, ibFnIx)
+      || rIx.length > 0 && !eqElemNullTestOk(n.binRight, ibFnIx))
+  ) {
     return irBMiss("nullable record eq element place")
   }
   // A bare record beside a nullable one is legacy's same guard over a non-null side, written
@@ -8123,6 +8170,11 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     const own = if atom || ref || bool || strNullable(dst) { nullOwnAt(lit, ibFnIx) } else { -1 }
     const want = if atom { NULL_OWN_ATOM } else if ref { NULL_OWN_NONE } else if bool { NULL_OWN_BOOL } else { NULL_OWN_STR }
     if own == want {
+      return repTemp(b, { nuAt: lit, nuOwn: own, nuRead: [] }, ix, dst)
+    }
+    // A `null` naming no null of its own is the bottom ref, which a nullable string also holds
+    // (`emitNullAt`).
+    if own == NULL_OWN_NONE && strNullable(dst) {
       return repTemp(b, { nuAt: lit, nuOwn: own, nuRead: [] }, ix, dst)
     }
   }
@@ -11137,6 +11189,9 @@ function mapGetRepOk(sh: i32, val: i32, rep: i32, recvIx: i32): boolean {
   // `-1`, the `K | null` one (`mapGetMissOf`).
   if sh < 0 {
     if rep == val { return true }
+    // A read typed at the bare atom is narrowed past an atom value's `-1` null: the same bits.
+    const vn = repNodeAt(val)
+    if atomNullable(val) && vn is RNullable && vn.rnInner == rep { return true }
     const bn = repNodeAt(rep)
     if !(bn is RNullable) || bn.rnInner != val { return false }
     const miss = mapGetMissOf(recvIx, ibFnIx)
@@ -11858,7 +11913,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   const cr = if own < 0 && !nv && pr < 0 && br < 0 { openCoalMapRep(ix) } else { -1 }
   // An assignment whose value legacy re-reads off a union-box target is that box (`asgBoxRep`).
   const xr = if own >= 0 && n is BinExpr { asgBoxRep(ix) } else { -1 }
-  const rep = if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else if xr >= 0 { xr } else { own }
+  // A `null` literal with no type of its own (one a rewrite minted) is legacy's `emitNullAt`:
+  // the bottom ref, at the `null` unit, where it names no null of its own.
+  const un = own < 0
+    && !nv
+    && n is NullLit
+    && nullOwnAt(ix, ibFnIx) == NULL_OWN_NONE
+  const rep = if un { repNodeOfNullUnit() } else if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else if xr >= 0 { xr } else { own }
   // A direct call whose own type has no rep is at its callee's result rep.
   if rep < 0 && n is Call && !nv { return openCallValue(b, n, ix) }
   // A desugared optional call's minted callee has no type: it is the field the plain `.f` call reads
@@ -12626,9 +12687,10 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if ibMiss != "" { return irBMiss(ibMiss) }
   const m = asgReReadEnter(ix)
   // A field or element target is read again whole, its receiver and index included. A global's
-  // re-read is seated (`cell`): its atom cell's id is the read, which `widenTo` below decodes.
+  // or an atom local's re-read is seated (`cell`): its cell's id is the read `widenTo` decodes.
   const rr = if uw >= 0 { repNodeOfTy(heldTy(exprTyOf(n.binLeft))) } else { rep }
-  const o = if t is Ident { identRead(b, t, n.binLeft, rr, globalTarget(n.binLeft)) } else { irBExpr(b, n.binLeft) }
+  const seat = if uw >= 0 { globalTarget(n.binLeft) } else { asgReReadSeated(n.binLeft) }
+  const o = if t is Ident { identRead(b, t, n.binLeft, rr, seat) } else { irBExpr(b, n.binLeft) }
   asgReReadLeave(m)
   if uw >= 0 {
     if ibMiss != "" { return o }
@@ -12639,8 +12701,12 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     }
     return irBLetTemp(b, { uwV: o, uwOp: uw, uwAt: ix }, ix, rep)
   }
-  // The cell's atom re-read at a `string` assignment is decoded, as legacy widens it (`widenTo`).
-  const w = if ibMiss == "" && atomAtStr(irBOpRep(o), rep) { widenTo(b, o, ix, rep, -1) } else { o }
+  // The cell's atom re-read at a `string` assignment is decoded, as legacy widens it (`widenTo`),
+  // a local `K | null` cell's included: the assigned member is no `null` (`atomToStr` checks).
+  const r0 = irBOpRep(o)
+  const nulLocal = t is Ident && !globalTarget(n.binLeft) && atomNullable(r0)
+  const dec = atomAtStr(r0, rep) || nulLocal && repPrim(rep) == "str"
+  const w = if ibMiss == "" && dec { widenTo(b, o, ix, rep, -1) } else { o }
   if ibMiss == "" && irBOpRep(w) != rep {
     return irBMiss("assignment value re-read rep")
   }
@@ -12666,6 +12732,19 @@ function assignValueNullLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 }
 
 // Whether identifier `ix` names a module global's `let`, not a local or a capture.
+// Whether the re-read of assignment target `ix` is seated: a global, or a local already held at a
+// cell of an atom or a `K | null`, which legacy's `emitExpr` reads as the cell's id. It asks the
+// local the store just wrote, minting none: a captured cell is held elsewhere.
+function asgReReadSeated(ix: i32): boolean {
+  if globalTarget(ix) { return true }
+  const d = identDeclOf(ix)
+  if d < 0 || !(nodeAt(d) is LetDecl) { return false }
+  const v = ibDeclVar[d] ?? -1
+  return v >= 0
+    && (repNodeAt(ib.irVars[v].vRep) is RAtom
+    || atomNullable(ib.irVars[v].vRep))
+}
+
 function globalTarget(ix: i32): boolean {
   const d = identDeclOf(ix)
   return d >= 0
@@ -12799,6 +12878,10 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   }
   const st = idxStorePlanOf(t, ibFnIx)
   if st == null { return skip("store plan") }
+  // Legacy writes an unstamped unit into a `null[]` as its sentinel, apart from the value's emit.
+  if idxStoreNullUnitUnstamped(t.idxArr, n.binRight, ibFnIx) {
+    return skip("store null unit sentinel")
+  }
   const why = idxStoreOtherWhy(st, n.binRight, ibFnIx)
   if why != "" { return skip(why) }
   const site = idxStoreSiteBoxes(st, n.binRight, ibFnIx)
@@ -14802,6 +14885,20 @@ function otherAgainControl() {
   return 0
 }
 
+// The nullable compare's failing control (`irShadowCorrupt(9)`): a record compare of two
+// non-nullable sides marked nullable, which verifier rule 2 must refuse.
+function nulEqNoNullableControl() {
+  for n in ib.irNodes {
+    if !(n is SLet) { continue }
+    const r = n.lRhs
+    if r is RStructEq && !r.seNul {
+      r.seNul = true
+      return 0
+    }
+  }
+  return 0
+}
+
 // The inner rep of nullable rep `r`, or -1.
 function repOfNulInner(r: i32): i32 {
   const n = repNodeAt(r)
@@ -14812,6 +14909,7 @@ function repOfNulInner(r: i32): i32 {
 function corrupt() {
   if ibCorrupt == 7 { unrelatedMapControl() }
   if ibCorrupt == 8 { otherAgainControl() }
+  if ibCorrupt == 9 { nulEqNoNullableControl() }
   if ibCorrupt == 1 && ib.irVars.length > 0 {
     const v = ib.irVars[0]
     const other = if repPrim(v.vRep) == "bool" { repNodeOfTy(TY_I32) } else { ibBool }
