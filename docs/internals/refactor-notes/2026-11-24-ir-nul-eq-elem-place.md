@@ -50,8 +50,9 @@ side's nullability, the index kind and the receiver kind are incidental.
 - A side with effects is staged and read once (`structEqStagesLeft`), so it never becomes an
   element place. A call that moves the index in the other operand reads in source order on both
   seeds.
-- `ys[j] == { r: 1, s: 2 }` (a literal right side) stays `record compare element place`, which is
-  #9905's class.
+- A literal right side (`ys[j] == { r: 1, s: 2 }`) is matched. The row's one remaining
+  `record compare element place` was the order cells' `gs[i]`, whose index is a global (#9905's
+  class, covered by the follow-up `2026-11-24-ir-eq-elem-place-index.md`).
 
 ## Legacy tails the IR calls
 
@@ -64,10 +65,11 @@ side's nullability, the index kind and the receiver kind are incidental.
   - the ablation set;
   - the order cells;
   - a narrowed-null cell and a `null`-unit (`nulName`) cell;
-  - the named literal-right neighbour.
+  - a literal-right cell.
 
-  It expects `no row containing spans` and `uncovered record compare element place = 1`.
-  Base: 4 of 13 matched and the start missing. Head: 12 of 13 matched and the start matched.
+  It expects `no row containing spans`. Base: 4 of 13 matched and the start missing. Head: 12 of
+  13 matched, the one miss being the order cells' global index (see Routes beside it); with the
+  index follow-up, 13 of 13 and `no row containing record compare element place`.
 - `tests/vl_ir_shadow_test.ts` adds two tests:
   - the row under control 5, which must red on `spans`;
   - rule 2's pair: a bare side against a nullable element verifies, and control 9 reds.
