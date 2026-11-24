@@ -421,7 +421,7 @@ run "ir claims"                "$VL" run scripts/silent-sweep/distilled/ir-shado
 run "ir claim refusals"        "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop refusals --out "$LOGS/ir-claim-refusals.tsv"
 # The invariant G3 exists for: a shipped build is never invalid, refused or running otherwise where
 # the claimless build builds and runs clean (coordinator ruling 2026-11-24). Every capability probe
-# and IR pin, and a fixed 1-in-12 of tests/cases. About 121 CPU-s.
+# and IR pin, and a fixed 1-in-12 of tests/cases. About 135 CPU-s in the gate.
 run "ir claim cross"           "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop cases,probes,pins --sample 12 --cross --out "$LOGS/ir-claim-cross.tsv"
 
 # THE OOM WATCH. A kill the kernel made during the run fails the gate, whatever the rows read:

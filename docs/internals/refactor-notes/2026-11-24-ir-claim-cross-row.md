@@ -26,6 +26,7 @@ claimed and claimless alike). The row is the standing check that such a report c
 | `--pop probes` | 282 | 13.5 |
 | `--pop cases` whole | 7,762 | 469 |
 | the row: `cases,probes,pins --sample 12` | 1,378 (665 cases) | 121 (103 user + 17.5 sys), 64 s wall |
+| the row inside `gate.sh --fast`, beside its siblings | 1,378 | 135, 102 s wall |
 
 A cold module cache costs more on the first population run: pins read 143 CPU-s cold, 23 warm.
 The whole of `cases` was 0 red too, so the sample is a cost choice, not a known gap.
