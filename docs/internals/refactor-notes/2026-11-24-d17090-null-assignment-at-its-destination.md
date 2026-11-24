@@ -27,6 +27,12 @@ capability probe, distilled cell and the matrix's cells (21,908 programs):
   16 of them running today. Not changed.
 - The value arm where the destination's null is not the literal's: 15 programs, all matrix cells.
 
-The matrix `null-assignment-value.matrix.vl`: 8 invalid-module cells become `RUNS`; under
-`VL_IR_SHADOW=6` all 47 programs are clean. The union-box rows stay uncovered in the IR as
+The matrix `null-assignment-value.matrix.vl` against master `aa4beffc6` (`capability-matrix.vl`
+`--before`/`--after`, its summary `runs 43 of 46 graded · 20 skipped · 0 silent · 3 other`):
+35 cells run on both, 8 go from check-clean invalid wasm to `RUNS`, and 3 stay a check refusal
+(the un-annotated null-only list and map). Under `VL_IR_SHADOW=6` the 47 generated programs show
+no mismatch, verifier failure or fallback. The union-box rows stay uncovered in the IR as
 `box ladder` (N9's class).
+
+D17088's own reading of the same matrix (#9817), as the instrument counts it: 24 WRONG to `RUNS`,
+11 run on both, 8 invalid wasm on both, 3 check refusals, 46 graded.
