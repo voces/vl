@@ -48,6 +48,14 @@ address fold`, head 77/77 functions matched under `VL_IR_SHADOW=6`. `ir-identity
 the class, both witnesses and the row: identical 18, differ 0. Row:
 `tests/ir-shadow-rows/memory-address-fold.vl`.
 
+Class count: 29 functions in tests/cases leave `memory address fold`, the 15 on master plus 14 in the
+two witnesses this PR added (4 cross-read, 10 positions); the 3 functions of the shadow row
+(`tests/ir-shadow-rows/memory-address-fold.vl`) make the 32 the READY quoted.
+
+A follow-up witness, `memarg-const-fold-two-folds-runs.vl`, holds two folds in one function and
+re-builds one in a loop (`1122 2222 30`): a builder that gave every fold the first slot passes every
+single-fold witness, and prints `2222 2222 30` here.
+
 ## Legacy tails the IR calls
 
 `memConstFoldShapeK`, `memConstFoldShapeRest`, `mfShapeIsSum` and `memAddrPlanWith` (wasmEmit.vl),
