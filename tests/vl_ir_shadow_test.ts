@@ -1755,6 +1755,9 @@ Deno.test({
       "never-call-value-at-consumer-rep": 0,
       "dead-never-temp-at-consumer-rep": 0,
       "dead-never-bound-to-non-temp": 3,
+      "identity-eq-of-records": 0,
+      "identity-eq-of-string": 2,
+      "identity-eq-of-i32": 2,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
       "union-cast-of-box": 0,
@@ -1796,6 +1799,14 @@ Deno.test({
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
+    // A staged root reads above a run of roots on the stack, never above a value that is no root
+    // (`rootsFloor`, D17089): the floor cannot hide a real order violation.
+    for (const [k, want, what] of [[0, 1, "above a run of roots"], [1, 0, "above a non-root"], [2, 0, "above a non-root over a root"]] as const) {
+      const got = exp.irStageFloorSelfTest(k);
+      if (got !== want) throw new Error(`stage floor ${what}: want ${want}, got ${got}`);
+    }
+    // A door fragment lowered while a root is staged gives the staging's root run back.
+    if (exp.irRootRunFrameSelfTest() !== 1) throw new Error("want the fragment frame to restore the root run");
     // A fit tail that misses leaves legacy's receiver read in place (`fitRecvReadHook`).
     if (exp.irFitTailSelfTest() !== 1) throw new Error("want the fit hook restored after a miss");
     // Each kind legacy's descriptor names alone maps to a type that describes back at that kind.
