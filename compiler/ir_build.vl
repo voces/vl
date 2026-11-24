@@ -668,6 +668,7 @@ import {
   storageReadLeave,
 } from "./emit_elab"
 import {
+  mapReadScalarBoxKind,
   narrowedNulLitPinBoxKey,
   nulNicheRecoverOwed,
   retNeedsNonNullRecover,
@@ -6797,6 +6798,40 @@ function isPopStmt(c: Call): boolean {
   return f is Member && f.memProp == "pop"
 }
 
+// `print(m[k])` over a scalar-valued map read (`print`'s `mapScalar` arm): the receiver and key,
+// then the probe and its value or `null` (`emitPrintScalarMapRead`).
+function printMapScalar(b: i32[], argIx: i32, ix: i32) {
+  const k = mapReadScalarBoxKind(argIx, ibFnIx)
+  const ai = unwrapParen(argIx)
+  if k < 0 || ai < 0 || ai >= P.nodes.length { return skip("print mapScalar") }
+  const rd = nodeAt(ai)
+  if !(rd is Index) { return skip("print mapScalar node") }
+  const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
+  const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
+  if ka != "plain" && ka != "i64" { return skip("print mapScalar key " + ka) }
+  const rk = mapRecvKeyOf(
+    b,
+    rd.idxArr,
+    rd.idxIndex,
+    "print mapScalar receiver",
+    ka == "i64",
+  )
+  if rk == null { return skip(ibMiss) }
+  const r: Rhs = {
+    mtSym: rk.mkSym,
+    mtNonNull: rk.mkNonNull,
+    mtLoc: rk.mkLoc,
+    mtKey: rk.mkKey,
+    mtAt: ai,
+    mtBox: -1,
+    mtRow: false,
+    mtTrap: false,
+    mtPrint: k,
+  }
+  irBNode(b, { efRhs: r }, -1, ibNoValue, ix)
+  return 0
+}
+
 // Whether call `c` is the `print` builtin, legacy's own arm: one argument, a callee no
 // declaration owns, and no pinned template hole.
 function isPrintStmt(c: Call): boolean {
@@ -6812,6 +6847,7 @@ function isPrintStmt(c: Call): boolean {
 // argument at that arm's rep. Every other arm is a named miss.
 function printStmt(b: i32[], c: Call, ix: i32) {
   const arm = printArmOf(c.callArgs[0], ibFnIx)
+  if arm == "mapScalar" { return printMapScalar(b, c.callArgs[0], ix) }
   const want = printArmRep(arm)
   if want == "" { return skip("print " + arm) }
   // A `K | null` read out of a wider box converts to the niche first, which the IR does not build.
@@ -10658,6 +10694,7 @@ function mapGetAt(
     mtBox: box,
     mtRow: row,
     mtTrap: trap,
+    mtPrint: -1,
   }
   if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
   if box < 0 && tempTy >= 0 { return irBLetTempTy(b, r, ix, rep, tempTy) }
