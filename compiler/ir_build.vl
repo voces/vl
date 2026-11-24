@@ -239,6 +239,7 @@ import {
   GlobalCtx,
   IntSwitchPlan,
   MapSetValArm,
+  MemAddrPlan,
   ObjLitArm,
   PrintArm,
   StructFieldArm,
@@ -378,10 +379,13 @@ import {
   mapUnboxTailTy,
   memAccessCallNamed,
   memAccessPlanOf,
-  memAddrPlanOf,
+  memAddrPlanWith,
   memCallArg,
+  memConstFoldShapeK,
+  memConstFoldShapeRest,
   memOpCallNamed,
   memOpPlanOf,
+  mfShapeIsSum,
   nulNicheBoxTagOf,
   nulNicheEqWhy,
   nulNoneWritesNothing,
@@ -774,6 +778,8 @@ import {
   globalStmtOrd,
   liFrameRestore,
   liFrameSave,
+  localIsRef,
+  maFoldScratchBase,
   monoGen,
   monoInstFe,
   monoInstOrig,
@@ -6474,7 +6480,7 @@ function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
 // immediate 0) or `rest` arm (its node), then a store's vector. Every other address arm is a miss.
 function simdMemRhs(b: i32[], c: Call, ix: i32, row: i32): Rhs {
   const base = simdMemBase(row)
-  const ap = memAddrPlanOf(c, base, ibFnIx)
+  const ap = irBAddrPlan(c, base)
   const at = b.length
   const args: Opnd[] = []
   match ap.maArm {
@@ -6483,7 +6489,8 @@ function simdMemRhs(b: i32[], c: Call, ix: i32, row: i32): Rhs {
       args.push(z)
     }
     "rest" => args.push(irBExpr(b, ap.maRest))
-    "bad" | "lma" | "fold" | "wide" => {
+    "fold" => args.push(foldAddrRead(b, c))
+    "bad" | "lma" | "wide" => {
       return missRhs("simd memory address " + ap.maArm)
     }
   }
@@ -9282,6 +9289,28 @@ function arrNewDefault(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { ldLen: len, ldAt: ix }, ix, rep)
 }
 
+// The address plan of memory call `c` (`base` declared operands) over the fold rows this function
+// has derived (`foldLetAt`), as `memAddrPlanOf` answers it over legacy's own table.
+function irBAddrPlan(c: Call, base: i32): MemAddrPlan {
+  return memAddrPlanWith(
+    c,
+    base,
+    ibFnIx,
+    { mfDecl: ib.irMaDecl, mfSlot: ib.irMaSlot, mfK: ib.irMaK },
+  )
+}
+
+// A `fold` arm's address: the folded binding's own read, which the lowering writes as its fold
+// local at the plan's offset; anything but a local's plain read is a miss.
+function foldAddrRead(b: i32[], c: Call): Opnd {
+  const a = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return a }
+  if !(a is OVar) || a.ov < 0 || ib.irVars[a.ov].vKind != "local" {
+    return irBMiss("memory address fold read")
+  }
+  return a
+}
+
 // A linear-memory load or store of an i32 as legacy's arm writes it (`memAccessPlanOf`): the
 // address along `memAddrPlanOf`'s `const` arm (an immediate 0) or `rest` arm (its node), then a
 // store's value. A widened store value and every other address arm are named misses.
@@ -9293,7 +9322,7 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !(f is Ident) { return missRhs("memory access callee") }
   const p = memAccessPlanOf(f.identName)
   if p.mxOp < 0 || p.mxAlign < 0 { return missRhs("memory access width") }
-  const ap = memAddrPlanOf(c, p.mxBase, ibFnIx)
+  const ap = irBAddrPlan(c, p.mxBase)
   const at = b.length
   const args: Opnd[] = []
   match ap.maArm {
@@ -9302,7 +9331,8 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
       args.push(z)
     }
     "rest" => args.push(irBExpr(b, ap.maRest))
-    "bad" | "lma" | "fold" | "wide" => {
+    "fold" => args.push(foldAddrRead(b, c))
+    "bad" | "lma" | "wide" => {
       return missRhs("memory address " + ap.maArm)
     }
   }
@@ -9347,7 +9377,7 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
     }
     return r
   }
-  const ap = memAddrPlanOf(c, pl.apBase, ibFnIx)
+  const ap = irBAddrPlan(c, pl.apBase)
   const at = b.length
   match ap.maArm {
     "const" => {
@@ -9355,7 +9385,8 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
       args.push(z)
     }
     "rest" => args.push(irBExpr(b, ap.maRest))
-    "bad" | "lma" | "fold" | "wide" => {
+    "fold" => args.push(foldAddrRead(b, c))
+    "bad" | "lma" | "wide" => {
       return missRhs("memory address " + ap.maArm)
     }
   }
@@ -12090,7 +12121,7 @@ function optFieldTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
 }
 
 // A standalone `?.` over one link and an unstaged base (`ROptRead`), as `emitOptMemberValueGo`
-// writes it along `optLeafArmOf`: the base is a variable read twice, which owes no recover.
+// writes it along `optLeafArmOf`: the base is a read the lowering writes again, owing no recover.
 function optRead(b: i32[], n: OptMember, ix: i32, rep: i32): Opnd {
   if exprIsNulNone(ix, ibFnIx) { return irBMiss("optional read of null") }
   if optLeafArmOf(ix, ibFnIx) == "fail" { return irBMiss("optional read arm") }
@@ -12107,7 +12138,9 @@ function optRead(b: i32[], n: OptMember, ix: i32, rep: i32): Opnd {
   if rep != repNodeOfTy(ty) { return irBMiss("optional read rep") }
   const r = irBExpr(b, n.omObj)
   if ibMiss != "" { return r }
-  if !(r is OVar) || r.ov < 0 || ib.irVars[r.ov].vKind == "temp" {
+  if !(r is OVar) || r.ov < 0 { return irBMiss("optional read base") }
+  // Legacy reads an unstaged base again after its null test, so a temp's read must re-read alike.
+  if ib.irVars[r.ov].vKind == "temp" && !recvReadsAgain(base) {
     return irBMiss("optional read base")
   }
   return irBLetTempTy(b, { orV: r, orAt: ix, orTag: -1 }, ix, rep, ty)
@@ -13252,6 +13285,45 @@ function reserveEnds(ix: i32): boolean {
   return hit
 }
 
+// The constant a `const` declaration `ix` folds out of its later memory addresses, or -1: legacy's
+// own checks in `emitLetPlainInit`'s order, over an i32 local of a function.
+function foldLetK(n: LetDecl, ix: i32): i64 {
+  if ibFnIx < 0 || n.letKw != "const" || !mfShapeIsSum(n.letInit) { return -1 }
+  const slot = declaredSlotOfDecl(ix)
+  if slot < 0 || slot >= localIsRef.length || localIsRef[slot] != "i32" {
+    return -1
+  }
+  return memConstFoldShapeK(n.letInit, ibFnIx)
+}
+
+// Declaration `ix` of `v` folding constant `k`: its bounded part teed into the fold local legacy
+// reserves for it, one per declaration in the order the body first writes them, plus `k`.
+function foldLetAt(b: i32[], n: LetDecl, ix: i32, v: i32, k: i64) {
+  const rest = memConstFoldShapeRest(n.letInit, ibFnIx)
+  if rest < 0 { return skip("address fold split") }
+  let row = 0
+  while row < ib.irMaDecl.length && ib.irMaDecl[row] != ix { row = row + 1 }
+  if row == ib.irMaDecl.length {
+    if row >= fnMemAddrFoldCount { return skip("address fold slot") }
+    ib.irMaDecl.push(ix)
+    ib.irMaSlot.push(maFoldScratchBase + row)
+    ib.irMaK.push(k)
+  }
+  const i32r = repNodeOfTy(TY_I32)
+  const rv = deliver(b, rest, i32r, TY_I32)
+  if ibMiss != "" { return 0 }
+  if irBOpRep(rv) != i32r { return skip("address fold operand") }
+  const t = irBLetTemp(
+    b,
+    { mfiV: rv, mfiSlot: ib.irMaSlot[row], mfiK: k },
+    ix,
+    i32r,
+  )
+  if ib.irVars[v].vRep != i32r { return skip("address fold binding rep") }
+  irBNode(b, { asDst: v, asSrc: t }, -1, ibNoValue, ix)
+  return 0
+}
+
 function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if ibMiss != "" { return 0 }
   const n = nodeAt(ix)
@@ -13324,6 +13396,9 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if pa >= 0 { return letIfArms(b, n.letInit, v, pa) }
     // Legacy's own binding arm reads a union-valued map's box past `emitExpr`, banking no
     // element-read row (`letNulMapReadUnionBox`).
+    // A `const` legacy keeps the bounded part of for later memory addresses (`emitLetPlainInit`).
+    const mk = foldLetK(n, ix)
+    if mk >= 0 { return foldLetAt(b, n, ix, v, mk) }
     const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(b, unwrapParen(n.letInit), ib.irVars[v].vRep, -1, false, -1, false) } else if letCellNulArmUnbox(ix, n.letInit, ib.irVars[v].vRep) { armUnboxTemp(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy, true) } else if letIsArmCell(ix) { variantCoerced(
       b,
       n.letInit,
@@ -13766,11 +13841,6 @@ function build(fnIx: i32, fnPos: i32): string {
   if !(fn is FuncDecl) { return "not a function" }
   ibReset(fnIx, fn.fnName, fnPos)
   if fn.fnTyParams.length > 0 { return "template" }
-  // Legacy keeps a qualifying `const`'s bounded part in a scratch local from its declaration and
-  // reads it at every memory address it folds; its count is decided before either path runs.
-  if fnMemAddrFoldCount > 0 && !censusGoesOn("memory address fold") {
-    return "memory address fold"
-  }
   ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
   ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
   const none = repIsNoValue(ib.irRetRep)

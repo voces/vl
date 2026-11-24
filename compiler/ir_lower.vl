@@ -174,6 +174,7 @@ import {
   RListSlice,
   RListStage,
   RLitArms,
+  RMaFoldInit,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -340,6 +341,7 @@ import {
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
+  MemAddrPlan,
   armSiteWrite,
   arrCopyBacking,
   arrCopyPlanOf,
@@ -512,7 +514,7 @@ import {
   mapValuesAreKeys,
   memAccessPlanOf,
   memAccessTail,
-  memAddrPlanOf,
+  memAddrPlanWith,
   memOpIsVoid,
   memOpPlanOf,
   memOpTail,
@@ -1350,6 +1352,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListNewDefault => listNewDefault(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
+    RMaFoldInit => maFoldInit(r)
     RAtomic => atomic(r)
     RTruncSat => truncSat(r)
     RMemOp => memOp(r)
@@ -2643,11 +2646,11 @@ function simd(r: RSimd) {
   const row = simdCallRow(c)
   if !(f is Ident) || row < 0 { return irLMiss("simd node") }
   if simdRowIsMem(row) {
-    const ap = memAddrPlanOf(c, simdMemBase(row), lw.irAt)
-    if ap.maArm != "const" && ap.maArm != "rest" {
+    const ap = irAddrPlan(c, simdMemBase(row))
+    if ap.maArm != "const" && ap.maArm != "rest" && ap.maArm != "fold" {
       return irLMiss("simd memory plan")
     }
-    for a in r.sdArgs { irLOpnd(a) }
+    addrOpnds(r.sdArgs, ap)
     return simdMemTail(row, ap.maOff)
   }
   for a in r.sdArgs { irLOpnd(a) }
@@ -2664,12 +2667,51 @@ function memAccess(r: RMemAccess) {
   const f = nodeAt(c.callFn)
   if !(f is Ident) { return irLMiss("memory access node") }
   const p = memAccessPlanOf(f.identName)
-  const ap = memAddrPlanOf(c, p.mxBase, lw.irAt)
-  if p.mxOp < 0 || (ap.maArm != "const" && ap.maArm != "rest") {
+  const ap = irAddrPlan(c, p.mxBase)
+  if (
+    p.mxOp < 0
+    || ap.maArm != "const" && ap.maArm != "rest" && ap.maArm != "fold"
+  ) {
     return irLMiss("memory access plan")
   }
-  for o in r.mmArgs { irLOpnd(o) }
+  addrOpnds(r.mmArgs, ap)
   return memAccessTail(p, ap.maOff)
+}
+
+// The address plan of memory call `c` (`base` declared operands) over the fold rows the builder
+// derived (`irMaDecl`), as `memAddrPlanOf` answers it over legacy's own.
+function irAddrPlan(c: Call, base: i32): MemAddrPlan {
+  return memAddrPlanWith(
+    c,
+    base,
+    lw.irAt,
+    { mfDecl: lw.irMaDecl, mfSlot: lw.irMaSlot, mfK: lw.irMaK },
+  )
+}
+
+// An access's operands along plan `ap`: on the `fold` arm its address is the fold's local, read in
+// place of the binding the builder named, which holds that local plus the plan's offset.
+function addrOpnds(args: Opnd[], ap: MemAddrPlan) {
+  let i = 0
+  while i < args.length {
+    if i == 0 && ap.maArm == "fold" {
+      fbLocalGet(ap.maRest)
+    } else {
+      irLOpnd(args[i])
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// `RMaFoldInit` as `emitMemConstFoldLet` writes it: the bounded part, teed into its fold local,
+// then plus the folded constant.
+function maFoldInit(r: RMaFoldInit) {
+  irLOpnd(r.mfiV)
+  fbLocalTee(r.mfiSlot)
+  fbI32Const(r.mfiK as% i32)
+  fbI32Bin(0x6a)
+  return 0
 }
 
 // `RAtomic`: legacy's atomic arm in `emitAtomicIntrinsic`'s order: the address the builder took
@@ -2680,9 +2722,11 @@ function atomic(r: RAtomic) {
   const pl = atomicPlanOf(c)
   if pl.apFail != "" { return irLMiss("atomic plan") }
   if pl.apBase == 0 { return atomicTail(pl.apRow, 0) }
-  const ap = memAddrPlanOf(c, pl.apBase, lw.irAt)
-  if ap.maArm != "const" && ap.maArm != "rest" { return irLMiss("atomic plan") }
-  for o in r.amArgs { irLOpnd(o) }
+  const ap = irAddrPlan(c, pl.apBase)
+  if ap.maArm != "const" && ap.maArm != "rest" && ap.maArm != "fold" {
+    return irLMiss("atomic plan")
+  }
+  addrOpnds(r.amArgs, ap)
   return atomicTail(pl.apRow, ap.maOff)
 }
 
@@ -4575,22 +4619,28 @@ function optRead(r: ROptRead) {
   if arm != "nonNull" {
     irLOpnd(r.orV)
     fbRefIsNull()
-    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r) }
+    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r, true) }
     emitOptLinkNullClose(r.orAt, lw.irAt)
     emitOptLeafHead(r.orAt, lw.irAt)
+    optReadBase(r, true)
+  } else {
+    optReadBase(r, false)
   }
-  optReadBase(r)
   emitOptLeafTail(r.orAt, lw.irAt)
   return 0
 }
 
-// The optional read's base as `emitOptChainValue` pushes an unstaged one: its niche recovered.
-function optReadBase(r: ROptRead) {
-  irLOpnd(r.orV)
+// The optional read's base as `emitOptChainValue` pushes an unstaged one, `again` once the null
+// test has read it (a temp's read written again, `opndAgain`): its niche recovered.
+function optReadBase(r: ROptRead, again: boolean) {
   const m = nodeAt(r.orAt)
-  if m is OptMember && exprNullableRefNiche(m.omObj, lw.irAt) {
-    fbRefAsNonNull()
+  if !(m is OptMember) { return irLMiss("optional read node") }
+  if again {
+    if opndAgain(r.orV, m.omObj) < 0 { return -1 }
+  } else {
+    irLOpnd(r.orV)
   }
+  if exprNullableRefNiche(m.omObj, lw.irAt) { fbRefAsNonNull() }
   return 0
 }
 
