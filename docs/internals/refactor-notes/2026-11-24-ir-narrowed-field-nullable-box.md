@@ -27,7 +27,28 @@ None new.
 
 ## Readings (fixpoint seeds on both sides, master 4435b3e3)
 
-READINGS
+Functions with no blocker, `VL_IR_SHADOW=4`: tests/cases 79,702 -> 79,720; distilled corpus 46,812
+-> 46,812 (the class had no corpus cell). `narrowed field unbox rep`: tests/cases 18 -> 0 (all
+sole). `narrowed field unbox nullable disc`: 0 in tests/cases and the corpus. No program loses a
+function.
+
+| tests/cases program | change |
+| --- | ---: |
+| `narrowing/narrowed-variant-union-box-field.vl` | +2 |
+| `unions/arm-nullable-field-of-own-union.vl` | +2 |
+| `unions/struct-field-union-arm-nesting.vl` | +2 |
+| `closures/nul-closure-nullable-field-arm-union-graduation.vl` | +1 |
+| `closures/rebind-union-arm-closure-field-call.vl` | +1 |
+| `records/map-value-literal-to-union-arm.vl` | +1 |
+| `records/repointed-let-alias-to-union-arm.vl` | +1 |
+| `types/type-name-walk-homes-coverage.vl` | +1 |
+| `unions/inferred-return-self-union-nullable.vl` | +1 |
+| `unions/narrowed-variant-nullable-field-reads-its-box.vl` (new witness) | +1 |
+| `unions/record-arms-same-field-narrowed-read-into-union.vl` | +1 |
+| `unions/rolled-unrolled-arm-one-tag.vl` | +1 |
+| `unions/shared-field-atom-and-string-arms.vl` | +1 |
+| `unions/tagged-arm-nullable-field-literal.vl` | +1 |
+| `unions/variant-nullable-litunion-field.vl` | +1 |
 
 ## Position sweep (Q58)
 
