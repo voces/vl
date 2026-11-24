@@ -2,7 +2,7 @@
 // (IR on) and by its `CLAIMED`-empty twin (IR off, `ir-identity.sh --build-claimless`), and both
 // modules are run; stdout, exit code and trap message must agree.
 //
-//     vl run scripts/ir-parity.vl -- [--seed P] [--claimless P] [--pop cells,cases,probes]
+//     vl run scripts/ir-parity.vl -- [--seed P] [--claimless P] [--pop cells,cases,probes|refusals]
 //         [--files F...] [--from LIST] [--out F] [--run-all] [--behaviour-only]
 //
 // Rows are `program\tverdict\tdetail`, one per program, in `--out` (default
@@ -100,7 +100,49 @@ function probesPop(): string[] {
   return out
 }
 
-function population(args: readonly string[]): string[] {
+// The programs legacy refuses at emit, where a claim that skipped the refusal would show: every
+// `@emit-error` tests/cases program, `tests/ir-claim-fallback`, and each inventory witness filed
+// `emit_reject`, materialised under `tmp` by `scripts/inventory/witnesses.vl`.
+function refusalsPop(seed: string, tmp: string): string[] {
+  const x = spawn(
+    "grep",
+    ["-rl", "^// @emit-error", "--include=*.vl", "tests/cases"],
+  )
+  if x.code > 1 { die("ir-parity: grep over tests/cases failed\n\{x.err}", 2) }
+  const out: string[] = []
+  for l in split(x.out, "\n") {
+    if endsWith(l, ".vl") { out.push(l) }
+  }
+  for n in cellsIn("tests/ir-claim-fallback") {
+    out.push("tests/ir-claim-fallback/" + n + ".vl")
+  }
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  const w = spawn(
+    vl,
+    [
+      "run",
+      "scripts/inventory/witnesses.vl",
+      "--compiler",
+      seed,
+      "--",
+      "--outcome",
+      "emit_reject",
+      "--out",
+      tmp + "/witnesses",
+    ],
+  )
+  if w.code != 0 { die("ir-parity: witnesses.vl failed\n\{w.out}\{w.err}", 2) }
+  for l in split(w.out, "\n") {
+    if endsWith(l, ".vl") { out.push(l) }
+  }
+  return out
+}
+
+function population(
+  args: readonly string[],
+  seed: string,
+  tmp: string,
+): string[] {
   const files = argsOf(args, "--files")
   const from = argOr(args, "--from", "")
   if files.length > 0 || from != "" {
@@ -116,10 +158,20 @@ function population(args: readonly string[]): string[] {
   const out: string[] = []
   for p in split(argOr(args, "--pop", "cells,cases,probes"), ",") {
     let got: string[] = []
-    if p == "cells" { got = cellsPop() }
-    else if p == "cases" { got = casesPop() }
-    else if p == "probes" { got = probesPop() }
-    else { die("ir-parity: --pop takes cells, cases and probes, not \{p}", 2) }
+    if p == "cells" {
+      got = cellsPop()
+    } else if p == "cases" {
+      got = casesPop()
+    } else if p == "probes" {
+      got = probesPop()
+    } else if p == "refusals" {
+      got = refusalsPop(seed, tmp)
+    } else {
+      die(
+        "ir-parity: --pop takes cells, cases, probes and refusals, not \{p}",
+        2,
+      )
+    }
     for f in got { out.push(f) }
   }
   sort(out, (a: string, b: string) => a < b)
@@ -152,10 +204,12 @@ function firstError(log: string): string {
 }
 
 function build(c: Ctx, compiler: string, f: string, out: string): Built {
+  // Strict, as every gate runs: an invalid claimed module is rc 70, never legacy's fallback bytes.
   const p = spawn(
     "env",
     [
       "VL_STD=" + c.std,
+      "VL_IR_STRICT=1",
       "timeout",
       BUILD_SECS,
       c.vl,
@@ -321,9 +375,12 @@ function main(args: readonly string[]) {
   const root = cwd()
   const seed = argOr(args, "--seed", TOOL_COMPILER)
   if !isFile(seed) { die("ir-parity: no seed at \{seed}", 2) }
-  const progs = population(args)
-  if progs.length == 0 { die("ir-parity: no programs", 2) }
   const tmp = makeTempDir()
+  const progs = population(args, seed, tmp)
+  if progs.length == 0 {
+    spawn("rm", ["-rf", tmp])
+    die("ir-parity: no programs", 2)
+  }
   let off = argOr(args, "--claimless", "")
   if off == "" {
     off = tmp + "/claimless.wasm"

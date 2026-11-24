@@ -504,6 +504,14 @@ admitted features. It is an order-of-magnitude guide, not a measurement of the b
 | **I9** | phase B: `irInstantiate(InstReq)` | — | I8, Q steps 1 and 6, H stage 5, S stages 3–5 | mono's clone, retype and string-key code (§3.2) |
 | **I10** | the IR passes in §4.2, one PR each | — | I8 | `opt_*.vl`, about 9,400 lines, as each replacement lands |
 
+**The claims-off fallback leaves at I8** (coordinator ruling 2026-11-24). Until then a claimed unit
+skips legacy's lowering, and with it any refusal legacy raises there. So the host rebuilds a unit
+whose claimed module fails validation with claims off (`claims_off_rebuild` in `scripts/vl-host`).
+Legacy's refusal is then the answer (rc 1). Otherwise legacy's bytes ship with a stderr line, or under
+`$VL_IR_STRICT=1`, which every gate and CI job sets, the build fails with rc 70. Once legacy is deleted
+there is nothing to fall back to. From I8 on, an invalid claimed module is a loud internal compiler
+error (rc 70) in every mode, and each refusal legacy raised must by then exist as the IR's own.
+
 The order is forced:
 - I1 → I2 → I4, because each widens the operand reps the next one's lowering takes.
 - I3 can land any time after I2. It belongs before I4, because box and unbox are coercions.
