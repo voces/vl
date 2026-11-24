@@ -1,4 +1,4 @@
-# A record-joined value `if` compares as its record (2026-11-24, lane IR-N5, D17128)
+# A record-joined value `if` compares as its record (2026-11-24, lane IR-N5, D17132)
 
 A value `if` whose arm is a union narrowed to a record is written by legacy as a reference join at
 the record's row (`ifJoinsAtRecord`, D17026). As a `==` / `!=` operand, `eqRouteOf` still took its
