@@ -3307,6 +3307,31 @@ Deno.test({
   },
 });
 
+// A miss at a node whose type has no rep keeps its class (`rep <what>`, a key the census diffs), and
+// the detail mode adds one row naming the node's kind and the function.
+Deno.test({
+  name: "ir shadow: a rep miss's detail row names its node, and the class is unchanged",
+  ignore,
+  fn: () => {
+    const src = Deno.readTextFileSync(
+      new URL("./cases/unions/layout-family-string-field-read-as-atom-hazards-runs.vl", import.meta.url),
+    );
+    const one = run(src, 1);
+    const detail = run(src, 2);
+    const plain = run(src, 0);
+    const rows1 = [...one.rows.keys()];
+    if (rows1.some((k) => k.startsWith("detail ")) || one.rows.get("uncovered rep ?") !== 1) {
+      throw new Error(`want mode 1's one \`uncovered rep ?\` and no detail row, got ${JSON.stringify([...one.rows])}`);
+    }
+    if (detail.rows.get("detail rep ? of string in mat") !== 1) {
+      throw new Error(`want the detail row naming the string node in mat, got ${JSON.stringify([...detail.rows])}`);
+    }
+    if (one.out.length !== plain.out.length || one.out.some((b, i) => b !== plain.out[i])) {
+      throw new Error("want the armed shadow's module byte-identical to the unarmed one");
+    }
+  },
+});
+
 // A lone-literal field filled from a binding of that literal, built at a parameter's row that
 // keeps the field as its atom: the binding's member id (`atom_sole`) is an atom typed at the
 // literal, which rule 3 admits (`loneLitAtom`). The callee reads the field at its atom, which its
