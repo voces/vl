@@ -217,6 +217,19 @@ Deno.test({
   },
 });
 
+// A record compare's element side over a place receiver banks the element-read rows legacy's
+// own root writes at each field: with them dropped (control 5) the row's spans count reds.
+Deno.test({
+  name: "ir shadow: a record compare's place element side banks its element-read rows",
+  ignore,
+  fn: () => {
+    const row = fileRows.find((r) => r.file.endsWith("/record-compare-element-place.vl"));
+    if (row === undefined) throw new Error("want the record-compare-element-place row, got none");
+    gradeRow(row);
+    reds(() => gradeRow(row, DIVERGENCES, 5), "spans");
+  },
+});
+
 // The tripwire: a row name is one row, inline or in a file, never both and never two files.
 Deno.test({
   name: "ir shadow: no row name is both inline and a file, or two files",
@@ -1682,6 +1695,8 @@ Deno.test({
       "record-arms-unbox-at-another-record": 2,
       "asg-arm-unbox-at-its-record": 0,
       "asg-arm-unbox-without-dest": 2,
+      "led-box-follows-its-dispatch": 0,
+      "led-box-past-a-node": 10,
       "box-list-retag-into-i32-list": 2,
       "list-of-lists-retag-into-nullable-lists": 0,
       "list-of-lists-retag-into-other-lists": 2,
@@ -1794,6 +1809,10 @@ Deno.test({
       "walk-map-key-off-rep": 2,
       "map-scalar-join-of-i32": 0,
       "map-scalar-join-of-string": 2,
+      "asg-unwiden-wrap-of-i64": 0,
+      "asg-unwiden-trunc-of-i64": 2,
+      "asg-unwiden-non-null-of-nullable-record": 0,
+      "asg-unwiden-non-null-of-record": 2,
       "map-print-of-i32": 0,
       "map-print-of-string": 2,
     };
@@ -1835,6 +1854,9 @@ Deno.test({
     // Each kind legacy's descriptor names alone maps to a type that describes back at that kind.
     const rd = exp.repDescSelfTest();
     if (rd !== 0) throw new Error(`want every descriptor kind to round-trip, got kind ${rd} off`);
+    // The map niche's kind lies above every box tag a list niche reads as its kind.
+    const nk = exp.nicheKindSelfTest();
+    if (nk !== 0) throw new Error(`want NICHE_NUL_MAP above every niche kind, got kind ${nk} at or above it`);
   },
 });
 
