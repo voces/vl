@@ -22,7 +22,7 @@ The builder built it at the row's recorded type, another rep, and no retag rule 
 that differs only in a record field's nullability. `retDelivered` now builds such a literal at the
 result's rep and type at that row. A struct literal among its fields at another rep of its own row
 (`retLitFieldsAtTheirReps`) would take a retag the verifier refuses, so the return misses as
-`return coercion nested twin`.
+`return coercion nested twin` ([D17385](../inventory/D17385.md)).
 
 ## Readings
 
