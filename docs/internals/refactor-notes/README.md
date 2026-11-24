@@ -8,6 +8,55 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-24-legacy-record-join-compare-operand](2026-11-24-legacy-record-join-compare-operand.md): A record-joined value `if` compares as its record (2026-11-24, lane IR-N5, D17132)
+- [2026-11-24-ir-union-if-record-join](2026-11-24-ir-union-if-record-join.md): A value `if` joined at a record's row is legacy's reference join, its narrowed arm unboxed (2026-11-24, lane IR-N5)
+- [2026-11-24-ir-union-compare-null-leg-reread](2026-11-24-ir-union-compare-null-leg-reread.md): IR: a null-leg union compare's field or global operand, read again (2026-11-24, lane N10)
+- [2026-11-24-ir-union-compare-atom-place](2026-11-24-ir-union-compare-atom-place.md): IR: a `K | null` place operand on a union compare's null leg (2026-11-24, lane N10)
+- [2026-11-24-ir-union-cast-boxed-nullable](2026-11-24-ir-union-cast-boxed-nullable.md): IR: a union cast over a boxed nullable operand, 2026-11-24
+- [2026-11-24-ir-store-short-circuit-start](2026-11-24-ir-store-short-circuit-start.md): IR: a store whose value is a staging `??` (2026-11-24, lane N10)
+- [2026-11-24-ir-store-after-a-lead](2026-11-24-ir-store-after-a-lead.md): IR soundness: an operand that stores declines after an earlier operand (2026-11-24, lane IR-N11, D17109)
+- [2026-11-24-ir-shared-member-callee-nullable](2026-11-24-ir-shared-member-callee-nullable.md): IR: a shared member callee over a nullable receiver misses by name (2026-11-24, lane S1)
+- [2026-11-24-ir-scalar-map-compare-route](2026-11-24-ir-scalar-map-compare-route.md): IR: a scalar map compare after a null test reads the probe's compare (2026-11-24, lane S1)
+- [2026-11-24-ir-push-nullable-element](2026-11-24-ir-push-nullable-element.md): IR: a push onto a nullable element slot, as legacy builds the value, 2026-11-24
+- [2026-11-24-ir-print-open-valued-if](2026-11-24-ir-print-open-valued-if.md): IR: a nullable print of a valued `if` opens its blocks before the `if`, 2026-11-24
+- [2026-11-24-ir-print-map-scalar](2026-11-24-ir-print-map-scalar.md): IR: `print` of a scalar-valued map read (2026-11-24, lane S1)
+- [2026-11-24-ir-optional-read-reread](2026-11-24-ir-optional-read-reread.md): IR: a standalone `?.` over a global or field-read base, 2026-11-24
+- [2026-11-24-ir-nulstruct-eq](2026-11-24-ir-nulstruct-eq.md): IR: nullable record equality (2026-11-24, lane IR-D1)
+- [2026-11-24-ir-nullable-record-eq-bare-side](2026-11-24-ir-nullable-record-eq-bare-side.md): IR: a nullable record compared with a bare one (2026-11-24, lane S1)
+- [2026-11-24-ir-narrowed-field-nullable-box](2026-11-24-ir-narrowed-field-nullable-box.md): IR: a narrowed variant's union-box field read as a boxed nullable on that box, 2026-11-24
+- [2026-11-24-ir-n9-d17089](2026-11-24-ir-n9-d17089.md): IR coverage: a staged root reads above the roots staged below it (2026-11-24, lane IR-N9, D17089)
+- [2026-11-24-ir-n9-batch10](2026-11-24-ir-n9-batch10.md): IR coverage, batch 10: a push receiver read with legacy's strict payload cast (2026-11-24, lane IR-N9)
+- [2026-11-24-ir-n7-narrowed-read](2026-11-24-ir-n7-narrowed-read.md): IR coverage: a box's null test and a seated box read on the `??` desugar; a non-atom string part at any rep (2026-11-24, lane IR-N7)
+- [2026-11-24-ir-n7-atom-part-b](2026-11-24-ir-n7-atom-part-b.md): IR coverage: a literal-union string part at a string rep, through the delivery's atom decode (2026-11-24, lane IR-N7)
+- [2026-11-24-ir-n3-global-read-5](2026-11-24-ir-n3-global-read-5.md): IR-N3: `global read coercion`, part 5 — a bundle holder global over a map read (2026-11-24, lane IR-N3)
+- [2026-11-24-ir-n3-atom-cell-local](2026-11-24-ir-n3-atom-cell-local.md): IR-N3: `atom cell local rep` — a `const` joining const-bound literals, held as the set's atom (2026-11-24, lane IR-N3)
+- [2026-11-24-ir-n3-asg-box-rep](2026-11-24-ir-n3-asg-box-rep.md): IR-N3: the assignment-value box rep (2026-11-24, lane IR-N3)
+- [2026-11-24-ir-member-record-c](2026-11-24-ir-member-record-c.md): IR coverage: `member record` family C, a field read off a narrowed `V | null` member (2026-11-24, lane IR-N8)
+- [2026-11-24-ir-mem-addr-fold](2026-11-24-ir-mem-addr-fold.md): IR coverage: `memory address fold`, legacy's declaration-time address fold ported byte-identically (2026-11-24, lane IR-N8)
+- [2026-11-24-ir-map-walk-element](2026-11-24-ir-map-walk-element.md): IR: a map walk binds its key or value at the rep the map stores it at, 2026-11-24
+- [2026-11-24-ir-m1-heap-value-note](2026-11-24-ir-m1-heap-value-note.md): IR heap identity 4b: a struct literal's temp carries the heap it was built at (2026-11-24, lane IR-M1, D17083)
+- [2026-11-24-ir-m1-heap-kid-notes](2026-11-24-ir-m1-heap-kid-notes.md): IR heap identity 4c: `recHeapsNote` walks the kids of a rep already noted (2026-11-24, lane IR-M1, D17083)
+- [2026-11-24-ir-list-get-str-bytes](2026-11-24-ir-list-get-str-bytes.md): IR: list `.get(i)` and string `.bytes()` (2026-11-24, lane IR-D1)
+- [2026-11-24-ir-is-fit-grow](2026-11-24-ir-is-fit-grow.md): IR: an `is K[]` whose arm pushes onto its receiver (2026-11-24, lane IR-N1)
+- [2026-11-24-ir-is-fit-capture](2026-11-24-ir-is-fit-capture.md): IR: a shadow-arm `is K[]` whose name a closure reads (2026-11-24, lane IR-N1)
+- [2026-11-24-ir-is-decided-shadow](2026-11-24-ir-is-decided-shadow.md): IR: a decided `is K[]` over a shadowed arm (2026-11-24, lane IR-N1)
+- [2026-11-24-ir-is-decided-grow](2026-11-24-ir-is-decided-grow.md): IR: a decided `is K[]` over a growing shadow arm (2026-11-24, lane IR-N1)
+- [2026-11-24-ir-identity-eq](2026-11-24-ir-identity-eq.md): IR: reference identity (2026-11-24, lane IR-D1)
+- [2026-11-24-ir-guarded-global-write](2026-11-24-ir-guarded-global-write.md): IR: a guarded global write (2026-11-24, lane N10)
+- [2026-11-24-ir-global-init-nulnone](2026-11-24-ir-global-init-nulnone.md): IR: a `null`-typed module global's initializer, 2026-11-24
+- [2026-11-24-ir-for-in-nullable-arm](2026-11-24-ir-for-in-nullable-arm.md): A walk over a nullable union-arm list is legacy's plain walk (2026-11-24, lane IR-N5)
+- [2026-11-24-ir-for-in-nulbool-f32](2026-11-24-ir-for-in-nulbool-f32.md): IR: a walk over a `(boolean | null)[]` or an `f32[]` (2026-11-24, lane IR-N1)
+- [2026-11-24-ir-coal-valbox-stage](2026-11-24-ir-coal-valbox-stage.md): IR coverage: a boxed binding's `??` argument after another argument (2026-11-24, lane IR-N11)
+- [2026-11-24-ir-closure-arg](2026-11-24-ir-closure-arg.md): IR coverage: `closure argument coercion`, a `null` at a function value's nullable reference parameter (2026-11-24, lane IR-N8)
+- [2026-11-24-ir-claim-soft-refusal](2026-11-24-ir-claim-soft-refusal.md): IR: a claim that meets a shared legacy helper's refusal declines (2026-11-24, lane IR-P1)
+- [2026-11-24-ir-claim-refusal-guard](2026-11-24-ir-claim-refusal-guard.md): A claimed unit skipped legacy's refusal: the claims-off fallback (2026-11-24, lane IR-P1, express)
+- [2026-11-24-ir-capture-shapes](2026-11-24-ir-capture-shapes.md): IR: capture binding shapes 2 and 3 (2026-11-24, lane IR-D1)
+- [2026-11-24-ir-call-ref-never](2026-11-24-ir-call-ref-never.md): IR: a function-value call whose result is never, 2026-11-24
+- [2026-11-24-ir-c1-map-store-variant](2026-11-24-ir-c1-map-store-variant.md): `map store value variant bare` (IR-C1)
+- [2026-11-24-ir-c1-aso-stage](2026-11-24-ir-c1-aso-stage.md): `arm site operand`, part 1: a narrowed receiver is its name (IR-C1)
+- [2026-11-24-ir-c1-arm-site-operand](2026-11-24-ir-c1-arm-site-operand.md): `arm site operand`, part 2: an effect-free index built once (IR-C1, Q57)
+- [2026-11-24-d17092-null-bound-result](2026-11-24-d17092-null-bound-result.md): D17092: a `Z | null` result bound at `never` (2026-11-24, lane IR-D1)
+- [2026-11-24-d17090-null-assignment-at-its-destination](2026-11-24-d17090-null-assignment-at-its-destination.md): D17090: an assignment of `null` is the null its destination holds (2026-11-24, lane S1)
 - [2026-11-24-d17088-null-binding-initialiser](2026-11-24-d17088-null-binding-initialiser.md): D17088: a `null` binding's initialiser runs for its effect (2026-11-24, lane S1)
 - [2026-11-24-ir-coal-stage-box-head](2026-11-24-ir-coal-stage-box-head.md): IR soundness: a staging `??`'s box head is written after its staged leads (2026-11-24, lane IR-N11, D17091)
 - [2026-11-24-ir-union-compare-bool-niche](2026-11-24-ir-union-compare-bool-niche.md): IR: a `boolean | null` operand against a union with no `null` arm (2026-11-24, lane N10)
