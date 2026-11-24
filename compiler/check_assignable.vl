@@ -519,10 +519,12 @@ import {
   tyArrayElemIx,
   tyAt,
   tyBearsNull,
+  tyChildrenOf,
   tyElemOf,
   tyElemOpen,
   tyFreshBegin,
   tyHasHole,
+  tyHasInferHole,
   tyHasNullHole,
   tyIsHole,
   tyIsLitUnion,
@@ -3788,6 +3790,18 @@ export function letRule(
     // A function whose own parameters are still open fits no destination that holds no
     // function, whatever they become, so it is judged now rather than deferred (D14979).
     const clash = tyHasHole(lg) && !tyHasHole(lw) && fnShapeClash(lg, lw, [])
+    // A generic function value into a binding a generic function type annotates: judged now, as
+    // no call closes the binding's type (D17322).
+    const gw = if !clash && tyHasHole(lg) && tyHasHole(lw) { genSigFitWhy(lg, lw, row.s) } else { GEN_SIG_DEFER }
+    if gw != GEN_SIG_DEFER && gw != "" && !letLamJudgedAtCall(ci, ix) {
+      tErr(
+        gw
+          + " ("
+          + atCallWhereAs(row.fn, who, row.on, row.a, row.site, ix, "used", "body")
+          + ")",
+        ix,
+      )
+    }
     if (
       (!tyHasHole(lg) && !tyHasHole(lw) || clash)
       && !letLamJudgedAtCall(ci, ix)
@@ -3819,6 +3833,110 @@ export function letRule(
   }
   cvNow = cvWas
   return 0
+}
+
+// `genSigFitWhy`'s answer for a pair it does not judge: the bound stays deferred.
+const GEN_SIG_DEFER = "defer"
+
+// Whether generic signature `g` fits binding `name` of generic signature `w`: `g`'s own type
+// parameters bound by `w`'s parameters, `w`'s held rigid. "" when it fits, the refusal's sentence
+// when not, GEN_SIG_DEFER unless both are a generic declaration's own signature with no hole.
+function genSigFitWhy(g: i32, w: i32, name: string): string {
+  const gd = genSigDecl(g)
+  const wd = genSigDecl(w)
+  if gd < 0 || wd < 0 { return GEN_SIG_DEFER }
+  const gf = tyAt(g)
+  const wf = tyAt(w)
+  if !(gf is TyFunc) || !(wf is TyFunc) { return GEN_SIG_DEFER }
+  const head = "cannot assign "
+    + genSigStr(g, gd)
+    + " to '"
+    + name
+    + "' of type "
+    + genSigStr(w, wd)
+  // An arity mismatch is refused where the parameters are compared, in its own words.
+  if gf.fnParamTypes.length != wf.fnParamTypes.length { return GEN_SIG_DEFER }
+  const bn: string[] = []
+  const bt: i32[] = []
+  let i = 0
+  while i < gf.fnParamTypes.length {
+    bindGenWalk(gf.fnParamTypes[i], wf.fnParamTypes[i], bn, bt)
+    i = i + 1
+  }
+  const d = nodeAt(gd)
+  if d is FuncDecl {
+    for tp in d.fnTyParams {
+      if !strListHas(bn, tp) {
+        return head
+          + ": `"
+          + tp
+          + "` of `"
+          + d.fnName
+          + "` is fixed by none of its parameters"
+      }
+    }
+  }
+  i = 0
+  while i < gf.fnParamTypes.length {
+    if !tySame(substTyDeep(gf.fnParamTypes[i], bn, bt), wf.fnParamTypes[i]) {
+      return head
+    }
+    i = i + 1
+  }
+  return if tySame(substTyDeep(gf.fnRet, bn, bt), wf.fnRet) { "" } else { head }
+}
+
+// The generic declaration whose own signature `t` is, every type variable in it bound by that
+// declaration, and no inference hole; -1 otherwise.
+function genSigDecl(t: i32): i32 {
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || tyHasInferHole(t) {
+    return -1
+  }
+  const vs: i32[] = []
+  genSigVars(t, vs, [])
+  if vs.length == 0 { return -1 }
+  let b = -1
+  for v in vs {
+    const tv = tyAt(v)
+    if !(tv is TyVar) { return -1 }
+    if b < 0 { b = tv.tvBinder }
+    if tv.tvBinder != b { return -1 }
+  }
+  if b < 0 || b >= P.nodes.length { return -1 }
+  const d = nodeAt(b)
+  if !(d is FuncDecl) || d.fnTyParams.length == 0 || !tySame(nodeTyIxOf(b), t) {
+    return -1
+  }
+  return b
+}
+
+// Pushes onto `out` each type variable `t` holds, however deep, each once.
+function genSigVars(t: i32, out: i32[], seen: i32[]) {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return 0 }
+  seen.push(t)
+  if tyAt(t) is TyVar {
+    out.push(t)
+    return 0
+  }
+  const kids: i32[] = []
+  tyChildrenOf(t, kids)
+  for k in kids { genSigVars(k, out, seen) }
+  return 0
+}
+
+// Generic signature `t` of declaration `d` with its type parameters: `<T>(T) => T`.
+function genSigStr(t: i32, d: i32): string {
+  const f = nodeAt(d)
+  let s = "<"
+  if f is FuncDecl {
+    let i = 0
+    while i < f.fnTyParams.length {
+      if i > 0 { s = s + ", " }
+      s = s + f.fnTyParams[i]
+      i = i + 1
+    }
+  }
+  return s + ">" + tyToStr(t)
 }
 
 // The method-argument rule for one `BND_BM` bound `row` (row `ci` of its kind) of `calleeFn`: a
