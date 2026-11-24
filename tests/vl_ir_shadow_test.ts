@@ -1749,7 +1749,7 @@ Deno.test({
       "captured-atom-param-typed-as-string": 3,
       "get-of-list": 0,
       "get-index-of-string": 2,
-      "bytes-of-string": 0,
+      "bytes-into-i32-list": 2,
       "bytes-of-i32": 2,
       "opt-read-of-i32": 2,
       "dead-return-after-returning-call": 5,
