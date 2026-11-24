@@ -35,6 +35,20 @@ Base 0319020c, both seeds fixpoints.
 - Mode-4 corpus: `blockers none` 46789 → 46795 of 46958 functions. Starts covered/matched
   9689/9689 on both seeds.
 
+Position sweep (Q58): each arm in 10 positions, written with an earlier effectful operand where
+the position has one: a direct argument at the arm's own type and at a wider union, a nested call
+argument, a string `+` operand, an interpolation hole, `return`, a `const` initializer, an `if`
+arm, a `??` operand and a record-literal field. All 20 are check-clean and give output identical
+to a claimless compiler on both seeds, and all are matched under mode 6. At base, 12 of the 20
+were refused at `coalesce box after an operand`. The templates
+`scripts/capability-probes/matrix/coalesce-boxed-binding-{wide,scalar}-default.matrix.vl` run in
+every graded position on both seeds (64 of 64, 46 of 46). Their 110 generated programs are
+identical to claimless, with no mode-6 fail.
+
+This lane's first candidate made `scripts/silent-sweep/distilled/ir-shadow.vl` build invalid wasm,
+through the staging arms' box head order. That defect was already on master for the niche arms.
+It shipped first as D17091's express fix (#9816), and this change is measured on top of it.
+
 Rows: `tests/ir-shadow-rows/coalesce-box-argument-after-a-call.vl`,
 `coalesce-box-scalar-argument-after-a-call.vl`, `coalesce-box-arguments-side-by-side.vl`.
 Neighbours already matched at base and still matched: the `??` argument first, then a plain
