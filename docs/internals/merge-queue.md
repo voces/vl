@@ -299,6 +299,13 @@ For the queue:
 - **Q55.** Before a squash, `presq.sh` flags `changelog.d` entries the squash would resurrect
   (already folded on master, still on a stale branch). The queue removes them in the mechanical
   master merge and checks that the code tree equals the train's (queue practice).
+- **Q56.** When a train's base lacks master's compiler commits (the PR head and the train base
+  predate a master commit touching `compiler/`), the queue's sqcheck typechecks the squash tree
+  before merging: `git archive <tree> | tar -x` into a scratch dir, then `vl check
+  compiler/entry.vl` there with `VL_STD` set to that dir's `std`; it must print `Found 0 errors`.
+  A mechanical tree comparison cannot see a semantic conflict: #9778 added a fifth `coalesce`
+  parameter while master's #9771 added 4-argument calls, both merged textually clean, and the
+  merged compiler did not typecheck (coordinator ruling, 2026-11-23).
 
 ### Squash artifacts and Q3 members
 
