@@ -1362,6 +1362,7 @@ import {
 } from "./emit_sig_tokens"
 import {
   NICHE_NUL_LIT,
+  NICHE_NUL_MAP,
   RC_MAP,
   RC_REF_LIST,
   coalesceResultIsBox,
@@ -8608,6 +8609,20 @@ export function emitNicheReadTail(exprIx: i32, ak: i32, fnIx: i32) {
   } else if ak == 2 {
     fbIfRefNul(sTy(), true) // if (result (ref null $sTypeIdx))
     fbRefNull(sTy())
+  } else if ak == 11 {
+    // A closure's niche is the nullable fat pointer; `emitUnionUnboxTail` casts the payload to it.
+    fbIfRefNul(cloStructIdx, true)
+    fbRefNull(cloStructIdx)
+  } else if ak == NICHE_NUL_MAP {
+    // A map's niche is its nullable struct, the one the read's consumer is typed against.
+    const mt = mapTypeIdxOf(mapShapeOfExpr(exprIx, fnIx))
+    fbIfRefNul(mt, true)
+    fbRefNull(mt)
+    fbElse()
+    fbLocalGet(st)
+    if mapUnionUnboxTail(exprIx, fnIx) < 0 { return -1 }
+    fbEnd()
+    return 0
   } else {
     // A list's niche is its nullable wrapper; `emitUnionUnboxTail` casts the payload to it.
     const lw = listWrapHeapOfKind(ak)
@@ -44805,6 +44820,7 @@ function nulScalarListAtomKind(kind: VKind): i32 {
 // Read off the NICHE, since the value is still nullable and classifies as no atom at all.
 function coalNicheAtomKind(lhsIx: i32, fnIx: i32): i32 {
   if exprNullableString(lhsIx, fnIx) { return 2 }
+  if exprNulClosure(lhsIx, fnIx) { return 11 }
   if exprNullableList(lhsIx, fnIx) {
     // A boolean list tags apart from the `i32` list it shares storage with.
     if boolLeafListDepthOfTy(tyPeelNul(nodeTyIxOf(unwrapParen(lhsIx)))) == 0 {
@@ -44848,6 +44864,10 @@ function coalNicheBoxTag(joinTy: i32, lhsIx: i32, heapIx: i32, fnIx: i32): i32 {
     return refArrSlotTag(rs)
   }
   const ak = coalNicheAtomKind(lhsIx, fnIx)
+  // A closure rides the box's `anyref` slot as its fat pointer, under the closure arm's tag.
+  if ak == 11 {
+    return if unionTyHasBoxKind(joinTy, 11) { scalarTagOfKind(11) } else { -1 }
+  }
   if ak >= 0 {
     if refAtomElemName(ak) == "" || !unionTyHasBoxKind(joinTy, ak) { return -1 }
     return scalarTagOfKind(ak)
@@ -44892,7 +44912,10 @@ function emitUnionBoxNulNiche(
     return nulBoolBoxTail()
   }
   // The value's shape is asked before the union's `null`, so only a niche reads the set.
-  if exprNulBool(nnIx, fnIx) || !coalesceNulRefNicheOperand(nnIx, fnIx) {
+  if (
+    exprNulBool(nnIx, fnIx)
+    || !(coalesceNulRefNicheOperand(nnIx, fnIx) || exprNulClosure(nnIx, fnIx))
+  ) {
     return 0
   }
   if !unionSetHasNullTy(unionKey, unionTy) { return 0 }
