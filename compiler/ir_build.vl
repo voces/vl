@@ -10,6 +10,7 @@ import { asExprNumCastDomain } from "./emit_union_casts"
 import { nulAtomWidenTexts } from "./emit_lit_atoms"
 import {
   objLitBuildVariantRow,
+  popRecvIsList,
   rangeConstIs,
   rangeConstVal,
 } from "./emit_plan_list"
@@ -552,6 +553,7 @@ import {
   NULL_OWN_NONE,
   NULL_OWN_STR,
   NulTestArm,
+  binNulNameTestOf,
   binNulTestOf,
   coalArmOf,
   coalBoxArmOf,
@@ -773,6 +775,8 @@ import {
   cloLiftWriteSlot,
   emitErr,
   emitFailed,
+  emitSoftFail,
+  emitSoftMsg,
   fRecRetTy,
   fRetKind,
   fRetStructIdx,
@@ -855,6 +859,7 @@ import {
 import { isVoidTy, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
+  listGetIdxReReadable,
   optChainStagesRecv,
   sFieldTgtStructIdx,
   structIndexOfTy,
@@ -1033,17 +1038,58 @@ function claimable(): boolean {
   return true
 }
 
+// The soft-refusal scope one claim seam opens: the enclosing scope, restored when it closes, so a
+// seam nested in another (a const cell inside a claimed body) never hardens its caller's.
+type Soft = { sfWas: boolean, sfMsg: string }
+
+function softBegin(): Soft {
+  const s: Soft = { sfWas: emitSoftFail, sfMsg: emitSoftMsg }
+  emitSoftFail = true
+  emitSoftMsg = ""
+  return s
+}
+
+// Closes scope `s`, answering the refusal a shared legacy helper raised inside it, or "".
+function softEnd(s: Soft): string {
+  const m = emitSoftMsg
+  emitSoftFail = s.sfWas
+  emitSoftMsg = s.sfMsg
+  return m
+}
+
+// Whether a helper refused while this claim built: the claim declines before it writes a byte.
+function softRefused(what: string): boolean {
+  if emitSoftMsg == "" { return false }
+  count(
+    "claim fell back: "
+      + what
+      + "a legacy helper refused in `"
+      + ib.irName
+      + "`: "
+      + emitSoftMsg,
+  )
+  return true
+}
+
 // The claim seam, before legacy lowers the function at `fnIx` (`fnStmts` slot `fnPos`): when the
 // builder covers it and every node is claimed, the lowering writes its code entry onto `out` and
 // this answers true, so legacy does not run. Armed, legacy always runs and the shadow checks it.
 export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
+  const s = softBegin()
+  const ok = claimFn(fnIx, fnPos, out)
+  softEnd(s)
+  return ok
+}
+
+function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   const gen = repNodeGen()
   const minted = synthMintCount()
   ibClaimBuild = true
   const built = build(fnIx, fnPos)
   ibClaimBuild = false
+  if softRefused("") { return false }
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
@@ -1084,11 +1130,24 @@ export function irClaimStart(
   out: u8[],
 ): boolean {
   if !irStartClaimOn() { return false }
+  const s = softBegin()
+  const ok = claimStart(order, orderGi, poolFill, out)
+  softEnd(s)
+  return ok
+}
+
+function claimStart(
+  order: i32[],
+  orderGi: i32[],
+  poolFill: boolean,
+  out: u8[],
+): boolean {
   const gen = repNodeGen()
   const minted = synthMintCount()
   ibClaimBuild = true
   const built = buildStart(order, orderGi, poolFill)
   ibClaimBuild = false
+  if softRefused("start ") { return false }
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
@@ -6316,9 +6375,10 @@ function inPlaceFrom(b: i32[], at: i32): boolean {
 }
 
 // `inPlaceFrom` less a `??` that writes the temps staged before it below its tag test
-// (`coalArmStagesLeads`), as a valued `if` does.
+// (`coalArmStagesLeads`), as a valued `if` does, and less a literal's order stash, whose fields
+// it sets below them too.
 function inPlaceUnstagedFrom(b: i32[], at: i32): boolean {
-  return coalBoxFrom(b, at, false) || receiverStageFrom(b, at)
+  return coalBoxFrom(b, at, false) || listStageFrom(b, at)
 }
 
 // Whether operands built into `b` from `at` on hold a push receiver's stage, which the lowering
@@ -6443,6 +6503,14 @@ export function ifBelowLead(b: i32[], at: i32, why: string): boolean {
 
 // `ifBelowLead` over the operands built into `b` from `at` up to `to`.
 function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
+  if !ifBelowLeadHas(b, at, to) { return false }
+  irBMiss(why)
+  return true
+}
+
+// Whether the operands built into `b` from `at` up to `to` write a statement legacy would write
+// below a lead opened before them: a valued `if`, a boxed `??` or a stash.
+function ifBelowLeadHas(b: i32[], at: i32, to: i32): boolean {
   let i = at
   while i < to {
     const n = ib.irNodes[b[i]]
@@ -6452,7 +6520,6 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
       || n is SEffect && n.efRhs is RStashSet
       || storeAt(n)
     ) {
-      irBMiss(why)
       return true
     }
     i = i + 1
@@ -6810,6 +6877,13 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if m.memProp == "pop" && c.callArgs.length == 0 {
     return popValueRhs(b, m, ix)
   }
+  if (
+    m.memProp == "get"
+    && c.callArgs.length == 1
+    && popRecvIsList(m.memObj, ibFnIx)
+  ) {
+    return getValueRhs(b, c, m, ix)
+  }
   if m.memProp == "has" && c.callArgs.length == 1 && exprMap(m.memObj, ibFnIx) {
     return mapHasRhs(b, m.memObj, c.callArgs[0], ix)
   }
@@ -6843,6 +6917,8 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     op = "charcode"
   } else if exprIsStrMethod(ix, ibFnIx, "cpAt") && c.callArgs.length == 1 {
     op = "cpat"
+  } else if exprIsStrMethod(ix, ibFnIx, "bytes") && c.callArgs.length == 0 {
+    op = "bytes"
   } else if exprIsStrIndexOf(ix, ibFnIx) && c.callArgs.length == 1 {
     op = if m.memProp == "includes" { "includes" } else { "indexof" }
   } else if !exprIsStrMethod(ix, ibFnIx, "slice") {
@@ -6939,14 +7015,10 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   // An atom arm, or its `K | null`, streams the id its operand is held at (`emitStashAtomId`).
   const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else if want == "atom" || want == "nulAtom" { exprAt(b, c.callArgs[0], true) } else { irBExpr(b, c.callArgs[0]) }
   if ibMiss != "" { return 0 }
-  // Legacy opens a nullable string's or boolean's print blocks before its operand, so a valued
-  // `if` in it would sit above them.
-  if want == "nulStr" && ifBelowLead(b, from, "print nulStr of a valued if") {
-    return 0
-  }
-  if want == "nulBool" && ifBelowLead(b, from, "print nulBool of a valued if") {
-    return 0
-  }
+  // Legacy opens a nullable string's or boolean's print blocks before its operand, so where the
+  // operand wrote a valued `if` (or a stash) the blocks open before it (`RPrintOpen`).
+  const opened = if (want == "nulStr" || want == "nulBool") && ifBelowLeadHas(b, from, b.length) { if want == "nulBool" { 1 } else { 0 } } else { -1 }
+  if opened >= 0 { printOpenAt(b, from, opened, ix) }
   const vr = irBOpRep(v)
   const p = repPrim(vr)
   let ok = p != null && p == want
@@ -6960,7 +7032,13 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   if want == "nulAtom" { ok = atomNullable(vr) || repNodeAt(vr) is RAtom }
   if want == "union" { ok = repNodeAt(vr) is RBox || boxedNullable(vr) }
   if !ok { return skip("print operand rep") }
-  irBNode(b, { efRhs: { pnV: v, pnAt: ix } }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { efRhs: { pnV: v, pnAt: ix, pnOpened: opened } },
+    -1,
+    ibNoValue,
+    ix,
+  )
   return 0
 }
 
@@ -6990,9 +7068,24 @@ function trapStmt(b: i32[], c: Call, ix: i32) {
     const v = irBExpr(b, c.callArgs[0])
     if ibMiss != "" { return 0 }
     if repPrim(irBOpRep(v)) != "str" { return skip("trap message rep") }
-    irBNode(b, { efRhs: { pnV: v, pnAt: ix } }, -1, ibNoValue, ix)
+    irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
   }
   irBNode(b, { tpWhy: 0 }, -1, ibNoValue, ix)
+  return 0
+}
+
+// Places the blocks a nullable print opens (`RPrintOpen`, arm `arm`) at index `at` of body `b`,
+// before the operand statements built from there.
+function printOpenAt(b: i32[], at: i32, arm: i32, ix: i32) {
+  irBNode(b, { efRhs: { poArm: arm } }, -1, ibNoValue, ix)
+  const id = b.pop() ?? -1
+  let i = b.length
+  b.push(id)
+  while i > at {
+    b[i] = b[i - 1]
+    i = i - 1
+  }
+  b[at] = id
   return 0
 }
 
@@ -7238,7 +7331,27 @@ function popValueRhs(b: i32[], m: Member, ix: i32): Rhs {
   if !(repNodeAt(irBOpRep(v)) is RList) {
     return missRhs("pop operand coercion")
   }
-  const r: Rhs = { lqV: v, lqAt: ix }
+  const r: Rhs = { lqV: v, lqIx: [], lqAt: ix }
+  return r
+}
+
+// A list `.get(i)` on legacy's arm, `.pop`'s body with a bound (`emitPop`): the receiver, then the
+// index, which legacy writes from the call twice, so only an index it re-reads in place is taken.
+function getValueRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  if popAnyPlanOf(ix, ibFnIx) == null { return missRhs("method get") }
+  if !listGetIdxReReadable(c.callArgs[0]) { return missRhs("get index staged") }
+  const v = irBExpr(b, m.memObj)
+  if ibMiss != "" { return missRhs("method operand") }
+  if !(repNodeAt(irBOpRep(v)) is RList) {
+    return missRhs("get operand coercion")
+  }
+  const at = b.length
+  const i = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return missRhs("method operand") }
+  if b.length != at || irBOpRep(i) != repNodeOfTy(TY_I32) {
+    return missRhs("get index operand")
+  }
+  const r: Rhs = { lqV: v, lqIx: [i], lqAt: ix }
   return r
 }
 
@@ -7283,7 +7396,7 @@ function popStmt(b: i32[], c: Call, ix: i32) {
   const v = irBExpr(b, f.memObj)
   if ibMiss != "" { return 0 }
   if !(repNodeAt(irBOpRep(v)) is RList) { return skip("pop operand coercion") }
-  irBNode(b, { efRhs: { lqV: v, lqAt: ix } }, -1, ibNoValue, ix)
+  irBNode(b, { efRhs: { lqV: v, lqIx: [], lqAt: ix } }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -7592,9 +7705,6 @@ function structEqOpAt(
   }
   // A bare record beside a nullable one is legacy's same guard over a non-null side, written
   // with locals the IR does not declare: a named miss until it does.
-  if nul && (!refNullable(irBOpRep(l)) || !refNullable(irBOpRep(r))) {
-    return irBMiss("nullable record eq bare side")
-  }
   return irBLetTemp(
     b,
     {
@@ -11731,6 +11841,16 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if n.binOp == "=" { return assignValue(b, n, ix, rep) }
     const bt = binNulTestOf(n)
     if bt != null { return nulTest(b, n, bt, ix, rep) }
+    // A non-literal `null` against a nullable is that operand's null test, by legacy's route; a
+    // `null` side other than a name read, which legacy runs for its effect, is legacy's.
+    const nt = binNulNameTestOf(n, ibFnIx)
+    if nt != null && eqRouteOf(n, ix, ibFnIx) == "nulName" {
+      const ns = if nt.bnRef == n.binRight { n.binLeft } else { n.binRight }
+      if !nulNoneWritesNothing(ns) {
+        return irBMiss("null name test of a non-name null side")
+      }
+      return nulTest(b, n, nt, ix, rep)
+    }
     if n.binOp == "??" { return coalesce(b, n, ix, rep, cell) }
     // Legacy declares a string compare's locals for a side the checker typed `string` and holds as
     // an atom, which no IR compare route declares; it misses rather than move those bytes.
@@ -14359,7 +14479,16 @@ export function irLowerConstCell(gi: i32, gst: i32, probe: boolean): string {
 // The claim seam for global `gi`'s constant initializer: unarmed and every node in a claimed family,
 // the IR writes it and this answers true, so legacy does not; armed, legacy always runs.
 export function irClaimConstCell(gi: i32, gst: i32): boolean {
-  if ibArmed || irLowerConstCell(gi, gst, false) != "" { return false }
+  if ibArmed { return false }
+  const s = softBegin()
+  const why = irLowerConstCell(gi, gst, false)
+  softEnd(s)
+  if why != "" {
+    if why.indexOf("a legacy helper refused in ") == 0 {
+      count("claim fell back: const cell " + why)
+    }
+    return false
+  }
   count("claimed const cell")
   return true
 }
@@ -14819,7 +14948,16 @@ function thunkRetTy(ty: i32, r: i32): i32 {
 // in a claimed family, the lowering writes its code entry onto `out` and this answers true.
 export function irClaimThunk(fe: i32, out: u8[]): boolean {
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
-  if buildThunk(fe) != "" || !claimable() { return false }
+  const s = softBegin()
+  const ok = claimThunk(fe, out)
+  softEnd(s)
+  return ok
+}
+
+function claimThunk(fe: i32, out: u8[]): boolean {
+  const built = buildThunk(fe)
+  if softRefused("thunk ") { return false }
+  if built != "" || !claimable() { return false }
   corrupt()
   if irBVerify(ib).vfRule != 0 { return thunkFellBack("verifier") }
   const why = irLowerHelper(ib, out)
@@ -14897,7 +15035,16 @@ function buildEqHelp(si: i32): string {
 // it: when it builds and every node is in a claimed family, its code entry goes onto `out`.
 export function irClaimEqHelp(si: i32, out: u8[]): boolean {
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
-  if buildEqHelp(si) != "" || !claimable() { return false }
+  const s = softBegin()
+  const ok = claimEqHelp(si, out)
+  softEnd(s)
+  return ok
+}
+
+function claimEqHelp(si: i32, out: u8[]): boolean {
+  const built = buildEqHelp(si)
+  if softRefused("eq helper ") { return false }
+  if built != "" || !claimable() { return false }
   corrupt()
   if irBVerify(ib).vfRule != 0 { return eqHelpFellBack("verifier") }
   const why = irLowerEqHelper(ib, out)
@@ -15035,6 +15182,53 @@ function startItemOrd(node: i32, gi: i32): i32 {
   return -1
 }
 
+// Global `gi`'s `null`-typed initializer `init`, as `emitNulNoneBoxPayload` writes it, then the
+// store; an if-expression is a named miss.
+function globalInitNulNone(b: i32[], gi: i32, gst: i32, init: i32): i32 {
+  const rep = globalRep(gi, gst)
+  if rep < 0 { return skip("global initializer rep") }
+  const src = nulNonePayload(b, init, rep)
+  if ibMiss != "" { return 0 }
+  const gm = irGlobalWriteMiss(gi, ibGlobalCtx())
+  if gm != "" { return skip(gm) }
+  irBNode(b, { gsSym: gi, gsSrc: src }, -1, ibNoValue, gst)
+  return 0
+}
+
+// A `null`-typed value `x` at rep `rep` as `emitNulNoneLeafPayload` writes it: a call's own value,
+// `a ?? b` as `a` for effect then `b`'s payload, an assignment yielding `null` then the bottom
+// null, and anything else run for effect (`nulNoneEffect`) then the bottom `ref.null none`.
+function nulNonePayload(b: i32[], x: i32, rep: i32): Opnd {
+  const u = unwrapParen(x)
+  if u < 0 || u >= P.nodes.length {
+    return irBMiss("global initializer nulnone node")
+  }
+  const n = nodeAt(u)
+  if n is IfStmt { return irBMiss("global initializer nulnone if") }
+  if n is Call {
+    const v = irBExpr(b, u)
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != rep {
+      return irBMiss("global initializer nulnone call rep")
+    }
+    return v
+  }
+  const co = plainCoalesceAt(u)
+  if co != null {
+    const l = nulNoneEffect(b, co.binLeft, u)
+    if ibMiss != "" { return l }
+    return nulNonePayload(b, co.binRight, rep)
+  }
+  if asgYieldsNullLit(u) && n is BinExpr {
+    assign(b, n, u)
+    if ibMiss != "" { return irBMiss(ibMiss) }
+  } else {
+    const e = nulNoneEffect(b, u, u)
+    if ibMiss != "" { return e }
+  }
+  return repTemp(b, { nuAt: u, nuOwn: NULL_OWN_NONE }, u, rep)
+}
+
 // Global `gi`'s initializer, at statement `gst`, written as legacy's plain arm writes it: the
 // value delivered at the cell's rep, then its store.
 function globalInit(b: i32[], gi: i32, gst: i32) {
@@ -15068,6 +15262,7 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
     irBNode(b, { gsSym: gi, gsSrc: mv }, -1, ibNoValue, gst)
     return 0
   }
+  if arm == "nulnone" { return globalInitNulNone(b, gi, gst, g.letInit) }
   if arm != "plain" && arm != "widen" && arm != "variant" {
     return skip("global initializer " + arm)
   }
@@ -15107,6 +15302,16 @@ function globalInitVariant(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
 // value built at the cell's storage row, the D14434 binding column's (`letBindTy`), stores at it,
 // and this build's reads of the global then meet that rep (D14426, DECISIONS.md).
 function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
+  // An assignment to an atom cell as the initializer: legacy stores the atom's id in this cell,
+  // where the IR would decode the target's re-read to the cell's string.
+  const ai = nodeAt(unwrapParen(init))
+  if (
+    ai is BinExpr
+    && ai.binOp == "="
+    && repNodeAt(repNodeOfTy(heldTy(exprTyOf(ai.binLeft)))) is RAtom
+  ) {
+    return irBMiss("global initializer atom assignment")
+  }
   const noted = irGlobalRepOf(ib, gi)
   const rep = if noted >= 0 { noted } else { globalTyRep(globalHeldTy(gst)) }
   if rep < 0 { return irBMiss("global initializer rep") }

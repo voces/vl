@@ -18,6 +18,7 @@ import {
   P,
   nodeAt,
 } from "./ast"
+import { identDeclOf } from "./symbols"
 import { arrLitDestTy } from "./check_bind_rows"
 import { ctxElemOwnerOf, nodeCtxTyIxOf } from "./check_core_state"
 import { nodeTyProvesNonNull } from "./check_emit_queries"
@@ -92,6 +93,7 @@ import {
   exprRefArray,
   exprStringArray,
   exprUnion,
+  holderRecordSigs,
   inferredRetMapSlot,
   mapShapeOfExpr,
   nulTagIdRepTy,
@@ -266,6 +268,16 @@ export function nulTestArmOf(
     }
   }
   if nodeRepIsNullRef(refIx, fnIx) { return "nullRef" }
+  // A `const` holding a record of members whole is that record or null, even where its read is
+  // checked before the holder's own declaration and keeps an open type.
+  const hr = unwrapParen(refIx)
+  if (
+    hr >= 0
+    && nodeAt(hr) is Ident
+    && holderRecordSigs(identDeclOf(hr), fnIx).length > 0
+  ) {
+    return "nullRef"
+  }
   // Read raw: a `string | null` ident is otherwise recovered to non-null, and `ref.is_null`
   // would be a constant 0.
   if exprNullableString(refIx, fnIx) { return "nulStr" }
@@ -285,6 +297,39 @@ export function binNulTestOf(e: BinExpr): BinNulTest | null {
   if ref < 0 { return null }
   const t: BinNulTest = { bnRef: ref, bnInvert: e.binOp == "!=" }
   return t
+}
+
+// The other operand and direction of `==`/`!=` node `e` where one side is a non-literal `null`
+// (a narrowed read, a `null` unit, a call or assignment of one) and the other may hold `null`: the
+// compare is that operand's null test, whatever arms its storage has. Null for any other compare.
+export function binNulNameTestOf(e: BinExpr, fnIx: i32): BinNulTest | null {
+  if e.binOp != "==" && e.binOp != "!=" { return null }
+  let ref = -1
+  if nulNameSide(e.binRight, fnIx) && nulTestableSide(e.binLeft, fnIx) {
+    ref = e.binLeft
+  }
+  if nulNameSide(e.binLeft, fnIx) && nulTestableSide(e.binRight, fnIx) {
+    ref = e.binRight
+  }
+  if ref < 0 { return null }
+  const t: BinNulTest = { bnRef: ref, bnInvert: e.binOp == "!=" }
+  return t
+}
+
+// One side of `binNulNameTestOf`: an operand other than a `null` literal whose type at `fnIx` is
+// `null`, or which is stored as the `null` unit.
+function nulNameSide(ix: i32, fnIx: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || nodeAt(u) is NullLit { return false }
+  return isNullTy(nodeTyAt(u, fnIx)) || exprIsNulNone(u, fnIx)
+}
+
+// The other side of `binNulNameTestOf`: an operand that may hold `null` and is not itself `null`.
+function nulTestableSide(ix: i32, fnIx: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || nodeAt(u) is NullLit { return false }
+  if isNullTy(nodeTyAt(u, fnIx)) || exprIsNulNone(u, fnIx) { return false }
+  return tyBearsNull(nodeTyAt(u, fnIx))
 }
 
 // Whether `l ?? d` has a nullable map left and a union result with an arm for that map, as a

@@ -16,16 +16,25 @@ import {
   exprUnion,
   ifExprRefKind,
   ifExprRefSlot,
+  structIndexOfExpr,
 } from "./emit_classify"
 import {
   exprIsNullLike,
+  ifElseValueIx,
   ifLinkYieldsNull,
   ifListArmValueIx,
+  ifThenValueIx,
 } from "./emit_if_arm_values"
 import { nulAtomWidenTexts } from "./emit_lit_atoms"
 import { ifJoinNarrowsPerArm } from "./emit_local_slots"
 import { ifArmValueExpr } from "./emit_query"
-import { repRowOfTyStruct, repScanLim, tyRepsAsNulAtom } from "./emit_rep"
+import {
+  repOfNode,
+  repRowOfTyStruct,
+  repScanLim,
+  tyRepsAsNulAtom,
+} from "./emit_rep"
+import { vkNonNullTwin } from "./emit_list_rep"
 import { VKind } from "./emit_state"
 import { holeOperandTyOf, nodeTyInOf } from "./emit_ty_canon"
 import { ifChainAllBareNull } from "./emit_if_arm_values"
@@ -49,10 +58,48 @@ function ifTypedStructRow(ifIx: i32, fnIx: i32): i32 {
 // arm has no struct row of its own, so it builds at the destination's.
 function ifExprRefKindAt(ifIx: i32, fnIx: i32, destStruct: i32): VKind | null {
   const rk = ifExprRefKind(ifIx, fnIx)
-  if rk != null || destStruct < 0 { return rk }
-  const tv = ifListArmValueIx(ifIx)
-  if tv >= 0 && nodeAt(tv) is ObjLit { return "struct" }
-  return null
+  if rk != null { return rk }
+  if destStruct >= 0 {
+    const tv = ifListArmValueIx(ifIx)
+    if tv >= 0 && nodeAt(tv) is ObjLit { return "struct" }
+  }
+  return nulUnitJoinRecordKind(ifIx, fnIx, destStruct)
+}
+
+// The record row of `nulUnitJoinRecordKind`'s record arm, -1 for any other join.
+function nulUnitJoinRecordRow(ifIx: i32, fnIx: i32): i32 {
+  const other = nulUnitJoinOtherArm(ifIx, fnIx)
+  return if other >= 0 { structIndexOfExpr(other, fnIx) } else { -1 }
+}
+
+// The arm of an open-hole join (its rep `nulnone`) that is not the `null`-typed binding, or -1.
+function nulUnitJoinOtherArm(ifIx: i32, fnIx: i32): i32 {
+  if repOfNode(ifIx, fnIx).rdKind != "nulnone" { return -1 }
+  const tv = ifThenValueIx(ifIx)
+  const ev = ifElseValueIx(ifIx)
+  if tv < 0 || ev < 0 { return -1 }
+  const tNone = repOfNode(tv, fnIx).rdKind == "nulnone"
+  const eNone = repOfNode(ev, fnIx).rdKind == "nulnone"
+  if tNone == eNone { return -1 }
+  return if tNone { ev } else { tv }
+}
+
+// A join of a `null`-typed binding with a record, which the checker leaves `_ | null` (its rep
+// `nulnone`): `struct` when the other arm is a record (an object literal only at a destination
+// record), so the block type is the record's nullable ref and `ref.null none` fits it (D17124).
+function nulUnitJoinRecordKind(
+  ifIx: i32,
+  fnIx: i32,
+  destStruct: i32,
+): VKind | null {
+  const other = nulUnitJoinOtherArm(ifIx, fnIx)
+  if other < 0 { return null }
+  if nodeAt(unwrapParen(other)) is ObjLit {
+    return if destStruct >= 0 { "struct" } else { null }
+  }
+  const ok = repOfNode(other, fnIx).rdKind
+  if ok == null { return null }
+  return if vkNonNullTwin(ok) == "struct" { "struct" } else { null }
 }
 
 // The ref kind and table slot a value `if` at `ifIx` joins at (`emitIfExprRef`), or a null kind
@@ -66,6 +113,10 @@ export function ifRefJoinOf(ifIx: i32, fnIx: i32): RefJoin {
   const destStruct = ifTypedStructRow(ifIx, fnIx)
   const rk = ifExprRefKindAt(ifIx, fnIx, destStruct)
   const slot = if rk != null { ifExprRefSlot(ifIx, fnIx, rk, destStruct) } else { -1 }
+  // A `null`-typed binding's join takes its row from the record arm, the arm the slot does not read.
+  if rk == "struct" && slot < 0 {
+    return { rjKind: rk, rjSlot: nulUnitJoinRecordRow(ifIx, fnIx) }
+  }
   return { rjKind: rk, rjSlot: slot }
 }
 
