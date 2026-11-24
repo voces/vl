@@ -1754,6 +1754,8 @@ Deno.test({
       "atom-tower-zero-reads": 2,
       "atom-staged-of-i32": 2,
       "map-get-boxed-scalar-into-bool": 2,
+      "map-get-atom-niche-narrowed": 0,
+      "map-get-atom-niche-into-string": 2,
       "field-coalesce-of-i32-receiver": 2,
       "bool-join-coalesce-of-i32": 2,
       "trunc-sat-operand-off-plan": 2,
