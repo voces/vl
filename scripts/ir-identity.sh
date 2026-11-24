@@ -88,12 +88,13 @@ timed_out() {
 # it; `<module>` names everything outside the function bodies.
 BASELINE=${IR_DIVERGENCE_BASELINE:-scripts/ir-divergence-baseline.txt}
 WASM_DIS=${WASM_DIS:-$PWD/node_modules/.bin/wasm-dis}
-# The baseline key of file $1: an inventory witness, written under $T/wit/inv<k>/<id>/, is its row's
-# file (`--claimless` extracts witnesses to a fresh temp dir each run).
+# Where `--claimless` extracts the inventory witnesses, a fresh temp dir unless $IR_IDENTITY_WIT names
+# one. The baseline key of file $1: a witness written under $WIT/inv<k>/<id>/ is its row's file.
+WIT=${IR_IDENTITY_WIT:-$T/wit}
 bkey() {
   case "$1" in
-    "$T"/wit/inv1/*) local r=${1#"$T"/wit/inv1/}; echo "docs/internals/inventory/${r%%/*}.md" ;;
-    "$T"/wit/inv2/*) local r=${1#"$T"/wit/inv2/}; echo "docs/internals/inventory-2/${r%%/*}.md" ;;
+    "$WIT"/inv1/*) local r=${1#"$WIT"/inv1/}; echo "docs/internals/inventory/${r%%/*}.md" ;;
+    "$WIT"/inv2/*) local r=${1#"$WIT"/inv2/}; echo "docs/internals/inventory-2/${r%%/*}.md" ;;
     *) echo "$1" ;;
   esac
 }
@@ -241,7 +242,7 @@ if [ "${1:-}" = "--claimless" ]; then
   SEED_A=$SEED SEED_B=$T/claimless.wasm
   if [ -n "${3:-}" ]; then cp "$3" "$T/list"; else
     ls scripts/silent-sweep/distilled/cells/*.vl scripts/silent-sweep/distilled/named/*.vl > "$T/list"
-    "$VL" run scripts/ir-i8-census/witnesses.vl --compiler "$SEED" -- "$T/wit" \
+    "$VL" run scripts/ir-i8-census/witnesses.vl --compiler "$SEED" -- "$WIT" \
       docs/internals/inventory docs/internals/inventory-2 >> "$T/list"
   fi
   build_all "$T/list" "$SEED" "$T/a"
