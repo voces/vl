@@ -17,6 +17,8 @@ Lane IR-N4. Base: master 67327cc9. Class `start: global initializer nulnone`.
   - an assignment: the IR's own `assign`, then the `NULL_OWN_NONE` operand;
   - anything else: `nulNoneEffect`, the twin of `emitNulNoneLeafForEffect` for a non-`if` node,
     then the `NULL_OWN_NONE` operand (`ref.null none`, `emitNullOwn`).
+- The call-rep check (`global initializer nulnone call rep`) is a guard that no program reaches:
+  a `null`-typed global's call result is always the null-unit rep. It is kept as a guard.
 - A value `if` keeps a named miss, `global initializer nulnone if`. The IR has no twin of
   `emitIfForEffect`, so the 2 such starts are a follow-up.
 
@@ -47,6 +49,10 @@ Witnesses, all committed:
   - The `if` arm position is D17124 (below), so it is named, not run.
   - Concat and an interpolation hole are check refusals for `null`.
 - `tests/ir-shadow-rows/null-typed-global-initializer.vl`: the same globals and reads in one row.
+- `tests/cases/types/null-typed-global-initializer-effects-run.vl` (V3's effect witness): calls and
+  `??` chains traced in order, `ffghghf / 223`, and `nul() ?? nul()` with `(nul())`, `3 3`. With
+  the `??` left's `nulNoneEffect` dropped (V3's mutant C3, a scratch build) it prints
+  `fghf / 112 / … / 2 2`.
 - No capability probe carries the class.
 - A call returning `null` into a `T | null`-annotated global takes the `plain` arm (a `nulstruct`
   cell), which master's seed already matches. The `nulnone` arm is always the null-unit rep, and a
