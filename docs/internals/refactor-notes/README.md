@@ -8,6 +8,20 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-23-ir-n3-global-read-2](2026-11-23-ir-n3-global-read-2.md): IR-N3: `global read coercion`, part 2 — an atom global's re-read, a rowless record global (2026-11-23, lane IR-N3)
+- [2026-11-23-ir-record-arms-unbox](2026-11-23-ir-record-arms-unbox.md): IR: a union of records delivered unboxed at a record slot (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-capture-holder-member](2026-11-23-ir-capture-holder-member.md): IR: a captured holder of one bundle member, 2026-11-23
+- [2026-11-23-ir-decl-holder-pick](2026-11-23-ir-decl-holder-pick.md): IR: an annotated binding of a bundle holder's read (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-n3-rep-q](2026-11-23-ir-n3-rep-q.md): IR-N3: `rep ?` (D17077), a minted `??` link over a map read (2026-11-23, lane IR-N3)
+- [2026-11-23-ir-coalesce-field-place-reread](2026-11-23-ir-coalesce-field-place-reread.md): IR coverage: `??` over a field of a re-read top-level receiver (2026-11-23, lane IR-N2)
+- [2026-11-23-ir-union-compare-doors](2026-11-23-ir-union-compare-doors.md): IR: a union compare's variant and cross-width doors (2026-11-23, lane S1)
+- [2026-11-23-ir-c1-index-none-1](2026-11-23-ir-c1-index-none-1.md): `index none`, batch 1: the arm-site writer (IR-C1)
+- [2026-11-23-ir-m1-omit-variant-relay](2026-11-23-ir-m1-omit-variant-relay.md): IR-M1: omitting variant literals and re-laid literal sets (2026-11-23, lane IR-M1)
+- [2026-11-23-ir-n9-census-starts](2026-11-23-ir-n9-census-starts.md): The blocker census reports a start's classes (2026-11-23, lane IR-N9)
+- [2026-11-23-ir-global-initializer-remainder](2026-11-23-ir-global-initializer-remainder.md): The global initializer remainder: null-only calls, box maps, declared list cells, holder nulls (2026-11-23, lane IR-N5)
+- [2026-11-23-ir-effect-mapfilter](2026-11-23-ir-effect-mapfilter.md): IR: a discarded `.map`/`.filter`, 2026-11-23
+- [2026-11-23-ir-open-slot-declared-kind](2026-11-23-ir-open-slot-declared-kind.md): An open-typed parameter is held at legacy's declared kind (2026-11-23, lane IR-N5)
+- [2026-11-23-ir-self-miss-ratchet](2026-11-23-ir-self-miss-ratchet.md): IR: the self-compile's IR misses are ratcheted at 0 (2026-11-23, lane IR-S1)
 - [2026-11-23-ir-method-f](2026-11-23-ir-method-f.md): IR coverage: `method f`, a field call off a receiver that is not a plain record (2026-11-23, lane IR-N8)
 - [2026-11-23-ir-capture-box-narrowed](2026-11-23-ir-capture-box-narrowed.md): IR: a narrowed union-box capture, 2026-11-23
 - [2026-11-23-ir-n7-narrowed-field](2026-11-23-ir-n7-narrowed-field.md): IR coverage: a narrowed field's boxed-nullable storage, an intersection's field kid (2026-11-23, lane IR-N7)
