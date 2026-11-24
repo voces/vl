@@ -31,8 +31,10 @@ on bytes. This lane adds it.
 | run | programs | same | differs | build-fails(both) | one-sided | wall | CPU-s |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | master, default | 20,125 | 16,790 | 0 | 3,335 | 0 | 406 s | 1,412 |
-| master, `--run-all` | see the PR body | | | | | | |
+| master, `--run-all` | 20,125 | 16,788 | 0 | 3,335 | 0 | 556 s | 2,052 |
 | control, probes | 282 | 227 | 53 | 1 | 0 | 35 s | 47 |
+
+`--run-all` ran every byte-identical pair on both sides, so it is the run path's own determinism check. The modules agreed on 150 traps (92 `unreachable`, 33 array out of bounds, 9 memory out of bounds) and on every exit code and stdout. The only other rows are 2 `timeout(run both)`: `tests/cases/lint/unconditional-recursion*.vl`, check-only cases that recurse forever by design. As in `ir-identity.sh`, a timeout is refused (exit 3), never passed.
 
 By population (master): distilled 12,304 (9,037 same, 3,267 fail under both), `tests/cases` 7,539
 (7,472 same, 67 fail under both), probes 282 (281 same, 1 fail under both).
