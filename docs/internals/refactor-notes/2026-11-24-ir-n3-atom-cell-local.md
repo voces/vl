@@ -41,3 +41,14 @@ binding shape 3's print decode, FREE).
 ## Legacy tails the IR calls
 
 None new.
+
+## Measured (fixpoint seeds on both sides)
+
+Full proof on base master 26a9bee97: byte A/B 20,609 programs 0 moved; `ir-identity --cases`,
+`--claimless`, `--names` differ 0 (2 listed expected divergences, neither this PR's) / differ 0 /
+self-compile identical; mode 3 self byte-identical; corpus shadow 46,879 matched, 0 order rows;
+self-compile guest fuel 126,015,567,274 → 126,054,466,528 (+0.03%). Q58: the template's 68 cells and
+the member-text witness claimless-identical under both seeds (identical 70, differ 0);
+`capability-matrix.vl --before/--after` runs 68 of 68, 0 runs → not-runs.
+`tests/vl_ir_door_guard_test.ts`'s atom-cell fragment case now reads its miss as the fragment's
+`local cell rep` (the variable is declared at the atom): the case asks any fragment miss, no differ.
