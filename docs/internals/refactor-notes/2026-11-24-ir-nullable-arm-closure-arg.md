@@ -18,7 +18,13 @@ arm's nullable heap; an object literal, a `null` or a nullable list element is w
   (`closureParamRep`), the nullable arm record. `deliver` reaches the existing `armUnboxOwed` /
   `RArmUnbox` path for an owed box, as the direct call already does.
 
-New test case: `closures/nullable-arm-closure-param-each-value-kind.vl`.
+New test cases:
+- `closures/nullable-arm-closure-param-each-value-kind.vl`
+- `closures/nullable-arm-closure-arg-in-each-position.vl`, the position sweep: the call's result
+  at a scalar and a union parameter, a nested call, a concatenation, an interpolation hole, a
+  return, a binding, an `if` arm, a `??` operand and a record-literal field.
+
+A record field's closure (`o.g(d)`) takes the same plain key, so its `method g` miss clears too.
 
 ## Not in this change
 
