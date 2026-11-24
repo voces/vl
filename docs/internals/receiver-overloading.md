@@ -18,9 +18,19 @@ member's class. Two NONE candidates overlap.
 
 ## Rules
 
-- **Coexistence.** A local declaration and imports, or several imports, may bind one name only
-  when every candidate is a function and their heads are pairwise disjoint. Anything else is
-  `Duplicate binding` at the later binding site, naming both candidates with module and head.
+- **Coexistence.** Local declarations and imports, in any mix, may bind one name only when every
+  candidate is a function and their heads are pairwise disjoint. Anything else is `Duplicate
+  binding` at the later binding site, naming both candidates with module and head; two local
+  declarations that overlap read `redeclared f: …`, naming both. Several local candidates must
+  all be `self`-functions; same-named functions without `self` stay a plain redeclaration (B16).
+- **One module, several candidates** (owner ruling D1, 2026-11-23,
+  `receiver-overloading-intra-module-proposal.md`). When a module declares two or more
+  same-named `self`-functions, the parser mints every one receiver-keyed, `min@F32x4`, through
+  `opDeclName` (ruling D2: all of them, so declaration order never renames a symbol). The minted
+  name is internal: it shows only in `--names` trap banners and `wasm-dis`; diagnostics, hover,
+  completion and the outline read `min`. `import { min }` binds every candidate, `as` renames the
+  set, and the receiver type's module answers the type-bound rung from its set. An entry module's
+  `export` of such a name, like a receiver-keyed operator's, adds no wasm export.
 - **Method calls.** The receiver is typed first, then its head is looked up once among the
   `self`-functions; the choice never feeds back into inference. An unknown head (a nullable, a
   union across classes, an anonymous record) is refused; `x?.f()` resolves on the type under the
@@ -35,8 +45,9 @@ member's class. Two NONE candidates overlap.
   value is refused, since the instance a value makes has no call to pick for — an annotated
   lambda, `(x: A) => h(x)`, is the spelling. Only a receiver that is the function's own
   parameter is re-dispatched (D3818).
-- **Plain calls** use lexical scope (rule (e), owner-confirmed): the local declaration wins;
-  two imports and no local is refused with the method spelling or an `as` alias as the fix.
+- **Plain calls** use lexical scope (rule (e), owner-confirmed): one local declaration wins;
+  two imports and no local, or two or more locals, is refused with the method spelling as the
+  fix (and an `as` alias when no two candidates come from one module).
   Resolving `f(x, …)` as `x.f(…)` (rule (c)) is a possible later widening that breaks nothing;
   `tests/cases/modules/err-overload-plain-call-two-imports/` records today's answer.
 - **Refused:** a function value naming several candidates (`const g = f`, `ys.map(f)`);
@@ -45,7 +56,10 @@ member's class. Two NONE candidates overlap.
 
 ## Where it lives
 
-`driver.vl` banks every name with two or more targets (`modNoteOverloads`), decides each set
+`parser.vl`'s `ovMintLocalSets` mints a module's own candidates; the merge's rename map binds the
+plain name to each (`modBuildRename`, and `modImportTargets` for an import), and a single-source
+program forms its sets the same way (`singleOvRows`). `driver.vl` banks every name with two or
+more targets (`modNoteOverloads`), decides each set
 after the merge rewrite (`modCheckOverloads`, which needs the merged first-parameter spellings),
 and banks a member call's set or its single `self`-function. `typecheck.vl`'s `ufcsCallTy`
 picks (`ovPickFor`) and banks the answer through `ufcsSiteAdd`, the per-call record the emitter
