@@ -1544,6 +1544,7 @@ import {
   repSigKindOfTy,
   repVariantShapeRowOf,
   rlElemKindAt,
+  rowStoreRepIn,
   rvMayView,
   sFieldElemTyIxAt,
   scalarTagOfKind,
@@ -2015,6 +2016,15 @@ export function fieldNullOwnOf(si: i32, fi: i32): i32 {
     "union" => if unionHasAtomK(msSetOfTy(sFieldElemTyIxAt(si, fi)), "null", nullValKind()) { NULL_OWN_BOX } else { -1 }
     "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" | "nulstruct" | "nulvariant" | "nulreflist" | "nulmap" | "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => -1
   }
+}
+
+// The null an omitted field `fj` of variant row `vi` takes where its slot is a sentinel niche
+// (`boolean | null`, `K | null`): no reference null fits an i32 slot. -1 for any other field.
+export function variantFieldSentinelNullOwn(vi: i32, fj: i32): i32 {
+  if vi < 0 || vi >= uFieldStart.length { return -1 }
+  const d = rowStoreRepIn(armFieldStoreTy(), uFieldStart[vi] + fj)
+  if d == null { return -1 }
+  return if d.rdNul == 2 { NULL_OWN_BOOL } else if d.rdNul == 3 { NULL_OWN_ATOM } else { -1 }
 }
 
 // Whether field `fi` of struct row `si` has a typed reference's null whose heap is fixed when emit
@@ -3035,6 +3045,13 @@ function emitVariantStruct(objIx: i32, vi: i32, fnIx: i32) {
       // the literal `null` written there would be (D2223): the node the literal's check minted.
       const nullIx = omittedFieldNullNode(objIx, sFieldNames[start + fj])
       if nullIx < 0 { return -1 }
+      // A sentinel slot takes its own null: the minted node names none, and `ref.null` fits no i32.
+      const sn = variantFieldSentinelNullOwn(vi, fj)
+      if sn >= 0 {
+        emitNullOwn(sn)
+        fj = fj + 1
+        continue
+      }
       if emitVariantFieldValue(vi, fj, nullIx, fnIx) < 0 { return -1 }
       fj = fj + 1
       continue
@@ -28638,6 +28655,15 @@ function emitCall(callIx: i32, fnIx: i32) {
   if callIx < 0 || callIx >= P.nodes.length {
     return emitFail("emitProgram: expected a call expression")
   }
+  // A call an arm overrides (a `.length` receiver, D17102) is that arm's unboxed payload, the call
+  // having run once into the arm stash.
+  if luOvLocNodes.length > 0 {
+    const ovl = luOvLocalOf(callIx)
+    if ovl >= 0 {
+      fbLocalGet(ovl)
+      return 0
+    }
+  }
   // A map's `.has` / `.get` over a union-of-maps box a pin left unrewritten, read per arm.
   const arm = emitArmSite(callIx, fnIx)
   if arm != 0 { return if arm < 0 { -1 } else { 0 } }
@@ -38619,8 +38645,8 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
 // read whole into the loop variable.
 function forInElemPlain(ek: VKind): boolean {
   return match ek {
-    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" | "nulbool" | "f32" | "f64list" | "i64list" | "nulu8list" => true
-    "map" | "nullist" | "nulreflist" | "nulclosure" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulmap" | "nulnone" | "v128" => false
+    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" | "nulbool" | "f32" | "map" | "nulmap" | "v128" | "f32list" | "v128list" | "nullist" | "nulreflist" | "nulstrlist" | "nulf64list" | "nulf32list" | "nuli64list" | "nulv128list" | "nulclosure" | "f64list" | "i64list" | "nulu8list" => true
+    "nulnone" => false
   }
 }
 
@@ -45698,10 +45724,12 @@ function coalChainMint(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   // A chain joining structs is one box: both links take the chain's union, a supertype of
   // the inner link's own join with the same null-ness, so its arm tags agree (D2373).
   const chTy = nodeTyInOf(exprIx, fnIx)
-  // A chain joining numbers of different types apart is one box the same way.
+  // A chain joining numbers of different types apart is one box the same way, as is any chain
+  // whose value `emitCoalesce` boxes (`exprUnion`): an untyped inner link delivers its member raw.
   if (
     tyIsStructBearingUnion(chTy)
     || (numUnionMinted && tyHoldsNumbersApart(chTy))
+    || exprUnion(exprIx, fnIx)
   ) {
     nodeTyRecord(reInner, chTy)
     nodeTyRecord(reOuter, chTy)

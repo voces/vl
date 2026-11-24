@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **A `??` chain into a value union keeps each link's own kind (D17401):** `f() ?? g() ?? 2` over `boolean | null` links printed `1` for `true`, and with a string default built an invalid module; the re-associated inner link is now typed at the chain's union wherever the chain is a box, as struct-bearing and number-apart chains already were. Graded by four committed position matrices (`coalesce-chain-{bool,i32,f64,litunion}-links-boxed`): every boolean-, i32- and f64-link cell runs, 0 lost. D17182 filed (a `K | null` niche `??` a number or boolean default, refused at emit).
