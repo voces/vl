@@ -214,3 +214,13 @@ a `nulstruct` cell, whose `globalCellStructIdx` is its record's row (row 0, heap
   `tests/cases/closures/heap-capture-annotated-binding-{fn-body,block}.vl`: measured here it is
   no `declaration coercion` miss on either seed in any of four frame shapes; the block frames keep
   only `start uncovered closure env capture` (N7's class).
+
+## Parked: N6's three map-read-default cells (queue ruling 2026-11-24, option 1)
+
+b011298, b011299 and b021775 (`uncovered map read default rep`) stay named misses. In `mapGetOr`,
+`rep` is `g1`'s target, fixed by the caller from `storeRowTyOf`'s `{r: null}` row (a row a
+`{r: null}` literal minted, D14890's own-row rule), while the map's value and the default build
+at `{r: i32 | null}` on the same struct. The two closes are both out: (a) the narrowing retag
+`{r: i32 | null}` → `{r: null}` is refused as clause 1, since a stored non-null `r` read through the
+narrower view reads wrong; (b) holding `g1` at its checked type's rep moves `storeRowTyOf` for every
+such let. "Let at checked rep over a narrow-minted row (D14890), Q57" is a FREE design item.
