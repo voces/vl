@@ -640,7 +640,7 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   touchDumpAt: "uncached", touchDumpBuild: "uncached",
   irShadowCorrupt: "uncached", irShadowRowAt: "uncached", irShadowRowCount: "uncached",
   irRefCorrupt: "uncached", irFitTailSelfTest: "uncached", repDescSelfTest: "uncached",
-  irBoundsStrSelfTest: "uncached", irSelfTestIdAt: "uncached", irSelfTestIdCount: "uncached",
+  irArmUnboxRouteSelfTest: "uncached", irBoundsStrSelfTest: "uncached", irSelfTestIdAt: "uncached", irSelfTestIdCount: "uncached",
   irSelfTestIdLen: "uncached", irShadowRowLen: "uncached", irShadowRowN: "uncached", irVerifySelfTest: "uncached", setOptimized: "input", setRepShadow: "uncached", setSharedMemory: "input", src: "input",
   srcReset: "input",
   vlRootCommit: "input", vlRootPush: "input", vltCount: "uncached", vltFailAt: "uncached",
