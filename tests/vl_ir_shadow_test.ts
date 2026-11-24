@@ -1744,6 +1744,10 @@ Deno.test({
       "walk-pair-string-index-of-bool": 2,
       "map-scalar-join-of-i32": 0,
       "map-scalar-join-of-string": 2,
+      "asg-unwiden-wrap-of-i64": 0,
+      "asg-unwiden-trunc-of-i64": 2,
+      "asg-unwiden-non-null-of-nullable-record": 0,
+      "asg-unwiden-non-null-of-record": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {

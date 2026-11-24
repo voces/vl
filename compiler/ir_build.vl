@@ -675,6 +675,8 @@ import {
   armSiteReads,
   asgReReadEnter,
   asgReReadLeave,
+  asgReReadOf,
+  asgReReadTy,
   asgReadUnwidenOp,
   asgYieldsNullLit,
   boxedFieldUnionTyOf,
@@ -2803,6 +2805,12 @@ export function irBOpenLocalReadRep(ix: i32): i32 {
 // `ix`'s type: its callee's result for an untyped call of a declaration (an operator a generic
 // instance rewrote to its overload), else its recorded type.
 function exprTyOf(ix: i32): i32 {
+  // An assignment's re-read of its target is of the value just stored, as legacy's `readTyHere`.
+  const ra = asgReReadOf(ix)
+  if ra >= 0 {
+    const pt = asgReReadTy(ra, ibFnIx)
+    if pt >= 0 { return pt }
+  }
   // A read at its storage is of the type its storage holds, past its narrowing.
   if isStorageRead(ix) {
     const st = readNarrowedStoreAt(ix, ibFnIx)
@@ -12004,28 +12012,35 @@ function siteBuilt(n0: i32, ix: i32): boolean {
   return false
 }
 
-// An assignment as a value that legacy re-reads (`asgValueArmOf` "reRead") with no unwidening:
-// the store, then the target's read. A guarded global's read misses, so the guard-off context
+// An assignment as a value that legacy re-reads (`asgValueArmOf` "reRead"): the store, then the
+// target's read. A guarded global's read misses, so the guard-off context
 // legacy re-reads in reads it as the builder's own does.
 function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const arm = asgValueArmOf(ix, ibFnIx)
   if arm == "lit" { return assignValueLit(b, n, ix, rep) }
   if arm == "nullLit" { return assignValueNullLit(b, n, ix, rep) }
   if arm != "reRead" { return irBMiss("assignment value " + arm) }
-  if asgReadUnwidenOp(ix, ibFnIx) >= 0 {
-    return irBMiss("assignment value unwiden")
-  }
+  // A value narrower than its cell is re-read at the cell's rep, then narrowed back by the one
+  // opcode legacy writes (`asgReadUnwidenOp`).
+  const uw = asgReadUnwidenOp(ix, ibFnIx)
   const t = nodeAt(n.binLeft)
   if !(t is Ident || t is Member || t is Index) {
     return irBMiss("assignment value target")
   }
+  // The store is a statement, so no temp an operand before it built may wait across it.
+  if uw >= 0 && endsInTemp(b) { return irBMiss("assignment value unwiden after an operand") }
   assignTo(b, n, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
   const m = asgReReadEnter(ix)
   // A field or element target is read again whole, its receiver and index included. A global's
   // re-read is seated (`cell`): its atom cell's id is the read, which `widenTo` below decodes.
-  const o = if t is Ident { identRead(b, t, n.binLeft, rep, globalTarget(n.binLeft)) } else { irBExpr(b, n.binLeft) }
+  const rr = if uw >= 0 { repNodeOfTy(heldTy(exprTyOf(n.binLeft))) } else { rep }
+  const o = if t is Ident { identRead(b, t, n.binLeft, rr, globalTarget(n.binLeft)) } else { irBExpr(b, n.binLeft) }
   asgReReadLeave(m)
+  if uw >= 0 {
+    if ibMiss != "" { return o }
+    return irBLetTemp(b, { uwV: o, uwOp: uw, uwAt: ix }, ix, rep)
+  }
   // The cell's atom re-read at a `string` assignment is decoded, as legacy widens it (`widenTo`).
   const w = if ibMiss == "" && atomAtStr(irBOpRep(o), rep) { widenTo(b, o, ix, rep, -1) } else { o }
   if ibMiss == "" && irBOpRep(w) != rep {
