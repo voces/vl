@@ -6216,6 +6216,13 @@ export function irBStageLeads(
   // A receiver stage, and a `??` along an arm that stages nothing, is written in place, below
   // which the lowering stages nothing. A literal's order stash sets its fields below them.
   if listStageFrom(b, at) || coalBoxFrom(b, at, false) { return false }
+  // A store the operand makes (an assignment as its value) is a statement, which the lowering
+  // writes above an earlier operand read at its use, so that read would see the stored value;
+  // an earlier temp cannot wait across it either.
+  if storeFrom(b, at) {
+    irBMiss("store after an operand")
+    return false
+  }
   const coal = coalBoxFrom(b, at, true)
   const stash = stashSetFrom(b, at)
   if !valuedIfFrom(b, at) && !coal && !stash || opndsAreTemps(args) {
@@ -6321,20 +6328,20 @@ function stashSetFrom(b: i32[], at: i32): boolean {
   return false
 }
 
+// Whether node `n` is a store statement: to a local, a global, a field, an element or a cell.
+function storeAt(n: IrNode): boolean {
+  return n is SAssign
+    || n is SGlobalSet
+    || n is SSetField
+    || n is SListSet
+    || n is SCellSet
+}
+
 // Whether operands built into `b` from `at` on hold a store statement.
 function storeFrom(b: i32[], at: i32): boolean {
   let i = at
   while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if (
-      n is SAssign
-      || n is SGlobalSet
-      || n is SSetField
-      || n is SListSet
-      || n is SCellSet
-    ) {
-      return true
-    }
+    if storeAt(ib.irNodes[b[i]]) { return true }
     i = i + 1
   }
   return false
@@ -6383,14 +6390,17 @@ function valuedIfFrom(b: i32[], at: i32): boolean {
 }
 
 // `ifBelowLead` for a node whose operands `leads`, written before those from `at`, are all
-// temps the lowering stages below the `if` (`opndsAreTemps`): then no miss.
+// temps the lowering stages below the `if` (`opndsAreTemps`): then no miss, unless the later
+// operands store, which no earlier temp can wait across.
 export function ifBelowLeadOf(
   b: i32[],
   at: i32,
   why: string,
   leads: Opnd[],
 ): boolean {
-  if opndsAreTemps(leads) && !inPlaceFrom(b, at) { return false }
+  if opndsAreTemps(leads) && !inPlaceFrom(b, at) && !storeFrom(b, at) {
+    return false
+  }
   return ifBelowLead(b, at, why)
 }
 
@@ -6411,6 +6421,7 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
       n is SIf && n.siOut >= 0
       || n is SCoalBox
       || n is SEffect && n.efRhs is RStashSet
+      || storeAt(n)
     ) {
       irBMiss(why)
       return true
