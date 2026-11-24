@@ -236,7 +236,9 @@ gained a heap by then (`recordHeapAll`: its own, else its storage row's), emit f
   and a capture read noted before a later `{f: null}` global.
 - Control (the hold re-asked at `>= -1`, so it fires on every recorded -1): fires on the cell
   witness `tests/cases/globals/heap-nullable-cell-narrowed-two-fields.vl` and the capture witness
-  `tests/cases/closures/heap-capture-unannotated-binding-fn-body.vl`; CONTROL_POP.
+  `tests/cases/closures/heap-capture-unannotated-binding-fn-body.vl`. Over the 7,082 `// @run`
+  programs of tests/cases it fires on 6, all heap-identity witnesses (`closures/heap-capture-*`
+  ×3, `globals/heap-nullable-cell-*` ×3); it does not fire on the self-compile.
 - Readings vs #9851's head (ad2259f5): mode-6 corpus 0 of 86,272; `--cases` 7,800, `--claimless`
   14,459, `--names` 9,433, differ 0 each; L2 +0.02%; census 6,170 of 7,220 runs on both arms;
   regress.vl 0 runs → not-runs, 0 → silent (261,224 census cells, 11,223 named).
