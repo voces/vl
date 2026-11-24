@@ -50,7 +50,8 @@ master `490fadee7`.
 - Census, each arm in a tree at its own commit (#26): `member record` rows 18 → 9 (5 functions and
   4 starts, one a distilled-corpus cell), `member atom` 5 → 6.
 - Covered-fell: tests/cases fell 0, rose 9; corpus fell 0, rose 0.
-- L2 self-compile fuel per PR +0.01% on `e6fac9e78`; the pair (the head seed compiling the base tree) is −0.0002%.
+- L2 self-compile fuel per PR +0.01% on `e6fac9e78`; the pair (the head seed compiling the base
+  tree) is −0.0002%.
 
 Disassembly: `functions/one-literal-result-widens-atom.vl`'s `fld` is, claimed and under legacy,
 `local.set $4 (struct.get $0 0 (local.get $0))` then `return (global.get $global$0)`, the decode of
