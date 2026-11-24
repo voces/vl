@@ -455,7 +455,10 @@ two-stage protocol:
 
    The legacy path runs first and owns every first-ask mint (type indices in first-ask order,
    E's `EmitCtx.typeIndexOf`). The IR lowering may only read an index that already exists. A miss
-   or a byte difference unclaims the function and records its first differing node.
+   or a byte difference unclaims the function and records its first differing node. Under
+   `VL_IR_SHADOW=2` a mismatch also prints a `detail` row with both hex bodies, and a `rep <what>`
+   miss one naming its node's kind and function (`detail rep ? of string in mat`); the classes
+   themselves are unchanged.
 
 A step's PR turns claiming on for its construct set only at **zero dual-emit mismatches** over the
 self-compile and the distilled corpus. After that the IR path mints for itself, and the seed `cmp`
