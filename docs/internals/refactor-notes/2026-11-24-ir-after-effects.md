@@ -32,7 +32,7 @@ constant default, and an argument, return, `let` or list-element consumer, match
 
 `matrix/null-typed-left-coalesce.matrix.vl`: runs 76 of 76 graded on both seeds. The cells
 read the call trace for `n() ?? g()`, a compare's left, a call receiver, a tail return, a chain and
-a global initializer. `u?.tags ?? g()` is a loud emit reject on master, filed as D17422 and out of
+a global initializer. `u?.tags ?? g()` is a loud emit reject on master, filed as D17422 (unfiled: D17422; IR-P1 carries it) and out of
 this change.
 
 ## The same walk at a `null` cell's store (D17220; unfiled: D17220)
