@@ -42,8 +42,11 @@ side's nullability, the index kind and the receiver kind are incidental.
 
 ## Routes beside it
 
-- A null-typed other side (`xs[0] == n`, `n` narrowed to `null`) is `eqRouteOf`'s `nulName`: the
-  element's null test, chosen before any record route. It is matched on base and head alike.
+- A `null`-typed other side (`const n = null`, either order, or a parameter `n: null`) is
+  `eqRouteOf`'s `nulName`: the element's null test, chosen before any record route. It is matched
+  on base, where every nullable element compare still missed, and on head alike.
+- A side narrowed under `if n == null` keeps its declared `C | null` type, so `xs[0] == n` there
+  is this class's nullable compare. It is a miss on base and matched on head.
 - A side with effects is staged and read once (`structEqStagesLeft`), so it never becomes an
   element place. A call that moves the index in the other operand reads in source order on both
   seeds.
@@ -60,11 +63,11 @@ side's nullability, the index kind and the receiver kind are incidental.
 - `tests/ir-shadow-rows/nullable-record-compare-element-side.vl` holds:
   - the ablation set;
   - the order cells;
-  - the `nulName` cell;
+  - a narrowed-null cell and a `null`-unit (`nulName`) cell;
   - the named literal-right neighbour.
 
   It expects `no row containing spans` and `uncovered record compare element place = 1`.
-  Base: 3 of 12 matched and the start missing. Head: 11 of 12 matched and the start matched.
+  Base: 4 of 13 matched and the start missing. Head: 12 of 13 matched and the start matched.
 - `tests/vl_ir_shadow_test.ts` adds two tests:
   - the row under control 5, which must red on `spans`;
   - rule 2's pair: a bare side against a nullable element verifies, and control 9 reds.
