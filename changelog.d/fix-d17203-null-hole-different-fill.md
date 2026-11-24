@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Fixed D17203 and D17204** (clause 1): a binding `let m = null` read before a later write fills it with another record now runs inside a function. The read is `null`, and it is delivered as each destination's own null: a plain or annotated binding, a value `if`, a list and a union box. These were invalid wasm, and at an `In | Out | null` destination a wrong `false`. A function reading such a module binding, whose value `if` was typed before the write, is re-asked at the fill. It keeps running where the fill fits, and is otherwise a check error naming the join and asking for an annotation (coordinator ruling, DECISIONS.md). Filed D17205: a `??` over such a read, and an alias of it, are still wrong at emit.
