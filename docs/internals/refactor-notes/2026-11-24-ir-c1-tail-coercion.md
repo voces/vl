@@ -16,8 +16,9 @@ A probe compiler, never committed, split the miss's two halves. All six corpus f
   unannotated result, else -1, as `emitReturnValue` computes it. `retDelivered` (expression tail
   and explicit `return`) and the tail `if` arm's value call it. No new kind.
 - **Label split**: a tail whose delivery already missed now keeps that miss (`ibMiss`) rather than
-  `tail coercion`. In the tests/cases IR-only census, no function moved; base and head have the
-  same 1,927 rows.
+  `tail coercion`. In the tests/cases IR-only census, no function moved: 1,926 missed functions at
+  base 41c3d2f63 and at head, no class count changed (`scripts/ir-only-census-ab.sh`, which runs
+  each side at its own `compiler/`; the first reading ran both sides from one tree).
 
 ## What stays (FREE, per the queue)
 
