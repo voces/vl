@@ -637,9 +637,12 @@ import {
   liftWbEnd,
   listFitStoodIn,
   listFitStoodTy,
+  listGetDepth,
+  listGetIdxOwner,
   listGetIdxSlot,
   listGetIdxStagedIx,
   listGetIdxStagedSet,
+  listGetRecvOwner,
   listGetRecvSlot,
   listGetRecvStagedIx,
   listGetRecvStagedSet,
@@ -1362,6 +1365,7 @@ import {
 } from "./emit_sig_tokens"
 import {
   NICHE_NUL_LIT,
+  NICHE_NUL_MAP,
   RC_MAP,
   RC_REF_LIST,
   coalesceResultIsBox,
@@ -1414,6 +1418,7 @@ import {
 } from "./emit_union_atoms"
 import {
   SCRATCH_BY_BOTH,
+  SCRATCH_BY_KEY,
   asExprHoleNumOpt,
   asExprHoleNumSad,
   asExprNumCastDomain,
@@ -8181,6 +8186,7 @@ function listGetStageSave(): i32[] {
   sv.push(if listGetIdxStagedSet { 1 } else { 0 })
   sv.push(listGetRecvStagedIx)
   sv.push(if listGetRecvStagedSet { 1 } else { 0 })
+  sv.push(listGetDepth)
   return sv
 }
 
@@ -8198,6 +8204,7 @@ export function listGetStageRestore(sv: i32[]) {
   listGetIdxStagedSet = sv[1] == 1
   listGetRecvStagedIx = sv[2]
   listGetRecvStagedSet = sv[3] == 1
+  listGetDepth = sv[4]
   return 0
 }
 
@@ -8209,19 +8216,49 @@ function listGetStageMark(callIx: i32) {
   if c is Call {
     const callee = nodeAt(unwrapParen(c.callFn))
     if callee is Member {
-      if !optRecvReReadable(callee.memObj) {
+      const stagesRecv = !optRecvReReadable(callee.memObj)
+      const stagesIdx = c.callArgs.length == 1
+        && !listGetIdxReReadable(c.callArgs[0])
+      // A call that stages takes the next depth's slots; one that stages nothing takes none.
+      if stagesRecv || stagesIdx { listGetDepth = listGetDepth + 1 }
+      if stagesRecv {
         listGetRecvStagedIx = unwrapParen(callee.memObj)
         listGetRecvStagedSet = false
       }
-      if c.callArgs.length == 1 {
-        if !listGetIdxReReadable(c.callArgs[0]) {
-          listGetIdxStagedIx = unwrapParen(c.callArgs[0])
-          listGetIdxStagedSet = false
-        }
+      if stagesIdx {
+        listGetIdxStagedIx = unwrapParen(c.callArgs[0])
+        listGetIdxStagedSet = false
       }
     }
   }
   return 0
+}
+
+// The index stash of the `.get` at the current staging depth: depth 1's eager slot, a deeper
+// one's own lazy slot (code 54).
+function listGetIdxSlotNow(): i32 {
+  if listGetDepth <= 1 { return listGetIdxSlot }
+  return scratchSlot(54, "list", listGetDepth, SCRATCH_BY_KEY)
+}
+
+// The receiver stash of the `.get` at the current staging depth (code 55 past depth 1).
+function listGetRecvSlotNow(): i32 {
+  if listGetDepth <= 1 { return listGetRecvSlot }
+  return scratchSlot(55, "list", listGetDepth, SCRATCH_BY_KEY)
+}
+
+// Record `ix` as the node depth `listGetDepth`'s stash in `owners` holds.
+function listGetOwnerSet(owners: i32[], ix: i32) {
+  while owners.length < listGetDepth { owners.push(-1) }
+  owners[listGetDepth - 1] = ix
+  return 0
+}
+
+// Whether depth `listGetDepth`'s stash in `owners` still holds `ix`: a nested staging call that
+// took the same depth would have overwritten it.
+function listGetOwnerHolds(owners: i32[], ix: i32): boolean {
+  if listGetDepth < 1 || listGetDepth > owners.length { return false }
+  return owners[listGetDepth - 1] == ix
 }
 
 // Push a `.get` index: the i32 stash when this call staged it, teed in on the first read,
@@ -8231,14 +8268,21 @@ function emitListGetIdx(idxIx: i32, fnIx: i32) {
     return emitExpr(idxIx, fnIx)
   }
   if listGetIdxStagedSet {
-    fbLocalGet(listGetIdxSlot)
+    if !listGetOwnerHolds(listGetIdxOwner, listGetIdxStagedIx) {
+      return emitFailAt(
+        "emitProgram: `.get` index stash overwritten by a nested `.get`",
+        idxIx,
+      )
+    }
+    fbLocalGet(listGetIdxSlotNow())
     return 0
   }
   if !fnUses.listGet {
     return emitFailAt("emitProgram: `.get` operand stash not reserved", idxIx)
   }
   if emitExpr(idxIx, fnIx) < 0 { return -1 }
-  fbLocalTee(listGetIdxSlot)
+  fbLocalTee(listGetIdxSlotNow())
+  listGetOwnerSet(listGetIdxOwner, listGetIdxStagedIx)
   listGetIdxStagedSet = true
   return 0
 }
@@ -8251,14 +8295,21 @@ function emitListGetRecv(objIx: i32, fnIx: i32, heap: i32) {
     return svSyncRecv(objIx, fnIx)
   }
   if listGetRecvStagedSet {
-    fbLocalGet(listGetRecvSlot)
+    if !listGetOwnerHolds(listGetRecvOwner, listGetRecvStagedIx) {
+      return emitFailAt(
+        "emitProgram: `.get` receiver stash overwritten by a nested `.get`",
+        objIx,
+      )
+    }
+    fbLocalGet(listGetRecvSlotNow())
   } else {
     if !fnUses.listGet {
       return emitFailAt("emitProgram: `.get` operand stash not reserved", objIx)
     }
     if emitExpr(objIx, fnIx) < 0 { return -1 }
     svSyncRecv(objIx, fnIx)
-    fbLocalTee(listGetRecvSlot)
+    fbLocalTee(listGetRecvSlotNow())
+    listGetOwnerSet(listGetRecvOwner, listGetRecvStagedIx)
     listGetRecvStagedSet = true
   }
   fbRefCast(heap)
@@ -8608,6 +8659,20 @@ export function emitNicheReadTail(exprIx: i32, ak: i32, fnIx: i32) {
   } else if ak == 2 {
     fbIfRefNul(sTy(), true) // if (result (ref null $sTypeIdx))
     fbRefNull(sTy())
+  } else if ak == 11 {
+    // A closure's niche is the nullable fat pointer; `emitUnionUnboxTail` casts the payload to it.
+    fbIfRefNul(cloStructIdx, true)
+    fbRefNull(cloStructIdx)
+  } else if ak == NICHE_NUL_MAP {
+    // A map's niche is its nullable struct, the one the read's consumer is typed against.
+    const mt = mapTypeIdxOf(mapShapeOfExpr(exprIx, fnIx))
+    fbIfRefNul(mt, true)
+    fbRefNull(mt)
+    fbElse()
+    fbLocalGet(st)
+    if mapUnionUnboxTail(exprIx, fnIx) < 0 { return -1 }
+    fbEnd()
+    return 0
   } else {
     // A list's niche is its nullable wrapper; `emitUnionUnboxTail` casts the payload to it.
     const lw = listWrapHeapOfKind(ak)
@@ -23906,6 +23971,12 @@ export function fnTagLeafEmitted(ix: i32, fnIx: i32): i32 {
   return id
 }
 
+// Whether `emitExpr` writes `ix` as a null-unit place read (`emitNulNoneRead`). Legacy and the IR
+// share it.
+export function nulUnitPlaceReadAt(ix: i32, fnIx: i32): boolean {
+  return ix >= 0 && placePrePathWhy(ix, fnIx) == "pre-path null unit read"
+}
+
 // `emitExpr`'s null-unit and niche reads of a place or method call `ix`, or "".
 function placePrePathWhy(ix: i32, fnIx: i32): string {
   const e = nodeAt(ix)
@@ -38541,11 +38612,12 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
 }
 
 // The element kinds the IR's walk binds as legacy's does: an `i32`, a string, a value union's
-// box, a record, or an `i32`, string, byte or record list, each read whole into the loop variable.
+// box, a record, or an `i32`, `i64`, `f64`, string, byte (or nullable byte) or record list, each
+// read whole into the loop variable.
 function forInElemPlain(ek: VKind): boolean {
   return match ek {
-    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" | "nulbool" | "f32" => true
-    "map" | "f64list" | "nullist" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
+    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "reflist" | "nulstr" | "variant" | "nulstruct" | "nulvariant" | "i64" | "f64" | "closure" | "nulbool" | "f32" | "f64list" | "i64list" | "nulu8list" => true
+    "map" | "nullist" | "nulreflist" | "nulclosure" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulmap" | "nulnone" | "v128" => false
   }
 }
 
@@ -44820,6 +44892,7 @@ function nulScalarListAtomKind(kind: VKind): i32 {
 // Read off the NICHE, since the value is still nullable and classifies as no atom at all.
 function coalNicheAtomKind(lhsIx: i32, fnIx: i32): i32 {
   if exprNullableString(lhsIx, fnIx) { return 2 }
+  if exprNulClosure(lhsIx, fnIx) { return 11 }
   if exprNullableList(lhsIx, fnIx) {
     // A boolean list tags apart from the `i32` list it shares storage with.
     if boolLeafListDepthOfTy(tyPeelNul(nodeTyIxOf(unwrapParen(lhsIx)))) == 0 {
@@ -44863,6 +44936,10 @@ function coalNicheBoxTag(joinTy: i32, lhsIx: i32, heapIx: i32, fnIx: i32): i32 {
     return refArrSlotTag(rs)
   }
   const ak = coalNicheAtomKind(lhsIx, fnIx)
+  // A closure rides the box's `anyref` slot as its fat pointer, under the closure arm's tag.
+  if ak == 11 {
+    return if unionTyHasBoxKind(joinTy, 11) { scalarTagOfKind(11) } else { -1 }
+  }
   if ak >= 0 {
     if refAtomElemName(ak) == "" || !unionTyHasBoxKind(joinTy, ak) { return -1 }
     return scalarTagOfKind(ak)
@@ -44907,7 +44984,10 @@ function emitUnionBoxNulNiche(
     return nulBoolBoxTail()
   }
   // The value's shape is asked before the union's `null`, so only a niche reads the set.
-  if exprNulBool(nnIx, fnIx) || !coalesceNulRefNicheOperand(nnIx, fnIx) {
+  if (
+    exprNulBool(nnIx, fnIx)
+    || !(coalesceNulRefNicheOperand(nnIx, fnIx) || exprNulClosure(nnIx, fnIx))
+  ) {
     return 0
   }
   if !unionSetHasNullTy(unionKey, unionTy) { return 0 }
