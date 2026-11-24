@@ -25,6 +25,7 @@ import {
   RRecord,
   RUnsup,
   RpPrim,
+  askRecordHeap,
   repNodeAt,
   repNodeKids,
   repRecordFieldNames,
@@ -139,9 +140,10 @@ export type RBoxNarrow = {
 // `uaAt` is the read; `uaCellNul` a binding whose cell is a nullable arm, which legacy casts to as a
 // nullable ref whatever the value's own nullability (`emitLetDelivery`).
 export type RArmUnbox = { uaV: Opnd, uaAt: i32, uaCellNul: boolean, uaDst: i32 }
-// An element read `asAt` through a union-of-lists box variable `asV`, written by legacy's tag chain
-// (`armSiteWrite`) per arm with `asIx`, a variable or an immediate, as its index.
-export type RArmSite = { asV: Opnd, asIx: Opnd, asAt: i32 }
+// A read `asAt` through a box of lists or maps (an element, `.length`, `.has` or `.get`),
+// written by legacy's tag chain (`armSiteWrite`) per arm: `asOps` the box, then its index or key,
+// none for a `.length`; `asStash` the box is held in legacy's receiver stash, not re-read by name.
+export type RArmSite = { asOps: Opnd[], asAt: i32, asStash: boolean }
 // A box local read at its storage as the niche (`nicheReadKindAt`, kind `nrKind`) its narrowing
 // names, `nrAt` the read: the null tag is the niche's null, any other arm its payload.
 export type RNicheRead = { nrV: Opnd, nrAt: i32, nrKind: i32 }
@@ -315,10 +317,9 @@ export type RAtomEq = {
   aeNe: boolean,
   aeAt: i32,
 }
-// The `==` (or, with `ueNe`, `!=`) of two union boxes at compare node `ueAt`, written by legacy's
-// compare over the two operands (`unionUnionBoxesTail`): the struct union's, or the staged one.
 // A union box `ucBox` against `ucOther` at `ucAt` (`ucSwap`: box on the right) by legacy's plan,
-// `ucStash` its stash, `ucNul` the operand's null leg, `ucAgain` its read written again.
+// `ucStash` its stash, `ucNul` the operand's null leg, `ucAgain` its read written again, `ucStage`
+// the null legs' parked sides (1 the box, 2 the operand, 4 the operand parked first).
 export type RUnionConcreteEq = {
   ucBox: Opnd,
   ucOther: Opnd,
@@ -327,8 +328,11 @@ export type RUnionConcreteEq = {
   ucStash: boolean,
   ucNul: boolean,
   ucAgain: boolean,
+  ucStage: i32,
   ucAt: i32,
 }
+// The `==` (or, with `ueNe`, `!=`) of two union boxes at compare node `ueAt`, written by legacy's
+// compare over the two operands (`unionUnionBoxesTail`): the struct union's, or the staged one.
 export type RUnionEq = { ueL: Opnd, ueR: Opnd, ueNe: boolean, ueAt: i32 }
 // A union box `uvBox` against the record `uvOther` at `uvAt` (`uvSwap`: the box on the right), on
 // legacy's variant door.
@@ -343,7 +347,8 @@ export type RUnionNumCrossEq = {
   ncAt: i32,
 }
 // One step of a staged union compare at `usAt` (`emitUnionEqStaged`, arm kind `usKind`): `usOp` 0
-// opens its level, 1 parks the box `usV`, 2 parks the operand `usV`, 3 closes the level.
+// opens its level, 1 parks the box `usV`, 2 parks the operand `usV`, 3 closes it; on the null legs
+// 4 opens (`usKind` 1: the box staged), 5 parks the operand first (`usKind` its leg), 6 the box.
 export type RUnionStage = { usOp: i32, usV: Opnd, usKind: i32, usAt: i32 }
 // A staged union compare's value at `uqsAt`: the plan's tails over the parked sides.
 export type RUnionStagedEq = { uqsNe: boolean, uqsSwap: boolean, uqsAt: i32 }
@@ -1174,7 +1179,17 @@ export function irCloFieldRetagNote(f: IrFn, id: i32) {
 
 // Notes record rep `r` stored at heap `h`, once.
 export function irRecHeapNote(f: IrFn, r: i32, h: i32) {
-  if (f.irRecHeap[r] ?? -1) < 0 { f.irRecHeap[r] = h }
+  if (f.irRecHeap[r] ?? -1) == -1 { f.irRecHeap[r] = h }
+  return 0
+}
+
+// Notes heap `h` for rep `r` as one source's answer: a second answer that differs leaves `r` with
+// no heap (-2), which no later note fills.
+export function irRecHeapNoteOne(f: IrFn, r: i32, h: i32) {
+  if h < 0 { return 0 }
+  const cur = f.irRecHeap[r] ?? -1
+  if cur == -1 { f.irRecHeap[r] = h }
+  else if cur != h { f.irRecHeap[r] = -2 }
   return 0
 }
 
@@ -1693,7 +1708,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RAsUnion => [r.auV]
     RAsTail => [r.akV]
     RArmUnbox => [r.uaV]
-    RArmSite => [r.asV, r.asIx]
+    RArmSite => r.asOps
     RTagStash => [r.tgsV]
     RStashSet => [r.ssV]
     RTagIs => []
@@ -1812,7 +1827,7 @@ function rhsText(r: Rhs): string {
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RAsUnion => "as.union " + opndText(r.auV)
     RAsTail => "as.tail " + opndText(r.akV)
-    RArmSite => "arm_site " + opndText(r.asV) + "[" + opndText(r.asIx) + "]"
+    RArmSite => "arm_site @" + i32ToStr(r.asAt) + (if r.asStash { " stash" } else { "" })
     RArmUnbox => "arm_unbox "
       + opndText(r.uaV)
       + " @"
@@ -2560,11 +2575,60 @@ export function recRowRetag(src: i32, dst: i32, hs: {[i32]: i32}): boolean {
   ) {
     return false
   }
-  const h = recHeapOf(src)
-  if h < 0 || h != recHeapOf(dst) { return false }
+  const h = heapNotedOr(hs, src)
+  if h < 0 || h != heapNotedOr(hs, dst) { return false }
   recHeapsNote(hs, src)
   recHeapsNote(hs, dst)
-  return repsLowerAlike(src, dst, hs)
+  return repsLowerAlike(src, dst, hs) || recFieldsWiden(src, dst, hs)
+}
+
+// Rep `r`'s heap as noted in `hs`, else its own (`recHeapOf`); -1 for none or a conflicting note.
+function heapNotedOr(hs: {[i32]: i32}, r: i32): i32 {
+  const n = hs[r] ?? -1
+  if n != -1 { return n }
+  return recHeapOf(r)
+}
+
+// Whether plain record rep `src` stands at plain record rep `dst`, both noted in `hs` at one heap,
+// as a narrower view: each field lowers alike, or goes into a nullable field of `dst` as that field's
+// inner rep or as `null`. The ref is the same; the row stores the nullable field.
+export function recFieldsWiden(src: i32, dst: i32, hs: {[i32]: i32}): boolean {
+  const x = repNodeAt(src)
+  const y = repNodeAt(dst)
+  if !(x is RRecord) || !(y is RRecord) || x.rrVariant || y.rrVariant {
+    return false
+  }
+  const h = hs[src] ?? -1
+  if h < 0 || h != (hs[dst] ?? -1) { return false }
+  const nb = repRecordFieldNames(dst)
+  if (
+    repRecordFieldNames(src).length != nb.length
+    || x.rrFields.length != y.rrFields.length
+  ) {
+    return false
+  }
+  let j = 0
+  while j < nb.length && j < y.rrFields.length {
+    const i = repRecordKidOf(src, repTyOf(src), nb[j])
+    if (
+      i < 0
+      || i >= x.rrFields.length
+      || !fieldWidens(x.rrFields[i], y.rrFields[j], hs)
+    ) {
+      return false
+    }
+    j = j + 1
+  }
+  return true
+}
+
+// Whether field rep `a` is stored as field rep `b`: alike, or `b` nullable over `a` or `a` `null`.
+function fieldWidens(a: i32, b: i32, hs: {[i32]: i32}): boolean {
+  if repsLowerAlike(a, b, hs) { return true }
+  const y = repNodeAt(b)
+  if !(y is RNullable) { return false }
+  const x = repNodeAt(a)
+  return repsLowerAlike(a, y.rnInner, hs) || x is RPrim && x.rpK == "null"
 }
 
 // Whether a plain record at rep `src` stands at plain rep `dst` as it is, by width, as the builder
@@ -2681,7 +2745,7 @@ export function recHeapsNote(hs: {[i32]: i32}, r: i32) {
     const t = todo.pop() ?? -1
     if t < 0 || (seen[t] ?? false) { continue }
     seen[t] = true
-    if repNodeAt(t) is RRecord { hs[t] = recHeapOf(t) }
+    if repNodeAt(t) is RRecord && (hs[t] ?? -1) == -1 { hs[t] = recHeapOf(t) }
     for k in repNodeKids(t) { todo.push(k) }
   }
   return 0
@@ -2772,10 +2836,14 @@ function fieldsLowerAlike(
   return true
 }
 
-// The struct heap a value of record rep `r` is stored at (`recordHeapOfTy` of its type), or -1.
+// The struct heap a value of record rep `r` is stored at: its type's own (`recordHeapOfTy`), else
+// the heap of the row legacy stores it at, asked so it is recorded (`askRecordHeap`); -1 for none.
 export function recHeapOf(r: i32): i32 {
   if !(repNodeAt(r) is RRecord) { return -1 }
-  return recordHeapOfTy(repTyOf(r))
+  const ty = repTyOf(r)
+  const h = recordHeapOfTy(ty)
+  if h >= 0 { return h }
+  return askRecordHeap(ty)
 }
 
 // The record, list or map rep of list element `e`, under a `| null`, or -1.
