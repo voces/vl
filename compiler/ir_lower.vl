@@ -258,6 +258,7 @@ import {
   SSetField,
   SSwitch,
   STrap,
+  armUnboxRoute,
   coalArmStagesLeads,
   irFnNew,
   irNoTailEffHas,
@@ -416,6 +417,7 @@ import {
   emitMapGetScalarBoxTail,
   emitMapGetTail,
   emitMapNew,
+  emitNarrowedArmUnboxTo,
   emitNarrowedMapReadTail,
   emitNicheReadTail,
   emitNullOwn,
@@ -529,6 +531,7 @@ import {
   nulNicheEqWhy,
   nulNoneBoxHead,
   nulNoneBoxTail,
+  nulStructEqGuardTail,
   nulTestAtomTail,
   nulTestBoolTail,
   nulTestBoxTagTail,
@@ -609,6 +612,7 @@ import {
   strToAtomTexts,
   strToAtomWideTail,
   structEqEnter,
+  structEqLeave,
   structEqRoots,
   structEqStagesLeft,
   structEqStagesRight,
@@ -2550,19 +2554,25 @@ function plainVarLocal(o: Opnd): i32 {
   return s
 }
 
-// `RArmUnbox`: the box, then the table's cast to the read's arm record (`emitArmUnboxAtCell`).
+// `RArmUnbox`: the box, then the table's cast to the read's arm record (`emitArmUnboxAtCell`). An
+// assignment's box takes its destination's (`emitNarrowedArmUnboxTo`), where legacy's position casts.
 function armUnbox(r: RArmUnbox) {
   irLOpnd(r.uaV)
-  if r.uaDst >= 0 {
-    if emitRecordArmsUnboxTo(recHeapOf(r.uaDst), r.uaAt, lw.irAt) < 0 {
-      return irLMiss("record arms unbox heap")
+  return match armUnboxRoute(r) {
+    "asg" => emitNarrowedArmUnboxTo(recHeapOf(r.uaDst), r.uaAt, lw.irAt)
+    "recordArms" => {
+      if emitRecordArmsUnboxTo(recHeapOf(r.uaDst), r.uaAt, lw.irAt) < 0 {
+        return irLMiss("record arms unbox heap")
+      }
+      0
     }
-    return 0
+    "arm" => {
+      if emitArmUnboxAtCell(r.uaAt, lw.irAt, r.uaCellNul) < 0 {
+        return irLMiss("arm unbox heap")
+      }
+      0
+    }
   }
-  if emitArmUnboxAtCell(r.uaAt, lw.irAt, r.uaCellNul) < 0 {
-    return irLMiss("arm unbox heap")
-  }
-  return 0
 }
 
 // `RBoxNarrow` of a ref list or map arm: the box, then legacy's payload cast to the container,
@@ -3873,11 +3883,24 @@ function structEq(r: RStructEq) {
   if plan.erL.epSlot == -2 || plan.erR.epSlot == -2 {
     return irLMiss("record compare element place")
   }
+  if r.seNul && (lE || rE) {
+    return irLMiss("nullable record compare element place")
+  }
   const saved = structEqEnter()
   if lS { irLOpnd(r.seL) }
   if rS { irLOpnd(r.seR) }
   structEqPlaceSkip(lG, rG, r)
   const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
+  // Two nullable records' compare: the nullness guard and the fields, then `!=`'s `i32.eqz`, as
+  // `emitNulNicheEqBin` writes it after the guarded block.
+  if r.seNul {
+    if nulStructEqGuardTail(n.binLeft, n.binRight, roots, row, fnIx) < 0 {
+      return irLMiss("nullable record compare fields")
+    }
+    structEqLeave(saved)
+    if n.binOp == "!=" { fbI32Eqz() }
+    return 0
+  }
   if structEqTail(n, row, roots, saved, fnIx, plan) < 0 {
     return irLMiss("record compare fields")
   }
