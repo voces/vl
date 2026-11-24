@@ -115,3 +115,16 @@ Trusts and order:
 Quick A/B (mode 1, tests/cases plus the named cells) against N6's 194193920, after step 3:
 covered, verified and matched 118,179 → 118,180; start covered, verified and matched
 14,932 → 14,935; no losses, mismatch/fail 0. d15214_plain_inner's start is covered.
+
+## Readings (batch 1, base master 49a2a3c20, head 2311cd26f, fixpoint seeds)
+
+- Quick A/B (mode 1, tests/cases plus the 10,827 named cells): covered, verified and matched
+  118,263 → 118,264; start covered, verified and matched 14,952 → 14,953; no losses, no
+  mismatch or verifier fail. On tests/cases alone the A/B and the ir-only census (6,017 of
+  7,173) are unchanged: master already carries the starts the slot's own PR (#9788) closed.
+- `ir-identity.sh --cases`: identical 7,753, differ 0; `--claimless`: identical 14,055, differ
+  0; `--names`: differ 0; self-compile identical. Mode 6 prepost differs: corpus 0 of 82,251,
+  cases 1 of 66,756 (not own refusal 0).
+- rep-fuzz exact; L2 self-compile fuel +0.06% on 124,231,434,992; fuel pair +0.03%
+  (124,232,156,004 → 124,268,594,079), after the cell-heap memo (the unmemoised note cost
+  +0.70%); `self ir misses` 0; deep nesting 8 passed, 0 failed.
