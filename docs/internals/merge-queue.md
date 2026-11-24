@@ -371,6 +371,8 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 - a parallel predicate mirror, unless legacy consumes it or an agreement check is armed;
 - a new dead export;
 - any differ under `ir-identity.sh --claimless` or `--cases`;
+- a claimed module that fails validation under `$VL_IR_STRICT=1`, or any differ in the gate row
+  `ir claim refusals` (`ir-parity.vl --pop refusals`);
 - a shipping door that bypasses `claimable()` (ir-design §10.2).
 
 ## A chosen divergence (Q57)
