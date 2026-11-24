@@ -151,6 +151,7 @@ import {
   irNodeFamily,
   irNodeNew,
   irRecHeapNote,
+  irRecHeapNoteOne,
   irRecHeapOf,
   irSigNote,
   irSigOf,
@@ -169,7 +170,9 @@ import {
   listRetagHole,
   mapBoxReadsAt,
   mapNicheReadsAt,
+  recFieldsWiden,
   recHeapOf,
+  recHeapsNote,
   recRetag,
   recRowRetag,
   recSubAdmit,
@@ -652,6 +655,7 @@ import {
 import {
   narrowedNulLitPinBoxKey,
   nulNicheRecoverOwed,
+  retNeedsNonNullRecover,
 } from "./emit_value_sites"
 import {
   armSiteReads,
@@ -818,7 +822,7 @@ import {
   sFieldTgtStructIdx,
   structIndexOfTy,
 } from "./emit_atom_kinds"
-import { recordHeapOfTy } from "./emit_shape_intern"
+import { recordHeapOfTy, structRowHeap } from "./emit_shape_intern"
 import { RC_MAP, RC_REF_LIST, letBindingUnionTy } from "./emit_start_block"
 import {
   TY_BOOL,
@@ -1079,6 +1083,7 @@ export function irShadowArmed(): boolean { return ibArmed }
 export function irShadowBegin() {
   ibRowKey = []
   ibRowN = []
+  cellHeapMemo = Map()
   return 0
 }
 
@@ -4156,12 +4161,41 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       return irBLetTempTy(b, gr, ix, cellRep, at)
     }
     if member { return irBLetTempTy(b, gr, ix, cellRep, gh) }
+    noteCellHeap(d, rep)
     return irBLetTempTy(b, gr, ix, rep, globalReadTy(d, ix, rep))
   }
   if dn is FuncDecl && repNodeAt(rep) is RClosure {
     return cloValue(b, ix, rep, heldTy(exprTyOf(ix)))
   }
   return irBMiss("read of " + n.identName)
+}
+
+// Notes a struct cell's heap (`globalCellStructIdx`) for the record rep `rep` it is read at, where
+// that rep's type has no heap of its own and its fields lower alike with, or widen to, the cell
+// row's own; a second cell of that rep on another heap unnotes it.
+function noteCellHeap(d: i32, rep: i32) {
+  if !(repNodeAt(rep) is RRecord) { return 0 }
+  const key = i32ToStr(d) + ":" + i32ToStr(rep) + ":" + i32ToStr(repTyOf(rep))
+  const memo = cellHeapMemo[key] ?? -2
+  const h = if memo != -2 { memo } else { cellHeapOf(d, rep) }
+  cellHeapMemo[key] = h
+  return irRecHeapNoteOne(ib, rep, h)
+}
+
+// Each (global, rep, type) answer `cellHeapOf` gave in this program's emit (`irShadowBegin`).
+let cellHeapMemo: {[string]: i32} = Map()
+
+function cellHeapOf(d: i32, rep: i32): i32 {
+  if recHeapOf(rep) >= 0 || globalCellKind(d) != "struct" { return -1 }
+  const row = globalCellStructIdx(d)
+  const h = structRowHeap(row)
+  const rr = repNodeOfTy(slotRowTyOf(row))
+  if h < 0 || rr < 0 || recHeapOf(rr) != h { return -1 }
+  const hs: {[i32]: i32} = Map()
+  hs[rep] = h
+  recHeapsNote(hs, rr)
+  if !repsLowerAlike(rep, rr, hs) && !recFieldsWiden(rep, rr, hs) { return -1 }
+  return h
 }
 
 // A `string | null` capture read where its type bears no null: its slot, then the `ref.as_non_null`
@@ -8711,10 +8745,37 @@ function nulTest(
   ) {
     return irBMiss("null test " + arm)
   }
-  const v = irBExpr(b, bt.bnRef)
+  const v = nulTestOperand(b, arm, bt.bnRef)
   if ibMiss != "" { return v }
   if !nulTestOperandOk(arm, irBOpRep(v)) { return irBMiss("null test operand") }
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
+}
+
+// The operand of null test arm `arm` over `ref`: a union-box global the checker narrowed to a rep
+// that is no box is read as its cell stores it, the box whose tag legacy compares.
+function nulTestOperand(b: i32[], arm: NulTestArm, ref: i32): Opnd {
+  const r = unwrapParen(ref)
+  if (
+    arm == "boxTag"
+    && r >= 0
+    && r < P.nodes.length
+    && nodeAt(r) is Ident
+    && globalTarget(r)
+  ) {
+    const d = identDeclOf(r)
+    const g = globalIndexOfSid(sidOfNode(r))
+    const cr = globalRep(g, d)
+    const st = heldTy(letBindTy(d, -1))
+    if (
+      cr >= 0
+      && heldAsBox(cr)
+      && !heldAsBox(exprRepOf(r))
+      && cr == globalTyRep(st)
+    ) {
+      return globalStoredRead(b, g, r, cr, st)
+    }
+  }
+  return irBExpr(b, ref)
 }
 
 // Whether operand rep `vr` is the one null-test arm `arm` reads; an arm `RNulTest` does not
@@ -12985,7 +13046,8 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   const n0 = b.length
   if retRefusedWhy(last, ibFnIx) != "" { return skip("return refused") }
   const v = retDelivered(b, last)
-  if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
+  if ibMiss != "" { return 0 }
+  if irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])
   return 0
@@ -13018,7 +13080,22 @@ function retDelivered(b: i32[], arg: i32): Opnd {
   if ibMiss == "" && fu >= 0 && irBOpRep(v) != r {
     return boxTempIn(b, v, arg, r, -1, fu)
   }
-  return v
+  return retRecover(b, v, arg)
+}
+
+// Returned value `v` of `arg` at the result's rep where legacy's plain return writes a
+// `ref.as_non_null` after it (`retNeedsNonNullRecover`): a nullable value whose inner rep is the
+// result's. Any other value as it stands.
+function retRecover(b: i32[], v: Opnd, arg: i32): Opnd {
+  if ibMiss != "" { return v }
+  const r = ib.irRetRep
+  const vn = repNodeAt(irBOpRep(v))
+  if !(vn is RNullable) || vn.rnInner != r { return v }
+  const fn = nodeAt(ibFnIx)
+  const fp = if fn is FuncDecl && fn.fnRet < 0 { fnStmtsPosOf(ibFnIx) } else { -1 }
+  if !retNeedsNonNullRecover(arg, ibFnIx, fp) { return v }
+  const rc: Rhs = { rcV: v, rcAt: arg, rcNn: 1 }
+  return irBLetTempTy(b, rc, arg, r, ib.irRetTy)
 }
 
 // A value `if` in tail position (legacy's `emitIfTail`): the statement `if` with each arm's last
@@ -13113,8 +13190,9 @@ function tailArm(blockIx: i32): i32[] {
     skip("return refused")
     return body
   }
-  const v = deliver(body, last, ib.irRetRep, -1)
-  if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
+  const v = retRecover(body, deliver(body, last, ib.irRetRep, -1), last)
+  if ibMiss != "" { return body }
+  if irBOpRep(v) != ib.irRetRep {
     skip("tail coercion")
     return body
   }
