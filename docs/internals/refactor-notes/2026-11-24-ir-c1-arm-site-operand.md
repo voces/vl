@@ -17,6 +17,20 @@ override, estimated at 3–4h of identity-only work. The queue acked the Q57 exc
   tag test, which reads only the box, changes nothing observable. A trap in it is the program's
   trap either way.
 
+## Price (Q57)
+
+- **Run cost:** the IR sets the index once into the `armIdxSlot` stash ahead of the tag chain, then
+  the arm that runs copies it into the read's index local (`local.set` of a `local.get`). Legacy
+  computes the index straight into that local inside the arm. Each side evaluates the index once,
+  so the IR pays one more `local.set` / `local.get` pair per executed arm-site read. Run fuel is
+  unmeasured: no program run-fuel instrument exists. The Q57 readings' "fuel" column is the whole
+  `vl run`, compile included.
+- **Size:** the modules are smaller: `arm-site-hoisted-index-positions` 12955 → 12395 B,
+  `list-union-element-through-hole` 2078 → 2022 B, `arm-site-narrowed-receiver-and-index`
+  1639 → 1586 B.
+- **No codegen property is lost:** the index is evaluated once, the bounds check is unchanged, and
+  no unboxing or tail form changes.
+
 ## Divergences (`scripts/ir-divergence-baseline.txt`)
 
 | program | functions |
