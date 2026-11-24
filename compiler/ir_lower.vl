@@ -477,6 +477,7 @@ import {
   idxSpanOn,
   initBitOf,
   listBuildClose,
+  listGetOrOpen,
   listOpRecvHeld,
   listOpStageBase,
   listReserveOpen,
@@ -4047,12 +4048,14 @@ function structEqRowsBank(lRows: i32[], rRows: i32[]) {
 
 // The `elem` root place of a record compare side read as a ref list element: receiver `v` from
 // its local, or re-read from its expression (`epSlot` -1) where it is a place, and index `i`
-// from its local or an immediate; `epSlot` -2 where one has neither.
+// from its local, an immediate, or its expression (`epIdx` -2) where it is a place; `epSlot` -2
+// where one has neither.
 function structEqElemPlace(v: Opnd, i: Opnd, placeRecv: boolean): EqRootPlace {
   const vs = if placeRecv { -1 } else { structEqSideLocal(v) }
-  const xs = if i is OImm { -1 } else { structEqSideLocal(i) }
+  const placeIdx = structEqPlaceSide(i)
+  const xs = if i is OImm { -1 } else if placeIdx { -2 } else { structEqSideLocal(i) }
   const imm = if i is OImm { i.oiBits as% i32 } else { 0 }
-  const bad = vs < 0 && !placeRecv || !(i is OImm) && xs < 0
+  const bad = vs < 0 && !placeRecv || !(i is OImm) && xs == -1
   return {
     epKind: "elem",
     epSlot: if bad { -2 } else { vs },
@@ -4087,7 +4090,9 @@ function structEqPlaceSide(o: Opnd): boolean {
 // Consumes the place sides' temps unwritten, left first, as legacy reads each from its place.
 function structEqPlaceSkip(lG: boolean, rG: boolean, r: RStructEq) {
   if lG { irLSkip(r.seL) }
+  if r.seLIx.length > 0 && structEqPlaceSide(r.seLIx[0]) { irLSkip(r.seLIx[0]) }
   if rG { irLSkip(r.seR) }
+  if r.seRIx.length > 0 && structEqPlaceSide(r.seRIx[0]) { irLSkip(r.seRIx[0]) }
   return 0
 }
 
@@ -5240,6 +5245,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   const ba = coalValBoxArm(n.cbArm)
   const got = if ba != null { coalBoxArm(n, ba, e, pending) } else { match n.cbArm {
     "popOr" => coalPopOr(n, e, pending)
+    "listGetOr" => coalListGetOr(n, e, pending)
     "mapIndexGetOr" => coalMapGetOr(n, e, pending)
     "nulRef" => coalNulRef(n, e, pending)
     "litUnion" => coalNicheCell(n, e, -1, pending)
@@ -5405,6 +5411,23 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   }
   irLSettle(pending)
   popOrOpen(p, lIdx)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  fbEnd()
+  return 0
+}
+
+// The fused `xs.get(i) ?? d`: legacy's shared head re-reads the receiver and the index the
+// builder found re-readable, so the receiver operand is skipped; then the default and the end.
+function coalListGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  lwSeq = []
+  irLSkip(n.cbL)
+  if lwMiss != "" { return -1 }
+  irLSettle(pending)
+  if listGetOrOpen(unwrapParen(e.binLeft), lw.irAt) == null {
+    return irLMiss("listGetOr head")
+  }
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   lwFrames.pop()
