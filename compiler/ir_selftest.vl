@@ -38,7 +38,7 @@ import {
   mkNullableTy,
   mkObjTy,
 } from "./check_types"
-import { CoalValArm } from "./emit_plan_null"
+import { CoalValArm, NULL_OWN_NONE } from "./emit_plan_null"
 import { mkUnionTy } from "./check_union_mint"
 import { BinExpr, Call, StrLit, addNode } from "./ast"
 import { irBoundsRule } from "./ir_verify_bounds"
@@ -88,6 +88,8 @@ const selfTestIds: string[] = [
   "map-read-out-unwritten",
   "shared-read-of-temp",
   "map-read-mv-into-wrong-out",
+  "null-none-into-bool-niche",
+  "null-none-into-ref-niche",
   "nul-ref-of-i32",
   "nul-ref-of-non-null-list",
   "nul-ref-list-into-i32",
@@ -151,6 +153,8 @@ const selfTestIds: string[] = [
   "atom-tower-zero-reads",
   "atom-staged-of-i32",
   "map-get-boxed-scalar-into-bool",
+  "map-get-atom-niche-narrowed",
+  "map-get-atom-niche-into-string",
   "field-coalesce-of-i32-receiver",
   "bool-join-coalesce-of-i32",
   "trunc-sat-operand-off-plan",
@@ -981,6 +985,31 @@ function caseFn(id: string): IrFn {
     }
     f.irBody.push(node(f, { lDst: bt, lRhs: g }, boolr))
   }
+  // Rule 2: an atom-valued map's `K | null` read narrowed past its `-1` null is the bare atom, which
+  // holds; the same read delivered as a `string` is refused.
+  if (
+    id == "map-get-atom-niche-narrowed"
+    || id == "map-get-atom-niche-into-string"
+  ) {
+    const at = mkUnionTy([mkLitTy("str", "a"), mkLitTy("str", "b")])
+    const mt = mkMapTy(TY_I32, mkNullableTy(at), 0)
+    const mv = irVarNew(f, repNodeOfTy(mt), mt, "local", 1)
+    const dt = if id == "map-get-atom-niche-narrowed" { at } else { TY_STR }
+    const dr = repNodeOfTy(dt)
+    const tv = irVarNew(f, dr, dt, "temp", -1)
+    const g: Rhs = {
+      mtSym: -1,
+      mtNonNull: false,
+      mtLoc: v(mv),
+      mtKey: v(p),
+      mtAt: -1,
+      mtBox: -1,
+      mtRow: false,
+      mtTrap: false,
+      mtPrint: -1,
+    }
+    f.irBody.push(node(f, { lDst: tv, lRhs: g }, dr))
+  }
   // Rule 2: `print`'s map read (`mtPrint`) prints a scalar value; one of a `string`-valued map is
   // refused, one of an `i32`-valued map holds.
   if id == "map-print-of-i32" || id == "map-print-of-string" {
@@ -1431,6 +1460,20 @@ function caseFn(id: string): IrFn {
         i32r,
       ),
     )
+  }
+  // The bottom ref into a `boolean | null`, whose sentinel slot is an i32, and into a nullable list.
+  if id == "null-none-into-bool-niche" || id == "null-none-into-ref-niche" {
+    const nt = if id == "null-none-into-bool-niche" { mkNullableTy(TY_BOOL) } else { mkNullableTy(mkArrayTy(TY_I32)) }
+    const nr = repNodeOfTy(nt)
+    const nv = irVarNew(f, nr, nt, "temp", -1)
+    const k = node(
+      f,
+      { lDst: nv, lRhs: { nuAt: -1, nuOwn: NULL_OWN_NONE, nuRead: [] } },
+      nr,
+    )
+    // The fact the builder notes for it (`irNoteVerifyFacts`): the bottom ref.
+    f.irFactInt[k] = 0
+    f.irBody.push(k)
   }
   // Rule 10: a valued block outside a helper whose out is a temp, not a loop value's binding.
   if id == "valued-block-temp-out" {

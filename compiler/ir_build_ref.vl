@@ -6,7 +6,7 @@ import { variantFieldTypeAt } from "./emit_atom_kinds"
 // over the same operands; the lowering takes its scratch slots from the shared lazy list frame.
 // Every other element or member read is a named miss. `irRefInstall` sets the hooks.
 
-import { BinExpr, Ident, Index, LetDecl, Member, P, nodeAt } from "./ast"
+import { BinExpr, Call, Ident, Index, LetDecl, Member, P, nodeAt } from "./ast"
 import {
   IrFn,
   OImm,
@@ -35,6 +35,7 @@ import {
   boxedNullable,
   declRowReadTy,
   deliverStr,
+  exprTyOf,
   heldAsBox,
   holeCloTy,
   ifBelowLeadOf,
@@ -79,7 +80,7 @@ import {
   irLowerListHook,
   irLowerListSetHook,
 } from "./ir_lower"
-import { irBoundsRuleHook } from "./ir_verify"
+import { irBoundsRuleHook, irTyOpen } from "./ir_verify"
 import {
   openRepTakes,
   repStoresAs,
@@ -96,6 +97,7 @@ import {
 } from "./ir_lower_ref"
 import { irBoundsRule } from "./ir_verify_bounds"
 import {
+  RAtom,
   RBox,
   RClosure,
   RList,
@@ -478,6 +480,15 @@ function storedBoxRead(b: i32[], ix: i32): Opnd {
   return v
 }
 
+// The type receiver `o` is built at: an open-typed call, or a field of one, at the type `irBExpr`
+// builds it at (`exprTyOf`); else its own type.
+function builtRecvTy(o: i32): i32 {
+  const u = unwrapParen(o)
+  const t = nodeTyAt(u, irBFnIx())
+  if u < 0 || !irTyOpen(t) { return t }
+  return if nodeAt(u) is Call || nodeAt(u) is Member { exprTyOf(u) } else { t }
+}
+
 // A member read, routed by its receiver's rep: a record's own `length` field never reaches a
 // list or string arm.
 function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
@@ -493,7 +504,7 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   }
   // A receiver held at legacy's declared row (`declRowReadTy`) is read at that row.
   const dt = declRowReadTy(n.memObj)
-  const ot = if dt >= 0 { dt } else { nodeTyAt(n.memObj, irBFnIx()) }
+  const ot = if dt >= 0 { dt } else { builtRecvTy(n.memObj) }
   // A hole receiver is read at the rep its parameter is held at (`irBOpenLocalReadRep`).
   const r0 = repNodeOfTy(ot)
   const hr = if repNodeAt(r0) is RUnsup { holeRecvBox(irBOpenLocalReadRep(n.memObj)) } else { -1 }
@@ -537,7 +548,14 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     // tail writes the read's recover (`readOwesNonNullRecover`), as for any member read.
     const kn = repNodeAt(kr)
     const narrowed = kn is RNullable && kn.rnInner == rep
-    if kr != rep && !own && !narrowed { return irBMiss("field read coercion") }
+    // An atom field read as its literal's string is read at the atom; its consumer decodes it.
+    const atomStr = kn is RAtom
+      && repPrim(rep) == "str"
+      && !own
+      && exprIsLitAtom(ix, fnIx)
+    if kr != rep && !own && !narrowed && !atomStr {
+      return irBMiss("field read coercion")
+    }
     // The box read below, declined before its receiver is built where it reaches D17076.
     const nullBox = own
       && repPrim(rep) == "null"
@@ -572,6 +590,7 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
       gfShared: false,
     }
     if ur != rep { return irBLetStrTemp(b, gf, ix) }
+    if atomStr { return irBLetTempTy(b, gf, ix, kr, repTyOf(kr)) }
     // A `null`-typed read whose field tail leaves the box writes nothing after it: the read is
     // that box, the `null` member nothing unboxes to.
     if (
