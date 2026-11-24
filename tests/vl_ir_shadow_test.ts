@@ -1807,6 +1807,9 @@ Deno.test({
       "walk-map-value-off-rep": 2,
       "walk-map-key-i32": 0,
       "walk-map-key-off-rep": 2,
+      "walk-map-key-i64": 0,
+      "walk-map-key-width-mismatch": 2,
+      "walk-map-key-record": 2,
       "map-scalar-join-of-i32": 0,
       "map-scalar-join-of-string": 2,
       "asg-unwiden-wrap-of-i64": 0,
@@ -1815,6 +1818,10 @@ Deno.test({
       "asg-unwiden-non-null-of-record": 2,
       "map-print-of-i32": 0,
       "map-print-of-string": 2,
+      "null-of-plain": 0,
+      "null-of-place-with-read": 0,
+      "null-of-read-off-place": 2,
+      "null-of-place-without-read": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -1854,6 +1861,9 @@ Deno.test({
     // Each kind legacy's descriptor names alone maps to a type that describes back at that kind.
     const rd = exp.repDescSelfTest();
     if (rd !== 0) throw new Error(`want every descriptor kind to round-trip, got kind ${rd} off`);
+    // The map niche's kind lies above every box tag a list niche reads as its kind.
+    const nk = exp.nicheKindSelfTest();
+    if (nk !== 0) throw new Error(`want NICHE_NUL_MAP above every niche kind, got kind ${nk} at or above it`);
   },
 });
 
