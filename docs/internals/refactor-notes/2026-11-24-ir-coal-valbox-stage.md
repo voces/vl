@@ -38,9 +38,11 @@ Base 0319020c, both seeds fixpoints.
 Position sweep (Q58): each arm in 10 positions, written with an earlier effectful operand where
 the position has one: a direct argument at the arm's own type and at a wider union, a nested call
 argument, a string `+` operand, an interpolation hole, `return`, a `const` initializer, an `if`
-arm, a `??` operand and a record-literal field. All 20 are check-clean and give output identical
-to a claimless compiler on both seeds, and all are matched under mode 6. At base, 12 of the 20
-were refused at `coalesce box after an operand`. The templates
+arm, a `??` operand and a record-literal field
+(`tests/cases/null/coalesce-boxed-binding-positions-{wide,scalar}.vl`, one function per position).
+Both are check-clean and give output identical to a claimless compiler on both seeds. Under mode 6,
+head covers and matches all 80 functions; base leaves 6 uncovered at `coalesce box after an
+operand`. The templates
 `scripts/capability-probes/matrix/coalesce-boxed-binding-{wide,scalar}-default.matrix.vl` run in
 every graded position on both seeds (64 of 64, 46 of 46). Their 110 generated programs are
 identical to claimless, with no mode-6 fail.
