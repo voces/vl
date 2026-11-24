@@ -45,14 +45,14 @@ Swapping either expected rule (0 ↔ 3) reds the shadow suite.
 
 ## Readings
 
-Master 34f66267 → head, fixpoint seeds:
+Master 0319020c → head, fixpoint seeds:
 - ir-i8 census `pre-path dead never`: distilled 6 → 0 (d16261 named cells); tests/cases
-  4 → 0 functions.
-- IR shadow, functions covered, verified and matched: tests/cases 79,465 → 79,471 of 80,755; corpus
-  45,546 → 45,552 of 45,678.
-- tests/cases fully IR-only: 6,003 of 7,169 → 6,004 of 7,170 (the new trap case is one).
-- Identity: names, cases and claimless all show 0 differ.
-- L2 self-compile fuel: +0.48% on the base's own L2.
+  4 → 0 functions; no claimed function lost in any population.
+- IR shadow, functions covered, verified and matched: tests/cases 79,501 → 79,507 of 80,791; corpus
+  46,789 → 46,795 of 46,958.
+- Identity: names 9,433, cases 7,755 and claimless 14,453 identical, 0 differ; A/B 7,817 same.
+- L2 self-compile fuel: +0.29% on the base's own L2, the PR's source included; +0.105% for the
+  head seed compiling the base tree.
 
 One never instance per consumer kind is byte-identical on both seeds. Each writes `unreachable` in
 the value's place, and its consumer's code goes on:
@@ -62,6 +62,12 @@ the value's place, and its consumer's code goes on:
 - concat operand: `(call $__str_concat__ (global.get …) (unreachable))`.
 
 None writes a conversion after `unreachable`.
+
+The Q58 sweep (`tests/ir-shadow-rows/dead-never-positions*.vl`) reads the never value at each
+delivery position in a hole lambda's face and a null-bound type parameter's. Every claimed
+position matches and prints as claimless; `void return value` and `print nulNone` keep four
+null-bound positions; the sweep's `return` of a null-bound parameter found invalid wasm on
+master, fixed in its own express PR.
 
 ## Legacy tails the IR calls
 
