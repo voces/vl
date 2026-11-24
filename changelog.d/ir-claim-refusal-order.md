@@ -1,0 +1,3 @@
+## Infrastructure (Track F)
+
+- **An IR claim no longer changes which refusal a program sees (D17123):** a claim's build or lowering that meets a shared legacy helper's `emitFail` now declines instead of latching the refusal. Legacy writes the unit and raises its own refusal, or builds it. The hosts report the decline as the G3 event: legacy's refusal plus a note, or legacy's bytes plus a line, and rc 70 under `$VL_IR_STRICT=1`. A refusal outside any claim still latches. `$VL_TEST_CLAIM_REFUSAL=1|2` makes every claimed function or start refuse before or after its body, the fallback's control. This covers coordinator ruling (a), a claim refusing a program legacy builds (D4645's witness, measured with N5's decline reverted).
