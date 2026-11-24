@@ -1,6 +1,6 @@
 # IR coverage: a boxed binding's `??` argument after another argument (2026-11-24, lane IR-N11)
 
-`short-circuit argument after another` on master 0319020c: 7 functions, each the only blocker
+`short-circuit argument after another` on master 1db11290: 7 functions, each the only blocker
 of its program. One is in tests/cases (`places` in
 `numerics/coalesce-joins-runtime-numbers-apart`). Six are corpus cells,
 `named/nj2_co__*__std__op`. All of them are `filled(2, q ?? b)`: a `??` over a boxed binding,
@@ -24,16 +24,16 @@ arm only. This is the order `stageLead` already writes for the niche and nullabl
 
 ## Measured
 
-Base 0319020c, both seeds fixpoints.
+Base 1db11290 (D17091's fix included), both seeds fixpoints.
 
 - `short-circuit argument after another`: 7 → 0 (tests/cases 1 → 0, corpus 6 → 0). Before this
   change, the side-effect witnesses `show(two(), q ?? b)` and `s(two(), q ?? five())` were
   refused at `coalesce box after an operand`. They now match. That class has no tests/cases or
   corpus function at base, so it moves 0 → 0 in both populations.
-- IR-only census: 6032 → 6033 of 7174 tests/cases programs fully IR-only. The one function
+- IR-only census: 6098 → 6099 of 7191 tests/cases programs fully IR-only. The one function
   above is the only row of `functions.tsv` that moves.
-- Mode-4 corpus: `blockers none` 46789 → 46795 of 46958 functions. Starts covered/matched
-  9689/9689 on both seeds.
+- Mode-4 corpus: `blockers none` 46828 → 46834 of 46958 functions. Starts covered/matched
+  9690/9690 on both seeds.
 
 Position sweep (Q58): each arm in 10 positions, written with an earlier effectful operand where
 the position has one: a direct argument at the arm's own type and at a wider union, a nested call
@@ -51,8 +51,12 @@ This lane's first candidate made `scripts/silent-sweep/distilled/ir-shadow.vl` b
 through the staging arms' box head order. That defect was already on master for the niche arms.
 It shipped first as D17091's express fix (#9816), and this change is measured on top of it.
 
-Rows: `tests/ir-shadow-rows/coalesce-box-argument-after-a-call.vl`,
-`coalesce-box-scalar-argument-after-a-call.vl`, `coalesce-box-arguments-side-by-side.vl`.
+An element read whose receiver call stages a lead below such a `??` (`filled(2, q ?? b)[1]`)
+banks its row from the lead, as legacy's does. `receiverStmtLeads` (ir_build_ref.vl) now counts
+a staging `??` as it counts a valued `if`, so the row opens at the receiver's first statement.
+
+Rows: `tests/ir-shadow-rows/coalesce-box-argument-in-an-indexed-receiver.vl`,
+`coalesce-box-argument-after-a-call.vl`, `coalesce-box-scalar-argument-after-a-call.vl`, `coalesce-box-arguments-side-by-side.vl`.
 Neighbours already matched at base and still matched: the `??` argument first, then a plain
 one; `&&` and `||` after another argument.
 
