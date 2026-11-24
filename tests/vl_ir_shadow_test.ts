@@ -1739,6 +1739,8 @@ Deno.test({
       "identity-eq-of-i32": 2,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
+      "never-closure-call-value-at-consumer-rep": 0,
+      "returning-closure-call-temp-typed-never": 3,
       "never-field-read-at-its-storage": 0,
       "never-field-read-off-its-storage": 3,
       "walk-pair-map-value-record": 0,
@@ -3311,6 +3313,27 @@ Deno.test({
       }
     } finally {
       Deno.removeSync(tmp, { recursive: true });
+    }
+  },
+});
+
+// A capture of a record whose type has no heap of its own, stored at its environment row (legacy's
+// `captureValStructIdx`): the read takes that row's heap, so a binding of it at the row's record
+// builds; a `let` reassigned before the closure runs does too.
+const CAPTURE_ENV_HEAP: string[] = ["type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nfunction fr() {\n  const __c = mk2()\n  const __f = () => {\n    const v = __c\n    print(v.f ?? 8)\n  }\n  __f()\n}\nfr()\n", "type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nfunction fr() {\n  let __c = mk2()\n  __c = mk2()\n  const __f = () => {\n    const v = __c\n    print(v.f ?? 9)\n  }\n  __f()\n}\nfr()\n"];
+Deno.test({
+  name: "ir shadow: a heapless record capture takes its environment row's heap",
+  ignore,
+  fn: () => {
+    for (const src of CAPTURE_ENV_HEAP) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const miss = [...rows.keys()].filter((k) => k.includes("uncovered"));
+      if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want every function and the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
     }
   },
 });
