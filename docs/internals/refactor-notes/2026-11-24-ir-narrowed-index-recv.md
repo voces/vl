@@ -35,7 +35,8 @@ Base master `9fc46f2d1`, head this branch on it, both seeds fixpoints.
 - Class regrade over the 4 programs plus the new tests and row: base 15 `uncovered member record`
   and 3 `start uncovered member record`; head 150/150 functions and 9/9 starts matched.
 - Covered-fell: tests/cases fell 0, rose 8; corpus fell 0, rose 0.
-- Census, each arm in a tree at its own commit (#26): CENSUS.
+- Census, each arm in a tree at its own commit (#26): `member record` rows 21 → 15 (functions 11 → 8,
+  starts 10 → 7).
 - L2 self-compile fuel per PR −0.01% on `9fc46f2d1`; the pair (the head seed compiling the base
   tree) is +0.0007%.
 
