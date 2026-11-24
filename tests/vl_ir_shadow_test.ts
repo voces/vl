@@ -364,6 +364,25 @@ Deno.test({
   },
 });
 
+// The operand re-read's control: a union compare off its null leg marked as reading its operand
+// again (`irShadowCorrupt(8)`), which the verifier must refuse; the re-read is a null leg's alone.
+Deno.test({
+  name: "ir shadow: a union compare's operand read again off its null leg fails the verifier",
+  ignore,
+  fn: () => {
+    const src = `type U = i32 | string\nfunction f(u: U) { return u == "s" }\nprint(f("s"))\n`;
+    const ok = run(src, true);
+    if (failures(ok.rows).length > 0 || ok.rows.get("matched") !== 1) {
+      throw new Error(`want f matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 8);
+    const want = "operand is read again off a null leg";
+    if (!failures(rows).some((k) => k.includes(want))) {
+      throw new Error(`want a fail row naming "${want}", got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The file rows' controls: an unreadable directive is refused, and a row whose expectation the
 // compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
 Deno.test({
