@@ -27,6 +27,13 @@ Each value is read back through `m.get(k)` and its `r` printed. Under `VL_IR_SHA
 byte-identical under both seeds. The five nullable sources are the no-recover witnesses
 (`readOwesNonNullRecover`): their `ref.as_non_null` is the read's own, the same bytes on both sides.
 
+## Census (`scripts/ir-only-census-ab.sh`, base dbeb64c77)
+
+`map store value variant bare` 26 → 0 and `start: map store value variant bare` 3 → 0: the 16
+targets, the sweep's 10 and three module bodies (the sweep's, `narrowed-map-place-object-value` and
+`print-and-shared-read-of-an-in-place-coalesce`) are built. `for in map element` 12 → 13 is
+`arm-valued-map-values-forin` `cell`. Nothing else moved.
+
 ## Legacy tails the IR calls
 
 None.
