@@ -90,7 +90,13 @@ import { runWasm, VLRuntimeError } from "./runWasm.ts";
 import { needsModules } from "../../compiler/moduleGate.ts";
 import { isStdKey } from "../../lsp/src/editorText.ts";
 import { isDisplayableType } from "../../lsp/src/typeFeatures.ts";
-import { engineRefusal, invalidHeadline, needsClaimsOff, withClaimsOff } from "../../lsp/src/claimFallback.ts";
+import {
+  engineRefusal,
+  invalidHeadline,
+  needsClaimsOff,
+  softRefusals,
+  withClaimsOff,
+} from "../../lsp/src/claimFallback.ts";
 
 const CASES_DIR = new URL("../cases/", import.meta.url);
 const STD_DIR = new URL("../../std/", import.meta.url);
@@ -283,6 +289,15 @@ const driveCase = (
 ): { rc: number; diags: WasmDiag[]; bytes?: Uint8Array; redun: LintDiag[] } => {
   stageCase(exp, entryKey, src, isModule);
   let rc = emit ? exp.compileSrc() : exp.checkSrc();
+  // Strict, as a gate: a claim that declined on a shared legacy helper's refusal while legacy built
+  // the program is the claim's bug. Legacy's own refusal (rc 3) stands.
+  const soft = emit && rc === 0 ? softRefusals(exp) : [];
+  if (soft.length > 0) {
+    const [name, msg] = soft[0];
+    throw new Error(
+      `${entryKey}: inside \`${name}\`: ${msg}\nan IR claim refused, and the legacy emitter builds the program (strict)`,
+    );
+  }
   // A claimed module the engine refuses is compiled again with claims off (`claimFallback.ts`).
   // Strict, as every gate is: legacy's refusal stands, and legacy building it is the claim's bug.
   const claimed = emit && rc === 0 ? moduleBytes(exp) : undefined;
