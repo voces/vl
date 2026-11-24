@@ -13105,11 +13105,11 @@ refusal a program sees.
 
 **A named price is not a lost property.** #9841's arm-site operand built once ahead of the chain costs about two local operations per executed arm read, with run fuel unmeasured; the queue read it as a price within Q57, recorded in its refactor note, not a lost property.
 
-## A value `if` over an inferred-null hole is re-asked at the fill, and a different-type fill is refused (2026-11-24, coordinator ruling) — D17203
+## A function's value `if` over a module inferred-null binding is re-asked at the later top-level fill, and a fill of another type is refused (2026-11-24, coordinator ruling) — D17203
 
 **Ruled by the coordinator 2026-11-24**, on the merge queue's referral of lane IR-N4's D17203 pre-review.
 
-**What happens now.** `let m = null` binds an open hole, which a later write fills in place. A value `if` whose arm reads `m` while it is still the hole is noted with the join it was typed (`In | null`) and its destination. At the fill, `fillIfHoleNodes` re-derives the join from the filled arm:
+**What happens now.** A module-scope `let m = null` binds an open hole, which a later top-level write fills in place. A function's value `if` whose arm reads `m` while it is still the hole (a read across the function boundary is not flow-narrowed) is noted with the join it was typed (`In | null`) and its destination. At the fill, `fillIfHoleNodes` re-derives the join from the filled arm:
 - where the re-derived join fits the destination, or the join already typed, it is re-banked, so a same-type or narrower fill, and a declared destination that holds both, keep running;
 - else the checker refuses at the `if`: "this `if` was typed In | null — the assignment below makes the binding {w: string} | null, so the join is {w: string} | In | null; annotate the binding".
 
