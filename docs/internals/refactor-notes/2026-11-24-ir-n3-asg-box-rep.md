@@ -22,7 +22,7 @@ takes a narrowed box local: `RArmUnbox` over the box built by `exprAt`, its dest
 (`emitNarrowedArmUnboxTo`, now exported), as legacy's position does; a narrowed read keeps its arm
 record's cast.
 
-## Grading — the position matrix (both templates, fixpoint seeds on master 06b5d0806)
+## Grading — the position matrix (both templates, fixpoint seeds on master ec119adc0, each built in its own tree)
 
 `scripts/capability-probes/matrix/assignment-value-union-box-{global,local}-at-member.matrix.vl`,
 66 graded cells each (two_instances skipped), RUNS 66 of 66 before and after. Shadow mode 4 per cell:
@@ -35,7 +35,9 @@ record's cast.
 | 6 `map_*` | `map store value variant box` | unchanged — its own class (the narrowed-local twin misses the same) |
 | 6 `array_element*` | `array ref` | unchanged — its own class (the narrowed-local twin misses the same) |
 
-Mode 1 per cell: 138 of 138 covered functions matched in each template.
+Mode 1 per cell: covered and matched 92 → 138 (of 138) in each template, 0 mismatch, 0 fail. Q58: the
+134 kept cells are claimless-identical under both seeds (`ir-identity --claimless`, identical 134,
+differ 0); `capability-matrix.vl --before/--after` reads runs 66 of 66 in both, 0 runs → not-runs.
 
 tests/cases (mode 1): covered and matched 74,728 → 74,730; `uncovered global read coercion` 3 → 1
 (`closures/closure-store-struct-union-global`, `functions/return-assign-expression-global` now
@@ -44,3 +46,10 @@ covered, matched).
 ## Legacy tails the IR calls
 
 `emitNarrowedArmUnboxTo` (exported, unchanged): the site-heap unbox legacy's position writes.
+
+## Measured (fixpoint seeds on both sides)
+
+Full proof on base master ec119adc0: byte A/B 20,555 programs 0 moved; `ir-identity --cases`,
+`--claimless`, `--names` differ 0 / differ 0 / self-compile identical; mode 3 self byte-identical;
+corpus shadow 46,847 matched, 0 order rows; self-compile guest fuel 125,888,720,293 →
+125,920,525,950 (+0.03%).
