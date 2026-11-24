@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Fixed D17200 and D17201** (clause 2): a value `if` joining an inferred-null binding (`const n = null`) with a record now runs under `??` and when passed at a union-of-records parameter such as `A | B | null`, in either arm order. Both were loud emit refusals. The binding's arm has no rep of its own, so the join's row is read off its record arm, as for a `null` literal. At a union box the IR writes the binding's read as the bottom null, as it writes a `null` literal. Filed D17202: legacy alone (a claimless compiler) still refuses that argument shape for the `null` literal's spelling too; as shipped, the IR's claim runs it.
