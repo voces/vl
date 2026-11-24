@@ -17,6 +17,24 @@ and its consumer's code goes on.
   take its consumer's rep. A `never` local bound from it at `i32` is still refused (rule 3, its
   rep is not its type's).
 
+## Cost
+
+`deliver` and `exprAtPre` each asked `exprReadsDeadNever` of every expression. `exprAtPre` now
+reads the pre-path's answer, whose first check is the same walk; its two callers that pass no
+answer are inside `deliver`, past its own check, and the two past a coercion follow a `pre-path
+coercion` answer, which rules dead never out. L2 self-compile fuel, each head seed compiling the
+base tree (master 0319020c, base 124,879,107,582):
+
+| variant | L2 | vs base |
+|---|---:|---:|
+| a per-function flag (any name read as `never`), skipping both walks | 125,258,337,653 | +0.30% |
+| floor: the flag forced false, no walk | 124,909,771,072 | +0.025% |
+| V2, shipped: `exprAtPre` reads the pre-path; `deliver` walks | 125,010,122,654 | +0.105% |
+| V3: V2, `deliver` walking only off the expression's own rep | 125,245,433,179 | +0.29% |
+
+The flag's pass, a `nodeTyAt` per name over every function body, cost what it skipped, and
+`exprRepOf` costs more than the walk it would guard.
+
 ## Verifier
 
 Keyed self-tests:
