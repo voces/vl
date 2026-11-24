@@ -66,6 +66,7 @@ import {
   emitArrLenHeld,
   emitClosureValue,
   emitEqNonNullCore,
+  emitListGetViewSync,
   fcpBackingTail,
   fcpLenTail,
   fcpSpillTail,
@@ -82,6 +83,8 @@ import {
   listFitGrowLenClose,
   listFitGrowLenOpen,
   listFitGrowLenRowOf,
+  listGetStageEnter,
+  listGetStageRestore,
   listOpRecvHeld,
   listOpStageBase,
   loopHoistClose,
@@ -110,6 +113,7 @@ import {
   sliceRecvTail,
   stageListRecvTail,
   strAccAppendTail,
+  strBytesTail,
   strCatTail,
   strCpAtTail,
   strCpLenTail,
@@ -294,6 +298,12 @@ export function irLowerRefListSet(n: SListSet, at: i32): i32 {
 // `RListPop`: the receiver held or staged as for a push, then legacy's scalar or ref pop tail, at a
 // value position when `want`.
 function lowerPop(r: RListPop, want: boolean): i32 {
+  if r.lqIx.length > 0 {
+    const sv = listGetStageEnter(r.lqAt)
+    const got = lowerListGetCall(r, want)
+    listGetStageRestore(sv)
+    return got
+  }
   const fnIx = irLFn().irAt
   const pq = popAnyPlanOf(r.lqAt, fnIx)
   if pq == null { return irLMiss("pop plan") }
@@ -309,6 +319,44 @@ function lowerPop(r: RListPop, want: boolean): i32 {
   }
   // A statement drops what the tail left, as legacy's statement caller does.
   const got = if pq.pqElemRef { popRefTail(r.lqAt, lIdx, pq.pqWrap, pq.pqBack, -1, pq.pqRefSlot, fnIx) } else { popScalarTail(r.lqAt, pq.pqRecv, lIdx, pq.pqWrap, pq.pqBack, -1, want, fnIx) }
+  if got < 0 { return -1 }
+  if !want && got == 0 { fbDrop() }
+  return 0
+}
+
+// `RListPop` with an index, a `.get(i)`: the receiver as for a pop, the view sync, then legacy's
+// tail, which writes the index from the call; the index operand is consumed without being written.
+// The tail leaves `T | null` as at a value; a statement drops it.
+function lowerListGetCall(r: RListPop, want: boolean): i32 {
+  const fnIx = irLFn().irAt
+  const pq = popAnyPlanOf(r.lqAt, fnIx)
+  if pq == null { return irLMiss("get plan") }
+  const c = nodeAt(r.lqAt)
+  if !(c is Call) || c.callFn < 0 || c.callArgs.length != 1 {
+    return irLMiss("get call")
+  }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) { return irLMiss("get call") }
+  let lIdx = listOpRecvHeld(pq.pqRecv, fnIx, ".get")
+  if lIdx == -2 { return irLMiss("get receiver") }
+  if lIdx >= 0 {
+    irLSkip(r.lqV)
+  } else {
+    irLOpnd(r.lqV)
+    const sb = listOpStageBase(pq.pqBase, pq.pqRefSlot)
+    stageListRecvTail(pq.pqRecv, fnIx, sb)
+    lIdx = sb + 3
+  }
+  const ek = scalarListElemKind(callee.memObj, fnIx)
+  emitListGetViewSync(
+    lIdx,
+    if ek == "i32" { null } else { ek },
+    callee.memObj,
+    fnIx,
+  )
+  irLSkip(r.lqIx[0])
+  const gi = c.callArgs[0]
+  const got = if pq.pqElemRef { popRefTail(r.lqAt, lIdx, pq.pqWrap, pq.pqBack, gi, pq.pqRefSlot, fnIx) } else { popScalarTail(r.lqAt, pq.pqRecv, lIdx, pq.pqWrap, pq.pqBack, gi, true, fnIx) }
   if got < 0 { return -1 }
   if !want && got == 0 { fbDrop() }
   return 0
@@ -437,6 +485,7 @@ function lowerStr(r: RStrOp): i32 {
     "slice" => strSliceTail()
     "cplen" => strCpLenTail()
     "cpat" => strCpAtTail()
+    "bytes" => strBytesTail()
     "indexof" => strIndexOfTail(false)
     "includes" => strIndexOfTail(true)
     "lt" => if e is BinExpr { strOrderTail(e) } else { irLMiss("string operator node") }
