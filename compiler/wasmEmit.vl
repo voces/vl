@@ -10453,7 +10453,7 @@ function exprRecordArmsAt(exprIx: i32, fnIx: i32, heapIdx: i32): boolean {
 // `exprIx` is narrowed to `X | null`. Emitted after the value, so the box is already on the
 // stack. A negative `heapIdx` emits nothing: a destination whose table slot never resolved has
 // no cast target, and `ref.cast -1` would put a garbage heap index in the module.
-function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32, fnIx: i32) {
+export function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32, fnIx: i32) {
   if !armUnboxCastOwed(heapIdx, exprIx, fnIx) { return 0 }
   armSrcShadowNote(heapIdx, exprIx, fnIx)
   return emitArmUnboxCast(heapIdx, armUnboxNullable(exprIx, fnIx))
@@ -22189,35 +22189,8 @@ export function nulNicheEqNullTail(): i32 {
 function emitNulStructEq(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    // Asks the same two namespaces as the non-null dispatch, in the same order (niche rung
-    // first) — asking only the struct one is how the nullable half drifts out of the
-    // non-null half's capability. `siFound` is load-bearing, not decoration: an eq row is
-    // `>= 0` for a struct and `< 0` for a variant, so `-1` is variant row 0 and cannot double as "no answer".
-    let si = -1
-    let siFound = false
-    const nvi = binEqNulVariantRow(binIx, fnIx)
-    if nvi >= 0 {
-      si = eqRowOfVariant(nvi)
-      siFound = true
-    }
-    if !siFound {
-      const nsSi = structIndexOfExpr(e.binLeft, fnIx)
-      if nsSi >= 0 {
-        si = nsSi
-        siFound = true
-      }
-    }
-    if !siFound {
-      // One side nullable over a variant record, the other that record bare: one variant row.
-      const lnv = nulVariantIdxOfExpr(e.binLeft, fnIx)
-      const pv = if lnv >= 0 { lnv } else { nulVariantIdxOfExpr(e.binRight, fnIx) }
-      const bare = if lnv >= 0 { e.binRight } else { e.binLeft }
-      if pv >= 0 && eqConcreteVariantRow(bare, fnIx) == pv {
-        si = eqRowOfVariant(pv)
-        siFound = true
-      }
-    }
-    if !siFound {
+    const si = nulStructEqRowOf(binIx, fnIx)
+    if si == NUL_STRUCT_EQ_NO_ROW {
       return emitFail("emitProgram: struct equality over a non-struct operand")
     }
     const savedL = eqStashL
@@ -22230,10 +22203,47 @@ function emitNulStructEq(binIx: i32, fnIx: i32) {
   return emitFail("emitProgram: expected a nullable-struct equality")
 }
 
+// What `nulStructEqRowOf` answers where no namespace names a row: no eq row is this low.
+export const NUL_STRUCT_EQ_NO_ROW = -1000000
+
+// The eq row nullable-record compare `binIx` reads its fields through, or `NUL_STRUCT_EQ_NO_ROW`.
+// Legacy and the IR share it.
+export function nulStructEqRowOf(binIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(binIx)
+  if !(e is BinExpr) { return NUL_STRUCT_EQ_NO_ROW }
+  // Asks the same two namespaces as the non-null dispatch, in the same order (niche rung
+  // first) — asking only the struct one is how the nullable half drifts out of the
+  // non-null half's capability. An eq row is `>= 0` for a struct and `< 0` for a variant.
+  const nvi = binEqNulVariantRow(binIx, fnIx)
+  if nvi >= 0 { return eqRowOfVariant(nvi) }
+  const nsSi = structIndexOfExpr(e.binLeft, fnIx)
+  if nsSi >= 0 { return nsSi }
+  // One side nullable over a variant record, the other that record bare: one variant row.
+  const lnv = nulVariantIdxOfExpr(e.binLeft, fnIx)
+  const pv = if lnv >= 0 { lnv } else { nulVariantIdxOfExpr(e.binRight, fnIx) }
+  const bare = if lnv >= 0 { e.binRight } else { e.binLeft }
+  if pv >= 0 && eqConcreteVariantRow(bare, fnIx) == pv {
+    return eqRowOfVariant(pv)
+  }
+  return NUL_STRUCT_EQ_NO_ROW
+}
+
 // `emitNulStructEq`'s guard and compare at eq row `si`, over roots staged once (`structEqStage`).
 function emitNulStructEqAt(lIx: i32, rIx: i32, si: i32, fnIx: i32) {
   const roots = structEqStage(lIx, rIx, si, fnIx)
   if roots[0] == -1 { return -1 }
+  return nulStructEqGuardTail(lIx, rIx, roots, si, fnIx)
+}
+
+// After the roots of a nullable-record compare at eq row `si`: `0` where the sides disagree on
+// nullness, `1` where both are null, else the field-wise compare. Legacy and the IR share it.
+export function nulStructEqGuardTail(
+  lIx: i32,
+  rIx: i32,
+  roots: i32[],
+  si: i32,
+  fnIx: i32,
+) {
   const lRoot = roots[0]
   const rRoot = roots[1]
   fbBlock(127) // block i32 — $out
@@ -22258,6 +22268,13 @@ function emitNulStructEqAt(lIx: i32, rIx: i32, si: i32, fnIx: i32) {
     return -1
   }
   fbEnd()
+  return 0
+}
+
+// The stash slots `structEqEnter` saved, restored after a compare that is not `structEqTail`'s.
+export function structEqLeave(saved: i32[]) {
+  eqStashL = saved[0]
+  eqStashR = saved[1]
   return 0
 }
 
@@ -24183,9 +24200,13 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   if p.ijArm == "atom" {
     return if ifJoinDropsNulAtom(ifIx, fnIx, "atom") { "string drops null atom" } else { "" }
   }
+  const rk = p.ijRef.rjKind
+  // A join at a record's own row is legacy's reference join, a narrowed arm unboxed in its arm.
+  if p.ijArm == "ref" && rk != null && joinKindIsRecord(rk) {
+    return "ref " + rk
+  }
   // A union join with no render name takes a later rung in legacy; the IR lowers no union join.
   if exprUnion(ifIx, fnIx) { return "union" }
-  const rk = p.ijRef.rjKind
   if rk != null { return "ref " + rk }
   if ifJoinDropsNulAtom(ifIx, fnIx, "scalar") {
     return "string drops null atom"
@@ -29011,8 +29032,8 @@ export type PrintArm = "nulNone"
 // The arm `print` takes for argument `argIx` in function `fnIx`, in `emitCallCorePrint`'s order.
 export function printArmOf(argIx: i32, fnIx: i32): PrintArm {
   // The `null` type has no arm to select, and every classifier below reads a rep this value
-  // lacks (D1576).
-  if exprIsNulNone(argIx, fnIx) { return "nulNone" }
+  // lacks (D1576); an assignment of `null` yields that unit, not the cell's null (D17118).
+  if boxOperandIsNulNone(argIx, fnIx) { return "nulNone" }
   // A bare `null` literal names no cell for that classifier to read (D17093).
   const pnLit = unwrapParen(argIx)
   if pnLit >= 0 && pnLit < P.nodes.length && nodeAt(pnLit) is NullLit {
@@ -41678,7 +41699,7 @@ export function nullReadDstOwnOf(exprIx: i32, fnIx: i32): i32 {
   if dt is TyNullable {
     if dt.nInner < 0 { return -1 }
   }
-  if dk == "union" { return NULL_OWN_BOX }
+  if dk == "union" { return -1 }
   return nullOwnOfTy(dst)
 }
 
@@ -44049,7 +44070,8 @@ function emitDirectArgValue(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
 function emitDirectArgUnbox(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
   const cVi = sd.cVi
   if cVi >= 0 {
-    if exprUnion(arg, fnIx) {
+    // An `if` joined at a record's row unboxes each arm itself, so its value is no box (D17115).
+    if exprUnion(arg, fnIx) && !ifJoinsAtRecord(arg, fnIx) {
       if variantHasCrossTagFits(cVi, arg, fnIx) {
         return emitFailCrossTagDelivery(arg, cVi)
       }

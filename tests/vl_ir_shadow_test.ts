@@ -1680,6 +1680,8 @@ Deno.test({
       "arm-unbox-of-i32": 2,
       "record-arms-unbox-at-its-record": 0,
       "record-arms-unbox-at-another-record": 2,
+      "asg-arm-unbox-at-its-record": 0,
+      "asg-arm-unbox-without-dest": 2,
       "box-list-retag-into-i32-list": 2,
       "list-of-lists-retag-into-nullable-lists": 0,
       "list-of-lists-retag-into-other-lists": 2,
@@ -1696,6 +1698,9 @@ Deno.test({
       "record-retag-field-other-valtype": 2,
       "record-retag-two-noted-heaps": 2,
       "record-retag-one-noted-heap": 0,
+      "value-retag-built-heap": 0,
+      "value-retag-other-heap": 2,
+      "value-retag-field-other-valtype": 2,
       "width-retag-noted-leading": 0,
       "width-retag-field-not-leading": 2,
       "width-retag-pair-unnoted": 2,
@@ -1745,6 +1750,8 @@ Deno.test({
       "coal-atom-str-default-off-rep": 2,
       "atom-decode-nullable-into-string": 2,
       "atom-decode-nullable-into-nullable-string": 0,
+      "nullable-records-compared-nullable": 0,
+      "plain-records-compared-nullable": 2,
       "captured-atom-param-decoded-at-string": 0,
       "captured-atom-param-typed-as-string": 3,
       "opt-read-of-i32": 2,
@@ -1801,6 +1808,11 @@ Deno.test({
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
+    // An arm unbox routes on its `uaAsg` flag, never on its read's node kind: a record arms unbox over an
+    // assignment node still takes the record arms cast.
+    if (exp.irArmUnboxRouteSelfTest(0) !== 1) throw new Error("want a record arms unbox over an assignment node routed recordArms");
+    if (exp.irArmUnboxRouteSelfTest(1) !== 1) throw new Error("want an uaAsg unbox routed asg");
+    if (exp.irArmUnboxRouteSelfTest(2) !== 1) throw new Error("want an unbox naming no destination routed arm");
     // A staged root reads above a run of roots on the stack, never above a value that is no root
     // (`rootsFloor`, D17089): the floor cannot hide a real order violation.
     for (const [k, want, what] of [[0, 1, "above a run of roots"], [1, 0, "above a non-root"], [2, 0, "above a non-root over a root"]] as const) {
@@ -2724,8 +2736,8 @@ print(nullable(null))
 // A map store whose value is a short-circuit (a valued `if`): legacy writes the receiver and key,
 // then the value. A global receiver (staged as its read), a local and a parameter, with a
 // variable, a call-result or a literal key, are staged below the `if`, covered and matched; so are
-// values that run a map op of the same or of another shape. A boxed `??` value stays legacy's, by
-// name.
+// values that run a map op of the same or of another shape, and a boxed binding's `??`, whose tag
+// test the staged leads sit below (`coalArmStagesLeads`).
 Deno.test({
   name: "ir shadow: a map store of a short-circuit value stages its receiver and key below the if",
   ignore,
@@ -2762,11 +2774,8 @@ print(gi["k"] ?? 0)
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
-      throw new Error(`want key, glob, loc, par, other and lit covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if (rows.get("uncovered map store short-circuit operand") !== 1) {
-      throw new Error(`want boxed left to legacy by name, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 7 || rows.get("covered") !== 7) {
+      throw new Error(`want key, glob, loc, par, other, boxed and lit covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
