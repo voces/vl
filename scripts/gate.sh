@@ -151,6 +151,7 @@ row_mem() {
     "dead-export budget"|"render-parse budget") echo 600 ;;
     "late demands") echo 500 ;;
     "self ir misses") echo 1600 ;;
+    "ir claim refusals"|"ir claim cross") echo 4400 ;;
     "lsp typecheck"|"inventory refs") echo 400 ;;
     *) echo 200 ;;
   esac
@@ -419,6 +420,10 @@ run "ir claims"                "$VL" run scripts/silent-sweep/distilled/ir-shado
 # cases, tests/ir-claim-fallback, the emit_reject witnesses) is refused alike with claims on and
 # off, strict, held at 0 differs (coordinator ruling 2026-11-24). About 57 CPU-s.
 run "ir claim refusals"        "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop refusals --out "$LOGS/ir-claim-refusals.tsv"
+# The invariant G3 exists for: a shipped build is never invalid, refused or running otherwise where
+# the claimless build builds and runs clean (coordinator ruling 2026-11-24). Every capability probe
+# and IR pin, and a fixed 1-in-12 of tests/cases. About 135 CPU-s in the gate.
+run "ir claim cross"           "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop cases,probes,pins --sample 12 --cross --out "$LOGS/ir-claim-cross.tsv"
 
 # THE OOM WATCH. A kill the kernel made during the run fails the gate, whatever the rows read:
 # a test that expected a failure, or a grader that reads a refusal, takes a killed child for one.

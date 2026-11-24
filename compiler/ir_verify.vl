@@ -20,6 +20,7 @@ import {
   RArmUnbox,
   RAsTail,
   RAsUnion,
+  RAsgUnwiden,
   RAtomEq,
   RAtomSole,
   RAtomStr,
@@ -262,6 +263,23 @@ export function numKindOf(r: i32): i32 {
     "f32" => 5
     "bool" | "str" | "u8" | "null" | "v128" => -1
   }
+}
+
+// Whether opcode `op` narrows a value of rep `src` to rep `dst`: `i32.wrap_i64`, `i32.trunc_f64_s`
+// or `i32.trunc_f32_s` into an i32, `f32.demote_f64` into an f32, or `ref.as_non_null` of a
+// nullable reference into that reference.
+function unwidenAgrees(op: i32, src: i32, dst: i32): boolean {
+  const s = numKindOf(src)
+  const d = numKindOf(dst)
+  if op == 167 { return s == 3 && d == 1 }
+  if op == 170 { return s == 4 && d == 1 }
+  if op == 168 { return s == 5 && d == 1 }
+  if op == 182 { return s == 4 && d == 5 }
+  if op == 212 {
+    const sn = repNodeAt(src)
+    return sn is RNullable && sn.rnInner == dst
+  }
+  return false
 }
 
 function opRep(o: Opnd): i32 {
@@ -1061,7 +1079,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RNullOf => {
       const d = repNodeAt(dst)
-      const own = irFactIntOf(vf, at, 2)
+      const fact = irFactIntOf(vf, at, 2)
+      const own = fact % 3
+      // A null-unit place read's null carries the read, written for its effect where it is read.
+      if r.nuRead.length > 1 || (r.nuRead.length == 1) != (fact >= 3) {
+        return fail(
+          2,
+          at,
+          "a null-unit place read's null does not carry exactly its read",
+        )
+      }
       if own == 1 {
         if !(d is RBox) && !(d is RNullable && d.rnDisc == 4) {
           return fail(2, at, "a null box is not delivered into a union box")
@@ -1256,6 +1283,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       // A type parameter's `as?` boxes the scalar its plain cast yields into a value union's box.
       if !repIsScalar(opRep(r.hxV)) || dst >= 0 && !boxShaped(dst) {
         return fail(2, at, "a type parameter's cast box is no box of a scalar")
+      }
+      0
+    }
+    RAsgUnwiden => {
+      use(r.uwV, at)
+      if !unwidenAgrees(r.uwOp, opRep(r.uwV), dst) {
+        return fail(
+          2,
+          at,
+          "an assignment's unwidening is not its operand's narrowing to its result",
+        )
       }
       0
     }
@@ -3025,6 +3063,7 @@ function rhsReadsList(r: Rhs): boolean {
       RArmUnbox |
       RAsTail |
       RAsUnion |
+      RAsgUnwiden |
       RAtomEq |
       RAtomSole |
       RAtomStr |
@@ -3195,6 +3234,42 @@ function stagePairsWhy(f: IrFn): string {
   return ""
 }
 
+// Why a box whose head the lowering writes ahead of a dispatch (`irBoxLeadFirst`) does not directly
+// follow that dispatch's nodes in one body, or "": a node between would land above the head.
+function boxLeadsWhy(f: IrFn): string {
+  const bodies: i32[][] = [f.irBody]
+  const pos: i32[] = [0]
+  let found = 0
+  while bodies.length > 0 {
+    const top = bodies.length - 1
+    const body = bodies[top]
+    const i = pos[top]
+    if i >= body.length {
+      bodies.pop()
+      pos.pop()
+      continue
+    }
+    pos[top] = i + 1
+    const id = body[i]
+    let k = 0
+    while k < f.irBoxLeadBox.length {
+      if f.irBoxLeadBox[k] == id {
+        const n = f.irBoxLeadN[k]
+        if n < 1 || i < n || body[i - n] != f.irBoxLeadFirst[k] {
+          return "node "
+            + i32ToStr(id)
+            + ": a led box does not directly follow its dispatch"
+        }
+        found = found + 1
+      }
+      k = k + 1
+    }
+    irPushBodies(f, id, bodies, pos)
+  }
+  if found != f.irBoxLeadBox.length { return "a led box no body holds" }
+  return ""
+}
+
 // The bounds rule, installed with the list builder; it answers "" or what broke, naming the node.
 // Whether a map get of value rep `val` may deliver into `dst`: the value itself, or it nullable.
 function mapGetDstOk(val: i32, dst: i32): boolean {
@@ -3351,6 +3426,10 @@ export function irVerify(f: IrFn): IrVerdict {
   if vfRule == 0 && vfStaged {
     const sp = stagePairsWhy(f)
     if sp != "" { fail(10, -1, sp) }
+  }
+  if vfRule == 0 && f.irBoxLeadBox.length > 0 {
+    const bl = boxLeadsWhy(f)
+    if bl != "" { fail(10, -1, bl) }
   }
   if vfRule == 0 && vfSetAt.length > 0 {
     fail(2, -1, "a stash set no record reads")
