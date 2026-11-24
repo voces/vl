@@ -88,12 +88,15 @@ timed_out() {
 # it; `<module>` names everything outside the function bodies.
 BASELINE=${IR_DIVERGENCE_BASELINE:-scripts/ir-divergence-baseline.txt}
 WASM_DIS=${WASM_DIS:-$PWD/node_modules/.bin/wasm-dis}
-# A listed divergence is read through the disassembler; without it each would read as a differ.
-if grep -q '^[^#]' "$BASELINE" 2>/dev/null && [ ! -x "$WASM_DIS" ]; then
-  echo "ir-identity: $WASM_DIS is not executable, so no listed divergence can be read;" >&2
+# A listed divergence is read through the disassembler; without it the byte differ of a listed
+# program would read as a plain differ, so the run stops at the first one instead.
+need_dis() {
+  [ -x "$WASM_DIS" ] && return 0
+  [ -f "$BASELINE" ] && awk -F '\t' -v f="$1" '$1 == f { hit = 1 } END { exit !hit }' "$BASELINE" || return 0
+  echo "ir-identity: $WASM_DIS is not executable, so the listed divergence of $1 cannot be read;" >&2
   echo "  link the main checkout's node_modules into this tree, or set \$WASM_DIS" >&2
   exit 2
-fi
+}
 
 # Each function of wasm $1 on one line, `name\tbody`, and `<module>\trest`, sorted by name.
 fn_lines() {
@@ -151,7 +154,7 @@ compare_all() {
       diff=$((diff + 1)); echo "DIFF $f (first error: $(cat "$2/$k.err") vs $(cat "$3/$k.err"))"
     elif [ "$ra" != 0 ]; then both=$((both + 1))
     elif cmp -s "$2/$k.wasm" "$3/$k.wasm"; then same=$((same + 1))
-    elif why=$(expected_divergence "$f" "$2/$k.wasm" "$3/$k.wasm"); then
+    elif need_dis "$f" && why=$(expected_divergence "$f" "$2/$k.wasm" "$3/$k.wasm"); then
       expd=$((expd + 1)); echo "expected divergence $f ($why)"
     else diff=$((diff + 1)); echo "DIFF $f${why:+ ($why)}"; fi
   done < "$1"

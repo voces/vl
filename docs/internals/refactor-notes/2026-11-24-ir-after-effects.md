@@ -35,7 +35,7 @@ read the call trace for `n() ?? g()`, a compare's left, a call receiver, a tail 
 a global initializer. `u?.tags ?? g()` is a loud emit reject on master, filed as D17422 and out of
 this change.
 
-## The same walk at a `null` cell's store (D17220; unfiled: D17220)
+## The same walk at a `null` cell's store (D17220)
 
 An assignment into a `null` cell is written by legacy's `nulnone` store (the local arm and D1576's
 global twin) as `emitNulNoneForEffect(rhs)` and then `ref.null none`. The IR's `assignToGo`

@@ -6376,16 +6376,12 @@ export function irBStageLeads(
   // A receiver stage, and a `??` along an arm that stages nothing, is written in place, below
   // which the lowering stages nothing. A literal's order stash sets its fields below them.
   if listStageFrom(b, at) || coalBoxFrom(b, at, false) { return false }
-  // A store the operand makes (an assignment as its value) is a statement, which the lowering
-  // writes above an earlier operand read at its use, so that read would see the stored value;
-  // an earlier temp cannot wait across it either.
-  if storeFrom(b, at) {
-    irBMiss("store after an operand")
-    return false
-  }
+  // A store the operand makes (an assignment as its value) is a statement: an earlier operand
+  // read at its use would see the stored value, so it is staged below the store, as below an `if`.
+  const store = storeFrom(b, at)
   const coal = coalBoxFrom(b, at, true)
   const stash = stashSetFrom(b, at)
-  if !valuedIfFrom(b, at) && !coal && !stash || opndsAreTemps(args) {
+  if !valuedIfFrom(b, at) && !coal && !stash && !store || opndsAreTemps(args) {
     return true
   }
   let j = 0
@@ -6557,17 +6553,14 @@ function valuedIfFrom(b: i32[], at: i32): boolean {
 }
 
 // `ifBelowLead` for a node whose operands `leads`, written before those from `at`, are all
-// temps the lowering stages below the `if` (`opndsAreTemps`): then no miss, unless the later
-// operands store, which no earlier temp can wait across.
+// temps the lowering stages below the `if` or a store (`opndsAreTemps`): then no miss.
 export function ifBelowLeadOf(
   b: i32[],
   at: i32,
   why: string,
   leads: Opnd[],
 ): boolean {
-  if opndsAreTemps(leads) && !inPlaceUnstagedFrom(b, at) && !storeFrom(b, at) {
-    return false
-  }
+  if opndsAreTemps(leads) && !inPlaceUnstagedFrom(b, at) { return false }
   return ifBelowLead(b, at, why)
 }
 
@@ -7087,6 +7080,13 @@ function isPrintStmt(c: Call): boolean {
 function printStmt(b: i32[], c: Call, ix: i32) {
   const arm = printArmOf(c.callArgs[0], ibFnIx)
   if arm == "mapScalar" { return printMapScalar(b, c.callArgs[0], ix) }
+  // A `null`-typed argument runs for its effect, then the word `null` (`emitNulNoneForEffect`).
+  if arm == "nulNone" {
+    const e = nulNoneEffect(b, c.callArgs[0], ix, null)
+    if ibMiss != "" { return 0 }
+    irBNode(b, { efRhs: { pnV: e, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+    return 0
+  }
   const want = printArmRep(arm)
   if want == "" { return skip("print " + arm) }
   // A `K | null` read out of a wider box converts to the niche first, which the IR does not build.
@@ -9424,6 +9424,20 @@ function atomOperand(ix: i32): boolean {
   return repNodeAt(r) is RAtom || atomNullable(r)
 }
 
+// A `==`/`!=` over two `null`-typed sides, as legacy's `emitNulNoneEq` writes it: each side for
+// its effect, left then right, where the answer is read, then the constant; a bare `null` or a
+// name read runs nothing.
+function nulNonePairEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const effs: Opnd[] = []
+  const le = nulNoneEffect(b, n.binLeft, ix, effs)
+  if ibMiss != "" { return le }
+  const re = nulNoneEffect(b, n.binRight, ix, effs)
+  if ibMiss != "" { return re }
+  const eq: Opnd = { oiRep: rep, oiBits: if n.binOp == "==" { 1 } else { 0 } }
+  if effs.length == 0 { return eq }
+  return irBLetTemp(b, { aeEff: effs, aeV: eq, aeAt: ix }, ix, rep)
+}
+
 // A `==`/`!=` against a `null` literal, by legacy's own route: a dead test, or a `null`-typed
 // pair (`nulNoneEqSides`), is its constant; then the null test's arm (`nulTestArmOf`) with the
 // direction the dispatch hands it. Built: a niche's compare, a nullable ref's or string's typed
@@ -9438,13 +9452,9 @@ function nulTest(
   const dn = deadNullTestOperand(n, ibFnIx)
   if dn >= 0 { return deadNulTest(b, n, dn, ix, rep) }
   // A `null`-typed pair is legacy's constant (`emitNulNoneEq`): each side runs for its effect,
-  // which a bare `null` or a name read has none of (`nulNoneWritesNothing`).
+  // left then right, where the answer is read, and a bare `null` or a name read runs nothing.
   if nulNoneEqSides(n.binLeft, n.binRight, ibFnIx) {
-    if !nulNoneWritesNothing(n.binLeft) || !nulNoneWritesNothing(n.binRight) {
-      return irBMiss("null test of null")
-    }
-    const eq: Opnd = { oiRep: rep, oiBits: if n.binOp == "==" { 1 } else { 0 } }
-    return eq
+    return nulNonePairEq(b, n, ix, rep)
   }
   const arm = nulTestArmOf(bt.bnRef, ibFnIx, bt.bnInvert, false)
   if arm == "mapHas" { return nulTestMapHas(b, bt, ix, rep) }
@@ -12130,6 +12140,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       // Guard: legacy's route and the IR's disagree; miss rather than ship the operator's bytes.
       return irBMiss("scalar map compare route")
     }
+    if (
+      (n.binOp == "==" || n.binOp == "!=")
+      && nulNoneEqSides(n.binLeft, n.binRight, ibFnIx)
+      && eqRouteOf(n, ix, ibFnIx) == "nulNone"
+    ) {
+      return nulNonePairEq(b, n, ix, rep)
+    }
     const p = binPrimOp(n.binOp, opUnsigned(n.binLeft))
     if p == null || n.binIdent != 0 { return irBMiss("operator " + n.binOp) }
     // Legacy strength-reduces a masked shift (`shiftMaskFoldOf`) at an integer width.
@@ -12703,10 +12720,6 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !(t is Ident || t is Member || t is Index) {
     return irBMiss("assignment value target")
   }
-  // The store is a statement, so no temp an operand before it built may wait across it.
-  if uw >= 0 && endsInTemp(b) {
-    return irBMiss("assignment value unwiden after an operand")
-  }
   assignTo(b, n, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
   const m = asgReReadEnter(ix)
@@ -12740,8 +12753,6 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // An assignment of `null` the checker types `null` (`asgValueArmOf` "nullLit"): the store, then
 // the null its destination holds, as `emitAsgValueOf` writes it.
 function assignValueNullLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
-  // The store is a statement, so no temp an operand before it built may wait across it.
-  if endsInTemp(b) { return irBMiss("assignment value lit after an operand") }
   assignTo(b, n, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
   // The null is the assignment's own (`emitNullAt` at the assignment), not the cell's (D17090).
@@ -12780,8 +12791,6 @@ function globalTarget(ix: i32): boolean {
 // An assignment whose value is its right side's number literal (`asgValueArmOf` "lit"): the
 // store, then that literal built again at the assignment's rep, as `emitAsgLitAs` writes it.
 function assignValueLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
-  // The store is a statement, so no temp an operand before it built may wait across it.
-  if endsInTemp(b) { return irBMiss("assignment value lit after an operand") }
   assignTo(b, n, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
   return signedLitAt(unwrapParen(n.binRight), rep)
