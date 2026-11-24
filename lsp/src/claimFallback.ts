@@ -132,3 +132,30 @@ export const refusedNote = (headline: string): string =>
 
 /** The warning beside legacy's bytes, as the native host words it. */
 export const fellBackLine = (headline: string): string => `${headline}: ${FELL_BACK}`;
+
+/** Each claimed unit whose build or lowering met a shared legacy helper's refusal, and so declined
+ * in the guest (legacy wrote the unit): `[name, message]` from its `… a legacy helper refused in
+ * `name`: message` rows, which the guest counts even unarmed. */
+export const softRefusals = (exp: ClaimExports): Array<[string, string]> => {
+  const { irShadowRowCount: count, irShadowRowLen: len, irShadowRowAt: at } = exp;
+  if (count === undefined || len === undefined || at === undefined) return [];
+  const MARK = "a legacy helper refused in `";
+  const out: Array<[string, string]> = [];
+  for (let i = 0; i < count(); i++) {
+    const row = guestStr(len(i), (j) => at(i, j));
+    const k = row.indexOf(MARK);
+    if (k < 0) continue;
+    const rest = row.slice(k + MARK.length);
+    const sep = rest.indexOf("`: ");
+    if (sep >= 0) out.push([rest.slice(0, sep), rest.slice(sep + 3).split("\n")[0]]);
+  }
+  return out;
+};
+
+/** The note beside legacy's refusal when such a claim declined, as the native host words it. */
+export const softNote = (name: string, msg: string): string =>
+  `an IR claim refused inside \`${name}\` (${msg}); legacy's emitter refuses the program`;
+
+/** The line beside legacy's bytes when such a claim declined and legacy built the unit. */
+export const softFellBack = (name: string, msg: string): string =>
+  `inside \`${name}\`: ${msg}: IR claim refused; used the legacy emitter`;
