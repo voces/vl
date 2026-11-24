@@ -25,6 +25,7 @@ import {
   RRecord,
   RUnsup,
   RpPrim,
+  askRecordHeap,
   repNodeAt,
   repNodeKids,
   repRecordFieldNames,
@@ -426,8 +427,9 @@ export type RTagStash = { tgsV: Opnd }
 // The kept set id is member id `tgiId` (`tagIsTail`).
 export type RTagIs = { tgiId: i32 }
 // `leV`, a list, tested empty at every depth down to the arm `is` test `leAt` names, as legacy's
-// `emitListEmptyLoop` walks it (`emptyFitPlanOf`): a bool.
-export type RListEmpty = { leV: Opnd, leAt: i32 }
+// `emitListEmptyLoop` walks it (`emptyFitPlanOf`): a bool. A `shadow` arm's test first stores
+// the arm's empty `K[]` in variable `leFit` (`listFitShadowSet`), which the region reads; else -1.
+export type RListEmpty = { leV: Opnd, leAt: i32, leFit: i32 }
 // Box variable `lfV` tested at each list arm of `is` test `lfAt` whose elements never meet the
 // tested type (`emptyFitArmsPlanOf`): the arm's tag, then its list's emptiness, or'd: a bool.
 export type RListEmptyArms = { lfV: Opnd, lfAt: i32 }
@@ -550,6 +552,9 @@ export type RFnId = { fiMember: i32 }
 // The interned id of the one member of a literal place at node `asAt`, written for it by legacy's
 // atom hook (`strToAtomArmOf`'s `sole`); the place is not read.
 export type RAtomSole = { asAt: i32 }
+// Legacy's `nullty` null test (`emitDeadNullTest`): operand `dnV` built for its effect and dropped,
+// then the test's constant `dnBits`, in the operand's place.
+export type RDeadNullTest = { dnV: Opnd, dnBits: i64 }
 // Legacy's atom tower over a literal place at node `saAt` (`strToAtomArmOf`'s `chain`): each
 // member's id, then the place's string read `saReads[i]` tested against member `i`, last first.
 export type RStrToAtom = { saReads: Opnd[], saAt: i32 }
@@ -620,6 +625,7 @@ export type Rhs = RArmSite
   | RCoalAtomStr
   | RCoalStr
   | RCoerce
+  | RDeadNullTest
   | REnvDrop
   | REnvGet
   | REqHelp
@@ -1163,7 +1169,17 @@ export function irCloFieldRetagNote(f: IrFn, id: i32) {
 
 // Notes record rep `r` stored at heap `h`, once.
 export function irRecHeapNote(f: IrFn, r: i32, h: i32) {
-  if (f.irRecHeap[r] ?? -1) < 0 { f.irRecHeap[r] = h }
+  if (f.irRecHeap[r] ?? -1) == -1 { f.irRecHeap[r] = h }
+  return 0
+}
+
+// Notes heap `h` for rep `r` as one source's answer: a second answer that differs leaves `r` with
+// no heap (-2), which no later note fills.
+export function irRecHeapNoteOne(f: IrFn, r: i32, h: i32) {
+  if h < 0 { return 0 }
+  const cur = f.irRecHeap[r] ?? -1
+  if cur == -1 { f.irRecHeap[r] = h }
+  else if cur != h { f.irRecHeap[r] = -2 }
   return 0
 }
 
@@ -1282,6 +1298,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RCoalAtomStr |
       RCoalStr |
       RCoerce |
+      RDeadNullTest |
       REnvDrop |
       REnvGet |
       REqHelp |
@@ -1705,6 +1722,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMakeClo => r.mcEnv
     RFnId => []
     RAtomSole => []
+    RDeadNullTest => [r.dnV]
     RAtomWide => [r.awV]
     RStrToAtom => r.saReads
     RStrToAtomStaged => [r.zsV]
@@ -1872,6 +1890,10 @@ function rhsText(r: Rhs): string {
     RMakeClo => "closure f" + i32ToStr(r.mcFn) + "(" + opndsText(r.mcEnv) + ")"
     RFnId => "fn_id " + i32ToStr(r.fiMember)
     RAtomSole => "atom_sole @" + i32ToStr(r.asAt)
+    RDeadNullTest => "dead_null_test("
+      + opndText(r.dnV)
+      + ") "
+      + (if r.dnBits == 1 { "true" } else { "false" })
     RAtomWide => "atom_wide(" + opndText(r.awV) + ")"
     RStrToAtom => "str_to_atom(" + opndsText(r.saReads) + ")"
     RStrToAtomStaged => "str_to_atom_staged(" + opndText(r.zsV) + ")"
@@ -2138,6 +2160,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RClosureEq |
       RCoalAtomStr |
       RCoalStr |
+      RDeadNullTest |
       REqHelp |
       RHoleOptBox |
       RJoinNull |
@@ -2549,11 +2572,60 @@ export function recRowRetag(src: i32, dst: i32, hs: {[i32]: i32}): boolean {
   ) {
     return false
   }
-  const h = recHeapOf(src)
-  if h < 0 || h != recHeapOf(dst) { return false }
+  const h = heapNotedOr(hs, src)
+  if h < 0 || h != heapNotedOr(hs, dst) { return false }
   recHeapsNote(hs, src)
   recHeapsNote(hs, dst)
-  return repsLowerAlike(src, dst, hs)
+  return repsLowerAlike(src, dst, hs) || recFieldsWiden(src, dst, hs)
+}
+
+// Rep `r`'s heap as noted in `hs`, else its own (`recHeapOf`); -1 for none or a conflicting note.
+function heapNotedOr(hs: {[i32]: i32}, r: i32): i32 {
+  const n = hs[r] ?? -1
+  if n != -1 { return n }
+  return recHeapOf(r)
+}
+
+// Whether plain record rep `src` stands at plain record rep `dst`, both noted in `hs` at one heap,
+// as a narrower view: each field lowers alike, or goes into a nullable field of `dst` as that field's
+// inner rep or as `null`. The ref is the same; the row stores the nullable field.
+export function recFieldsWiden(src: i32, dst: i32, hs: {[i32]: i32}): boolean {
+  const x = repNodeAt(src)
+  const y = repNodeAt(dst)
+  if !(x is RRecord) || !(y is RRecord) || x.rrVariant || y.rrVariant {
+    return false
+  }
+  const h = hs[src] ?? -1
+  if h < 0 || h != (hs[dst] ?? -1) { return false }
+  const nb = repRecordFieldNames(dst)
+  if (
+    repRecordFieldNames(src).length != nb.length
+    || x.rrFields.length != y.rrFields.length
+  ) {
+    return false
+  }
+  let j = 0
+  while j < nb.length && j < y.rrFields.length {
+    const i = repRecordKidOf(src, repTyOf(src), nb[j])
+    if (
+      i < 0
+      || i >= x.rrFields.length
+      || !fieldWidens(x.rrFields[i], y.rrFields[j], hs)
+    ) {
+      return false
+    }
+    j = j + 1
+  }
+  return true
+}
+
+// Whether field rep `a` is stored as field rep `b`: alike, or `b` nullable over `a` or `a` `null`.
+function fieldWidens(a: i32, b: i32, hs: {[i32]: i32}): boolean {
+  if repsLowerAlike(a, b, hs) { return true }
+  const y = repNodeAt(b)
+  if !(y is RNullable) { return false }
+  const x = repNodeAt(a)
+  return repsLowerAlike(a, y.rnInner, hs) || x is RPrim && x.rpK == "null"
 }
 
 // Whether a plain record at rep `src` stands at plain rep `dst` as it is, by width, as the builder
@@ -2670,7 +2742,7 @@ export function recHeapsNote(hs: {[i32]: i32}, r: i32) {
     const t = todo.pop() ?? -1
     if t < 0 || (seen[t] ?? false) { continue }
     seen[t] = true
-    if repNodeAt(t) is RRecord { hs[t] = recHeapOf(t) }
+    if repNodeAt(t) is RRecord && (hs[t] ?? -1) == -1 { hs[t] = recHeapOf(t) }
     for k in repNodeKids(t) { todo.push(k) }
   }
   return 0
@@ -2761,10 +2833,14 @@ function fieldsLowerAlike(
   return true
 }
 
-// The struct heap a value of record rep `r` is stored at (`recordHeapOfTy` of its type), or -1.
+// The struct heap a value of record rep `r` is stored at: its type's own (`recordHeapOfTy`), else
+// the heap of the row legacy stores it at, asked so it is recorded (`askRecordHeap`); -1 for none.
 export function recHeapOf(r: i32): i32 {
   if !(repNodeAt(r) is RRecord) { return -1 }
-  return recordHeapOfTy(repTyOf(r))
+  const ty = repTyOf(r)
+  const h = recordHeapOfTy(ty)
+  if h >= 0 { return h }
+  return askRecordHeap(ty)
 }
 
 // The record, list or map rep of list element `e`, under a `| null`, or -1.
