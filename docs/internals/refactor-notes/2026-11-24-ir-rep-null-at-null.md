@@ -17,7 +17,8 @@ Legacy writes both through `emitNullAt` → `nullOwnAt` → `NULL_OWN_NONE`, whi
 builder now keys on that same `nullOwnAt`:
 
 1. `exprAt`: a `NullLit` with no rep of its own whose `nullOwnAt` is `NULL_OWN_NONE` is at the
-   `null` unit, built by the existing `RNullOf NONE` arm.
+   `null` unit (`repNodeOfNullUnit`, in `emit_rep.vl`, so the builder imports no new checker
+   symbol), built by the existing `RNullOf NONE` arm.
 2. `deliver`: `NULL_OWN_NONE` into a `string | null` is `RNullOf NONE`, since the bottom ref
    fits `ref null $str`. Nothing else widens: a sentinel slot still refuses.
 
@@ -63,3 +64,5 @@ None new.
 | legacy A/B (tests/cases + probes) | 8,156 programs, 0 moved |
 | L2 self-compile fuel per PR | +0.04% on 128,505,172,184 |
 | late demands / late tag rows / `self ir misses` | 10 (baseline 10) / 315 (0 gone) / 0 |
+| after the master merge (13753236, mechanical) | `gate.sh --fast` passed; `--cases` 8093 identical, differ 0; `--claimless` 14499 identical, differ 0, claimless compiler sha256 `6337ebcda07b7aebf76c279ac93020fbf5e73b2e60d4c17af0ecceebd13030a1` built at f9428f7c, `compiler/` clean; `check-filed-witnesses --strict` 5676 as filed, 0 MOVED |
+| `lint-self` / `phase-state-census --check` / `rep-fuzz-check.sh` | clean / ok (surface unchanged) / exact, 0 new, 0 stale |
