@@ -176,7 +176,7 @@ import {
   voidSlotExemptExpr,
 } from "./check_leaf_steps"
 import { monoRecheckDepth, noteTpJoinRow, tpIfCmpOn } from "./check_list_union"
-import { tpIfJoinAt, tpIfOkAt } from "./check_tp_join"
+import { tpIfJoinAt, tpIfOkAt, tpJoinUnions } from "./check_tp_join"
 import { constIntExprIs, constIntExprVal, u8LexValue } from "./check_literals"
 import { cmpLitTyOf, condUnderParens } from "./check_match_desugar"
 import {
@@ -233,6 +233,7 @@ import {
   joinArmLit,
   joinFloatLitTails,
   joinTys,
+  joinVariantTys,
   sameVariantTy,
   substTyDeep,
   tErr,
@@ -272,6 +273,7 @@ import {
   mkNullableTy,
   tyAt,
   tyBearsNull,
+  tyEq,
   tyMentionsTyVarNamed,
   tyToStr,
 } from "./check_types"
@@ -1435,12 +1437,7 @@ function ifTailBankValTy(
     if f.thenExits || valTy == TY_VOID {
       valTy = ev
     } else if ev != TY_VOID {
-      valTy = joinArmLit(
-        valTy,
-        armLit(valTy, n.ifThen),
-        ev,
-        armLit(ev, n.ifElse),
-      )
+      valTy = ifArmsJoin(ix, valTy, n.ifThen, ev, n.ifElse)
     }
   }
   if f32Join >= 0 { valTy = f32Join }
@@ -1709,6 +1706,22 @@ function ifTailApplyGuards(
   }
 }
 
+// The join of `if` `ix`'s arm values `a` (arm `aArm`) and `b`: `joinArmLit`'s, except that an
+// instance re-checking an `if` its generic body kept apart (D2760) keeps two lists apart, as the
+// instance's own type of the `if` does, so each arm is built at its own list.
+function ifArmsJoin(ix: i32, a: i32, aArm: i32, b: i32, bArm: i32): i32 {
+  if elabCapLive() && tpJoinUnions.has(nodeTyIxOf(ix)) && listsApart(a, b) {
+    return joinVariantTys(a, b)
+  }
+  return joinArmLit(a, armLit(a, aArm), b, armLit(b, bArm))
+}
+
+// Whether `a` and `b` are two list types of different element types.
+function listsApart(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
+  return tyAt(a) is TyArray && tyAt(b) is TyArray && !tyEq(a, b)
+}
+
 // The value type of `checkIfTail`'s `if` node `ix` with an `else`: the join of the two arm
 // tails, an exiting arm handing none; `f32Keep` keeps an arm an inner join typed `f32`.
 function ifTailElseJoin(
@@ -1730,12 +1743,7 @@ function ifTailElseJoin(
   }
   // An arm block that always exits (`return`, `break`, `continue`) hands no value to the
   // join; the emitter ends it with a `never` value (`exitArmBlockAt`) so every rep lowers it.
-  let plainJoin = joinArmLit(
-    thenPlain,
-    armLit(thenPlain, n.ifThen),
-    elsePlain,
-    armLit(elsePlain, n.ifElse),
-  )
+  let plainJoin = ifArmsJoin(ix, thenPlain, n.ifThen, elsePlain, n.ifElse)
   // A function's tail `if` already lowers an exiting arm as a return, so it needs no tail.
   if thenExits && !daElseDiverges && nodeAt(n.ifThen) is Block {
     if atValueArmTail(ix) { refuseNestedExitFirst(ix, elsePlain) }
