@@ -204,6 +204,7 @@ import {
   ROptRead,
   RPrimOp,
   RPrint,
+  RPrintOpen,
   RRawOp,
   RRecCopyPure,
   RRecordFitIs,
@@ -799,6 +800,7 @@ import {
   emitFnSpanKind,
   emitFnSpanNode,
   emitFnSpanStart,
+  emitSoftMsg,
   fbEagerScratch,
   fbFrameParams,
   fnStmts,
@@ -807,6 +809,7 @@ import {
   gCellIdx,
   gHelpF64Rem,
   gImports,
+  gTestClaimRefusal,
   liKinds,
   listIdxScratchBase,
   localIsRef,
@@ -886,6 +889,15 @@ let lwRowOpenTemp: {[i32]: i32} = Map()
 
 export function irLMiss(why: string) {
   if lwMiss == "" { lwMiss = why }
+  return 0
+}
+
+// A refusal a shared legacy helper raises while a claim lowers (`emitSoftMsg`, recorded only
+// inside a claim seam) is the claim's miss, so it declines and legacy writes the unit.
+function softMiss(name: string) {
+  if emitSoftMsg != "" {
+    irLMiss("a legacy helper refused in `" + name + "`: " + emitSoftMsg)
+  }
   return 0
 }
 
@@ -1185,6 +1197,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMapEq => mapEq(r)
     RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
+    RPrintOpen => irLMiss("print open value")
     RNumUnionBin => numUnionBin(r)
     RNumUnionConvert => {
       // Legacy stashes the box one dispatch level deeper, then converts at its member.
@@ -3172,6 +3185,15 @@ function framesPop(k: i32) {
   return 0
 }
 
+// `RPrintOpen`: legacy's two blocks a nullable string's or boolean's print opens before its
+// operand, each an open frame until the opened `RPrint` closes them.
+function printOpen(r: RPrintOpen) {
+  if r.poArm == 1 { printNulBoolOpen() } else { printNulStrOpen() }
+  lwFrames.push(-1)
+  lwFrames.push(-1)
+  return 0
+}
+
 // `RPrint`: the argument, then legacy's tail for the arm `printArmOf` names, a string stream or
 // one scalar print import.
 function printOp(r: RPrint) {
@@ -3179,6 +3201,21 @@ function printOp(r: RPrint) {
   const c = nodeAt(r.pnAt)
   if !(c is Call) || c.callArgs.length != 1 { return irLMiss("print node") }
   const arm = printArmOf(c.callArgs[0], lw.irAt)
+  // A print an `RPrintOpen` opened before its operand's statements writes only the operand and
+  // the tail, and closes the two frames the open pushed.
+  if r.pnOpened >= 0 {
+    if (
+      r.pnOpened
+      != (if arm == "nulBool" { 1 } else if arm == "nulStr" { 0 } else { -1 })
+    ) {
+      return irLMiss("print open arm")
+    }
+    irLOpnd(r.pnV)
+    const rc = if r.pnOpened == 1 { printNulBoolTail() } else { printNulStrTail() }
+    lwFrames.pop()
+    lwFrames.pop()
+    return rc
+  }
   if arm == "nulStr" {
     printNulStrOpen()
     irLOpnd(r.pnV)
@@ -4505,6 +4542,10 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         printOp(r)
         irLSettle(pending)
         return 0
+      }
+      if r is RPrintOpen {
+        irLSettle(pending)
+        return printOpen(r)
       }
       if r is RMapGet && r.mtPrint >= 0 {
         mapGet(r)
@@ -5890,6 +5931,7 @@ export function irLowerFragment(
   const at = cur.length
   lwReset(f, ctx, cur)
   fragmentBody(f.irBody, out)
+  softMiss(f.irName)
   if lwSinkFired > 0 { irLMiss("fragment return") }
   if ctrlDepth != depth0 { irLMiss("fragment control depth") }
   const why = lwMiss
@@ -5982,7 +6024,14 @@ export function irLowerClaim(
   out: u8[],
 ): string {
   const callees0 = dfeCallee.length
+  if gTestClaimRefusal == 1 {
+    emitFail("emitProgram: test claim refusal before the body")
+  }
   const got = entry(f, ctx)
+  if gTestClaimRefusal == 2 {
+    emitFail("emitProgram: test claim refusal after the body")
+  }
+  softMiss(f.irName)
   if lwMiss != "" {
     while dfeCallee.length > callees0 { dfeCallee.pop() }
     // Legacy lowers the function in its place, from the empty lazy frame `fbBeginFunc` left.
@@ -6025,6 +6074,7 @@ export function irLowerEqHelper(f: IrFn, out: u8[]): string {
   // The lazy frame grows from empty, as `fbBeginFunc` left it; the shadow's follows legacy's.
   fbResetLazyFrame()
   lowerBody(f, lwGlobalCtx)
+  softMiss(f.irName)
   if lwPushed.length > 0 { irLMiss("push never consumed") }
   if lwMiss != "" {
     fbResetLazyFrame()
@@ -6056,6 +6106,7 @@ export function irLowerHelper(f: IrFn, out: u8[]): string {
   if !f.irHelper { return "not a helper" }
   fnUses.unionSink = false
   lowerBody(f, lwGlobalCtx)
+  softMiss(f.irName)
   const runs: i32[] = []
   let slot = f.irParams.length
   for v in f.irVars {
