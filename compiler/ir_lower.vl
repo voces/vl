@@ -20,6 +20,7 @@ import {
   emitOptLinkNullOpen,
   optLeafArmOf,
 } from "./wasmEmit"
+import { pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
 import {
   capCellTargetOf,
   exprNullableRefNiche,
@@ -140,6 +141,7 @@ import {
   RCoalAtomStr,
   RCoalStr,
   RCoerce,
+  RDeadNever,
   RDeadNullTest,
   REnvDrop,
   REnvGet,
@@ -257,6 +259,7 @@ import {
   irFnNew,
   irNoTailEffHas,
   irNoTailHas,
+  irPushRecvAt,
   irRhsOpnds,
   irSigOf,
   primOpcode,
@@ -939,7 +942,7 @@ export function irLOpnd(o: Opnd) {
         if !tempDefined(v) { return irLMiss("temp used before its definition") }
         if !takeUse(v) { return irLMiss("non-stack temp: used twice") }
         tempOpenNote(v)
-        rhs(tempRhs(v), false)
+        tempRhsWrite(v)
         lwSeq.push(v)
         return 0
       }
@@ -1222,6 +1225,11 @@ function rhs(r: Rhs, tail: boolean) {
     }
     ROptRead => optRead(r)
     RToBox => boxOp(r)
+    RDeadNever => {
+      // Legacy's `emitExpr` writes `unreachable` for the value, and its consumer goes on.
+      leaf()
+      fbUnreachable()
+    }
     RHoleOptBox => {
       // Legacy writes the box's tag, then the operand's plain cast, then the two boxes.
       leaf()
@@ -1647,8 +1655,9 @@ function stashIfBoxHead(id: i32) {
   if !lwIfHeadBuilt { stashIfHeadsNote() }
   const at = lwIfHeadAt.get(out) ?? -1
   if at >= 0 && !i32ListHas(lwBoxHeadAt, at) { return stashBoxHead(at) }
-  // A valued `if`'s box head follows the operands staged ahead of it (`valuedIfOpen`).
-  if n is SCoalBox { joinBoxHead(out, false) }
+  // A valued `if`'s box head follows the operands staged ahead of it (`valuedIfOpen`), as does a
+  // `??`'s that stages them (`coalBox`).
+  if n is SCoalBox && !coalArmStagesLeads(n.cbArm) { joinBoxHead(out, false) }
   return 0
 }
 
@@ -4741,12 +4750,22 @@ function liveCountIn(vs: i32[]): i32 {
   return k
 }
 
+// Writes temp `v`'s definition, a `.push` receiver's with its list payload cast strict.
+function tempRhsWrite(v: i32) {
+  if !irPushRecvAt(lw, v) { return rhs(tempRhs(v), false) }
+  const was = pushRecvCastOn()
+  pushRecvCastSet(true)
+  rhs(tempRhs(v), false)
+  pushRecvCastSet(was)
+  return 0
+}
+
 // Writes temp `v`'s definition now and leaves its value on the stack, above any already there.
 function stageRoot(v: i32) {
   // It lands above the roots staged before it, as legacy writes the operands in turn.
   lwPushing = true
   tempOpenNote(v)
-  rhs(lwTempRhs[v], false)
+  tempRhsWrite(v)
   lwPushing = false
   return livePush(v)
 }
@@ -4865,8 +4884,10 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
   // An earlier operand's temps are written below the operand, as a valued `if` stages them.
-  const roots = if coalArmStagesLeads(n.cbArm) { stageLead(n.cbL, pending) } else { noRoots() }
+  const stages = coalArmStagesLeads(n.cbArm)
+  const roots = if stages { stageLead(n.cbL, pending) } else { noRoots() }
   if lwMiss != "" { return -1 }
+  if stages { joinBoxHead(t, true) }
   lwFloors.push(lwFloor)
   lwFloor = lwLive.length - liveCountIn(pending)
   const ba = coalValBoxArm(n.cbArm)

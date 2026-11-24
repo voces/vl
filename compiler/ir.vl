@@ -282,6 +282,9 @@ export type RToBox = { bxV: Opnd, bxAt: i32, bxTy: i32, bxFree: boolean }
 // `u as? N` over a type parameter boxing scalar `hxV` at cast node `hxAt` (`holeOptShapeOf`'s
 // "box"), whose tag legacy writes ahead of the operand (`holeOptBoxHead`, `holeOptBoxTail`).
 export type RHoleOptBox = { hxV: Opnd, hxAt: i32 }
+// The value of node `dnAt`, which a dead arm's `never` read feeds (`exprReadsDeadNever`): no value
+// reaches it, so legacy writes `unreachable` in its place and its consumer's code goes on (D16006).
+export type RDeadNever = { dnAt: i32 }
 // Atom `rgV` as the `K | null` (discipline 3) that holds it: the same i32, so no bytes.
 export type RRetag = { rgV: Opnd }
 // Atom `sxV`, or its `K | null`, as the string, or `string | null`, legacy's atom decode writes
@@ -625,6 +628,7 @@ export type Rhs = RArmSite
   | RCoalAtomStr
   | RCoalStr
   | RCoerce
+  | RDeadNever
   | RDeadNullTest
   | REnvDrop
   | REnvGet
@@ -937,6 +941,9 @@ export type IrFn = {
   // The retag nodes the builder noted as a closure stored at a record field legacy writes plainly,
   // whose closure kid another row on the same heap typed (`irCloFieldRetagNote`).
   irCloFieldRetag: {[i32]: boolean},
+  // The temps a `.push` receiver's read builds, which legacy writes with its list payload cast
+  // strict (`listCastForPush`).
+  irPushRecv: {[i32]: boolean},
   // The storage-row type (`letBindTy`) of each global the builder reads or stores at that row.
   irGlobalStoreTy: {[i32]: i32},
   // Facts the builder notes for the verifier by node (`irNoteVerifyFacts`): the checked type of a
@@ -1046,6 +1053,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irGlobalAt: Map(),
     irRecHeap: Map(),
     irCloFieldRetag: Map(),
+    irPushRecv: Map(),
     irGlobalStoreTy: Map(),
     irFactTy: Map(),
     irFactInt: Map(),
@@ -1154,6 +1162,17 @@ export function irSpanNoteKind(
 // The heap `f` noted for record rep `r`, or -1 for none.
 export function irRecHeapOf(f: IrFn, r: i32): i32 {
   return f.irRecHeap[r] ?? -1
+}
+
+// Whether temp `v` is read inside a `.push` receiver (`irPushRecvNote`).
+export function irPushRecvAt(f: IrFn, v: i32): boolean {
+  return f.irPushRecv[v] ?? false
+}
+
+// Notes temp `v` as built inside a `.push` receiver.
+export function irPushRecvNote(f: IrFn, v: i32) {
+  f.irPushRecv[v] = true
+  return 0
 }
 
 // Whether `f` noted retag node `id` as a closure stored at a plainly written record field.
@@ -1298,6 +1317,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RCoalAtomStr |
       RCoalStr |
       RCoerce |
+      RDeadNever |
       RDeadNullTest |
       REnvDrop |
       REnvGet |
@@ -1687,6 +1707,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RCoalAtomStr => [r.zaL, r.zaD]
     RToBox => [r.bxV]
     RHoleOptBox => [r.hxV]
+    RDeadNever => []
     RRetag => [r.rgV]
     RAtomStr => [r.sxV]
     RNullOf => []
@@ -1802,6 +1823,7 @@ function rhsText(r: Rhs): string {
     RNumCast => "cast " + opndText(r.ncV)
     RToBox => "box " + opndText(r.bxV)
     RHoleOptBox => "hole opt box " + opndText(r.hxV)
+    RDeadNever => "dead never"
     RAtomStr => "atomstr " + opndText(r.sxV)
     RRetag => "retag " + opndText(r.rgV)
     RNullOf => "null"
@@ -2160,6 +2182,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RClosureEq |
       RCoalAtomStr |
       RCoalStr |
+      RDeadNever |
       RDeadNullTest |
       REqHelp |
       RHoleOptBox |
