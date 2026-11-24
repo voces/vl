@@ -30,7 +30,8 @@ Base 334f6958, both seeds fixpoints.
   decline as well.
 
 Pins: `tests/cases/assignment/value-after-a-lead-{i32-lit,i32-reread,i32-compound,i32-capture,f64-lit,f64-reread}.vl`
-(the wrong writers) and `...-other-writers.vl` (field, element, global and effectful call).
+(the wrong writers), `...-string.vl` (D17122's string `+` and interpolation) and `...-other-writers.vl`
+(field, element, global and effectful call).
 
 ## Legacy tails the IR calls
 
