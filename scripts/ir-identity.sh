@@ -88,6 +88,12 @@ timed_out() {
 # it; `<module>` names everything outside the function bodies.
 BASELINE=${IR_DIVERGENCE_BASELINE:-scripts/ir-divergence-baseline.txt}
 WASM_DIS=${WASM_DIS:-$PWD/node_modules/.bin/wasm-dis}
+# A listed divergence is read through the disassembler; without it each would read as a differ.
+if grep -q '^[^#]' "$BASELINE" 2>/dev/null && [ ! -x "$WASM_DIS" ]; then
+  echo "ir-identity: $WASM_DIS is not executable, so no listed divergence can be read;" >&2
+  echo "  link the main checkout's node_modules into this tree, or set \$WASM_DIS" >&2
+  exit 2
+fi
 
 # Each function of wasm $1 on one line, `name\tbody`, and `<module>\trest`, sorted by name.
 fn_lines() {
