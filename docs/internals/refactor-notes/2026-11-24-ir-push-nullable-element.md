@@ -56,8 +56,8 @@ verified = matched (20,497) on both seeds.
 length) at every built-in position in both faces, plus six element cells (`null`, a literal, a
 narrowed local, a parameter, a field, a closure into a nullable closure list), each reading the
 element back. 52 of 52 graded cells RUN before and after; `local_assign`, `struct_field_assign`
-and `array_element_assign` are skipped, since those positions evaluate the value twice and so push
-twice. Under `VL_IR_SHADOW=6` the 52 programs are covered 60 = verified 60 = matched 60 with no
+and `array_element_assign` are skipped: the harness writes the value twice at those positions (an
+initializer and an assignment), so the generated program pushes twice. Under `VL_IR_SHADOW=6` the 52 programs are covered 60 = verified 60 = matched 60 with no
 fail or mismatch row, and `ir-identity.sh --claimless` over them is identical 52, differ 0. The
 position functions left uncovered under both seeds are other classes this change does not touch
 (Q58 as #24 reads it): `coalesce optional staged receiver`, from the cells' `?.` read-back, and
