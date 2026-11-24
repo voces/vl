@@ -1736,6 +1736,8 @@ Deno.test({
       "dead-never-bound-to-non-temp": 3,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
+      "never-closure-call-value-at-consumer-rep": 0,
+      "returning-closure-call-temp-typed-never": 3,
       "never-field-read-at-its-storage": 0,
       "never-field-read-off-its-storage": 3,
       "walk-pair-map-value-record": 0,
