@@ -4049,7 +4049,7 @@ fn compile_vl_located(
 ) -> Result<(Vec<u8>, Option<(Store<()>, Instance)>)> {
     FELL_BACK.with(|c| c.set(false));
     let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
-    let mut bytes = compile_vl_instance(
+    let compiled = compile_vl_instance(
         &mut store,
         &inst,
         source,
@@ -4057,7 +4057,26 @@ fn compile_vl_located(
         entry,
         emit_names,
         link,
-    )?;
+    );
+    // A claim whose build or lowering met a shared legacy helper's refusal declined, and legacy
+    // wrote that unit: legacy's refusal stands, or legacy's bytes ship with one line (rc 70 strict).
+    let soft = soft_refusals(&inst, &mut store);
+    let mut bytes = match compiled {
+        Err(refusal) => {
+            for (name, msg) in &soft {
+                eprintln!("{}", soft_note(name, msg));
+            }
+            return Err(refusal);
+        }
+        Ok(b) => b,
+    };
+    if let Some((name, msg)) = soft.first() {
+        if ir_strict() {
+            return Err(invalid_module_error(&soft_strict(name, msg)));
+        }
+        eprintln!("vl: {}", soft_fell_back(name, msg));
+        FELL_BACK.with(|c| c.set(true));
+    }
     // A unit an IR claim lowered never ran legacy's lowering, so a refusal legacy would raise
     // there never fired. A claimed module the engine refuses is rebuilt with claims off.
     if claims_taken(&inst, &mut store) {
@@ -4628,6 +4647,13 @@ fn compile_vl_instance(
     }
     // `--test-emit-refusal`: refused on an old seed, since a test that pins a refusal would
     // otherwise build clean and measure nothing.
+    // `$VL_TEST_CLAIM_REFUSAL=1|2`: every claimed function or start refuses before or after its body
+    // lowers (tests only), the control for the soft-refusal fallback. A seed without the export ignores it.
+    if let Ok(k) = std::env::var("VL_TEST_CLAIM_REFUSAL") {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setTestClaimRefusal") {
+            set.call(&mut store, k.parse().unwrap_or(0))?;
+        }
+    }
     if link.test_emit_refusal {
         let set = inst
             .get_typed_func::<i32, i32>(&mut store, "setTestEmitRefusal")
@@ -4830,6 +4856,50 @@ fn claims_taken(inst: &Instance, store: &mut Store<()>) -> bool {
         len.call(&mut *store, i).unwrap_or(0) >= 7
             && (0..7).all(|j| at.call(&mut *store, (i, j)).ok() == Some(b"claimed"[j as usize] as i32))
     })
+}
+
+/// Each claimed unit whose build or lowering met a shared legacy helper's refusal, and so declined:
+/// `(name, message)` from the guest's `… a legacy helper refused in `name`: message` rows.
+fn soft_refusals(inst: &Instance, store: &mut Store<()>) -> Vec<(String, String)> {
+    let (Ok(count), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "irShadowRowCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "irShadowRowLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "irShadowRowAt"),
+    ) else {
+        return Vec::new();
+    };
+    const MARK: &str = "a legacy helper refused in `";
+    let mut out = Vec::new();
+    for i in 0..count.call(&mut *store, ()).unwrap_or(0) {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let row: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        let Some(k) = row.find(MARK) else { continue };
+        let rest = &row[k + MARK.len()..];
+        if let Some((name, msg)) = rest.split_once("`: ") {
+            out.push((name.to_string(), msg.lines().next().unwrap_or(msg).to_string()));
+        }
+    }
+    out
+}
+
+/// The note beside legacy's refusal when a claim declined on a helper's refusal (the TS hosts' text too).
+fn soft_note(name: &str, msg: &str) -> String {
+    format!("vl: note: an IR claim refused inside `{name}` ({msg}); legacy's emitter refuses the program")
+}
+
+/// The line beside legacy's bytes when such a claim declined and legacy built the unit.
+fn soft_fell_back(name: &str, msg: &str) -> String {
+    format!("inside `{name}`: {msg}: IR claim refused; used the legacy emitter")
+}
+
+/// The strict error for the same: rc 70, since an IR claim must not refuse what legacy builds.
+fn soft_strict(name: &str, msg: &str) -> String {
+    format!(
+        "inside `{name}`: {msg}\nan IR claim refused, and the legacy emitter builds the program \
+         ($VL_IR_STRICT=1 refuses that fallback)"
+    )
 }
 
 /// `$VL_IR_STRICT=1`: a claimed module that fails validation is a loud internal error even when

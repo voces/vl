@@ -13068,3 +13068,29 @@ What the host does with a claimed module the engine refuses (`claims_off_rebuild
   hosts only. A claimed escape is an IR bug to fix, so no `@emit-error` case for it goes in tests/cases.
 - **The TS hosts** (the LSP's compile, the playground's Run, the V8 corpus oracle) take the same
   fallback (`lsp/src/claimFallback.ts`, #9848). The oracle is strict, as a gate.
+
+## A claim that meets a shared legacy helper's refusal declines (2026-11-24, coordinator ruling (a))
+
+**Ruled by the coordinator 2026-11-24**: ruling (a), extending G3. The per-unit decline over a
+whole-compile rebuild was approved by the coordinator and the queue. D17123 is the witness: a claimed
+function's lowering called a shared legacy helper (`emitMapGetScalarBoxTail`), which refused through
+`emitFail`. The compile latched that refusal before legacy reached its own, so the claim changed which
+refusal a program sees.
+
+**What happens now.**
+- While a claim seam builds or lowers a unit, `emitFailAt` records the refusal (`emitSoftMsg`)
+  instead of latching it, and does not reset the module writer.
+- The claim declines through its existing miss rewind, so legacy writes the unit and raises its own
+  refusal, if it has one.
+- The guest counts `claim fell back: … a legacy helper refused in `name`: <msg>`. The hosts report
+  that as the G3 event:
+  - if legacy refuses: legacy's refusal plus a note, rc 1;
+  - if legacy builds: legacy's bytes plus a line, or rc 70 under `$VL_IR_STRICT=1`.
+- A refusal outside any claim still latches hard.
+
+**Why.**
+- About 42 legacy helpers that the IR's lowering calls can refuse. A pre-check per helper would
+  mirror each one's refusal condition, a parallel predicate, so the decline is the uniform answer.
+- Each seam saves and restores the enclosing scope, so a nested seam never hardens its caller.
+- On a build that succeeds today no helper refuses mid-claim, so no byte can move.
+- The fallback leaves at I8 (ir-design-2026-11.md, after the step table).

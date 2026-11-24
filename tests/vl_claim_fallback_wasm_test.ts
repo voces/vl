@@ -98,3 +98,37 @@ Deno.test({
     }
   },
 });
+
+// The soft refusal (D17123; coordinator ruling (a)): a claim that meets a shared legacy helper's
+// refusal declines in the guest and legacy writes the unit. The LSP reports it with the native
+// host's text: legacy's refusal and a note, or legacy's bytes and a warning.
+Deno.test({
+  name: "claim fallback (wasm): D17123's claim declines; the LSP reports legacy's refusal and the native note",
+  ignore,
+  fn: async () => {
+    const src = Deno.readTextFileSync(`${ROOT}/tests/ir-claim-fallback/claim-helper-refusal-legacy-refused.vl`);
+    const { bytes, diagnostics } = await createWasmChecker(fresh).compile(src, "main.vl", noSiblings);
+    const legacy = "a union's arm rows were asked of a type no row holds";
+    const note = "an IR claim refused inside `take` (emitProgram: scalar map read has no value-box type); legacy's emitter refuses the program";
+    if (bytes !== undefined || !diagnostics.some((d) => d.message.includes(legacy)) || !diagnostics.some((d) => d.message === note)) {
+      throw new Error(`want legacy's refusal and the note, got ${JSON.stringify(diagnostics.map((d) => d.message))}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "claim fallback (wasm): a claim the test hook makes refuse ships legacy's bytes with the native warning",
+  ignore,
+  fn: async () => {
+    const exp = fresh();
+    exp.setTestClaimRefusal(2);
+    const src = Deno.readTextFileSync(`${ROOT}/tests/ir-claim-fallback/claimed-and-valid.vl`);
+    const { bytes, diagnostics } = await createWasmChecker(() => exp).compile(src, "main.vl", noSiblings);
+    const fell = diagnostics.some((d) =>
+      /^inside `[^`]+`: emitProgram: test claim refusal after the body: IR claim refused; used the legacy emitter$/.test(d.message)
+    );
+    if (bytes === undefined || !WebAssembly.validate(bytes as Uint8Array<ArrayBuffer>) || !fell) {
+      throw new Error(`want legacy's valid bytes and the warning, got ${bytes?.length} bytes and ${JSON.stringify(diagnostics.map((d) => d.message))}`);
+    }
+  },
+});

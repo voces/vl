@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: a `print` of a `string | null` or `boolean | null` whose argument is a valued `if`, byte-identical to legacy.** Legacy opens the print's two blocks before its operand, so the `if` is written inside them. The IR now places a new `RPrintOpen` effect before the operand's statements, and the print (`pnOpened`) closes it. The lowering keeps the two blocks as control frames, so a `??`, a nested `if` or a `return` inside an arm counts them as legacy does. The verifier pairs each open with its print, with five keyed self-tests. `print nulStr of a valued if` and `print nulBool of a valued if` fall to 0.
