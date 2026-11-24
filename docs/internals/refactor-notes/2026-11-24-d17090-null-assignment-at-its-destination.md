@@ -16,7 +16,9 @@ owes another null:
 
 The IR misses by name at a `null` local storing an assignment of `null` (`store of an assignment
 of null into a null local`): legacy declares that local apart from the IR's. One such shape, a
-list cell, mismatched on master already; it now misses instead.
+list cell (`tests/cases/closures/null-local-stores-assignment-of-null.vl`, committed with the
+following PR), read `mismatch bytes: prefix or locals` on #9837's base `8b757cf1` and now misses
+instead; no corpus, `tests/cases` or cell program had that shape when #9837 landed.
 
 ## Reach
 
