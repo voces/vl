@@ -2542,7 +2542,7 @@ function boolNullable(r: i32): boolean {
 }
 
 // Whether rep `r` is a nullable boxed as a union is (discipline 4): `{tag, payload}`.
-function boxedNullable(r: i32): boolean {
+export function boxedNullable(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RNullable && n.rnDisc == 4
 }
@@ -5896,6 +5896,12 @@ function sharedFieldCallee(b: i32[], m: Member, at: i32): Opnd {
   const r = if ot >= 0 { repNodeOfTy(ot) } else { -1 }
   const si = structIndexOfExpr(m.memObj, ibFnIx)
   const fi = if si >= 0 { sFieldIndex(si, m.memProp) } else { -1 }
+  // A nullable record receiver (a `?.` on an un-annotated parameter) is read by legacy off the
+  // nullable reference the chain tested; the verifier admits no field read of a nullable.
+  const rn = repNodeAt(r)
+  if rn is RNullable && repNodeAt(rn.rnInner) is RRecord {
+    return irBMiss("shared member callee nullable receiver")
+  }
   if !(repNodeAt(r) is RRecord) || fi < 0 {
     return irBMiss("shared member callee row")
   }
@@ -5966,7 +5972,7 @@ function holderCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   }
   const pk = holderPickOf(ix, ibFnIx)
   // A holder captured whole is read at the record its capture holds (`capTyOf`).
-  const v = if calleeIsCapture(c.callFn) { bundleCaptureRead(b, c.callFn) } else { irBExpr(b, c.callFn) }
+  const v = if calleeIsCapture(c.callFn) { bundleCaptureRead(b, c.callFn) } else { holderRecordOf(b, c.callFn) }
   if ibMiss != "" { return missRhs("holder callee") }
   const crep = repNodeOfTy(pk.bpTy)
   if !(repNodeAt(crep) is RClosure) { return missRhs("holder member rep") }
@@ -8976,13 +8982,13 @@ function nulTest(
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
 }
 
-// The operand of null test arm `arm` over `ref`: a box's tag test reads the box legacy compares,
-// a union-box global narrowed to a rep that is no box as its cell stores it, and any other read
-// at its cell, a read narrowed past one of the box's members included.
+// The operand of null test arm `arm` over `ref`: a box's tag test reads the box legacy compares, a
+// union-box global narrowed to a rep that is no box as its cell stores it, a binding holding a
+// returned record (`globalHolderTy`) as its nullable cell, and any other read at its cell.
 function nulTestOperand(b: i32[], arm: NulTestArm, ref: i32): Opnd {
   const r = unwrapParen(ref)
   if (
-    arm == "boxTag"
+    (arm == "boxTag" || arm == "nullRef")
     && r >= 0
     && r < P.nodes.length
     && nodeAt(r) is Ident
@@ -8993,12 +8999,28 @@ function nulTestOperand(b: i32[], arm: NulTestArm, ref: i32): Opnd {
     const cr = globalRep(g, d)
     const st = heldTy(letBindTy(d, -1))
     if (
-      cr >= 0
+      arm == "boxTag"
+      && cr >= 0
       && heldAsBox(cr)
       && !heldAsBox(exprRepOf(r))
       && cr == globalTyRep(st)
     ) {
       return globalStoredRead(b, g, r, cr, st)
+    }
+    const ht = if arm == "nullRef" && cr >= 0 { globalHolderTy(d) } else { -1 }
+    // The cell holds the record, or `null` beside it where the binding's value is a map read.
+    const cn = repNodeAt(cr)
+    const hr = if ht >= 0 { repNodeOfTy(ht) } else { -1 }
+    const held = hr >= 0 && (hr == cr || cn is RNullable && cn.rnInner == hr)
+    if held && refNullable(cr) && exprRepOf(r) != cr {
+      globalHeldNote(g)
+      return globalStoredRead(
+        b,
+        g,
+        r,
+        cr,
+        if hr == cr { ht } else { repTyOf(cr) },
+      )
     }
   }
   return if arm == "boxTag" { exprAt(b, ref, true) } else { irBExpr(b, ref) }
@@ -9918,8 +9940,11 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   if boxOut != heldAsBox(rep) { return irBMiss("coalesce box result rep") }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
-  // Its value stays on the stack from here, so no temp an operand before it built may wait.
-  if endsInTemp(b) { return irBMiss("coalesce box after an operand") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait,
+  // unless the lowering writes that temp below the tag test (`coalArmStagesLeads`).
+  if endsInTemp(b) && !coalArmStagesLeads(arm) {
+    return irBMiss("coalesce box after an operand")
+  }
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
   if !heldAsBox(irBOpRep(l)) { return irBMiss("coalesce box operand rep") }
@@ -13021,13 +13046,52 @@ function blockCut(b: i32[]): boolean {
   return n is STrap && n.tpWhy == TRAP_BLOCK_CUT
 }
 
+// Notes global `g` held whole as its record (`irGlobalHeld`), as `globalRep` notes a holder's cell.
+function globalHeldNote(g: i32) {
+  if g < 0 { return 0 }
+  ib.irGlobalHeld[g] = true
+  return 0
+}
+
+// The record a bundle holder `f` holds, which a pick reads a member of: a global holding it beside
+// `null` (a map read) is read narrowed to the record, its recover legacy's `ref.as_non_null`.
+function holderRecordOf(b: i32[], f: i32): Opnd {
+  const r = unwrapParen(f)
+  if r >= 0 && r < P.nodes.length && nodeAt(r) is Ident && globalTarget(r) {
+    const d = identDeclOf(r)
+    const g = globalIndexOfSid(sidOfNode(r))
+    const cr = globalRep(g, d)
+    const ht = globalHolderTy(d)
+    const hr = if ht >= 0 { repNodeOfTy(ht) } else { -1 }
+    const cn = repNodeAt(cr)
+    if (
+      hr >= 0
+      && cn is RNullable
+      && cn.rnInner == hr
+      && repNodeAt(hr) is RRecord
+    ) {
+      const gm = irGlobalReadMiss(g, ibGlobalCtx())
+      if gm != "" { return irBMiss(gm) }
+      const gr: Rhs = {
+        ggSym: g,
+        ggNonNull: globalReadRecovers(sidOfNode(r), r, ibFnIx),
+        ggNn: 0,
+      }
+      ib.irReadAgain[r] = gr
+      globalHeldNote(g)
+      return irBLetTempTy(b, gr, r, hr, ht)
+    }
+  }
+  return irBExpr(b, f)
+}
+
 // `let` `ix` (variable `v`) initialised with a bundle holder's read: the holder's record, then the
 // member the binding's type names (`RHolderPick`), at the binding's rep and type.
 function holderPickLet(b: i32[], n: LetDecl, ix: i32, v: i32): i32 {
   if !(repNodeAt(ib.irVars[v].vRep) is RClosure) {
     return skip("holder pick binding rep")
   }
-  const rec = exprAt(b, n.letInit, false)
+  const rec = holderRecordOf(b, n.letInit)
   if ibMiss != "" { return 0 }
   if !(repNodeAt(irBOpRep(rec)) is RRecord) {
     return skip("holder pick record")
