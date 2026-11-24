@@ -8,6 +8,8 @@
 //
 // Run with:  deno test -A tests/vl_ir_identity_compare_test.ts
 
+import { binaryen, exists } from "./support/tree.ts";
+
 const SCRIPT = new URL("../scripts/ir-identity.sh", import.meta.url).pathname;
 
 type Build = { rc: number; err?: string; wasm?: string; log?: string };
@@ -146,5 +148,77 @@ Deno.test("ir-identity --compare-errors: a timeout is refused there too", () => 
   const r = compare("--compare-errors", { "t/e1.vl": { rc: 124, err: "" } }, { "t/e1.vl": { rc: 1, err: "t/e1.vl:1:1: x" } });
   if (r.code !== 3 || !r.text.includes("TIMEOUT t/e1.vl (a)") || !r.text.includes("errors: same 0, differ 0, timeout 1")) {
     throw new Error(`want exit 3 and a TIMEOUT, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+// A listed divergence (`ir-divergence-baseline.txt`, Q57): a byte differ passes as `expected
+// divergence` only when every function whose body differs is listed for that program.
+// Binaryen as every suite finds it: the native release `$VL_BINARYEN` names (ci-native has no
+// node_modules and sets it), else npm's. With neither, these three ignore themselves, saying so.
+const AS = binaryen("wasm-as");
+const DIS = binaryen("wasm-dis");
+const noBinaryen = !exists(AS) || !exists(DIS);
+if (noBinaryen) {
+  console.warn(`[ir-identity-compare] divergence tests skipped — no binaryen at ${AS}: set \$VL_BINARYEN (scripts/fetch-binaryen.sh) or run npm ci`);
+}
+
+/** The wasm of a module whose `$f@1` returns `n`, beside an unchanged `$g@1`, with names kept. */
+function wat(root: string, n: number): string {
+  const p = `${root}/m${n}.wat`;
+  Deno.writeTextFileSync(
+    p,
+    `(module (func $f@1 (result i32) (i32.const ${n})) (func $g@1 (result i32) (i32.const 7)))\n`,
+  );
+  const out = new Deno.Command(AS, { args: ["-g", p, "-o", `${p}.wasm`] }).outputSync();
+  if (out.code !== 0) throw new Error(`wasm-as failed: ${new TextDecoder().decode(out.stderr)}`);
+  return new TextDecoder("latin1").decode(Deno.readFileSync(`${p}.wasm`));
+}
+
+/** `--compare` of `t/ok.vl` built to two modules whose `$f@1` differs, under `baseline`. */
+function diverged(baseline: string) {
+  const root = Deno.makeTempDirSync();
+  try {
+    const b = `${root}/baseline.txt`;
+    Deno.writeTextFileSync(b, baseline);
+    const one = wat(root, 1), two = wat(root, 2);
+    const list = `${root}/list`;
+    Deno.writeTextFileSync(list, "t/ok.vl\n");
+    const a = `${root}/a`, c = `${root}/b`;
+    for (const [d, w] of [[a, one], [c, two]]) {
+      Deno.mkdirSync(d);
+      Deno.writeTextFileSync(`${d}/t_ok.vl.rc`, "0\n");
+      Deno.writeTextFileSync(`${d}/t_ok.vl.err`, "");
+      Deno.writeFileSync(`${d}/t_ok.vl.wasm`, Uint8Array.from(w, (ch) => ch.charCodeAt(0)));
+    }
+    const out = new Deno.Command("bash", {
+      args: [SCRIPT, "--compare", list, a, c],
+      env: { IR_IDENTITY_KEEP: `${root}/keep`, IR_DIVERGENCE_BASELINE: b, WASM_DIS: DIS },
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    return { code: out.code, text: new TextDecoder().decode(out.stdout) };
+  } finally {
+    Deno.removeSync(root, { recursive: true });
+  }
+}
+
+Deno.test({ name: "ir-identity --compare: a listed function's differ is an expected divergence", ignore: noBinaryen }, () => {
+  const r = diverged("t/ok.vl\tf@1\ttest mechanism\t#0\n");
+  if (r.code !== 0 || !r.text.includes("expected divergence t/ok.vl (f@1)") || !r.text.includes("expected divergence 1")) {
+    throw new Error(`want a pass naming f@1, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+Deno.test({ name: "ir-identity --compare: a differ in a function the baseline does not list reds", ignore: noBinaryen }, () => {
+  const r = diverged("t/ok.vl\tg@1\ttest mechanism\t#0\n");
+  if (r.code !== 1 || !r.text.includes("DIFF t/ok.vl (unlisted: f@1)")) {
+    throw new Error(`want t/ok.vl to red naming f@1, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+Deno.test({ name: "ir-identity --compare: a differ in a program the baseline does not list reds", ignore: noBinaryen }, () => {
+  const r = diverged("t/other.vl\tf@1\ttest mechanism\t#0\n");
+  if (r.code !== 1 || !r.text.includes("DIFF t/ok.vl\n")) {
+    throw new Error(`want t/ok.vl to red, got exit ${r.code}:\n${r.text}`);
   }
 });
