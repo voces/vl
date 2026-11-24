@@ -8,6 +8,40 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-24-d17088-null-binding-initialiser](2026-11-24-d17088-null-binding-initialiser.md): D17088: a `null` binding's initialiser runs for its effect (2026-11-24, lane S1)
+- [2026-11-24-ir-coal-stage-box-head](2026-11-24-ir-coal-stage-box-head.md): IR soundness: a staging `??`'s box head is written after its staged leads (2026-11-24, lane IR-N11, D17091)
+- [2026-11-24-ir-union-compare-bool-niche](2026-11-24-ir-union-compare-bool-niche.md): IR: a `boolean | null` operand against a union with no `null` arm (2026-11-24, lane N10)
+- [2026-11-24-ir-nullable-arm-closure-arg](2026-11-24-ir-nullable-arm-closure-arg.md): A closure call's nullable union-arm parameter takes its argument as legacy does (2026-11-24, lane IR-N5)
+- [2026-11-24-ir-n3-global-read-4](2026-11-24-ir-n3-global-read-4.md): IR-N3: `global read coercion`, part 4 — a tagged set's id global delivered as its member's closure (2026-11-24, lane IR-N3)
+- [2026-11-24-ir-coalesce-chain-arm-and-scalar-map-join](2026-11-24-ir-coalesce-chain-arm-and-scalar-map-join.md): IR coverage: a union join's `??`-chain arm and the scalar map join (2026-11-24, lane IR-N2)
+- [2026-11-24-ir-union-compare-box-again](2026-11-24-ir-union-compare-box-again.md): IR: a union compare's narrowed or captured box, read again (2026-11-24, lane N10)
+- [2026-11-24-ir-assignment-value-null-lit](2026-11-24-ir-assignment-value-null-lit.md): IR: an assignment of `null` the checker types `null`, as a value (2026-11-24, lane S1)
+- [2026-11-24-ir-null-unit-place](2026-11-24-ir-null-unit-place.md): IR coverage: `pre-path null unit read` and `member record`, a null-unit place read (2026-11-24, lane IR-N8)
+- [2026-11-24-ir-is-fit-shadow](2026-11-24-ir-is-fit-shadow.md): IR: an `is K[]` whose region reads the arm's empty `K[]` (2026-11-24, lane IR-N1)
+- [2026-11-24-ir-nullty-place](2026-11-24-ir-nullty-place.md): IR: a `nullty` null test on a callback parameter or a closure `let`, at its held row, 2026-11-24
+- [2026-11-24-ir-dead-never](2026-11-24-ir-dead-never.md): IR: a value a dead never read feeds (2026-11-24, lane IR-D1)
+- [2026-11-24-ir-c1-tail-coercion](2026-11-24-ir-c1-tail-coercion.md): `tail coercion`: a nullable value recovered at the non-null result (IR-C1)
+- [2026-11-24-ir-parity-harness](2026-11-24-ir-parity-harness.md): IR behavioural parity: the oracle for Q57 and for after I8 (2026-11-24, lane IR-P1)
+- [2026-11-23-ir-store-element-site-box](2026-11-23-ir-store-element-site-box.md): A shared let's cell write boxes its value at the site's union (2026-11-23, lane IR-N5)
+- [2026-11-23-ir-call-atom-and-nul-list](2026-11-23-ir-call-atom-and-nul-list.md): IR: a function-value call with an atom at a string, or a list at a nullable list, 2026-11-23
+- [2026-11-23-ir-m1-heap-identity-family](2026-11-23-ir-m1-heap-identity-family.md): IR-M1: record stored on another type's row — heap identity (family, 2026-11-23, lane IR-M1)
+- [2026-11-23-ir-n3-global-read-3](2026-11-23-ir-n3-global-read-3.md): IR-N3: `global read coercion`, part 3 — a null test of a narrowed union-box global (2026-11-23, lane IR-N3)
+- [2026-11-23-ir-coalesce-receiver-shapes](2026-11-23-ir-coalesce-receiver-shapes.md): IR coverage: field-coalesce receiver shapes and an undecided constant join (2026-11-23, lane IR-N2)
+- [2026-11-23-n7-narrowed-list-copy](2026-11-23-n7-narrowed-list-copy.md): D17086: a union box narrowed to `L[] | null` reads as that nullable list (2026-11-23, lane IR-N7)
+- [2026-11-23-ir-union-compare-nul-staged](2026-11-23-ir-union-compare-nul-staged.md): IR: a union compare's null legs over a call box or call operand, parked as legacy parks them (2026-11-23, lane S1)
+- [2026-11-23-ir-decl-atom-str](2026-11-23-ir-decl-atom-str.md): IR: a narrowed `K | null` decoded into a plain string (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-expression-null](2026-11-23-ir-expression-null.md): A bare `null` literal: the null box, the bottom ref, a parenthesised sentinel (2026-11-23, lane IR-N5)
+- [2026-11-23-ir-rowless-map-value](2026-11-23-ir-rowless-map-value.md): IR: a map whose value is a rowless record, at legacy's storage row, 2026-11-23
+- [2026-11-23-ir-n9-batch9](2026-11-23-ir-n9-batch9.md): IR coverage, batch 9: an empty list into a union's scalar list arm (2026-11-23, lane IR-N9)
+- [2026-11-23-ir-call-nullable-ref-param](2026-11-23-ir-call-nullable-ref-param.md): IR: a function-value call at a nullable reference parameter, 2026-11-23
+- [2026-11-23-ir-decl-retags](2026-11-23-ir-decl-retags.md): IR: two declaration retags (2026-11-23, lane IR-D1)
+- [2026-11-23-ir-is-family3](2026-11-23-ir-is-family3.md): IR: `is` over a record's box field at its storage, and `x?.f is K` (2026-11-23, lane IR-N1)
+- [2026-11-23-ir-c1-member-box](2026-11-23-ir-c1-member-box.md): `member box` / `method has`: batch 2 on the arm-site writer (IR-C1)
+- [2026-11-23-ir-m1-d17075-nullable-by-inner](2026-11-23-ir-m1-d17075-nullable-by-inner.md): IR-M1: a nullable rep node per inner type (D17075)
+- [2026-11-23-ir-union-compare-staged](2026-11-23-ir-union-compare-staged.md): IR: a union compare whose operand has effects, staged as legacy stages it (2026-11-23, lane S1)
+- [2026-11-23-ir-n9-batch8](2026-11-23-ir-n9-batch8.md): IR coverage, batch 8: a boolean printed at an i32 rep (2026-11-23, lane IR-N9)
+- [2026-11-23-ir-n7-capture-classes](2026-11-23-ir-n7-capture-classes.md): IR coverage: capture recover, capture list test, closure env capture, and a narrowed read seated at its cell (2026-11-23, lane IR-N7)
+- [2026-11-23-ir-arg-frame](2026-11-23-ir-arg-frame.md): IR coverage: `start: argument coercion` cut 1, delivery at the callee frame's type (2026-11-23, lane IR-N8)
 - [2026-11-23-ir-n3-global-read-2](2026-11-23-ir-n3-global-read-2.md): IR-N3: `global read coercion`, part 2 — an atom global's re-read, a rowless record global (2026-11-23, lane IR-N3)
 - [2026-11-23-ir-record-arms-unbox](2026-11-23-ir-record-arms-unbox.md): IR: a union of records delivered unboxed at a record slot (2026-11-23, lane IR-D1)
 - [2026-11-23-ir-capture-holder-member](2026-11-23-ir-capture-holder-member.md): IR: a captured holder of one bundle member, 2026-11-23
