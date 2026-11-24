@@ -573,6 +573,7 @@ import {
   boxTyNameAt,
   coerceKindAt,
   fnCloCoerceAtNode,
+  ifJoinsAtRecord,
   instTyOrSelf,
   listCopyAtNode,
   narrowedArmNeedsUnbox,
@@ -3446,6 +3447,11 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   }
   const ty = rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
+  // A union-typed join legacy writes at its destination's row names no row of its own: its out
+  // would declare a local of no interned shape (D4645's module-scope spelling).
+  if rj.rjSlot < 0 && exprUnion(ix, ibFnIx) {
+    return irBMiss("union if record join row")
+  }
   return refIfLink(b, n, ix, rep, ty, kind, rj.rjSlot, false)
 }
 
@@ -3705,7 +3711,7 @@ function refIfArm(
 ): i32[] {
   const body: i32[] = []
   const arm = refIfArmOf(blockIx, ibFnIx, kind, slot, nul)
-  if arm != "plain" && arm != "atomStr" && arm != "null" {
+  if arm != "plain" && arm != "atomStr" && arm != "null" && arm != "unbox" {
     irBMiss("ref if arm " + arm)
     return body
   }
@@ -3722,6 +3728,15 @@ function refIfArm(
   if arm == "null" {
     const z = repTemp(body, { jnKind: kind, jnSlot: slot }, tv, rep)
     irBNode(body, { asDst: t, asSrc: z }, -1, ibNoValue, blockIx)
+    return body
+  }
+  // A narrowed read of a union is its box, recovered at the join's record in the arm (D17026).
+  if arm == "unbox" {
+    const u = if armUnboxOwed(tv, rep) { armUnboxTemp(body, tv, rep, repTyOf(rep), false) } else if recordArmsUnboxOwed(tv, rep) { recordArmsUnboxTemp(body, tv, rep, repTyOf(rep)) } else { irBMiss("ref if arm unbox shape") }
+    if ibMiss == "" && irBOpRep(u) != rep { irBMiss("ref if arm unbox rep") }
+    if ibMiss == "" {
+      irBNode(body, { asDst: t, asSrc: u }, -1, ibNoValue, blockIx)
+    }
     return body
   }
   // An atom arm in a `string` join decodes to its member string (`emitAtomToStr`), from the atom
@@ -5543,6 +5558,15 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         )
         i = i + 1
         continue
+      }
+      // A union-typed value `if` joined at a record's row is coerced by legacy's argument path as
+      // the union, not the record join a binding takes (D17115), so the IR does not claim it.
+      if (
+        repNodeAt(pr) is RRecord
+        && ifJoinsAtRecord(c.callArgs[i], ibFnIx)
+        && exprUnion(c.callArgs[i], ibFnIx)
+      ) {
+        return missRhs("argument union if at a record (D17115)")
       }
       // An argument the checker records no box at is boxed at its parameter's union, legacy's
       // direct-call floor (`directArgUnionTyOf`).
