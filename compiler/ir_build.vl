@@ -7,7 +7,11 @@ import {
   listFitShadowTyOf,
 } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
-import { nulAtomWidenTexts } from "./emit_lit_atoms"
+import {
+  litAtomMark,
+  litAtomRollback,
+  nulAtomWidenTexts,
+} from "./emit_lit_atoms"
 import {
   objLitBuildVariantRow,
   popRecvIsList,
@@ -752,6 +756,7 @@ import {
   nicheReadKindAt,
   nulLitAtomTexts,
   readOwesNonNullRecover,
+  readRepMemoAdvance,
   sFieldIsUnionBox,
   sFieldStoreKind,
   spreadBoxingSource,
@@ -1047,22 +1052,33 @@ function claimable(): boolean {
   return true
 }
 
-// The soft-refusal scope one claim seam opens: the enclosing scope, restored when it closes, so a
-// seam nested in another (a const cell inside a claimed body) never hardens its caller's.
-type Soft = { sfWas: boolean, sfMsg: string }
+// The scope one claim seam opens: the enclosing soft-refusal scope, restored when it closes, so a
+// seam nested in another (a const cell inside a claimed body) never hardens its caller's; and the
+// atom table's mark, so a claim that falls back leaves what legacy then writes as legacy alone would.
+type ClaimScope = { sfWas: boolean, sfMsg: string, csAtoms: i32 }
 
-function softBegin(): Soft {
-  const s: Soft = { sfWas: emitSoftFail, sfMsg: emitSoftMsg }
+function claimScopeBegin(): ClaimScope {
+  const s: ClaimScope = {
+    sfWas: emitSoftFail,
+    sfMsg: emitSoftMsg,
+    csAtoms: litAtomMark(),
+  }
   emitSoftFail = true
   emitSoftMsg = ""
   return s
 }
 
-// Closes scope `s`, answering the refusal a shared legacy helper raised inside it, or "".
-function softEnd(s: Soft): string {
+// Closes scope `s` for a claim that wrote (`ok`) or fell back: a fallback forgets the atoms it
+// interned and the read reps it remembered (D17241, D17243). Answers the refusal a shared legacy
+// helper raised inside it, or "".
+function claimScopeEnd(s: ClaimScope, ok: boolean): string {
   const m = emitSoftMsg
   emitSoftFail = s.sfWas
   emitSoftMsg = s.sfMsg
+  if !ok {
+    litAtomRollback(s.csAtoms)
+    readRepMemoAdvance()
+  }
   return m
 }
 
@@ -1086,9 +1102,9 @@ function softRefused(what: string): boolean {
 export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
-  const s = softBegin()
+  const s = claimScopeBegin()
   const ok = claimFn(fnIx, fnPos, out)
-  softEnd(s)
+  claimScopeEnd(s, ok)
   return ok
 }
 
@@ -1139,9 +1155,9 @@ export function irClaimStart(
   out: u8[],
 ): boolean {
   if !irStartClaimOn() { return false }
-  const s = softBegin()
+  const s = claimScopeBegin()
   const ok = claimStart(order, orderGi, poolFill, out)
-  softEnd(s)
+  claimScopeEnd(s, ok)
   return ok
 }
 
@@ -14864,9 +14880,9 @@ export function irLowerConstCell(gi: i32, gst: i32, probe: boolean): string {
 // the IR writes it and this answers true, so legacy does not; armed, legacy always runs.
 export function irClaimConstCell(gi: i32, gst: i32): boolean {
   if ibArmed { return false }
-  const s = softBegin()
+  const s = claimScopeBegin()
   const why = irLowerConstCell(gi, gst, false)
-  softEnd(s)
+  claimScopeEnd(s, why == "")
   if why != "" {
     if why.indexOf("a legacy helper refused in ") == 0 {
       count("claim fell back: const cell " + why)
@@ -15348,9 +15364,9 @@ function thunkRetTy(ty: i32, r: i32): i32 {
 // in a claimed family, the lowering writes its code entry onto `out` and this answers true.
 export function irClaimThunk(fe: i32, out: u8[]): boolean {
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
-  const s = softBegin()
+  const s = claimScopeBegin()
   const ok = claimThunk(fe, out)
-  softEnd(s)
+  claimScopeEnd(s, ok)
   return ok
 }
 
@@ -15436,9 +15452,9 @@ function buildEqHelp(si: i32): string {
 // it: when it builds and every node is in a claimed family, its code entry goes onto `out`.
 export function irClaimEqHelp(si: i32, out: u8[]): boolean {
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
-  const s = softBegin()
+  const s = claimScopeBegin()
   const ok = claimEqHelp(si, out)
-  softEnd(s)
+  claimScopeEnd(s, ok)
   return ok
 }
 
