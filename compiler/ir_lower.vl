@@ -328,6 +328,7 @@ import {
 } from "./emit_bytes"
 import {
   ARM_IDX_IMM,
+  ARM_IDX_NODE,
   ARM_IDX_STR,
   EQ_ROOT_EXPR,
   EqRootPlace,
@@ -613,12 +614,16 @@ import {
   uBoxSinkToPair,
   unionBoxToPairTail,
   unionConcreteEqPlanOf,
+  unionEqAtomOperandTail,
   unionEqCmpTail,
   unionEqHead,
   unionEqNoNullTail,
+  unionEqNulBoxSlot,
   unionEqNulElse,
   unionEqNulEndTail,
+  unionEqNulOpSlot,
   unionEqNulPlanOf,
+  unionEqNulStageOpen,
   unionEqNulTestTail,
   unionEqNullTagTail,
   unionEqPayloadTail,
@@ -766,6 +771,7 @@ import {
 } from "./emit_plan_list"
 import {
   bankSpanRow,
+  bankedRowsDrop,
   callRefDepth,
   ctrlDepth,
   dfeCallee,
@@ -2380,27 +2386,69 @@ function nicheRead(r: RNicheRead) {
   return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
 }
 
-// `RArmSite`: legacy's tag chain (`armSiteWrite`) over the box variable's local, the index a
-// variable's local, an immediate or a string literal, its element-read row banked around it as legacy's is.
+// `RArmSite`: legacy's tag chain (`armSiteWrite`) over the box: a named variable's local, or the
+// value set into legacy's receiver stash; the index or key a variable's local, an immediate or a
+// string literal. An element read's row is banked around it as legacy's is.
 function armSite(r: RArmSite) {
-  const bl = plainVarLocal(r.asV)
-  if bl < 0 { return irLMiss("arm site receiver") }
-  const ix = r.asIx
-  let il = ARM_IDX_IMM
-  let ii = 0
-  if ix is OImm && repPrim(ix.oiRep) == "i32" {
-    ii = ix.oiBits as% i32
-  } else if ix is OStr {
-    il = ARM_IDX_STR
-  } else {
-    il = plainVarLocal(ix)
-    if il < 0 { return irLMiss("arm site index") }
+  if r.asOps.length < 1 || r.asOps.length > 2 {
+    return irLMiss("arm site operands")
   }
-  leaf()
+  let il = ARM_IDX_NODE
+  let ii = 0
+  if r.asOps.length == 2 {
+    const ix = r.asOps[1]
+    if ix is OImm && repPrim(ix.oiRep) == "i32" {
+      il = ARM_IDX_IMM
+      ii = ix.oiBits as% i32
+    } else if ix is OStr {
+      il = ARM_IDX_STR
+    } else {
+      il = plainVarLocal(ix)
+      if il < 0 { return irLMiss("arm site index") }
+    }
+  }
   const from = irLIndexFrom(r.asAt, lwBuf.length)
+  let bl = -1
+  if r.asStash {
+    // Legacy takes the stash before it writes the box, so the box's own scratch locals follow it.
+    bl = sharedFieldRecvSlot()
+    irLOpnd(r.asOps[0])
+    fbLocalSet(bl)
+  } else {
+    bl = plainVarLocal(r.asOps[0])
+    if bl < 0 { return irLMiss("arm site receiver") }
+    leaf()
+  }
+  const sp = emitFnSpanNode.length
+  const sh = shIdxNode.length
   if armSiteWrite(r.asAt, bl, il, ii, lw.irAt) < 0 { return -1 }
-  irLIndexRow(r.asAt, from)
+  adoptBankedRows(sp, sh)
+  // Only an element read banks a row of its own (`emitIndexBanked`).
+  if nodeAt(r.asAt) is Index { irLIndexRow(r.asAt, from) }
   return 0
+}
+
+// Takes the element-read rows legacy's writer banked since marks `sp` and `sh` as this lowering's,
+// which `fragmentRows` banks again; a writer banks no other kind.
+function adoptBankedRows(sp: i32, sh: i32) {
+  let k = sp
+  while k < emitFnSpanNode.length {
+    if emitFnSpanKind[k] != 6 { return irLMiss("arm site banked row") }
+    lwRowAst.push(emitFnSpanNode[k])
+    lwRowFrom.push(emitFnSpanStart[k])
+    lwRowTo.push(emitFnSpanEnd[k])
+    lwRowKind.push(6)
+    k = k + 1
+  }
+  let q = sh
+  while q < shIdxNode.length {
+    lwRowAst.push(shIdxNode[q])
+    lwRowFrom.push(shIdxFrom[q])
+    lwRowTo.push(shIdxTo[q])
+    lwRowKind.push(6)
+    q = q + 1
+  }
+  return bankedRowsDrop(sp, sh)
 }
 
 // The local a named variable `o` is read from with a plain `local.get`, or -1: a temp, a staged
@@ -3453,31 +3501,61 @@ function boxAgain(r: RUnionConcreteEq, boxIx: i32): i32 {
 }
 
 // `RUnionConcreteEq` on legacy's null leg: the operand's null test, the box's null tag (or 0), then
-// the plain arm under the leg's `else`, through the tails legacy writes.
+// the plain arm under the leg's `else`, through the tails legacy writes. A side `ucStage` names as
+// parked is read from its slot (`unionStageEffect`'s ops 4 to 6).
 function unionNulEq(r: RUnionConcreteEq, boxIx: i32, otherIx: i32): i32 {
   const np = unionEqNulPlanOf(boxIx, otherIx, lw.irAt)
   if np.unLeg == 0 { return irLMiss("union compare null plan") }
   const qp = np.unPlan
-  unionEqHead()
-  irLOpnd(r.ucOther)
-  unionEqNulTestTail(np.unLeg)
+  const leg = np.unLeg
+  const boxSt = (r.ucStage & 1) != 0
+  const opSt = (r.ucStage & 2) != 0
+  const opFirst = (r.ucStage & 4) != 0
+  if r.ucStage == 0 { unionEqHead() }
+  if opFirst {
+    fbLocalGet(unionEqNulOpSlot(leg))
+  } else {
+    irLOpnd(r.ucOther)
+    if opSt { fbLocalTee(unionEqNulOpSlot(leg)) }
+  }
+  unionEqNulTestTail(leg)
   // The box's first read is its own; each later one its read written again (`ucAgain`).
   let first = true
   if np.unBoxNul {
-    irLOpnd(r.ucBox)
+    parkedOr(boxSt, r.ucBox)
     first = false
     unionEqNullTagTail()
   } else {
     unionEqNoNullTail()
   }
   unionEqNulElse()
-  if first { irLOpnd(r.ucBox) }
+  if boxSt || first { parkedOr(boxSt, r.ucBox) }
   else if boxAgain(r, boxIx) < 0 { return -1 }
   unionEqTagTail(qp)
-  if boxAgain(r, boxIx) < 0 { return -1 }
+  if boxSt { parkedOr(true, r.ucBox) }
+  else if boxAgain(r, boxIx) < 0 { return -1 }
   unionEqPayloadTail(qp)
-  irLOpnd(r.ucOther)
-  return unionEqNulEndTail(qp, np.unLeg == 3, r.ucNe, lw.irAt)
+  if !opSt {
+    irLOpnd(r.ucOther)
+  } else {
+    fbLocalGet(unionEqNulOpSlot(leg))
+    if leg == 1 && unionEqAtomOperandTail(otherIx, lw.irAt) < 0 { return -1 }
+  }
+  if unionEqNulEndTail(qp, leg == 1 || leg == 3, r.ucNe, lw.irAt) < 0 {
+    return -1
+  }
+  if r.ucStage != 0 { unionEqStageClose() }
+  return 0
+}
+
+// The null legs' box: from its slot where it is parked, else operand `o`.
+function parkedOr(parked: boolean, o: Opnd): i32 {
+  if parked {
+    fbLocalGet(unionEqNulBoxSlot())
+    return 0
+  }
+  irLOpnd(o)
+  return 0
 }
 
 // `RUnionEq`: both boxes, then legacy's compare over them (`unionUnionBoxesTail`).
@@ -4102,16 +4180,20 @@ function unionStageEffect(r: RUnionStage, pending: i32[]) {
     unionEqStageClose()
     return 0
   }
+  if r.usOp == 4 {
+    unionEqHead()
+    unionEqNulStageOpen(r.usKind == 1)
+    return 0
+  }
   const roots = stageLead(r.usV, pending)
   if lwMiss != "" { return 0 }
   lwFloors.push(lwFloor)
   lwFloor = lwLive.length - liveCountIn(pending)
   irLOpnd(r.usV)
-  if r.usOp == 1 {
-    unionEqStageSetBox()
-  } else {
-    unionEqStageSetOther(r.usKind)
-  }
+  if r.usOp == 5 { fbLocalSet(unionEqNulOpSlot(r.usKind)) }
+  if r.usOp == 6 { fbLocalSet(unionEqNulBoxSlot()) }
+  if r.usOp == 1 { unionEqStageSetBox() }
+  if r.usOp == 2 { unionEqStageSetOther(r.usKind) }
   liveNeutral()
   irLSettle(pending)
   lwFloor = lwFloors.pop() ?? 0
