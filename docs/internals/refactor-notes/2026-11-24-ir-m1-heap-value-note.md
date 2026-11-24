@@ -40,6 +40,10 @@ missing fact.
 The head with the verifier line removed refuses `heap-value-ret-s.vl`'s `mk` with `fail rule 2 …
 a retag is not …`. The head with the line verifies it.
 
+A literal copied into a local first (`const m = {…}; return m`, `heap-value-const-*`) is covered
+on both seeds and verifies on the head with that line removed. The copy is another variable, with no
+note, and an existing route holds it.
+
 ## Position sweep (Q58), base 26a9bee97 → head, `VL_IR_SHADOW=2`, each side's `f` called
 
 Calling both `f`s fills the result's holes, and then base already covers it. So each position is
@@ -62,4 +66,20 @@ result row's field: a per-position fact, so a separate pre-review.
 
 ## Readings
 
-READINGS
+Base 26a9bee97 and head 309e54827, each built in its own tree, both fixpoint seeds:
+
+| reading | result |
+| --- | --- |
+| mode-6, corpus | 0 prepost differs in 86,260 rows |
+| mode-6, tests/cases | 1 in 69,173 rows: an `error-` case whose own refusal fires early, the same on base |
+| `ir-identity --cases` / `--claimless` / `--names` | 7,858 / 14,462 / 9,433 identical, differ 0 |
+| self-compile | identical; IR shadow 20,550 of 20,550 covered and matched on both |
+| L2 self-compile fuel | +0.05% (126,014,881,024 base); fuel pair output identical |
+| rep-fuzz | exact |
+| A/B over tests/cases | covered 82,218 → 82,222, matched 82,206 → 82,210, mismatch/fail 24 → 24 |
+| census, cases run and trap tiers | base 6,223 of 7,260 fully IR-only; head 6,241 of 7,280 (the 20 cases here) |
+| d15221 cells | each module cmp-identical to legacy's, and its `wasm-dis` too |
+| D17047 | identical |
+
+The keyed verifier cases (`ir_selftest.vl`) are `value-retag-built-heap` (holds),
+`value-retag-other-heap` (rule 2) and `value-retag-field-other-valtype` (rule 2).
