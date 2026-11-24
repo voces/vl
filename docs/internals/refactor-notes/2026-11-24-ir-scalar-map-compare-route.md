@@ -24,4 +24,23 @@ compare (re-read: `mutated`); the start body, a function, a closure and a generi
 
 ## Readings
 
-READINGS
+On fixpoint `7885cb17…` (head `5c747e483`); the base is #9874's head `acb8a92d1`'s fixpoint,
+each census arm run in a tree at its own commit.
+
+| run | base | head |
+|---|---|---|
+| the two `d16846_makergen_map_value_place` cells under `VL_IR_SHADOW=6` | `scalar map compare route` | covered and matched |
+| `ir-only-census.vl`, programs fully IR-only | 6239 of 7261 | 6239 of 7262 (the witness added) |
+| `ir-only-census.vl`, `scalar map compare` rows | 1 (`pair`) | 2 (`pair`, and the witness's `kind`) |
+| legacy A/B, tests/cases + probes, and `--names` | | differ 0 |
+| self-compile fuel per PR, on master `f080c9665` | | +0.05% |
+
+Two readings to keep apart. The census reads only `tests/cases`, so `scalar map compare route`
+(the guard, whose only programs were the two corpus cells) never shows there; its census row
+`scalar map compare pair` is `scalarMapEq`'s own miss for two map reads compared, in
+`maps/scalar-read-miss-is-null-when-consumed.vl`'s start, present on the base too. And the cells'
+`claimless differ 2` was on #9874's intermediate head `1569c0d0`, which covered their `print`
+before the guard: on master the start is unclaimed and claimless-identical.
+
+A first cut asked `eqRouteOf` on every primitive `==`/`!=` and cost +1.37% self-compile fuel; the
+route is now asked only over a bare scalar map read, `scalarMapEqPlanOf`'s own precondition.
