@@ -29,6 +29,7 @@ import {
   asInstMissNullOwn,
   holeOptBoxScalarTy,
   holeOptShapeOf,
+  listFitCaptureStandIn,
   listReserveRegionPushes,
   objLitVariantOmitAt,
   omittedFieldNullNode,
@@ -441,6 +442,7 @@ import {
   unionConcreteEqPlanOf,
   unionEqNulPlanOf,
   unionEqOperandKindOf,
+  unionEqStagedPlanOf,
   unionEqStashPlanOf,
   unionEqVariantRowOf,
   unionIfAtDstWhy,
@@ -775,7 +777,6 @@ import {
   charLitCp,
   exprEffectFree,
   isTestsNull,
-  listIsTestedIdent,
   objFieldSrcOrder,
   objFieldSrcPairs,
   objFieldVal,
@@ -1315,6 +1316,7 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   }
   // Membership over the box's string payload is the `boxLits` arm's test over the same members.
   if ta == "boxLitSet" { return isLitArmsTest(b, n, ix, rep, "boxLits") }
+  if ta == "optField" { return optFieldTest(b, n, ix, rep) }
   const tag = boxTestTagOf(n, ix, arm, ta, vi)
   if ibMiss != "" { return irBMiss(ibMiss) }
   // A record's box field is read raw, at its storage, as legacy's `memStruct` arm reads it.
@@ -2260,7 +2262,8 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   }
   const ta: TagIsArm = if arm == "armTag" { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
   const vi = if arm == "variant" { isVariantTagPlain(ix, ibFnIx) } else { -1 }
-  const tag = if ta == "identBox" || ta == "box" { isArmTagOf(ix, n, ibFnIx) } else if vi >= 0 && vi < uTags.length { uTags[vi] } else { -1 }
+  const memTa = ta == "memStruct" || ta == "memVariant" || ta == "memNarrow"
+  const tag = if ta == "identBox" || ta == "box" || memTa { isArmTagOf(ix, n, ibFnIx) } else if vi >= 0 && vi < uTags.length { uTags[vi] } else { -1 }
   storageReadLeave(mark)
   // Any other rung is the ordinary one, its receiver read at the storage legacy marks.
   if arm != "armTag" && arm != "variant" {
@@ -2285,6 +2288,19 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
       return irBMiss("is stored box receiver")
     }
     return storedValueTagTest(b, n, ix, rep, ta, tag)
+  }
+  // A local record's box field at its storage is the field read raw (`storedMemberBoxTest`); a
+  // global's read unboxes its narrowed field, legacy's arm does not.
+  if memTa && tag >= 0 {
+    const mr = nodeAt(unwrapParen(n.isObj))
+    if (
+      !(mr is Member)
+      || ibFnIx < 0
+      || localIndexOf(ibFnIx, unwrapParen(mr.memObj)) < 0
+    ) {
+      return irBMiss("is stored member receiver")
+    }
+    return storedMemberBoxTest(b, n, ix, rep, tag)
   }
   if arm == "armTag" && (ta != "identBox" || tag < 0) {
     return irBMiss("is arm tag " + ta)
@@ -4141,6 +4157,35 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   return irBMiss("read of " + n.identName)
 }
 
+// A `string | null` capture read where its type bears no null: its slot, then the `ref.as_non_null`
+// legacy writes for it (`emitCapturedReadRecover`), at the plain string.
+function capturedStrRecovered(
+  b: i32[],
+  fe: i32,
+  name: string,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  if repPrim(rep) != "str" { return irBMiss("capture recover rep") }
+  if cloLifted(fe) {
+    // A lifted function's capture is its own parameter, recovered as a local read is.
+    const v = liftCapVar(fe, name, -1)
+    if v < 0 || !strNullable(ib.irVars[v].vRep) {
+      return irBMiss("capture recover")
+    }
+    const o: Opnd = { ov: v }
+    return irBLetTempTy(
+      b,
+      { rcV: o, rcAt: ix, rcNn: 1 },
+      ix,
+      rep,
+      heldTy(exprTyOf(ix)),
+    )
+  }
+  const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
+  return irBLetTempTy(b, ev, ix, rep, heldTy(exprTyOf(ix)))
+}
+
 // The type read `ix` of global `d` at rep `rep` is held at: the read's own, or the type the
 // binding holds where the read's leaves a variable open and the held type's rep is `rep`.
 function globalReadTy(d: i32, ix: i32, rep: i32): i32 {
@@ -4200,7 +4245,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   const fe = fnStmtsPosOf(ibFnIx)
   const name = n.identName
   if captureValKind(fe, name) == "nulstr" && nulStrReadRecovers(ix, ibFnIx) {
-    return irBMiss("capture recover")
+    return capturedStrRecovered(b, fe, name, ix, rep)
   }
   const cr = capRepFor(fe, name, if unbox { -1 } else { rep })
   // A nullable capture read at the member the checker narrowed it to: the capture at its own rep.
@@ -4243,8 +4288,8 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     return irBMiss("capture binding")
   }
   if !cloLifted(fe) {
-    // An `is K[]`-tested capture may read the empty list legacy stands in (D4935).
-    if listIsTestedIdent(unwrapParen(ix)) {
+    // An `is K[]`-tested capture legacy reads as an empty `K[]` of its own (D4935).
+    if listFitCaptureStandIn(name, ix, ibFnIx, false, []) >= 0 {
       return irBMiss("capture list test")
     }
     const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
@@ -4482,11 +4527,20 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
         if t is OVar { v = t.ov }
       }
     }
-    if v < 0 || ib.irVars[v].vRep != r {
+    if v < 0 {
       irBMiss("closure env capture")
       return out
     }
     const o: Opnd = { ov: v }
+    // A closure held apart from its environment slot only in its holes is the same struct, retagged.
+    if ib.irVars[v].vRep != r {
+      if !holeRetagNoted(ib.irVars[v].vRep, r, true) {
+        irBMiss("closure env capture")
+        return out
+      }
+      out.push(repTemp(b, { rgV: o }, ix, r))
+      continue
+    }
     out.push(o)
   }
   return out
@@ -6493,7 +6547,8 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   }
   const unionIf = arm == "union" && nodeAt(unwrapParen(c.callArgs[0])) is IfStmt
   const from = b.length
-  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else { irBExpr(b, c.callArgs[0]) }
+  // An atom arm, or its `K | null`, streams the id its operand is held at (`emitStashAtomId`).
+  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else if want == "atom" || want == "nulAtom" { exprAt(b, c.callArgs[0], true) } else { irBExpr(b, c.callArgs[0]) }
   if ibMiss != "" { return 0 }
   // Legacy opens a nullable string's or boolean's print blocks before its operand, so a valued
   // `if` in it would sit above them.
@@ -6506,6 +6561,8 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   const vr = irBOpRep(v)
   const p = repPrim(vr)
   let ok = p != null && p == want
+  // A boolean read at an i32 rep (a hole instance's parameter) is the same i32 the bool arm prints.
+  if want == "bool" && p != null && p == "i32" { ok = true }
   if want == "nulStr" { ok = strNullable(vr) }
   if want == "nulBool" { ok = boolNullable(vr) }
   if want == "atom" { ok = repNodeAt(vr) is RAtom }
@@ -7380,11 +7437,11 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     const lr = nodeAt(unwrapParen(dn.binLeft))
     const vr = if heldAsBox(dst) && lr is Index { repNodeOfTy(tyMapValOf(mapRecvTyIn(lr.idxArr, ibFnIx))) } else { -1 }
     if vr >= 0 {
-      const v = coalesce(b, dn, du, vr)
+      const v = coalesce(b, dn, du, vr, false)
       if ibMiss != "" { return v }
       return boxTemp(b, v, du, dst)
     }
-    return coalesce(b, dn, du, dst)
+    return coalesce(b, dn, du, dst, false)
   }
   // A read the checker narrowed to `null` is the destination's null where legacy's `nullread` arm
   // writes one (`nullReadDstOwnOf`), not its storage's.
@@ -7887,8 +7944,8 @@ export function irBAtomKindRep(k: i32, r: i32): boolean {
 
 // A temp at destination rep `dst`, typed at it, holding `r` for delivery node `ix`.
 // Struct row `row`'s field `fi` set to a typed `null` at node `ix`, held at the record's kid rep
-// `k`. A kid rep its own type does not intern to, as a recursive record's first nullable self
-// field's can be (D17075), is a named miss: the temp would hold a rep its type does not name.
+// `k`. A kid rep its own type does not intern to is a named miss: the temp would hold a rep its
+// type does not name.
 function fieldNullTemp(b: i32[], row: i32, fi: i32, ix: i32, k: i32): Opnd {
   if repNodeOfTy(repTyOf(k)) != k { return irBMiss("record field null rep") }
   return repTemp(b, { fnRow: row, fnFi: fi }, ix, k)
@@ -8068,6 +8125,97 @@ function unionSideOf(ix: i32): boolean {
 
 // A union box against a concrete operand (`eqRouteOf`'s `unionLeft`/`unionRight`, `swap` the
 // latter) on legacy's plain plan: the box a variable read twice, the operand at the arm's rep.
+// A union compare whose operand has effects, as `emitUnionEqStaged` writes it: its level opened,
+// each side built and parked in source order, the level closed, then the tails over the slots.
+function unionStagedEq(
+  b: i32[],
+  n: BinExpr,
+  boxIx: i32,
+  otherIx: i32,
+  k: i32,
+  ix: i32,
+  rep: i32,
+  swap: boolean,
+): Opnd {
+  if rep != ibBool { return irBMiss("union compare rep") }
+  if !(k >= 0 && k <= 5 || k == 11 || listWrapHeapOfKind(k) >= 0) {
+    return irBMiss("union staged compare kind")
+  }
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  irBNode(
+    b,
+    { efRhs: { usOp: 0, usV: none, usKind: k, usAt: ix } },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  if !swap && stagedBox(b, boxIx, k, ix) < 0 { return irBMiss(ibMiss) }
+  if stagedOperand(b, otherIx, k, ix) < 0 { return irBMiss(ibMiss) }
+  if swap && stagedBox(b, boxIx, k, ix) < 0 { return irBMiss(ibMiss) }
+  irBNode(
+    b,
+    { efRhs: { usOp: 3, usV: none, usKind: k, usAt: ix } },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  return irBLetTemp(
+    b,
+    { uqsNe: n.binOp == "!=", uqsSwap: swap, uqsAt: ix },
+    ix,
+    rep,
+  )
+}
+
+// A staged compare's box, built and parked; -1 on a miss.
+function stagedBox(b: i32[], boxIx: i32, k: i32, ix: i32): i32 {
+  const bx = irBExpr(b, boxIx)
+  if ibMiss != "" { return -1 }
+  if !heldAsBox(irBOpRep(bx)) {
+    irBMiss("union staged compare box")
+    return -1
+  }
+  irBNode(
+    b,
+    { efRhs: { usOp: 1, usV: bx, usKind: k, usAt: ix } },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  return 0
+}
+
+// A staged compare's operand, delivered at arm kind `k` as `emitUnionEqOther` writes it, and parked.
+function stagedOperand(b: i32[], otherIx: i32, k: i32, ix: i32): i32 {
+  const wt = numCastKindTy(k)
+  let o: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  if k == 2 { o = deliverStr(b, otherIx) }
+  else if wt >= 0 { o = deliver(b, otherIx, repNodeOfTy(wt), wt) }
+  else { o = irBExpr(b, otherIx) }
+  if ibMiss != "" { return -1 }
+  const orep = irBOpRep(o)
+  const orn = repNodeAt(orep)
+  let ok = false
+  if wt >= 0 { ok = orep == repNodeOfTy(wt) }
+  else if k == 11 { ok = orn is RClosure }
+  else if listWrapHeapOfKind(k) >= 0 { ok = orn is RList }
+  else if k == 2 { ok = repPrim(orep) == "str" }
+  else if k == 1 { ok = orep == ibBool }
+  else { ok = repPrim(orep) == "i32" }
+  if !ok {
+    irBMiss("union staged compare operand rep")
+    return -1
+  }
+  irBNode(
+    b,
+    { efRhs: { usOp: 2, usV: o, usKind: k, usAt: ix } },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  return 0
+}
+
 // A union box against a number on legacy's cross-width door: the box, then the number at its own
 // kind (`emitUnionEqOther`), each read once, then legacy's tail (`unionNumCrossTail`).
 function unionNumCrossEq(
@@ -8154,6 +8302,11 @@ function unionConcreteEq(
 ): Opnd {
   const boxIx = if swap { n.binRight } else { n.binLeft }
   const otherIx = if swap { n.binLeft } else { n.binRight }
+  // An operand with effects: both sides parked once each, in source order (D17068).
+  const sp = unionEqStagedPlanOf(boxIx, otherIx, ibFnIx)
+  if sp.uqKind >= 0 {
+    return unionStagedEq(b, n, boxIx, otherIx, sp.uqKind, ix, rep, swap)
+  }
   const qp0 = unionConcreteEqPlanOf(boxIx, otherIx, ibFnIx)
   // A record operand legacy compares on its variant door, field by field.
   if qp0.uqKind < 0 {
@@ -8924,7 +9077,14 @@ function spreadSrcBuild(
 }
 
 // `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.
-function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+// `cell` as `exprAt`'s: an arm that writes its left operand alone passes it to that operand.
+function coalesce(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  cell: boolean,
+): Opnd {
   const arm = coalArmOf(n, ix, ibFnIx)
   if arm == "closed" { return coalClosed(b, n, ix, rep) }
   if arm == "chain" { return coalChain(b, n, ix, rep) }
@@ -8946,6 +9106,7 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     || arm == "fieldFlat"
     || arm == "popElem"
   ) {
+    if cell { return exprAt(b, n.binLeft, true) }
     return coalAsBuilt(b, unwrapParen(n.binLeft), rep, arm)
   }
   if arm == "deadJoin" {
@@ -10715,7 +10876,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if n.binOp == "=" { return assignValue(b, n, ix, rep) }
     const bt = binNulTestOf(n)
     if bt != null { return nulTest(b, n, bt, ix, rep) }
-    if n.binOp == "??" { return coalesce(b, n, ix, rep) }
+    if n.binOp == "??" { return coalesce(b, n, ix, rep, cell) }
     // A union box against a concrete operand is legacy's union compare, by legacy's own route.
     if (
       (n.binOp == "==" || n.binOp == "!=")
@@ -11210,6 +11371,33 @@ function shiftMaskFold(b: i32[], f: i64[], w: i32, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { poOp: "and", poArgs: [s, m] }, ix, rep)
 }
 
+// `x?.f is K` over a record's box field `f` (`ROptRead` with a tag), as legacy's `optField` arm writes
+// it: an unstaged base `x` that owes no recover, a variable read twice.
+function optFieldTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  const om = unwrapParen(n.isObj)
+  if om < 0 || om >= P.nodes.length { return irBMiss("is optional field node") }
+  const m = nodeAt(om)
+  if !(m is OptMember) { return irBMiss("is optional field node") }
+  const base = unwrapParen(m.omObj)
+  if base < 0 || base >= P.nodes.length || nodeAt(base) is OptMember {
+    return irBMiss("is optional field chain")
+  }
+  if optChainStagesRecv(om) || optChainStagesRecv(m.omObj) {
+    return irBMiss("is optional field staged")
+  }
+  if readOwesNonNullRecover(m.omObj, ibFnIx) {
+    return irBMiss("is optional field recover")
+  }
+  const tag = isArmTagOf(ix, n, ibFnIx)
+  if tag < 0 { return irBMiss("is optional field tag") }
+  const v = irBExpr(b, m.omObj)
+  if ibMiss != "" { return v }
+  if !(v is OVar) || v.ov < 0 || ib.irVars[v.ov].vKind == "temp" {
+    return irBMiss("is optional field base")
+  }
+  return irBLetTemp(b, { orV: v, orAt: ix, orTag: tag }, ix, rep)
+}
+
 // A standalone `?.` over one link and an unstaged base (`ROptRead`), as `emitOptMemberValueGo`
 // writes it along `optLeafArmOf`: the base is a variable read twice, which owes no recover.
 function optRead(b: i32[], n: OptMember, ix: i32, rep: i32): Opnd {
@@ -11231,7 +11419,7 @@ function optRead(b: i32[], n: OptMember, ix: i32, rep: i32): Opnd {
   if !(r is OVar) || r.ov < 0 || ib.irVars[r.ov].vKind == "temp" {
     return irBMiss("optional read base")
   }
-  return irBLetTempTy(b, { orV: r, orAt: ix }, ix, rep, ty)
+  return irBLetTempTy(b, { orV: r, orAt: ix, orTag: -1 }, ix, rep, ty)
 }
 
 // A string literal at the `str` rep, or delivered as its destination's interned atom.
