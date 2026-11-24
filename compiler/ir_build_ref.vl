@@ -19,6 +19,7 @@ import {
   SEffect,
   SIf,
   StrOp,
+  repBoxCore,
   repPrim,
   repWhat,
 } from "./ir"
@@ -34,6 +35,7 @@ import { isStorageRead, storageReadEnter, storageReadLeave } from "./emit_elab"
 import { identDeclOf } from "./symbols"
 import {
   atomNullable,
+  boxedNullable,
   declRowReadTy,
   deliverStr,
   heldAsBox,
@@ -378,14 +380,23 @@ function refUnboxedAt(n: Index, ix: i32, fnIx: i32, rep: i32): boolean {
   return u >= 0 && irBAtomKindRep(u, rep)
 }
 
-// Whether a union-box field read `ix` leaves rep `rep` by the unbox legacy writes after it
-// (`unionFieldNarrowUnboxOf`): the box itself, or the atom it unboxes to. A container is a miss.
-function narrowUnboxRepIs(ix: i32, rep: i32): boolean {
+// Whether a union-box field read `ix` of member `n` off variant record `r` leaves rep `rep` by the
+// unbox legacy writes after it (`unionFieldNarrowUnboxOf`): the box itself, as a box or as the
+// nullable boxed on that field's box (`boxedNullable`), or the atom it unboxes to.
+function narrowUnboxRepIs(ix: i32, r: i32, n: Member, rep: i32): boolean {
   return match unionFieldNarrowUnboxOf(ix, irBFnIx()) {
     "container" => false
     "atom" | "unbox" => irBAtomKindRep(unionFieldUnboxKindOf(ix, irBFnIx()), rep)
-    "none" => repNodeAt(rep) is RBox
+    "none" => repNodeAt(rep) is RBox || boxedNullable(rep) && fieldBoxOf(r, n, rep)
   }
+}
+
+// Whether boxed nullable `rep` rides the box variant record `r` stores field `n` in.
+function fieldBoxOf(r: i32, n: Member, rep: i32): boolean {
+  const k = repRecordKidOf(r, nodeTyAt(n.memObj, irBFnIx()), n.memProp)
+  const ks = repNodeKids(r)
+  if k < 0 || k >= ks.length { return false }
+  return ks[k] == rep || repBoxCore(ks[k]) == repBoxCore(rep)
 }
 
 // Whether a narrowed variant field `n` of record rep `r` reads at `rep` as its tail writes it: the
@@ -551,7 +562,11 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   const idx = narrowedFieldPlain(ix, irBFnIx())
   if repNodeAt(r) is RRecord && idx >= 0 {
     if narrowedFieldIsUnionBox(ix, irBFnIx()) {
-      if !narrowUnboxRepIs(ix, rep) {
+      if !narrowUnboxRepIs(ix, r, n, rep) {
+        // A boxed nullable on another box than the field's is the narrower refusal.
+        if boxedNullable(rep) {
+          return irBMiss("narrowed field unbox nullable disc")
+        }
         return irBMiss("narrowed field unbox rep")
       }
     } else if !fieldReadsAt(r, n, rep) {
