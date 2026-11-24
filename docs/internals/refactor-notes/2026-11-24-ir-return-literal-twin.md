@@ -9,9 +9,10 @@
   functions, returned from a generic (list rows differ); its own PRE-REVIEW follows. Its
   non-generic spelling is [D17384](../inventory/D17384.md), a loud emit reject.
 - `cells/b000017`, `b000057`, `b000058`, `b000418`, `b000498`: blocked first on
-  `object variant field box` / `object variant field i64` (lane N5); their return is a BOUND
-  literal (`const cc = { r: null }; return cc`) held at the result's variant row, the next step
-  once N5's fix lands.
+  `object variant field box` / `object variant field i64` (lane N5). Their return is a BOUND
+  literal (`const cc = { r: null }; return cc`); N5's fix types the binding at the variant row
+  legacy stores it at, so on N5's seed the first four match with no `return coercion` left, and
+  `b000498` stops at `array element coercion`. Re-graded once N5's branch lands.
 
 ## Mechanism
 
