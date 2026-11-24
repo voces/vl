@@ -214,3 +214,31 @@ a `nulstruct` cell, whose `globalCellStructIdx` is its record's row (row 0, heap
   `tests/cases/closures/heap-capture-annotated-binding-{fn-body,block}.vl`: measured here it is
   no `declaration coercion` miss on either seed in any of four frame shapes; the block frames keep
   only `start uncovered closure env capture` (N7's class).
+
+## Parked: N6's three map-read-default cells (queue ruling 2026-11-24, option 1)
+
+b011298, b011299 and b021775 (`uncovered map read default rep`) stay named misses. In `mapGetOr`,
+`rep` is `g1`'s target, fixed by the caller from `storeRowTyOf`'s `{r: null}` row (a row a
+`{r: null}` literal minted, D14890's own-row rule), while the map's value and the default build
+at `{r: i32 | null}` on the same struct. The two closes are both out: (a) the narrowing retag
+`{r: i32 | null}` → `{r: null}` is refused as clause 1, since a stored non-null `r` read through the
+narrower view reads wrong; (b) holding `g1` at its checked type's rep moves `storeRowTyOf` for every
+such let. "Let at checked rep over a narrow-minted row (D14890), Q57" is a FREE design item.
+
+## 4a: the "no heap of its own" a cell or capture note rests on is held (a guard)
+
+`noteCellHeap` and `noteCapHeap` note a heap only when `recHeapOf(rep)` reads -1. That -1 is now
+recorded (`askRecordHeapNone`, emit_rep.vl) and re-asked at `rowFieldAsksCheck`: if the type has
+gained a heap by then (`recordHeapAll`: its own, else its storage row's), emit fails with
+`internal: … (recordHeapNone)`. A guard, not a fix — no stale note was constructible:
+- 0 trips over tests/cases and the 10,827 named cells. Two hand-built attempts run correctly
+  without tripping: a cell read noted before a later function mints a literal of the same shape,
+  and a capture read noted before a later `{f: null}` global.
+- Control (the hold re-asked at `>= -1`, so it fires on every recorded -1): fires on the cell
+  witness `tests/cases/globals/heap-nullable-cell-narrowed-two-fields.vl` and the capture witness
+  `tests/cases/closures/heap-capture-unannotated-binding-fn-body.vl`. Over the 7,082 `// @run`
+  programs of tests/cases it fires on 6, all heap-identity witnesses (`closures/heap-capture-*`
+  ×3, `globals/heap-nullable-cell-*` ×3); it does not fire on the self-compile.
+- Readings vs #9851's head (ad2259f5): mode-6 corpus 0 of 86,272; `--cases` 7,800, `--claimless`
+  14,459, `--names` 9,433, differ 0 each; L2 +0.02%; census 6,170 of 7,220 runs on both arms;
+  regress.vl 0 runs → not-runs, 0 → silent (261,224 census cells, 11,223 named).
