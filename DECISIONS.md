@@ -13063,5 +13063,8 @@ What the host does with a claimed module the engine refuses (`claims_off_rebuild
   - 0 claimed invalid modules over 93,094 generated capability-matrix programs.
 - **Held at zero** by the gate row `ir claim refusals` (`ir-parity.vl --pop refusals`).
 - **The fallback leaves at I8** (ir-design-2026-11.md, after the step table).
-- **Still open:** the TS hosts (LSP, playground, the V8 corpus oracle) take the claimed bytes without
-  the fallback. They follow in a separate PR.
+- **`vl check --codegen` is strict** (coordinator ruling, same day): an invalid claimed module
+  reports at the validate stage. The claims-off fallback applies to `vl build`, `vl run` and the TS
+  hosts only. A claimed escape is an IR bug to fix, so no `@emit-error` case for it goes in tests/cases.
+- **The TS hosts** (the LSP's compile, the playground's Run, the V8 corpus oracle) take the same
+  fallback (`lsp/src/claimFallback.ts`, #9848). The oracle is strict, as a gate.
