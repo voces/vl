@@ -355,6 +355,12 @@ cost more than about two hours. Byte identity cannot prove such a function, so b
 - `scripts/ir-identity.sh` then prints `expected divergence <program> (<functions>)` for that
   program and passes it, but only when every function whose body differs is listed for it. An
   unlisted function or program still reds as `DIFF`.
+- The armed shadow subtracts the same pairs: `ir-shadow.vl` (every mode but `--claims` and
+  `--blockers`) and `tests/vl_ir_shadow_test.ts`'s row files turn a listed program's byte
+  mismatches into `expected divergence` when a detail build (`$VL_IR_SHADOW=2`) names each one,
+  each a listed function (`f@1` is the detail row's `f`, `__start__@1` its `@start`). An
+  unlisted function, a mismatch the detail cannot name (it names at most three a class), or any
+  non-bytes row (a verifier failure, spans, order) still reds.
 - `vl run scripts/ir-parity.vl` is the proof. It builds each program with the IR on (the seed) and
   off (the `CLAIMED`-empty twin), runs both, and compares stdout, exit code and trap message.
   Any `differs` or one-sided `build-fails` reds, and so does a byte differ the baseline does not
