@@ -1774,8 +1774,14 @@ Deno.test({
       "walk-pair-map-value-off-type": 3,
       "walk-pair-string-index": 0,
       "walk-pair-string-index-of-bool": 2,
+      "walk-map-value-record": 0,
+      "walk-map-value-off-rep": 2,
+      "walk-map-key-i32": 0,
+      "walk-map-key-off-rep": 2,
       "map-scalar-join-of-i32": 0,
       "map-scalar-join-of-string": 2,
+      "map-print-of-i32": 0,
+      "map-print-of-string": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
