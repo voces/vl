@@ -1641,6 +1641,8 @@ Deno.test({
       "pop-or-default-never-call": 0,
       "dead-return-after-never-call": 0,
       "never-call-value-at-consumer-rep": 0,
+      "dead-never-temp-at-consumer-rep": 0,
+      "dead-never-bound-to-non-temp": 3,
       "returning-call-temp-typed-never": 3,
       "never-call-value-into-bool": 2,
       "never-field-read-at-its-storage": 0,
