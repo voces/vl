@@ -29,7 +29,7 @@ record's cast.
 
 | cells (each template) | before | after |
 |---|---|---|
-| 47 (binding, argument, return, fn_body, closure_capture, blocks, global_*, local_assign, the TEST-gated is_in_* / else_if / early_return_guard / *_place reads, other_member) | `global read coercion` (global) / `narrowed read` in a function (local) | covered, matched |
+| 46 (binding, argument, return, fn_body, closure_capture, blocks, global_*, local_assign, the TEST-gated is_in_* / else_if / early_return_guard / *_place reads, other_member) | `global read coercion` (global) / `narrowed read` in a function (local) | covered, matched |
 | 2 `array_push` | `global read coercion` | `assignment value box after an operand` |
 | 6 `struct_field_*` | `object field arm unbox` | unchanged — its own class: a narrowed box local into a record field misses the same |
 | 6 `map_*` | `map store value variant box` | unchanged — its own class (the narrowed-local twin misses the same) |
@@ -39,7 +39,7 @@ Mode 1 per cell: covered and matched 92 → 138 (of 138) in each template, 0 mis
 134 kept cells are claimless-identical under both seeds (`ir-identity --claimless`, identical 134,
 differ 0); `capability-matrix.vl --before/--after` reads runs 66 of 66 in both, 0 runs → not-runs.
 
-tests/cases (mode 1): covered and matched 74,728 → 74,730; `uncovered global read coercion` 3 → 1
+tests/cases (mode 1, master ec119adc0): covered and matched 74,999 → 75,001; `uncovered global read coercion` 3 → 1
 (`closures/closure-store-struct-union-global`, `functions/return-assign-expression-global` now
 covered, matched).
 
