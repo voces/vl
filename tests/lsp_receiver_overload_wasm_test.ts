@@ -12,6 +12,7 @@ import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { pathToUri } from "../lsp/src/moduleGraph.ts";
 import {
   definitionAt,
+  documentSymbolsAt,
   type FeatureContext,
   type FeatureWorkspace,
   hoverAt,
@@ -136,4 +137,75 @@ Deno.test({
   if (!refs.includes(`${main}@3:6`)) throw new Error(`size refs: want ${main}@3:6 among ${JSON.stringify(refs)}`);
   const h = await hoverAt(ONE_MAIN, { line: 3, character: 7 }, ctx);
   if (!h?.includes("size: (self: C) => i32")) throw new Error(`size hover: want its signature, got ${JSON.stringify(h)}`);
+});
+
+// One module declares both candidates (the intra-module extension of O1). The declarations
+// sit on lines 2 and 3, `tag` at columns 9..12; the entry's calls on lines 6 and 7.
+const SET_SRC = "type K = { k: i32 }\ntype L = { l: string }\n" +
+  'function tag(self: K): string { return "K" }\nfunction tag(self: L): string { return "L" }\n' +
+  'const k: K = { k: 1 }\nconst l: L = { l: "s" }\nprint(k.tag())\nprint(l.tag())\n';
+files["/proj/set.vl"] = SET_SRC;
+const tagDecl = (line: number) => ({ start: { line, character: 9 }, end: { line, character: 12 } });
+
+Deno.test({
+  name: "receiver overload, one module: go-to-definition picks each call's candidate",
+  ignore,
+}, async () => {
+  const ctx = ctxFor("/proj/set.vl");
+  // A same-file definition carries no module key.
+  want("k.tag()", { range: tagDecl(2) }, await definitionAt(SET_SRC, { line: 6, character: 9 }, ctx));
+  want("l.tag()", { range: tagDecl(3) }, await definitionAt(SET_SRC, { line: 7, character: 9 }, ctx));
+});
+
+Deno.test({
+  name: "receiver overload, one module: find-references names one candidate's declaration and call",
+  ignore,
+}, async () => {
+  const ctx = ctxFor("/proj/set.vl");
+  const ws = workspaceFor("/proj/set.vl", ["/proj/set.vl"]);
+  const pick = async (line: number) =>
+    ((await referencesAt(SET_SRC, { line, character: 9 }, true, ctx, ws)) ?? [])
+      .map((r) => `${r.range.start.line}:${r.range.start.character}`)
+      .sort();
+  want("refs from k.tag()", ["2:9", "6:8"], await pick(6));
+  want("refs from l.tag()", ["3:9", "7:8"], await pick(7));
+});
+
+Deno.test({
+  name: "receiver overload, one module: hover shows the plain name and the candidate's signature",
+  ignore,
+}, async () => {
+  const ctx = ctxFor("/proj/set.vl");
+  const k = await hoverAt(SET_SRC, { line: 6, character: 9 }, ctx);
+  const l = await hoverAt(SET_SRC, { line: 7, character: 9 }, ctx);
+  if (!k?.includes("tag: (self: K) => string")) throw new Error(`k hover: want K's signature, got ${JSON.stringify(k)}`);
+  if (!l?.includes("tag: (self: L) => string")) throw new Error(`l hover: want L's signature, got ${JSON.stringify(l)}`);
+});
+
+Deno.test({
+  name: "receiver overload, one module: the outline names each candidate by its plain name",
+  ignore,
+}, async () => {
+  const ctx = ctxFor("/proj/set.vl");
+  const names = ((await documentSymbolsAt(SET_SRC, ctx)) ?? []).map((s) => s.name);
+  want("outline", ["K", "L", "tag", "tag", "k", "l"], names);
+});
+
+// An importer of a set one module declares: `import { tag }` binds every candidate.
+const SETLIB_SRC = 'export type K = { k: i32 }\nexport type L = { l: string }\n' +
+  'export function tag(self: K): string { return "K" }\nexport function tag(self: L): string { return "L" }\n';
+const SETMAIN_SRC = 'import { K, L, tag } from "./setlib"\nconst k: K = { k: 1 }\nconst l: L = { l: "s" }\n' +
+  "print(k.tag())\nprint(l.tag())\n";
+files["/proj/setlib.vl"] = SETLIB_SRC;
+files["/proj/setmain.vl"] = SETMAIN_SRC;
+
+Deno.test({
+  name: "receiver overload, one module imported: go-to-definition and hover pick each call's candidate",
+  ignore,
+}, async () => {
+  const ctx = ctxFor("/proj/setmain.vl");
+  want("k.tag()", { key: "/proj/setlib.vl", range: { start: { line: 2, character: 16 }, end: { line: 2, character: 19 } } }, await definitionAt(SETMAIN_SRC, { line: 3, character: 9 }, ctx));
+  want("l.tag()", { key: "/proj/setlib.vl", range: { start: { line: 3, character: 16 }, end: { line: 3, character: 19 } } }, await definitionAt(SETMAIN_SRC, { line: 4, character: 9 }, ctx));
+  const l = await hoverAt(SETMAIN_SRC, { line: 4, character: 9 }, ctx);
+  if (!l?.includes("tag: (self: L) => string")) throw new Error(`l hover: want L's signature, got ${JSON.stringify(l)}`);
 });
