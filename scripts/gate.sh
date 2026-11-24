@@ -151,7 +151,7 @@ row_mem() {
     "dead-export budget"|"render-parse budget") echo 600 ;;
     "late demands") echo 500 ;;
     "self ir misses") echo 1600 ;;
-    "ir claim refusals"|"ir claim cross") echo 4400 ;;
+    "ir claims"|"ir claim refusals"|"ir claim cross") echo 4600 ;;
     "lsp typecheck"|"inventory refs") echo 400 ;;
     *) echo 200 ;;
   esac

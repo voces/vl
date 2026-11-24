@@ -11,7 +11,8 @@
 // class the baseline does not list counts as 0 there). A count that fell prints and passes,
 // and `--write-baseline` records the current counts. Exit 2 is the harness failing: a chunk
 // trapped or timed out, or the host printed no rows. Run it from the checkout root; chunks
-// run `$JOBS` at a time (default 4). `--blockers` runs the blocker census (`$VL_IR_SHADOW=4`) and
+// run `$JOBS` at a time (default 4), and the programs `heavy-programs.txt` names run after them in
+// one process, so two multi-GB builds never overlap. `--blockers` runs the blocker census (`$VL_IR_SHADOW=4`) and
 // prints, per set of one or two miss classes, the functions that set alone keeps uncovered: the
 // functions a coverage step unblocks, an upper bound since a statement stops at its first miss.
 // `--claims` builds disarmed (`$VL_IR_SHADOW=5`), as shipped, and exits 1 on any `claim fell back`
@@ -44,6 +45,28 @@ const DIVERGENCE = "scripts/ir-divergence-baseline.txt"
 const ORDER = "prepost"
 const PREFIX = "[ir] "
 const CHUNK = 200
+const HEAVY = "scripts/silent-sweep/distilled/heavy-programs.txt"
+
+// The programs `heavy-programs.txt` names: a row id (`D3417`, its staged witness) or a checkout
+// path. Each builds at a multi-GB peak, so `measure` runs them after the fan-out, one process.
+function heavyKeys(): string[] {
+  const out: string[] = []
+  for line in split(readOr(HEAVY), "\n") {
+    if line == "" || startsWith(line, "#") { continue }
+    const t = line.indexOf("\t")
+    out.push(if t < 0 { line } else { line.slice(0, t) })
+  }
+  return out
+}
+
+// Whether `path` is a program `keys` names: a witness staged under its row id, or that path.
+function isHeavy(path: string, keys: readonly string[]): boolean {
+  for k in keys {
+    if startsWith(k, "D") && path.indexOf("/" + k + "/") >= 0 { return true }
+    if path == k || endsWith(path, "/" + k) { return true }
+  }
+  return false
+}
 
 // The value after `flag` in the arguments, or `dflt`.
 function argOr(args: readonly string[], flag: string, dflt: string): string {
@@ -179,12 +202,19 @@ function measure(
   if paths.length == 0 { return m }
   const vl = envOr("VL", "scripts/vl-host/target/release/vl")
   const root = makeTempDir()
+  // A heavy program never shares the fan-out: two in parallel chunks would sum their peaks.
+  const keys = heavyKeys()
+  const light: string[] = []
+  const heavy: string[] = []
+  for p in paths {
+    if isHeavy(p, keys) { heavy.push(p) } else { light.push(p) }
+  }
   const chunks: string[] = []
   let i = 0
-  while i < paths.length {
+  while i < light.length {
     const f = root + "/chunk-" + toString(chunks.length)
-    const end = if i + CHUNK < paths.length { i + CHUNK } else { paths.length }
-    writeText(f, join(paths.slice(i, end), "\n") + "\n")
+    const end = if i + CHUNK < light.length { i + CHUNK } else { light.length }
+    writeText(f, join(light.slice(i, end), "\n") + "\n")
     chunks.push(f)
     i = end
   }
@@ -194,13 +224,22 @@ function measure(
     + mode
     + " timeout 1200 \"$0\" check --codegen --compiler \"$1\" $(cat \"$2\")"
     + " > /dev/null 2> \"$2.err\"; echo $? > \"$2.rc\""
-  const x = spawn(
-    "sh",
-    fanOutArgv(root + "/chunks", jobs, ["sh", "-c", sh, vl, seed]),
-  )
-  if x.code != 0 {
-    spawn("rm", ["-rf", root])
-    die("ir-shadow: the chunk fan-out failed (rc=\{x.code})\n\{x.err}", 2)
+  if chunks.length > 0 {
+    const x = spawn(
+      "sh",
+      fanOutArgv(root + "/chunks", jobs, ["sh", "-c", sh, vl, seed]),
+    )
+    if x.code != 0 {
+      spawn("rm", ["-rf", root])
+      die("ir-shadow: the chunk fan-out failed (rc=\{x.code})\n\{x.err}", 2)
+    }
+  }
+  // The heavy programs, after the fan-out has finished: one process, so one heavy peak at a time.
+  if heavy.length > 0 {
+    const f = root + "/chunk-heavy"
+    writeText(f, join(heavy, "\n") + "\n")
+    chunks.push(f)
+    spawn("sh", ["-c", sh, vl, seed, f])
   }
   for f in chunks {
     const rc = parseI32(trim(readOr(f + ".rc")))
