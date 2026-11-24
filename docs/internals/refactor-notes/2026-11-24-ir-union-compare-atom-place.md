@@ -35,6 +35,21 @@ reports a mismatch rather than writing wrong code.
 
 None new: `unionEqAtomOperandTail` (S1's staged leg) and #9829's `opndAgain` second read.
 
-## Readings (base @@BASE@@, fixpoint seeds on both sides)
+## Readings (base 24f48936, fixpoint seeds on both sides)
 
-@@READINGS@@
+| reading | result |
+| --- | --- |
+| distilled corpus, mode 4 | `union compare plan` 26 → 0 (`d17065_box_atom_{n,x}_{param,global,call}_{L,R}`, `d17065_mix_atom_*_param`, `d17065_op_atom_{n,x}_{eq,ne}_{field,global}`); no other row moved |
+| tests/cases (IR-only census) | `union compare plan` 109 → 0 (`atomNoNull` and the sweep's 108); no other row moved; fully IR-only programs 6,162 → 6,164; self-compile 0 missed |
+| Q58 sweep (`union-eq-atom-null-leg-operand-positions.vl`, `VL_IR_SHADOW=6`) | 108 positions: 9 positions × parameter, field and global × `==` and `!=` × a box with and without `null` (K = `"a" \| "b"`, operand `null`, `"a"`, `"b"`); base 108 miss, head 108 matched; output identical; claimless identical 2 of 2 (sweep and shadow row) |
+| `ir-identity.sh <base> <head> --names` | identical 9433, differ 0, built under one only 0; self-compile identical |
+| `ir-identity.sh --cases` | identical 7788, fail under both 68, differ 0; witnesses same 61, differ 0 |
+| `ir-identity.sh --claimless` | identical 14459, differ 0 |
+| legacy A/B (tests/cases + probes) | 7,856 programs, 0 moved |
+| L2 self-compile fuel per PR | +0.01% on 125,882,218,463 |
+| late demands / late tag rows | 9 (baseline 9) / 307 (baseline 307, 0 gone) |
+| `self ir misses` | 0 (baseline 0) |
+| `lint-self`, `gate.sh --fast` | clean, passed |
+| IR tests, door guard, emitter audit (`SELFHOST_NATIVE_ALIGN=1`) / `vl_deep_nesting_test.ts` | 553 passed / 8 passed, 0 failed |
+| shadow row `union-compare-atom-place-operand.vl` | head 4 covered = matched; base 1, 3 `union compare plan` |
+| control `irShadowCorrupt(8)` | the verifier refuses the marked compare |
