@@ -9405,6 +9405,20 @@ function atomOperand(ix: i32): boolean {
   return repNodeAt(r) is RAtom || atomNullable(r)
 }
 
+// A `==`/`!=` over two `null`-typed sides, as legacy's `emitNulNoneEq` writes it: each side for
+// its effect, left then right, where the answer is read, then the constant; a bare `null` or a
+// name read runs nothing.
+function nulNonePairEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const effs: Opnd[] = []
+  const le = nulNoneEffect(b, n.binLeft, ix, effs)
+  if ibMiss != "" { return le }
+  const re = nulNoneEffect(b, n.binRight, ix, effs)
+  if ibMiss != "" { return re }
+  const eq: Opnd = { oiRep: rep, oiBits: if n.binOp == "==" { 1 } else { 0 } }
+  if effs.length == 0 { return eq }
+  return irBLetTemp(b, { aeEff: effs, aeV: eq, aeAt: ix }, ix, rep)
+}
+
 // A `==`/`!=` against a `null` literal, by legacy's own route: a dead test, or a `null`-typed
 // pair (`nulNoneEqSides`), is its constant; then the null test's arm (`nulTestArmOf`) with the
 // direction the dispatch hands it. Built: a niche's compare, a nullable ref's or string's typed
@@ -9419,13 +9433,9 @@ function nulTest(
   const dn = deadNullTestOperand(n, ibFnIx)
   if dn >= 0 { return deadNulTest(b, n, dn, ix, rep) }
   // A `null`-typed pair is legacy's constant (`emitNulNoneEq`): each side runs for its effect,
-  // which a bare `null` or a name read has none of (`nulNoneWritesNothing`).
+  // left then right, where the answer is read, and a bare `null` or a name read runs nothing.
   if nulNoneEqSides(n.binLeft, n.binRight, ibFnIx) {
-    if !nulNoneWritesNothing(n.binLeft) || !nulNoneWritesNothing(n.binRight) {
-      return irBMiss("null test of null")
-    }
-    const eq: Opnd = { oiRep: rep, oiBits: if n.binOp == "==" { 1 } else { 0 } }
-    return eq
+    return nulNonePairEq(b, n, ix, rep)
   }
   const arm = nulTestArmOf(bt.bnRef, ibFnIx, bt.bnInvert, false)
   if arm == "mapHas" { return nulTestMapHas(b, bt, ix, rep) }
@@ -12105,6 +12115,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       }
       // Guard: legacy's route and the IR's disagree; miss rather than ship the operator's bytes.
       return irBMiss("scalar map compare route")
+    }
+    if (
+      (n.binOp == "==" || n.binOp == "!=")
+      && nulNoneEqSides(n.binLeft, n.binRight, ibFnIx)
+      && eqRouteOf(n, ix, ibFnIx) == "nulNone"
+    ) {
+      return nulNonePairEq(b, n, ix, rep)
     }
     const p = binPrimOp(n.binOp, opUnsigned(n.binLeft))
     if p == null || n.binIdent != 0 { return irBMiss("operator " + n.binOp) }
