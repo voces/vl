@@ -238,6 +238,7 @@ import {
   GlobalCtx,
   IntSwitchPlan,
   MapSetValArm,
+  NUL_STRUCT_EQ_NO_ROW,
   ObjLitArm,
   PrintArm,
   StructFieldArm,
@@ -383,6 +384,7 @@ import {
   nulNicheBoxTagOf,
   nulNicheEqWhy,
   nulNoneWritesNothing,
+  nulStructEqRowOf,
   nullReadDstOwnOf,
   numCastKindOf,
   numCastKindTy,
@@ -7394,6 +7396,19 @@ function closureEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // (`structEqStagesLeft`/`Right`) must be a variable, read from its local. A field or index place
 // re-read is a named miss.
 function structEqOp(b: i32[], n: BinExpr, ix: i32, rep: i32, row: i32): Opnd {
+  return structEqOpAt(b, n, ix, rep, row, false)
+}
+
+// `structEqOp`, `nul` the nullable records' guarded compare (`emitNulStructEq`), which reads no
+// operand at a ref list element place.
+function structEqOpAt(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  row: i32,
+  nul: boolean,
+): Opnd {
   if repPrim(rep) != "bool" { return irBMiss("record compare result rep") }
   const lS = structEqStagesLeft(n.binLeft, n.binRight)
   const rS = structEqStagesRight(n.binRight)
@@ -7414,9 +7429,25 @@ function structEqOp(b: i32[], n: BinExpr, ix: i32, rep: i32, row: i32): Opnd {
   const rIx: Opnd[] = []
   if ls.length > 1 { lIx.push(ls[1]) }
   if rs.length > 1 { rIx.push(rs[1]) }
+  if nul && (lIx.length > 0 || rIx.length > 0) {
+    return irBMiss("nullable record eq element place")
+  }
+  // A bare record beside a nullable one is legacy's same guard over a non-null side, written
+  // with locals the IR does not declare: a named miss until it does.
+  if nul && (!refNullable(irBOpRep(l)) || !refNullable(irBOpRep(r))) {
+    return irBMiss("nullable record eq bare side")
+  }
   return irBLetTemp(
     b,
-    { seL: l, seR: r, seAt: ix, seRow: row, seLIx: lIx, seRIx: rIx },
+    {
+      seL: l,
+      seR: r,
+      seAt: ix,
+      seRow: row,
+      seLIx: lIx,
+      seRIx: rIx,
+      seNul: nul,
+    },
     ix,
     rep,
   )
@@ -7521,6 +7552,12 @@ function structEqVarOpnd(o: Opnd): boolean {
 // built again, as legacy writes it again. A nullable record's compare is a named miss.
 function nulNicheEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const why = nulNicheEqWhy(ix, ibFnIx)
+  // Two nullable records compare field-wise under a nullness guard (`emitNulStructEq`).
+  if why == "nullable record eq" {
+    const row = nulStructEqRowOf(ix, ibFnIx)
+    if row == NUL_STRUCT_EQ_NO_ROW { return irBMiss("nullable record eq row") }
+    return structEqOpAt(b, n, ix, rep, row, true)
+  }
   if why != "" { return irBMiss(why) }
   if repPrim(rep) != "bool" { return irBMiss("nullable eq result rep") }
   const l = eqOperandRaw(b, n.binLeft)
