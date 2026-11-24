@@ -5906,7 +5906,7 @@ function holderCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   }
   const pk = holderPickOf(ix, ibFnIx)
   // A holder captured whole is read at the record its capture holds (`capTyOf`).
-  const v = if calleeIsCapture(c.callFn) { bundleCaptureRead(b, c.callFn) } else { irBExpr(b, c.callFn) }
+  const v = if calleeIsCapture(c.callFn) { bundleCaptureRead(b, c.callFn) } else { holderRecordOf(b, c.callFn) }
   if ibMiss != "" { return missRhs("holder callee") }
   const crep = repNodeOfTy(pk.bpTy)
   if !(repNodeAt(crep) is RClosure) { return missRhs("holder member rep") }
@@ -12809,13 +12809,45 @@ function blockCut(b: i32[]): boolean {
   return n is STrap && n.tpWhy == TRAP_BLOCK_CUT
 }
 
+// The record a bundle holder `f` holds, which a pick reads a member of: a global holding it beside
+// `null` (a map read) is read narrowed to the record, its recover legacy's `ref.as_non_null`.
+function holderRecordOf(b: i32[], f: i32): Opnd {
+  const r = unwrapParen(f)
+  if r >= 0 && r < P.nodes.length && nodeAt(r) is Ident && globalTarget(r) {
+    const d = identDeclOf(r)
+    const g = globalIndexOfSid(sidOfNode(r))
+    const cr = globalRep(g, d)
+    const ht = globalHolderTy(d)
+    const hr = if ht >= 0 { repNodeOfTy(ht) } else { -1 }
+    const cn = repNodeAt(cr)
+    if (
+      hr >= 0
+      && cn is RNullable
+      && cn.rnInner == hr
+      && repNodeAt(hr) is RRecord
+    ) {
+      const gm = irGlobalReadMiss(g, ibGlobalCtx())
+      if gm != "" { return irBMiss(gm) }
+      const gr: Rhs = {
+        ggSym: g,
+        ggNonNull: globalReadRecovers(sidOfNode(r), r, ibFnIx),
+        ggNn: 0,
+      }
+      ib.irReadAgain[r] = gr
+      ib.irGlobalHeld[g] = true
+      return irBLetTempTy(b, gr, r, hr, ht)
+    }
+  }
+  return irBExpr(b, f)
+}
+
 // `let` `ix` (variable `v`) initialised with a bundle holder's read: the holder's record, then the
 // member the binding's type names (`RHolderPick`), at the binding's rep and type.
 function holderPickLet(b: i32[], n: LetDecl, ix: i32, v: i32): i32 {
   if !(repNodeAt(ib.irVars[v].vRep) is RClosure) {
     return skip("holder pick binding rep")
   }
-  const rec = exprAt(b, n.letInit, false)
+  const rec = holderRecordOf(b, n.letInit)
   if ibMiss != "" { return 0 }
   if !(repNodeAt(irBOpRep(rec)) is RRecord) {
     return skip("holder pick record")
