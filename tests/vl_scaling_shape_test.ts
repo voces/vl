@@ -2709,6 +2709,36 @@ axis(
   (d) => twoFiles(d, genRecordUnionReturns(64), genRecordUnionReturns(16)),
 );
 
+// Receiver overloading within one module (receiver-overloading-intra-module-proposal.md §8): a
+// library declaring `sets` two-candidate sets, the rest of its 280 `self`-functions one-candidate,
+// every one reached from `main` by the type-bound rung. Both arms hold the same functions and
+// calls; 140 sets against 35, so a per-call scan over a module's sets is what separates them.
+const writeOverloadSets = (dir: string, sets: number): string => {
+  Deno.mkdirSync(dir, { recursive: true });
+  const total = 140;
+  const o = ["export type A = { a: i32 }", "export type B = { b: i32 }"];
+  for (let i = 0; i < total; i++) {
+    const [na, nb] = i < sets ? [`op${i}`, `op${i}`] : [`opa${i}`, `opb${i}`];
+    o.push(`export function ${na}(self: A, k: i32) { return self.a + k * ${i % 7} }`);
+    o.push(`export function ${nb}(self: B, k: i32) { return self.b - k * ${i % 5} }`);
+  }
+  Deno.writeTextFileSync(`${dir}/lib.vl`, o.join("\n") + "\n");
+  const main = ['import { A, B } from "./lib"', "const x: A = { a: 1 }", "const y: B = { b: 2 }", "let acc = 0"];
+  for (let i = 0; i < total; i++) {
+    const [na, nb] = i < sets ? [`op${i}`, `op${i}`] : [`opa${i}`, `opb${i}`];
+    main.push(`acc = acc + x.${na}(${i % 3}) + y.${nb}(${i % 4})`);
+  }
+  main.push("print(acc)");
+  Deno.writeTextFileSync(`${dir}/main.vl`, main.join("\n") + "\n");
+  return `${dir}/main.vl`;
+};
+axis(
+  "receiver-overload sets in one module",
+  2.5,
+  "A member call looks its name up among the module's sets (`ovSetOf`, compiler/ast.vl) or its exported scope rows (`ufcsExportedScopeIn`) by a scan; key them by (module, name) once.",
+  (d) => [writeOverloadSets(`${d}/many`, 140), writeOverloadSets(`${d}/one`, 35)],
+);
+
 // THE FUEL AND ALLOCATION GRADERS' CONTROL. The same program at 20x the statements against 1x:
 // twenty times the work by construction, so it must red a 2.5 bar on fuel and on allocation
 // (which reads 4.50: a fixed cost rides on both arms), and only a broken reading (no line
