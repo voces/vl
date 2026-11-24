@@ -694,6 +694,7 @@ import {
 } from "./emit_value_sites"
 import {
   armSiteReads,
+  asgLitUnionMemberReRead,
   asgReReadEnter,
   asgReReadLeave,
   asgReReadOf,
@@ -779,6 +780,7 @@ import {
   cloLiftWriteCapAt,
   cloLiftWriteCount,
   cloLiftWriteSlot,
+  coalLinkChainOf,
   emitErr,
   emitFailed,
   emitSoftFail,
@@ -867,6 +869,7 @@ import { forInBindTy } from "./check_leaf_steps"
 import {
   listGetIdxReReadable,
   optChainStagesRecv,
+  optRecvReReadable,
   sFieldTgtStructIdx,
   structIndexOfTy,
 } from "./emit_atom_kinds"
@@ -1244,6 +1247,8 @@ let ibReservePushes: i32[][] = []
 // The fully unrolled range loops being built, by `ForRange`, and the constant each copy's
 // variable reads, innermost last. Stacks, not a map: a map delete anywhere in the compiler makes
 // every map it builds dearer.
+// By the null-test `if` of a minted `??` link's `holeMap` arm, the link's type (`chainLinkTy`).
+let ibLinkIfTy: {[i32]: i32} = Map()
 let ibRangeImmAt: i32[] = []
 let ibRangeImmVal: i32[] = []
 let ibBool = -1
@@ -2787,6 +2792,17 @@ function openCoalMapTy(ix: i32): i32 {
   return if inner >= 0 { inner } else { mt }
 }
 
+// The type of `??` link `ix` the chain re-association minted, its chain's (`coalLinkChainOf`); of a
+// minted link's `holeMap` null test, the link's (`ibLinkIfTy`); -1 for any other node.
+function chainLinkTy(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if n is BinExpr && n.binOp == "??" {
+    const ch = coalLinkChainOf(ix)
+    return if ch >= 0 { exprTyOf(ch) } else { -1 }
+  }
+  return ibLinkIfTy[ix] ?? -1
+}
+
 // The rep of `openCoalMapTy`'s type, or -1.
 function openCoalMapRep(ix: i32): i32 {
   const t = openCoalMapTy(ix)
@@ -2916,6 +2932,11 @@ export function exprTyOf(ix: i32): i32 {
   }
   if ix < 0 || ix >= P.nodes.length { return t }
   const n = nodeAt(ix)
+  // A `??` link a chain's re-association minted, or its `holeMap` null test, is of its chain's type.
+  if t < 0 && (n is BinExpr || n is IfStmt) {
+    const lt = chainLinkTy(ix)
+    if lt >= 0 { return lt }
+  }
   // A field typed open of a receiver the IR builds closed is of that field's type there.
   if n is Member && irTyOpen(t) {
     const ft = builtFieldTy(n)
@@ -3287,7 +3308,15 @@ function rowlessLetTy(d: i32, ty: i32, rep: i32): i32 {
   }
   const s = declaredSlotOfDecl(d)
   const slot = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
-  return rowlessStoredTy(ty, rep, irSlotRowTy(slot))
+  const st = rowlessStoredTy(ty, rep, irSlotRowTy(slot))
+  if st >= 0 || !letIsArmCell(d) { return st }
+  // An arm cell holds its rowless record at the variant row legacy's `emitVariantCoerce` builds.
+  const vi = letArmCellRow(d, ibFnIx)
+  return rowlessStoredTy(
+    ty,
+    rep,
+    if vi >= 0 && vi < uVarTyIx.length { uVarTyIx[vi] } else { -1 },
+  )
 }
 
 // Loop variable `d` read at `ix`: the walk's variable, or in a fragment the element's slot at the
@@ -7812,9 +7841,10 @@ function structEqSide(b: i32[], ix: i32, staged: boolean): Opnd[] {
     const mid = b.length
     const i = irBExpr(b, nd.idxIndex)
     if ibMiss != "" { return [i] }
-    if (b.length != mid || !recv || !(i is OImm || structEqVarOpnd(i))) {
-      return [irBMiss("record compare element place")]
-    }
+    const idx = i is OImm
+      || structEqVarOpnd(i) && b.length == mid
+      || structEqPlaceRead(b, mid, i, nd.idxIndex)
+    if !recv || !idx { return [irBMiss("record compare element place")] }
     return [v, i]
   }
   const o = irBExpr(b, ix)
@@ -10080,6 +10110,7 @@ function coalesce(
   if arm == "chain" { return coalChain(b, n, ix, rep) }
   if arm == "niche" { return coalNiche(b, n, ix, rep) }
   if arm == "popOr" { return coalPopOr(b, n, ix, rep) }
+  if arm == "listGetOr" { return coalListGetOr(b, n, ix, rep) }
   // A map read joining a union is legacy's synthesized null-test `if` (`coalNullTestIf`), built
   // as the valued `if` it is.
   if arm == "mapJoinIf" {
@@ -10112,9 +10143,14 @@ function coalesce(
     // The left's effects are written where the value is read, as legacy writes the whole `??`.
     return irBLetTemp(b, { aeEff: effs, aeV: d, aeAt: ix }, ix, rep)
   }
-  // A hole's map read is legacy's null-test `if` too (`coalHoleMapIfOf`).
+  // A hole's map read is legacy's null-test `if` too (`coalHoleMapIfOf`), a minted link's of the
+  // link's type, which it carries none of.
   if arm == "holeMap" {
-    const v = irBExpr(b, coalHoleMapIfOf(n, ix, ibFnIx))
+    const hi = coalHoleMapIfOf(n, ix, ibFnIx)
+    if coalLinkChainOf(unwrapParen(ix)) >= 0 && nodeTyAt(hi, ibFnIx) < 0 {
+      ibLinkIfTy[hi] = exprTyOf(ix)
+    }
+    const v = irBExpr(b, hi)
     if ibMiss != "" { return v }
     if irBOpRep(v) != rep { return irBMiss("coalesce holeMap rep") }
     return v
@@ -10261,6 +10297,63 @@ function coalPopOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
       cbL: l,
       cbLB: [],
       cbArm: "popOr",
+      cbNull: nb,
+      cbOut: t,
+      cbAt: ix,
+      cbMap: null,
+    },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// The fused `xs.get(i) ?? d` over a scalar list (legacy's `emitListGetOr`): its shared head reads
+// the receiver and the index twice from the call, so only operands it re-reads in place are
+// taken; the default is built into the `else` arm at the element rep, as `coalPopOr`'s.
+function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const c = nodeAt(unwrapParen(n.binLeft))
+  if !(c is Call) || c.callFn < 0 || c.callArgs.length != 1 {
+    return irBMiss("coalesce listGetOr call")
+  }
+  const m = nodeAt(c.callFn)
+  if !(m is Member) { return irBMiss("coalesce listGetOr call") }
+  if !optRecvReReadable(m.memObj) || !listGetIdxReReadable(c.callArgs[0]) {
+    return irBMiss("coalesce listGetOr staged operand")
+  }
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce listGetOr after an operand") }
+  const l = irBExpr(b, m.memObj)
+  if ibMiss != "" { return l }
+  const ln = repNodeAt(irBOpRep(l))
+  if !(ln is RList) || ln.rlsElem != rep {
+    return irBMiss("coalesce listGetOr result rep")
+  }
+  const at = b.length
+  const i = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return i }
+  if b.length != at || irBOpRep(i) != repNodeOfTy(TY_I32) {
+    return irBMiss("coalesce listGetOr index operand")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  if !coalNeverDefault(nb, n.binRight, rep) {
+    const d = irBExpr(nb, n.binRight)
+    if ibMiss != "" { return d }
+    if irBOpRep(d) != rep { return irBMiss("listGetOr default conversion") }
+    irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  }
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  irBNode(
+    b,
+    {
+      cbL: l,
+      cbLB: [],
+      cbArm: "listGetOr",
       cbNull: nb,
       cbOut: t,
       cbAt: ix,
@@ -12027,6 +12120,14 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     ) {
       return irBMiss("compare of a joined const atom")
     }
+    // Legacy compares such an assignment's re-read atom by its own fold, which no IR compare
+    // route writes.
+    if (
+      (n.binOp == "==" || n.binOp == "!=")
+      && (asgMemberReReadAt(n.binLeft) || asgMemberReReadAt(n.binRight))
+    ) {
+      return irBMiss("assignment-value atom re-read as a compare operand")
+    }
     // A union box against a concrete operand is legacy's union compare, by legacy's own route.
     if (
       (n.binOp == "==" || n.binOp == "!=")
@@ -12743,6 +12844,13 @@ function assignValueNullLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("assignment value nullLit rep")
   }
   return repTemp(b, { nuAt: lit, nuOwn: own, nuRead: [] }, ix, rep)
+}
+
+// Whether `ix`, under any parentheses, is an assignment storing one member of a literal-union
+// place, which legacy yields as the re-read atom (`asgLitUnionMemberReRead`).
+function asgMemberReReadAt(ix: i32): boolean {
+  const x = unwrapParen(ix)
+  return x >= 0 && asgLitUnionMemberReRead(x, ibFnIx)
 }
 
 // Whether identifier `ix` names a module global's `let`, not a local or a capture.
@@ -14454,6 +14562,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   lbPlanDrop(null)
   ibRangeImmAt = []
   ibRangeImmVal = []
+  ibLinkIfTy = Map()
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
   ibOwnDecls = Map()
