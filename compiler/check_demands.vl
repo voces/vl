@@ -39,6 +39,7 @@ import {
   MC_RUNG_BUILTIN,
   MC_RUNG_FIELD,
   MatchExpr,
+  Member,
   NullLit,
   OP_INDEX_GET,
   OP_INDEX_SET,
@@ -76,8 +77,10 @@ import {
   ovInstRecvTy,
   ovInstSite,
   ovLocalCount,
+  ovModOfNode,
   ovSetBad,
   ovSetCands,
+  ovSetMod,
   ovSetOf,
   ovSetSpecs,
   ovSiteSetOf,
@@ -200,6 +203,7 @@ import {
   LIP_MEET,
   LIP_OPEN,
   MC_LAYOUT_MARK,
+  calleeCallOf,
   cstrOwnerTop,
   cvNow,
   cvPick,
@@ -394,6 +398,7 @@ import {
   declParamsAfterSelf,
   diagDataField,
   namedOrderFixData,
+  ovKeyedSplit,
   ovRecvHeads,
   ovRefuseMsg,
   paramIndexOfName,
@@ -443,6 +448,7 @@ import {
   identBoundFnDeclOf,
   mergedDeclKeyOf,
   moduleNameTyOf,
+  scopeBindsNonFnNamed,
 } from "./check_scopes"
 import { jwRecordSite, noteRetJoin } from "./check_side_rows"
 import {
@@ -1921,9 +1927,70 @@ export function memberFloorErr(objTy: i32, prop: string, ix: i32) {
     msg
       + unkeyedSubscriptNote(ix)
       + getterNarrowNote(objTy, ix)
-      + builtinMethodNote(objTy, prop, ix),
+      + builtinMethodNote(objTy, prop, ix)
+      + keyedMethodNote(objTy, prop, ix),
     ix,
   )
+}
+
+// `; did you mean \`a.lt(…)\`…?` for `a.ltF32x4(…)` on an `F32x4`, when a receiver-overload set
+// `lt` this call reaches takes the type the name ends in, and no local binding hides `lt`.
+function keyedMethodNote(objTy: i32, prop: string, ix: i32): string {
+  if ovSetMod.length == 0 { return "" }
+  const sp = ovKeyedSplit(prop, ovModOfNode(ix))
+  if (
+    sp.length != 2
+    || tyToStrUser(objTy) != sp[1]
+    || scopeBindsNonFnNamed(sp[0])
+  ) {
+    return ""
+  }
+  let recv = -1
+  const mn = nodeAt(ix)
+  if mn is Member { recv = mn.memObj }
+  return "; did you mean `"
+    + keyedCallSpelling(recv, callArgsOfCallee(ix), 0, sp[0])
+    + "`, the `"
+    + sp[0]
+    + "` that takes `"
+    + sp[1]
+    + "`?"
+}
+
+// The arguments of the call whose callee is node `ix`, else [].
+export function callArgsOfCallee(ix: i32): i32[] {
+  const ci = calleeCallOf(ix)
+  if ci >= 0 {
+    const c = nodeAt(ci)
+    if c is Call { return c.callArgs }
+  }
+  const none: i32[] = []
+  return none
+}
+
+// `a.lt(b)` for receiver node `recv` and arguments `args` from `from` on, each spelled by its
+// name when it is a plain identifier; `x` and `…` stand for anything else.
+export function keyedCallSpelling(
+  recv: i32,
+  args: i32[],
+  from: i32,
+  verb: string,
+): string {
+  let r = "x"
+  if recv >= 0 {
+    const o = nodeAt(recv)
+    if o is Ident { r = o.identName }
+  }
+  let a = ""
+  let k = from
+  while k < args.length {
+    const an = nodeAt(args[k])
+    if !(an is Ident) { return r + "." + verb + "(…)" }
+    if k > from { a = a + ", " }
+    a = a + an.identName
+    k = k + 1
+  }
+  return r + "." + verb + "(" + a + ")"
 }
 
 // D1230 at member node `memIx`, else D1570 at call node `ix`, for `recv.prop(argc args)`; false
