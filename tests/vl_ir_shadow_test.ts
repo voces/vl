@@ -217,6 +217,19 @@ Deno.test({
   },
 });
 
+// A record compare's element side over a place receiver banks the element-read rows legacy's
+// own root writes at each field: with them dropped (control 5) the row's spans count reds.
+Deno.test({
+  name: "ir shadow: a record compare's place element side banks its element-read rows",
+  ignore,
+  fn: () => {
+    const row = fileRows.find((r) => r.file.endsWith("/record-compare-element-place.vl"));
+    if (row === undefined) throw new Error("want the record-compare-element-place row, got none");
+    gradeRow(row);
+    reds(() => gradeRow(row, DIVERGENCES, 5), "spans");
+  },
+});
+
 // The tripwire: a row name is one row, inline or in a file, never both and never two files.
 Deno.test({
   name: "ir shadow: no row name is both inline and a file, or two files",
