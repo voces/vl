@@ -35,23 +35,19 @@ census "$SEED_BASE" "$OUT/base" || { echo "ir-only-census-ab: base census failed
 restore
 census "$SEED_HEAD" "$OUT/head" || { echo "ir-only-census-ab: head census failed" >&2; exit 2; }
 trap - EXIT
-python3 -I - "$OUT/base/functions.tsv" "$OUT/head/functions.tsv" <<'PY'
-import collections, sys
-def load(p):
-    d = {}
-    for line in open(p):
-        if line.startswith("#"):
-            continue
-        cls, fn, _ = line.rstrip("\n").split("\t")
-        d[fn] = cls
-    return d
-b, h = load(sys.argv[1]), load(sys.argv[2])
-cb, ch = collections.Counter(b.values()), collections.Counter(h.values())
-print(f"functions missed: {len(b)} -> {len(h)}")
-for k in sorted(set(cb) | set(ch)):
-    if cb[k] != ch[k]:
-        print(f"class\t{k}\t{cb[k]} -> {ch[k]}")
-for f in sorted(set(b) | set(h)):
-    if b.get(f) != h.get(f):
-        print(f"moved\t{f}\t{b.get(f, 'built')} -> {h.get(f, 'built')}")
-PY
+# Each side's `class\tfunction\tprograms` rows: the class counts that moved, then each function
+# whose class differs (`built` where a side has no row).
+awk -F '\t' '
+  /^#/ { next }
+  FNR == NR { b[$2] = $1; cb[$1]++; next }
+  { h[$2] = $1; ch[$1]++ }
+  END {
+    nb = 0; for (f in b) nb++; nh = 0; for (f in h) nh++
+    printf "functions missed: %d -> %d\n", nb, nh
+    for (k in cb) if (cb[k] != ch[k] + 0) printf "class\t%s\t%d -> %d\n", k, cb[k], ch[k] + 0
+    for (k in ch) if (!(k in cb)) printf "class\t%s\t0 -> %d\n", k, ch[k]
+    for (f in b) if (!(f in h)) printf "moved\t%s\t%s -> built\n", f, b[f]
+    for (f in h) if (!(f in b)) printf "moved\t%s\tbuilt -> %s\n", f, h[f]
+      else if (b[f] != h[f]) printf "moved\t%s\t%s -> %s\n", f, b[f], h[f]
+  }
+' "$OUT/base/functions.tsv" "$OUT/head/functions.tsv" | LC_ALL=C sort
