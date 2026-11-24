@@ -124,6 +124,7 @@ import {
   RArmUnbox,
   RAsTail,
   RAsUnion,
+  RAsgUnwiden,
   RAtomEq,
   RAtomSole,
   RAtomStr,
@@ -700,6 +701,7 @@ import {
 } from "./emit_plan_null"
 import {
   NulTestArm,
+  binNulNameTestOf,
   binNulTestOf,
   coalArmOf,
   coalResultKindOf,
@@ -1270,6 +1272,11 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.ncV)
       numCastTail(r.ncAt, lw.irAt)
     }
+    // The cell's re-read, then the opcode narrowing it back, as `emitAsgValue` writes it.
+    RAsgUnwiden => {
+      irLOpnd(r.uwV)
+      wU8(r.uwOp)
+    }
     ROptRead => optRead(r)
     RToBox => boxOp(r)
     RDeadNever => {
@@ -1710,6 +1717,34 @@ function stashIfBoxHead(id: i32) {
   return 0
 }
 
+// Where node `id` opens a tag dispatch a box directly follows (`irBoxLeadFirst`), that box's head,
+// ahead of the dispatch, as legacy writes the dispatch under the box's leading tag.
+function dispatchBoxHead(id: i32) {
+  let i = 0
+  while i < lw.irBoxLeadFirst.length {
+    if lw.irBoxLeadFirst[i] == id {
+      return dispatchBoxHeadOf(lw.irBoxLeadBox[i])
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+function dispatchBoxHeadOf(boxId: i32) {
+  const n = lw.irNodes[boxId]
+  if !(n is SLet) { return irLMiss("dispatch box node") }
+  const r = n.lRhs
+  if !(r is RToBox) { return irLMiss("dispatch box node") }
+  const p = holeBoxPlanOf(r.bxAt, r.bxTy, lw.irAt)
+  if !holeBoxLeads(p.hbArm) {
+    return irLMiss("dispatch box with no leading head")
+  }
+  leaf()
+  holeBoxHead(p, r.bxAt, lw.irAt)
+  lwBoxHeadAt.push(unwrapParen(r.bxAt))
+  return 0
+}
+
 // The head of the box whose value is join out `out`, ahead of the join, as legacy's box leads;
 // `staged` where it lands above the operands an earlier argument staged for the join.
 function joinBoxHead(out: i32, staged: boolean) {
@@ -1925,8 +1960,11 @@ function nulTestOpArm(r: RNulTest): NulTestArm | null {
   if n is IsExpr { return nulTestArmOf(n.isObj, lw.irAt, r.ntInvert, true) }
   if !(n is BinExpr) { return null }
   const bt = binNulTestOf(n)
-  if bt == null { return null }
-  return nulTestArmOf(bt.bnRef, lw.irAt, r.ntInvert, false)
+  if bt != null { return nulTestArmOf(bt.bnRef, lw.irAt, r.ntInvert, false) }
+  // A name read typed `null` against a nullable tests the other operand (`binNulNameTestOf`).
+  const nt = binNulNameTestOf(n, lw.irAt)
+  if nt == null { return null }
+  return nulTestArmOf(nt.bnRef, lw.irAt, r.ntInvert, false)
 }
 
 // `RNulTest`: the operand, then legacy's tail for the arm `nulTestArmOf` names: the atom
@@ -3906,19 +3944,20 @@ function structEq(r: RStructEq) {
   const rS = structEqStagesRight(n.binRight)
   const lE = r.seLIx.length > 0
   const rE = r.seRIx.length > 0
-  // A nullable compare's non-nullable side is legacy's expression root, never a null-tested local.
-  const lB = r.seNul && !(repNodeAt(opRepOf(r.seL)) is RNullable)
-  const rB = r.seNul && !(repNodeAt(opRepOf(r.seR)) is RNullable)
-  const lG = !lS && !lE && (structEqPlaceSide(r.seL) || lB)
-  const rG = !rS && !rE && (structEqPlaceSide(r.seR) || rB)
+  // A nullable compare's non-nullable side is legacy's expression root, never a null-tested local;
+  // a place side, or an element side's place receiver, is re-read at each field the same way.
+  const lB = r.seNul && !lE && !(repNodeAt(opRepOf(r.seL)) is RNullable)
+  const rB = r.seNul && !rE && !(repNodeAt(opRepOf(r.seR)) is RNullable)
+  const lG = !lS && (structEqPlaceSide(r.seL) || lB)
+  const rG = !rS && (structEqPlaceSide(r.seR) || rB)
   const lLoc = if lS || lE || lG { -1 } else { structEqSideLocal(r.seL) }
   const rLoc = if rS || rE || rG { -1 } else { structEqSideLocal(r.seR) }
   if !lS && !lE && !lG && lLoc < 0 || !rS && !rE && !rG && rLoc < 0 {
     return irLMiss("record compare place")
   }
   const plan: EqRootPlan = {
-    erL: if lE { structEqElemPlace(r.seL, r.seLIx[0]) } else { EQ_ROOT_EXPR },
-    erR: if rE { structEqElemPlace(r.seR, r.seRIx[0]) } else { EQ_ROOT_EXPR },
+    erL: if lE { structEqElemPlace(r.seL, r.seLIx[0], lG) } else { EQ_ROOT_EXPR },
+    erR: if rE { structEqElemPlace(r.seR, r.seRIx[0], rG) } else { EQ_ROOT_EXPR },
   }
   if plan.erL.epSlot == -2 || plan.erR.epSlot == -2 {
     return irLMiss("record compare element place")
@@ -3982,13 +4021,14 @@ function structEqRowsBank(lRows: i32[], rRows: i32[]) {
   return 0
 }
 
-// The `elem` root place of a record compare side read as a ref list element: receiver `v` and
-// index `i` from their locals, or `i` an immediate; `epSlot` -2 where one has no local.
-function structEqElemPlace(v: Opnd, i: Opnd): EqRootPlace {
-  const vs = structEqSideLocal(v)
+// The `elem` root place of a record compare side read as a ref list element: receiver `v` from
+// its local, or re-read from its expression (`epSlot` -1) where it is a place, and index `i`
+// from its local or an immediate; `epSlot` -2 where one has neither.
+function structEqElemPlace(v: Opnd, i: Opnd, placeRecv: boolean): EqRootPlace {
+  const vs = if placeRecv { -1 } else { structEqSideLocal(v) }
   const xs = if i is OImm { -1 } else { structEqSideLocal(i) }
   const imm = if i is OImm { i.oiBits as% i32 } else { 0 }
-  const bad = vs < 0 || !(i is OImm) && xs < 0
+  const bad = vs < 0 && !placeRecv || !(i is OImm) && xs < 0
   return {
     epKind: "elem",
     epSlot: if bad { -2 } else { vs },
@@ -4326,6 +4366,7 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
       // A valueless `return` after a call in its tail form writes nothing.
       if !(i > 0 && callReturns(b, i - 1)) {
         const tl = ft[top] && i == b.length - 1 || callReturns(b, i)
+        dispatchBoxHead(id)
         stashIfBoxHead(id)
         const k = ifOpen(id, pending, tl)
         if k == IF_NOT {
