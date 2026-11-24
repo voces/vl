@@ -1771,6 +1771,8 @@ Deno.test({
       const got = exp.irStageFloorSelfTest(k);
       if (got !== want) throw new Error(`stage floor ${what}: want ${want}, got ${got}`);
     }
+    // A door fragment lowered while a root is staged gives the staging's root run back.
+    if (exp.irRootRunFrameSelfTest() !== 1) throw new Error("want the fragment frame to restore the root run");
     // A fit tail that misses leaves legacy's receiver read in place (`fitRecvReadHook`).
     if (exp.irFitTailSelfTest() !== 1) throw new Error("want the fit hook restored after a miss");
     // Each kind legacy's descriptor names alone maps to a type that describes back at that kind.
