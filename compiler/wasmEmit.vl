@@ -1153,6 +1153,7 @@ import {
   atomEqSlotOfKind,
   eqKindIsRecord,
   eqRowFieldCount,
+  eqRowFieldElemTyIx,
   eqRowFieldKind,
   eqRowHeapIdx,
   eqRowOfVariant,
@@ -5836,7 +5837,7 @@ function liftedFnCapturesIn(fe: i32, name: string, fnIx: i32): boolean {
 }
 
 // Whether some lifted closure inside the function at `fnIx` captures `name`.
-export function liftedFnCaptures(name: string, fnIx: i32): boolean {
+function liftedFnCaptures(name: string, fnIx: i32): boolean {
   let k = 0
   while k < cloLiftedFes.length {
     if liftedFnCapturesIn(cloLiftedFes[k], name, fnIx) { return true }
@@ -22750,7 +22751,7 @@ function emitStructEqFieldAt(
     // level: tag first, then the arm the tag selects, reading the two boxes off a field
     // path instead of off two operands. Columns are resolved first, so an arm set the
     // core cannot serve declines before any byte is written and reaches the loud refusal below (D1290).
-    const bxTy = sFieldElemTyIxAt(si, fi)
+    const bxTy = eqRowFieldElemTyIx(si, fi)
     if bxTy >= 0 {
       const bxArms: i32[] = []
       const bxVis: i32[] = []
@@ -27572,7 +27573,7 @@ function memConstFoldRest(a: BinExpr, fnIx: i32): i32 {
 // or -1 when the whole initializer is already constant (nothing to preserve at runtime) or
 // matches neither shape. `emitLetDeclStmt` and `maFoldCandidateCount` share this one answer,
 // since a deviation between them is unsound.
-function memConstFoldShapeK(initIx: i32, fnIx: i32): i64 {
+export function memConstFoldShapeK(initIx: i32, fnIx: i32): i64 {
   const ix = unwrapParen(initIx)
   if ix < 0 || ix >= P.nodes.length { return -1 }
   if memAddrConst(ix, fnIx) >= 0 { return -1 }
@@ -27588,7 +27589,7 @@ function memConstFoldShapeK(initIx: i32, fnIx: i32): i64 {
 
 // The bounded operand `memConstFoldShapeK` found, or -1 when it found none — a second, cheap
 // re-derivation rather than a two-value return, since VL has no tuple type here.
-function memConstFoldShapeRest(initIx: i32, fnIx: i32): i32 {
+export function memConstFoldShapeRest(initIx: i32, fnIx: i32): i32 {
   const ix = unwrapParen(initIx)
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const e = nodeAt(ix)
@@ -27599,7 +27600,7 @@ function memConstFoldShapeRest(initIx: i32, fnIx: i32): i32 {
 // True when `initIx`'s top-level shape is a `+` at all — the one cheap, non-recursive check
 // every caller of `memConstFoldShapeK` runs first, so the real (`memAddrConst`/`memAddrBound`)
 // analysis is skipped for the vast majority of `const`s, which are never address sums.
-function mfShapeIsSum(initIx: i32): boolean {
+export function mfShapeIsSum(initIx: i32): boolean {
   const ix = unwrapParen(initIx)
   if ix < 0 || ix >= P.nodes.length { return false }
   const e = nodeAt(ix)
@@ -27659,15 +27660,20 @@ function maFoldRowOfDecl(declIx: i32): i32 {
   return -1
 }
 
-// The fold table's row for the `Ident` read at `ix`, or -1 — through the slot the read's own
-// declaration names, so a shadowed name in a nested block can never match an outer
+// The row of fold declarations `decls` for the `Ident` read at `ix`, or -1 — through the slot the
+// read's own declaration names, so a shadowed name in a nested block can never match an outer
 // declaration's row.
-function maFoldRowOf(ix: i32): i32 {
+function maFoldRowIn(ix: i32, decls: i32[]): i32 {
   const slot = declaredSlotOf(ix)
   if slot < 0 || slot >= localDeclIx.length { return -1 }
   const decl = localDeclIx[slot]
   if decl < 0 { return -1 }
-  return maFoldRowOfDecl(decl)
+  let i = 0
+  while i < decls.length {
+    if decls[i] == decl { return i }
+    i = i + 1
+  }
+  return -1
 }
 
 // Emits a qualifying `const`'s initializer: push the bounded part, tee it into this
@@ -27741,7 +27747,27 @@ function memAddrAt(arm: MemAddrArm, rest: i32, off: i64): MemAddrPlan {
   return { maArm: arm, maRest: rest, maOff: off }
 }
 
+// A function's declaration-time address-fold rows: each qualifying `const`'s node, the wasm local
+// its bounded part is kept in, and the constant it folds out.
+export type MaFoldRows = { mfDecl: i32[], mfSlot: i32[], mfK: i64[] }
+
 export function memAddrPlanOf(c: Call, base: i32, fnIx: i32): MemAddrPlan {
+  return memAddrPlanWith(
+    c,
+    base,
+    fnIx,
+    { mfDecl: maFoldDeclIx, mfSlot: maFoldWasmSlot, mfK: maFoldK },
+  )
+}
+
+// `memAddrPlanOf` over fold rows `rows`: legacy's own table, or the rows the IR derives before
+// legacy has written the function.
+export function memAddrPlanWith(
+  c: Call,
+  base: i32,
+  fnIx: i32,
+  rows: MaFoldRows,
+): MemAddrPlan {
   let off: i64 = 0
   if c.callArgs.length == base + 1 {
     off = memOffsetConstValue(c.callArgs[1], fnIx)
@@ -27762,11 +27788,11 @@ export function memAddrPlanOf(c: Call, base: i32, fnIx: i32): MemAddrPlan {
   }
   const a = nodeAt(addr)
   if a is Ident {
-    const mf = maFoldRowOf(addr)
+    const mf = maFoldRowIn(addr, rows.mfDecl)
     if mf >= 0 {
-      const k = maFoldK[mf]
+      const k = rows.mfK[mf]
       if k + off <= MEM_OFFSET_MAX {
-        return memAddrAt("fold", maFoldWasmSlot[mf], k + off)
+        return memAddrAt("fold", rows.mfSlot[mf], k + off)
       }
     }
   }
@@ -43242,15 +43268,26 @@ function identityTyIsUnion(ty: i32): boolean {
 // down from `anyref` (a `null` arm's payload is null, which `ref.eq` holds equal to null).
 function emitIdentityOperand(ix: i32, fnIx: i32): i32 {
   if emitExpr(ix, fnIx) < 0 { return -1 }
-  // A read narrowed out of a union's storage still pushes the box (`unionBoxStoreTyOf`).
-  if (
-    identityTyIsUnion(nodeTyInOf(unwrapParen(ix), fnIx))
-    || identityTyIsUnion(unionBoxStoreTyOf(ix, fnIx))
-  ) {
+  identityOperandTail(ix, fnIx)
+  return 0
+}
+
+// After identity operand `ix`'s value: a union box's payload, read as an `eqref`. A read
+// narrowed out of a union's storage still pushes the box (`unionBoxStoreTyOf`). Legacy and the
+// IR share it.
+export function identityOperandTail(ix: i32, fnIx: i32) {
+  if identityOperandUnboxes(ix, fnIx) {
     fbStructGet(uBoxIdx, 1)
     fbRefCastNull(-19) // the abstract `eq` heap type
   }
   return 0
+}
+
+// Whether identity operand `ix`'s value is a union box, read by its payload: a union-typed
+// operand, or a read narrowed out of a union's storage, which still pushes the box.
+export function identityOperandUnboxes(ix: i32, fnIx: i32): boolean {
+  return identityTyIsUnion(nodeTyInOf(unwrapParen(ix), fnIx))
+    || identityTyIsUnion(unionBoxStoreTyOf(ix, fnIx))
 }
 
 // Identity over a union of record and function arms (A15): each operand's payload is staged

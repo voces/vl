@@ -153,6 +153,7 @@ import {
   RHandPick,
   RHolderPick,
   RHoleOptBox,
+  RIdentityEq,
   RInitProgress,
   RJoinNull,
   RListCat,
@@ -173,6 +174,7 @@ import {
   RListSlice,
   RListStage,
   RLitArms,
+  RMaFoldInit,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -339,6 +341,7 @@ import {
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
+  MemAddrPlan,
   armSiteWrite,
   arrCopyBacking,
   arrCopyPlanOf,
@@ -460,6 +463,7 @@ import {
   holeOptBoxTail,
   hostCallTail,
   identListOverrideOf,
+  identityOperandTail,
   idxRowsOn,
   idxSpanOn,
   initBitOf,
@@ -510,7 +514,7 @@ import {
   mapValuesAreKeys,
   memAccessPlanOf,
   memAccessTail,
-  memAddrPlanOf,
+  memAddrPlanWith,
   memOpIsVoid,
   memOpPlanOf,
   memOpTail,
@@ -980,14 +984,13 @@ function liveNeutral() {
 // Takes stack value `v` off the live stack when it is the lowest above the floor, the next a
 // reader in order may take; false, leaving it, when it is not.
 function liveTake(v: i32): boolean {
-  if lwFloor >= lwLive.length || lwLive[lwFloor] != v { return false }
-  // A byte written since the top value ended would land above it, where legacy has it below.
-  if lwBuf.length != lwLiveEnd[lwLive.length - 1] { return false }
+  const at = lwFloor + lwRootRun
+  if !liveTakeOk(lwLive, lwLiveEnd, at, v, lwBuf.length) { return false }
   const rest: i32[] = []
   const ends: i32[] = []
   let i = 0
   while i < lwLive.length {
-    if i != lwFloor {
+    if i != at {
       rest.push(lwLive[i])
       ends.push(lwLiveEnd[i])
     }
@@ -997,6 +1000,24 @@ function liveTake(v: i32): boolean {
   lwLiveEnd = ends
   return true
 }
+
+// Whether `v` is the value at live index `at`, the next a reader in order may take, with no byte
+// written past the top value's end (one would land above it, where legacy has it below).
+function liveTakeOk(
+  live: i32[],
+  ends: i32[],
+  at: i32,
+  v: i32,
+  bufLen: i32,
+): boolean {
+  if at >= live.length || live[at] != v { return false }
+  return bufLen == ends[live.length - 1]
+}
+
+// How many roots `stageLead` leaves below the floor while it stages one above them; 0 otherwise.
+let lwRootRun = 0
+// The outer stagings' runs, as `lwFloors` holds the outer floors.
+let lwRootRuns: i32[] = []
 
 // Puts value `v`, just written, on the live stack.
 function livePush(v: i32) {
@@ -1282,6 +1303,7 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RNulNicheEq => nulNicheEq(r)
     RClosureEq => closureEq(r)
+    RIdentityEq => identityEq(r)
     RFieldNull => {
       leaf()
       if emitOmittedFieldNull(r.fnRow, r.fnFi) < 0 {
@@ -1331,6 +1353,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListNewDefault => listNewDefault(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
+    RMaFoldInit => maFoldInit(r)
     RAtomic => atomic(r)
     RTruncSat => truncSat(r)
     RMemOp => memOp(r)
@@ -1838,7 +1861,7 @@ export function irGlobalWriteMiss(g: i32, c: GlobalCtx): string {
     "plain" => if globalMinted(g) { "" } else { "global index" }
     "promo" => if promoSlotIn(g, c) >= 0 { "" } else { "promoted global write" }
     "immutable" => "immutable global write"
-    "guard" => "guarded global write"
+    "guard" => if globalMinted(g) { "" } else { "global index" }
   }
 }
 
@@ -2624,11 +2647,11 @@ function simd(r: RSimd) {
   const row = simdCallRow(c)
   if !(f is Ident) || row < 0 { return irLMiss("simd node") }
   if simdRowIsMem(row) {
-    const ap = memAddrPlanOf(c, simdMemBase(row), lw.irAt)
-    if ap.maArm != "const" && ap.maArm != "rest" {
+    const ap = irAddrPlan(c, simdMemBase(row))
+    if ap.maArm != "const" && ap.maArm != "rest" && ap.maArm != "fold" {
       return irLMiss("simd memory plan")
     }
-    for a in r.sdArgs { irLOpnd(a) }
+    addrOpnds(r.sdArgs, ap)
     return simdMemTail(row, ap.maOff)
   }
   for a in r.sdArgs { irLOpnd(a) }
@@ -2645,12 +2668,51 @@ function memAccess(r: RMemAccess) {
   const f = nodeAt(c.callFn)
   if !(f is Ident) { return irLMiss("memory access node") }
   const p = memAccessPlanOf(f.identName)
-  const ap = memAddrPlanOf(c, p.mxBase, lw.irAt)
-  if p.mxOp < 0 || (ap.maArm != "const" && ap.maArm != "rest") {
+  const ap = irAddrPlan(c, p.mxBase)
+  if (
+    p.mxOp < 0
+    || ap.maArm != "const" && ap.maArm != "rest" && ap.maArm != "fold"
+  ) {
     return irLMiss("memory access plan")
   }
-  for o in r.mmArgs { irLOpnd(o) }
+  addrOpnds(r.mmArgs, ap)
   return memAccessTail(p, ap.maOff)
+}
+
+// The address plan of memory call `c` (`base` declared operands) over the fold rows the builder
+// derived (`irMaDecl`), as `memAddrPlanOf` answers it over legacy's own.
+function irAddrPlan(c: Call, base: i32): MemAddrPlan {
+  return memAddrPlanWith(
+    c,
+    base,
+    lw.irAt,
+    { mfDecl: lw.irMaDecl, mfSlot: lw.irMaSlot, mfK: lw.irMaK },
+  )
+}
+
+// An access's operands along plan `ap`: on the `fold` arm its address is the fold's local, read in
+// place of the binding the builder named, which holds that local plus the plan's offset.
+function addrOpnds(args: Opnd[], ap: MemAddrPlan) {
+  let i = 0
+  while i < args.length {
+    if i == 0 && ap.maArm == "fold" {
+      fbLocalGet(ap.maRest)
+    } else {
+      irLOpnd(args[i])
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// `RMaFoldInit` as `emitMemConstFoldLet` writes it: the bounded part, teed into its fold local,
+// then plus the folded constant.
+function maFoldInit(r: RMaFoldInit) {
+  irLOpnd(r.mfiV)
+  fbLocalTee(r.mfiSlot)
+  fbI32Const(r.mfiK as% i32)
+  fbI32Bin(0x6a)
+  return 0
 }
 
 // `RAtomic`: legacy's atomic arm in `emitAtomicIntrinsic`'s order: the address the builder took
@@ -2661,9 +2723,11 @@ function atomic(r: RAtomic) {
   const pl = atomicPlanOf(c)
   if pl.apFail != "" { return irLMiss("atomic plan") }
   if pl.apBase == 0 { return atomicTail(pl.apRow, 0) }
-  const ap = memAddrPlanOf(c, pl.apBase, lw.irAt)
-  if ap.maArm != "const" && ap.maArm != "rest" { return irLMiss("atomic plan") }
-  for o in r.amArgs { irLOpnd(o) }
+  const ap = irAddrPlan(c, pl.apBase)
+  if ap.maArm != "const" && ap.maArm != "rest" && ap.maArm != "fold" {
+    return irLMiss("atomic plan")
+  }
+  addrOpnds(r.amArgs, ap)
   return atomicTail(pl.apRow, ap.maOff)
 }
 
@@ -3758,6 +3822,20 @@ function closureEq(r: RClosureEq) {
   return 0
 }
 
+// `RIdentityEq`: legacy's `emitIdentityBin`, each operand then its payload tail, `ref.eq`, and
+// `i32.eqz` for `!==`.
+function identityEq(r: RIdentityEq) {
+  const n = nodeAt(r.ieAt)
+  if !(n is BinExpr) { return irLMiss("identity compare node") }
+  irLOpnd(r.ieL)
+  identityOperandTail(n.binLeft, lw.irAt)
+  irLOpnd(r.ieR)
+  identityOperandTail(n.binRight, lw.irAt)
+  fbRefEq()
+  if n.binOp == "!=" { fbI32Eqz() }
+  return 0
+}
+
 // `RStructEq`: legacy's field-wise record compare (`emitStructEq`): the stashed operands' values,
 // their slots, then the compare, which reads an unstashed operand from its variable's local.
 function structEq(r: RStructEq) {
@@ -4347,7 +4425,19 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
           fbLocalSet(ps)
         }
         "immutable" => irLMiss("immutable global write")
-        "guard" => irLMiss("guarded global write")
+        // Legacy's write-before-init guard, then the write (`emitUserGlobalSet`). A guarded write's
+        // global has an initializer, and only one without has an assigned bit.
+        "guard" => {
+          if !globalMinted(n.gsSym) { return irLMiss("global index") }
+          if initBitOf(n.gsSym) >= 0 {
+            return irLMiss("guarded global write init bit")
+          }
+          cond(n.gsSrc, pending)
+          if emitInitGuard(n.gsSym, "written") < 0 {
+            return irLMiss("guarded global write")
+          }
+          fbGlobalSet(userGlobalIdx(n.gsSym))
+        }
       }
     }
     SEffect => {
@@ -4540,22 +4630,28 @@ function optRead(r: ROptRead) {
   if arm != "nonNull" {
     irLOpnd(r.orV)
     fbRefIsNull()
-    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r) }
+    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r, true) }
     emitOptLinkNullClose(r.orAt, lw.irAt)
     emitOptLeafHead(r.orAt, lw.irAt)
+    optReadBase(r, true)
+  } else {
+    optReadBase(r, false)
   }
-  optReadBase(r)
   emitOptLeafTail(r.orAt, lw.irAt)
   return 0
 }
 
-// The optional read's base as `emitOptChainValue` pushes an unstaged one: its niche recovered.
-function optReadBase(r: ROptRead) {
-  irLOpnd(r.orV)
+// The optional read's base as `emitOptChainValue` pushes an unstaged one, `again` once the null
+// test has read it (a temp's read written again, `opndAgain`): its niche recovered.
+function optReadBase(r: ROptRead, again: boolean) {
   const m = nodeAt(r.orAt)
-  if m is OptMember && exprNullableRefNiche(m.omObj, lw.irAt) {
-    fbRefAsNonNull()
+  if !(m is OptMember) { return irLMiss("optional read node") }
+  if again {
+    if opndAgain(r.orV, m.omObj) < 0 { return -1 }
+  } else {
+    irLOpnd(r.orV)
   }
+  if exprNullableRefNiche(m.omObj, lw.irAt) { fbRefAsNonNull() }
   return 0
 }
 
@@ -4742,7 +4838,13 @@ function stageLead(c: Opnd, pending: i32[]): i32[] {
     const v = pending[i]
     if !readBy.has(v) {
       roots.push(v)
-      if !lwStackVal[v] { stageRoot(v) }
+      if !lwStackVal[v] {
+        // A root's definition reads above the roots already staged below it, which stay there.
+        lwRootRuns.push(lwRootRun)
+        lwRootRun = rootsFloor(lwLive, lwFloor, roots) - lwFloor
+        stageRoot(v)
+        lwRootRun = lwRootRuns.pop() ?? 0
+      }
       lwSeq.push(v)
     }
     i = i + 1
@@ -4767,6 +4869,26 @@ function stageLead(c: Opnd, pending: i32[]): i32[] {
   while pending.length > 0 { pending.pop() }
   for v in rest { pending.push(v) }
   return roots
+}
+
+// The live index just past the run of `roots` that sits in `live` from `floor` up.
+function rootsFloor(live: i32[], floor: i32, roots: i32[]): i32 {
+  const isRoot: {[i32]: boolean} = Map()
+  for r in roots { isRoot[r] = true }
+  let f = floor
+  while f < live.length && isRoot.has(live[f]) { f = f + 1 }
+  return f
+}
+
+// The order rule under `rootsFloor`, keyed: 0 a value above a run of roots is taken (1); 1 a
+// value above a non-root, and 2 one above a non-root sitting over a root, are refused (0).
+export function irStageFloorSelfTest(k: i32): i32 {
+  const roots: i32[] = [1]
+  const live: i32[] = if k == 0 { [1, 3] } else if k == 1 { [2, 3] } else { [1, 2, 3] }
+  const ends: i32[] = []
+  while ends.length < live.length { ends.push(0) }
+  const ok = liveTakeOk(live, ends, rootsFloor(live, 0, roots), 3, 0)
+  return if ok { 1 } else { 0 }
 }
 
 // How many of `vs` are values on the stack.
@@ -5579,6 +5701,8 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwLive = []
   lwLiveEnd = []
   lwFloor = 0
+  lwRootRun = 0
+  lwRootRuns = []
   lwFloors = []
   lwStashAt = []
   lwBoxHeadAt = []
@@ -5626,6 +5750,8 @@ type LwFrame = {
   lfLiveEnd: i32[],
   lfFloor: i32,
   lfFloors: i32[],
+  lfRootRun: i32,
+  lfRootRuns: i32[],
   lfSeq: i32[],
   lfFrames: i32[],
   lfSpanOpen: i32[],
@@ -5655,6 +5781,8 @@ function lwSave(): LwFrame {
     lfLiveEnd: lwLiveEnd,
     lfFloor: lwFloor,
     lfFloors: lwFloors,
+    lfRootRun: lwRootRun,
+    lfRootRuns: lwRootRuns,
     lfSeq: lwSeq,
     lfFrames: lwFrames,
     lfSpanOpen: lwSpanOpen,
@@ -5685,6 +5813,8 @@ function lwRestore(f: LwFrame) {
   lwLiveEnd = f.lfLiveEnd
   lwFloor = f.lfFloor
   lwFloors = f.lfFloors
+  lwRootRun = f.lfRootRun
+  lwRootRuns = f.lfRootRuns
   lwSeq = f.lfSeq
   lwFrames = f.lfFrames
   lwSpanOpen = f.lfSpanOpen
@@ -5700,6 +5830,21 @@ function lwRestore(f: LwFrame) {
   lwPushed = f.lfPushed
   lwPushing = f.lfPushing
   return 0
+}
+
+// Whether a fragment's frame gives back the staging root run it found: a fragment lowered while a
+// root is staged resets the run (`lwReset`), and the outer staging reads on with its own. 1 when so.
+export function irRootRunFrameSelfTest(): i32 {
+  const outer = lwSave()
+  lwRootRun = 2
+  lwRootRuns = [1]
+  const inner = lwSave()
+  lwRootRun = 0
+  lwRootRuns = []
+  lwRestore(inner)
+  const ok = lwRootRun == 2 && lwRootRuns.length == 1
+  lwRestore(outer)
+  return if ok { 1 } else { 0 }
 }
 
 // Lowers fragment `f` with value `out` (`irLowerNodeIn`) onto the buffer being written, where
