@@ -1713,6 +1713,8 @@ Deno.test({
       "pop-or-of-i32": 2,
       "pop-or-bool-out": 2,
       "pop-or-out-unwritten": 5,
+      "list-get-or-holds": 0,
+      "list-get-or-record-list": 2,
       "record-field-read-twice": 2,
       "stored-read-of-i32-field": 2,
       "stored-read-of-boxed-nullable-field": 0,
