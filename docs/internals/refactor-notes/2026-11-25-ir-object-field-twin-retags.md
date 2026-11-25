@@ -24,6 +24,11 @@ In each, the IR's operand agrees with legacy's heap and the IR's row rep does no
   plain record delivered there missed. Either direction is now the one struct as it stands.
   - The rule is shared, so the same pair also claims a return and argument coercion in the
     class's programs.
+  - Each field's rep must be the same rep id, which is stricter than lowering alike. Heap
+    equality alone is unsound where field reps differ.
+  - A twin that stores a field differently cannot be shared at all. The checker refuses
+    `{v: i32} is not W … they store field v differently … only a fresh record widens`. A fresh
+    literal is built at the field's row, never retagged; the sweep's `fresh` row pins that.
 - **A boolean list at an i32 list.** `boolean[]` rides the `i32[]` backing (`rlCanonElemName`).
   So a hole's `[x]` built at `[bool]`, where the record's row holds the `i32` instance's list, is
   that list. `listRetag` admits the unpacked pair.
