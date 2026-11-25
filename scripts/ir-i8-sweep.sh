@@ -264,24 +264,45 @@ VL
     mv "$T/f.new" "$T/tree/$f"
   done
   cut -f1,3 "$T/dead.sorted" > "$OUT/deleted.txt"
-  # (b) Delete a module let or const no remaining compiler/ text names, to a fixpoint. A
-  # declaration that spans lines runs to the line that balances its brackets.
+  # (b) Delete a module let or const no remaining compiler/ text reads, to a fixpoint. A
+  # declaration that spans lines runs to the line that balances its brackets. A pure write (one
+  # line storing a literal, a name, `[]`, `Map()` or `Set()` into it or an index of it) reads
+  # nothing and goes with it; a write whose right side calls anything keeps it.
   local lets=0 n=1
+  PURE_WRITE='^ *[A-Za-z_][A-Za-z0-9_]*(\[[A-Za-z0-9_]*\])? = (\[\]|Map\(\)|Set\(\)|-?[0-9]+|true|false|""|[A-Za-z_][A-Za-z0-9_]*)$'
   while [ "$n" -gt 0 ]; do
     # Every identifier's count over the tree's non-comment text, then the unread declarations.
     awk '!/^ *\/\// { l = $0; while (match(l, /[A-Za-z_][A-Za-z0-9_]*/)) { c[substr(l, RSTART, RLENGTH)]++; l = substr(l, RSTART + RLENGTH) } }
       END { for (k in c) print k "\t" c[k] }' "$T"/tree/compiler/*.vl > "$T/counts"
+    # A name some function also binds (a local, a parameter, or any `name:` field) is never
+    # taken by its writes, since a write of that name may be the local's.
+    { grep -ohE '^ +(let|const) [A-Za-z_][A-Za-z0-9_]*' "$T"/tree/compiler/*.vl | awk '{ print $2 }'
+      grep -hvE '^(export )?(let|const) ' "$T"/tree/compiler/*.vl | grep -oE '[A-Za-z_][A-Za-z0-9_]*\??: ' \
+        | sed -E 's/\??: $//'; } | sort -u > "$T/bound"
+    grep -hE "$PURE_WRITE" "$T"/tree/compiler/*.vl | sed -E 's/^ *([A-Za-z_][A-Za-z0-9_]*).*/\1/' | sort | uniq -c \
+      | awk 'FILENAME == ARGV[1] { b[$1] = 1; next } !($2 in b) { print $2 "\t" $1 }' "$T/bound" - > "$T/writes" || true
     grep -nE '^(export )?(let|const) [A-Za-z_][A-Za-z0-9_]*' "$T"/tree/compiler/*.vl \
       | sed -E 's/^([^:]+):([0-9]+):(export )?(let|const) ([A-Za-z_][A-Za-z0-9_]*).*/\1\t\2\t\5/' > "$T/decls" || true
-    awk -F'\t' 'FILENAME == ARGV[1] { c[$1] = $2; next } FILENAME == ARGV[2] { root[$1] = 1; next }
-      c[$3] <= 1 && !($3 in root)' "$T/counts" "$T/tree/scripts/roots.txt" "$T/decls" > "$T/unread"
+    awk -F'\t' 'FILENAME == ARGV[1] { c[$1] = $2; next } FILENAME == ARGV[2] { w[$1] = $2; next }
+      FILENAME == ARGV[3] { root[$1] = 1; next }
+      c[$3] - w[$3] <= 1 && !($3 in root)' "$T/counts" "$T/writes" "$T/tree/scripts/roots.txt" "$T/decls" > "$T/unread"
     n=$(wc -l < "$T/unread")
     cut -f1 "$T/unread" | sort -u | while read -r f; do
       awk -F'\t' -v f="$f" '$1 == f { print $2 }' "$T/unread" > "$T/at"
       awk 'FILENAME == ARGV[1] { del[$1] = 1; next }
-        (FNR in del) { d = 0; on = 1 }
+        (FNR in del) { d = 0; on = 1; buf = "" }
         on { t = $0; o = gsub(/[\[\{\(]/, "", t); cl = gsub(/[\]\}\)]/, "", t); d += o - cl; if (d <= 0) on = 0; next }
-        { print }' "$T/at" "$f" > "$T/f.new"
+        /^\/\// { buf = buf $0 "\n"; next }
+        { printf "%s", buf; buf = ""; print }
+        END { printf "%s", buf }' "$T/at" "$f" > "$T/f.new"
+      mv "$T/f.new" "$f"
+    done
+    # Their pure writes go too, each a single line.
+    cut -f3 "$T/unread" | sort -u > "$T/unread.names"
+    for f in "$T"/tree/compiler/*.vl; do
+      PURE_WRITE="$PURE_WRITE" awk 'BEGIN { re = ENVIRON["PURE_WRITE"] } FILENAME == ARGV[1] { gone[$1] = 1; next }
+        $0 ~ re { nm = $0; sub(/^ */, "", nm); sub(/[^A-Za-z0-9_].*/, "", nm); if (nm in gone) next }
+        { print }' "$T/unread.names" "$f" > "$T/f.new"
       mv "$T/f.new" "$f"
     done
     awk -F'\t' -v r="$T/tree/" '{ sub(r, "", $1); print $1 "\tlet " $3 }' "$T/unread" >> "$OUT/deleted.txt"
