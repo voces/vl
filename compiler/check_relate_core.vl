@@ -448,6 +448,7 @@ import {
   sameDeclaredTyParam,
   tpArmJoinDepth,
   tpGradualView,
+  tyIsTpJoinUnion,
   tpJoinUnions,
   tpOpenJoin,
   tpParamLitJoins,
@@ -2108,6 +2109,10 @@ function joinTysAcc(acc: JoinAcc, a: i32, b: i32): i32 {
   if !aVar && !bVar {
     const pw = paramUnionBesideConcrete(a, b)
     if pw >= 0 { return pw }
+    const mw = mixedParamUnionBesideConcrete(a, b)
+    if mw >= 0 { return mw }
+    const hw = heldMixedParamJoin(a, b)
+    if hw >= 0 { return hw }
   }
   // Such a union absorbs only its own members: its parameter member is assignable from
   // anything, which would fold `T | string` beside `T | i32` to the first (D3212).
@@ -2283,6 +2288,108 @@ function paramUnionBesideConcrete(a: i32, b: i32): i32 {
   tpParamLitJoins[tc] = u
   noteHoleTpJoin(tc)
   return tc
+}
+
+// The join of a written union of a declared parameter and concrete members with a concrete type
+// those members do not take, kept apart: the parameter takes anything inside the body, which would
+// fold `A | i32` beside `string` to the union and drop `string` at each pin (D17446). -1 otherwise.
+function mixedParamUnionBesideConcrete(a: i32, b: i32): i32 {
+  if !mixedParamApart(a, b) { return -1 }
+  const tc = joinVariantTys(a, b)
+  tpJoinUnions[tc] = 1
+  noteHoleTpJoin(tc)
+  return tc
+}
+
+// Whether one of `a`, `b` is such a union and the other a concrete type its concrete members do
+// not take.
+function mixedParamApart(a: i32, b: i32): boolean {
+  let u = a
+  let c = b
+  if !mixedParamUnion(a) {
+    u = b
+    c = a
+  }
+  if !mixedParamUnion(u) || c < 0 || c >= T.tys.length { return false }
+  if tyHasTyVar(c) || isNullTy(c) || c == TY_VOID || tyBearsNull(c) {
+    return false
+  }
+  const ux = tyAt(u)
+  if !(ux is TyUnion) { return false }
+  for m in ux.uMembers {
+    if !tyIsDeclaredParam(m) && (m == c || assignable(c, m)) { return false }
+  }
+  return true
+}
+
+// Whether `t` is a written union with a declared type parameter member and a concrete one.
+function mixedParamUnion(t: i32): boolean {
+  if t < 0 || t >= T.tys.length || tyIsTpJoinUnion(t) { return false }
+  const u = tyAt(t)
+  if !(u is TyUnion) { return false }
+  let param = false
+  let concrete = false
+  for m in u.uMembers {
+    if tyIsDeclaredParam(m) { param = true } else if !tyHasTyVar(m) { concrete = true }
+  }
+  return param && concrete
+}
+
+// The join of two same-field records, or two lists, one of whose field or element pairs is kept
+// apart by `mixedParamApart`, joined fieldwise: the record's own fit would fold the pair through
+// the parameter as the bare pair would (D17446). -1 otherwise.
+function heldMixedParamJoin(a: i32, b: i32): i32 {
+  if !heldMixedParamApart(a, b, 0) { return -1 }
+  const ta = tyAt(a)
+  const tb = tyAt(b)
+  if ta is TyArray {
+    if tb is TyArray { return mkArrayTy(joinTys(tyElemOf(ta), tyElemOf(tb))) }
+  }
+  if ta is TyObj {
+    if tb is TyObj {
+      const names: string[] = []
+      const tys: i32[] = []
+      let i = 0
+      while i < ta.objFieldNames.length {
+        names.push(ta.objFieldNames[i])
+        tys.push(joinTys(ta.objFieldTypes[i], objPairedTy(ta, tb, i)))
+        i = i + 1
+      }
+      recordJoinMintedSet(true)
+      return mkObjTy(names, tys)
+    }
+  }
+  return -1
+}
+
+// Whether `a` and `b` are same-field records or lists holding, at some depth, a pair
+// `mixedParamApart` keeps apart.
+function heldMixedParamApart(a: i32, b: i32, depth: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length || a == b || depth > 8 {
+    return false
+  }
+  if depth > 0 && mixedParamApart(a, b) { return true }
+  const ta = tyAt(a)
+  const tb = tyAt(b)
+  if ta is TyArray {
+    if tb is TyArray {
+      return heldMixedParamApart(tyElemOf(ta), tyElemOf(tb), depth + 1)
+    }
+    return false
+  }
+  if ta is TyObj {
+    if tb is TyObj {
+      if !objSigSame(ta, tb) { return false }
+      let k = 0
+      while k < ta.objFieldNames.length {
+        if heldMixedParamApart(ta.objFieldTypes[k], objPairedTy(ta, tb, k), depth + 1) {
+          return true
+        }
+        k = k + 1
+      }
+    }
+  }
+  return false
 }
 
 // The join of a type over inference holes and a closed one that fits it either way, each a
