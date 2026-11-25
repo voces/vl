@@ -21,6 +21,7 @@ import {
   asgParkedElemTail,
   asgParkedFieldTail,
   asgParkedMapTail,
+  asgWiderRowTail,
   emitInitGuard,
   emitOptLeafHead,
   emitOptLeafTail,
@@ -160,6 +161,7 @@ import {
   RCall,
   RCallHost,
   RCallRef,
+  RCallRefHead,
   RCast,
   RCellGet,
   RCellNew,
@@ -234,6 +236,7 @@ import {
   RPrintOpen,
   RRawOp,
   RRecCopyPure,
+  RRecDown,
   RRecordFitIs,
   RRecover,
   RRel,
@@ -1248,14 +1251,32 @@ function call(c: RCall, tail: boolean) {
   return 0
 }
 
+// The slot and depth each `RCallRefHead` written and not yet read left for its `RCallRef`; heads
+// nest as their calls do.
+let lwHeadSlot: i32[] = []
+let lwHeadDepth: i32[] = []
+
+// `RCallRefHead`: the closure, its stash and its env, as `callRef` writes them before its arguments.
+function callRefHead(r: RCallRefHead) {
+  irLOpnd(r.chFn)
+  const d = callRefDepth
+  const s = callRefStash()
+  callRefEnvOpen(s, d)
+  lwHeadSlot.push(s)
+  lwHeadDepth.push(d)
+  return 0
+}
+
 // `RCallRef`: the closure, then legacy's shared head and tail around the arguments
 // (`callRefStash`, `callRefEnvOpen`, `callRefCallTail`); a never call has no tail form and is
 // followed by `unreachable`, as `emitCall` writes it.
 function callRef(r: RCallRef, tail: boolean) {
   irLOpnd(r.crFn)
-  const d = callRefDepth
-  const s = callRefStash()
-  callRefEnvOpen(s, d)
+  // A staged head wrote the callee, stash and env already, and left its slot and depth.
+  const d = if r.crHead { lwHeadDepth.pop() ?? -1 } else { callRefDepth }
+  const s = if r.crHead { lwHeadSlot.pop() ?? -1 } else { callRefStash() }
+  if s < 0 || d < 0 { return irLMiss("call_ref head") }
+  if !r.crHead { callRefEnvOpen(s, d) }
   for a in r.crArgs { irLOpnd(a) }
   callRefDepth = d
   callRefCallTail(s, r.crSig, tail && !r.crNever)
@@ -1366,6 +1387,10 @@ function rhs(r: Rhs, tail: boolean) {
       wU8(r.uwOp)
     }
     RAsgParked => asgParked(r)
+    RRecDown => {
+      irLOpnd(r.rdV)
+      asgWiderRowTail(r.rdAt, lw.irAt)
+    }
     ROptRead => optRead(r)
     RToBox => boxOp(r)
     RDeadNever => {
@@ -1471,6 +1496,7 @@ function rhs(r: Rhs, tail: boolean) {
     RRecover => recoverRead(r)
     RGetField => getField(r)
     RCallRef => callRef(r, tail)
+    RCallRefHead => callRefHead(r)
     RMakeRec => makeRec(r)
     RMapOp => mapOp(r)
     RListNew => listNew(r)
@@ -6848,6 +6874,8 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   }
   lwSeq = []
   lwFrames = []
+  lwHeadSlot = []
+  lwHeadDepth = []
   lwLvLabels = []
   lwSpanOpen = []
   lwSpanAt = []
