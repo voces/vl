@@ -448,13 +448,13 @@ import {
   sameDeclaredTyParam,
   tpArmJoinDepth,
   tpGradualView,
-  tyIsTpJoinUnion,
   tpJoinUnions,
   tpOpenJoin,
   tpParamLitJoins,
   tvElseBase,
   tyIsDeferredJoin,
   tyIsGradualParam,
+  tyIsTpJoinUnion,
   tyParamBesideBare,
   tyParamBesideDerived,
   tyParamOfInnermostBody,
@@ -2330,7 +2330,8 @@ function mixedParamUnion(t: i32): boolean {
   let param = false
   let concrete = false
   for m in u.uMembers {
-    if tyIsDeclaredParam(m) { param = true } else if !tyHasTyVar(m) { concrete = true }
+    if tyIsDeclaredParam(m) { param = true }
+    else if !tyHasTyVar(m) { concrete = true }
   }
   return param && concrete
 }
@@ -2339,12 +2340,27 @@ function mixedParamUnion(t: i32): boolean {
 // apart by `mixedParamApart`, joined fieldwise: the record's own fit would fold the pair through
 // the parameter as the bare pair would (D17446). -1 otherwise.
 function heldMixedParamJoin(a: i32, b: i32): i32 {
-  if !heldMixedParamApart(a, b, 0) { return -1 }
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return -1 }
+  if !heldMixedParamApart(a, b, false, []) { return -1 }
+  const lj = heldMixedListJoin(a, b)
+  if lj >= 0 { return lj }
+  return heldMixedObjJoin(a, b)
+}
+
+// Two lists joined at the join of their elements; -1 unless both are lists.
+function heldMixedListJoin(a: i32, b: i32): i32 {
   const ta = tyAt(a)
   const tb = tyAt(b)
   if ta is TyArray {
     if tb is TyArray { return mkArrayTy(joinTys(tyElemOf(ta), tyElemOf(tb))) }
   }
+  return -1
+}
+
+// Two same-field records joined field by field; -1 unless both are records.
+function heldMixedObjJoin(a: i32, b: i32): i32 {
+  const ta = tyAt(a)
+  const tb = tyAt(b)
   if ta is TyObj {
     if tb is TyObj {
       const names: string[] = []
@@ -2363,26 +2379,56 @@ function heldMixedParamJoin(a: i32, b: i32): i32 {
 }
 
 // Whether `a` and `b` are same-field records or lists holding, at some depth, a pair
-// `mixedParamApart` keeps apart.
-function heldMixedParamApart(a: i32, b: i32, depth: i32): boolean {
-  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length || a == b || depth > 8 {
+// `mixedParamApart` keeps apart; `seen` holds the left types on the path, so a recursive type
+// ends at its revisit.
+function heldMixedParamApart(
+  a: i32,
+  b: i32,
+  inner: boolean,
+  seen: i32[],
+): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length || a == b {
     return false
   }
-  if depth > 0 && mixedParamApart(a, b) { return true }
+  if inner && mixedParamApart(a, b) { return true }
+  for x in seen {
+    if x == a { return false }
+  }
+  seen.push(a)
+  const hit = heldMixedListApart(a, b, seen) || heldMixedObjApart(a, b, seen)
+  seen.pop()
+  return hit
+}
+
+// `heldMixedParamApart` over two lists' elements; false unless both are lists.
+function heldMixedListApart(a: i32, b: i32, seen: i32[]): boolean {
   const ta = tyAt(a)
   const tb = tyAt(b)
   if ta is TyArray {
     if tb is TyArray {
-      return heldMixedParamApart(tyElemOf(ta), tyElemOf(tb), depth + 1)
+      return heldMixedParamApart(tyElemOf(ta), tyElemOf(tb), true, seen)
     }
-    return false
   }
+  return false
+}
+
+// `heldMixedParamApart` over two same-field records' fields; false unless both are records.
+function heldMixedObjApart(a: i32, b: i32, seen: i32[]): boolean {
+  const ta = tyAt(a)
+  const tb = tyAt(b)
   if ta is TyObj {
     if tb is TyObj {
       if !objSigSame(ta, tb) { return false }
       let k = 0
       while k < ta.objFieldNames.length {
-        if heldMixedParamApart(ta.objFieldTypes[k], objPairedTy(ta, tb, k), depth + 1) {
+        if (
+          heldMixedParamApart(
+            ta.objFieldTypes[k],
+            objPairedTy(ta, tb, k),
+            true,
+            seen,
+          )
+        ) {
           return true
         }
         k = k + 1
