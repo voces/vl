@@ -764,9 +764,11 @@ import {
   coalNulBoolJoinPresent,
   coalNulBoolJoinReserve,
   coalOptArmOf,
+  coalOptBoxLeafPlanAt,
   coalOptLeafOpen,
   coalOptLeafPlanOf,
   coalOptLeafRead,
+  coalOptRecLeafPlanAt,
   discrimFieldEqTail,
   emitListEmptyLoop,
   emitRecordFitIs,
@@ -798,6 +800,11 @@ import {
   numLitEqTail,
   numLitOnceMember,
   numLitOnceStash,
+  optBoxLeafOpen,
+  optBoxLeafRead,
+  optRecLeafRead,
+  optRecLeafTestClose,
+  optRecLeafTestOpen,
   optRecvStagedAt,
   recordFitPlanOf,
   strMemberEqTail,
@@ -5499,6 +5506,8 @@ function coalBoxGo(n: SCoalBox, pending: i32[]): i32 {
     "nulBool" => coalNicheCell(n, e, 2, pending)
     "fieldBox" | "fieldVal" => coalUnionField(n, e, pending)
     "optLeaf" => coalOptLeaf(n, e, pending)
+    "optBoxLeaf" => coalOptBoxLeaf(n, e, pending)
+    "optRecLeaf" => coalOptRecLeaf(n, e, pending)
     "nulBoolJoin" => coalNulBoolJoin(n, pending)
     "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
@@ -5595,6 +5604,75 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
   lwFrames.pop()
   return coalOptLeafRead(lp)
+}
+
+// `p?.f ?? d` over a union box field, as `emitOptCoalesceBoxLeaf` writes it over an unstaged base
+// that is no link itself: the chain's null test (the base's, then the field's), the plan's `if`, the
+// default, then the base again and the field's box at the result's rep.
+function coalOptBoxLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const lhsIx = unwrapParen(e.binLeft)
+  if lhsIx < 0 || lhsIx >= P.nodes.length {
+    return irLMiss("coalesce optional box field node")
+  }
+  const m = nodeAt(lhsIx)
+  if !(m is OptMember) || nodeAt(unwrapParen(m.omObj)) is OptMember {
+    return irLMiss("coalesce optional box field node")
+  }
+  if optRecvStagedAt(m.omObj) {
+    return irLMiss("coalesce optional box field staged receiver")
+  }
+  const p = coalOptBoxLeafPlanAt(
+    e,
+    m,
+    structIndexOfExpr(m.omObj, lw.irAt),
+    n.cbAt,
+    lw.irAt,
+  )
+  if p.obFail != "" { return irLMiss("coalesce optional box field plan") }
+  const niche = exprNullableRefNiche(m.omObj, lw.irAt)
+  cond(n.cbL, pending)
+  fbRefIsNull()
+  if emitOptLinkNullOpen(lhsIx, lw.irAt) {
+    if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
+    if niche { fbRefAsNonNull() }
+  }
+  emitOptLinkNullClose(lhsIx, lw.irAt)
+  optBoxLeafOpen(p)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  fbElse()
+  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
+  if niche { fbRefAsNonNull() }
+  lwFrames.pop()
+  return optBoxLeafRead(p)
+}
+
+// `p?.f ?? d` over a record field, as `emitCoalesceOptNulRecord` writes it over an unstaged base:
+// the base and its null test, the base again and the field slot's, the default, then the base a
+// third time and the field.
+function coalOptRecLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const m = nodeAt(unwrapParen(e.binLeft))
+  if !(m is OptMember) { return irLMiss("coalesce optional record field node") }
+  if optRecvStagedAt(m.omObj) {
+    return irLMiss("coalesce optional record field staged receiver")
+  }
+  const p = coalOptRecLeafPlanAt(
+    e,
+    m,
+    structIndexOfExpr(m.omObj, lw.irAt),
+    lw.irAt,
+  )
+  if p.orTgtHeap < 0 { return irLMiss("coalesce optional record field plan") }
+  cond(n.cbL, pending)
+  optRecLeafTestOpen()
+  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
+  optRecLeafTestClose(p)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  fbElse()
+  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
+  lwFrames.pop()
+  return optRecLeafRead(p)
 }
 
 // A `boolean | null` niche joining a box, as `emitCoalesceNulBoolJoin` writes it: the slot taken,
