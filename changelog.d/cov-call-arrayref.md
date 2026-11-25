@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims a list of a union's record arm whose elements need coercing:** `[if c { { a: 3 } } else { { a: 4 } }]` at `A[]`, a mix with a literal and a call, and an `if` with a `never` arm. Legacy's general ref-list path coerces each element to the variant's row (`emitArrRefElem`'s `emitVariantCoerce`), then writes the short tail. `arrLitVariantLongSlot` names that slot for the IR, which builds each element through its own variant coercion. `array ref` falls from 11 rows to 3 (the chunked literals, which wait on the chunk writer). Legacy's bytes are identical across every population and the self-compile.
