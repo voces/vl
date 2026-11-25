@@ -3368,7 +3368,7 @@ Deno.test({
   ignore,
   fn: () => {
     const src = Deno.readTextFileSync(
-      new URL("./cases/unions/shared-nullable-scalar-field-read.vl", import.meta.url),
+      new URL("./cases/closures/captured-hole-fn-handed-on-two-generics.vl", import.meta.url),
     );
     const one = run(src, 1);
     const detail = run(src, 2);
@@ -3377,8 +3377,8 @@ Deno.test({
     if (rows1.some((k) => k.startsWith("detail ")) || one.rows.get("uncovered rep unsup") !== 1) {
       throw new Error(`want mode 1's one \`uncovered rep unsup\` and no detail row, got ${JSON.stringify([...one.rows])}`);
     }
-    if (detail.rows.get("detail rep unsup of member in X") !== 1) {
-      throw new Error(`want the detail row naming the member node in X, got ${JSON.stringify([...detail.rows])}`);
+    if (detail.rows.get("detail rep unsup of call in viaReturn$1") !== 1) {
+      throw new Error(`want the detail row naming the call node in viaReturn$1, got ${JSON.stringify([...detail.rows])}`);
     }
     if (one.out.length !== plain.out.length || one.out.some((b, i) => b !== plain.out[i])) {
       throw new Error("want the armed shadow's module byte-identical to the unarmed one");
