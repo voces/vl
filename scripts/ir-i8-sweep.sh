@@ -33,7 +33,8 @@
 # stage B; the boundary writers scripts/ir-i8-census/boundary.txt names are marked. --check exits 1
 # on an edge scripts/ir-i8-census/edges-baseline.txt does not hold.
 # --grow appends each IR need that is a stub, not an entry point or a re-entry, to <keep-list>
-# (reason `ir-tail`) and runs again, until a run finds none or --max-iter (default 30) have passed.
+# (reason `ir-tail`), and each stub a program reaches whose claim fell back for a reason the seed
+# lacks (reason `ir-sentinel`), and runs again, until a run finds none or --max-iter (default 30) have passed.
 # Writes <out>/report.txt (the summary and the stub table), <out>/failing.tsv (pop, program, stub),
 # <out>/fell.tsv (pop, program, a fallback reason new under the sweep), <out>/ir-stub-edges.txt,
 # <out>/needs.tsv (stub, programs), <out>/tree (the swept compiler/), <out>/compiler.wasm (built from it)
@@ -373,10 +374,15 @@ while :; do
   run
   echo "== run $it: $(grep -c . "$OUT/failing.tsv" 2>/dev/null || echo 0) newly failing, $(grep -c . "$OUT/needs.tsv" 2>/dev/null || echo 0) IR needs" >&2
   [ "$GROW" = 1 ] && [ "$RC" != 2 ] || break
-  new=$(cut -f1 "$OUT/needs.tsv" | grep -v '^reentry ' | grep -vxF -f <(tr ' ' '\n' <<< "$ENTRY") | grep -vxF -f <(awk '!/^#/ && NF { print $1 }' "$KEEP") || true)
-  [ -n "$new" ] || break
+  kept() { awk '!/^#/ && NF { print $1 }' "$KEEP"; tr ' ' '\n' <<< "$ENTRY"; }
+  new=$(cut -f1 "$OUT/needs.tsv" | grep -v '^reentry ' | grep -vxF -f <(kept) || true)
+  # A sentinel need: a stub reached by a program whose claim fell back for a reason the seed lacks.
+  sent=$(awk -F'\t' 'FILENAME == ARGV[1] { fell[$2] = 1; next } ($2 in fell) && $3 !~ /^reentry / { print $3 }' \
+    "$OUT/fell.tsv" "$OUT/hits.tsv" | sort -u | grep -vxF -f <(kept) | grep -vxF -f <(printf '%s\n' $new) || true)
+  [ -n "$new$sent" ] || break
   for n in $new; do echo "$n ir-tail" >> "$KEEP"; done
-  echo "== grew the keep-list by $(wc -w <<< "$new"): $(tr '\n' ' ' <<< "$new")" >&2
+  for n in $sent; do echo "$n ir-sentinel" >> "$KEEP"; done
+  echo "== grew the keep-list by $(wc -w <<< "$new $sent"): $(tr '\n' ' ' <<< "$new $sent")" >&2
   it=$((it + 1)); [ $it -le "$MAXIT" ] || { echo "ir-i8-sweep: --max-iter $MAXIT reached" >&2; break; }
 done
 cat "$OUT/report.txt"
