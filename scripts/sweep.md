@@ -142,4 +142,11 @@ Beside the diff, a `census` job runs `scripts/registration-census.vl --check` on
 the distilled corpus. It is red when any program registers a union, struct or variant row once
 `registerReachRows` has made the rows final. Every compile already refuses a late union row
 (`unTyKeyPushRow`); the census also counts struct and variant rows and names each producer.
-`sweep-gate` requires both.
+
+A `claim-refusal` job runs `scripts/claim-refusal-survey.sh` on the head seed, in 4 shards. It
+builds every tests/cases program not marked `@error` and every distilled cell three ways: claimless,
+and with every claimed function and start refused before and after its body
+(`$VL_TEST_CLAIM_REFUSAL=1`, `=2`). Each forced-refusal module must `cmp` equal to the claimless one:
+a claim that falls back leaves the module as legacy alone writes it (D17241, D17242). It is red on
+any differ or a build only the refusal fails. It costs about 25 minutes of 4 jobs, which is why it
+is here and not in `scripts/gate.sh`. `sweep-gate` requires all three.
