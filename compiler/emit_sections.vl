@@ -51,6 +51,8 @@ import {
   irClaimStart,
   irClaimThunk,
   irConstCellShadow,
+  irDeclineAt,
+  irDeclinedFor,
   irPreBuild,
   irShadowArmed,
   irShadowBegin,
@@ -1391,11 +1393,8 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // A function the IR claims has its code entry written by the lowering, in the frame laid out
     // above, and legacy's body lowering does not run. A function under the test refusal hook or
     // the box-dst shadow (both instrument legacy) stays legacy's.
-    if (
-      gTestEmitRefusal == 0
-      && !boxDstShadowArmed()
-      && irClaimFn(fnIx, fnPos, out)
-    ) {
+    const claimTried = gTestEmitRefusal == 0 && !boxDstShadowArmed()
+    if claimTried && irClaimFn(fnIx, fnPos, out) {
       fbEndFunc()
       return 0
     }
@@ -1412,7 +1411,10 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // moves them onto the code payload with the rest of this entry (ROADMAP row 22).
     const stmtSpanBase = emitFnSpanStart.length
     shIdxReset()
-    if emitFuncBody(fn.fnBody, fnIx) < 0 { return -1 }
+    if emitFuncBody(fn.fnBody, fnIx) < 0 {
+      if claimTried { noteDecline(fnIx) }
+      return -1
+    }
     // A void body whose last instruction is a call falls off its end with nothing to hand
     // back, so that call is a tail call (D4655).
     emitVoidTailCall(fnIx)
@@ -2481,7 +2483,11 @@ function emitStartBodyCode(out: u8[], k: i32) {
   // A start body the IR claims (the single start, or init function `k`) has its code entry
   // written by the lowering, in the frame laid out above, and legacy's does not run. Under the
   // test refusal hook or the box-dst shadow (both instrument legacy) it stays legacy's.
-  if (gTestEmitRefusal == 0 && !boxDstShadowArmed() && irStartClaimOn()) {
+  const startTried = gTestEmitRefusal == 0
+    && !boxDstShadowArmed()
+    && irStartClaimOn()
+  const startUnit = startUnitOf(ent)
+  if startTried {
     startFrameReset()
     const order: i32[] = []
     const orderGi: i32[] = []
@@ -2529,7 +2535,10 @@ function emitStartBodyCode(out: u8[], k: i32) {
         globalStmts[gi],
       )
       if gArmKept >= 0 { stmtArmScopeClose(gArmKept) }
-      if gInitRc < 0 { return gInitRc }
+      if gInitRc < 0 {
+        if startTried { noteDecline(startUnit) }
+        return gInitRc
+      }
       emitInitProgressAt(globalStmtOrd[gi])
       // The row the D1594 diagnostic reads: this initializer's own byte range, so an
       // offset inside it names the `const`/`let` rather than the whole start function.
@@ -2543,6 +2552,7 @@ function emitStartBodyCode(out: u8[], k: i32) {
       gInitStartOrd = startStmtOrd[si]
       const sSpanAt = bodyExpr.length
       if emitStmt(startStmts[si], -1) < 0 {
+        if startTried { noteDecline(startUnit) }
         wTarget(exprPrev)
         return -1
       }
@@ -8407,4 +8417,31 @@ function tagRepTyOf(ty: i32): i32 { return monoTagMapRepTy(ty, [], []) }
 // `tagRepNameFn`'s installed body: the spelling a record of tagged-set ids is stored as.
 function tagRepNameOfTy(ty: i32): string {
   return monoPinSpellShaped(monoTagMapRepTy(ty, [], []))
+}
+
+// The node the top-level code's claim is keyed by: its first statement in merge order, or -1.
+function startUnitOf(ent: i32[]): i32 {
+  if ent.length == 0 { return -1 }
+  if ent[0] >= 0 { return globalStmts[ent[0]] }
+  return startStmts[-1 - ent[0]]
+}
+
+// A legacy refusal of a unit whose IR claim declined says on a second line what the IR declined
+// and on which line. Legacy's message stays the refusal; the note concedes nothing.
+function noteDecline(unit: i32) {
+  const what = irDeclinedFor(unit)
+  if !emitFailed || what == "" { return }
+  emitErr = emitErr
+    + "\n  note: the IR declined "
+    + what
+    + " at line "
+    + i32ToStr(declineLine(irDeclineAt()))
+}
+
+// The source line of node `at`'s anchor token, or 0 when it has none.
+function declineLine(at: i32): i32 {
+  if at < 0 || at >= nodeToks.length { return 0 }
+  const tk = nodeToks[at]
+  if tk < 0 || tk >= P.toks.length { return 0 }
+  return P.toks[tk].line
 }
