@@ -1,6 +1,8 @@
 import { recFieldTyOf } from "./emit_rec_field_codes"
+import { nodeTyIxOf } from "./check_node_tys"
 import {
   asgFieldParks,
+  coalFieldPlanOfOpt,
   identityOperandUnboxes,
   listFitShadowPlanOf,
   listFitShadowReadsRow,
@@ -917,7 +919,7 @@ import {
   parseI32,
   parseI64Pair,
 } from "./emit_bignum"
-import { isVoidTy, tyMapValOf } from "./tyquery"
+import { isVoidTy, tyHasTyVar, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
   listGetIdxReReadable,
@@ -11560,13 +11562,18 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
     "boolPop" | "valNoKind" | "callNoKind" | "next" => false
   }
   const na = if arm == "next" { coalNextArmOf(n, lhsIx, ix, ibFnIx) } else { "nulRefs" }
-  if !built && na == "field" { return coalField(b, n, lhsIx, ix, rep) }
+  if !built && na == "field" { return coalField(b, n, lhsIx, ix, rep, -1) }
   // A call's (or an `if`'s) `boolean | null` is stashed once and tested against its sentinel, as
   // the niche cell's arm writes a stashed operand (`emitCoalesceCallNiche`, `coalNicheOpen`).
   if !built && na == "callBool" && coalLhsStashes(lhsIx) {
     return coalNicheCell(b, n, lhsIx, ix, rep, "nulBool")
   }
   // Past the optional chains legacy reaches the nullable-reference rungs (`coalOptPassesToNulRefs`).
+  // A `p?.f` whose hole receiver an instance holds as a non-null record is that row's field.
+  if !built && na == "opt" {
+    const osi = optRecvInstanceRow(lhsIx)
+    if osi >= 0 { return coalField(b, n, lhsIx, ix, rep, osi) }
+  }
   if !built && na == "opt" && coalOptPassesToNulRefs(lhsIx, ibFnIx) {
     return coalNulRef(b, n, lhsIx, ix, rep)
   }
@@ -11669,12 +11676,33 @@ function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return o
 }
 
+// The struct row of `p?.f`'s receiver where the template typed it a hole and this instance holds
+// it as a non-null record (D17566); -1 otherwise.
+function optRecvInstanceRow(lhsIx: i32): i32 {
+  const m = nodeAt(lhsIx)
+  if !(m is OptMember) { return -1 }
+  const recv = unwrapParen(m.omObj)
+  if recv < 0 || recv >= P.nodes.length || !tyHasTyVar(nodeTyIxOf(recv)) {
+    return -1
+  }
+  const r = exprRepOf(recv)
+  if !(repNodeAt(r) is RRecord) { return -1 }
+  return structIndexOfTy(repTyOf(r))
+}
+
 // `o.v ?? d` over a value-union record field past the boxed arms, along `coalFieldPlanOf` as
 // `emitCoalesceUnionField` writes it: the record, a variable it re-reads, then the shared null
 // test's `if`, the default built into its null arm. A receiver it unwraps (`cfCast`) is unwrapped
 // after each read.
-function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
-  const p = coalFieldPlanOf(n, lhsIx, ix, ibFnIx)
+function coalField(
+  b: i32[],
+  n: BinExpr,
+  lhsIx: i32,
+  ix: i32,
+  rep: i32,
+  optSi: i32,
+): Opnd {
+  const p = if optSi >= 0 { coalFieldPlanOfOpt(n, lhsIx, optSi, ix, ibFnIx) } else { coalFieldPlanOf(n, lhsIx, ix, ibFnIx) }
   if p.cfArm != "boxed" && p.cfArm != "unbox" {
     return irBMiss("coalesce field " + p.cfArm)
   }
@@ -11682,21 +11710,23 @@ function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   const repOk = if boxed { repNodeAt(rep) is RBox } else { repPrim(rep) != null }
   if !repOk { return irBMiss("coalesce field result rep") }
   const m = nodeAt(lhsIx)
-  if !(m is Member) { return irBMiss("coalesce field node") }
+  // A `p?.f` an instance holds over a non-null record (`optSi`) reads its receiver as `p.f`'s.
+  const recvIx = if m is Member { m.memObj } else if m is OptMember && optSi >= 0 { m.omObj } else { -1 }
+  if recvIx < 0 { return irBMiss("coalesce field node") }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   // Its value stays on the stack from here, so no temp an operand before it built may wait.
   if endsInTemp(b) { return irBMiss("coalesce field after an operand") }
   // A box legacy unwraps itself is read at its storage, not narrowed.
-  const r = if p.cfCast >= 0 { storageReadOf(b, m.memObj) } else { irBExpr(b, m.memObj) }
+  const r = if p.cfCast >= 0 { storageReadOf(b, recvIx) } else { irBExpr(b, recvIx) }
   if ibMiss != "" { return r }
   // A receiver legacy re-emits is read again as the builder read it (`irHoistRecv`).
   if !(r is OVar) || r.ov < 0 { return irBMiss("coalesce field place") }
   // One legacy keeps in its stash (`coalFieldRecvStash`, a call) is read back from there.
   if (
     ib.irVars[r.ov].vKind == "temp"
-    && !recvReadsAgain(unwrapParen(m.memObj))
-    && unionEqOperandOk(m.memObj)
+    && !recvReadsAgain(unwrapParen(recvIx))
+    && unionEqOperandOk(recvIx)
   ) {
     return irBMiss("coalesce field place")
   }
