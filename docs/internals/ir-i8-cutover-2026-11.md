@@ -143,7 +143,8 @@ builders. They are reached, just not by these programs.
 
 A rehearsal of §5 ran on master 7eddff27. It emptied the 14 entry points, grew stage B, then built
 and ran every program of the five populations with both the seed and the stubbed compiler. The
-method and every reading are in `refactor-notes/2026-11-25-ir-i8-rehearsal.md`.
+method and every reading are in `refactor-notes/2026-11-25-ir-i8-rehearsal.md`; the programs behind each re-entry are
+`scripts/ir-i8-census/failing.tsv`.
 
 **Stage B as `stub-reach.sh` grows it breaks the IR.** Its name-level fixpoint also empties shared
 tails that the claim path calls, so claims fall back and the self-compile fails. A keep set, grown
