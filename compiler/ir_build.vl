@@ -8,6 +8,7 @@ import {
   listFitShadowSameTy,
   listFitShadowTyOf,
   optRecvHoleTyped,
+  spreadGroupConverts,
 } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import {
@@ -76,7 +77,7 @@ import {
 import { irTyF64, irTyI64 } from "./ir_helper"
 import { fnSigIdxOfFn } from "./emit_closure_sites"
 import { numUnionMinted } from "./check_union_mint"
-import { strListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import {
   ArrayLit,
   AsExpr,
@@ -11859,8 +11860,19 @@ function spreadLit(
   }
   const p = spreadPlanOf(ix, ibFnIx, lb)
   if p.spWhy != "" { return irBMiss("array spread plan") }
-  for k in p.spSrcKinds {
-    if k != p.spKind { return irBMiss("array spread conversion") }
+  // A group at another element kind is converted by the plan's own tail (`spreadGroupStash`): an
+  // atom list into a `string` list, or a scalar list widened.
+  const conv: i32[] = []
+  let ck = 0
+  while ck < p.spSrcKinds.length {
+    const k = p.spSrcKinds[ck]
+    if k != p.spKind {
+      if !spreadGroupConverts(k, p.spKind) {
+        return irBMiss("array spread conversion")
+      }
+      conv.push(ck)
+    }
+    ck = ck + 1
   }
   for r in p.spGroupRows {
     if r != p.spRow { return irBMiss("array spread sub row") }
@@ -11895,7 +11907,16 @@ function spreadLit(
     // retagged: the plan copies its elements raw, at one kind.
     const v = if irBOpRep(v0) != rep
       && (listRetag(irBOpRep(v0), rep) || holeRetagNoted(irBOpRep(v0), rep, true)) { repTemp(b, { rgV: v0 }, grps[g], rep) } else { v0 }
-    if irBOpRep(v) != rep { return irBMiss("array spread source rep") }
+    // A converted group reaches the tail as a list at its own element rep, which the tail converts.
+    if i32ListHas(conv, g) && irBOpRep(v) == rep {
+      return irBMiss("array spread conversion")
+    }
+    if (
+      irBOpRep(v) != rep
+      && !(i32ListHas(conv, g) && repNodeAt(irBOpRep(v)) is RList)
+    ) {
+      return irBMiss("array spread source rep")
+    }
     srcs.push(v)
     g = g + 1
   }
@@ -11917,6 +11938,7 @@ function spreadLit(
     spSlot: lb.lbSlot,
     spAt: ix,
     spBoxRow: -1,
+    spConv: conv,
   }
   // A minted literal (a variadic push's run) has no checker type; it holds its build's. A literal
   // held at its laid-out row is typed at that row's list (`outTyOf`).
@@ -11990,6 +12012,7 @@ function spreadBoxedLit(
     spSlot: lb.lbSlot,
     spAt: ix,
     spBoxRow: row,
+    spConv: [],
   }
   return irBLetTempTy(b, r, ix, lrep, lt)
 }
