@@ -30,7 +30,7 @@ import { emitFail, htStructHeap, lbPlanAdd, lbPlanDrop } from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
-import { monoBundleFe, monoBundleReadFe } from "./emit_mono"
+import { monoBundleFe, monoBundleReadFe, monoGenericAliasFe } from "./emit_mono"
 import {
   repElemTyOfName,
   repRecordFieldNames,
@@ -99,6 +99,9 @@ import {
   nodeAt,
   nodeChildrenPush,
   spreadArgOf,
+  tailPushBlockTail,
+  tailPushIfArms,
+  tailPushMatchArms,
 } from "./ast"
 import {
   IrFamily,
@@ -341,7 +344,6 @@ import {
   forRangeTestOf,
   forRangeUnrollPlan,
   globalCtxNow,
-  globalInitArmUnboxes,
   globalReadRecovers,
   holderCallRefPlainKey,
   holderCallSigs,
@@ -4490,6 +4492,16 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !narrowed
       && rep == globalTyRep(scopeTyAt(d, -1))
       && cellRep == globalTyRep(letBindTy(d, -1))
+    // A list cell the global section declares at the list its initializer built, an instance's
+    // (`cellDeclStores`), is read as it is, at that list.
+    const declStored = cellRep != rep
+      && !narrowed
+      && !stored
+      && repNodeAt(rep) is RList
+      && cellDeclStores(d, rep, cellRep)
+    if declStored {
+      return globalStoredRead(b, g, ix, cellRep, repTyOf(cellRep))
+    }
     // A reference the cell holds at a rep that stores as the read's (`repStoresAs`) is legacy's
     // plain `global.get`, read at the read's rep.
     const alike = cellRep != rep
@@ -5446,10 +5458,20 @@ function globalNoteAt(g: i32, d: i32, rep: i32) {
 }
 
 // The storage-row type of global `d` noted at rep `rep`: its binding's (`letBindTy`), or where
-// that is a record no struct row records, the row legacy declares the cell at, `rep`'s record.
+// that is a record no struct row records, the row legacy declares the cell at, `rep`'s record, or
+// the list the global section declares the cell at.
 function globalStoreTy(d: i32, rep: i32): i32 {
   const st = letBindTy(d, -1)
   const ht = heldTy(st)
+  // A list cell declared at the instance list its initializer built is stored at that list.
+  if (
+    repNodeAt(rep) is RList
+    && repNodeOfTy(ht) != rep
+    && repTyOf(rep) >= 0
+    && cellDeclStores(d, repNodeOfTy(ht), rep)
+  ) {
+    return repTyOf(rep)
+  }
   const rt = rowlessStoredTy(ht, repNodeOfTy(ht), repTyOf(rep))
   return if rt >= 0 { rt } else { st }
 }
@@ -15864,18 +15886,28 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
     return 0
   }
   if arm == "nulnone" { return globalInitNulNone(b, gi, gst, g.letInit) }
+  if arm == "alias" || arm == "holder" || arm == "atom" {
+    const rep = globalRep(gi, gst)
+    if rep < 0 { return skip("global initializer rep") }
+    const av = if arm == "alias" { globalAliasCore(b, gst, rep) } else if arm == "holder" { globalHolderPick(b, gst, g.letInit, rep) } else { deliver(b, g.letInit, rep, -1) }
+    if ibMiss != "" { return 0 }
+    if irBOpRep(av) != rep { return skip("global initializer " + arm + " rep") }
+    const am = irGlobalWriteMiss(gi, ibGlobalCtx())
+    if am != "" { return skip(am) }
+    irBNode(b, { gsSym: gi, gsSrc: av }, -1, ibNoValue, gst)
+    return 0
+  }
   if arm != "plain" && arm != "widen" && arm != "variant" {
     return skip("global initializer " + arm)
   }
-  // A widened value `if` is legacy's nested-join adoption (`numLitAdoptJoin`, D16496), which
-  // keeps an inner join at its own type and extends it; the IR's delivery widens per arm.
-  if arm == "widen" && nodeAt(unwrapParen(g.letInit)) is IfStmt {
+  // A widened value `if` holding a nested join that keeps its own type is legacy's adoption
+  // (`numLitAdoptJoin`, D16496): the inner join is built at its type and extended whole, where
+  // the IR's delivery widens per arm.
+  if arm == "widen" && widenJoinKeepsInner(g.letInit) {
     return skip("global initializer widen join")
   }
-  // A numeric cell's initializer is delivered widened to it, as legacy's `emitWidened` writes it.
-  if arm != "widen" && globalInitArmUnboxes(gck, g.letInit) {
-    return skip("global initializer arm unbox")
-  }
+  // A numeric cell's initializer is delivered widened to it, as legacy's `emitWidened` writes it,
+  // and a narrowed arm's unbox (`emitGlobalInitArmUnbox`) is the delivery's own.
   // A bare-arm cell takes the arm's struct whatever builds it (`emitVariantCoerce`): the value is
   // delivered at the cell's type.
   const src = if arm == "variant" { globalInitVariant(b, gi, gst, g.letInit) } else if mapCtorOf(g.letInit) { mapNewInit(b, gi, gst, g.letInit) } else if gck == "closure" { cloInit(b, gi, gst, g.letInit) } else { globalInitValue(b, gi, gst, g.letInit) }
@@ -15884,6 +15916,52 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: gi, gsSrc: src }, -1, ibNoValue, gst)
   return 0
+}
+
+// Whether value join `init` nests a join typed other than the whole, which legacy converts whole.
+function widenJoinKeepsInner(init: i32): boolean {
+  const root = unwrapParen(init)
+  if root < 0 || root >= P.nodes.length { return false }
+  const t = exprTyOf(root)
+  const todo: i32[] = [root]
+  while todo.length > 0 {
+    const at = unwrapParen(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      if tailPushIfArms(at, todo) || tailPushMatchArms(at, todo) {
+        if at != root && exprTyOf(at) != t { return true }
+      } else {
+        tailPushBlockTail(at, todo)
+      }
+    }
+  }
+  return false
+}
+
+// Global statement `gst`'s alias of a generic function used only as a direct callee: the
+// capture-free closure core, as legacy's `emitClosureValueCore` writes it at a start's alias arm.
+function globalAliasCore(b: i32[], gst: i32, rep: i32): Opnd {
+  const fe = monoGenericAliasFe(gst)
+  if fe < 0 || fnEnvIdxOf(fe) >= 0 {
+    return irBMiss("global initializer alias env")
+  }
+  if !(repNodeAt(rep) is RClosure) {
+    return irBMiss("global initializer alias rep")
+  }
+  if closureValueCoreWhy(fe) != "" { return irBMiss("closure value refused") }
+  const empty: Opnd[] = []
+  return repTemp(b, { mcFn: fe, mcEnv: empty, mcAt: gst }, gst, rep)
+}
+
+// Global statement `gst`'s annotated read of a bundle holder `init`: the member its type names, as
+// legacy's `emitTypedHolderInit` picks it.
+function globalHolderPick(b: i32[], gst: i32, init: i32, rep: i32): Opnd {
+  if !(repNodeAt(rep) is RClosure) { return irBMiss("holder pick binding rep") }
+  const rec = holderRecordOf(b, init)
+  if ibMiss != "" { return rec }
+  if !(repNodeAt(irBOpRep(rec)) is RRecord) {
+    return irBMiss("holder pick record")
+  }
+  return repTemp(b, { hkV: rec, hkAt: gst, hkArg: init }, init, rep)
 }
 
 // Global `gi`'s initializer `init` at its bare-arm cell, delivered at the cell's type so a
@@ -15976,11 +16054,13 @@ function bodyRetagAt(src: i32, dst: i32, at: i32): boolean {
   return (list || hole) && exprPrePathWhy(at, ibFnIx) == ""
 }
 
-// Whether open-typed global `gst`'s cell, at rep `rep` legacy writes no valtype for, holds value rep
-// `vr` as it stands: the global section declares the cell (`globalCellKind`, `letCellSlot`, read
-// again after that section minted it) at `vr`'s heap.
+// Whether global `gst`'s cell holds value rep `vr` as it stands: the global section declares the
+// cell (`globalCellKind`, `letCellSlot`, read again after that section minted it) at `vr`'s heap.
+// An open-typed cell's rep has no valtype of its own; a closed one's list is the instance's.
 function cellDeclStores(gst: i32, rep: i32, vr: i32): boolean {
-  if !undeclaredRepTakes(globalHeldTy(gst), rep, vr) { return false }
+  const open = undeclaredRepTakes(globalHeldTy(gst), rep, vr)
+  const lists = repNodeAt(rep) is RList && repNodeAt(vr) is RList
+  if !open && !lists || refRepValtype(vr).length == 0 { return false }
   const k = globalCellKind(gst)
   const vt: u8[] = []
   const prev = wTarget(vt)
@@ -16046,12 +16126,23 @@ function mapCtorOf(ix: i32): boolean {
 // The empty map global `gi` starts as: legacy's constructor at the cell's map rep, or at its
 // storage row (`letBindTy`) where the constructor builds that, as `globalInitValue` stores one.
 function mapNewInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
-  const rep = repNodeOfTy(scopeTyAt(gst, -1))
+  const cell = repNodeOfTy(scopeTyAt(gst, -1))
+  // A nullable map cell is its map's ref niche: the new map stores as it stands.
+  const cn = repNodeAt(cell)
+  const niche = cn is RNullable
+    && cn.rnDisc == 1
+    && repNodeAt(cn.rnInner) is RMap
+  const rep = if cn is RNullable && niche { cn.rnInner } else { cell }
   if !(repNodeAt(rep) is RMap) { return irBMiss("global initializer rep") }
   const ix = unwrapParen(init)
   const pre = exprPrePathWhy(ix, ibFnIx)
   if pre != "" { return irBMiss(pre) }
   const nr = repNodeOfTy(nodeTyAt(ix, ibFnIx))
+  if niche {
+    if nr != rep { return irBMiss("global initializer coercion") }
+    globalNoteAt(gi, gst, cell)
+    return irBLetTemp(b, { mnAt: ix }, ix, nr)
+  }
   const stored = irGlobalRepOf(ib, gi) < 0
     && nr != rep
     && nr == globalTyRep(letBindTy(gst, -1))
