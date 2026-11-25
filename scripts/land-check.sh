@@ -13,7 +13,12 @@ seed=$(pick build/vl-compiler.wasm || true)
   echo "LAND-NO: missing scripts/vl-host/target/release/vl or build/vl-compiler.wasm (in $root or $main)"
   exit 1
 }
-read -r sha state < <(gh api "repos/voces/vl/pulls/$pr" -q '.head.sha + " " + .mergeable_state')
+# GitHub answers `unknown` for a minute or two after master moves: ask again, 15 s apart.
+for try in 1 2 3 4 5 6; do
+  read -r sha state < <(gh api "repos/voces/vl/pulls/$pr" -q '.head.sha + " " + .mergeable_state')
+  [ "$state" != unknown ] || [ "$try" = 6 ] && break
+  sleep 15
+done
 bad=$(gh api "repos/voces/vl/commits/$sha/check-runs" --paginate \
   -q '.check_runs[] | select(.status != "completed" or (.conclusion != "success" and .conclusion != "skipped")) | .name')
 n=$(gh api "repos/voces/vl/commits/$sha/check-runs" -q '.total_count')
