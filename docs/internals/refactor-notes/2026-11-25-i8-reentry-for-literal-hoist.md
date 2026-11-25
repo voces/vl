@@ -27,7 +27,8 @@ self-compile.
 
 ## Measurement
 
-`scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep.txt` over cases, witnesses and probes:
+`scripts/ir-i8-sweep.sh` over the keep list (then `keep.txt`, since replaced by `keep/`), over cases,
+witnesses and probes:
 
 | | before (master) | after |
 |---|---:|---:|
