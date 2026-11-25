@@ -276,6 +276,7 @@ import {
   asLitAtomWhy,
   asNicheCastWhy,
   asNumLitScalarWhy,
+  asPropNicheHeapOf,
   asUnionTagWhy,
   asWrapArmOf,
   asgValueArmOf,
@@ -12776,9 +12777,10 @@ function asLit(b: i32[], n: AsExpr, ix: i32, rep: i32, arm: string): Opnd {
 }
 
 // A cast over a niche-repped `T | null` operand, as `emitAsNulNiche` writes it: `as?` is the
-// operand at its own rep, and `as!` its `ref.as_non_null` (`RCast`).
+// operand at its own rep, `as!` its `ref.as_non_null` (`RCast`), and the propagating `as` a block.
 function asNiche(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
   const why = asNicheCastWhy(ix, ibFnIx)
+  if why == "propagate" { return asNicheProp(b, n, ix, rep) }
   if why != "" { return irBMiss("union cast niche " + why) }
   const v = irBExpr(b, n.asObj)
   if ibMiss != "" { return v }
@@ -12796,6 +12798,48 @@ function asNiche(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("union cast niche rep")
   }
   return irBLetTemp(b, { ctV: v, ctTarget: rep, ctOnFail: "trap" }, ix, rep)
+}
+
+// The propagating `as` over a niche-repped `T | null` operand: the operand built inside the block,
+// whose null path returns the function's null (`RRetNull`) and leaves legacy's `unreachable`.
+function asNicheProp(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  if asPropNicheHeapOf(n.asObj, ibFnIx) < 0 {
+    return irBMiss("union cast niche propagate heap")
+  }
+  if nullRetPlanOf(ibFnIx) == null {
+    return irBMiss("union cast niche propagate null plan")
+  }
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const lb: i32[] = []
+  const l = irBExpr(lb, n.asObj)
+  if ibMiss != "" { return l }
+  if !(l is OVar) || l.ov < 0 { return irBMiss("union cast niche operand") }
+  const vr = irBOpRep(l)
+  const vn = repNodeAt(vr)
+  if (
+    !(vn is RNullable)
+    || vn.rnInner != rep
+    || !refNullable(vr) && !strNullable(vr)
+  ) {
+    return irBMiss("union cast niche rep")
+  }
+  const nb: i32[] = []
+  const r: Rhs = { rnrAt: ix }
+  const rt = irBLetTempTy(nb, r, ix, ib.irRetRep, ib.irRetTy)
+  irBNode(nb, { rtHas: true, rtV: rt }, -1, ibNoValue, ix)
+  irBNode(nb, { tpWhy: 0 }, -1, ibNoValue, ix)
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const arm: CoalValArm = "asProp"
+  irBNode(
+    b,
+    { cbL: l, cbLB: lb, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // An `as` at a `v128` rep over a `v128` operand re-brands the same bits, which legacy writes as
