@@ -3,6 +3,7 @@
 #
 #     scripts/ir-i8-sweep.sh <keep-list> [--grow] [--pops self,distilled,cases,probes,witnesses]
 #                            [--out <dir>] [--max-iter N] [--check | --write-baseline]
+#     scripts/ir-i8-sweep.sh <keep-list> --edges [--check | --write-baseline]
 #
 # (a) stub-reach.sh's stage B, minus <keep-list>: the 14 entry points and every emitter function
 #     that calls an emptied one are emptied, each to `emitFail("i8 stub <name>")`
@@ -23,6 +24,10 @@
 # newly failing program with no function or start body the seed already leaves unclaimed is
 # UNEXPLAINED: a re-entry or a stubbed helper the claim path needs. --check exits 1 when that count
 # rises above scripts/ir-i8-census/sweep-baseline.txt; --write-baseline writes it.
+# --edges is the static half, in seconds and with no build: every call a kept function or an ir*.vl
+# file makes of a stubbed function (`<caller>\t<stub>`), the latent paths from the claim path into
+# stage B; the boundary writers scripts/ir-i8-census/boundary.txt names are marked. --check exits 1
+# on an edge scripts/ir-i8-census/edges-baseline.txt does not hold.
 # --grow appends each IR need that is a stub, not an entry point or a re-entry, to <keep-list>
 # (reason `ir-tail`) and runs again, until a run finds none or --max-iter (default 30) have passed.
 # Writes <out>/report.txt (the summary and the stub table), <out>/failing.tsv (pop, program, stub),
@@ -35,7 +40,7 @@
 set -euo pipefail
 KEEP=${1:?usage: scripts/ir-i8-sweep.sh <keep-list> [--grow] [--pops LIST] [--out DIR] [--max-iter N]}
 shift
-GROW=0 POPS=self,distilled,cases,probes,witnesses OUT=build/ir-i8-sweep MAXIT=30 RATCHET=""
+EDGES=0 GROW=0 POPS=self,distilled,cases,probes,witnesses OUT=build/ir-i8-sweep MAXIT=30 RATCHET=""
 BASELINE_FILE=scripts/ir-i8-census/sweep-baseline.txt
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -44,6 +49,7 @@ while [ $# -gt 0 ]; do
     --out) OUT=${2:?}; shift 2 ;;
     --max-iter) MAXIT=${2:?}; shift 2 ;;
     --check|--write-baseline) RATCHET=$1; shift ;;
+    --edges) EDGES=1; shift ;;
     *) echo "ir-i8-sweep: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -314,6 +320,37 @@ VL
   } > "$OUT/report.txt"
   if [ -s "$T/failing" ]; then RC=1; else RC=0; fi
 }
+
+# The static edges into stage B: a call of a stubbed function from a kept function or an ir*.vl file.
+if [ "$EDGES" = 1 ]; then
+  STUB_KEEP="$KEEP" STUB_BODIES=scripts/ir-i8-census/stub-bodies.txt STUB_TREE="$T/tree" STUB_ONLY_B=1 \
+    bash scripts/ir-i8-census/stub-reach.sh "$T/reach" >&2
+  grep -ohE 'emitFail\("i8 stub [A-Za-z0-9_]+"\)' "$T"/tree/compiler/*.vl | sed -E 's/.*i8 stub ([A-Za-z0-9_]+).*/\1/' | sort -u > "$T/stubs"
+  awk '!/^#/ && NF { print $1 }' "$KEEP" > "$T/kept"
+  awk 'FILENAME == ARGV[1] { stub[$1] = 1; next } FILENAME == ARGV[2] { kept[$1] = 1; next }
+    FNR == 1 { ir = (FILENAME ~ /\/ir[^\/]*\.vl$/); cur = "" }
+    match($0, /^(export )?function [A-Za-z0-9_]+[ (<]/) { cur = $0; sub(/^(export )?function /, "", cur); sub(/[ (<].*/, "", cur); next }
+    /^}/ { cur = ""; next }
+    cur != "" && (ir || (cur in kept)) && $0 !~ /^ *\/\// {
+      l = $0
+      while (match(l, /[A-Za-z_][A-Za-z0-9_]*\(/)) {
+        n = substr(l, RSTART, RLENGTH - 1); pre = (RSTART > 1) ? substr(l, RSTART - 1, 1) : ""
+        if (pre != "." && (n in stub) && n != cur) print cur "\t" n
+        l = substr(l, RSTART + RLENGTH)
+      }
+    }' "$T/stubs" "$T/kept" "$T"/tree/compiler/*.vl | sort -u > "$OUT/edges.txt"
+  B=scripts/ir-i8-census/boundary.txt
+  echo "static edges into stage B (a kept function or an ir*.vl file calling a stubbed one): $(wc -l < "$OUT/edges.txt")"
+  awk -F'\t' 'FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF) w[$1] = 1; next } { print "  " $1 " -> " $2 (($2 in w) ? "   [boundary writer]" : "") }' "$B" "$OUT/edges.txt"
+  [ -n "$RATCHET" ] || exit 0
+  EB=scripts/ir-i8-census/edges-baseline.txt
+  if [ "$RATCHET" = --write-baseline ]; then cp "$OUT/edges.txt" "$EB"; echo "ir-i8-sweep: wrote $(wc -l < "$EB") edges to $EB"; exit 0; fi
+  new=$(comm -23 "$OUT/edges.txt" <(sort -u "$EB"))
+  gone=$(comm -13 "$OUT/edges.txt" <(sort -u "$EB"))
+  [ -z "$gone" ] || { echo "ir-i8-sweep: edges gone (run --edges --write-baseline in this PR):"; sed 's/^/  /' <<< "$gone"; }
+  if [ -n "$new" ]; then echo "ir-i8-sweep: NEW edges into stage B (a kept tail now calls a stubbed writer):"; sed 's/^/  /' <<< "$new"; exit 1; fi
+  echo "ir-i8-sweep: edges $(wc -l < "$OUT/edges.txt"), none new: ok"; exit 0
+fi
 
 lists
 it=1
