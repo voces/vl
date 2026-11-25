@@ -692,6 +692,7 @@ import {
   mapReadScalarBoxKindIn,
   mapRecvScalarBoxKindIn,
   mapRecvTyIn,
+  mapTyScalarBoxKind,
   nodeTyInOf,
   readContainerTyAt,
 } from "./emit_ty_canon"
@@ -10054,7 +10055,8 @@ function boxPlanWhy(p: HoleBox, v: Opnd, ix: i32): string {
     "nulBool" => repBoolNiche(r)
     "rec" | "obj" => repNodeAt(r) is RRecord
     "refList" | "atomList" => repNodeAt(r) is RList
-    "mapScalar" => false
+    // A scalar map read is built as the probe's own box (`mapGetAt`), which this plan writes as is.
+    "mapScalar" => boxedNullable(r)
     // A union-valued map read is built as its box, a miss the null-tagged box (`mapGetAt`).
     "mapBox" => tempIsWholeMapRead(v, ix)
     "map" => repNodeAt(r) is RMap
@@ -13144,10 +13146,17 @@ function mapGetAt(
     }
     if box >= 0 || !repOk { return irBMiss("map get union box rep") }
   }
+  // A scalar read typed at a boxed nullable its map's value rep is not (one arm of a union of
+  // maps) is the probe's own box at that value's kind, as the box plan's `mapScalar` writes it.
+  const sk = if box < 0
+    && arm != "unionBox"
+    && boxedNullable(rep)
+    && !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) { mapTyScalarBoxKind(repTyOf(mr)) } else { -1 }
+  const bk = if sk >= 0 { sk } else { box }
   // A read the instance types without the null its map's value holds is the helper's value at
   // that niche, as legacy reads it: a miss and a stored null are both its sentinel.
   const plain = arm == "unionBox"
-    || box >= 0
+    || bk >= 0
     || mapGetRepOk(sh, m.rmVal, rep, rd.idxArr)
   const nt = if plain { -1 } else { mapReadNicheTy(sh, m.rmVal, rep, rd.idxArr) }
   const twTy = if plain || nt >= 0 { -1 } else { mapGetTwinTy(sh, m.rmVal, rep, rd.idxArr) }
@@ -13158,7 +13167,7 @@ function mapGetAt(
     mtLoc: rk.mkLoc,
     mtKey: rk.mkKey,
     mtAt: ix,
-    mtBox: box,
+    mtBox: bk,
     mtRow: row,
     mtTrap: trap,
     mtPrint: -1,
@@ -13171,11 +13180,13 @@ function mapGetAt(
     if ibMiss != "" { return v }
     return repTemp(b, { rgV: v }, ix, rep)
   }
-  if box < 0 && tempTy >= 0 { return irBLetTempTy(b, r, ix, rep, tempTy) }
-  if box < 0 { return irBLetTemp(b, r, ix, rep) }
+  if bk < 0 && tempTy >= 0 { return irBLetTempTy(b, r, ix, rep, tempTy) }
+  if bk < 0 { return irBLetTemp(b, r, ix, rep) }
   // The box is the union's own, typed at it where a narrowed re-read's node is the member's.
-  const bt = if tempTy >= 0 { tempTy } else { holeBoxTyAt(ix, ibFnIx) }
-  if bt < 0 || repNodeOfTy(bt) != rep { return irBMiss("map get box type") }
+  const bt = if tempTy >= 0 { tempTy } else if sk >= 0 { nodeTyAt(ix, ibFnIx) } else { holeBoxTyAt(ix, ibFnIx) }
+  if bt < 0 || repNodeOfTy(heldTy(bt)) != rep {
+    return irBMiss("map get box type")
+  }
   return irBLetTempTy(b, r, ix, rep, heldTy(bt))
 }
 
