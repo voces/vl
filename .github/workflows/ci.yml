@@ -188,6 +188,7 @@ jobs:
       rustc: ${{ steps.keys.outputs.rustc }}
       ir_identity: ${{ steps.ir.outputs.identity }}
       cost: ${{ steps.ir.outputs.cost }}
+      i8_sweep: ${{ steps.ir.outputs.sweep }}
     steps:
       # The seed's compiled forms live in a private cache outside the checkout (DECISIONS.md,
       # "The seed sidecar lives only in the user's private cache"); the seed cache steps save it.
@@ -237,11 +238,14 @@ jobs:
       - name: Does this change reach the IR identity proof, or ci-cost part 1
         id: ir
         run: |
-          if [ "${{ github.event_name }}" != pull_request ]; then printf 'identity=true\ncost=true\n' >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "${{ github.event_name }}" != pull_request ]; then printf 'identity=true\ncost=true\nsweep=true\n' >> "$GITHUB_OUTPUT"; exit 0; fi
           re='^(compiler/|std/|tests/cases/|scripts/capability-probes/|scripts/silent-sweep/distilled/(cells|named)/|scripts/vl-host/|docs/internals/inventory(-2)?/|scripts/ir-identity\.sh$|scripts/ir-divergence-baseline\.txt$|scripts/inventory/witnesses\.vl$|scripts/ir-i8-census/witnesses\.vl$|\.github/workflows/ci\.yml$)'
           hit=$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" | grep -E -m1 "$re" || true)
           if [ -n "$hit" ]; then echo "identity=true" >> "$GITHUB_OUTPUT"; echo "ir identity: runs ($hit)"
           else echo "identity=false" >> "$GITHUB_OUTPUT"; echo "ir identity: no compiler, std, program or baseline change"; fi
+          # ci-i8-sweep reads the same inputs plus its own tool, keep-list and baselines.
+          hit=$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" | grep -E -m1 "$re|^scripts/ir-i8-sweep\.sh\$|^scripts/ir-i8-census/" || true)
+          if [ -n "$hit" ]; then echo "sweep=true" >> "$GITHUB_OUTPUT"; else echo "sweep=false" >> "$GITHUB_OUTPUT"; fi
           # ci-cost part 1's plumb-shape and scaling ratchets read the compiler, std and their own inputs.
           re='^(compiler/|std/|scripts/vl-host/|scripts/plumb-shape|tests/vl_scaling_shape_test\.ts$|\.github/workflows/ci\.yml$)'
           hit=$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" | grep -E -m1 "$re" || true)
@@ -1266,6 +1270,73 @@ jobs:
         with:
           name: ir-identity-keep-${{ matrix.shard }}
           path: ${{ runner.temp }}/ir-identity-keep
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # ci-i8-sweep — the I8 cutover rehearsed on every compiler change (scripts/ir-i8-sweep.sh). First
+  # the static half: no kept tail or ir*.vl file may gain a call into stage B (edges-baseline.txt).
+  # Then stage B minus scripts/ir-i8-census/keep.txt is emptied and swept and every population runs
+  # under it; the programs that newly fail with nothing the seed leaves unclaimed (re-entries and
+  # stubbed helpers the claim path needs) may only fall from sweep-baseline.txt. A pull request that
+  # touches none of its inputs runs no step and stays green.
+  # ---------------------------------------------------------------------------
+  ci-i8-sweep:
+    needs: seed
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RUN: ${{ needs.seed.outputs.i8_sweep }}
+    steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        if: env.RUN == 'true'
+
+      - name: Restore vl-host binary
+        if: env.RUN == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        if: env.RUN == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            ${{ runner.temp }}/vl-seed-cache
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      - name: Warm the seed's sidecars
+        if: env.RUN == 'true'
+        run: bash scripts/warm-seed.sh
+
+      - name: I8 static edges into stage B (none new)
+        if: env.RUN == 'true'
+        run: bash scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep.txt --edges --check --out "$RUNNER_TEMP/ir-i8-edges"
+
+      - name: I8 sweep (unexplained may only fall)
+        if: env.RUN == 'true' && !cancelled()
+        run: bash scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep.txt --check --out "$RUNNER_TEMP/ir-i8-sweep"
+        env:
+          JOBS: "4"
+
+      - name: Upload the sweep's report
+        if: always() && env.RUN == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: ir-i8-sweep
+          path: |
+            ${{ runner.temp }}/ir-i8-sweep/*.txt
+            ${{ runner.temp }}/ir-i8-sweep/*.tsv
+            ${{ runner.temp }}/ir-i8-edges/*.txt
           if-no-files-found: ignore
           retention-days: 7
 

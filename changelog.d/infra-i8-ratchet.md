@@ -1,0 +1,3 @@
+## Infrastructure (Track F)
+
+- **CI rehearses I8 on every compiler change (`ci-i8-sweep`):** `ir-i8-sweep.sh --edges --check` reds when a kept tail or an `ir*.vl` file gains a call into stage B (54 edges, 16 onto the boundary writers), and `ir-i8-sweep.sh --check` reds when the programs that newly fail under the swept compiler with nothing the seed leaves unclaimed rise above `sweep-baseline.txt` (680, attributed by tail: `rcReadSource` 309, `arrLitDataElemEmit` 148, `emitListGetIdx` 59, ...). The sweep now records every stub a program reaches (`i8 hit`), scans its baseline with the census probe (`probe-patch.sh`, shared with `census.sh`), and attributes a failure to its first IR need. `keep.txt` is CENSUS's v3, 109 names.

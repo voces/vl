@@ -164,6 +164,7 @@ function runJobs(over: Record<string, string> = {}): string {
     "ci-witnesses (2)",
     "ci-ir-identity (1)",
     "ci-ir-identity (2)",
+    "ci-i8-sweep",
   ];
   return JSON.stringify({
     jobs: names.map((name, i) => ({
@@ -291,6 +292,7 @@ Deno.test({
               runJobs({
                 "ci-ir-identity (1)": "skipped",
                 "ci-ir-identity (2)": "skipped",
+                "ci-i8-sweep": "skipped",
               }),
             ),
         ],
@@ -397,6 +399,7 @@ Deno.test({
                 "ci-witnesses (2)": "skipped",
                 "ci-ir-identity (1)": "skipped",
                 "ci-ir-identity (2)": "skipped",
+                "ci-i8-sweep": "skipped",
               }),
             ),
         ],
