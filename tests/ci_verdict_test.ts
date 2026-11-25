@@ -1,24 +1,14 @@
 // CI REPEATS ONLY WHAT NOTHING ELSE PROVED (scripts/ci-verdict.sh, .github/actions/ci-verdict).
 //
-// Two halves. The structural half holds ci.yml's `gated` skip to the jobs scripts/gate.sh runs
-// whole on the queue's merged tree: a job that runs anything gate.sh does not (the V8 corpus
-// oracle, the emitter-state audit, the LSP bundle, the embed-seed build) must not carry it.
-// The behavioural half runs ci-verdict.sh in a scratch repository against a fake `gh` that
+// Two halves. The structural half holds ci.yml's `tree` skip to ci-verdict.sh's TREE_SKIPS and
+// the verdict's wiring into the jobs that start a run. The behavioural half runs ci-verdict.sh in a scratch repository against a fake `gh` that
 // answers from fixtures through the real `jq`, and checks every refusal answers `full`.
 // No assertion library, per CLAUDE.md.
 
 import { ROOT } from "./support/tree.ts";
 
 const ci = Deno.readTextFileSync(`${ROOT}/.github/workflows/ci.yml`);
-const gate = Deno.readTextFileSync(`${ROOT}/scripts/gate.sh`);
 const SCRIPT = `${ROOT}/scripts/ci-verdict.sh`;
-
-// The jobs `gated` may skip, each with the gate.sh row that runs its content.
-const GATE_COVERED: Record<string, string> = {
-  "ci-native": "ci-native",
-  "ci-release-shape": "ci-native",
-  "ci-cost": "scaling shape",
-};
 
 // Top-level jobs of ci.yml, name -> body.
 function jobs(): Map<string, string> {
@@ -34,52 +24,6 @@ function jobs(): Map<string, string> {
 }
 
 const jobIf = (b: string) => b.match(/^ {4}if: (.*)$/m)?.[1] ?? "";
-
-Deno.test("ci-verdict: `gated` skips exactly the jobs scripts/gate.sh runs whole", () => {
-  const all = jobs();
-  const gated = [...all].filter(([, b]) =>
-    jobIf(b).includes("needs.seed.outputs.gated != 'true'")
-  )
-    .map(([n]) => n).sort();
-  const want = Object.keys(GATE_COVERED).sort();
-  if (gated.join(",") !== want.join(",")) {
-    throw new Error(
-      `want gated-skippable jobs ${want.join(", ")}, got ${gated.join(", ")}`,
-    );
-  }
-  for (const [job, row] of Object.entries(GATE_COVERED)) {
-    if (!gate.includes(`run "${row}"`)) {
-      throw new Error(
-        `${job} is skipped on a gated tree because gate.sh row "${row}" runs it; want that row in scripts/gate.sh, got none`,
-      );
-    }
-    const body = all.get(job)!;
-    // Every test file the job names must be one gate.sh's ci-native row globs.
-    for (const [f] of body.matchAll(/tests\/[A-Za-z0-9_]+\.ts/g)) {
-      const name = f.slice("tests/".length);
-      if (
-        !/^selfhost_native_.*_test\.ts$/.test(name) &&
-        !/^vl_.*_test\.ts$/.test(name)
-      ) {
-        throw new Error(
-          `${job} runs ${f}, which gate.sh's ci-native globs do not; want it out of a gated-skippable job`,
-        );
-      }
-    }
-    for (const [s] of body.matchAll(/scripts\/[A-Za-z0-9_./-]+\.vl/g)) {
-      if (!gate.includes(s)) {
-        throw new Error(
-          `${job} runs ${s}, which scripts/gate.sh does not; want it out of a gated-skippable job`,
-        );
-      }
-    }
-  }
-  if (!gate.includes("ls tests/selfhost_native_*_test.ts tests/vl_*_test.ts")) {
-    throw new Error(
-      "want gate.sh's ci-native row to glob tests/selfhost_native_*_test.ts tests/vl_*_test.ts, got another set",
-    );
-  }
-});
 
 // The jobs a `tree` verdict skips: ci-verdict.sh's TREE_SKIPS, each of which the PR's run must
 // have passed. seed (the proven seed master's consumers restore), ci and ci-cost (a master
@@ -141,7 +85,6 @@ Deno.test("ci-verdict: the jobs that start a run decide, and the seed hands the 
   for (
     const o of [
       "heavy: ${{ steps.verdict.outputs.heavy }}",
-      "gated: ${{ steps.verdict.outputs.gated }}",
       "tree: ${{ steps.verdict.outputs.tree }}",
     ]
   ) {
@@ -181,7 +124,6 @@ path=$2; filter=$4
 case "$path" in
   */actions/runs\\?head_sha=*) k=runs-$(sed -E 's/.*head_sha=([0-9a-f]+).*/\\1/' <<< "$path");;
   */pulls/*) k=pull-\${path##*/};;
-  */commits/*/statuses*) k=statuses-$(sed -E 's#.*/commits/([0-9a-f]+)/.*#\\1#' <<< "$path");;
   */actions/runs/*/jobs*) k=jobs-$(sed -E 's#.*/actions/runs/([0-9]+)/jobs.*#\\1#' <<< "$path");;
   */check-runs/*/annotations) k=ann-$(sed -E 's#.*/check-runs/([0-9]+)/annotations#\\1#' <<< "$path");;
   *) exit 1;;
@@ -222,13 +164,12 @@ function runJobs(over: Record<string, string> = {}): string {
     "ci-witnesses (2)",
     "ci-ir-identity (1)",
     "ci-ir-identity (2)",
-    "ci-proof",
   ];
   return JSON.stringify({
     jobs: names.map((name, i) => ({
       id: name === "seed" ? 500 : 501 + i,
       name,
-      conclusion: over[name] ?? (name === "ci-proof" ? "skipped" : "success"),
+      conclusion: over[name] ?? "success",
     })),
   });
 }
@@ -266,7 +207,7 @@ function verdict(
 }
 
 Deno.test({
-  name: "ci-verdict: inherit, gated and every refusal",
+  name: "ci-verdict: inherit, tree and every refusal",
   ignore: !hasJq,
   fn() {
     const dir = Deno.makeTempDirSync({ prefix: "ci-verdict-" });
@@ -301,10 +242,10 @@ Deno.test({
 
       const write = (k: string, v: string) =>
         Deno.writeTextFileSync(`${fake}/${k}.json`, v);
-      // The jobs an inherited run must have passed: every top-level job but ci-proof.
+      // The jobs an inherited run must have passed: every top-level job.
       Deno.writeTextFileSync(
         `${dir}/ci.yml`,
-        "on: push\njobs:\n  ci:\n    runs-on: x\n  seed:\n    runs-on: x\n  ci-ir-identity:\n    runs-on: x\n  ci-proof:\n    runs-on: x\n",
+        "on: push\njobs:\n  ci:\n    runs-on: x\n  seed:\n    runs-on: x\n  ci-ir-identity:\n    runs-on: x\n",
       );
       const pr = (head: string) => ({
         EVENT: "pull_request",
@@ -385,7 +326,13 @@ Deno.test({
           () => {},
         ],
         ["fork head", { ...pr(clean), HEAD_REPO: "x/r" }, "full", () => {}],
-        ["master push, queue mark names this tree", push, "gated", () => {
+        [
+          "the job asked only for inherit",
+          { ...push, MODES: "inherit" },
+          "full",
+          () => {},
+        ],
+        ["head CI red", push, "full", () => {
           write(
             "pull-7",
             JSON.stringify({
@@ -394,70 +341,9 @@ Deno.test({
               head: { sha: clean },
             }),
           );
-          write(
-            `statuses-${clean}`,
-            JSON.stringify([{
-              context: "vl-queue/gate",
-              state: "success",
-              description: `gated tree ${tree}`,
-            }]),
-          );
-          write(`runs-${clean}`, runs("success"));
+          write(`runs-${clean}`, runs("failure"));
         }],
-        [
-          "the job asked only for inherit",
-          { ...push, MODES: "inherit" },
-          "full",
-          () => {},
-        ],
-        [
-          "head CI red",
-          push,
-          "full",
-          () => write(`runs-${clean}`, runs("failure")),
-        ],
-        ["newest mark is a failure", push, "full", () => {
-          write(`runs-${clean}`, runs("success"));
-          write(
-            `statuses-${clean}`,
-            JSON.stringify([
-              {
-                context: "vl-queue/gate",
-                state: "failure",
-                description: `gated tree ${tree}`,
-              },
-              {
-                context: "vl-queue/gate",
-                state: "success",
-                description: `gated tree ${tree}`,
-              },
-            ]),
-          );
-        }],
-        [
-          "mark names another tree",
-          push,
-          "full",
-          () =>
-            write(
-              `statuses-${clean}`,
-              JSON.stringify([{
-                context: "vl-queue/gate",
-                state: "success",
-                description: "gated tree 0123",
-              }]),
-            ),
-        ],
-        ["no mark", push, "full", () => write(`statuses-${clean}`, "[]")],
         ["PR merged as another commit", push, "full", () => {
-          write(
-            `statuses-${clean}`,
-            JSON.stringify([{
-              context: "vl-queue/gate",
-              state: "success",
-              description: `gated tree ${tree}`,
-            }]),
-          );
           write(
             "pull-7",
             JSON.stringify({
@@ -476,17 +362,10 @@ Deno.test({
               head: { sha: clean },
             }),
           );
-          write(`statuses-${clean}`, "[]");
           write(`runs-${clean}`, runs("success"));
           write("jobs-99", runJobs());
           write("ann-500", annotation(tree));
         }],
-        [
-          "tree: the job asked only for gated",
-          { ...push, MODES: "inherit gated" },
-          "full",
-          () => {},
-        ],
         [
           "tree refused: the PR ran from a fork",
           push,
