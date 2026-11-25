@@ -594,8 +594,10 @@ import {
 } from "./emit_plan_union"
 import {
   SpreadPlan,
+  allocLitChunk,
   arrLitBuildAt,
   arrLitBuiltTyOf,
+  arrLitRefLongSlot,
   arrLitRefShortSlot,
   arrLitTyAt,
   arrLitUnionBoxSlot,
@@ -11269,17 +11271,21 @@ function arrayLit(
   if arm == "spread" { return spreadLit(b, n, ix, rep, lb, bt) }
   // A ref list builds along `emitArrRef`'s short arms (`arrLitRefShortSlot`) or not at all: each
   // element as is, or each boxed by its record, which `deliver` writes at the box rep.
+  // …or, past the chunk cap, the short arms' chunked twin (`arrLitRefLongSlot`).
+  const short = if arm == "ref" { arrLitRefShortSlot(ix, ibFnIx, lb) } else { -1 }
+  const lslot = if arm == "ref" && short < 0 && arrLitVariantSlot(ix, ibFnIx, lb) < 0 { arrLitRefLongSlot(ix, ibFnIx, lb) } else { -1 }
   // …or a non-null variant's, each element a literal built at the variant's row or a value of it.
   // …or, along legacy's general path, each element coerced to the variant's row all the same.
-  const vshort = if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 { arrLitVariantSlot(ix, ibFnIx, lb) } else { -1 }
-  const vslot = if vshort < 0 && arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 { arrLitVariantLongSlot(ix, ibFnIx, lb) } else { vshort }
+  const vshort = if arm == "ref" && short < 0 { arrLitVariantSlot(ix, ibFnIx, lb) } else { -1 }
+  const vslot = if vshort < 0 && arm == "ref" && short < 0 && lslot < 0 { arrLitVariantLongSlot(ix, ibFnIx, lb) } else { vshort }
   // …or a union-box slot's per-element build, each element boxed into the slot's union.
-  const uslot = if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 && vslot < 0 { arrLitUnionLongSlot(ix, n.arrElems, ibFnIx, lb) } else { -1 }
+  const uslot = if arm == "ref" && short < 0 && vslot < 0 && lslot < 0 { arrLitUnionLongSlot(ix, n.arrElems, ibFnIx, lb) } else { -1 }
   if (
     arm == "ref"
     && arrLitRefShortSlot(ix, ibFnIx, lb) < 0
     && vslot < 0
     && uslot < 0
+    && lslot < 0
   ) {
     return irBMiss("array ref")
   }
@@ -11372,6 +11378,15 @@ function arrayLit(
     const ve = if holed { repTemp(b, { rgV: v }, e, er) } else { v }
     if irBOpRep(ve) != er { return irBMiss("array element coercion") }
     elems.push(ve)
+  }
+  // A chunked ref list writes each chunk's flush between its elements, which a valued `if`'s out,
+  // waiting on the stack below the elements after it, cannot cross.
+  if (
+    arm == "ref"
+    && starts.length > allocLitChunk()
+    && ifBelowLeadHas(b, starts[0], b.length)
+  ) {
+    return irBMiss("chunked list valued element")
   }
   const r: Rhs = {
     mlElems: elems,
