@@ -44,5 +44,18 @@ Census probe (`$VL_IR_SHADOW=5`), same program lists on both sides; a tests/case
 batch dropped is rerun alone.
 
 | reading | master | head |
-|---|---:|---|
-| `array long chunk` / `array long dataComputed` units, all populations | see PR | |
+|---|---:|---:|
+| functions claimed, tests/cases | 89,298 | 89,299 |
+| start bodies claimed, tests/cases | 7,868 | 7,871 |
+| start bodies claimed, witnesses | 5,060 | 5,062 |
+| start bodies claimed, probes and distilled | 269, 9,740 | 269, 9,740 |
+| functions newly unclaimed, any population | | 0 |
+| armed shadow mismatch, fail and fallback rows | 23 | 23, the same rows |
+
+Claimed: `long-literal-computed-element-chunked` (its start and `f`), `long-literal-widths-exact`,
+`long-literal-with-computed-elements`, D3463 and D3465. No `array long chunk` or
+`array long dataComputed` unit is left in any population.
+
+- The writer's open takes the arm and names the scratch kind by a `match`. A plan field of a
+  literal-union type is held as its string, and the IR misses its atom tower over a field read
+  (`self-ir-misses`).
