@@ -20,7 +20,7 @@ of one. It took `EQ_ROOT_EXPR`, so legacy's `emitChainRead` wrote the operand no
 
 ## Measurement
 
-`scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep.txt` over cases, witnesses and probes:
+`scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep` over cases, witnesses and probes:
 
 | | master 56de706a | this change |
 |---|---:|---:|
