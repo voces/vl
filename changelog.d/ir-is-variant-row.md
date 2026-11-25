@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage: an impossible `nulTest`, and the variant row rung's tag-and-discriminant test.** An `is` that can never match a niche-held `T | null` is built as legacy writes it: `false`, with a receiver that is no re-readable place still evaluated. `recv is V` at `V`'s tested row is built along a new plan, `variantRowArmOf` (fold, never-fits, plain tag, discriminant, or the full chain), which legacy's `emitIsTestVariantRow` now reads too, with the same output. The discriminant arm is an `RVariantDiscrim` node over legacy's per-literal compare (`discrimFieldEqTail`). A row with shared or cross-row field fits stays legacy's.

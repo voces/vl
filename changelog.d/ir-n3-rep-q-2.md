@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage, the boxed tag dispatch:** a call through a tagged function set whose value a leading box takes (a `?.` call through a hole-typed function field into `f64 | null`) writes the box's tag ahead of the dispatch, as legacy does; the builder records the dispatch's run of nodes and the verifier refuses a node between it and its box. A desugared `?.` call's untyped callee is read through the plain call's field read. Graded by two committed position matrices (`optional-call-through-hole-fn-field`, `optional-call-effect-order-under-box`): 68 graded cells each move from `rep ?` to covered and matched; in tests/cases `boxed tag dispatch` 5 → 0. No legacy bytes moved.

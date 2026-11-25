@@ -33,6 +33,17 @@ import type { ModuleReader } from "../../compiler/coreTypes.ts";
 // the test that keeps them agreeing; the two TS ones used to be hand-maintained
 // twins and had silently lost the `export { … } from "…"` arm.
 import { needsModules } from "../../compiler/moduleGate.ts";
+import {
+  engineRefusal,
+  fellBackLine,
+  invalidHeadline,
+  needsClaimsOff,
+  refusedNote,
+  softFellBack,
+  softNote,
+  softRefusals,
+  withClaimsOff,
+} from "./claimFallback.ts";
 import { columnMap } from "./utf16Columns.ts";
 
 /**
@@ -48,6 +59,20 @@ export type Exports = Record<string, (...args: number[]) => number>;
 export type WasmRange = {
   start: { line: number; character: number };
   end: { line: number; character: number };
+};
+
+/**
+ * Where the binding under a cursor is declared, as the checker resolved it at that
+ * site: `key` is the declaring module (the entry's own key for a local binding),
+ * `range` the declaration name's span in that module, `line` its 1-based native line,
+ * and `name` the declared spelling. A method call answers the candidate its receiver
+ * picked, so two same-named `self`-functions are told apart.
+ */
+export type WasmDefinitionSite = {
+  key: string;
+  range: WasmRange;
+  line: number;
+  name: string;
 };
 
 /**
@@ -434,6 +459,17 @@ export type WasmChecker = {
     line: number,
     character: number,
   ) => Promise<WasmRange | undefined>;
+  /**
+   * `definitionAt` with the declaring module: the site-resolved declaration of the
+   * binding under (`line`, `character`), or undefined off any tracked binding.
+   */
+  definitionSiteAt?: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<WasmDefinitionSite | undefined>;
   /**
    * Find-references (Stage 2): every occurrence span (declaration + uses) of the
    * binding under the cursor. `includeDeclaration` drops the declaration's own
@@ -1265,6 +1301,28 @@ export const createWasmChecker = (
     // Native lines are 1-based; the LSP cursor line is 0-based.
     const occ = exp.defAt(line + 1, seedCol(source, line, character));
     return occ >= 0 ? occRange(exp, occ, source) : undefined;
+  };
+
+  const definitionSiteAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<WasmDefinitionSite | undefined> => {
+    const exp = instantiate();
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp)) return undefined;
+    await ensurePrepared(exp, source, entryKey, read);
+    const occ = exp.defAt(line + 1, seedCol(source, line, character));
+    if (occ < 0) return undefined;
+    const m = hasModuleTags(exp) ? exp.symOccModuleAt(occ) : 0;
+    const key = m <= 0 || m >= exp.modKeyCount()
+      ? entryKey
+      : readString(exp.modKeyAtLen(m), (j) => exp.modKeyAtCharAt(m, j));
+    const range = occRange(exp, occ, source);
+    const declLine = (moduleText(exp, source, m) ?? "").split(/\r\n|\r|\n/)[range.start.line] ?? "";
+    const name = declLine.slice(range.start.character, range.end.character);
+    return { key, range, line: exp.symSpanStartLine(occ), name };
   };
 
   const referencesAt = async (
@@ -2237,11 +2295,47 @@ export const createWasmChecker = (
     const status = exp.compileSrc(); // 0 ok; 1 lex/parse; 2 type; 3 emit
     staging.checked = false; // the emit path leaves no symbol tables behind
     const diagnostics = readDiags(exp, source);
-    if (status !== 0) return { bytes: undefined, diagnostics };
+    // A claim that met a shared legacy helper's refusal declined, and legacy wrote that unit: its
+    // refusal stands with a note, or its bytes ship with a warning (`claimFallback.ts`).
+    const soft = softRefusals(exp);
+    const top = { line: 0, character: 0 };
+    const notice = (message: string, severity: VLDiagnostic["severity"]): VLDiagnostic =>
+      ({ message, severity, range: { start: top, end: top }, source: "vital" });
+    if (status !== 0) {
+      const notes = soft.map(([name, msg]) => notice(softNote(name, msg), "info"));
+      return { bytes: undefined, diagnostics: [...diagnostics, ...notes] };
+    }
+    const bytes = moduleBytes(exp);
+    if (soft.length > 0) {
+      const [name, msg] = soft[0];
+      return { bytes, diagnostics: [...diagnostics, notice(softFellBack(name, msg), "warning")] };
+    }
+    if (!needsClaimsOff(exp, bytes)) return { bytes, diagnostics };
+    // A claimed module the engine refuses: compiled again with claims off, legacy's answer is
+    // the result — its refusal with a note, or its bytes with a warning (`claimFallback.ts`).
+    // Located first: the rebuild replaces the spans the claimed compile recorded.
+    const where = invalidHeadline(exp, engineRefusal(bytes), entryKey);
+    const at = where.line !== undefined && where.file === entryKey
+      ? { line: where.line - 1, character: where.col ?? 0 }
+      : { line: 0, character: 0 };
+    const said = (message: string, severity: VLDiagnostic["severity"]): VLDiagnostic =>
+      ({ message, severity, range: { start: at, end: at }, source: "vital" });
+    staged = undefined;
+    await ensureStaged(exp, source, entryKey, read);
+    const legacy = withClaimsOff(exp, () => exp.compileSrc());
+    staged = undefined;
+    const legacyDiags = readDiags(exp, source);
+    if (legacy !== 0) {
+      return { bytes: undefined, diagnostics: [...legacyDiags, said(refusedNote(where.headline), "info")] };
+    }
+    return { bytes: moduleBytes(exp), diagnostics: [...legacyDiags, said(fellBackLine(where.headline), "warning")] };
+  };
+
+  const moduleBytes = (exp: Exports): Uint8Array => {
     const n = exp.rbyteLen();
     const bytes = new Uint8Array(n);
     for (let i = 0; i < n; i++) bytes[i] = exp.rbyteAt(i);
-    return { bytes, diagnostics };
+    return bytes;
   };
 
   // Formatting rides the same seed as the other Stage-1+ exports; an older seed
@@ -2535,6 +2629,7 @@ export const createWasmChecker = (
     setTestEmitRefusal,
     setOptimized,
     definitionAt,
+    definitionSiteAt,
     referencesAt,
     referencesInEntry,
     hoverTypeAt,

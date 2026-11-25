@@ -239,6 +239,112 @@ For the queue:
   (queue practice).
 - **Q38.** A docs merge conflict on a squash reparent, such as an inventory add/add, takes the
   train's version, which is the closed row. D17055 in #9639 was that case (queue practice).
+- **Q39.** A lane runs `git fetch origin master` before it branches or merges master. A shallow
+  clone carries a stale `origin/master` ref, which is how #9680's first base was #9306's master
+  (coordinator ruling, 2026-11-23).
+- **Q40.** A moved-programs list (Q15) comes from a legacy byte A/B over the whole of `tests/cases`
+  and `scripts/capability-probes`, never a directory pick. #9685 missed 2 of 26 and #9680 missed 7
+  of 95 (a probe, and cases newer than its base); the queue names such omissions in the squash
+  message, as for CY1 (coordinator ruling, 2026-11-23).
+- **Q41.** A verifier builds each arm's host in a fresh cargo `--target-dir`, or touches the
+  sources first, and checks the binary by hash. `git archive` sets old mtimes, so a reused target
+  skips the rebuild and serves the previous host (IR-V2 on DB1) (queue practice).
+- **Q42.** IR lowering may read shared emitter state, such as `liKinds.length`, at the same
+  emission point legacy reads it; the IR build may not. The lane lists that state under its
+  refactor note's "Legacy tails the IR calls" heading, marked "state", and the fold carries it
+  into [`ir-legacy-tails.md`](ir-legacy-tails.md) (coordinator ruling, 2026-11-23).
+- **Q43.** While the queue's own box is gating, a built train goes to any free verifier as
+  GATE+VERIFY. IR-V3 and IR-V4 are end-to-end gate-and-verify lanes (coordinator ruling,
+  2026-11-23).
+- **Q44.** On each MERGED, the queue sends a one-line "#X merged" to the lane that owns the PR and to
+  any lane that asked "notify me when #X merges". A blocked lane asks for that instead of waiting
+  silently (coordinator ruling, 2026-11-23, after four lanes waited hours on merges already made).
+- **Q45.** The gate carries the `self ir misses` row (#9701; kill-matrix mutant `selfirmiss`, about
+  65 CPU-s): it is the only row that catches a new self-compile function landing in a missed shape.
+  When it reds on a train, the queue pulls that PR and rebuilds the trains behind it without it
+  (coordinator ruling, 2026-11-23; its first catch was on a train).
+- **Q46.** When GitHub refuses a verified PR's squash as dirty, the queue pushes one mechanical
+  master-merge to the PR branch whose tree equals the verified train's tree outside docs, then
+  squashes; no ungated tree merges (queue practice; #9696, #9682).
+- **Q47.** A lane's identity readings set `VL_STD=<tree>/std` on both arms. A stale shared std shows up
+  as extra "fail under both" rows or a spurious differ (#9699's 72 against 68; #9702's D16943
+  differ), which the lane must explain before READY (queue practice).
+- **Q48.** Every READY that touches `compiler/` quotes `self-ir-misses` = 0 and
+  `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check tests/vl_deep_nesting_test.ts` passing with all
+  8 tests run (the shared host linked; an isolated host skips 3). The queue refuses a READY without
+  both (coordinator ruling, 2026-11-23, after DX2 and DW1 red on trains).
+- **Q49.** The queue broadcasts the lane-claims list to every lane on each change. A lane reads the
+  latest broadcast before picking, announces its pick and waits for the queue's ack before writing
+  code; a collision is answered "taken by X", and a contested class goes to the coordinator
+  (coordinator ruling, 2026-11-23). The coordinator has split a class by mechanism, each lane
+  taking a named sub-cut, and has given a contested class to the lane whose own refusal and
+  in-flight cells depend on it.
+- **Q50.** A train's tree holds every file master holds. A train merge over the PR's master base
+  reads a docs-only commit that went straight to master as a train-side deletion and drops it; an
+  `inventory refs` red on a later citing PR is the symptom (IR-V3 on EM1, D17073). The queue's
+  merge restores any master file the merged train lacks unless the PR deleted it (queue practice).
+- **Q51.** A PR stacked on another queued PR merges into the train with the lower PR's head as merge
+  base, and the train's delta is checked to equal the PR's own diff. Once the lower PR squashes,
+  the upper squash needs a Q46 mechanical merge (#9717, #9720) (queue practice).
+- **Q52.** A verifier given VERIFY-only runs no gate when the queue box gated the same train; the
+  queue box gates while a verifier proves (queue practice).
+- **Q53.** When a lower PR in a train stack needs a fix that touches only docs, each affected train
+  is rebuilt as `<train>2` = `<train>1` plus only that fix. The verifier's proof on `<train>1`
+  carries over and only the affected test is rerun on `<train>2`. When the fix touches code, the
+  verifier also reruns `gate.sh --fast`, the affected test and `ir-identity.sh --cases` on
+  `<train>2` (queue practice).
+- **Q54.** A READY whose natural stack position sits above a red train is branched from the last
+  green train instead. The squash check compares against master with that train's own base, so the
+  two branches merge in either order (queue practice).
+- **Q55.** Before a squash, `presq.sh` flags `changelog.d` entries the squash would resurrect
+  (already folded on master, still on a stale branch). The queue removes them in the mechanical
+  master merge and checks that the code tree equals the train's (queue practice).
+- **Q56.** When a train's base lacks master's compiler commits (the PR head and the train base
+  predate a master commit touching `compiler/`), the queue's sqcheck typechecks the squash tree
+  before merging: `git archive <tree> | tar -x` into a scratch dir, then `vl check
+  compiler/entry.vl` there with `VL_STD` set to that dir's `std`; it must print `Found 0 errors`.
+  A mechanical tree comparison cannot see a semantic conflict: #9778 added a fifth `coalesce`
+  parameter while master's #9771 added 4-argument calls, both merged textually clean, and the
+  merged compiler did not typecheck (coordinator ruling, 2026-11-23).
+- **Q58.** Every READY that adds or widens an IR claim carries an armed position sweep: the
+  claimed value as a call argument (at a scalar and at a union parameter), a nested call argument,
+  a concat operand, an interpolation hole, a `return`, a `let`/`const` initializer, an `if` arm, a
+  `??` operand and a record field. Each program builds under `VL_IR_SHADOW=6`, runs, and is
+  identical to `ir-identity.sh --claimless`; the READY names the sweep's paths and the verifier
+  re-runs it. A red position is pinned; a red already on master is filed as a clause-1 row and
+  fixed express. Trains in flight on 2026-11-24 were held to the earlier bar (coordinator ruling,
+  2026-11-24). Grading (queue ruling, coordinator-approved, 2026-11-24, BROADCAST #24): "matched"
+  means no covered function mismatches or fails the verifier. A position function uncovered under
+  both seeds, in a class the PR does not touch, is not red when the program runs and is
+  claimless-identical, and the note names that class. A position that fails to run, or differs
+  from claimless, is always red and is filed clause-1, whoever owns its class.
+- **Q59.** A verifier may make a stated one-line control edit (a failing control for a probe) only
+  in an isolated `git archive` scratch build, never in the worktree or `build/`; it `cmp`s `build/`
+  before and after and deletes the scratch build (queue ruling, 2026-11-24).
+- **Q60.** Each worktree starts with master's `scripts/agent-setup.sh --host-check`, run before
+  the fixpoints, never the candidate tree's copy: a candidate's own copy can pass a host that
+  master's guest protocol needs rebuilt (queue ruling, 2026-11-24, BROADCAST #21).
+- **Q61.** Guest fuel is a deterministic count: the same seed building the same tree gives the
+  same number every time, so a fuel reading has no noise floor. A READY and a verifier quote
+  exact counts (queue ruling, 2026-11-24).
+- **Q62.** A legacy clause-1 red that a Q58 sweep finds and that is not tied to the finding lane's
+  own change goes to the soundness lane S2, which files and fixes it express (coordinator ruling,
+  2026-11-24).
+- **Q63.** `gate.sh --fast` runs neither `tests/vl_ir_door_guard_test.ts` nor
+  `tests/vl_emitter_state_audit_test.ts`, so a lane runs both directly before every READY and
+  quotes them. A train went red on both in its full gate after a green fast tier: a new module
+  `let` no reset clears, and door guards still pinning a miss the PR removed (queue ruling,
+  2026-11-24).
+- **Q64.** A claimed build that fails to validate ships legacy's bytes with a note, and one whose claim meets a legacy helper's refusal declines that unit (G3 and its ruling (a), DECISIONS.md, #9845, #9888). Every gate, harness and CI run sets `VL_IR_STRICT=1`, so a fallback is rc 70 there; `vl check --codegen` stays strict and is never covered by the fallback (coordinator rulings, 2026-11-24).
+- **Q65.** A short pass after a change to inventory rows, tests or `scripts/inventory/` runs ci-native's inventory tests (`tests/vl_inventory_rows_test.ts`, `tests/vl_inventory_refs_test.ts`), not `gate.sh --fast` alone: a fast-only short pass left master red on a row's wording (queue ruling, 2026-11-24; fixed by #9861). Before squashing a PR that adds a row, the queue checks master for a stale `unfiled: D<id>` marker naming it (#9897, after #9882 landed D17108 under #9878's marker).
+- **Q66.** Every program a Q58 sweep or a witness reads is committed in the PR, never only in a scratchpad (queue ruling, 2026-11-24, BROADCAST #25).
+- **Q67.** A census or legacy A/B builds each arm in a tree at its own commit with that tree's own fixpoint seed: `scripts/ir-only-census.vl` builds from the working tree's `compiler/`, so a file-swapped base arm measures the wrong compiler. `scripts/ir-only-census-ab.sh` does this (queue ruling, 2026-11-24, BROADCAST #26).
+- **Q68.** A verifier grades on a host whose `scripts/vl-host` matches the train's own tree and quotes its sha256; `scripts/ir-parity.vl` runs `$VL`, so check it. A host built before `c0cbdab7` lacks the claims-off fallback, and one built before `6bf25409` (#9888) lacks the soft-refusal note; a train containing either commit is graded on a host built from a tree containing it, a train that lacks it on its own tree's host (queue rulings, 2026-11-24, BROADCASTS #27 and #30).
+- **Q69.** A reading of a claimless face names the claimless compiler's sha256 and the commit of the tree it was built in, with `git status --short compiler` clean: a claimless compiler built on a fix branch, read as master's, opened a false G3 express (coordinator ruling, 2026-11-24, BROADCAST #29).
+- **Q70.** Each active lane files new inventory rows only from its own reserved range (`docs/internals/inventory/reserved/`, 20 ids each, ids 17140 to 17479, #9893) and asks the queue for another when it runs out: ids raced four times in ten minutes before the ranges (coordinator directive, 2026-11-24, BROADCAST #28).
+- **Q71.** A row whose filed witness falls back to legacy (a `runs` witness the claims run builds) lands with its line in `scripts/silent-sweep/distilled/claims-fallbacks.txt` in the same PR (queue rule, after #9910's row reddened `ir claims`, fixed by #9913).
+
+Readings recorded at the eighteenth fold, for the next reader of the same class: a legacy plan never shadows a region once it mutates or is reassigned, so #9862's guard protected nothing (V7); #9878's skipped cross-tag delivery check is unconstructible, since the checker refuses `is` narrowing to a contained arm (V6); a wrong heap fill in #9899 is caught by the builder as a miss, not by the verifier, and cannot reach a claim (V3); #9887's relaxed door-guard case reds on its miss clause, since no path produces a differ once the atom is declared (V6); a verifier's coverage gap, a mutant that ships wrong output while every committed program passes, is closed before merge with a committed witness (#9885 and #9891, queue rulings).
 
 ### Squash artifacts and Q3 members
 
@@ -275,7 +381,41 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 - a parallel predicate mirror, unless legacy consumes it or an agreement check is armed;
 - a new dead export;
 - any differ under `ir-identity.sh --claimless` or `--cases`;
+- a claimed module that fails validation under `$VL_IR_STRICT=1`, or any differ in the gate row
+  `ir claim refusals` (`ir-parity.vl --pop refusals`);
+- a red in the gate row `ir claim cross` (`ir-parity.vl --cross`): a shipped build that fails, or
+  runs otherwise, where the claimless build runs clean;
 - a shipping door that bypasses `claimable()` (ir-design §10.2).
+
+## A chosen divergence (Q57)
+
+Q57 (coordinator ruling) lets an IR lane write bytes legacy would not, when matching legacy would
+cost more than about two hours. The queue or the coordinator acks the divergence and its cost
+before the lane relies on it. Byte identity cannot prove such a function, so behaviour does:
+
+- The lane adds one line per diverging function to `scripts/ir-divergence-baseline.txt`:
+  `<program>\t<function>\t<mechanism>\t<PR>`, the function as a `--names` build spells it
+  (`f@1`), `<module>` for anything outside the function bodies.
+- `scripts/ir-identity.sh` then prints `expected divergence <program> (<functions>)` for that
+  program and passes it, but only when every function whose body differs is listed for it. An
+  unlisted function or program still reds as `DIFF`.
+- The armed shadow subtracts the same pairs: `ir-shadow.vl` (every mode but `--claims` and
+  `--blockers`) and `tests/vl_ir_shadow_test.ts`'s row files turn a listed program's byte
+  mismatches into `expected divergence` when a detail build (`$VL_IR_SHADOW=2`) names each one,
+  each a listed function (`f@1` is the detail row's `f`, `__start__@1` its `@start`). An
+  unlisted function, a mismatch the detail cannot name (it names at most three a class), or any
+  non-bytes row (a verifier failure, spans, order) still reds.
+- `vl run scripts/ir-parity.vl` is the proof. It builds each program with the IR on (the seed) and
+  off (the `CLAIMED`-empty twin), runs both, and compares stdout, exit code and trap message.
+  Any `differs` or one-sided `build-fails` reds, and so does a byte differ the baseline does not
+  list (`--behaviour-only` drops that last check, for after the I8 cutover drops byte identity).
+  A listed divergence must still behave alike.
+- The READY quotes the parity summary line over the three default populations (distilled cells,
+  `tests/cases`, capability probes), with the diverging programs among them, or `--files`
+  naming them when no population holds one. It also quotes `ir-identity.sh --cases` showing the
+  `expected divergence` rows.
+
+The queue's vetoes are unchanged: an unlisted differ under `ir-identity.sh` is still a veto.
 
 ## Folds
 

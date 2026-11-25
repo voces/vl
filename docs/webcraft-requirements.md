@@ -859,6 +859,45 @@ eliminate some checks; "some" isn't a contract.)
 > worth 31% on the `scale` kernel — `v.getF32(i)` avoids it. Both wasm-opt rungs
 > inline the forward away and the two spellings converge exactly.
 
+> **Third pass (2026-11-23, #9676): no accessor call survives `-O3`; a view held
+> in a MODULE GLOBAL still pays the descriptor reload.** (`buffer-design.md` §M11.)
+> The first table's `1.044` predates §M9/§M10. Re-run on the current seed, `-O3`,
+> ns per inner-loop iteration, min-of-5, control subtracted:
+>
+> | kernel | `v[i]` | fenced by hand over hoisted locals | raw hoisted |
+> |---|---|---|---|
+> | `scale` | 0.757 | | 0.687 |
+> | `reduce` | 0.727 | | 0.642 |
+> | `axpy` | 0.875 | 0.886 | |
+>
+> Those kernels' loops hold no `call` and no `struct.get`: the fenced spelling
+> already costs hoisted base + check. They take their views as PARAMETERS. Held
+> in module-level `const`s instead — `const terrain = buf.u8view(0, N)` — the
+> descriptor lives in a nullable mutable global, and every access re-reads the
+> global and the struct's fields. A branch-free three-column u8/u16 kernel
+> (`f[i] = f[i] + t[i] + o[i]`, 4M cells x 101, min-of-9):
+>
+> | spelling | ns/iter | reads per iteration in the loop |
+> |---|---|---|
+> | views in module globals, `x[i]` | 2.18 | 4 `global.get` + 9 `struct.get` |
+> | views as parameters, `x[i]` | 1.75 | 9 `struct.get` |
+> | hoisted `u8base`/`getU8At`/`setU8At` (fenced) | 0.82 | none |
+> | raw intrinsics (unfenced) | 0.77 | none |
+>
+> Calls in the loop: 0 in every row; the six bounds compares are ~0.13 of it.
+> Binaryen's loop-invariant motion hoists only TOP-LEVEL loop statements, and
+> these reads sit in the loop condition and inside the fence's `if`s, as
+> `struct.get` on a nullable reference it must treat as able to trap. No
+> wasm-opt pass order moves them (`--flatten --licm`, `-O4`, `--gufa-optimizing`,
+> `--simplify-globals-optimizing` were tried); `--traps-never-happen` would, and
+> would delete the fence with them.
+>
+> **So a kernel touching several columns either takes its views as parameters,
+> or — fastest and still fenced — hoists `xbase(v)` and `v.length` into locals
+> and indexes through `getXAt`/`setXAt`.** Making `x[i]` itself close this is a
+> codegen change, planned for after the IR cutover
+> (`refactor-notes/2026-11-23-view-global-reload.md`).
+
 ### P1.5 Nominal/opaque types (vl A14) — id safety  ✅ SHIPPED
 
 The kernel traffics in `EntityId`, `PlayerSlot`, `AbilityHandle`, all i32.

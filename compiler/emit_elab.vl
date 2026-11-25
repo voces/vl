@@ -7481,13 +7481,17 @@ function elabSlotRecordNote(c: i32) {
   const ms: i32[] = []
   const holders: i32[] = []
   const hands: i32[] = []
+  // A module-scope map nothing reassigns is one map whichever function reads it.
+  const global = isMap
+    && elabEnclosingFn(d) == -1
+    && (dn.letKw == "const" || !cwDeclAssigned(d))
   const ow = cwOccWalk(d)
   while cwOccNext(ow) {
     const k = cwIxKind[ow.row]
     const u = cwIxNode[ow.row]
     if k == CW_OCC_USE {
       if (
-        cwUseInOtherFrame(u)
+        cwUseInOtherFrame(u) && !global
         || !cwIxCovers(u)
         || cwIxUpKind[u] != CW_UP_OBJ
       ) {
@@ -7507,6 +7511,10 @@ function elabSlotRecordNote(c: i32) {
           if mk != CW_UP_CALLEE { return 0 }
           own = mn.memProp == "get"
           place = cwIxUp[m]
+        } else if mn is Member && mn.memProp == "keys" {
+          // A walk of the keys reads no value.
+          const kk = if cwIxCovers(m) { cwIxUpKind[m] } else { -1 }
+          if kk != CW_UP_CALLEE { return 0 }
         } else if !(mn is Member) || mn.memProp != "has" {
           return 0
         }
@@ -7639,13 +7647,15 @@ function elabSlotNulHolderOk(
 ): boolean {
   const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
   if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return false }
+  // A module-scope `const` is one holder whichever function reads it.
+  const global = elabEnclosingFn(h) == -1
   const mine: i32[] = []
   const hw = cwOccWalk(h)
   while cwOccNext(hw) {
     const k = cwIxKind[hw.row]
     const u = cwIxNode[hw.row]
     if k == CW_OCC_USE {
-      if cwUseInOtherFrame(u) || !cwIxCovers(u) { return false }
+      if cwUseInOtherFrame(u) && !global || !cwIxCovers(u) { return false }
       const uk = cwIxUpKind[u]
       if uk == CW_UP_LETINIT {
         if !elabSlotHolderOk(cwIxUp[u], rec, hands) { return false }
@@ -7712,6 +7722,11 @@ function elabSlotHolderOk(h: i32, rec: i32[], hands: i32[]): boolean {
 // entry where `h` is read any other way.
 function elabSlotHolderCalls(h: i32): i32[] {
   const out: i32[] = []
+  // A module-scope `const` is one holder whichever function calls through it.
+  const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+  const global = elabEnclosingFn(h) == -1
+    && hn is LetDecl
+    && hn.letKw == "const"
   const hw = cwOccWalk(h)
   while cwOccNext(hw) {
     const k = cwIxKind[hw.row]
@@ -7719,11 +7734,17 @@ function elabSlotHolderCalls(h: i32): i32[] {
     const cn = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
     let t = -1
     if k == CW_OCC_CALL {
-      if cn is Call && cn.callFn >= 0 && !cwUseInOtherFrame(cn.callFn) { t = u }
+      if (
+        cn is Call
+        && cn.callFn >= 0
+        && (global || !cwUseInOtherFrame(cn.callFn))
+      ) {
+        t = u
+      }
     } else if k == CW_OCC_USE {
       // A read that is a call's callee is the same call, filed by the read.
       const ok = cwIxCovers(u) && cwIxUpKind[u] == CW_UP_CALLEE
-      if ok && !cwUseInOtherFrame(u) { t = cwIxUp[u] }
+      if ok && (global || !cwUseInOtherFrame(u)) { t = cwIxUp[u] }
     } else if k == CW_OCC_BIND {
       continue
     }
@@ -14815,6 +14836,12 @@ function elabArgSetAt(st: i32, w: i32): i32 {
   return if fnTagSetOfTy(st) >= 0 { fnTagSetOfTy(st) } else { fnTagSetOfTy(w) }
 }
 
+// Whether parameter `pn` of `f` is annotated by one of `f`'s type parameters alone.
+function elabParamBareTyParam(f: FuncDecl, pn: Param): boolean {
+  const tn = if pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+  return tn is TypeRef && strListHas(f.fnTyParams, tn.tyName)
+}
+
 // Binding `tys` of call `ix` with each un-annotated parameter, or one its own type parameter
 // alone annotates, handed a tagged set bound to the set itself: the instance calls each member at its own arguments, so no one signature stands for it.
 // One handed only uncalled hole functions is bound to the stub the monomorphizer primed. `k` is
@@ -14955,10 +14982,12 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[], k: i32): i32[] {
       !named
       && pn is Param
       && (i == elabHandBackIx(d, f) || pn.parType < 0 && i == handBackHoleIx(f, 0))
+      && !(fnTagTyIsTagged(st) && elabParamBareTyParam(f, pn))
     ) {
       // A function handed back to a closed function-typed destination is bound at that type:
       // the call's value is delivered there, and the open binding names no instance. A hole
       // parameter takes, failing that, the one type every call through the value takes (D5530).
+      // A tagged set handed to a bare type parameter keeps the set, as monomorphization pins it.
       const cx = elabClosedFnCtx(ix)
       const ct = if cx >= 0 || pn.parType >= 0 { cx } else { elabResultCallTy(ix) }
       const hn = elabParamTyVarName(f, i)

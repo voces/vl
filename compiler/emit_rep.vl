@@ -167,6 +167,7 @@ import {
   fnTagSetOfTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
+import { recNarrowArmOf } from "./check_bind_adopt"
 import {
   PrimName,
   T,
@@ -574,6 +575,12 @@ function repCanonFieldTy(ty: i32): i32 {
   const nb = numLitUnionBaseTy(ty)
   if nb >= 0 { return nb }
   return ty
+}
+
+// Whether `ty` is one bare string literal, which a record field keeps as its atom though a binding
+// of it holds the string (`repFieldLitAsSet`).
+export function repTyIsLoneStrLit(ty: i32): boolean {
+  return repFieldLitAsSet(ty).length > 0
 }
 
 // A bare string literal at a record field keys as its one-member set: both rep as the atom, so
@@ -4349,6 +4356,13 @@ export function repVariantShapeRowOf(ty: i32): i32 {
   if rvsShapeMatches(ty) {
     r = rvsRow[repCanonId(ty)] ?? (-1)
     if r >= 0 && repTyHasDeclRow(ty) { r = -1 }
+    // A record with no row of its own, declared or a literal's, narrower than one union arm that
+    // no struct row stores either, is stored as that arm.
+    const own = repTyHasDeclRow(ty) || repRowOfTyStruct(ty, repScanLim()) >= 0
+    const arm = if r < 0 && !own { recNarrowArmOf(ty) } else { -1 }
+    if arm >= 0 && arm != ty && repRowOfTyStruct(arm, repScanLim()) < 0 {
+      r = repVariantShapeRowOf(arm)
+    }
   }
   while rvsAnsAt.length <= ty {
     rvsAnsAt.push(-1)
@@ -4943,6 +4957,9 @@ let rtNode: RepNode[] = []
 // hash-cons merge keeps the first builder's).
 let rtTy: i32[] = []
 let rtByTy: i32[] = [] // Ty index → node index (-1 unfilled); the cycle breaker
+// Inner Ty index → the nullable node over it (-1 unfilled). Two nullable types over one inner
+// are one node, so a recursive record's self fields share the node its cycle reaches (D17075).
+let rtNulByInner: i32[] = []
 // The hash-cons: a node's structural key interned in `rtKeys`, and the node each key id names.
 const rtKeys: Interner = internNew()
 let rtByKey: i32[] = []
@@ -5064,6 +5081,7 @@ function rtSync() {
   rtNode = []
   rtTy = []
   rtByTy = []
+  rtNulByInner = []
   rncMemo = []
   internResetIn(rtKeys)
   rtByKey = []
@@ -5373,15 +5391,16 @@ function rtOfObj(ty: i32, fieldTys: i32[]): i32 {
 }
 
 // The position among record rep `r`'s fields of field `name` of record type `ty`, in the type's
-// field order, or -1.
+// field order, or -1. A type that is no object itself (an intersection, an alias) names its fields
+// by the record it builds, `r`'s own (`repRecordFieldNames`).
 export function repRecordKidOf(r: i32, ty: i32, name: string): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   const t = tyAt(ty)
-  if !(t is TyObj) { return -1 }
+  const names = if t is TyObj { t.objFieldNames } else { repRecordFieldNames(r) }
   const ks = repNodeKids(r)
   let k = 0
-  while k < t.objFieldNames.length && k < ks.length {
-    if t.objFieldNames[k] == name { return k }
+  while k < names.length && k < ks.length {
+    if names[k] == name { return k }
     k = k + 1
   }
   return -1
@@ -5409,15 +5428,177 @@ function rtOfObjAs(
   const ix = rtAlloc(rn, objTy)
   rtByTyPut(memoTy, ix)
   const fs: i32[] = []
-  // A field typed by one bare string literal is stored as its atom, as its row keys it
-  // (`repFieldLitAsSet`), though a binding of that type holds the string.
-  for ft in fieldTys {
+  const ot = tyAt(objTy)
+  const names = if ot is TyObj { ot.objFieldNames } else { [] }
+  let k = 0
+  while k < fieldTys.length {
+    const ft = fieldTys[k]
     fs.push(
-      if repFieldLitAsSet(ft).length > 0 { rtLeafOf({ raAtom: 0 }, -1) } else { rtGo(ft) },
+      if repFieldLitAsSet(ft).length > 0 && !rtFieldStoredAsString(objTy, names, k) { rtLeafOf({ raAtom: 0 }, -1) } else { rtFieldAtom(objTy, ft, names, k) },
     )
+    k = k + 1
   }
   rn.rrFields = fs
   return rtComplete(ix, memoTy)
+}
+
+// The rep of record `objTy`'s field `k` of type `ft`: its own, or the string where the type is a
+// string literal set the tree keeps as its atom and the record's row keeps as the string (a layout
+// family re-laid at the string, D14752).
+function rtFieldAtom(objTy: i32, ft: i32, names: string[], k: i32): i32 {
+  const r = rtGo(ft)
+  if !(repNodeAt(r) is RAtom) || !rtFieldStoredAsString(objTy, names, k) {
+    return r
+  }
+  return rtPrimLeaf("str", -1)
+}
+
+// A field typed by one bare string literal is stored as its atom, as its row keys it
+// (`repFieldLitAsSet`), unless the row record `objTy` is stored at keeps it as the string a
+// binding of that type holds. Each (record, field) answer is recorded once, so a row that turns
+// it later is caught (`rowFieldAsksHold`).
+function rtFieldStoredAsString(objTy: i32, names: string[], k: i32): boolean {
+  if k >= names.length { return false }
+  const a = rowFieldStorageFn(objTy, names[k])
+  const key = i32ToStr(objTy) + ":" + names[k]
+  if rowFieldAskSeen.get(key) == null {
+    rowFieldAskSeen[key] = a
+    rowFieldAskTy.push(objTy)
+    rowFieldAskName.push(names[k])
+    rowFieldAskAns.push(a)
+  }
+  return a == 0
+}
+
+// Whether the row record type `ty` is stored at keeps literal field `name` as the atom (1) or the
+// string (0); -1 for no row or another code, where the type's default, the atom, stands.
+// `rowFieldStorage`, installed by `emitProgram` since its home sits above this module.
+function rowFieldStorageUnset(_ty: i32, _name: string): i32 { return -1 }
+export let rowFieldStorageFn: (ty: i32, name: string) => i32 = rowFieldStorageUnset
+
+// The struct row legacy stores record type `ty` at (`structRowOfRecordTy`), or -1: installed by
+// `emitProgram` beside `rowFieldStorageFn`, and asked through `askRecordRowTy` so it is recorded.
+function recordRowUnset(_ty: i32): i32 { return -1 }
+export let recordRowFn: (ty: i32) => i32 = recordRowUnset
+
+// The record type legacy stores record type `ty` as: its storage row's (`recordRowFn`), else `ty`.
+// Recorded once per type, so a row minted later that moves the decision is caught.
+export function askRecordRowTy(ty: i32): i32 {
+  const r = recordRowTyOf(ty)
+  if recordRowAskSeen.get(ty) == null {
+    recordRowAskSeen[ty] = r
+    recordRowAskTy.push(ty)
+    recordRowAskAns.push(r)
+  }
+  return r
+}
+
+function recordRowTyOf(ty: i32): i32 {
+  const row = recordRowFn(ty)
+  const rt = if row >= 0 { slotRowTyOf(row) } else { -1 }
+  return if rt >= 0 { rt } else { ty }
+}
+
+let recordRowAskSeen: {[i32]: i32} = Map()
+let recordRowAskTy: i32[] = []
+let recordRowAskAns: i32[] = []
+
+// The struct heap of the row legacy stores record type `ty` at, or -1. Installed by
+// `emitProgram`, and asked through `askRecordHeap` so it is recorded.
+function recordHeapUnset(_ty: i32): i32 { return -1 }
+export let recordHeapFn: (ty: i32) => i32 = recordHeapUnset
+
+// `recordHeapFn(ty)`. A heap it names is recorded once per type, so a row minted later that moves
+// it is caught; -1 admits no retag, so a later heap where none stood is no change.
+export function askRecordHeap(ty: i32): i32 {
+  const h = recordHeapFn(ty)
+  if h >= 0 && recordHeapAskSeen.get(ty) == null {
+    recordHeapAskSeen[ty] = h
+    recordHeapAskTy.push(ty)
+    recordHeapAskAns.push(h)
+  }
+  return h
+}
+
+let recordHeapAskSeen: {[i32]: i32} = Map()
+let recordHeapAskTy: i32[] = []
+let recordHeapAskAns: i32[] = []
+
+// A record type's full heap, its own else its storage row's; -1 for none. Installed by
+// `emitProgram` for `recordHeapNoneHolds`.
+function recordHeapAllUnset(_ty: i32): i32 { return -1 }
+export let recordHeapAllFn: (ty: i32) => i32 = recordHeapAllUnset
+
+// Records that record type `ty` had no heap when a cell or capture note rested on that, so a row
+// minted later that gives it one is caught (`recordHeapNoneHolds`).
+export function askRecordHeapNone(ty: i32) {
+  if recordHeapNoneSeen.get(ty) == null {
+    recordHeapNoneSeen[ty] = true
+    recordHeapNoneTy.push(ty)
+  }
+  return 0
+}
+
+let recordHeapNoneSeen: {[i32]: boolean} = Map()
+let recordHeapNoneTy: i32[] = []
+
+// Whether every type a cell or capture note rested on having no heap still has none.
+export function recordHeapNoneHolds(): boolean {
+  for ty in recordHeapNoneTy {
+    if recordHeapAllFn(ty) >= 0 { return false }
+  }
+  return true
+}
+
+// Every distinct `rowFieldStorageFn` answer a record rep rests on in this emit, kept across tree
+// rebuilds since a node read under an earlier build may already be lowered.
+let rowFieldAskSeen: {[string]: i32} = Map()
+let rowFieldAskTy: i32[] = []
+let rowFieldAskName: string[] = []
+let rowFieldAskAns: i32[] = []
+
+// Forgets the recorded answers, with the struct table.
+export function rowFieldAsksReset() {
+  rowFieldAskSeen = Map()
+  rowFieldAskTy = []
+  rowFieldAskName = []
+  rowFieldAskAns = []
+  recordRowAskSeen = Map()
+  recordRowAskTy = []
+  recordRowAskAns = []
+  recordHeapAskSeen = Map()
+  recordHeapAskTy = []
+  recordHeapAskAns = []
+  recordHeapNoneSeen = Map()
+  recordHeapNoneTy = []
+  return 0
+}
+
+// Whether every recorded answer still decides the same storage, the string or not: false once a
+// row minted or re-laid after a rep rests on it turns that decision. A row appearing where none
+// stood (-1 to 1) keeps the atom, so it is no change.
+export function rowFieldAsksHold(): boolean {
+  let i = 0
+  while i < rowFieldAskTy.length {
+    if (
+      (rowFieldStorageFn(rowFieldAskTy[i], rowFieldAskName[i]) == 0)
+      != (rowFieldAskAns[i] == 0)
+    ) {
+      return false
+    }
+    i = i + 1
+  }
+  let j = 0
+  while j < recordRowAskTy.length {
+    if recordRowTyOf(recordRowAskTy[j]) != recordRowAskAns[j] { return false }
+    j = j + 1
+  }
+  let k = 0
+  while k < recordHeapAskTy.length {
+    if recordHeapFn(recordHeapAskTy[k]) != recordHeapAskAns[k] { return false }
+    k = k + 1
+  }
+  return true
 }
 
 function rtOfUnion(ty: i32, members: i32[]): i32 {
@@ -5545,6 +5726,8 @@ function rtOfNullable(ty: i32, inner: i32): i32 {
   if inner < 0 { return rtPrimLeaf("null", ty) }
   const it = tyAt(inner)
   if nulInnerIsHole(inner) { return rtPrimLeaf("null", ty) }
+  // `never | null` holds no value but `null`: an instance a `null` binds at `never` (D17092).
+  if inner == TY_NEVER { return rtPrimLeaf("null", ty) }
   // A doubled nullable is the single one.
   if it is TyNullable {
     const k = rtGo(inner)
@@ -5553,11 +5736,25 @@ function rtOfNullable(ty: i32, inner: i32): i32 {
   }
   const disc = nulDisciplineOfTy(inner)
   if disc == 0 { return rtUnsup("nul:unclassified", ty) }
+  const prior = if inner < rtNulByInner.length { rtNulByInner[inner] } else { -1 }
+  if prior >= 0 {
+    rtByTyPut(ty, prior)
+    return prior
+  }
   const nn: RNullable = { rnInner: -1, rnDisc: disc }
   const ix = rtAlloc(nn, ty)
   rtByTyPut(ty, ix)
+  rtNulByInnerPut(inner, ix)
   nn.rnInner = rtGo(inner)
-  return rtComplete(ix, ty)
+  const done = rtComplete(ix, ty)
+  rtNulByInnerPut(inner, done)
+  return done
+}
+
+function rtNulByInnerPut(inner: i32, ix: i32) {
+  while rtNulByInner.length <= inner { rtNulByInner.push(-1) }
+  rtNulByInner[inner] = ix
+  return 0
 }
 
 function rtOfMap(ty: i32, mVal: i32, mSet: i32): i32 {
@@ -5567,8 +5764,15 @@ function rtOfMap(ty: i32, mVal: i32, mSet: i32): i32 {
   const ix = rtAlloc(mn, ty)
   rtByTyPut(ty, ix)
   // A Set is internally a boolean-valued map — the mono value rep.
-  mn.rmVal = if mSet == 1 { rtPrimLeaf("bool", -1) } else { rtGo(mVal) }
+  mn.rmVal = if mSet == 1 { rtPrimLeaf("bool", -1) } else { rtGo(rtMapValTy(mVal)) }
   return rtComplete(ix, ty)
+}
+
+// The type map value type `v` is held at: a record's at the type of the struct row legacy stores
+// it in (recorded), which for a record type no row records is another row's; else `v`.
+function rtMapValTy(v: i32): i32 {
+  if v < 0 || !(tyAt(v) is TyObj) { return v }
+  return askRecordRowTy(v)
 }
 
 // The tree's projection onto the flat `VKind` vocabulary — the fact the
@@ -5817,12 +6021,60 @@ export function repTyHasNoValue(ty: i32): boolean {
   return rtNode[repTreeOfTy(ty)] is RNoValue
 }
 
+// The rep tree node legacy's descriptor `d` names by its kind alone: a scalar's, a string's or the
+// null unit's. -1 for a kind that needs more than itself (a row, a shape,
+// a signature, a box's members) and for an atom, whose members `d` does not carry.
+function repNodeOfDesc(d: RepDesc): i32 {
+  const t = repDescTy(d)
+  return if t >= 0 { repNodeOfTy(t) } else { -1 }
+}
+
+// The type `repNodeOfDesc`'s node is of, or -1.
+export function repDescTy(d: RepDesc): i32 {
+  if d.rdKind == null || d.rdAtom == 1 { return -1 }
+  return descKindTy(d.rdKind)
+}
+
+// The type kind `k` names alone, or -1.
+function descKindTy(k: VKind): i32 {
+  return match k {
+    "i32" => TY_I32
+    "i64" => repElemTyOfName("i64")
+    "f32" => repElemTyOfName("f32")
+    "f64" => repElemTyOfName("f64")
+    "v128" => repElemTyOfName("v128")
+    "str" => repElemTyOfName("string")
+    "nulnone" => TY_NULL
+    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "u8list" => -1
+  }
+}
+
+// `repNodeOfDesc`'s round trip over every kind it names: the node's own type describes back at
+// that kind (`repOfTy`). 0, else 1 + the index of the first kind that does not.
+export function repDescSelfTest(): i32 {
+  const ks: VKind[] = ["i32", "i64", "f32", "f64", "v128", "str", "nulnone"]
+  let i = 0
+  while i < ks.length {
+    const d = repDescRet(ks[i], -1, "")
+    const t = repDescTy(d)
+    const r = repNodeOfDesc(d)
+    if t < 0 || r != repNodeOfTy(t) || repOfTy(t).rdKind != ks[i] {
+      return i + 1
+    }
+    i = i + 1
+  }
+  return 0
+}
+
 // The tree node of type `ty` in the current rebuild epoch, -1 for no type. A rebuild drops the
 // arena, so a node index is never kept across one.
 export function repNodeOfTy(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   return repTreeOfTy(ty)
 }
+
+// The `null` unit's rep: the one value of a type that is only `null`, the bottom ref.
+export function repNodeOfNullUnit(): i32 { return repNodeOfTy(TY_NULL) }
 
 // The closure rep taking reps `params` and returning rep `ret` (nothing where `isVoid`), interned
 // with no type: a function value whose signature no one arena type spells, such as a generic's

@@ -18,6 +18,7 @@ import {
   P,
   nodeAt,
 } from "./ast"
+import { identDeclOf } from "./symbols"
 import { arrLitDestTy } from "./check_bind_rows"
 import { ctxElemOwnerOf, nodeCtxTyIxOf } from "./check_core_state"
 import { nodeTyProvesNonNull } from "./check_emit_queries"
@@ -66,6 +67,8 @@ import {
 } from "./emit_capture_frames"
 import {
   asgReReadOf,
+  asgYieldsNulHole,
+  asgYieldsNullLit,
   coalHoleNulNumRead,
   coalRetypedDead,
   coalesceDefaultNullable,
@@ -92,6 +95,7 @@ import {
   exprRefArray,
   exprStringArray,
   exprUnion,
+  holderRecordSigs,
   inferredRetMapSlot,
   mapShapeOfExpr,
   nulTagIdRepTy,
@@ -248,8 +252,11 @@ export function nulTestArmOf(
     const ty = nodeTyAt(unwrapParen(refIx), fnIx)
     if narrowed && tyProvesNonNull(ty) { return "nnfold" }
     if narrowed && isNullTy(ty) { return "nulfold" }
-    // A row-less record's `null` field read through the row of the place that stores it.
-    if isNullTy(ty) { return "nullty" }
+    // A row-less record's `null` field read through the row of the place that stores it; an
+    // assignment of `null` into a never-filled `let x = null` is the unit too (D17120).
+    if isNullTy(ty) || asgYieldsNulHole(unwrapParen(refIx), fnIx) {
+      return "nullty"
+    }
   }
   if exprNulBool(refIx, fnIx) { return "bool" }
   if exprNulLitUnion(refIx, fnIx) { return "atom" }
@@ -266,6 +273,16 @@ export function nulTestArmOf(
     }
   }
   if nodeRepIsNullRef(refIx, fnIx) { return "nullRef" }
+  // A `const` holding a record of members whole is that record or null, even where its read is
+  // checked before the holder's own declaration and keeps an open type.
+  const hr = unwrapParen(refIx)
+  if (
+    hr >= 0
+    && nodeAt(hr) is Ident
+    && holderRecordSigs(identDeclOf(hr), fnIx).length > 0
+  ) {
+    return "nullRef"
+  }
   // Read raw: a `string | null` ident is otherwise recovered to non-null, and `ref.is_null`
   // would be a constant 0.
   if exprNullableString(refIx, fnIx) { return "nulStr" }
@@ -285,6 +302,42 @@ export function binNulTestOf(e: BinExpr): BinNulTest | null {
   if ref < 0 { return null }
   const t: BinNulTest = { bnRef: ref, bnInvert: e.binOp == "!=" }
   return t
+}
+
+// The other operand and direction of `==`/`!=` node `e` where one side is a non-literal `null`
+// (a narrowed read, a `null` unit, a call or assignment of one) and the other may hold `null`: the
+// compare is that operand's null test, whatever arms its storage has. Null for any other compare.
+export function binNulNameTestOf(e: BinExpr, fnIx: i32): BinNulTest | null {
+  if e.binOp != "==" && e.binOp != "!=" { return null }
+  let ref = -1
+  if nulNameSide(e.binRight, fnIx) && nulTestableSide(e.binLeft, fnIx) {
+    ref = e.binLeft
+  }
+  if nulNameSide(e.binLeft, fnIx) && nulTestableSide(e.binRight, fnIx) {
+    ref = e.binRight
+  }
+  if ref < 0 { return null }
+  const t: BinNulTest = { bnRef: ref, bnInvert: e.binOp == "!=" }
+  return t
+}
+
+// One side of `binNulNameTestOf`: an operand other than a `null` literal whose type at `fnIx` is
+// `null`, which is stored as the `null` unit, or which assigns `null` into a never-filled
+// `let x = null` (`asgYieldsNulHole`, D17302).
+function nulNameSide(ix: i32, fnIx: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || nodeAt(u) is NullLit { return false }
+  return isNullTy(nodeTyAt(u, fnIx))
+    || exprIsNulNone(u, fnIx)
+    || asgYieldsNulHole(u, fnIx)
+}
+
+// The other side of `binNulNameTestOf`: an operand that may hold `null` and is not itself `null`.
+function nulTestableSide(ix: i32, fnIx: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || nodeAt(u) is NullLit { return false }
+  if isNullTy(nodeTyAt(u, fnIx)) || exprIsNulNone(u, fnIx) { return false }
+  return tyBearsNull(nodeTyAt(u, fnIx))
 }
 
 // Whether `l ?? d` has a nullable map left and a union result with an arm for that map, as a
@@ -307,6 +360,18 @@ export function nulNoneEqSides(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
     return false
   }
   return nulNoneEqSide(leftIx, fnIx) && nulNoneEqSide(rightIx, fnIx)
+}
+
+// Whether legacy's `==`/`!=` at `leftIx`/`rightIx` takes the `null` pair's route (`emitNulNoneEq`):
+// `nulNoneEqSides`, or an assignment of `null` typed `null` (`asgYieldsNullLit`) on a side, which
+// stores and is then the unit, against the unit or a bare `null`.
+export function nulNoneEqRoute(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
+  if nulNoneEqSides(leftIx, rightIx, fnIx) { return true }
+  const la = asgYieldsNullLit(unwrapParen(leftIx))
+  const ra = asgYieldsNullLit(unwrapParen(rightIx))
+  if !la && !ra { return false }
+  return (la || nulNoneEqSide(leftIx, fnIx))
+    && (ra || nulNoneEqSide(rightIx, fnIx))
 }
 
 // One side of `nulNoneEqSides`: a `null`-typed value, or a bare `null` literal.
@@ -695,14 +760,15 @@ function coalCallArmOf(
         // `recv.get(k) ?? d` over a map is the same fused read as `recv[k] ?? d`.
         if mapFused && exprMap(lcallee.memObj, fnIx) { return "mapGetOr" }
         // Over a scalar-element list it is the fused checked read-with-default (B6), a wide
-        // element only where the `??` keeps the element type.
+        // element only where the `??` keeps the element type, and never a `??` stored as a box.
         const lgk = scalarListElemKind(lcallee.memObj, fnIx)
         const lgPrim = tyPrimNameOf(nodeTyIxOf(exprIx))
         if (
-          exprF64Array(lcallee.memObj, fnIx)
-          || exprArray(lcallee.memObj, fnIx)
-          || (lgk == "i64" && lgPrim == "i64")
-          || (lgk == "f32" && lgPrim == "f32")
+          (exprF64Array(lcallee.memObj, fnIx)
+            || exprArray(lcallee.memObj, fnIx)
+            || (lgk == "i64" && lgPrim == "i64")
+            || (lgk == "f32" && lgPrim == "f32"))
+          && !exprUnion(exprIx, fnIx)
         ) {
           return "listGetOr"
         }
@@ -733,9 +799,11 @@ function coalPopOrFits(recvIx: i32, exprIx: i32, fnIx: i32): boolean {
   ) {
     return false
   }
+  // A `??` stored as a union box (a nullable or mixed result) is not the element's scalar.
   return !exprRefArray(recvIx, fnIx)
     && !exprStringArray(recvIx, fnIx)
     && !coalesceNulAtomToStr(exprIx, fnIx)
+    && !exprUnion(exprIx, fnIx)
 }
 
 // The nullable-rep arm of `l ?? d` once `coalArmOf` names `niche`, in `emitCoalesceNiche`'s
@@ -802,6 +870,7 @@ export type CoalValArm = "boolPop"
   | "callNoKind"
   | "next"
   | "popOr"
+  | "listGetOr"
   | "mapIndexGetOr"
   | "nulRef"
   | "litUnion"
@@ -827,7 +896,7 @@ export function coalValBoxArm(a: CoalValArm): CoalBoxArm | null {
     "callScalar" => "callScalar"
     "callNoKind" => "callNoKind"
     "next" => "next"
-    "popOr" | "mapIndexGetOr" | "nulRef" | "litUnion" | "nulBool" | "fieldBox" | "fieldVal" | "optLeaf" | "nulBoolJoin" | "boxStash" | "boxFieldScalar" | "nulStr" => null
+    "popOr" | "listGetOr" | "mapIndexGetOr" | "nulRef" | "litUnion" | "nulBool" | "fieldBox" | "fieldVal" | "optLeaf" | "nulBoolJoin" | "boxStash" | "boxFieldScalar" | "nulStr" => null
   }
 }
 

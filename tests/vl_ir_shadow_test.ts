@@ -18,7 +18,7 @@
 //
 // Run with:  deno test -A tests/vl_ir_shadow_test.ts
 
-import { COMPILER, exists, ROOT } from "./support/tree.ts";
+import { COMPILER, exists, ROOT, VL } from "./support/tree.ts";
 
 const ignore = !exists(COMPILER);
 if (ignore) {
@@ -104,14 +104,71 @@ const fileRows: FileRow[] = [...(() => {
   .sort()
   .map((f) => parseRow(`tests/ir-shadow-rows/${f}`, Deno.readTextFileSync(`${ROWS_DIR}/${f}`)));
 
+// A divergence Q57 lets a lane choose: `scripts/ir-divergence-baseline.txt` lists it as
+// `program\tfunction\tmechanism\tPR`, the function as a `--names` build spells it (`f@1`).
+const DIVERGENCE_FILE = `${ROOT}/scripts/ir-divergence-baseline.txt`;
+
+/** A `--names` function name as a detail row spells it: no `@<module>` suffix, the start `@start`. */
+const shadowName = (fn: string) => {
+  const n = fn.replace(/@\d+$/, "");
+  return n === "__start__" ? "@start" : n;
+};
+
+/** Each listed program's functions, as detail rows spell them. */
+const parseDivergences = (text: string) => {
+  const out = new Map<string, Set<string>>();
+  for (const line of text.split("\n")) {
+    if (line === "" || line.startsWith("#")) continue;
+    const f = line.split("\t");
+    if (f.length !== 4) throw new Error(`${DIVERGENCE_FILE}: not four tab-separated fields: ${line}`);
+    out.set(f[0], (out.get(f[0]) ?? new Set()).add(shadowName(f[1])));
+  }
+  return out;
+};
+
+const DIVERGENCES = parseDivergences(exists(DIVERGENCE_FILE) ? Deno.readTextFileSync(DIVERGENCE_FILE) : "");
+
+/** A row a chosen divergence accounts for: a byte mismatch, or the claim rule's fail for one. */
+const bytesRow = (k: string) =>
+  k.includes("bytes") && (k.startsWith("mismatch ") || k.startsWith("fail a claimable function did not match: "));
+
+/**
+ * A listed program's rows without its byte mismatches, and how many functions those were, when
+ * the detail compile (`irShadowArm(2)`) names every one and each is listed for it; else it throws
+ * naming the function, or the mismatches it could not name. Other programs' rows pass unchanged.
+ */
+const subtractDivergence = (row: FileRow, rows: Map<string, number>, listed: Set<string> | undefined, corrupt: number) => {
+  const bytes = [...rows.keys()].filter(bytesRow);
+  if (listed === undefined || bytes.length === 0) return { rows, expected: 0 };
+  const want = bytes.filter((k) => k.startsWith("mismatch ")).reduce((n, k) => n + rows.get(k)!, 0);
+  const named = new Map<string, number>();
+  for (const [k, n] of run(row.src, 2, corrupt).rows) {
+    const head = k.split("\n")[0];
+    const at = head.lastIndexOf(" in ");
+    if (!head.startsWith("detail ") || !head.slice(7, at).includes("bytes")) continue;
+    const fn = head.slice(at + 4);
+    named.set(fn, (named.get(fn) ?? 0) + n);
+  }
+  const unlisted = [...named.keys()].filter((fn) => !listed.has(fn));
+  if (unlisted.length > 0) {
+    throw new Error(`${row.file}: a byte mismatch in a function the divergence baseline does not list: ${unlisted.join(", ")}`);
+  }
+  const got = [...named.values()].reduce((a, b) => a + b, 0);
+  if (got !== want) throw new Error(`${row.file}: ${want} byte mismatches, the detail compile names ${got} (at most 3 a class)`);
+  const fns = bytes.filter((k) => k.startsWith("mismatch ") && !k.startsWith("mismatch start ")).reduce((n, k) => n + rows.get(k)!, 0);
+  return { rows: new Map([...rows].filter(([k]) => !bytesRow(k))), expected: fns };
+};
+
 /** Grades one file row's armed compile against its expectations and the standing three. */
-const gradeRow = (row: FileRow) => {
-  const { rc, rows } = run(row.src, true);
+const gradeRow = (row: FileRow, listing = DIVERGENCES, corrupt = 0) => {
+  const armed = run(row.src, true, corrupt);
+  const { rc } = armed;
+  const { rows, expected } = subtractDivergence(row, armed.rows, listing.get(row.file), corrupt);
   const got = JSON.stringify([...rows]);
   if (rc !== 0) throw new Error(`${row.file}: want compileSrc rc 0, got ${rc}`);
   const fails = failures(rows);
   if (fails.length > 0) throw new Error(`${row.file}: want no failure, got:\n${fails.join("\n")}`);
-  if ((rows.get("matched") ?? 0) !== (rows.get("covered") ?? 0)) {
+  if ((rows.get("matched") ?? 0) + expected !== (rows.get("covered") ?? 0)) {
     throw new Error(`${row.file}: want every covered function matched, got ${got}`);
   }
   for (const { key, op, n } of row.counts) {
@@ -125,6 +182,89 @@ const gradeRow = (row: FileRow) => {
 };
 
 for (const row of fileRows) Deno.test({ name: row.name, ignore, fn: () => gradeRow(row) });
+
+// The divergence subtraction's controls. `irShadowCorrupt(3)` adds a byte to every lowering, so
+// each covered function (and the start body) is a byte mismatch: listed, the row passes. Unlisted,
+// or with one function left out, it reds. A spans mismatch (control 4) reds even when listed.
+const DIVERGED: FileRow = {
+  file: "tests/ir-shadow-rows/divergence-control.vl",
+  name: "ir shadow: divergence control",
+  counts: [],
+  absent: [],
+  src: "function f(x: i32): i32 { return x + 1 }\nfunction g(x: i32): i32 { return x * 2 }\n" +
+    "function h(x: i32): i32 { return x - 3 }\nprint(f(2))\nprint(g(3))\nprint(h(4))\n",
+};
+const listing = (...fns: string[]) =>
+  parseDivergences(fns.map((fn) => `${DIVERGED.file}\t${fn}\tcontrol\t#0\n`).join(""));
+const reds = (f: () => void, want: string) => {
+  try {
+    f();
+  } catch (e) {
+    if ((e as Error).message.includes(want)) return;
+    throw new Error(`want a red containing "${want}", got: ${(e as Error).message}`);
+  }
+  throw new Error(`want a red containing "${want}", got a pass`);
+};
+
+Deno.test({
+  name: "ir shadow: a listed divergence passes, and an unlisted one reds",
+  ignore,
+  fn: () => {
+    gradeRow(DIVERGED, listing("f@1", "g@1", "h@1", "__start__@1"), 3);
+    reds(() => gradeRow(DIVERGED, listing(), 3), "did not match: bytes");
+    reds(() => gradeRow(DIVERGED, listing("f@1", "g@1", "__start__@1"), 3), "does not list: h");
+    reds(() => gradeRow(DIVERGED, listing("f@1", "g@1", "h@1", "__start__@1"), 4), "did not match: spans");
+  },
+});
+
+// A nullable record compare's element side banks the element-read rows of its null tests and
+// fields: with them dropped (control 5) the row's spans count reds.
+Deno.test({
+  name: "ir shadow: a nullable record compare's element side banks its element-read rows",
+  ignore,
+  fn: () => {
+    const row = fileRows.find((r) => r.file.endsWith("/nullable-record-compare-element-side.vl"));
+    if (row === undefined) throw new Error("want the nullable-record-compare-element-side row, got none");
+    gradeRow(row);
+    reds(() => gradeRow(row, DIVERGENCES, 5), "spans");
+  },
+});
+
+// Verifier rule 2's nullable-compare pair: an element side counts at its list's element rep, so a
+// bare record against a nullable element verifies; a compare with no nullable side, marked
+// nullable (`irShadowCorrupt(9)`), is refused.
+Deno.test({
+  name: "ir shadow: a nullable record compare needs a nullable side, an element side's at its element rep",
+  ignore,
+  fn: () => {
+    const held = "type C = { r: i32 }\nfunction f(xs: (C | null)[], y: C) { return y == xs[0] }\n" +
+      "print(f([{ r: 1 }], { r: 1 }))\n";
+    const ok = run(held, true);
+    if (failures(ok.rows).length > 0 || ok.rows.get("matched") !== 1) {
+      throw new Error(`want f matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const bare = "type C = { r: i32 }\nfunction f(xs: C[], y: C) { return y == xs[0] }\n" +
+      "print(f([{ r: 1 }], { r: 1 }))\n";
+    const { rows } = run(bare, true, 9);
+    const want = "a nullable record compare has a nullable operand";
+    if (!failures(rows).some((k) => k.includes(want))) {
+      throw new Error(`want a fail row naming "${want}", got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A record compare's element side over a place receiver banks the element-read rows legacy's
+// own root writes at each field: with them dropped (control 5) the row's spans count reds.
+Deno.test({
+  name: "ir shadow: a record compare's place element side banks its element-read rows",
+  ignore,
+  fn: () => {
+    const row = fileRows.find((r) => r.file.endsWith("/record-compare-element-place.vl"));
+    if (row === undefined) throw new Error("want the record-compare-element-place row, got none");
+    gradeRow(row);
+    reds(() => gradeRow(row, DIVERGENCES, 5), "spans");
+  },
+});
 
 // The tripwire: a row name is one row, inline or in a file, never both and never two files.
 Deno.test({
@@ -164,6 +304,32 @@ Deno.test({
   },
 });
 
+// A record literal whose row drops an effectful field (D1696) is built through legacy's stash, the
+// dropped initialiser run for its effect in source order: at a struct row and at a union arm, a
+// partial literal at its destination's row, each matching legacy's bytes.
+Deno.test({
+  name: "ir shadow: a literal that drops or omits fields is built at its destination's row and matches",
+  ignore,
+  fn: () => {
+    const src = `type Plain = { legs: i64 }\ntype Shallow = { pet: Plain }\n` +
+      `type A = { k: i32, legs: i64 }\ntype B = { s: string }\ntype Pet = A | B\n` +
+      `type Cfg = { verbose: boolean | null, out: string | null }\n` +
+      `let n = 0\nfunction f() { n = n + 1\n  return true }\n` +
+      `function mk(): Shallow {\n  const sv = { pet: { legs: 4, purr: f() } }\n  return sv\n}\n` +
+      `function arm(): Pet {\n  const sv = { k: 1, legs: 4, purr: f() }\n  return sv\n}\n` +
+      `function cfg(): Cfg {\n  const c: Cfg = { out: "x" }\n  return c\n}\n` +
+      `print(mk().pet.legs)\nconst p = arm()\nif p is A { print(p.legs) }\nprint(cfg().out ?? "none")\nprint(n)\n`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
+    const unc = [...rows.keys()].filter((k) => k.startsWith("uncovered ") || k.startsWith("mismatch"));
+    if (unc.length > 0 || (rows.get("matched") ?? 0) < 4) {
+      throw new Error(`want mk, arm, cfg and f matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A closure thunk's IR lowering under the dual emit's control 3 must report a bytes mismatch;
 // unbroken, each thunk matches legacy's `emitCloThunkCode` (a valued and a void target).
 Deno.test({
@@ -179,6 +345,27 @@ Deno.test({
     const { rows } = run(src, true, 3);
     if (rows.get("mismatch bytes: thunk") !== 2 || rows.has("thunk matched")) {
       throw new Error(`want each thunk a "mismatch bytes: thunk" row, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A thunk whose target's result type is open is typed by its rep's own type where that is closed
+// and round-trips to the rep (`thunkRetTy`); where it does not, by legacy's declared result
+// descriptor (`resultDescTy`). Each matches.
+Deno.test({
+  name: "ir shadow: a thunk's open result type stands as its rep's own where that round-trips, else at its declared result",
+  ignore,
+  fn: () => {
+    const fits = `export function id<T>(x: T): T { return x }\nconst k = () => id\nprint(k()(9))\n`;
+    const ok = run(fits, true);
+    if (ok.rows.get("thunk fns") !== 1 || ok.rows.get("thunk matched") !== 1) {
+      throw new Error(`want the thunk matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const open = `function inc(x) { return x + 1 }\nfunction run(f) { return f()(41) }\n` +
+      `print(run(() => inc) + run(() => inc))\n`;
+    const { rows } = run(open, true);
+    if (rows.has("thunk uncovered thunk open result type") || (rows.get("thunk matched") ?? 0) < 2) {
+      throw new Error(`want both open-result thunks matched at the declared result, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -220,6 +407,25 @@ Deno.test({
     }
     const { rows } = run(src, true, 7);
     const want = "a map whose value widens the inner's";
+    if (!failures(rows).some((k) => k.includes(want))) {
+      throw new Error(`want a fail row naming "${want}", got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// The operand re-read's control: a union compare off its null leg marked as reading its operand
+// again (`irShadowCorrupt(8)`), which the verifier must refuse; the re-read is a null leg's alone.
+Deno.test({
+  name: "ir shadow: a union compare's operand read again off its null leg fails the verifier",
+  ignore,
+  fn: () => {
+    const src = `type U = i32 | string\nfunction f(u: U) { return u == "s" }\nprint(f("s"))\n`;
+    const ok = run(src, true);
+    if (failures(ok.rows).length > 0 || ok.rows.get("matched") !== 1) {
+      throw new Error(`want f matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 8);
+    const want = "operand is read again off a null leg";
     if (!failures(rows).some((k) => k.includes(want))) {
       throw new Error(`want a fail row naming "${want}", got ${JSON.stringify([...rows])}`);
     }
@@ -380,27 +586,26 @@ Deno.test({
   },
 });
 
-// Outside the set: a `??` over a `null`-typed if-expression and a propagating `as` conversion
+// Outside the set: a `??` over a `null`-typed if-expression and an `as?` over a type parameter
 // each leave their function uncovered, named. A closure parameter, its baked
 // callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // A conversion by a propagating `as`, which returns the function's null on a miss, is outside
-    // the set too.
+    // An `as!` over a type parameter pinned at no number, which legacy writes as the operand and a
+    // trap inside the expression, is outside the set too.
     const src = `function greet(c: boolean): i32 {
   const x = null
   return (if c { x } else { x }) ?? 0
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv(x: f64): i32 | null {
-  const n = x as i32
-  return n
+function cv<T>(u: T): i32 {
+  return u as! i32
 }
 print(greet(true))
 print(ap((x: i32) => x + 1))
-print(cv(3.0))
+print(cv("s"))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
@@ -538,16 +743,16 @@ Deno.test({
   },
 });
 
-// A code-point list that is no local is legacy's spill through a scratch slot: a named miss,
-// never a byte mismatch.
+// A code-point list that is no local is legacy's spill through a scratch slot, read once into
+// it (`fcpSpillTail`): covered and matched.
 Deno.test({
-  name: "ir shadow: a spilled code-point list is a named miss",
+  name: "ir shadow: a spilled code-point list is read once into its spill slot",
   ignore,
   fn: () => {
     const src = `function sp(n: i32): string { return fromCodePoints([n, 33]) }\nprint(sp(111))\n`;
     const { rows } = run(src, true);
-    if (rows.get("uncovered code point list spill") !== 1) {
-      throw new Error(`want one "uncovered code point list spill" row, got ${JSON.stringify([...rows])}`);
+    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
+      throw new Error(`want the spill covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -1502,23 +1707,41 @@ Deno.test({
       "bounds-rule-uninstalled": 8,
       "box-immediate-for-call": 2,
       "box-at-union-type-into-i32": 2,
+      "if-at-box-writes-i32": 2,
+      "if-at-box-arm-delivers-i32": 2,
       "nul-none-box-of-i32": 2,
       "pop-or-of-i32": 2,
       "pop-or-bool-out": 2,
       "pop-or-out-unwritten": 5,
+      "list-get-or-holds": 0,
+      "list-get-or-record-list": 2,
       "record-field-read-twice": 2,
+      "stored-read-of-i32-field": 2,
+      "stored-read-of-boxed-nullable-field": 0,
+      "field-read-at-receiver-type-kid": 2,
+      "field-read-at-operand-row-kid": 0,
       "map-read-probe-of-i32": 2,
       "map-read-on-pop-arm": 2,
       "map-read-out-unwritten": 5,
       "shared-read-of-temp": 2,
       "map-read-mv-into-wrong-out": 2,
+      "null-none-into-bool-niche": 2,
+      "null-none-into-ref-niche": 0,
       "nul-ref-of-i32": 2,
       "nul-ref-of-non-null-list": 2,
       "nul-ref-list-into-i32": 2,
       "shared-read-global-not-box": 2,
       "niche-read-of-i32": 2,
       "arm-unbox-of-i32": 2,
+      "record-arms-unbox-at-its-record": 0,
+      "record-arms-unbox-at-another-record": 2,
+      "asg-arm-unbox-at-its-record": 0,
+      "asg-arm-unbox-without-dest": 2,
+      "led-box-follows-its-dispatch": 0,
+      "led-box-past-a-node": 10,
       "box-list-retag-into-i32-list": 2,
+      "list-of-lists-retag-into-nullable-lists": 0,
+      "list-of-lists-retag-into-other-lists": 2,
       "box-list-retag-into-niche-record-list": 2,
       "num-union-conversion-of-non-box": 2,
       "num-union-conversion-off-result-kind": 2,
@@ -1532,22 +1755,49 @@ Deno.test({
       "record-retag-field-other-valtype": 2,
       "record-retag-two-noted-heaps": 2,
       "record-retag-one-noted-heap": 0,
+      "value-retag-built-heap": 0,
+      "value-retag-other-heap": 2,
+      "value-retag-field-other-valtype": 2,
       "width-retag-noted-leading": 0,
       "width-retag-field-not-leading": 2,
       "width-retag-pair-unnoted": 2,
       "hand-pick-of-i32": 2,
       "hand-pick-record-into-i32": 2,
+      "holder-pick-of-i32": 2,
+      "holder-pick-record-into-i32": 2,
+      "holder-pick-record-into-closure": 0,
+      "eq-helper-of-records": 0,
+      "eq-helper-of-i32": 2,
+      "eq-helper-into-bool": 2,
+      "rep-typed-thunk-forwards": 0,
+      "rep-typed-thunk-forwards-env": 1,
+      "rep-typed-result-not-thunk": 1,
+      "init-progress-as-value": 2,
+      "init-progress-effect": 0,
+      "literal-cast-of-record": 2,
+      "literal-cast-of-i32": 0,
+      "hole-opt-box-of-record": 2,
+      "hole-opt-box-of-i32": 0,
       "retag-closures-of-differing-arity": 2,
       "retag-closures-of-differing-arity-noted": 0,
+      "map-delete-of-map": 0,
+      "map-delete-of-i32": 2,
       "retag-field-alike-records-two-heaps": 2,
       "push-many-of-i32": 2,
       "global-read-off-store-type": 2,
+      "return-not-stored-alike": 2,
+      "return-stored-alike": 0,
+      "return-stored-unlike": 2,
+      "niche-return-not-stored-alike": 2,
+      "niche-return-stored-alike": 0,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
       "atom-tower-i32-read": 2,
       "atom-tower-zero-reads": 2,
       "atom-staged-of-i32": 2,
       "map-get-boxed-scalar-into-bool": 2,
+      "map-get-atom-niche-narrowed": 0,
+      "map-get-atom-niche-into-string": 2,
       "field-coalesce-of-i32-receiver": 2,
       "bool-join-coalesce-of-i32": 2,
       "trunc-sat-operand-off-plan": 2,
@@ -1557,11 +1807,73 @@ Deno.test({
       "call-write-back-not-a-capture": 2,
       "coal-str-default-off-rep": 2,
       "coal-atom-str-default-off-rep": 2,
+      "atom-decode-nullable-into-string": 2,
+      "atom-decode-nullable-into-nullable-string": 0,
+      "nullable-records-compared-nullable": 0,
+      "plain-records-compared-nullable": 2,
+      "captured-atom-param-decoded-at-string": 0,
+      "captured-atom-param-typed-as-string": 3,
+      "get-of-list": 0,
+      "get-index-of-string": 2,
+      "bytes-into-i32-list": 2,
+      "bytes-of-i32": 2,
       "opt-read-of-i32": 2,
       "dead-return-after-returning-call": 5,
       "pop-or-default-returning-call": 5,
       "pop-or-default-never-call": 0,
       "dead-return-after-never-call": 0,
+      "never-call-value-at-consumer-rep": 0,
+      "dead-never-temp-at-consumer-rep": 0,
+      "dead-never-bound-to-non-temp": 3,
+      "identity-eq-of-records": 0,
+      "identity-eq-of-string": 2,
+      "identity-eq-of-i32": 2,
+      "returning-call-temp-typed-never": 3,
+      "never-call-value-into-bool": 2,
+      "print-open-pair": 0,
+      "print-open-unclosed": 10,
+      "print-opened-unopened": 10,
+      "print-open-arm-mismatch": 10,
+      "print-open-left-by-return": 10,
+      "union-cast-of-box": 0,
+      "union-cast-of-boxed-nullable": 0,
+      "union-cast-of-niche-nullable": 2,
+      "union-cast-of-i32": 2,
+      "never-closure-call-value-at-consumer-rep": 0,
+      "returning-closure-call-temp-typed-never": 3,
+      "never-field-read-at-its-storage": 0,
+      "never-field-read-off-its-storage": 3,
+      "str-field-read-at-its-storage": 0,
+      "str-field-read-typed-as-atom": 3,
+      "str-field-read-into-atom-decode": 2,
+      "nulbool-field-read-at-its-boolean": 0,
+      "nulbool-field-read-at-i32": 2,
+      "nulbool-field-read-at-string": 2,
+      "walk-pair-map-value-record": 0,
+      "walk-pair-map-value-off-type": 3,
+      "walk-pair-string-index": 0,
+      "walk-pair-string-index-of-bool": 2,
+      "walk-map-value-record": 0,
+      "walk-map-value-off-rep": 2,
+      "walk-map-key-i32": 0,
+      "walk-map-key-off-rep": 2,
+      "walk-map-key-i64": 0,
+      "walk-map-key-width-mismatch": 2,
+      "walk-map-key-record": 2,
+      "map-scalar-join-of-i32": 0,
+      "map-scalar-join-of-string": 2,
+      "asg-unwiden-wrap-of-i64": 0,
+      "asg-unwiden-trunc-of-i64": 2,
+      "asg-unwiden-non-null-of-nullable-record": 0,
+      "asg-unwiden-non-null-of-record": 2,
+      "map-print-of-i32": 0,
+      "map-print-of-string": 2,
+      "after-effects-at-value-rep": 0,
+      "after-effects-off-value-rep": 2,
+      "null-of-plain": 0,
+      "null-of-place-with-read": 0,
+      "null-of-read-off-place": 2,
+      "null-of-place-without-read": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -1583,6 +1895,27 @@ Deno.test({
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
+    // An arm unbox routes on its `uaAsg` flag, never on its read's node kind: a record arms unbox over an
+    // assignment node still takes the record arms cast.
+    if (exp.irArmUnboxRouteSelfTest(0) !== 1) throw new Error("want a record arms unbox over an assignment node routed recordArms");
+    if (exp.irArmUnboxRouteSelfTest(1) !== 1) throw new Error("want an uaAsg unbox routed asg");
+    if (exp.irArmUnboxRouteSelfTest(2) !== 1) throw new Error("want an unbox naming no destination routed arm");
+    // A staged root reads above a run of roots on the stack, never above a value that is no root
+    // (`rootsFloor`, D17089): the floor cannot hide a real order violation.
+    for (const [k, want, what] of [[0, 1, "above a run of roots"], [1, 0, "above a non-root"], [2, 0, "above a non-root over a root"]] as const) {
+      const got = exp.irStageFloorSelfTest(k);
+      if (got !== want) throw new Error(`stage floor ${what}: want ${want}, got ${got}`);
+    }
+    // A door fragment lowered while a root is staged gives the staging's root run back.
+    if (exp.irRootRunFrameSelfTest() !== 1) throw new Error("want the fragment frame to restore the root run");
+    // A fit tail that misses leaves legacy's receiver read in place (`fitRecvReadHook`).
+    if (exp.irFitTailSelfTest() !== 1) throw new Error("want the fit hook restored after a miss");
+    // Each kind legacy's descriptor names alone maps to a type that describes back at that kind.
+    const rd = exp.repDescSelfTest();
+    if (rd !== 0) throw new Error(`want every descriptor kind to round-trip, got kind ${rd} off`);
+    // The map niche's kind lies above every box tag a list niche reads as its kind.
+    const nk = exp.nicheKindSelfTest();
+    if (nk !== 0) throw new Error(`want NICHE_NUL_MAP above every niche kind, got kind ${nk} at or above it`);
   },
 });
 
@@ -1619,34 +1952,45 @@ print(two(true))
   },
 });
 
-// `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
-// bound to a literal delivered to an atom (a record copy re-read per field builds, as
-// `RRecCopyPure`: `record-copy-into-wider-row.vl`). Each program is the smallest the corpus has.
-const PRE_PATHS: [string, string][] = [
-  [
-    "atom hook",
-    `const JX = "x"\nconst B: "y" = "y"\nfunction join(c: boolean) {\n  const M: "x" | "y" | "z" = if c { JX } else { B }\n  return M == "z"\n}\nprint(join(true))\n`,
-  ],
-];
+// A start the census builds on past a miss is uncovered at that class, as the armed shadow reports
+// it, never covered and lowered with the miss inside it.
 Deno.test({
-  name:
-    "ir shadow: a node emitExpr takes a generic pre-path for is a named miss",
+  name: "ir shadow: the blocker census names a start's classes instead of lowering past them",
   ignore,
   fn: () => {
-    for (const [why, src] of PRE_PATHS) {
-      const { rc, rows } = run(src, true);
-      if (rc !== 0) throw new Error(`${why}: want compileSrc rc 0, got ${rc}`);
-      const fails = failures(rows);
-      if (fails.length > 0) {
-        throw new Error(`${why}: want no failure, got:\n${fails.join("\n")}`);
-      }
-      if (!rows.has(`uncovered pre-path ${why}`)) {
-        throw new Error(
-          `${why}: want an "uncovered pre-path ${why}" row, got ${
-            JSON.stringify([...rows])
-          }`,
-        );
-      }
+    const src = `type J = { f: i32 | null }
+function mk2() { return { f: null } }
+const dA: J = mk2()
+let xs = [mk2()]
+if xs.length > 9 { xs = [] }
+print(xs.length)
+print(dA.f ?? 1)
+`;
+    const armed = run(src, true);
+    const census = run(src, 4);
+    const starts = (rows: Map<string, number>) => [...rows.keys()].filter((k) => k.startsWith("start uncovered"));
+    const want = starts(armed.rows);
+    if (want.length !== 1) throw new Error(`want one armed start miss, got ${JSON.stringify([...armed.rows])}`);
+    if (JSON.stringify(starts(census.rows)) !== JSON.stringify(want)) {
+      throw new Error(`want the census's start rows ${JSON.stringify(want)}, got ${JSON.stringify([...census.rows])}`);
+    }
+    if (census.rows.has("start covered")) throw new Error(`want no covered start, got ${JSON.stringify([...census.rows])}`);
+  },
+});
+
+// A join of an atom binding whose arms are a literal-bound const and a one-literal const, which the
+// atom hook writes at the destination (`emitIfExprAs`): covered and matched.
+Deno.test({
+  name: "ir shadow: a join the atom hook writes at its destination is built and matched",
+  ignore,
+  fn: () => {
+    const src = `const JX = "x"\nconst B: "y" = "y"\nfunction join(c: boolean) {\n  const M: "x" | "y" | "z" = if c { JX } else { B }\n  return M == "z"\n}\nprint(join(true))\n`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
+      throw new Error(`want the join covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -2482,8 +2826,8 @@ print(nullable(null))
 // A map store whose value is a short-circuit (a valued `if`): legacy writes the receiver and key,
 // then the value. A global receiver (staged as its read), a local and a parameter, with a
 // variable, a call-result or a literal key, are staged below the `if`, covered and matched; so are
-// values that run a map op of the same or of another shape. A boxed `??` value stays legacy's, by
-// name.
+// values that run a map op of the same or of another shape, and a boxed binding's `??`, whose tag
+// test the staged leads sit below (`coalArmStagesLeads`).
 Deno.test({
   name: "ir shadow: a map store of a short-circuit value stages its receiver and key below the if",
   ignore,
@@ -2520,11 +2864,8 @@ print(gi["k"] ?? 0)
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
-      throw new Error(`want key, glob, loc, par, other and lit covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if (rows.get("uncovered map store short-circuit operand") !== 1) {
-      throw new Error(`want boxed left to legacy by name, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 7 || rows.get("covered") !== 7) {
+      throw new Error(`want key, glob, loc, par, other, boxed and lit covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -2799,13 +3140,13 @@ Deno.test({
   },
 });
 
-// Two spellings stay legacy's: a stored literal boxed into a union (the box writes its tag ahead
-// of the store, which the builder writes as a statement first), and one after a call operand
-// whose value waits on the stack across the store.
+// A stored literal boxed into a union stays legacy's (the box writes its tag ahead of the store,
+// which the builder writes as a statement first); one after a call operand builds and matches,
+// the call's value staged below the store as legacy writes it first.
 const ASG_VALUE_LIT_MISSES =
   `function boxed(c: boolean) {\n  let x: i32 | null = null\n  return if c { x = 5 }\n}\nfunction k() { return 3 }\nfunction h(p: i32, q: i32) { return p + q }\nlet f: f32 = 0.5\nfunction lead() { return h(k(), f = 4) }\nprint(boxed(true) ?? 0)\nprint(lead())\n`;
 Deno.test({
-  name: "ir shadow: a boxed stored literal and one after a call operand stay named misses",
+  name: "ir shadow: a boxed stored literal stays a named miss; one after a call operand matches",
   ignore,
   fn: () => {
     const { rc, rows } = run(ASG_VALUE_LIT_MISSES, true);
@@ -2814,9 +3155,12 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if (
       (rows.get("uncovered box of an assignment") ?? 0) !== 1 ||
-      (rows.get("uncovered assignment value lit after an operand") ?? 0) !== 1
+      (rows.get("covered") ?? 0) !== 3 ||
+      (rows.get("matched") ?? 0) !== 3
     ) {
-      throw new Error(`want boxed and lead uncovered by name, got ${JSON.stringify([...rows])}`);
+      throw new Error(
+        `want boxed uncovered by name, lead, k and h matched, got ${JSON.stringify([...rows])}`,
+      );
     }
   },
 });
@@ -2906,6 +3250,277 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== (rows.get("fns") ?? -1) || (rows.get("start matched") ?? 0) !== 1) {
       throw new Error(`want every function and the start body covered, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A field typed by one bare string literal reps at the storage of the row its record is stored at
+// (`rowFieldStorage`): the string where an anonymous literal built from a binding keeps it, the
+// atom where a declared record's row does. One program per position the literal reaches (a read,
+// a binding, a return, a list element, a comparison, a module global) and a union-arm spelling.
+const ROW_FIELD_STORAGE_POSITIONS: string[] = [
+  "function h(x: \"a\") {\n  const w = { f: x, g: 1 }\n  print(w.f)\n}\nh(\"a\")\n",
+  "function h(x: \"a\") {\n  const w = { f: x, g: 1 }\n  const y = w.f\n  print(y)\n}\nh(\"a\")\n",
+  "function mk(x: \"a\") { return { f: x, g: 1 } }\nfunction h() {\n  const w = mk(\"a\")\n  print(w.f)\n}\nh()\n",
+  "function h(x: \"a\") {\n  const w = { f: x, g: 1 }\n  const v = w\n  print(v.f)\n}\nh(\"a\")\n",
+  "function h(x: \"a\") {\n  const ws = [{ f: x, g: 1 }]\n  print(ws[0].f)\n}\nh(\"a\")\n",
+  "function h(x: \"a\") {\n  const w = { f: x, g: 1 }\n  print(w.f == \"a\")\n}\nh(\"a\")\n",
+  "const x: \"a\" = \"a\"\nconst w = { f: x, g: 1 }\nprint(w.f)\n",
+  "type A = { kind: \"circle\", r: i32 }\ntype B = { kind: string, r: i32 }\nfunction f(n: i32): A | B {\n  if n == 0 {\n    const a: A = { kind: \"circle\", r: 1 }\n    return a\n  }\n  const b: B = { kind: \"round\", r: 3 }\n  return b\n}\nlet i = 0\nwhile i < 2 {\n  const x = f(i)\n  if x is A {\n    const y: A = { kind: x.kind, r: x.r }\n    print(y.kind)\n  } else {\n    print(\"B \" + x.kind)\n  }\n  i = i + 1\n}\nconst s: A = { kind: \"circle\", r: 4 }\nprint(\"a \" + s.kind)\n",
+];
+const ROW_FIELD_STORAGE_DECLARED =
+  `type R = { f: "a", g: i32 }\nfunction h(x: "a") {\n  const v: R = { f: "a", g: 1 }\n  const w = { f: x, g: 1 }\n  print(v.f)\n  print(w.f)\n  print(v.g + w.g)\n}\nh("a")\n`;
+const ROW_FIELD_STORAGE_FULL = new Set(["fns", "covered", "verified", "matched", "start fns", "start covered", "start verified", "start matched"]);
+Deno.test({
+  name: "ir shadow: a bare-literal field reps at its row's storage and matches",
+  ignore,
+  fn: () => {
+    for (const src of [...ROW_FIELD_STORAGE_POSITIONS, ROW_FIELD_STORAGE_DECLARED]) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+      if (src === ROW_FIELD_STORAGE_DECLARED) continue;
+      const misses = [...rows.keys()].filter((k) => !ROW_FIELD_STORAGE_FULL.has(k) && !k.endsWith(": matched"));
+      if (misses.length > 0) throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+    }
+  },
+});
+
+// A record literal whose storage row holds a tagged set of generic functions is built at that row:
+// the set's i32 id, though the row's type is open in the set's members. A global written whole, a
+// second field beside it, a nested record and a conditional write.
+const TAGGED_OPEN_ROW: string[] = [
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nlet r = { f: id1 }\nr = { f: id2 }\nprint(r.f(2))\nprint(r.f(2.5))\n",
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nfunction id3(a) { return a }\nlet s = { f: id1, n: 1 }\ns = { f: id2, n: 2 }\ns = { f: id3, n: 3 }\nprint(s.f(4))\nprint(s.f(4.5))\nprint(s.n)\n",
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nlet t = { g: { f: id1 } }\nt = { g: { f: id2 } }\nprint(t.g.f(5))\nprint(t.g.f(\"x\"))\n",
+  "function id1(a) { return a }\nfunction id2(a) { return a }\nlet n = 1\nlet u = { f: id1 }\nif n > 0 { u = { f: id2 } }\nprint(u.f(6))\nprint(u.f(6.5))\n",
+];
+const TAGGED_OPEN_ROW_FULL = new Set(["fns", "covered", "verified", "matched", "start fns", "start covered", "start verified", "start matched"]);
+Deno.test({
+  name: "ir shadow: a literal at a row open only in a tagged function set is built there and matches",
+  ignore,
+  fn: () => {
+    for (const src of TAGGED_OPEN_ROW) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+      const misses = [...rows.keys()].filter((k) => !TAGGED_OPEN_ROW_FULL.has(k) && !k.endsWith(": matched"));
+      if (misses.length > 0) throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+    }
+  },
+});
+
+// A miss at a node whose type has no rep keeps its class (`rep <what>`, a key the census diffs), and
+// the detail mode adds one row naming the node's kind and the function.
+Deno.test({
+  name: "ir shadow: a rep miss's detail row names its node, and the class is unchanged",
+  ignore,
+  fn: () => {
+    const src = Deno.readTextFileSync(
+      new URL("./cases/unions/layout-family-string-field-read-as-atom-hazards-runs.vl", import.meta.url),
+    );
+    const one = run(src, 1);
+    const detail = run(src, 2);
+    const plain = run(src, 0);
+    const rows1 = [...one.rows.keys()];
+    if (rows1.some((k) => k.startsWith("detail ")) || one.rows.get("uncovered rep ?") !== 1) {
+      throw new Error(`want mode 1's one \`uncovered rep ?\` and no detail row, got ${JSON.stringify([...one.rows])}`);
+    }
+    if (detail.rows.get("detail rep ? of string in mat") !== 1) {
+      throw new Error(`want the detail row naming the string node in mat, got ${JSON.stringify([...detail.rows])}`);
+    }
+    if (one.out.length !== plain.out.length || one.out.some((b, i) => b !== plain.out[i])) {
+      throw new Error("want the armed shadow's module byte-identical to the unarmed one");
+    }
+  },
+});
+
+// A lone-literal field filled from a binding of that literal, built at a parameter's row that
+// keeps the field as its atom: the binding's member id (`atom_sole`) is an atom typed at the
+// literal, which rule 3 admits (`loneLitAtom`). The callee reads the field at its atom, which its
+// `print` decodes.
+const LONE_LIT_ATOM_ARG: string[] = [
+  "function show(r: { f: \"a\", g: i32 }) { print(r.f) }\nfunction h(x: \"a\") {\n  show({ f: x, g: 1 })\n}\nh(\"a\")\n",
+  "function show(r: { f: \"a\" }) { print(r.f) }\nfunction h(x: \"a\") {\n  show({ f: x })\n}\nh(\"a\")\n",
+  "function show(r: { f: \"a\", g: i32 }) { print(r.f) }\nfunction h(x: \"a\") {\n  const w = { f: x, g: 1 }\n  show(w)\n}\nh(\"a\")\n",
+  "type R = { f: \"a\", g: i32 }\nfunction show(r: R) { print(r.f) }\nfunction h(x: \"a\") {\n  show({ f: x, g: 1 })\n}\nh(\"a\")\n",
+];
+Deno.test({
+  name: "ir shadow: a lone-literal binding delivered as its atom into a parameter's row verifies and matches",
+  ignore,
+  fn: () => {
+    for (const src of LONE_LIT_ATOM_ARG) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      if ((rows.get("matched") ?? 0) < 2 || rows.has("uncovered member record")) {
+        throw new Error(`want h and show matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
+    }
+  },
+});
+
+// A variant literal that omits a field its arm may omit is built at the arm's row with that field's
+// null (a module const cell, a return, a list element, a union of records), and a literal-set field a
+// layout family re-lays at the string reps there: no `object layout` or `object field coercion`.
+const OMIT_AND_RELAY: string[] = [
+  "type U = { kind: \"a\", q: i32 | null } | { kind: \"b\" }\nconst o: U = { kind: \"a\" }\nif o.kind == \"a\" { print(o.q ?? 9) }\nfunction mk(): U { return { kind: \"a\" } }\nconst m = mk()\nif m.kind == \"a\" { print(m.q ?? 8) }\n",
+  "type U = { kind: \"a\", q: i32 | null } | { kind: \"b\" }\nconst ys: U[] = [{ kind: \"a\" }, { kind: \"b\" }]\nprint(ys.length)\n",
+  "type Other = { a: string }\ntype Opt = { b: i32 | null, c: string | null }\nconst u1: Other | Opt = {}\nif u1 is Opt { print(u1.b ?? 3) }\n",
+  "type K = \"circle\" | \"round\"\ntype A = { kind: K, r: i32 }\ntype B = { kind: string, r: i32 }\nfunction f(n: i32): A | B {\n  if n == 0 {\n    const a: A = { kind: \"circle\", r: 1 }\n    return a\n  }\n  const b: B = { kind: \"round\", r: 3 }\n  return b\n}\nconst x = f(0)\nif x is A { print(x.kind) }\nconst s: A = { kind: \"circle\", r: 4 }\nprint(s.kind)\n",
+];
+Deno.test({
+  name: "ir shadow: an omitting variant literal and a re-laid literal-set field build at their row",
+  ignore,
+  fn: () => {
+    for (const src of OMIT_AND_RELAY) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const bad = [...rows.keys()].filter((k) => k.includes("object layout") || k.includes("object field coercion"));
+      if (bad.length > 0) throw new Error(`want no object layout or field coercion miss, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+    }
+  },
+});
+
+// A record with two nullable self fields: both `T | null` spellings are one rep node, so a typed
+// `null` field builds at a kid rep its type interns to (D17075) and the start verifies.
+const TWO_NULLABLE_SELF: string[] = [
+  "type T = { v: i32, l: T | null, r: T | null }\nfunction f(t1: T, t2: T): boolean { return t1 == t2 }\nprint(f({ v: 1, l: null, r: null }, { v: 1, l: null, r: null }))\n",
+  "type T = { name: string, l: T | null, r: T | null }\nfunction f(t1: T, t2: T): boolean { return t1 == t2 }\nconst a: T = { name: \"x\", l: null, r: null }\nconst b: T = { name: \"x\", l: null, r: null }\nprint(f(a, b))\n",
+];
+Deno.test({
+  name: "ir shadow: a record's two nullable self fields share one rep, so its null fields build",
+  ignore,
+  fn: () => {
+    for (const src of TWO_NULLABLE_SELF) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const bad = [...rows.keys()].filter((k) => k.includes("record field null rep"));
+      if (bad.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want the start matched with no record field null rep miss, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
+    }
+  },
+});
+
+// A record with no row of its own on its storage row's heap (`recHeapOf`), stood at a record whose
+// field is nullable over its own or where its own is `null` (`recFieldsWiden`), and a global read
+// noting its cell's heap: each start builds, verifies and matches.
+const HEAP_IDENTITY_1: string[] = [
+  "type J = { f: i32 }\ntype K = { j: J | null }\nfunction mk() { return { j: { f: 4 } } }\nconst _k: K = mk()\nconst y = mk()\nprint(y.j.f)\n",
+  "type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nconst go = [1].length > 0\nconst __c = mk2()\nconst __f = () => {\n  const v = __c\n  print(v.f)\n}\n__f()\n",
+];
+Deno.test({
+  name: "ir shadow: a rowless record on its storage row's heap widens to a nullable field",
+  ignore,
+  fn: () => {
+    for (const src of HEAP_IDENTITY_1) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const miss = [...rows.keys()].filter((k) => k.startsWith("start uncovered"));
+      if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
+    }
+  },
+});
+
+// A record global held at its storage row where its checked rep has no heap (D17087), a field that
+// row keeps as a union box read at the plain rep through legacy's unbox: the start matches.
+const HEAPLESS_GLOBAL_AT_ROW = "type V = { y: i32, x: i32 | string }\nfunction poke(self: V): i32 { return 1 }\nfunction g<T>(v: T): i32 { return v.poke() }\nconst i = { y: 2, x: 9 }\nprint(g(i))\nprint(i.x + 1)\n";
+Deno.test({
+  name: "ir shadow: a heapless record global is held at its storage row, its boxed field unboxed",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(HEAPLESS_GLOBAL_AT_ROW, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    const miss = [...rows.keys()].filter((k) => k.startsWith("start uncovered"));
+    if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+      throw new Error(`want the start matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `ir-shadow.vl` with a chunk that does not finish: a host standing in for `vl check` exits 70 on
+// every chunk, as a compiler crash does. The run reports each chunk and exits 2. It once looped:
+// with no listed divergence the detail pass was the run itself, whose broken list it copied into
+// itself until the GC heap ran out.
+Deno.test({
+  name: "ir shadow: ir-shadow.vl reports a chunk that did not finish and exits 2",
+  ignore: ignore || !exists(VL) || Deno.build.os === "windows",
+  fn: () => {
+    const tmp = Deno.makeTempDirSync();
+    try {
+      const host = `${tmp}/crashing-host`;
+      Deno.writeTextFileSync(host, "#!/bin/sh\nexit 70\n");
+      Deno.chmodSync(host, 0o755);
+      const prog = `${tmp}/p.vl`;
+      Deno.writeTextFileSync(prog, "print(1)\n");
+      const out = new Deno.Command("timeout", {
+        args: ["300", VL, "run", "scripts/silent-sweep/distilled/ir-shadow.vl", "--compiler", COMPILER, "--", "--files", prog, "--seed", COMPILER],
+        cwd: ROOT,
+        env: { VL: host, IR_DIVERGENCE_BASELINE: `${tmp}/none.txt` },
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      const text = new TextDecoder().decode(out.stdout) + new TextDecoder().decode(out.stderr);
+      if (out.code !== 2 || !text.includes("ir-shadow: chunk did not finish:") || !text.includes("(rc=70)")) {
+        throw new Error(`want exit 2 naming the chunk (rc=70), got exit ${out.code}:\n${text.slice(0, 2000)}`);
+      }
+    } finally {
+      Deno.removeSync(tmp, { recursive: true });
+    }
+  },
+});
+
+// A capture of a record whose type has no heap of its own, stored at its environment row (legacy's
+// `captureValStructIdx`): the read takes that row's heap, so a binding of it at the row's record
+// builds; a `let` reassigned before the closure runs does too.
+const CAPTURE_ENV_HEAP: string[] = ["type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nfunction fr() {\n  const __c = mk2()\n  const __f = () => {\n    const v = __c\n    print(v.f ?? 8)\n  }\n  __f()\n}\nfr()\n", "type J = { f: i32 | null }\nfunction mk2() { return { f: null } }\nconst dA: J = mk2()\nfunction fr() {\n  let __c = mk2()\n  __c = mk2()\n  const __f = () => {\n    const v = __c\n    print(v.f ?? 9)\n  }\n  __f()\n}\nfr()\n"];
+Deno.test({
+  name: "ir shadow: a heapless record capture takes its environment row's heap",
+  ignore,
+  fn: () => {
+    for (const src of CAPTURE_ENV_HEAP) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const miss = [...rows.keys()].filter((k) => k.includes("uncovered"));
+      if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want every function and the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
+    }
+  },
+});
+
+// A `T | null` global (a nullable struct cell) read narrowed at its record's heapless rep takes
+// its cell row's heap, so a binding of it at that row's record builds and reads both fields.
+const NULLABLE_CELL_HEAP: string[] = ["type J = { f: i32 | null, g: i32 }\nfunction mk2() { return { f: null, g: 7 } }\nconst dA: J = mk2()\nconst __m = Map()\n__m[\"k\"] = mk2()\nconst __mv = __m[\"k\"]\nif __mv != null {\n  const v = __mv\n  print(v.g)\n  print(v.f ?? 3)\n}\n", "type J = { f: i32 | null, g: i32 }\nfunction mk2() { return { f: null, g: 11 } }\nconst dA: J = mk2()\nconst __m = Map()\n__m.set(\"k\", mk2())\nconst __mv = __m.get(\"k\")\nif __mv != null {\n  const v = __mv\n  print(v.g + 1)\n  print(v.f ?? 4)\n}\n"];
+Deno.test({
+  name: "ir shadow: a nullable struct cell's narrowed read takes its record row's heap",
+  ignore,
+  fn: () => {
+    for (const src of NULLABLE_CELL_HEAP) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}\nin:\n${src}`);
+      const miss = [...rows.keys()].filter((k) => k.includes("uncovered"));
+      if (miss.length > 0 || (rows.get("start matched") ?? 0) < 1) {
+        throw new Error(`want the start matched, got ${JSON.stringify([...rows])}\nin:\n${src}`);
+      }
     }
   },
 });

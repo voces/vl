@@ -6,7 +6,13 @@ import { repSlotOfKind } from "./emit_rep_slot"
 import { spellTyShadowSweep } from "./emit_union_atoms"
 import { monoPinSpellShaped } from "./pin_spell"
 import { tagRepNameFn } from "./emit_shape_intern"
-import { tagRepTyFn, unionFieldNameFn } from "./emit_shape_rows"
+import {
+  rowFieldAsksCheck,
+  rowFieldStorage,
+  structRowOfRecordTy,
+  tagRepTyFn,
+  unionFieldNameFn,
+} from "./emit_shape_rows"
 import { valueUnionKeyTextOfTy } from "./emit_union_atoms"
 import { regUnionNameOfTy } from "./emit_anon_fields"
 import { monoTagMapRepTy } from "./emit_mono"
@@ -40,6 +46,7 @@ import { fvaMakerCallRows } from "./check_assignable"
 import { boxDstShadowArmed, boxDstShadowBegin } from "./box_dst_shadow"
 import {
   irClaimConstCell,
+  irClaimEqHelp,
   irClaimFn,
   irClaimStart,
   irClaimThunk,
@@ -47,12 +54,14 @@ import {
   irPreBuild,
   irShadowArmed,
   irShadowBegin,
+  irShadowEqHelp,
+  irShadowEqHelpCheck,
   irShadowFn,
   irShadowStart,
   irShadowThunk,
   irStartClaimOn,
 } from "./ir_build"
-import { irStartPrologueHook } from "./ir_lower"
+import { irInitProgressHook, irStartPrologueHook } from "./ir_lower"
 import {
   MapCompactTys,
   ViewList,
@@ -155,6 +164,9 @@ import {
   mapShapeKeyKind,
   msPoolReset,
   nullBoxTag,
+  recordHeapAllFn,
+  recordHeapFn,
+  recordRowFn,
   repKindOfSigTok,
   repNodeScalarMask,
   repReset,
@@ -164,6 +176,7 @@ import {
   repVariantShapeRowOf,
   repVariantShapesPrime,
   rlElemKindAt,
+  rowFieldStorageFn,
   sigTokBareSlot,
   sigTokSlotAt,
   structLateTwinOf,
@@ -377,6 +390,8 @@ import {
   emitLetCursor,
   emitPhaseSet,
   emitRootIx,
+  emitSoftFail,
+  emitSoftMsg,
   emitStateReset,
   envCacheFes,
   envCacheTys,
@@ -847,7 +862,7 @@ import {
 import { registerSharedReadUnion } from "./emit_obj_lit_fits"
 import { binRemFloatNeed } from "./emit_ref_list_kinds"
 import { shapeRowsReset, tyRegMemoReset } from "./emit_shape_rows"
-import { iisReset } from "./emit_shape_intern"
+import { iisReset, recordHeapOfTy, structRowHeap } from "./emit_shape_intern"
 import { typeOrderReset, typeOrderRun } from "./emit_type_order"
 import {
   mvShapeNestReset,
@@ -2619,14 +2634,13 @@ function startMergeOrder(): i32[] {
 
 // The IR's view of order `ent`, pushed onto `order` (each item's node) and `orderGi` (a global's
 // index, -1 for a statement). A global whose initializer runs elsewhere (a constexpr cell, or a
-// kept `const` no read reaches) writes nothing in start and is left out.
+// kept `const` no read reaches) writes nothing in start but its progress, `-2 - gi`.
 function startIrOrder(ent: i32[], order: i32[], orderGi: i32[]) {
   for e in ent {
     if e >= 0 {
-      if globalRunsInStartFn(e) && !lbiKeptDeclUnread(globalStmts[e]) {
-        order.push(globalStmts[e])
-        orderGi.push(e)
-      }
+      order.push(globalStmts[e])
+      const runs = globalRunsInStartFn(e) && !lbiKeptDeclUnread(globalStmts[e])
+      orderGi.push(if runs { e } else { -2 - e })
     } else {
       order.push(startStmts[-1 - e])
       orderGi.push(-1)
@@ -2747,11 +2761,16 @@ function eqHelpFnCode(out: u8[], si: i32): i32 {
   if shapeHasCloField(si, []) { fnUses.cloEq = true }
   leqNoteStructRowFields(si, [])
   fbBeginFunc(2, 0)
+  if irClaimEqHelp(si, out) { return 0 }
+  const shadow = irShadowEqHelp(si)
+  const from = out.length
   const code = eqHelpFnBody(si)
   const body: u8[] = []
   if fbEmitLocalsVec(body, 0) < 0 { return -1 }
   appendAll(body, code)
-  return helpFrameBody(out, body)
+  helpFrameBody(out, body)
+  irShadowEqHelpCheck(shadow, out, from)
+  return 0
 }
 
 // The fill prologue of the start function: every filled pool entry, in segment order.
@@ -5401,6 +5420,8 @@ function emitProgramReset(rootIx: i32) {
   armPreludeBlocks = Map()
   emitFailed = false
   emitErr = ""
+  emitSoftFail = false
+  emitSoftMsg = ""
   // Fresh per program: the diagnostic anchor + the "function being lowered"
   // cursor. A failure before any function body emits leaves these -1 (positionless).
   emitErrAt = -1
@@ -5601,6 +5622,7 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
   irShadowBegin()
   irRefInstall()
   irStartPrologueHook = emitStrFillCalls
+  irInitProgressHook = emitInitProgressAt
   tyHasFnMemoReset()
   identAuditBegin()
   const passDone: EmitPass[] = []
@@ -5645,6 +5667,19 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
   return 0
 }
 
+// The struct heap of the row legacy stores record type `ty` at (`structRowOfRecordTy`), or -1.
+function recordRowHeap(ty: i32): i32 {
+  return structRowHeap(structRowOfRecordTy(ty))
+}
+
+// The struct heap a value of record type `ty` is stored at: its own (`recordHeapOfTy`), else its
+// storage row's; -1 for none.
+function recordHeapAll(ty: i32): i32 {
+  const h = recordHeapOfTy(ty)
+  if h >= 0 { return h }
+  return recordRowHeap(ty)
+}
+
 // Lowers the checked program at `rootIx`; a negative return is a failed emit. A checker
 // diagnostic an emit pass raises by re-entering the checker is dropped, as it never fails a
 // build, so `vl check --codegen` reports what `vl build` and `vl run` do.
@@ -5653,6 +5688,10 @@ export function emitProgram(rootIx: i32) {
   tagRepNameFn = tagRepNameOfTy
   tagRepTyFn = tagRepTyOf
   unionFieldNameFn = unionFieldNameOfTy
+  rowFieldStorageFn = rowFieldStorage
+  recordRowFn = structRowOfRecordTy
+  recordHeapFn = recordRowHeap
+  recordHeapAllFn = recordHeapAll
   const d0 = T.diags.length
   const rc = emitProgramRun(rootIx)
   while T.diags.length > d0 { T.diags.pop() }
@@ -5662,6 +5701,7 @@ export function emitProgram(rootIx: i32) {
       "internal: an emit-phase write changed a type an emit memo may hold",
     )
   }
+  if rc >= 0 && rowFieldAsksCheck() < 0 { return -1 }
   return rc
 }
 

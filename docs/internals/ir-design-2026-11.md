@@ -455,7 +455,10 @@ two-stage protocol:
 
    The legacy path runs first and owns every first-ask mint (type indices in first-ask order,
    E's `EmitCtx.typeIndexOf`). The IR lowering may only read an index that already exists. A miss
-   or a byte difference unclaims the function and records its first differing node.
+   or a byte difference unclaims the function and records its first differing node. Under
+   `VL_IR_SHADOW=2` a mismatch also prints a `detail` row with both hex bodies, and a `rep <what>`
+   miss one naming its node's kind and function (`detail rep ? of string in mat`); the classes
+   themselves are unchanged.
 
 A step's PR turns claiming on for its construct set only at **zero dual-emit mismatches** over the
 self-compile and the distilled corpus. After that the IR path mints for itself, and the seed `cmp`
@@ -503,6 +506,18 @@ admitted features. It is an order-of-magnitude guide, not a measurement of the b
 | **I8** | **every function is claimed**, and the legacy expression emitter deletes. `vSlot` moves to an IR allocator in a following PR, and that PR is a named mover (local numbering). | all | I1–I7 at zero unclaimed on the self-compile and corpus | §7's I8 row: the bulk of `wasmEmit.vl`'s expression and statement lowering, `emit_classify.vl`'s re-classifiers, the retiring rewrite passes (§4.1), and the collect passes whose last reader went |
 | **I9** | phase B: `irInstantiate(InstReq)` | — | I8, Q steps 1 and 6, H stage 5, S stages 3–5 | mono's clone, retype and string-key code (§3.2) |
 | **I10** | the IR passes in §4.2, one PR each | — | I8 | `opt_*.vl`, about 9,400 lines, as each replacement lands |
+
+**The claims-off fallback leaves at I8** (coordinator ruling 2026-11-24). Until then a claimed unit
+skips legacy's lowering, and with it any refusal legacy raises there. So the host rebuilds a unit
+whose claimed module fails validation with claims off (`claims_off_rebuild` in `scripts/vl-host`).
+Legacy's refusal is then the answer (rc 1). Otherwise legacy's bytes ship with a stderr line, or under
+`$VL_IR_STRICT=1`, which every gate and CI job sets, the build fails with rc 70. Once legacy is deleted
+there is nothing to fall back to. From I8 on, an invalid claimed module is a loud internal compiler
+error (rc 70) in every mode, and each refusal legacy raised must by then exist as the IR's own.
+The soft refusal leaves with it (coordinator ruling (a), 2026-11-24). Until I8, a claim whose build or
+lowering meets a shared legacy helper's `emitFail` declines (`softBegin` in ir_build), and legacy
+writes the unit and owns its refusal. Without legacy there is nothing to decline to, so a refusal
+mid-claim becomes a loud internal compiler error.
 
 The order is forced:
 - I1 → I2 → I4, because each widens the operand reps the next one's lowering takes.

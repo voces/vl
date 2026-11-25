@@ -13011,6 +13011,118 @@ twins (`type L1 = {n: L1|null}` beside an L2 twin), a compiler stack overflow ca
 on different heaps. Identity is one compare and is what the target checks. Recording the heap on
 the IR keeps the verifier independent of emit (the ruling of the same day above, D17049).
 
+## A call that never returns is built as a value at the rep legacy writes it (2026-11-23, coordinator ruling) — D17064
+
+**Ruled by the coordinator 2026-11-23**, on IR-C1's proposal. The `rep novalue` functions are
+not left legacy-owned, because I8 needs every function. A direct call whose checker type is `never`
+is built as a temp, lowered as `call; unreachable`, and the IR writes the consumer after it as
+legacy does. Its rep is i32, which is legacy's for `never`, or its operator sibling's i32. An operator
+over it is i32, or bool for a comparison, and the destination widens it as for any i32. Verifier
+rule 3 admits the temp's rep only where its checker type is `never` and its defining Rhs is a never
+`RCall`. Rule 6 admits the result rep only for a callee with no result. A returning call's temp
+typed `never` still breaks rule 3. The never value at a bool consumer still breaks that consumer's
+rule 2.
+
+**Extended by the coordinator 2026-11-23** to a field read typed `never`. A field that is `never`
+in one instance never held a value, and its slot stores the default i32 (D15530). The read is built at
+that i32, and only where its record's row stores the field as i32 (`fieldStoresRead`). Rule 3 admits
+such a temp only where its rep is the row's field kid. A read at any other rep still breaks rule 3.
+
+**Why.** Past the `unreachable` the stack is polymorphic, so legacy's dead code after it is valid,
+and the IR has to write the same bytes to claim the function. An operand of another width is a
+named miss rather than a copy of legacy's conversion. An f64 one after the `unreachable` is
+legacy's own invalid module (D17064), and per the ruling of 2026-11-22 above, legacy changes and
+the IR does not reproduce it.
+
+## An invalid claimed module is rebuilt with IR claims off (2026-11-24, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-24**, on IR-P1's pre-review. A unit the IR claims never runs
+legacy's lowering, so a refusal legacy would raise there (`emitFail`) never fires, and the claim's
+module can fail validation where legacy would have refused (D17094, D17095, D17096).
+
+What the host does with a claimed module the engine refuses (`claims_off_rebuild`, `scripts/vl-host`):
+
+- It rebuilds the unit with claims off.
+- If legacy refuses, that refusal is the build's answer (rc 1), with one note naming the claim, in
+  every mode.
+- If legacy writes a valid module, a normal build ships legacy's bytes with one stderr line naming
+  the function. Under `$VL_IR_STRICT=1`, which `gate.sh`, CI, `ir-identity.sh` and `ir-parity.vl`
+  set, the build fails as an invalid module (rc 70), so no IR defect hides behind the fallback.
+- A fallen-back result is never stored in the compile cache.
+
+**Why.**
+- **The exact guard was refused.** It would run legacy's lowering for every claimed unit as well.
+  That costs between the shipped build and the armed shadow, and the armed shadow is +18.5% of
+  self-compile guest fuel (149.0G against 125.8G). It would also turn the four
+  `hole-fn-value-unresolved-read_declared_generic_*` matrix programs, which a claim legitimately runs
+  where legacy refuses (each prints the template's 4), into refusals: `runs → not-runs`.
+- **The fallback costs nothing on a valid build**: no guest fuel and no byte change. It closes the
+  silent class, check-clean invalid wasm, whatever the refusal site.
+- **The population measured on master** (seed against `ir-identity.sh --build-claimless`):
+  - 0 escapes over 20,539 tests/cases, corpus and probe programs;
+  - 0 claimed invalid modules over 93,094 generated capability-matrix programs.
+- **Held at zero** by the gate row `ir claim refusals` (`ir-parity.vl --pop refusals`).
+- **The fallback leaves at I8** (ir-design-2026-11.md, after the step table).
+- **`vl check --codegen` is strict** (coordinator ruling, same day): an invalid claimed module
+  reports at the validate stage. The claims-off fallback applies to `vl build`, `vl run` and the TS
+  hosts only. A claimed escape is an IR bug to fix, so no `@emit-error` case for it goes in tests/cases.
+- **The TS hosts** (the LSP's compile, the playground's Run, the V8 corpus oracle) take the same
+  fallback (`lsp/src/claimFallback.ts`, #9848). The oracle is strict, as a gate.
+
+## A claim that meets a shared legacy helper's refusal declines (2026-11-24, coordinator ruling (a))
+
+**Ruled by the coordinator 2026-11-24**: ruling (a), extending G3. The per-unit decline over a
+whole-compile rebuild was approved by the coordinator and the queue. D17123 is the witness: a claimed
+function's lowering called a shared legacy helper (`emitMapGetScalarBoxTail`), which refused through
+`emitFail`. The compile latched that refusal before legacy reached its own, so the claim changed which
+refusal a program sees.
+
+**What happens now.**
+- While a claim seam builds or lowers a unit, `emitFailAt` records the refusal (`emitSoftMsg`)
+  instead of latching it, and does not reset the module writer.
+- The claim declines through its existing miss rewind, so legacy writes the unit and raises its own
+  refusal, if it has one.
+- The guest counts `claim fell back: … a legacy helper refused in `name`: <msg>`. The hosts report
+  that as the G3 event:
+  - if legacy refuses: legacy's refusal plus a note, rc 1;
+  - if legacy builds: legacy's bytes plus a line, or rc 70 under `$VL_IR_STRICT=1`.
+- A refusal outside any claim still latches hard.
+
+**Why.**
+- About 42 legacy helpers that the IR's lowering calls can refuse. A pre-check per helper would
+  mirror each one's refusal condition, a parallel predicate, so the decline is the uniform answer.
+- Each seam saves and restores the enclosing scope, so a nested seam never hardens its caller.
+- On a build that succeeds today no helper refuses mid-claim, so no byte can move.
+- The fallback leaves at I8 (ir-design-2026-11.md, after the step table).
+
+**Conditions the merge queue set on the decline (queue ruling, 2026-11-24, before #9888 merged):** the seam saves and restores the enclosing scope, never sets then clears; it does not reset the module writer in soft mode; the declining unit is `cmp`-identical to a claimless build of it; a refusal outside a claim still latches hard; the refusal a program reports is legacy's; the native and TS note texts are identical. The save and restore is a dynamic scope, so the phase-state census's `emit_state` hidden count rose 11 → 12, accepted with its baseline in #9888 (queue ruling, option A; a depth counter that hid the scope from the census was refused; the census does not match a save through a struct literal, so the true count is 13).
+
+**The playground carries G3 too** (coordinator ruling, 2026-11-24): users meet it directly, so its Run takes the same three outcomes and the same tests as the LSP and the V8 oracle, as a follow-up in lane IR-P1.
+
+## Q57 does not permit losing a deliberate codegen property (2026-11-24, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-24.** Q57 lets the IR's bytes differ from legacy's where the difference is incidental. It does not permit losing a deliberate codegen property (address folding, bounds-check elision, unboxing, a tail form) even where guest fuel cannot see the loss. So lane IR-N8's memory address fold was ported byte-identically (#9870, option A) rather than accepted as a Q57 divergence, and lane IR-M1's heap identity 4b route B, which would have allocated a closure where legacy writes a direct function tag, was refused (#9881 took route A).
+
+**A named price is not a lost property.** #9841's arm-site operand built once ahead of the chain costs about two local operations per executed arm read, with run fuel unmeasured; the queue read it as a price within Q57, recorded in its refactor note, not a lost property.
+
+## A function's value `if` over a module inferred-null binding is re-asked at the later top-level fill, and a fill of another type is refused (2026-11-24, coordinator ruling) — D17203
+
+**Ruled by the coordinator 2026-11-24**, on the merge queue's referral of lane IR-N4's D17203 pre-review.
+
+**What happens now.** A module-scope `let m = null` binds an open hole, which a later top-level write fills in place. A function's value `if` whose arm reads `m` while it is still the hole (a read across the function boundary is not flow-narrowed) is noted with the join it was typed (`In | null`) and its destination. At the fill, `fillIfHoleNodes` re-derives the join from the filled arm:
+- where the re-derived join fits the destination, or the join already typed, it is re-banked, so a same-type or narrower fill, and a declared destination that holds both, keep running;
+- else the checker refuses at the `if`: "this `if` was typed In | null — the assignment below makes the binding {w: string} | null, so the join is {w: string} | In | null; annotate the binding".
+
+This extends the `??` hole precedent, D1589 (`fillCoalHoleNodes`), which re-asks a `??` over the hole the same way.
+
+**Why.**
+- The checker is one-pass. Consumers already checked against the join's type (`pick(false)?.v`) cannot be re-asked, so widening the join to `T | U | null` after the fact would be unsound. Today that widening shows up as silent wrong output or invalid wasm.
+- The refusal names a contract: annotating the binding runs.
+
+**Where it fires.** Only where the read is not flow-narrowed. Inside a function, the checker already types a read before any write as `null`, so the local spelling's join is a correct `In | null` and runs. Emit now delivers such a read as the destination's null (D17203's emit half, D17204). The refusal is left to a function that reads a module binding a later top-level write fills.
+
+**Rejected alternative.** A new flow-sensitive "still definitely null" arm was rejected: it covers only the straight-line local case, which the existing narrowing already covers, and not the read across a function boundary.
+
 ## A narrowed module `let` pays one program-wide writer analysis; a `const` pays none (2026-11-23) — D17063
 
 **Decided by the checker-fix lane that closed D17063 (2026-11-23), for the coordinator to confirm
