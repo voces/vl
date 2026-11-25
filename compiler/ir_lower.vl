@@ -2410,6 +2410,7 @@ function numIs(r: RNumIs): i32 {
 // last, and beside each the reads of it so far.
 const getIdxOs: Opnd[] = []
 const getIdxReads: i32[] = []
+const getIdxSlots: i32[] = []
 
 // The `.get` receiver operands `listGetRecvHook` reads while `coalListGetOr` writes legacy's head,
 // innermost last; each read is the operand read again (`opndAgain`).
@@ -2466,9 +2467,12 @@ function irListGetRecvRead(objIx: i32, _fnIx: i32): i32 {
 // Hands legacy's `.get` head index operand `o` (`listGetIdxHook`) where it is read at each use: an
 // immediate or a variable, never a temp. Returns whether it did; `irGetIdxEnd` then undoes it.
 export function irGetIdxBegin(o: Opnd): boolean {
-  if !(o is OImm || o is OVar && !isTemp(o.ov)) { return false }
+  // A temp (a call, say) is written once to a fresh i32 local and read from it at each use.
+  const once = o is OVar && isTemp(o.ov) && repPrim(opRepOf(o)) == "i32"
+  if !(o is OImm || o is OVar && !isTemp(o.ov) || once) { return false }
   getIdxOs.push(o)
   getIdxReads.push(0)
+  getIdxSlots.push(if once { irOnceSlot([127]) } else { -1 })
   listGetIdxHook = irListGetIdxRead
   return true
 }
@@ -2477,6 +2481,7 @@ export function irGetIdxBegin(o: Opnd): boolean {
 export function irGetIdxEnd() {
   getIdxOs.pop()
   getIdxReads.pop()
+  getIdxSlots.pop()
   if getIdxOs.length == 0 { listGetIdxHook = listGetIdxLegacy }
   return 0
 }
@@ -2490,10 +2495,16 @@ function irListGetIdxRead(idxIx: i32, _fnIx: i32): i32 {
   }
   const k = getIdxReads[at]
   getIdxReads[at] = k + 1
+  const slot = getIdxSlots[at] ?? -1
   if k == 0 {
     irLOpnd(getIdxOs[at])
+    if slot >= 0 {
+      fbLocalSet(slot)
+      fbLocalGet(slot)
+    }
     return 0
   }
+  if slot >= 0 { return fbLocalGet(slot) }
   return opndAgain(getIdxOs[at], idxIx)
 }
 
