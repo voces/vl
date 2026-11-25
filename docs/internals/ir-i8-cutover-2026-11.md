@@ -282,19 +282,29 @@ in one pass, in this order. Each step is one commit, and each commit is one mech
 or claimless compiler, or a legacy lowering, on one side. Once legacy is deleted, that side is the
 same compiler as the other, an older seed, or nothing.
 
-| check | where it runs | what it compares | at I8 |
-|---|---|---|---|
-| `ci-ir-identity` (`ir-identity.sh --cases` / `--claimless`, `ir-identity-annotate.sh`) | ci.yml, 4 shards; the queue | claims-on bytes against the same tree's claimless build | **convert**: against master's fetched seed for the I8 PR only, then behaviour parity (`ir-parity --behaviour-only`, run output against `@log`/Want; §7) |
-| `scripts/ir-divergence-baseline.txt` (17 rows) | read by `ir-identity.sh`, `ir-parity.vl`, `ir-shadow.vl` | the listed byte differences between claimed and claimless builds | **retire**: behaviour parity lists no byte differences; a `legacy-wrong:` row's program keeps its `@log`/Want |
-| `ir-parity.vl --pop refusals` (`ir claim refusals`) and `--cross` (`ir claim cross`) | gate.sh full | refusals and runs, claimed against claimless | **convert** `--cross` to `--behaviour-only` over the same populations; **retire** `--pop refusals`, since with one emitter a claim cannot skip a refusal |
-| `ir-shadow.vl` (`ir shadow`, `ir shadow cases`, `ir claims`), its two baselines, `heavy-programs.txt` | gate.sh full | each claimed function's bytes against legacy's; any fallback | **retire**: no legacy bytes remain, and the native fixpoint plus behaviour parity carry the claim check; `vl_heavy_programs_test` goes with them |
-| `tests/vl_ir_prepost_test.ts` (`ir shadow suite`) | gate.sh `--fast` | `$VL_IR_SHADOW=6`, the build before legacy against the build after | **retire**: with no legacy run, there is no "before" |
-| `tests/vl_ir_shadow_test.ts`, `vl_box_dst_shadow_test`, `vl_ir_claim_fallback_test`, `vl_claim_fallback_wasm_test`, `playground_claim_fallback_test`, `vl_ir_door_guard_test` | ci-native; the ci.yml editor step | the shadow, the box-destination shadow, the claims-off fallback, the door guard | **retire** (as the draft does), with `compiler/box_dst_shadow.vl` and `tests/ir-claim-fallback/` |
-| `tests/vl_ir_identity_compare_test.ts`, `vl_ir_parity_legacy_wrong_test.ts` | ci-native | the comparators of the two scripts above | **convert** with their scripts: the `legacy-wrong:` grading is behaviour parity's whole rule |
-| `self-ir-misses.vl` and its baseline; kill-matrix mutant `selfirmiss` | gate.sh, ci.yml | IR misses in the self-compile | **retire** the ratchet (a miss becomes an `emitUnclaimed` refusal, and the fixpoint fails); **re-aim** the mutant at `native fixpoint` |
-| `claim-refusal-survey.sh` (sweep.yml `claim-refusal`) | sweep label | a refused claim against the claimless build | **retire** |
-| `ir-driver-census.sh`, `ir-only-census.vl`, `ir-i8-census/` (`census.sh`, `probe-patch.sh`, `stub-reach.sh`) | by hand | where legacy is still reached | **retire** with the I8 tools; `ir-i8-sweep.sh` and `ir-i8-self-list.sh` go one PR later, once nothing reads them |
-| `ci-verdict.sh` `TREE_SKIPS`, `ci_verdict_test`, `ci_proof_test`'s local rows | ci.yml | job and row names | **follow** the renames and retirements above |
+A check is retired only when it names its survivor: the check that still catches the breakage after
+I8 (testing-strategy.md's kill-matrix rule). A check with no survivor is converted, not retired
+(coordinator ruling, 2026-11-25).
 
-Behaviour parity is the conversion target for every row marked convert. It holds the
-`ir-identity` paths filter in ci.yml, and it is the only check that still needs the shards.
+| check | where it runs | what it compares | at I8 | the survivor that catches its breakage |
+|---|---|---|---|---|
+| `ci-ir-identity` (`ir-identity.sh --cases` / `--claimless`, `ir-identity-annotate.sh`) | ci.yml, 4 shards; the queue | claims-on bytes against the same tree's claimless build | **convert**: against master's fetched seed for the I8 PR only, then behaviour parity (`ir-parity --behaviour-only`, run output against `@log`/Want; §7) | itself, converted |
+| `ir-parity.vl --cross` (`ir claim cross`), `tests/vl_ir_identity_compare_test.ts`, `vl_ir_parity_legacy_wrong_test.ts` | gate.sh full; ci-native | claimed against claimless runs; the comparators' controls | **convert** to `--behaviour-only` over the same populations; the tests keep their controls on the behaviour grading | themselves, converted |
+| the claims-off fallback tests (`vl_ir_claim_fallback_test`, `vl_claim_fallback_wasm_test`, `playground_claim_fallback_test`) | ci-native; the ci.yml editor step | an invalid claimed module falls back to legacy (rc 70 under strict) | **convert** to one test per host that an invalid module (the `$VL_FAULT_INJECT` seam) is rc 70 with the validator's message | themselves, converted |
+| `scripts/ir-divergence-baseline.txt` (17 rows) | read by `ir-identity.sh`, `ir-parity.vl`, `ir-shadow.vl` | the listed byte differences between claimed and claimless builds | **retire** | behaviour parity: a `legacy-wrong:` row's program keeps its `@log`/Want, and parity grades it |
+| `ir-parity.vl --pop refusals` (`ir claim refusals`) | gate.sh full | a program legacy refuses at emit is refused alike with claims on | **retire** | the `@emit-error` cases (`deno task test`) and the `emit_reject` witnesses (`ci-witnesses`): a refusal that turns into a build fails its expected error |
+| `ir-shadow.vl` (`ir shadow`, `ir shadow cases`), its two baselines, `heavy-programs.txt` with `vl_heavy_programs_test` | gate.sh full | each claimed function's bytes and spans against legacy's | **retire** | the native fixpoint (the compiler's own functions), behaviour parity and the run tiers of `tests/cases` (every program's output) |
+| `ir-shadow.vl --claims` (`ir claims`) | gate.sh full | no claimed function falls back | **retire** | the native fixpoint and every build: with no fallback, a claim that fails is an `emitUnclaimed` refusal or rc 70 |
+| `tests/vl_ir_shadow_test.ts` | ci-native; gate.sh `--fast` | the shadow's miss classes per program | **retire** | the native fixpoint and `ir-i8-sweep.sh`'s successor: a miss is a build failure |
+| `tests/vl_ir_prepost_test.ts` (`ir shadow suite`) | gate.sh `--fast` | `$VL_IR_SHADOW=6`, the build before legacy against the build after | **retire** | behaviour parity: the order bug it caught (an IR build reading state legacy wrote) needs a legacy pass, and a wrong build from any other order is a wrong output |
+| `vl_box_dst_shadow_test`, `compiler/box_dst_shadow.vl` | ci-native | the checker's box destination against each legacy box site | **retire** | the union-box capability probes and matrices (`capability-probes.vl`): a wrong destination is a wrong printed value |
+| `vl_ir_door_guard_test` | ci-native | the IR door's guard against legacy context | **retire** | none needed: the door and the legacy body it sat in are deleted, so no program can reach the guard; `dead-exports.vl` reds a guard left behind |
+| `self-ir-misses.vl` and its baseline | gate.sh; ci.yml | IR misses in the self-compile | **retire**; **re-aim** mutant `selfirmiss` at `native fixpoint` | `native-fixpoint.sh`: a miss is an `emitUnclaimed` refusal, so the self-compile fails |
+| `claim-refusal-survey.sh` (sweep.yml `claim-refusal`) | sweep label | a refused claim against the claimless build | **retire** | the `@emit-error` cases and the `emit_reject` witnesses, as for `--pop refusals` |
+| `ir-driver-census.sh`, `ir-only-census.vl`, `ir-i8-census/` (`census.sh`, `probe-patch.sh`, `stub-reach.sh`) | by hand | where legacy is still reached | **retire** with the I8 tools; `ir-i8-sweep.sh` and `ir-i8-self-list.sh` go one PR later, once nothing reads them | none needed: these are discovery instruments, not gates, and nothing they measure exists after I8 |
+| `ci-verdict.sh` `TREE_SKIPS`, `ci_verdict_test`, `ci_proof_test`'s local rows | ci.yml | job and row names | **follow** the renames and retirements above | themselves |
+
+Behaviour parity is the conversion target for `ci-ir-identity` and `--cross`, and the survivor most
+retired rows name. It keeps the `ir-identity` paths filter in ci.yml, and it is the only check that
+still needs the shards. The I8 PR proves each retirement against its survivor, using the kill
+matrix's mutant for that row where one exists.
