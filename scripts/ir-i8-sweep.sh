@@ -13,7 +13,8 @@
 # (c) The tree is built with the checkout's fixpoint seed, then refreshed by itself to a fixpoint
 #     (the self-compile, first). Every population then runs `vl check --codegen` under that compiler
 #     and under the seed. A program that fails only under the tree is newly failing, grouped by the
-#     first stub it hits. A claim that falls back on, or refuses inside, a stub is an IR need.
+#     first stub it hits: its first IR need when it has one (a claim that falls back on, or refuses
+#     inside, a stub or a re-entry, after which legacy's lowering fails too), else its first error.
 # A kept function's (and the start and constant-cell writers') call of `emitExpr` or `emitWidened`
 # is rewritten to a stub naming its caller (`i8 reentry <caller>`): those callers are the port list.
 # A claim that falls back for a reason the seed's run of that program does not show is reported
@@ -278,10 +279,14 @@ VL
     [ -s "$T/base.$pop" ] || scan "$T/probe.wasm" "$T/$pop" > "$T/base.$pop"
     scan "$c" "$T/$pop" > "$T/sweep.$pop"
     grep $'\tNEED ' "$T/sweep.$pop" | awk -F'\t' -v p="$pop" '{ sub(/^NEED /, "", $2); print p "\t" $1 "\t" $2 }' >> "$T/needs" || true
-    awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 !~ /^(NEED|FELL|HIT) / && $2 != "UNC") bad[$1] = 1; next }
+    awk -F'\t' -v p="$pop" 'FNR == 1 { fi++ }
+      fi == 1 { if ($2 !~ /^(NEED|FELL|HIT) / && $2 != "UNC") bad[$1] = 1; next }
+      fi == 2 { if ($2 ~ /^NEED / && !($1 in need)) { need[$1] = $2; sub(/^NEED /, "", need[$1]) }; next }
       $2 ~ /^(NEED|FELL|HIT) / || $2 == "UNC" || ($1 in bad) || ($1 in seen) { next }
-      { seen[$1] = 1; s = "other"; if (match($2, /i8 (stub|reentry) [A-Za-z0-9_]+/)) { s = substr($2, RSTART + 3, RLENGTH - 3); sub(/^stub /, "", s) }; print p "\t" $1 "\t" s }' \
-      "$T/base.$pop" "$T/sweep.$pop" >> "$T/failing"
+      { seen[$1] = 1; s = "other"; if (match($2, /i8 (stub|reentry) [A-Za-z0-9_]+/)) { s = substr($2, RSTART + 3, RLENGTH - 3); sub(/^stub /, "", s) }
+        if ($1 in need) s = need[$1]
+        print p "\t" $1 "\t" s }' \
+      "$T/base.$pop" "$T/sweep.$pop" "$T/sweep.$pop" >> "$T/failing"
     # Unexplained: newly failing with nothing the seed leaves unclaimed. And every stub each program reaches.
     awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 == "UNC") unc[$1] = 1; next }
       $1 == p && !($2 in unc) { print p "\t" $2 "\t" $3 }' "$T/base.$pop" "$T/failing" >> "$T/unexplained"
