@@ -5,6 +5,12 @@ holds the rules ("Gates", "Agent concurrency"); this page holds the steps. Who p
 CLAUDE.md's "Each proof runs once" bullet: the lane proves its change once, the queue proves the
 merged tree, and the reviewer reruns only a reading it disputes.
 
+> **Superseded in part, 2026-11-25 (coordinator ruling).** CI is the queue: trains, verifier lanes,
+> PRE-REVIEW and lane-claim broadcasts retire. A lane follows [`lane-brief.md`](lane-brief.md), and
+> the rulings O1 to O6 are in [`orchestration-reset-2026-11-25.md`](orchestration-reset-2026-11-25.md).
+> Below, R1 to R12 and Q1 to Q71 are kept as history and as the reasons behind each check. Where
+> they conflict with O1 to O6, O1 to O6 win.
+
 ## READY
 
 A lane that wants its PR merged sends one line:
@@ -414,6 +420,17 @@ before the lane relies on it. Byte identity cannot prove such a function, so beh
   `tests/cases`, capability probes), with the diverging programs among them, or `--files`
   naming them when no population holds one. It also quotes `ir-identity.sh --cases` showing the
   `expected divergence` rows.
+
+**`legacy-wrong` (ruling O3).** Where legacy's emitter is wrong and the IR is right, the lane does
+not fix legacy: it lists each diverging function with a mechanism that starts `legacy-wrong:`
+(`<program>\t<function>\tlegacy-wrong: <what legacy gets wrong>\t<PR>`). `ir-identity.sh` and the
+armed shadow pass it as they pass any listed divergence, and `ir-identity.sh` also passes the
+program when the claims seed builds it and the claimless one refuses. `ir-parity.vl` does not
+compare it with IR off: it runs the IR-on build alone and passes when that run meets the program's
+expected output, its `// @log` lines (a `// @trap` as any trap, `// @run` as a clean run) or, for
+an inventory row passed to `--files` as its `.md`, the row's `Want:`. A listed program with no
+expected output reds. The READY quotes `ir-parity.vl --files <program>` with its `legacy-wrong
+meeting expected output` count.
 
 The queue's vetoes are unchanged: an unlisted differ under `ir-identity.sh` is still a veto.
 

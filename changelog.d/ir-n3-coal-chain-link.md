@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage, a `??` chain's untyped inner link:** the link `b ?? d` that re-associating `a ?? b ?? d` mints, typed by legacy only where `d` already has the chain's type, is of its chain's type in the IR, as legacy's classifier and bytes treat it (`coalLinkChainOf`, now shared). Graded by a committed position matrix (`coalesce-chain-untyped-inner-link`): its 12 function cells move from `rep ?` to covered and matched. In tests/cases and the corpus, 7 of the family's 8 functions and both named corpus cells are covered and matched. No legacy bytes moved.

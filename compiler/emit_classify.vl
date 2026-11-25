@@ -9132,10 +9132,19 @@ function coalesceNulNoneDefaultIx(exprIx: i32, fnIx: i32): i32 {
   const e = nodeAt(unwrapParen(exprIx))
   if e is BinExpr {
     if e.binOp == "??" {
-      if exprIsNulNone(e.binLeft, fnIx) { return e.binRight }
+      if coalLhsIsNulUnit(e.binLeft, fnIx) { return e.binRight }
     }
   }
   return -1
+}
+
+// Whether `??`'s left operand `lhsIx` is the `null` unit, so the `??` is its default: a value
+// `exprIsNulNone` names, or an assignment whose value is the unit, whose store still runs
+// (D17301).
+export function coalLhsIsNulUnit(lhsIx: i32, fnIx: i32): boolean {
+  if exprIsNulNone(lhsIx, fnIx) { return true }
+  const x = unwrapParen(lhsIx)
+  return asgYieldsNullLit(x) || asgYieldsNulHole(x, fnIx)
 }
 
 // Whether binding `letIx` holds the `null` unit in `fnIx`: the type it holds there reps as
@@ -11579,6 +11588,23 @@ export function nicheReadKindAt(ix: i32, fnIx: i32): i32 {
   const t = nodeTyAt(ix, fnIx)
   if nulMapTy(t) { return NICHE_NUL_MAP }
   return nulRefBoxTagOf(t)
+}
+
+// The reference niche a narrowed box read at `ix` reads (`nicheReadKindAt`): "list", "closure"
+// or "map" for `A | null` of that shape, else "" (a scalar niche, or a tagged function set).
+export function nicheReadRefOf(ix: i32, fnIx: i32): string {
+  if nicheReadKindAt(ix, fnIx) < 0 { return "" }
+  const t = nodeTyAt(ix, fnIx)
+  if nulMapTy(t) { return "map" }
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyNullable) { return "" }
+  const inner = nonNullTy(t)
+  if inner < 0 || inner >= T.tys.length { return "" }
+  return match tyAt(inner) {
+    TyArray => "list"
+    TyFunc => if fnTagTyIsTagged(inner) { "" } else { "closure" }
+    TyMap => "map"
+    TyPrim | TyErr | TyObj | TyUnion | TyNullable | TyVar | TyLit | TyNeg => ""
+  }
 }
 
 // Whether `t` is `M | null` for a map type `M`.
@@ -14178,13 +14204,18 @@ function identIsBoundClosureGo(readIx: i32, fnIx: i32): boolean {
   return false
 }
 
+// Whether the checker typed expression `exprIx` as a tagged function set's member id.
+export function exprTypedTagId(exprIx: i32, fnIx: i32): boolean {
+  return exprIx >= 0 && fnTagTyIsTagged(nodeTyAt(exprIx, fnIx))
+}
+
 // True if the expression at `exprIx` evaluates to a function value (a closure
 // fat-pointer): a `function(...)` literal, a bare reference to a top-level/lifted
 // function name, a reference to a closure-typed param/local, or a call returning a
 // function value (a function whose body's tail is itself a function value).
 export function exprIsClosure(exprIx: i32, fnIx: i32) {
   // A tagged set's value is the i32 id of its member.
-  if exprIx < 0 || fnTagTyIsTagged(nodeTyAt(exprIx, fnIx)) { return false }
+  if exprIx < 0 || exprTypedTagId(exprIx, fnIx) { return false }
   const e = nodeAt(exprIx)
   match e {
     Paren => {
@@ -15258,6 +15289,13 @@ const rrKey = memoKeyNew(10)
 const rrStamp: i32[] = []
 const rrFn: i32[] = []
 const rrVal: ReadRep[] = []
+// Forgets every read rep remembered so far: a claim that falls back may have asked inside an
+// elaboration context the memo's key does not name (D17243).
+export function readRepMemoAdvance() {
+  memoGenAdvance(rrGen)
+  return 0
+}
+
 function readRepOf(ix: i32, fnIx: i32): ReadRep {
   const rx = unwrapParen(ix)
   if rx < 0 { return readRepGo(ix, fnIx) }
