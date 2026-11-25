@@ -1,4 +1,4 @@
-# IR: a box narrowed to a nullable map, list or closure (2026-11-25, lane COV-IS)
+# IR: a box narrowed to a nullable map, list or closure, and a global box's `is` (2026-11-25, lane COV-IS)
 
 `narrowed read niche kind`: a union-box local narrowed to `M | null`, `T[] | null` or
 `(…) => R | null` reads as that reference's niche. `nicheReadKindAt` names the kind:
@@ -37,3 +37,18 @@ local`, `box ladder` and `global read coercion`.
 - `loops/for-in-nulclosure-element-in-each-position.vl` (76 of 76) and
   `loops/for-in-nullist-element-in-each-position.vl` (74 of 74).
 - `unions/box-narrowed-to-nullable-list-copied.vl`: 15 of 16 matched.
+
+## `is box not a local`: a module global's box
+
+An `is` test whose arm tag reads the receiver's raw box (`identBox`), or a stored box test, over a
+module global's union box. Legacy pushes the global's cell raw (`emitUnionBoxPush`'s global arm,
+recovered non-null), whatever its narrowing. The builder now reads it through `irBBoxLocal`'s
+global arm (`globalBoxSymOf`) at both sites.
+
+A probe split the class's 26 hits over tests/cases and the witnesses by receiver: 14 globals, 4
+element receivers and 8 captured. Every program with a global receiver now claims and matches it.
+The captured ones are COV-CLOS's closure family; the element receivers stay `is box not a local`.
+
+Q58: `tests/cases/unions/global-box-is-tag-positions.vl`, at module scope: an `if` chain, a `let`,
+a call argument, a `&&` operand, a negation, an `if` arm, a record field, a list element and a
+`while` condition. Base: `start uncovered is box not a local`. Head: start matched.
