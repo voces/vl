@@ -1277,15 +1277,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           "a union compare's null-leg operand is not a re-read variable",
         )
       }
-      // An operand read again is a null leg's, unparked, beside a box held in a variable.
+      // An operand read again is a null leg's, unparked, beside a box held in a variable or parked.
       if (
         r.ucOtherAgain
         && (!r.ucNul
           || (r.ucStage & 2) != 0
-          || !(bv is OVar)
+          || (r.ucStage & 1) == 0
+          && (!(bv is OVar)
           || bv.ov < 0
           || bv.ov >= vf.irVars.length
-          || vf.irVars[bv.ov].vKind == "temp")
+          || vf.irVars[bv.ov].vKind == "temp"))
       ) {
         return fail(
           2,
@@ -2269,6 +2270,40 @@ function coalOptRecLeafWhy(n: SCoalBox): string {
   return ""
 }
 
+// A `K | null` niche's join `??` reads the atom niche and yields the union's box.
+function coalNulAtomJoinWhy(n: SCoalBox): string {
+  const r = repNodeAt(opRep(n.cbL))
+  if !(r is RNullable) || r.rnDisc != 3 {
+    return "an atom join `??` reads no atom niche"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "an atom join `??` writes no variable"
+  }
+  if !(repNodeAt(vf.irVars[o].vRep) is RBox) {
+    return "an atom join `??` yields no box"
+  }
+  return ""
+}
+
+// A fused `m[k]?.f ?? d` reads its map and key through its probe and yields the field's scalar.
+function coalOptMapFieldWhy(n: SCoalBox, id: i32): string {
+  const mp = n.cbMap
+  if mp == null { return "an optional map field `??` holds no probe" }
+  use(mp.prKey, id)
+  if !mapRecvOk(mp.prSym, n.cbL, id) {
+    return "an optional map field `??` reads a receiver that is no map"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "an optional map field `??` writes no variable"
+  }
+  if repPrim(vf.irVars[o].vRep) == null {
+    return "an optional map field `??` yields no scalar"
+  }
+  return ""
+}
+
 // A `boolean | null` niche's join `??` reads the niche and yields the union's box.
 function coalNulBoolJoinWhy(n: SCoalBox): string {
   if !repBoolNiche(opRep(n.cbL)) {
@@ -2626,7 +2661,7 @@ function coalBoxStashWhy(n: SCoalBox): string {
 // per-level frame stays as small as its other arms need.
 function coalBoxCheck(n: SCoalBox, id: i32) {
   // A fused map read's receiver is read by its probe, which may name a global instead.
-  const mapArm = n.cbArm == "mapIndexGetOr"
+  const mapArm = n.cbArm == "mapIndexGetOr" || n.cbArm == "optMapField"
   if (n.cbMap != null) != mapArm {
     return fail(2, id, "a `??` holds a map probe off the map-read arm")
   }
@@ -2670,6 +2705,8 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
     "optLeaf" => coalOptLeafWhy(n)
     "optBoxLeaf" => coalOptBoxLeafWhy(n)
     "optRecLeaf" => coalOptRecLeafWhy(n)
+    "optMapField" => coalOptMapFieldWhy(n, id)
+    "nulAtomJoin" => coalNulAtomJoinWhy(n)
     "nulBoolJoin" => coalNulBoolJoinWhy(n)
     "boxStash" => coalBoxStashWhy(n)
     "boxFieldScalar" => coalBoxFieldScalarWhy(n)
