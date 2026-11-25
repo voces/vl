@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **Fixed D17047 and D17425** (clause 1, check-clean invalid wasm): an un-annotated function that reads or writes its parameter's fields and returns it, called with a record literal and delivered to a wider record (`const c: A = g({ d: 5 })`), declared its parameter at the literal's row and its result at `A`'s, so the module did not validate. The literal is now adopted at `A` whenever the body uses the parameter, or an alias of it, only as a field's receiver. Filed D17560 (the parameter handed to a call, stored or rebound); D17426 (a `?.` read of it) is narrowed to its recorded type.
