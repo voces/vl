@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: an in-place `??` after an earlier operand, and a box over a valued `if` or `??`:** an earlier operand (the `"v="` of `"v=\{xs.get(i) ?? d()}"`) is staged below an in-place `??` and the box head is written after the staged leads; a box whose value holds a valued `if` or `??` is written late, its value and payload conversion held in an `anyref` local (`irOnceSlot`, one lowering-owned scratch helper keyed by valtype, of which `irOnceRefSlot` is the ref case), then the tag, the payload again and the box. `string operand after another` 12 → 1 and `box of a valued if` 5 → 0 on their programs; run output unchanged (behaviour parity).
