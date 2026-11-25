@@ -808,10 +808,11 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RAsUnion => {
       use(r.auV, at)
-      // The tag test reads a box, a boxed nullable's null-tagged one too; what it yields is the
-      // cast's own rep, which the builder takes.
+      // The tag test reads a box, a boxed nullable's null-tagged one too, and a union of lists
+      // stored as its one list reads that list; what it yields is the cast's own rep.
       const on = repNodeAt(opRep(r.auV))
-      if !(on is RBox || on is RNullable && on.rnDisc == 4) {
+      const ln = if on is RNullable { repNodeAt(on.rnInner) } else { on }
+      if !(on is RBox || on is RNullable && on.rnDisc == 4 || ln is RList) {
         return fail(2, at, "a union cast's operand is a box")
       }
       0
@@ -926,7 +927,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const el = kidAt(dst, 0)
       const en = repNodeAt(el)
       const packed = repPrim(el) == "u8" || en is RPrim && en.rpPacked != 0
-      const want = if packed { vfI32 } else { el }
+      // A `null[]` list holds legacy's i32 storage, each `null` its sentinel (`emitArrI32`).
+      const nulUnit = repPrim(el) == "null"
+      const want = if packed || nulUnit { vfI32 } else { el }
       for e in r.mlElems {
         if opRep(e) != want {
           return fail(2, at, "an element's rep is not the list's")
@@ -1180,7 +1183,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const d = repNodeAt(opRep(r.ntV))
       // A union box (discipline 4 included) answers by its null tag.
       const box = d is RBox || d is RNullable && d.rnDisc == 4
-      if !box && (!(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner)) {
+      // A record reference's `ref.is_null` answers too, for a holder read as its record.
+      if (
+        !box
+        && !(d is RRecord)
+        && (!(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner))
+      ) {
         return fail(
           2,
           at,
@@ -1599,6 +1607,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       uses(r.nxArgs, at)
       if dst >= 0 && !repIsScalar(dst) {
         return fail(2, at, "a numeric intrinsic's result is a scalar")
+      }
+      if r.nxSel != "op" && intSelArgsWrong(r) {
+        return fail(
+          2,
+          at,
+          "an integer select intrinsic's operands are at its width",
+        )
       }
       0
     }
@@ -2229,6 +2244,23 @@ function coalNulRefWhy(n: SCoalBox): string {
 
 // Why a `string | null` `??` whose default computes is ill-formed, or "": it reads a nullable
 // string and yields that string or its non-null inner.
+// A propagating `as`'s block reads a nullable reference or string and yields its non-null inner;
+// its null path returns.
+function coalAsPropWhy(n: SCoalBox): string {
+  const lr = repNodeAt(opRep(n.cbL))
+  if !(lr is RNullable) || lr.rnDisc != 1 {
+    return "a propagating `as` reads no nullable reference"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length || vf.irVars[o].vRep != lr.rnInner {
+    return "a propagating `as` yields no non-null inner"
+  }
+  if n.cbNull.length == 0 || !exits(n.cbNull[n.cbNull.length - 1]) {
+    return "a propagating `as`'s null path does not leave"
+  }
+  return ""
+}
+
 function coalNulStrWhy(n: SCoalBox): string {
   const lr = repNodeAt(opRep(n.cbL))
   if !(lr is RNullable) || lr.rnDisc != 1 || repPrim(lr.rnInner) != "str" {
@@ -2513,7 +2545,12 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
   if (n.cbMap != null) != mapArm {
     return fail(2, id, "a `??` holds a map probe off the map-read arm")
   }
-  if n.cbLB.length > 0 && n.cbArm != "nulRef" && n.cbArm != "nulStr" {
+  if (
+    n.cbLB.length > 0
+    && n.cbArm != "nulRef"
+    && n.cbArm != "nulStr"
+    && n.cbArm != "asProp"
+  ) {
     return fail(
       2,
       id,
@@ -2543,6 +2580,7 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
     "boxStash" => coalBoxStashWhy(n)
     "boxFieldScalar" => coalBoxFieldScalarWhy(n)
     "nulStr" => coalNulStrWhy(n)
+    "asProp" => coalAsPropWhy(n)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
   }
   if why != "" { return fail(2, id, why) }
@@ -2616,7 +2654,11 @@ function stmt(id: i32, prev: i32) {
       const l = opRep(n.lsV)
       // A packed list's element is stored as a plain i32, which its backing truncates.
       const ln = repNodeAt(l)
-      const want = if ln is RList && repPrim(ln.rlsElem) == "u8" { vfI32 } else { kidAt(l, 0) }
+      // A `null[]` list's element is its i32 storage's sentinel (`emitIdxStoreValue`).
+      const asI32 = ln is RList
+        && (repPrim(ln.rlsElem) == "u8"
+        || repPrim(ln.rlsElem) == "null")
+      const want = if asI32 { vfI32 } else { kidAt(l, 0) }
       if (!(ln is RList) || opRep(n.lsIx) != vfI32 || want != opRep(n.lsSrc)) {
         return fail(2, id, "an element write's reps do not match the list")
       }
@@ -3640,6 +3682,18 @@ function neverCallTemp(f: IrFn, i: i32): boolean {
         || (r is RCallRef && r.crNever)
         || r is RDeadNever
     }
+  }
+  return false
+}
+
+// Whether integer select `r` (`abs` over one operand, `min`/`max` over two) has another operand
+// count, or an operand not at its width (i64 when `nxWide`, else i32).
+function intSelArgsWrong(r: RNumIntr): boolean {
+  const n = if r.nxSel == "abs" { 1 } else { 2 }
+  if r.nxArgs.length != n { return true }
+  const want = if r.nxWide { "i64" } else { "i32" }
+  for a in r.nxArgs {
+    if repPrim(opRep(a)) != want { return true }
   }
   return false
 }
