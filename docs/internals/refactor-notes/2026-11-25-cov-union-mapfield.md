@@ -33,3 +33,27 @@ body, and the `end`. The verifier checks the probe's key and map receiver and a 
   `local` and the start are claimed, `arith` moves to `coalesce optional after an operand` (its
   second read follows a pending product), and `glob` and `nested` stay on `coalesce niche place`
   (a `boolean` field).
+
+# `coalesce nulRef atomJoinStash`
+
+`f() ?? d` where `f()` yields a literal union's `K | null` niche and the result is a union box
+(D17182): legacy's `emitCoalesceNulAtomJoin` tees the operand into a scratch slot, tests its `-1`
+null opening an `if` at the box, delivers the boxed default, and in the `else` boxes the atom as
+its member string.
+
+## Mechanism
+
+Legacy's open and present arms are extracted (`coalNulAtomJoinOpen`, `coalNulAtomJoinPresent`),
+and its refusal (`coalNulAtomJoinWhy`) is exported and decides the builder's route. The builder's
+`coalNulRef` sends `atomJoinStash` to `coalNulAtomJoin`: the operand at its atom niche, the default
+delivered at the box (`boxOwedAt`, as `emitUnionBoxAtRecord` delivers it). The lowering takes the
+slot (`widenTmpSlot(4001)`) before the operand, as legacy does, then the open arm, the default
+body, and the present arm. The verifier checks an atom-niche operand and a box out.
+
+## Measurements
+
+- Class cut (`scripts/ir-i8-census/classes/coalesce-nulref-atomjoinstash.txt`, 3 programs),
+  master tree before and this tree after: `coalesce nulRef atomJoinStash` 4 → 0 (one function
+  and three start bodies); every function and start body of the three programs is claimed (3 → 7).
+- The positions sweep is the class's own `tests/cases/null/coalesce-call-litunion-niche-boxed-positions.vl`
+  (its `f` and start body both missed before and both are claimed now).
