@@ -1718,6 +1718,8 @@ Deno.test({
       "record-field-read-twice": 2,
       "stored-read-of-i32-field": 2,
       "stored-read-of-boxed-nullable-field": 0,
+      "field-read-at-receiver-type-kid": 2,
+      "field-read-at-operand-row-kid": 0,
       "map-read-probe-of-i32": 2,
       "map-read-on-pop-arm": 2,
       "map-read-out-unwritten": 5,
