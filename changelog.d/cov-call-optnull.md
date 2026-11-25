@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR tests an optional chain once:** `x?.f == null` builds the chain once as its value and tests that value at its own rep (a niche's sentinel, a ref's `ref.is_null`, a box's tag), and `o?.f == y` beside a nullable record writes the chain's value once to a fresh local (`irOnceRefSlot` at the compare's row) and compares from it. Legacy writes the chain's test and its read separately, so the bytes differ and the behaviour is the same (behaviour parity, coordinator ruling 2026-11-25). `null test optChain` falls from 15 rows to 0 and `record compare place operand` from 13 to 0.
