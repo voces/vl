@@ -215,3 +215,23 @@ lists, and `emitNulIsNullTest` (2) to COV-IS, which owns nulls. Per-family stagi
 every failure the rehearsal found is a re-entry or missing coverage, not a family. I8 is ready when
 `ir-i8-sweep.sh` reports no newly failing program and the census reports no unclaimed function or
 start body.
+
+**The dress rehearsal and its red list** (coordinator ruling, 2026-11-25). A draft PR titled "I8
+DRESS REHEARSAL" holds the I8 PR built on fresh master: `--apply`, the driver arms as
+`emitUnclaimed`, the hand fixes, `ir-i8-rebaseline.sh`. INFRA regenerates it every few hours and
+posts the red list there; this table is the latest, by owner.
+
+| as of | what fails | count | owner |
+|---|---|---:|---|
+| master ad8ae0a3 | self-compile (`ir-i8-self-list.sh`) | 0 units | done |
+| master ad8ae0a3 | programs reaching an unclaimed function (`emitFuncBody`) | 568 | the COV lanes, by census class |
+| master ad8ae0a3 | programs reaching an unclaimed start body or global initializer (`emitStartGlobalInitValue` 310, `emitStmt` 99, `emitStartGlobalInit` 6, `emitVariantCoerce` 4) | 419 | COV-START, CENSUS |
+| master ad8ae0a3 | `reentry emitDelivered` | 47 | COV-IS |
+| master ad8ae0a3 | `reentry emitStrValue` | 37 | COV-CALL |
+| master ad8ae0a3 | tools that are programs (`scripts/lib/census-grade.vl` and others) | ≥1 | CENSUS |
+| master ad8ae0a3 | instruments that compare against legacy (`ci-ir-identity`, the shadow and claim-fallback tests, `self-ir-misses`) | 6 suites | INFRA (retire or rewrite in the I8 PR) |
+| master ad8ae0a3 | ratchets with no reading (unused-state, render-parse, self-ir-misses, plumb-shape-cost) | 4 | INFRA |
+| master ad8ae0a3 | stubs still called after `--apply` | 14 | INFRA |
+
+The program counts are `ir-i8-sweep.sh` on master: 1,071 of 27,539 programs newly fail (cases 723,
+witnesses 289, distilled 44, probes 15), and 35 of them with nothing the seed leaves unclaimed.
