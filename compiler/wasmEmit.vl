@@ -8293,6 +8293,25 @@ export function listGetStageEnter(callIx: i32): i32[] {
   return sv
 }
 
+// Whether the IR's lowering holds the `.get` index in a local of its own (`irGetIdxBegin`), which
+// legacy's head then reads through `listGetIdxHook` rather than staging it.
+let listGetIdxHeld = false
+
+// Drops the index staging `listGetStageEnter` marked, and stages none until `listGetIdxRelease`,
+// for an index the IR's lowering holds in a local of its own.
+export function listGetIdxUnstage() {
+  listGetIdxStagedIx = -1
+  listGetIdxStagedSet = false
+  listGetIdxHeld = true
+  return 0
+}
+
+// Ends `listGetIdxUnstage`'s hold.
+export function listGetIdxRelease() {
+  listGetIdxHeld = false
+  return 0
+}
+
 // Put back what `listGetStageSave` took.
 export function listGetStageRestore(sv: i32[]) {
   listGetIdxStagedIx = sv[0]
@@ -8314,6 +8333,7 @@ function listGetStageMark(callIx: i32) {
       const stagesRecv = !optRecvReReadable(callee.memObj)
       const stagesIdx = c.callArgs.length == 1
         && !listGetIdxReReadable(c.callArgs[0])
+        && !listGetIdxHeld
       // A call that stages takes the next depth's slots; one that stages nothing takes none.
       if stagesRecv || stagesIdx { listGetDepth = listGetDepth + 1 }
       if stagesRecv {
@@ -14259,6 +14279,14 @@ export function spreadGroupSlotAt(
     )
   }
   return spreadGroupIdSlot(kk, row, gid)
+}
+
+// Whether a spread group's tail (`spreadGroupStash`) converts a list of kind `gk` into the
+// literal's kind `kk`: an atom list into a `string` list, or a scalar list widened.
+export function spreadGroupConverts(gk: ListKind, kk: ListKind): boolean {
+  if gk == kk { return false }
+  if kk == "strlist" { return gk == "list" }
+  return scalarWidenConvOp(listKindElemKind(gk), listKindElemKind(kk)) >= 0
 }
 
 // A spread group's tail once its list `grp` is on the stack: refresh it if a view, convert it to
@@ -22579,24 +22607,60 @@ function emitCatOperand(
   }
   if widen {
     const sk = mfRecvKindOf(opIx, fnIx)
-    let dk: VKind | null = null
-    if kind == LBK_F64_LIST { dk = "f64" }
-    if kind == LBK_I64_LIST { dk = "i64" }
-    if sk == null || dk == null {
-      return emitFailAt(
-        "emitProgram: a list `+` widening reached an operand `catWidenSideOfBin` does not admit",
-        opIx,
-      )
-    }
-    if emitSpreadGroup(opIx, fnIx, pendingKindOfList(sk, 0), 0) < 0 {
+    if (
+      sk != null
+      && emitSpreadGroup(opIx, fnIx, pendingKindOfList(sk, 0), 0) < 0
+    ) {
       return -1
     }
-    if emitEqRecoverNarrowed(opIx, fnIx) < 0 { return -1 }
-    svSyncRecv(opIx, fnIx)
-    return emitScalarListWidenTop(listKindElemKind(sk), dk)
+    return catScalarWidenTail(opIx, fnIx, kind)
   }
   if emitExpr(opIx, fnIx) < 0 { return -1 }
   return listCatOperandTail(opIx, binIx, fnIx)
+}
+
+// Whether list `+` `binIx` widens one side to the concat's element by a tail over that side's own
+// list (`catWidenTail`): a scalar list converted, or a ref list boxed into the union-box row; not
+// a run the boxing builds at the row itself.
+export function catWidenTakes(binIx: i32, fnIx: i32): boolean {
+  const k = catListKindOfBin(binIx, fnIx)
+  const side = catWidenSideOfBin(binIx, fnIx)
+  if k <= 0 || side == 0 { return false }
+  if k != LBK_REF { return true }
+  const e = nodeAt(binIx)
+  if !(e is BinExpr) { return false }
+  return !spreadBoxedGroupIsRun(
+    if side == 1 { e.binLeft } else { e.binRight },
+    true,
+  )
+}
+
+// List `+` `binIx`'s widened operand `opIx` once its own list is on the stack, at the concat's rep:
+// boxed into the union-box row as a spread group is, or converted element-wise.
+export function catWidenTail(opIx: i32, binIx: i32, fnIx: i32) {
+  const k = catListKindOfBin(binIx, fnIx)
+  if k == LBK_REF {
+    return spreadBoxedGroupTail(opIx, true, catSlotOfBin(binIx, fnIx), fnIx)
+  }
+  return catScalarWidenTail(opIx, fnIx, k)
+}
+
+// A list `+` operand `opIx`'s widening once its narrower scalar list is on the stack: its narrowed
+// recover, then each element converted to concat kind `kind`'s element.
+export function catScalarWidenTail(opIx: i32, fnIx: i32, kind: i32) {
+  const sk = mfRecvKindOf(opIx, fnIx)
+  let dk: VKind | null = null
+  if kind == LBK_F64_LIST { dk = "f64" }
+  if kind == LBK_I64_LIST { dk = "i64" }
+  if sk == null || dk == null {
+    return emitFailAt(
+      "emitProgram: a list `+` widening reached an operand `catWidenSideOfBin` does not admit",
+      opIx,
+    )
+  }
+  if emitEqRecoverNarrowed(opIx, fnIx) < 0 { return -1 }
+  svSyncRecv(opIx, fnIx)
+  return emitScalarListWidenTop(listKindElemKind(sk), dk)
 }
 
 // The reserved LCAT frame base for concat rep `(kind, slot)`, or -1, over the pair the
