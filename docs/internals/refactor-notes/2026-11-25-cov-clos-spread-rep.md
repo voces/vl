@@ -45,3 +45,13 @@ One unit moves on to a new miss, `push many run rep`.
 
 `tests/cases/lists/spread-boxed-positions.vl`: all 12 positions are now claimed, against 6 on base,
 and the output matches under `VL_IR_STRICT=1`.
+
+## The verifier rule's control
+
+`compiler/ir_selftest.vl` gains two cases, both a boxing spread over an `i32[]` source:
+- `spread-boxed-at-box-list` is at a list of `i32 | string` boxes and holds (rule 0).
+- `spread-boxed-at-scalar-list` is at `i32[]` and fails rule 2.
+
+`tests/vl_ir_shadow_test.ts` expects both. With the rule taken out, the test fails with
+"case spread-boxed-at-scalar-list: want rule 2, got rule 0". With the rule restored, it passes, and
+the restored seed is byte-identical to the one built before the control.
