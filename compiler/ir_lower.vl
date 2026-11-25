@@ -1040,6 +1040,8 @@ export function irLSkip(o: Opnd) {
     // A field read's receiver is consumed first, as `irLOpnd` writes it.
     const r = tempRhs(o.ov)
     if r is RGetField { irLSkip(r.gfV) }
+    // So is an unbox's box, a global's read the hoist wrote again (`irLReadAgain`).
+    if r is RBoxNarrow { irLSkip(r.bnV) }
     lwSeq.push(o.ov)
   }
   return 0
@@ -4907,8 +4909,32 @@ function opndAgain(o: Opnd, ix: i32): i32 {
 export function irLReadAgain(ix: i32): boolean {
   if !lw.irReadAgain.has(ix) { return false }
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
-  rhs(lw.irReadAgain[ix] ?? none, false)
+  const r = lw.irReadAgain[ix] ?? none
+  // A global box's unbox (`globalUnboxRead`) reads the global again, then unboxes it.
+  if r is RBoxNarrow && r.bnAtom >= 0 && r.bnCon < 0 {
+    const g = globalBoxDefOf(r.bnV)
+    if g != null {
+      rhs(g, false)
+      emitUnionUnboxTail(r.bnAtom)
+      return true
+    }
+  }
+  rhs(r, false)
   return true
+}
+
+// The global read temp `o` is defined by, found in the body since a hoist is written before the
+// temp's own definition; null for any other operand.
+function globalBoxDefOf(o: Opnd): RGlobalGet | null {
+  if !(o is OVar) || o.ov < 0 || o.ov >= lw.irVars.length { return null }
+  if lw.irVars[o.ov].vKind != "temp" { return null }
+  for n in lw.irNodes {
+    if n is SLet && n.lDst == o.ov {
+      const d = n.lRhs
+      return if d is RGlobalGet && d.ggSym >= 0 { d } else { null }
+    }
+  }
+  return null
 }
 
 // `RRecCopyPure`: legacy's whole copy, its source read as the IR wrote it: whole, where the copy
