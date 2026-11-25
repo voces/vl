@@ -13147,3 +13147,16 @@ its elements stored as the `null[]` sentinel.
 ## A call refused for its argument count is typed by the callee's declared return (2026-11-25, coordinator ruling) — D17481
 
 **Ruled by the coordinator 2026-11-25**, on lane O2's D17481. Recovery after `wrong number of arguments` types the call by the callee's declared return, not `<error>`, as TypeScript does. What reads the result is checked against that type, so an independent true error still reports: `const s: string = mk(1, 2)` gives the arity error and `cannot assign A to 's'`, which is wrong at any arity. `<error>` would absorb such checks and hide them.
+
+## A narrowed module `let` pays one program-wide writer analysis; a `const` pays none (2026-11-23) — D17063
+
+**Decided by the checker-fix lane that closed D17063 (2026-11-23); confirmed by the coordinator
+2026-11-25**, on the checker cost cliff IR-N1 found. A module `let`'s initializer narrows it
+(`let g: U = { a: 0 }; print(g.a)` checks), so each later call must ask whether it may write the
+cell, and that needs the writer analysis of the whole module. A `const` holding a list is never
+narrowed and never asks. The analysis is linear and stays; the quadratic
+closure inside it was the defect and is gone.
+
+**Why.** Dropping the initializer's narrowing would reject programs the language accepts today.
+Keeping the analysis but caching the module root's walk across functions does not pay: the checker
+edits the arena in place between the asks, so a kept walk is stale (measured: no fuel moved).
