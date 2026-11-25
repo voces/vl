@@ -4,6 +4,7 @@
 // claimed by one. The checker resets the memo tables and asks the questions, and keeps the
 // halves that read the type arena; nothing here reads a type or the scope chain.
 // This module imports `./ast`, `./symbols`, `./listutil` and `./check_suggest`.
+import { recHoleIdentityArg } from "./check_hole_identity"
 import { nodeTyIxOf } from "./check_node_tys"
 import { T, TyArray, TyLit, TyMap, TyPrim, tyAt } from "./check_types"
 import {
@@ -2555,6 +2556,23 @@ function cwPathPrefix(p: string[], path: string[]): boolean {
   return true
 }
 
+// The object field read `v` reads, with its field name pushed onto `out`; -1 for any other node.
+function cwFieldReadOf(v: i32, out: string[]): i32 {
+  const n = nodeAt(v)
+  if !(n is Member) { return -1 }
+  out.push(n.memProp)
+  return n.memObj
+}
+
+// The argument call `v` of a named hole identity hands back; -1 for any other node.
+function cwIdentityArgOf(v: i32): i32 {
+  const n = nodeAt(v)
+  if !(n is Call) || n.callFn < 0 { return -1 }
+  const fd = identDeclOf(cwPeel(n.callFn))
+  if fd < 0 || fd >= P.nodes.length || !(nodeAt(fd) is FuncDecl) { return -1 }
+  return recHoleIdentityArg(v, fd)
+}
+
 // Add to `vals` what value `e` holds at the steps of `path` from `k`, through list and record
 // literals and the bindings they name, blamed on `blame` (or on the value itself at -1); false at
 // any other node.
@@ -2597,6 +2615,16 @@ export function cwSlotDescend(
       vals,
       ats,
     )
+  }
+  // A hole identity hands back its argument, so it holds what that argument does (D17361).
+  const ia = cwIdentityArgOf(v)
+  if ia >= 0 { return cwSlotDescend(ia, path, k, blame, vals, ats) }
+  // A field read holds what its object holds at that field, then at the rest of `path` (D17360).
+  const fp: string[] = []
+  const fo = cwFieldReadOf(v, fp)
+  if fo >= 0 {
+    for st in path.slice(k, path.length) { fp.push(st) }
+    return cwSlotDescend(fo, fp, 0, blame, vals, ats)
   }
   // A fresh `Map()` holds nothing at a slot, before any call it is read as returns.
   if path[k] == "[]" && cwFreshMap(v) { return true }
