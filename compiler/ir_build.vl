@@ -844,6 +844,7 @@ import {
   placeRecordSigs,
   readOwesNonNullRecover,
   readRepMemoAdvance,
+  refListSlotOfExpr,
   sFieldIsUnionBox,
   sFieldStoreKind,
   sharedUnionFieldPlan,
@@ -2255,6 +2256,11 @@ function outTyOf(ix: i32, rep: i32): i32 {
   }
   const ft = nullFoldedTy(t, rep)
   if ft >= 0 { return ft }
+  // A record list held at its laid-out row is typed at that row's list (`listRowRep`).
+  if t >= 0 && repNodeOfTy(t) != rep && repNodeAt(rep) is RList {
+    const lt = listRowTyOf(ix, repNodeOfTy(t))
+    if lt >= 0 && repNodeOfTy(lt) == rep { return lt }
+  }
   return rowlessRecordTy(ix, t, rep)
 }
 
@@ -3236,8 +3242,40 @@ function primRepOfTy(t: i32): i32 {
 function exprRepOf(ix: i32): i32 {
   const t = exprTyOf(ix)
   const r = primRepOfTy(t)
-  if r >= 0 { return rowlessRecordRep(ix, t, r) }
+  if r >= 0 { return listRowRep(ix, rowlessRecordRep(ix, t, r)) }
   return primRepOfTy(byteHeld(t))
+}
+
+// Rep `r` of built record list `ix`, or the list of the ref-list row legacy lays it out on where
+// that row's record element is not `r`'s (`listRowTyOf`).
+function listRowRep(ix: i32, r: i32): i32 {
+  const lt = listRowTyOf(ix, r)
+  if lt < 0 { return r }
+  return repNodeOfTy(lt)
+}
+
+// The list type of the ref-list row legacy lays built record list `ix` out on
+// (`refListSlotOfExpr`), where `ix` is at rep `r` whose record element is not that row's: a kept
+// maker's records, built at the row they are adopted at; else -1. A read of a place holds the
+// place's rep.
+function listRowTyOf(ix: i32, r: i32): i32 {
+  const l = repNodeAt(r)
+  if !(l is RList) || !(repNodeAt(l.rlsElem) is RRecord) { return -1 }
+  const nd = nodeAt(unwrapParen(ix))
+  if nd is Ident || nd is Member { return -1 }
+  const slot = refListSlotOfExpr(unwrapParen(ix), ibFnIx)
+  const et = if slot >= 0 { rlElemTyIxAt(slot) } else { -1 }
+  if et < 0 || irTyOpen(et) { return -1 }
+  const lt = listTyOfElem(et)
+  const ln = repNodeAt(repNodeOfTy(lt))
+  if (
+    !(ln is RList)
+    || ln.rlsElem == l.rlsElem
+    || !(repNodeAt(ln.rlsElem) is RRecord)
+  ) {
+    return -1
+  }
+  return lt
 }
 
 // Rep `r` of `ix` at type `t`, or, for a built value of a record type no struct row records, the
@@ -5051,6 +5089,21 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       ib.irReadAgain[ix] = gr
       return irBLetTemp(b, { sgV: bx }, ix, rep)
     }
+    // A box cell narrowed to a `boolean | null` or `string | null` niche, or a list's, closure's or
+    // map's `A | null`, is its box through the niche tail, as a box local's is.
+    if (
+      cellRep != rep
+      && heldAsBox(cellRep)
+      && identReadArmOf(n, ix, ibFnIx, false) == "niche"
+    ) {
+      const nk = nicheReadKindAt(ix, ibFnIx)
+      if nk != 1 && nk != 2 && nicheReadRefOf(ix, ibFnIx) == "" {
+        return irBMiss("narrowed read niche kind")
+      }
+      const bx = globalBoxAt(b, g, d, ix, cellRep)
+      if ibMiss != "" { return bx }
+      return irBLetTemp(b, { nrV: bx, nrAt: ix, nrKind: nk }, ix, rep)
+    }
     // A union cell narrowed to a ref-element list or a map arm reads unboxed to it.
     const con = if cellRep != rep { boxContainerReadOf(n, ix, cellRep, rep) } else { -1 }
     if con >= 0 {
@@ -5133,8 +5186,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     const member = gh >= 0
       && repNodeOfTy(gh) == cellRep
       && irTyHeldOpen(heldTy(exprTyOf(ix)), rep)
-    if (
-      cellRep != rep
+    const declined = cellRep != rep
       && !narrowed
       && !stored
       && !holed
@@ -5143,9 +5195,10 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !atomId
       && rowTy < 0
       && !tagId
-    ) {
-      return irBMiss("global read coercion")
-    }
+    // A struct cell read at a record its row holds is read at that row.
+    const rowRt = if declined { globalCellRowReadTy(ix, d, cellRep, rep) } else { -1 }
+    if rowRt >= 0 { return globalStoredRead(b, g, ix, cellRep, rowRt) }
+    if declined { return irBMiss("global read coercion") }
     if stored {
       return globalStoredRead(b, g, ix, cellRep, heldTy(letBindTy(d, -1)))
     }
@@ -5269,6 +5322,24 @@ function globalRowlessTy(d: i32, cellRep: i32, rep: i32): i32 {
   const st = heldTy(scopeTyAt(d, -1))
   if rep != repNodeOfTy(st) { return -1 }
   return rowlessStoredTy(st, rep, repTyOf(cellRep))
+}
+
+// The row type a struct global `d`'s cell (rep `cellRep`) is read at for its read `ix` at record
+// rep `rep`, where the read's record is that row's or one no row records, held there
+// (`rowlessStoredTy`); else -1.
+function globalCellRowReadTy(ix: i32, d: i32, cellRep: i32, rep: i32): i32 {
+  const row = globalCellStructIdx(d)
+  if globalCellKind(d) != "struct" || row < 0 || row >= sTyIx.length {
+    return -1
+  }
+  const rt = sTyIx[row]
+  if rt < 0 || irTyOpen(rt) || repNodeOfTy(rt) != cellRep { return -1 }
+  const t = nodeTyAt(ix, ibFnIx)
+  if t < 0 || repNodeOfTy(t) != rep || !(repNodeAt(rep) is RRecord) {
+    return -1
+  }
+  if structIndexOfTy(t) == row { return rt }
+  return if rowlessStoredTy(t, rep, rt) == rt { rt } else { -1 }
 }
 
 // Read `ix` of global `g` as its cell stores it: rep `cellRep`, typed at `ty`, the
@@ -9120,7 +9191,6 @@ function structEqPlaceRead(b: i32[], at: i32, o: Opnd, ix: i32): boolean {
 // second build is legal only of a read with no effect (`exprEffectFree`).
 function atomTower(b: i32[], ix: i32, dst: i32, ty: i32): Opnd {
   const n = nodeAt(ix)
-  if !(n is Ident) { return irBMiss("atom tower place") }
   const k = strToAtomTexts(ix).length - 1
   if k < 1 { return irBMiss("atom tower members") }
   if k > 1 && !exprEffectFree(ix) { return irBMiss("atom tower place") }
@@ -9130,7 +9200,8 @@ function atomTower(b: i32[], ix: i32, dst: i32, ty: i32): Opnd {
   let i = k - 1
   while i >= 0 {
     const at = b.length
-    const rd = identRead(b, n, ix, repNodeOfTy(TY_STR), false)
+    // A place other than a name is read past its tower hook, the string legacy's tower reads again.
+    const rd = if n is Ident { identRead(b, n, ix, repNodeOfTy(TY_STR), false) } else { exprAtPre(b, ix, false, "") }
     if ibMiss != "" { return rd }
     if repPrim(irBOpRep(rd)) != "str" { return irBMiss("atom tower read rep") }
     // A read this build minted is the raw string legacy reads, so it is typed at the string.
@@ -11631,8 +11702,9 @@ function spreadLit(
     spAt: ix,
     spBoxRow: -1,
   }
-  // A minted literal (a variadic push's run) has no checker type; it holds its build's.
-  const own = heldTy(exprTyOf(ix))
+  // A minted literal (a variadic push's run) has no checker type; it holds its build's. A literal
+  // held at its laid-out row is typed at that row's list (`outTyOf`).
+  const own = heldTy(outTyOf(ix, rep))
   const ty = if irTyHeldOpen(own, rep) && bt >= 0 { heldTy(bt) } else { own }
   return irBLetTempTy(b, r, ix, rep, ty)
 }
@@ -14048,6 +14120,27 @@ function armUnboxTemp(
   )
 }
 
+// A postfix `x++` / `x--` read for its value, the old one: its increment assignment, whose value is
+// the new one, then the step undone at the place's width, as legacy's `emitUnary` writes it.
+function postfixValue(b: i32[], n: Unary, ix: i32, rep: i32): Opnd {
+  const one = oneAt(rep)
+  if one.oiRep < 0 { return irBMiss("postfix rep") }
+  const v = irBExpr(b, n.unArg)
+  if ibMiss != "" { return v }
+  if irBOpRep(v) != rep { return irBMiss("postfix operand rep") }
+  const p = binPrimOp(if n.unOp == "p+" { "-" } else { "+" }, false)
+  if p == null { return irBMiss("postfix operator") }
+  return irBLetTemp(b, { poOp: p, poArgs: [v, one] }, ix, rep)
+}
+
+// The number one at numeric rep `rep` as an immediate (a float's bits), or a rep of -1.
+function oneAt(rep: i32): OImm {
+  const k: string = repPrim(rep) ?? ""
+  const bits: i64 = if k == "f64" { 4607182418800017408 } else if k == "f32" { 1065353216 } else { 1 }
+  const ok = k == "i32" || k == "i64" || k == "f64" || k == "f32"
+  return { oiRep: if ok { rep } else { -1 }, oiBits: bits }
+}
+
 // The value of `ix`, which a dead `never` read feeds, at rep `dst`: where -1, its own rep, else
 // the `i32` legacy's never value takes. No value reaches it (`RDeadNever`).
 function deadNeverTemp(b: i32[], ix: i32, dst: i32): Opnd {
@@ -14144,6 +14237,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   }
   if n is Ident { return identRead(b, n, ix, rep, cell) }
   if n is Unary {
+    if n.unOp == "p+" || n.unOp == "p-" { return postfixValue(b, n, ix, rep) }
     if n.unOp != "-" && n.unOp != "!" && n.unOp != "~" {
       return irBMiss("unary " + n.unOp)
     }
@@ -15308,13 +15402,32 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
   }
   const g = globalIndexOfSid(sidOfNode(n.binLeft))
   if g < 0 || d < 0 { return skip("assignment target") }
-  const src = storeValue(b, n.binRight, globalRep(g, d), ix)
+  const val = storeValue(b, n.binRight, globalRep(g, d), ix)
   if ibMiss != "" { return 0 }
+  const src = storedAsStands(b, val, globalRep(g, d), n.binRight)
   if globalRep(g, d) != irBOpRep(src) { return skip("global store coercion") }
   const gm = irGlobalWriteMiss(g, ibGlobalCtx())
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
   return 0
+}
+
+// Value `v` of `x` retagged to cell rep `rep` where it stands there with no coercion legacy
+// records at `x`, as a `let`'s initializer is: a list twin, a union-box list or map, a record on the
+// cell's heap or a declared subtype's, or a closure apart only in a hole; else `v`.
+function storedAsStands(b: i32[], v: Opnd, rep: i32, x: i32): Opnd {
+  const r = irBOpRep(v)
+  if r == rep || exprPrePathWhy(x, ibFnIx) != "" { return v }
+  if (
+    listRetag(r, rep)
+    || boxListRetag(r, rep)
+    || boxMapRetag(r, rep)
+    || recRetagAt(r, rep, x)
+    || holeRetagNoted(r, rep, true)
+  ) {
+    return repTemp(b, { rgV: v }, x, rep)
+  }
+  return v
 }
 
 // Assignment `at`'s value `x` at its cell's rep `rep`: delivered, or into a `null` cell, run for its
@@ -16606,6 +16719,11 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is BinExpr && n.binOp == "=" {
     assign(b, n, ix)
     return 0
+  }
+  // A postfix `x++` / `x--` statement discards its old value: it is its increment, the assignment
+  // the parser wraps (a place's prefix increment), as legacy's `emitStmt` writes it.
+  if n is Unary && (n.unOp == "p+" || n.unOp == "p-") {
+    return stmtNode(b, n.unArg, sibs, pos)
   }
   // A parenthesised call statement is that call statement, as legacy's `emitStmt` has it.
   if n is Paren && nodeAt(unwrapParen(ix)) is Call {
