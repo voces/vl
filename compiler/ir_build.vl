@@ -119,6 +119,7 @@ import {
   PStaged,
   PrimOp,
   PushRecv,
+  RAsgParked,
   RBoxNarrow,
   RCall,
   RCallRef,
@@ -9224,6 +9225,24 @@ function nulReadDropped(b: i32[], v: Opnd): boolean {
   return true
 }
 
+// Where the last node of `b` defines `v` as the unbox of an assignment's parked box at rep `dst`
+// (`assignValueBoxedArm`): that node dropped and the box returned; else null.
+function parkedBoxOf(b: i32[], v: Opnd, dst: i32): Opnd | null {
+  if !(v is OVar) || b.length < 2 { return null }
+  const n = ib.irNodes[b[b.length - 1]]
+  if !(n is SLet) || n.lDst != v.ov { return null }
+  const r = n.lRhs
+  if !(r is RBoxNarrow) || r.bnAtom < 0 { return null }
+  const pv = r.bnV
+  if !(pv is OVar) || !(repNodeAt(irBOpRep(pv)) is RBox) { return null }
+  const pn = ib.irNodes[b[b.length - 2]]
+  if !(pn is SLet) || pn.lDst != pv.ov || !(pn.lRhs is RAsgParked) {
+    return null
+  }
+  b.pop()
+  return pv
+}
+
 // `boxTemp` for `v` built at variant row `at`, or at its own layout where `at` is -1.
 function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   return boxTempIn(b, v, ix, dst, at, holeBoxTyAt(ix, ibFnIx))
@@ -9253,6 +9272,15 @@ function boxTempIn(
     return repTemp(b, { nnV: v, nnPay: false, nnAt: ix }, ix, dst)
   }
   const p = holeBoxPlanOf(ix, uTy, ibFnIx)
+  // An assignment's value unboxed from the box its store parked, where the plan passes a box: that
+  // box itself, the unbox dropped (legacy passes the unboxed value, which no box holds).
+  if p.hbArm == "pass" {
+    const pb = parkedBoxOf(b, v, dst)
+    if pb != null {
+      // The parked box is the hole's box under its own union's rep: the same box (`RStage`).
+      return if irBOpRep(pb) == dst { pb } else { irBLetTempTy(b, { sgV: pb }, ix, dst, repTyOf(dst)) }
+    }
+  }
   const why = boxPlanWhy(p, v, ix)
   if why != "" { return irBMiss(why) }
   // A box that writes its tag ahead of its value writes it ahead of an assignment's store, which
