@@ -23,7 +23,11 @@ import {
 } from "./emit_plan_list"
 import { blockHasContinueFor, globalIsNonConst } from "./emit_query"
 import { narrowedArmTyAt } from "./emit_local_scope"
-import { cboxElemTyOfCell, optCallCalleeOfMember } from "./emit_rewrite"
+import {
+  cboxElemTyOfCell,
+  cboxIsWriteLet,
+  optCallCalleeOfMember,
+} from "./emit_rewrite"
 // The IR shadow (ir-design-2026-11.md §5.2, step I0): with the shadow armed, `emitFuncCode`
 // hands each function here after its legacy lowering. The phase-A builder covers I1's set
 // (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
@@ -375,6 +379,7 @@ import {
   forRangeStaticStep,
   forRangeTestOf,
   forRangeUnrollPlan,
+  genericValueUnfixedMsg,
   globalCtxNow,
   globalReadRecovers,
   holderCallRefPlainKey,
@@ -1409,6 +1414,9 @@ let ibRetNestedTwin = -1
 let ibMiss = ""
 // The innermost statement whose build set `ibMiss`, or -1.
 let ibMissAt = -1
+// The right side of the name write (`x = v`, or a capture-box write `let`) last built, as legacy's
+// `stubWriteRhs`: a generic function read there is the stub cell's own value, not unfixed.
+let ibStubRhs = -1
 let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
@@ -5449,7 +5457,10 @@ function liftCapVarAt(fe: i32, name: string, readRep: i32, atTy: i32): i32 {
 // reads one, or over a fresh environment of its captures as this frame holds them; at type `ty`.
 function cloValue(b: i32[], ix: i32, rep: i32, ty: i32): Opnd {
   const fe = cloValueFeOf(ix)
-  if fe < 0 { return irBMiss(cloValueWhy(ix)) }
+  if fe < 0 {
+    cloUnfixedRefuse(ix)
+    return irBMiss(cloValueWhy(ix))
+  }
   const why = if cloValueIsCore(ix, fe) { closureValueCoreWhy(fe) } else { closureValueWhy(fe) }
   if why != "" { return irBMiss("closure value refused") }
   const env: Opnd[] = if fnEnvIdxOf(fe) >= 0 { cloEnvOf(b, fe, ix) } else { [] }
@@ -14720,6 +14731,7 @@ function siteBuilt(n0: i32, ix: i32): boolean {
 // target's read. A guarded global's read misses, so the guard-off context
 // legacy re-reads in reads it as the builder's own does.
 function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  if nodeAt(n.binLeft) is Ident { ibStubRhs = unwrapParen(n.binRight) }
   // The nodes it builds are its span, which a box leading its value is written ahead of.
   const b0 = b.length
   const o = assignValueGo(b, n, ix, rep)
@@ -14965,6 +14977,7 @@ function writesPlaceValue(rhs: i32): boolean {
 
 function assignTo(b: i32[], n: BinExpr, ix: i32) {
   const at = b.length
+  if nodeAt(n.binLeft) is Ident { ibStubRhs = unwrapParen(n.binRight) }
   assignToGo(b, n, ix)
   siteArmNote(b, at, n, ix)
   return 0
@@ -15897,12 +15910,17 @@ function stmtAt(b: i32[], stmts: i32[], i: i32) {
 // is -1 outside a list.
 function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
+  const sn = nodeAt(ix)
+  if sn is LetDecl && sn.letInit >= 0 && cboxIsWriteLet(ix) {
+    ibStubRhs = unwrapParen(sn.letInit)
+  }
   const cut = stmtNode(b, ix, sibs, pos) == IF_CUTS_BLOCK
     && nodeAt(ix) is IfStmt
   if ibMiss != "" && ibMissAt < 0 { ibMissAt = ix }
   if ibMiss != "" && censusGoesOn(ibMiss) {
     ibMiss = ""
     ibMissAt = -1
+    ibStubRhs = -1
   }
   // Legacy writes back a region's length after its last statement, inside that statement's
   // span (`emitStmtIn`).
@@ -16682,6 +16700,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibCalleeParamFn = Map()
   ibMiss = ""
   ibMissAt = -1
+  ibStubRhs = -1
   ibMisses = []
   ibReserveEnd = []
   ibReservePushes = []
@@ -17453,6 +17472,7 @@ function buildThunk(fe: i32): string {
   ibRetNestedTwin = -1
   ibMiss = ""
   ibMissAt = -1
+  ibStubRhs = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if fe < 0 || fe >= fnStmts.length { return "thunk target" }
   const d = fnStmts[fe]
@@ -17584,6 +17604,7 @@ function buildEqHelp(si: i32): string {
   ibRetNestedTwin = -1
   ibMiss = ""
   ibMissAt = -1
+  ibStubRhs = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if si < 0 || si >= sHeapIdx.length { return "compare helper row" }
   ib.irName = "@eq " + i32ToStr(si)
@@ -17688,6 +17709,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibRetNestedTwin = -1
   ibMiss = ""
   ibMissAt = -1
+  ibStubRhs = -1
   ibMisses = []
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
@@ -18246,6 +18268,20 @@ function taggedNameCloValue(ix: i32): boolean {
 }
 
 // Why `cloValueFeOf` found no function for closure value `ix`.
+// A generic function read as a value that no call fixes is legacy's own refusal, raised at the
+// read before the claim declines; a stub write's right side is exempt, as legacy's is.
+function cloUnfixedRefuse(ix: i32) {
+  const n = nodeAt(ix)
+  if !(n is Ident) || identReadArmOf(n, ix, ibFnIx, false) != "nonlocal" {
+    return 0
+  }
+  const fe = fnValueFeOf(n, sidOfNode(ix), ix, ibFnIx)
+  if fe >= 0 && fnValueArmOf(fe, ix, ibStubRhs) == "unfixed" {
+    emitFailAt(genericValueUnfixedMsg(), ix)
+  }
+  return 0
+}
+
 function cloValueWhy(ix: i32): string {
   const n = nodeAt(ix)
   if n is FuncDecl { return "closure literal not lifted" }
