@@ -18,7 +18,7 @@ import {
   sharedFieldArmTag,
 } from "./emit_obj_lit_fits"
 import { armFieldElemTyIx, armFieldStoreTy, sFieldStoreTy } from "./emit_state"
-import { exprPackedRow } from "./emit_classify"
+import { exprPackedRow, readRepMemoAdvance } from "./emit_classify"
 import { unMemPeelAliasWrapper } from "./emit_union_tykey_text"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { unionArmRowOfTy } from "./emit_local_slots"
@@ -15332,7 +15332,6 @@ function emitMapRecvKey(recvIx: i32, keyIx: i32, fnIx: i32) {
   let kr = 0
   if arm == "atom" { kr = emitAtomToStr(keyIx, fnIx) }
   else if arm == "i64" { kr = emitScalarValue(keyIx, fnIx, "i64") }
-  else if keyIx == armIdxNode && armIdxNode >= 0 { kr = emitArmIdx(fnIx) }
   else { kr = emitExpr(keyIx, fnIx) }
   if kr < 0 { return -1 }
   return mapRecvKeyTail(mshape)
@@ -40738,9 +40737,6 @@ export function wasmEmitStateReset() {
   callRefLegacyPlain = Map()
   callRefLastPlain = false
   luOvLocNodes = []
-  armIdxNode = -1
-  armIdxLocal = -1
-  armIdxImm = 0
   knownArmDecl = []
   knownArmIdx = []
   forInPairBox = null
@@ -42460,25 +42456,12 @@ function emitArmSite(idxIx: i32, fnIx: i32): i32 {
     if emitExpr(recv, fnIx) < 0 { return -1 }
     fbLocalSet(slot)
   }
-  return armSiteWrite(idxIx, slot, ARM_IDX_NODE, 0, fnIx)
+  return armSiteWrite(idxIx, slot, fnIx)
 }
 
-// The index operand `armSiteWrite` takes: the read's own index node, a local, an immediate, or
-// the node's string literal.
-export const ARM_IDX_NODE = -1
-export const ARM_IDX_IMM = -2
-export const ARM_IDX_STR = -3
-
 // The tag chain of arm-site read `idxIx` after its receiver: the box in local `slot`, or the name
-// re-read when -1. The read's index or key is local `ixLocal`, immediate `ixImm` (`ARM_IDX_IMM`),
-// its string literal (`ARM_IDX_STR`) or its own node. 1 when emitted, -1 on failure.
-export function armSiteWrite(
-  idxIx: i32,
-  slot: i32,
-  ixLocal: i32,
-  ixImm: i32,
-  fnIx: i32,
-): i32 {
+// re-read when -1. 1 when emitted, -1 on failure.
+function armSiteWrite(idxIx: i32, slot: i32, fnIx: i32): i32 {
   const recv = armSiteRecv(idxIx)
   if (
     idxIx < 0
@@ -42490,30 +42473,15 @@ export function armSiteWrite(
   }
   const arms = ctnArmsAt(nodeTyAt(recv, fnIx))
   const u = nodeTyAt(idxIx, fnIx)
-  // A read at a numeric literal set is at the set's scalar rep, never boxed (D17001).
-  const uName = if numLitUnionBaseName(u) != "" { "" } else { boxTyName(u) }
-  // An element union that is no box is a string (a literal union joined with `string`) or an
-  // atom (two literal unions); each arm's element is delivered at that rep.
-  const k = if uName == "" { repSigKindOfTy(u) } else { "union" }
-  // A map arm's read of a nullable string is that string ref at every arm.
-  const nulStr = k == "nulstr" && arms.length > 0 && tyAt(arms[0]) is TyMap
-  if k != "union" && k != "str" && k != "i32" && !nulStr {
+  const uName = armSiteUName(idxIx, fnIx)
+  if !armSiteRepHolds(idxIx, fnIx) {
     return emitFail(
       "emitProgram: a union-of-lists element read has no element union box",
     )
   }
   const outer = idxSpanNode
   idxSpanNode = idxIx
-  // An operand stands for the read's index or key; the node itself leaves the writer's state alone.
-  const on = armSiteOpndNode(idxIx)
-  const opnd = ixLocal != ARM_IDX_NODE && on >= 0
-  if opnd {
-    armIdxNode = on
-    armIdxLocal = ixLocal
-    armIdxImm = ixImm
-  }
   const r = emitArmSiteAt(idxIx, recv, slot, arms, 0, u, uName, fnIx)
-  if opnd { armIdxNode = -1 }
   idxSpanNode = outer
   return r
 }
@@ -42531,25 +42499,9 @@ export function armSiteOpndNode(site: i32): i32 {
   }
 }
 
-// The index node an `armSiteWrite` operand stands for, and that operand; -1 outside one.
-let armIdxNode = -1
-let armIdxLocal = -1
-let armIdxImm = 0
-
-// Writes list read `nd`'s index: the arm-site writer's operand where it stands for the node.
+// Writes list read `nd`'s index.
 function emitIdxIndex(nd: Index, fnIx: i32): i32 {
-  if nd.idxIndex != armIdxNode || armIdxNode < 0 {
-    return emitExpr(nd.idxIndex, fnIx)
-  }
-  return emitArmIdx(fnIx)
-}
-
-// The arm-site writer's index operand.
-function emitArmIdx(fnIx: i32): i32 {
-  if armIdxLocal >= 0 { fbLocalGet(armIdxLocal) }
-  else if armIdxLocal == ARM_IDX_STR { return emitStrLitAt(armIdxNode, fnIx) }
-  else { fbI32Const(armIdxImm) }
-  return 0
+  return emitExpr(nd.idxIndex, fnIx)
 }
 
 // The reads `emitArmSiteAt` overrides to an arm's unboxed payload, and the local each
@@ -42688,6 +42640,15 @@ function emitNumRepNarrow(from: VKind, to: VKind): i32 {
   )
 }
 
+// `emitNumRepNarrow` between number kinds (1 i32, 3 i64, 4 f64, 5 f32), as `widenPlanOf` names them.
+export function numNarrowTail(src: i32, dst: i32): i32 {
+  const ks: VKind[] = ["i32", "i32", "i32", "i64", "f64", "f32"]
+  if src < 1 || src > 5 || dst < 1 || dst > 5 || src == 2 || dst == 2 {
+    return emitFail("emitProgram: a numeric narrowing names no number kind")
+  }
+  return emitNumRepNarrow(ks[src], ks[dst])
+}
+
 // The list arms `emitArmIndexWrite` stores `target` through, or none: an identifier receiver whose
 // box of list arms no list-union rewrite overrides.
 export function armIndexWriteArmsOf(target: Index, fnIx: i32): i32[] {
@@ -42774,38 +42735,11 @@ function emitArmSiteAt(
     return 1
   }
   const m = arms[i]
-  const t = listIsArmTag(m)
   const e = armSiteTyOf(idxIx, m, fnIx)
-  if t < 0 || e < 0 {
-    return emitFail(
-      "emitProgram: a union-of-lists arm has no box tag or element to read",
-    )
-  }
-  const loc = armWrapLocal(m)
-  const heap = armHeapOf(m)
-  if loc < 0 || heap < 0 {
-    return emitFail(
-      "emitProgram: a union-of-lists arm has no wrapper to read through",
-    )
-  }
-  if armRecvPush(recv, slot, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, t)
-  fbI32Bin(70) // 0x46 i32.eq
+  const loc = armSiteArmOpen(idxIx, slot, m, fnIx)
+  if loc < 0 { return -1 }
   const k: VKind = if uName == "" { repSigKindOfTy(u) ?? "i32" } else { "union" }
-  if uName != "" {
-    fbIfRef(uBoxIdx)
-  } else {
-    fbOpenIf()
-    fbValtype(k, -1)
-  }
-  if armRecvPush(recv, slot, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1)
-  fbRefCast(heap)
-  fbLocalSet(loc)
-  const mark = luOvEnter(recv, m)
-  luOvEnter(idxIx, e)
-  const lmark = luOvLocalEnter(recv, loc)
+  armSiteArmEnter(idxIx, m, loc, fnIx)
   let r = 0
   if uName != "" {
     r = emitUnionCoerce(uName, u, idxIx, fnIx)
@@ -42823,8 +42757,7 @@ function emitArmSiteAt(
       r = emitNumRepNarrow(repSigKindOfTy(e) ?? k, k)
     }
   }
-  luOvLocalLeave(lmark)
-  luOvLeave(mark)
+  armSiteArmLeave()
   if r < 0 { return -1 }
   fbElse()
   if emitArmSiteAt(idxIx, recv, slot, arms, i + 1, u, uName, fnIx) < 0 {
@@ -42832,6 +42765,97 @@ function emitArmSiteAt(
   }
   fbEnd()
   return 1
+}
+
+// Whether arm-site read `idxIx` has a rep each arm delivers into: its union's box, or for an element
+// union that is no box a string (a literal union joined with `string`) or an atom (two literal
+// unions); a map arm's read of a nullable string is that string ref at every arm.
+export function armSiteRepHolds(idxIx: i32, fnIx: i32): boolean {
+  if armSiteUName(idxIx, fnIx) != "" { return true }
+  const k = repSigKindOfTy(nodeTyAt(idxIx, fnIx))
+  const arms = armSiteArmsOf(idxIx, fnIx)
+  const nulStr = k == "nulstr" && arms.length > 0 && tyAt(arms[0]) is TyMap
+  return k == "str" || k == "i32" || nulStr
+}
+
+// The box name arm-site read `idxIx`'s value is delivered into, "" for a scalar or string rep.
+function armSiteUName(idxIx: i32, fnIx: i32): string {
+  const u = nodeTyAt(idxIx, fnIx)
+  // A read at a numeric literal set is at the set's scalar rep, never boxed (D17001).
+  return if numLitUnionBaseName(u) != "" { "" } else { boxTyName(u) }
+}
+
+// Opens arm `m` of arm-site read `idxIx`'s tag chain over the box in local `slot` (the name re-read
+// when -1): its tag test, the arm's `if` at the read's rep, the payload cast into the arm's wrapper
+// local, which it returns; -1 on failure.
+export function armSiteArmOpen(idxIx: i32, slot: i32, m: i32, fnIx: i32): i32 {
+  const recv = armSiteRecv(idxIx)
+  const t = listIsArmTag(m)
+  if t < 0 || armSiteTyOf(idxIx, m, fnIx) < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no box tag or element to read",
+    )
+  }
+  const loc = armWrapLocal(m)
+  const heap = armHeapOf(m)
+  if loc < 0 || heap < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no wrapper to read through",
+    )
+  }
+  if armRecvPush(recv, slot, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, t)
+  fbI32Bin(70) // 0x46 i32.eq
+  if armSiteUName(idxIx, fnIx) != "" {
+    fbIfRef(uBoxIdx)
+  } else {
+    fbOpenIf()
+    fbValtype(repSigKindOfTy(nodeTyAt(idxIx, fnIx)) ?? "i32", -1)
+  }
+  if armRecvPush(recv, slot, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbLocalSet(loc)
+  return loc
+}
+
+// The override marks `armSiteArmEnter` pushed, innermost last, two per arm.
+const armOvMarks: i32[] = []
+
+// Reads arm-site read `idxIx` at arm `m`: its receiver at `m` and in local `loc`, the read at the
+// arm's element. `armSiteArmLeave` drops it.
+export function armSiteArmEnter(idxIx: i32, m: i32, loc: i32, fnIx: i32) {
+  const recv = armSiteRecv(idxIx)
+  const e = armSiteTyOf(idxIx, m, fnIx)
+  const mark = luOvEnter(recv, m)
+  luOvEnter(idxIx, e)
+  armOvMarks.push(mark)
+  armOvMarks.push(luOvLocalEnter(recv, loc))
+  // The read-rep memo's key names no override, so what it holds is forgotten across one.
+  readRepMemoAdvance()
+  return 0
+}
+
+export function armSiteArmLeave() {
+  luOvLocalLeave(armOvMarks.pop() ?? 0)
+  luOvLeave(armOvMarks.pop() ?? 0)
+  readRepMemoAdvance()
+  return 0
+}
+
+// The arms of arm-site read `idxIx`, in tag-chain order, and what the read yields at arm `m`.
+export function armSiteArmsOf(idxIx: i32, fnIx: i32): i32[] {
+  return ctnArmsAt(nodeTyAt(armSiteRecv(idxIx), fnIx))
+}
+
+export function armSiteElemTyOf(idxIx: i32, m: i32, fnIx: i32): i32 {
+  return armSiteTyOf(idxIx, m, fnIx)
+}
+
+// Whether arm-site read `idxIx` is at a numeric literal set, whose arms convert to its rep.
+export function armSiteAtLitSet(idxIx: i32, fnIx: i32): boolean {
+  return numLitUnionBaseName(nodeTyAt(idxIx, fnIx)) != ""
 }
 
 // ── numeric-union dispatch ─────────────────────────────────────────────────────
