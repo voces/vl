@@ -203,6 +203,12 @@ that takes an expression index. Porting the hook leaves its whole kept subtree u
 | `rhs` → `emitAsUnionTagged` → `emitAsOneListTail` | `emitListFitAt` | INFRA |
 | none (`structEqStage`, kept with no IR root) | its `emitExpr` call | INFRA (off the keep list) |
 
+**An edge the IR provably never takes may stay until I8** (coordinator ruling, 2026-11-25). A kept
+helper that legacy also calls, such as `fitRecvRead`'s `emitExpr` fallback, keeps its arm until the
+I8 PR deletes it. The edge goes in `scripts/ir-i8-census/edges-proven.txt` with its proof, and the
+target before I8 is zero unproven edges. Its guard is the sweep: `--check` reds when any program
+reaches a proven edge, so a broken proof surfaces in CI rather than at I8.
+
 A port makes the tail take an IR-lowered operand in place of its `emitExpr` call. The rehearsal
 found two more re-entries in its last keep round: `refListReadAt` (4) goes to COV-CLOS, which owns
 lists, and `emitNulIsNullTest` (2) to COV-IS, which owns nulls. Per-family staging (§4) buys nothing:

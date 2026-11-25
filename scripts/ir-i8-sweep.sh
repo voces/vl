@@ -31,7 +31,12 @@
 # --edges is the static half, in seconds and with no build: every call a kept function or an ir*.vl
 # file makes of a stubbed function (`<caller>\t<stub>`), the latent paths from the claim path into
 # stage B; the boundary writers scripts/ir-i8-census/boundary.txt names are marked. --check exits 1
-# on an edge scripts/ir-i8-census/edges-baseline.txt does not hold.
+# on an edge scripts/ir-i8-census/edges-baseline.txt does not hold. An edge in
+# scripts/ir-i8-census/edges-proven.txt is proven unreachable from the IR (its line cites the proof)
+# and stays only because legacy still takes it; the target before I8 is 0 unproven edges, and the
+# I8 PR deletes the proven arms. Its guard is the sweep: --check exits 1 when any program reaches a
+# proven edge, baseline or not, and --edges exits 1 on a proven line that is no edge. No guard in the
+# compiler: while re-entries remain, one would perturb live claims (coordinator ruling, 2026-11-25).
 # --grow appends each IR need that is a stub, not an entry point or a re-entry, to <keep-list>
 # (reason `ir-tail`), and each stub a program reaches whose claim fell back for a reason the seed
 # lacks (reason `ir-sentinel`), and runs again, until a run finds none or --max-iter (default 30) have passed.
@@ -45,6 +50,8 @@
 set -euo pipefail
 KEEP=${1:?usage: scripts/ir-i8-sweep.sh <keep-list> [--grow] [--pops LIST] [--out DIR] [--max-iter N]}
 shift
+PROVEN_FILE=${IR_I8_PROVEN:-scripts/ir-i8-census/edges-proven.txt}
+proven_edges() { [ -f "$PROVEN_FILE" ] && awk -F'\t' '!/^#/ && NF { print $1 "\t" $2 }' "$PROVEN_FILE" | sort -u || true; }
 EDGES=0 GROW=0 POPS=self,distilled,cases,probes,witnesses OUT=build/ir-i8-sweep MAXIT=30 RATCHET=""
 BASELINE_FILE=${IR_I8_SWEEP_BASELINE:-scripts/ir-i8-census/sweep-baseline.txt}
 # Static edges, --edges: --write-baseline there rewrites edges-baseline.txt whole.
@@ -278,6 +285,9 @@ VL
   : > "$T/failing" ; : > "$T/needs" ; : > "$T/fell" ; : > "$T/unexplained" ; : > "$T/hits"
   grep -E '(claim fell back|IR claim refused).*i8 stub [A-Za-z0-9_]+' "$T/self.log" \
     | grep -oE 'i8 stub [A-Za-z0-9_]+' | sed 's/^i8 stub /self\tcompiler\/entry.vl\t/' >> "$T/needs" || true
+  # The self-compile's hits are every stub or re-entry its log names; it runs no probe to drain them.
+  grep -oE 'i8 (stub|reentry) [A-Za-z0-9_]+' "$T/self.log" | sed -E 's/^i8 (stub )?//' | sort -u \
+    | sed 's/^/self\tcompiler\/entry.vl\t/' >> "$T/hits" || true
   [ "$fix" != "${fix#self-compile fails}" ] && printf 'self\tcompiler/entry.vl\t%s\n' "$(grep -m1 -oE 'i8 (stub|reentry) [A-Za-z0-9_]+' "$T/self.log" | sed -E 's/i8 (stub )?//' || echo other)" >> "$T/failing"
   for pop in ${POPS//,/ }; do
     [ "$pop" = self ] && continue
@@ -365,7 +375,10 @@ if [ "$EDGES" = 1 ]; then
   gone=$(comm -13 "$OUT/edges.txt" <(sort -u "$EB"))
   [ -z "$gone" ] || { echo "ir-i8-sweep: edges gone (run --edges --write-baseline in this PR):"; sed 's/^/  /' <<< "$gone"; }
   if [ -n "$new" ]; then echo "ir-i8-sweep: NEW edges into stage B (a kept tail now calls a stubbed writer):"; sed 's/^/  /' <<< "$new"; exit 1; fi
-  echo "ir-i8-sweep: edges $(wc -l < "$OUT/edges.txt"), none new: ok"; exit 0
+  stale=$(comm -23 <(proven_edges) "$OUT/edges.txt")
+  if [ -n "$stale" ]; then echo "ir-i8-sweep: proven edges that are no edge (delete their lines from $PROVEN_FILE):"; sed 's/^/  /' <<< "$stale"; exit 1; fi
+  np=$(comm -12 <(proven_edges) "$OUT/edges.txt" | grep -c . || true)
+  echo "ir-i8-sweep: edges $(wc -l < "$OUT/edges.txt") ($np proven, $(( $(wc -l < "$OUT/edges.txt") - np )) unproven), none new: ok"; exit 0
 fi
 
 lists
@@ -387,6 +400,13 @@ while :; do
 done
 cat "$OUT/report.txt"
 if [ "$RC" != 2 ] && [ -n "$RATCHET" ]; then
+  # A proven edge reached: its caller re-entering (`reentry <caller>`) or, for a stub, the stub hit.
+  reached=$(awk -F'\t' 'FILENAME == ARGV[1] { k = ($2 == "emitExpr" || $2 == "emitWidened") ? "reentry " $1 : $2; e[k] = $1 " -> " $2; next }
+    ($3 in e) { print e[$3] "   (" $1 " " $2 ")" }' <(proven_edges) "$OUT/hits.tsv" | sort -u)
+  if [ -n "$reached" ]; then
+    echo "ir-i8-sweep: PROVEN edges reached, so their proof is broken (fix the IR, or move the line out of $PROVEN_FILE):"; sed 's/^/  /' <<< "$reached"
+    exit 1
+  fi
   # The cause list, one per line (`#` comments allowed); a missing baseline is written whole once.
   [ -f "$BASELINE_FILE" ] || { cp "$OUT/causes.txt" "$BASELINE_FILE"; echo "ir-i8-sweep: started $BASELINE_FILE with $(wc -l < "$BASELINE_FILE") causes"; exit 0; }
   grep -v '^#' "$BASELINE_FILE" | awk 'NF' | sort -u > "$T/base.causes"
