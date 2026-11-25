@@ -35,8 +35,8 @@
 # scripts/ir-i8-census/edges-proven.txt is proven unreachable from the IR (its line cites the proof)
 # and stays only because legacy still takes it; the target before I8 is 0 unproven edges, and the
 # I8 PR deletes the proven arms. Its guard is the sweep: --check exits 1 when any program reaches a
-# proven edge, baseline or not, and --edges exits 1 on a proven line that is no edge (coordinator
-# ruling, 2026-11-25).
+# proven edge, baseline or not, and --edges exits 1 on a proven line that is no edge. No guard in the
+# compiler: while re-entries remain, one would perturb live claims (coordinator ruling, 2026-11-25).
 # --grow appends each IR need that is a stub, not an entry point or a re-entry, to <keep-list>
 # (reason `ir-tail`), and each stub a program reaches whose claim fell back for a reason the seed
 # lacks (reason `ir-sentinel`), and runs again, until a run finds none or --max-iter (default 30) have passed.
