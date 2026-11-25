@@ -1167,10 +1167,41 @@ function softRefused(what: string): boolean {
   return true
 }
 
+// The last claim's decline: its unit, what it declined, and the node that names. Written only on
+// a decline and read by a refusal of the same unit. A unit no claim declined reads "".
+let declUnit = -1
+let declWhat = ""
+let declAt = -1
+
+// What the claim for `unit` (a function, or the top-level code's first statement) declined, such
+// as "this statement (is guard)", or "" when it did not decline.
+export function irDeclinedFor(unit: i32): string {
+  if unit < 0 || unit != declUnit { return "" }
+  return declWhat
+}
+
+// The node the last decline names: the statement holding a builder miss, else the unit.
+export function irDeclineAt(): i32 { return declAt }
+
+// Records that the claim for `unit` declined at `at`, and answers false.
+function declined(unit: i32, what: string, at: i32): boolean {
+  declUnit = unit
+  declWhat = what
+  declAt = at
+  return false
+}
+
+// The node a builder miss names: the statement holding it, else the unit.
+function missAtOr(unit: i32): i32 {
+  if ibMissAt >= 0 { return ibMissAt }
+  return unit
+}
+
 // The claim seam, before legacy lowers the function at `fnIx` (`fnStmts` slot `fnPos`): when the
 // builder covers it and every node is claimed, the lowering writes its code entry onto `out` and
 // this answers true, so legacy does not run. Armed, legacy always runs and the shadow checks it.
 export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
+  declUnit = -1
   // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
   const s = claimScopeBegin()
@@ -1186,17 +1217,22 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   const built = build(fnIx, fnPos)
   ibClaimBuild = false
   if softRefused("") { return false }
-  if claimBuildMinted(minted) { return false }
-  if built != "" || repNodeGen() != gen || !claimable() { return false }
+  if claimBuildMinted(minted) { return declined(fnIx, "this function", fnIx) }
+  if built != "" {
+    return declined(fnIx, "this statement (" + built + ")", missAtOr(fnIx))
+  }
+  if repNodeGen() != gen || !claimable() {
+    return declined(fnIx, "this function", fnIx)
+  }
   corrupt()
   if irBVerify(ib).vfRule != 0 {
     count("claim fell back: verifier")
-    return false
+    return declined(fnIx, "this function", fnIx)
   }
   const why = irLowerClaim(ib, globalCtxOf(fnPos), fnPos, out)
   if why != "" {
     count("claim fell back: " + why)
-    return false
+    return declined(fnIx, "this function (" + why + ")", fnIx)
   }
   count("claimed")
   return true
@@ -1225,6 +1261,7 @@ export function irClaimStart(
   poolFill: boolean,
   out: u8[],
 ): boolean {
+  declUnit = -1
   if !irStartClaimOn() { return false }
   const s = claimScopeBegin()
   const ok = claimStart(order, orderGi, poolFill, out)
@@ -1243,18 +1280,27 @@ function claimStart(
   ibClaimBuild = true
   const built = buildStart(order, orderGi, poolFill)
   ibClaimBuild = false
+  // The top-level code is anchored at its first statement when no statement is named.
+  const unit = if order.length > 0 { order[0] } else { -1 }
   if softRefused("start ") { return false }
-  if claimBuildMinted(minted) { return false }
-  if built != "" || repNodeGen() != gen || !claimable() { return false }
+  if claimBuildMinted(minted) {
+    return declined(unit, "this top-level code", unit)
+  }
+  if built != "" {
+    return declined(unit, "this statement (" + built + ")", missAtOr(unit))
+  }
+  if repNodeGen() != gen || !claimable() {
+    return declined(unit, "this top-level code", unit)
+  }
   corrupt()
   if irBVerify(ib).vfRule != 0 {
     count("claim fell back: verifier")
-    return false
+    return declined(unit, "this top-level code", unit)
   }
   const why = irLowerClaim(ib, ibGlobalCtx(), -1, out)
   if why != "" {
     count("claim fell back: " + why)
-    return false
+    return declined(unit, "this top-level code (" + why + ")", unit)
   }
   count("claimed start")
   return true
@@ -1314,6 +1360,8 @@ let ibFnPos = -1
 // its row, so the return's miss names that case; -1 when none.
 let ibRetNestedTwin = -1
 let ibMiss = ""
+// The innermost statement whose build set `ibMiss`, or -1.
+let ibMissAt = -1
 let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
@@ -15490,7 +15538,11 @@ function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
   const cut = stmtNode(b, ix, sibs, pos) == IF_CUTS_BLOCK
     && nodeAt(ix) is IfStmt
-  if ibMiss != "" && censusGoesOn(ibMiss) { ibMiss = "" }
+  if ibMiss != "" && ibMissAt < 0 { ibMissAt = ix }
+  if ibMiss != "" && censusGoesOn(ibMiss) {
+    ibMiss = ""
+    ibMissAt = -1
+  }
   // Legacy writes back a region's length after its last statement, inside that statement's
   // span (`emitStmtIn`).
   if reserveEnds(ix) {
@@ -16268,6 +16320,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibCalleeParamAt = Map()
   ibCalleeParamFn = Map()
   ibMiss = ""
+  ibMissAt = -1
   ibMisses = []
   ibReserveEnd = []
   ibReservePushes = []
@@ -17034,6 +17087,7 @@ function buildThunk(fe: i32): string {
   ibFnPos = -1
   ibRetNestedTwin = -1
   ibMiss = ""
+  ibMissAt = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if fe < 0 || fe >= fnStmts.length { return "thunk target" }
   const d = fnStmts[fe]
@@ -17164,6 +17218,7 @@ function buildEqHelp(si: i32): string {
   ibFnPos = -1
   ibRetNestedTwin = -1
   ibMiss = ""
+  ibMissAt = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if si < 0 || si >= sHeapIdx.length { return "compare helper row" }
   ib.irName = "@eq " + i32ToStr(si)
@@ -17267,6 +17322,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibFnPos = -1
   ibRetNestedTwin = -1
   ibMiss = ""
+  ibMissAt = -1
   ibMisses = []
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
