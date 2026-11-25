@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **Fixed D17207** (clause 2, a price of D17206): a loop's write to an inferred-null binding `let m = null` that the back edge never carries (one a `break` or `return` always follows, or one no pass reaches) no longer ends the `null` its read at the loop's top is narrowed to. So `while true { const j = if f { m } else { rec }; …; m = { … }; break }` runs again instead of asking for an annotation. A conditional `break`, a `continue` to an enclosing loop and a `break` leaving only an inner loop still carry the write. Filed D17208 and D17209 (a module binding filled with a width subtype of the record its join reads it beside builds invalid wasm) and D17210 (a fill with a literal-union value is refused).

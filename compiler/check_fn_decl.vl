@@ -9,6 +9,7 @@ import { nodeStartTok } from "./fmt_util"
 import { tyPathCycles, tyPathWith, tySame } from "./check_types"
 import { ivSeedMovedWidth } from "./check_intrinsic_values"
 import {
+  coerceRecordOpen,
   elabDeadRestClose,
   elabDeadRestOpen,
   elabNestNote,
@@ -268,6 +269,7 @@ import {
   mkTyVarSlot,
   solvedParamTys,
   solvedParamTysSetAt,
+  tyVarsOfEnclosingGeneric,
   unannotParamTy,
 } from "./check_subst"
 import { demangleName } from "./check_suggest"
@@ -302,6 +304,7 @@ import {
   tyElemOf,
   tyEq,
   tyHasHole,
+  tyHasInferHole,
   tyMutBump,
   tyToStr,
 } from "./check_types"
@@ -1727,6 +1730,8 @@ function fnDeclIsGeneric(n: FuncDecl): boolean {
 // delivered to, with that return; `lamRetApply` writes each as the lambda's annotation.
 let lamRetQNode: i32[] = []
 let lamRetQTy: i32[] = []
+// The annotation spelled at the queue, where the type parameters it names are in scope, or -1.
+let lamRetQAnn: i32[] = []
 // The lambdas whose return-annotation node a pin wrote, which no source token spells.
 let lamRetWritten: {[i32]: boolean} = Map()
 
@@ -1737,15 +1742,19 @@ export function lamRetWrittenAt(ix: i32): boolean {
 export function lamRetReset() {
   lamRetQNode = []
   lamRetQTy = []
+  lamRetQAnn = []
   lamRetWritten = Map()
   return 0
 }
 
 // Queues lambda `n` at `fnIx`, whose inferred return is `ret`, when it is held to a closed
 // contextual return that it, or a value its body hands back, is not: that value is a delivery its
-// annotated twin converts, where the inferred lambda builds it at its own type.
+// annotated twin converts, where the inferred lambda builds it at its own type. Not under one
+// instance's bindings: the annotation is written on the node every instance shares (D17062).
 function lamRetQueue(n: FuncDecl, fnIx: i32, ret: i32) {
-  if inferQuiet || n.fnName != "" || n.fnRet >= 0 { return 0 }
+  if inferQuiet || !coerceRecordOpen() || n.fnName != "" || n.fnRet >= 0 {
+    return 0
+  }
   const er = cbExpectedRetFor(fnIx)
   if !lamCtxRetClosed(er) || !cbExpectedRetHeld(fnIx) { return 0 }
   let differs = ret < 0 || !tySame(ret, er)
@@ -1755,8 +1764,17 @@ function lamRetQueue(n: FuncDecl, fnIx: i32, ret: i32) {
     if v >= 0 && !tySame(nodeTyOf(v), er) { differs = true }
   }
   if !differs || i32ListHas(lamRetQNode, fnIx) { return 0 }
+  // An open return is spelled here, only when it names the enclosing generic's parameters and the
+  // lambda's own return is not already it.
+  const open = tyHasTyVar(er)
+  if open && (!tyVarsOfEnclosingGeneric(er) || ret >= 0 && tySame(ret, er)) {
+    return 0
+  }
+  const ann = if open { fvaAnnot(er, -1, n.pos) } else { -1 }
+  if open && ann < 0 { return 0 }
   lamRetQNode.push(fnIx)
   lamRetQTy.push(er)
+  lamRetQAnn.push(ann)
   return 0
 }
 
@@ -1769,9 +1787,10 @@ export function lamRetApply(): i32 {
     const ix = lamRetQNode[i]
     const n = nodeAt(ix)
     if n is FuncDecl && n.fnRet < 0 {
-      const tr = fvaAnnot(lamRetQTy[i], -1, n.pos)
+      const qt = lamRetQTy[i]
+      const tr = if lamRetQAnn[i] >= 0 { lamRetQAnn[i] } else { fvaAnnot(qt, -1, n.pos) }
       if tr >= 0 {
-        nodeTySetGrow(tr, lamRetQTy[i])
+        nodeTySetGrow(tr, qt)
         const nf: Node = {
           fnName: n.fnName,
           fnTyParams: n.fnTyParams,
@@ -1789,20 +1808,21 @@ export function lamRetApply(): i32 {
   }
   lamRetQNode = []
   lamRetQTy = []
+  lamRetQAnn = []
   return k
 }
 
-// Whether `t`, a lambda's contextual return, is a closed type that can stand in for its annotation:
-// not void or never, not an error, naming no hole or type variable, and not a literal result. A
-// literal result is adopted by its own rule, which judges each returned value against it (D9520).
+// Whether `t`, a lambda's contextual return, is a type that can stand in for its annotation: not
+// void or never, not an error, naming no inference hole, and not a literal result. A declared type
+// parameter is spelled by name and read at each instance's binding (`mintedAnnTy`). A literal
+// result is adopted by its own rule, which judges each returned value against it (D9520).
 function lamCtxRetClosed(t: i32): boolean {
   return t >= 0
     && t < T.tys.length
     && !isVoidTy(t)
     && !isNeverTy(t)
     && t != TY_ERR
-    && !tyHasHole(t)
-    && !tyHasTyVar(t)
+    && !tyHasInferHole(t)
     && !lamLitResult(t)
 }
 

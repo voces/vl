@@ -124,6 +124,11 @@ Run the sweep after coverage is complete and the prerequisites have landed, in o
 4. Build, refresh to a fixpoint, and run the full gate. A refusal anywhere in the five populations
    means coverage was not complete, and the cutover waits.
 
+`scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep.txt` runs steps 1 to 3 and step 4's build,
+self-compile fixpoint and populations in a throwaway tree. It reports each newly failing program by
+the first stub it hits, and each claim that falls back on a stub as an IR need (`--grow` adds those
+to the keep-list). The keep-list holds the legacy tails the IR still calls, each with its reason.
+
 The dynamic census cannot replace step 2. Its 6.1k lines that no program reaches are mostly code
 behind modes no population turns on (the linker, the name section, the diagnostics) and refusal
 builders. They are reached, just not by these programs.

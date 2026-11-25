@@ -211,6 +211,7 @@ import {
   repsLowerAlike,
 } from "./ir"
 import { tyHasTyVar } from "./tyquery"
+import { NICHE_NUL_MAP } from "./emit_start_block"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { AsExpr, Call, i32ToStr, nodeAt } from "./ast"
 
@@ -298,6 +299,17 @@ function eqSideRep(o: Opnd, ix: Opnd[]): i32 {
   if ix.length == 0 { return r }
   const n = repNodeAt(r)
   return if n is RList { n.rlsElem } else { r }
+}
+
+// Whether a reference niche read of kind `k` lands at `A | null` of its own shape: the map niche
+// at a nullable map, a closure's box tag (11) at a nullable closure, a list's at a nullable list.
+function nicheRefFits(k: i32, dst: i32): boolean {
+  const dn = repNodeAt(dst)
+  if !(dn is RNullable) { return false }
+  const inner = repNodeAt(dn.rnInner)
+  if k == NICHE_NUL_MAP { return inner is RMap }
+  if k == 11 { return inner is RClosure }
+  return inner is RList
 }
 
 // A map operation's receiver: global `sym` of a map rep, or, where `sym` is -1, a variable `loc`
@@ -706,7 +718,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       const dn = repNodeAt(dst)
       const nulStr = dn is RNullable && dn.rnDisc == 1 && dn.rnInner == vfStr
-      const fits = if r.nrKind == 1 { repBoolNiche(dst) } else { r.nrKind == 2 && nulStr }
+      const fits = if r.nrKind == 1 { repBoolNiche(dst) } else if r.nrKind == 2 { nulStr } else { nicheRefFits(r.nrKind, dst) }
       if !fits { return fail(2, at, "a niche read is at its niche's rep") }
       0
     }
@@ -1168,7 +1180,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const d = repNodeAt(opRep(r.ntV))
       // A union box (discipline 4 included) answers by its null tag.
       const box = d is RBox || d is RNullable && d.rnDisc == 4
-      if !box && (!(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner)) {
+      // A record reference's `ref.is_null` answers too, for a holder read as its record.
+      if (
+        !box
+        && !(d is RRecord)
+        && (!(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner))
+      ) {
         return fail(
           2,
           at,
@@ -1587,6 +1604,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       uses(r.nxArgs, at)
       if dst >= 0 && !repIsScalar(dst) {
         return fail(2, at, "a numeric intrinsic's result is a scalar")
+      }
+      if r.nxSel != "op" && intSelArgsWrong(r) {
+        return fail(
+          2,
+          at,
+          "an integer select intrinsic's operands are at its width",
+        )
       }
       0
     }
@@ -2618,11 +2642,13 @@ function stmt(id: i32, prev: i32) {
       use(n.gsSrc, id)
       const g = irGlobalRepOf(vf, n.gsSym)
       if g < 0 { return fail(2, id, "writes a global with no recorded rep") }
-      // A source that stores as the cell's valtype (`vfStoresAs`) needs no coercion.
+      // A source that stores as the cell's valtype (`vfStoresAs`) needs no coercion, nor does a
+      // reference stored into its own ref niche (`vfNicheTakes`).
       if (
         opRep(n.gsSrc) != g
         && !repNullRefFits(opRep(n.gsSrc), g)
         && !vfStoresAs(g, opRep(n.gsSrc))
+        && !vfNicheTakes(g, opRep(n.gsSrc))
       ) {
         return fail(2, id, "a global store needs a coercion")
       }
@@ -3626,6 +3652,18 @@ function neverCallTemp(f: IrFn, i: i32): boolean {
         || (r is RCallRef && r.crNever)
         || r is RDeadNever
     }
+  }
+  return false
+}
+
+// Whether integer select `r` (`abs` over one operand, `min`/`max` over two) has another operand
+// count, or an operand not at its width (i64 when `nxWide`, else i32).
+function intSelArgsWrong(r: RNumIntr): boolean {
+  const n = if r.nxSel == "abs" { 1 } else { 2 }
+  if r.nxArgs.length != n { return true }
+  const want = if r.nxWide { "i64" } else { "i32" }
+  for a in r.nxArgs {
+    if repPrim(opRep(a)) != want { return true }
   }
   return false
 }
