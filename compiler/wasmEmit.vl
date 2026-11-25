@@ -2042,6 +2042,14 @@ export function fieldTypedNullHas(si: i32, fi: i32): boolean {
   }
 }
 
+// Whether `emitOmittedFieldNull` writes field `fi` of row `si`'s null as its heap's `ref.null`: a
+// typed reference (`fieldTypedNullHas`) or a nullable map, whose map struct it nulls.
+export function fieldTypedNullWrites(si: i32, fi: i32): boolean {
+  if fieldTypedNullHas(si, fi) { return true }
+  if si < 0 || si >= sFieldStart.length { return false }
+  return fieldRowKind(sFieldStart[si] + fi) == "nulmap"
+}
+
 // The null value of an omitted nullable field (`si`/`fi`) in a struct literal: `fieldNullOwnOf`'s
 // null, else `ref.null` of the field's own backing for the typed ref codes. -1 when not nullable.
 export function emitOmittedFieldNull(si: i32, fi: i32) {
@@ -2054,7 +2062,7 @@ export function emitOmittedFieldNull(si: i32, fi: i32) {
   const r = sFieldStart[si] + fi
   const k = fieldRowKind(r)
   if k == null { return -1 }
-  if !fieldTypedNullHas(si, fi) && k != "nulmap" { return -1 }
+  if !fieldTypedNullWrites(si, fi) { return -1 }
   match k {
     "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" => {
       fbRefNullForKind(
@@ -21384,9 +21392,23 @@ function emitStrEqLit(litIx: i32, fnIx: i32) {
   const f = strEqLitForm(litIx)
   strEqLitHead(litIx, f)
   if f == 0 || f == 3 {
-    if emitStrValue(litIx, fnIx) < 0 { return -1 }
+    if emitStrLitValue(litIx, fnIx) < 0 { return -1 }
   }
   return strEqLitTail(f)
+}
+
+// String literal `litIx` as `emitStrValue` writes it: a literal no atom or pre-path arm takes is
+// `emitExpr`'s literal arm (`emitStrLitAt`) alone; any other goes through `emitStrValue`.
+function emitStrLitValue(litIx: i32, fnIx: i32) {
+  const e = if litIx >= 0 && litIx < P.nodes.length { nodeAt(litIx) } else { null }
+  if (
+    e is StrLit
+    && !exprIsLitAtom(litIx, fnIx)
+    && exprPrePathWhy(litIx, fnIx) == ""
+  ) {
+    return emitStrLitAt(litIx, fnIx)
+  }
+  return emitStrValue(litIx, fnIx)
 }
 
 // ── list value-equality + concat cores (collections-design §VL.4/§VL.6) ───────
@@ -44005,6 +44027,16 @@ export function asgParkedFieldTail(asgIx: i32, fnIx: i32): i32 {
   return 0
 }
 
+// After assignment `asgIx`'s re-read: the cast to the wider row its right side extends (D16105).
+export function asgWiderRowTail(asgIx: i32, fnIx: i32): i32 {
+  const si = asgNameWiderRow(asgIx, fnIx)
+  if si < 0 {
+    return emitFail("emitProgram: an assignment's wider row is not known")
+  }
+  fbRefCast(sHeapIdx[si])
+  return 0
+}
+
 // Assignment `exprIx` as a value, on its arm (`asgValueArmOf`).
 function emitAsgValueOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   return match asgValueArmOf(exprIx, fnIx) {
@@ -44073,8 +44105,7 @@ function emitAsgValueOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     // that record itself, so the re-read cast back to its row is the value (D16105).
     "widerRow" => {
       if emitAsgValue(exprIx, fnIx, -1) < 0 { return -1 }
-      fbRefCast(sHeapIdx[asgNameWiderRow(exprIx, fnIx)])
-      0
+      asgWiderRowTail(exprIx, fnIx)
     }
     "none" => emitFail(
       "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",

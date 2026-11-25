@@ -1529,12 +1529,14 @@ print(intr(true, 0.5))
     const { rows } = run(src, true);
     const want: [string, number][] = [
       ["uncovered store short-circuit operand", 1],
-      ["uncovered method short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
       if (rows.get(k) !== n) throw new Error(`want ${n} "${k}" rows, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered method short-circuit operand")) {
+      throw new Error(`want \`meth\` staged, got ${JSON.stringify([...rows])}`);
+    }
     if (rows.has("uncovered short-circuit argument after another")) {
       throw new Error(`want \`intr\` staged, got ${JSON.stringify([...rows])}`);
     }
@@ -1929,6 +1931,8 @@ Deno.test({
       "null-of-place-with-read": 0,
       "null-of-read-off-place": 2,
       "null-of-place-without-read": 2,
+      "spread-boxed-at-box-list": 0,
+      "spread-boxed-at-scalar-list": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
