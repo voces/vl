@@ -18,10 +18,12 @@ import {
   emitOptLeafTail,
   emitOptLinkNullClose,
   emitOptLinkNullOpen,
+  emitOptLinkValueTail,
   optLeafArmOf,
 } from "./wasmEmit"
 import { pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
 import {
+  armSiteRecv,
   capCellTargetOf,
   exprNullableRefNiche,
   nulVariantIdxOfExpr,
@@ -128,7 +130,6 @@ import {
   OVar,
   Opnd,
   RAfterEffects,
-  RArmSite,
   RArmUnbox,
   RAsTail,
   RAsUnion,
@@ -248,6 +249,7 @@ import {
   RVariantChain,
   RVariantDiscrim,
   Rhs,
+  SArmSite,
   SAssign,
   SBlock,
   SBoundsCheck,
@@ -345,9 +347,6 @@ import {
   wULEB,
 } from "./emit_bytes"
 import {
-  ARM_IDX_IMM,
-  ARM_IDX_NODE,
-  ARM_IDX_STR,
   EQ_ROOT_EXPR,
   EqRootPlace,
   EqRootPlan,
@@ -356,7 +355,11 @@ import {
   MapGetOrArm,
   MapUnionPlan,
   MemAddrPlan,
-  armSiteWrite,
+  OptLeafArm,
+  armSiteArmEnter,
+  armSiteArmLeave,
+  armSiteArmOpen,
+  armSiteArmsOf,
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
@@ -425,6 +428,7 @@ import {
   emitEnvCacheClose,
   emitEnvCacheDrop,
   emitEnvCacheOpen,
+  emitEqRootIsNull,
   emitFoldedConstRead,
   emitForInCursorInit,
   emitMapGetScalarBoxTail,
@@ -555,7 +559,11 @@ import {
   nulNicheEqWhy,
   nulNoneBoxHead,
   nulNoneBoxTail,
-  nulStructEqGuardTail,
+  nulStructEqFieldsAt,
+  nulStructEqGuardBoth,
+  nulStructEqGuardClose,
+  nulStructEqGuardMid,
+  nulStructEqGuardOpen,
   nulTestAtomTail,
   nulTestBoolTail,
   nulTestBoxTagTail,
@@ -565,6 +573,7 @@ import {
   numExactCastClose,
   numExactCastHead,
   numIntrTail,
+  numNarrowTail,
   numUnionBinTail,
   numUnionConvertTail,
   numUnionIsUnionSide,
@@ -763,12 +772,14 @@ import {
   coalNulBoolJoinPresent,
   coalNulBoolJoinReserve,
   coalOptArmOf,
+  coalOptBoxLeafPlanAt,
   coalOptLeafOpen,
   coalOptLeafPlanOf,
   coalOptLeafRead,
+  coalOptRecLeafPlanAt,
   discrimFieldEqTail,
   emitListEmptyLoop,
-  emitRecordFitIs,
+  emitRecordFitPlaced,
   emptyFitArmBody,
   emptyFitArmHead,
   emptyFitArmsPlain,
@@ -797,6 +808,11 @@ import {
   numLitEqTail,
   numLitOnceMember,
   numLitOnceStash,
+  optBoxLeafOpen,
+  optBoxLeafRead,
+  optRecLeafRead,
+  optRecLeafTestClose,
+  optRecLeafTestOpen,
   optRecvStagedAt,
   recordFitPlanOf,
   strMemberEqTail,
@@ -1005,8 +1021,14 @@ export function irLOpnd(o: Opnd) {
       const s = varSlot(v)
       if s < 0 { return irLMiss("unmapped slot") }
       leaf()
+      const rf = lwBuf.length
       // A range loop copy's variable reads as legacy's copy reads it (`urLocalRead`).
       if !urLocalRead(s) { fbLocalGet(s) }
+      // An arm-site payload standing for an element read banks that read's row (`emitIndexBanked`).
+      const pk = lwPayloadVars.length - 1
+      if pk >= 0 && v == lwPayloadVars[pk] && lwPayloadRows[pk] >= 0 {
+        irLIndexRow(lwPayloadRows[pk], rf)
+      }
       // A `shadow` arm's list is the frame's nullable list scratch, read non-null.
       if listFitShadowHolds(s) { fbRefAsNonNull() }
       // A staged `is` receiver held as a non-null string reads its nullable stash non-null.
@@ -1297,9 +1319,8 @@ function rhs(r: Rhs, tail: boolean) {
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
       irLOpnd(r.nwV)
-      // The one narrowing, a shift-mask fold's i64 source at width 32, is `srPushSource`'s wrap.
-      if r.nwSrc == 3 && r.nwDst == 1 {
-        fbI32WrapI64()
+      if numNarrows(r.nwSrc, r.nwDst) {
+        numNarrowTail(r.nwSrc, r.nwDst)
       } else {
         numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
       }
@@ -1416,7 +1437,6 @@ function rhs(r: Rhs, tail: boolean) {
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
     RNicheRead => nicheRead(r)
-    RArmSite => armSite(r)
     RArmUnbox => armUnbox(r)
     RRecCopyPure => {
       leaf()
@@ -2278,8 +2298,8 @@ function irFitRecvRead(recvIx: i32, _fnIx: i32): i32 {
   return opndAgain(fitRecvOs[at], recvIx)
 }
 
-// Legacy's fit writer for `is` test `isIx` over operand `o`, `emitRecordFitIs` when `record`, else
-// the variant chain tail at arm `vi`: the hook set to read `o` and every piece of its state
+// Legacy's fit writer for `is` test `isIx` over operand `o`, `emitRecordFitPlaced` when `record`,
+// else the variant chain tail at arm `vi`: the hook set to read `o` and every piece of its state
 // restored at the one exit, whatever the writer answered.
 function irFitTail(o: Opnd, isIx: i32, vi: i32, record: boolean): i32 {
   const svHook = fitRecvReadHook
@@ -2294,7 +2314,7 @@ function irFitTail(o: Opnd, isIx: i32, vi: i32, record: boolean): i32 {
     const n = nodeAt(isIx)
     if n is IsExpr {
       fitRecvIx = unwrapParen(n.isObj)
-      rc = if !record { variantRowChainTail(isIx, n, lw.irAt, vi, -1) } else if recordFitPlanOf(isIx, lw.irAt) == 1 { emitRecordFitIs(isIx, lw.irAt) } else { irLMiss("record fit plan") - 1 }
+      rc = if !record { variantRowChainTail(isIx, n, lw.irAt, vi, -1) } else if recordFitPlanOf(isIx, lw.irAt) == 1 { emitRecordFitPlaced(isIx, -1, lw.irAt) } else { irLMiss("record fit plan") - 1 }
     }
   }
   if fitRecvIx < 0 { irLMiss("variant chain node") }
@@ -2611,55 +2631,83 @@ function nicheRead(r: RNicheRead) {
   return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
 }
 
-// `RArmSite`: legacy's tag chain (`armSiteWrite`) over the box: a named variable's local, or the
-// value set into legacy's receiver stash; the index or key a variable's local, an immediate, a
-// string literal, or an effect-free index set once into its stash (`armIdxSlot`). An element
-// read's row is banked around it as legacy's is.
-function armSite(r: RArmSite) {
-  if r.asOps.length < 1 || r.asOps.length > 2 {
-    return irLMiss("arm site operands")
+// `SArmSite` as legacy's tag chain (`emitArmSiteAt`) writes it: an index set once into its stash
+// (`armIdxSlot`), the box set into the receiver stash or read by its name's local, then per arm
+// its tag test and payload cast (`armSiteArmOpen`) and the arm's body, `unreachable` past the last.
+// The out waits on the stack for its one reader; one element-read row covers the chain.
+function armSiteStmt(n: SArmSite, pending: i32[]) {
+  const t = n.saOut
+  if varSlot(t) >= 0 { return irLMiss("arm site into a slot") }
+  if t < 0 || t >= lw.irVars.length || t >= lwStackVal.length {
+    return irLMiss("arm site out")
   }
-  let il = ARM_IDX_NODE
-  let ii = 0
-  let once = false
-  if r.asOps.length == 2 {
-    const ix = r.asOps[1]
-    if ix is OImm && repPrim(ix.oiRep) == "i32" {
-      il = ARM_IDX_IMM
-      ii = ix.oiBits as% i32
-    } else if ix is OStr {
-      il = ARM_IDX_STR
-    } else if ix is OVar && isTemp(ix.ov) {
-      once = true
-    } else {
-      il = plainVarLocal(ix)
-      if il < 0 { return irLMiss("arm site index") }
-    }
+  const arms = armSiteArmsOf(n.saAt, lw.irAt)
+  if arms.length != n.saArms.length || n.saOps.length < 1 {
+    return irLMiss("arm site arms")
   }
-  const from = irLIndexFrom(r.asAt, lwBuf.length)
-  // An index the builder admitted as built once is set into its stash ahead of the chain (Q57).
-  if once {
-    il = armIdxSlot()
-    irLOpnd(r.asOps[1])
-    fbLocalSet(il)
+  const roots = stageLeadOf(n.saOps, pending)
+  if lwMiss != "" { return -1 }
+  // Legacy takes an outer arm site's receiver stash before it writes this chain as that receiver.
+  if stashedArmSiteReads(t) { sharedFieldRecvSlot() }
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length - liveCountIn(pending)
+  const from = irLIndexFrom(n.saAt, lwBuf.length)
+  lwSeq = []
+  if n.saIdx >= 0 {
+    const sl = armIdxSlot()
+    irLOpnd(n.saOps[1])
+    fbLocalSet(sl)
+    lw.irVars[n.saIdx].vSlot = sl
   }
   let bl = -1
-  if r.asStash {
+  if n.saStash {
     // Legacy takes the stash before it writes the box, so the box's own scratch locals follow it.
     bl = sharedFieldRecvSlot()
-    irLOpnd(r.asOps[0])
+    irLOpnd(n.saOps[0])
     fbLocalSet(bl)
   } else {
-    bl = plainVarLocal(r.asOps[0])
-    if bl < 0 { return irLMiss("arm site receiver") }
-    leaf()
+    bl = plainVarLocal(n.saOps[0])
+    if bl < 0 { irLMiss("arm site receiver") }
   }
+  irLSettle(pending)
   const sp = emitFnSpanNode.length
   const sh = shIdxNode.length
-  if armSiteWrite(r.asAt, bl, il, ii, lw.irAt) < 0 { return -1 }
+  lwIdxRowMutes.push(n.saAt)
+  const recv = armSiteRecv(n.saAt)
+  const recvRow = if recv >= 0 && recv < P.nodes.length && nodeAt(recv) is Index { recv } else { -1 }
+  let k = 0
+  while k < arms.length && lwMiss == "" {
+    const loc = armSiteArmOpen(n.saAt, bl, arms[k], lw.irAt)
+    if loc < 0 {
+      irLMiss("arm site arm")
+      break
+    }
+    lw.irVars[n.saVars[k]].vSlot = loc
+    lwFrames.push(-1)
+    armSiteArmEnter(n.saAt, arms[k], loc, lw.irAt)
+    lwPayloadVars.push(n.saVars[k])
+    lwPayloadRows.push(recvRow)
+    body(n.saArms[k], false, t, false)
+    lwPayloadVars.pop()
+    lwPayloadRows.pop()
+    armSiteArmLeave()
+    fbElse()
+    k = k + 1
+  }
+  fbUnreachable()
+  while k > 0 {
+    lwFrames.pop()
+    fbEnd()
+    k = k - 1
+  }
+  lwIdxRowMutes.pop()
   adoptBankedRows(sp, sh)
   // Only an element read banks a row of its own (`emitIndexBanked`).
-  if nodeAt(r.asAt) is Index { irLIndexRow(r.asAt, from) }
+  if nodeAt(n.saAt) is Index { irLIndexRow(n.saAt, from) }
+  lwFloor = lwFloors.pop() ?? 0
+  for r in roots { pending.push(r) }
+  livePush(t)
+  pending.push(t)
   return 0
 }
 
@@ -4143,7 +4191,7 @@ function structEq(r: RStructEq) {
   // Two nullable records' compare: the nullness guard and the fields, then `!=`'s `i32.eqz`, as
   // `emitNulNicheEqBin` writes it after the guarded block.
   if r.seNul {
-    if nulStructEqGuardTail(n.binLeft, n.binRight, roots, row, fnIx, plan) < 0 {
+    if structEqNulGuard(r, n, roots, row, plan, lG, rG) < 0 {
       return irLMiss("nullable record compare fields")
     }
     structEqLeave(saved)
@@ -4156,6 +4204,81 @@ function structEq(r: RStructEq) {
   }
   structEqRowsBank(plan.erL.epRows, plan.erR.epRows)
   return 0
+}
+
+// `nulStructEqGuardTail` over the IR's own null tests where it holds the side (`structEqSideNul`):
+// the `$out` block, both sides' tests, the disagreement's 0, the left's test again, both-null's 1,
+// then legacy's field-wise compare.
+function structEqNulGuard(
+  r: RStructEq,
+  n: BinExpr,
+  roots: i32[],
+  row: i32,
+  plan: EqRootPlan,
+  lG: boolean,
+  rG: boolean,
+): i32 {
+  nulStructEqGuardOpen()
+  if structEqSideNul(r.seL, n.binLeft, roots[0], plan.erL, lG) < 0 { return -1 }
+  if structEqSideNul(r.seR, n.binRight, roots[1], plan.erR, rG) < 0 {
+    return -1
+  }
+  nulStructEqGuardMid()
+  if structEqSideNul(r.seL, n.binLeft, roots[0], plan.erL, lG) < 0 { return -1 }
+  nulStructEqGuardBoth()
+  if nulStructEqFieldsAt(roots[0], roots[1], row, lw.irAt, plan) < 0 {
+    return -1
+  }
+  nulStructEqGuardClose()
+  return 0
+}
+
+// One side's null test in a nullable-record compare, as `emitEqIsNull` writes it along
+// `nulTestArmOf`: a folded arm's constant, or the side read again (its variable's local, or a
+// place the builder re-reads, `irHoistRecv`) and the arm's tail. A stashed or element side, and
+// an arm reading anything else, is legacy's (`emitEqRootIsNull`).
+function structEqSideNul(
+  o: Opnd,
+  ix: i32,
+  root: i32,
+  place: EqRootPlace,
+  placeSide: boolean,
+): i32 {
+  const fnIx = lw.irAt
+  if root == -2 || root == -3 || place.epKind == "elem" {
+    return emitEqRootIsNull(root, ix, fnIx, place)
+  }
+  const arm = nulTestArmOf(ix, fnIx, false, false)
+  if arm == "nnfold" || arm == "none" {
+    fbI32Const(0)
+    return 0
+  }
+  if arm == "nulfold" {
+    fbI32Const(1)
+    return 0
+  }
+  if (
+    arm != "nullRef"
+    && arm != "nulStr"
+    && arm != "bool"
+    && arm != "atom"
+    && arm != "boxTag"
+  ) {
+    return emitEqRootIsNull(root, ix, fnIx, place)
+  }
+  if placeSide {
+    if irHoistRecv(unwrapParen(ix)) < 0 { return -1 }
+  } else {
+    const loc = structEqSideLocal(o)
+    if loc < 0 { return irLMiss("nullable record compare side") }
+    fbLocalGet(loc)
+  }
+  if arm == "bool" { return if nulTestBoolTail(false) < 0 { -1 } else { 0 } }
+  if arm == "atom" { return if nulTestAtomTail(false) < 0 { -1 } else { 0 } }
+  if arm == "boxTag" {
+    return if nulTestBoxTagTail(false) < 0 { -1 } else { 0 }
+  }
+  return if nulTestRefTail(false) < 0 { -1 } else { 0 }
 }
 
 // `REqHelp`: `__eq_<row>__`'s compare, which reads its operands at their parameter slots.
@@ -4350,6 +4473,8 @@ function irHoistRecv(ix: i32): i32 {
     if irHoistRecv(unwrapParen(m.memObj)) < 0 { return -1 }
     return fieldTail(ix, m)
   }
+  const o = lw.irReadOpt.get(ix)
+  if o != null { return optReadGo(o, true) }
   irLMiss("hoisted receiver read")
   return -1
 }
@@ -4700,7 +4825,8 @@ function storeLeadOpnds(n: IrNode, armOut: i32): Opnd[] {
     SGlobalSet => [n.gsSrc]
     SSetField => [n.sfV, n.sfSrc]
     SListSet => [n.lsV, n.lsIx, n.lsSrc]
-    SBlock |
+    SArmSite |
+      SBlock |
       SBoundsCheck |
       SBr |
       SCellSet |
@@ -4888,6 +5014,7 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       irLMiss("effect outside I1")
     }
     SCoalBox => coalBox(n, pending)
+    SArmSite => armSiteStmt(n, pending)
     SBlock => {
       if n.bkOut >= 0 && varSlot(n.bkOut) >= 0 {
         return loopValueBlock(n, pending, id)
@@ -4969,34 +5096,76 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
 // and the leaf's head, then the base as non-null (its niche recovered) and the leaf's tail.
 function optRead(r: ROptRead) {
   if r.orTag >= 0 { return optFieldIs(r) }
+  return optReadGo(r, false)
+}
+
+// `optRead`'s untagged read, written `again` (its root read again from the first, `irHoistRecv`).
+function optReadGo(r: ROptRead, again: boolean): i32 {
   const arm = optLeafArmOf(r.orAt, lw.irAt)
   if arm == "fail" { return irLMiss("optional read arm") }
+  const m = nodeAt(r.orAt)
+  if !(m is OptMember) { return irLMiss("optional read node") }
+  return optReadLinks(r, m, arm, [again])
+}
+
+// `optReadGo`'s chain test, leaf head, value and tail.
+// `read[0]`: whether the root has been read once (`optChainRoot`).
+function optReadLinks(
+  r: ROptRead,
+  m: OptMember,
+  arm: OptLeafArm,
+  read: boolean[],
+): i32 {
   if arm != "nonNull" {
-    irLOpnd(r.orV)
-    fbRefIsNull()
-    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r, true) }
-    emitOptLinkNullClose(r.orAt, lw.irAt)
+    if optChainIsNullAt(r, r.orAt, read) < 0 { return -1 }
     emitOptLeafHead(r.orAt, lw.irAt)
-    optReadBase(r, true)
-  } else {
-    optReadBase(r, false)
   }
+  if optChainValueAt(r, m.omObj, read) < 0 { return -1 }
   emitOptLeafTail(r.orAt, lw.irAt)
   return 0
 }
 
-// The optional read's base as `emitOptChainValue` pushes an unstaged one, `again` once the null
-// test has read it (a temp's read written again, `opndAgain`): its niche recovered.
-function optReadBase(r: ROptRead, again: boolean) {
-  const m = nodeAt(r.orAt)
-  if !(m is OptMember) { return irLMiss("optional read node") }
-  if again {
-    if opndAgain(r.orV, m.omObj) < 0 { return -1 }
-  } else {
-    irLOpnd(r.orV)
+// `emitOptChainIsNull` over read `r`'s chain at `x`: each link's receiver test, then its own field
+// test where the field has a null; the root's null test at the bottom.
+function optChainIsNullAt(r: ROptRead, x: i32, read: boolean[]): i32 {
+  const m = nodeAt(unwrapParen(x))
+  if !(m is OptMember) {
+    if optChainRoot(r, x, read) < 0 { return -1 }
+    fbRefIsNull()
+    return 0
   }
-  if exprNullableRefNiche(m.omObj, lw.irAt) { fbRefAsNonNull() }
+  if optChainIsNullAt(r, m.omObj, read) < 0 { return -1 }
+  if emitOptLinkNullOpen(x, lw.irAt) && optChainValueAt(r, m.omObj, read) < 0 {
+    return -1
+  }
+  emitOptLinkNullClose(x, lw.irAt)
   return 0
+}
+
+// `emitOptChainValue` over read `r`'s chain at `x`: the root, its niche recovered, then each link's
+// field, recovered non-null.
+function optChainValueAt(r: ROptRead, x: i32, read: boolean[]): i32 {
+  const m = nodeAt(unwrapParen(x))
+  if !(m is OptMember) {
+    if optChainRoot(r, x, read) < 0 { return -1 }
+    if exprNullableRefNiche(x, lw.irAt) { fbRefAsNonNull() }
+    return 0
+  }
+  if optChainValueAt(r, m.omObj, read) < 0 { return -1 }
+  if emitOptLinkValueTail(x, lw.irAt) < 0 {
+    return irLMiss("optional link field")
+  }
+  return 0
+}
+
+// Read `r`'s chain root `x`: its operand the first time, then read again (`opndAgain`).
+function optChainRoot(r: ROptRead, x: i32, read: boolean[]): i32 {
+  if !read[0] {
+    read[0] = true
+    irLOpnd(r.orV)
+    return 0
+  }
+  return opndAgain(r.orV, x)
 }
 
 // A tagged `ROptRead` as legacy's `optField` arm writes it over an unstaged base: its null test,
@@ -5415,6 +5584,8 @@ function coalBoxGo(n: SCoalBox, pending: i32[]): i32 {
     "nulBool" => coalNicheCell(n, e, 2, pending)
     "fieldBox" | "fieldVal" => coalUnionField(n, e, pending)
     "optLeaf" => coalOptLeaf(n, e, pending)
+    "optBoxLeaf" => coalOptBoxLeaf(n, e, pending)
+    "optRecLeaf" => coalOptRecLeaf(n, e, pending)
     "nulBoolJoin" => coalNulBoolJoin(n, pending)
     "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
@@ -5511,6 +5682,75 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
   lwFrames.pop()
   return coalOptLeafRead(lp)
+}
+
+// `p?.f ?? d` over a union box field, as `emitOptCoalesceBoxLeaf` writes it over an unstaged base
+// that is no link itself: the chain's null test (the base's, then the field's), the plan's `if`, the
+// default, then the base again and the field's box at the result's rep.
+function coalOptBoxLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const lhsIx = unwrapParen(e.binLeft)
+  if lhsIx < 0 || lhsIx >= P.nodes.length {
+    return irLMiss("coalesce optional box field node")
+  }
+  const m = nodeAt(lhsIx)
+  if !(m is OptMember) || nodeAt(unwrapParen(m.omObj)) is OptMember {
+    return irLMiss("coalesce optional box field node")
+  }
+  if optRecvStagedAt(m.omObj) {
+    return irLMiss("coalesce optional box field staged receiver")
+  }
+  const p = coalOptBoxLeafPlanAt(
+    e,
+    m,
+    structIndexOfExpr(m.omObj, lw.irAt),
+    n.cbAt,
+    lw.irAt,
+  )
+  if p.obFail != "" { return irLMiss("coalesce optional box field plan") }
+  const niche = exprNullableRefNiche(m.omObj, lw.irAt)
+  cond(n.cbL, pending)
+  fbRefIsNull()
+  if emitOptLinkNullOpen(lhsIx, lw.irAt) {
+    if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
+    if niche { fbRefAsNonNull() }
+  }
+  emitOptLinkNullClose(lhsIx, lw.irAt)
+  optBoxLeafOpen(p)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  fbElse()
+  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
+  if niche { fbRefAsNonNull() }
+  lwFrames.pop()
+  return optBoxLeafRead(p)
+}
+
+// `p?.f ?? d` over a record field, as `emitCoalesceOptNulRecord` writes it over an unstaged base:
+// the base and its null test, the base again and the field slot's, the default, then the base a
+// third time and the field.
+function coalOptRecLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const m = nodeAt(unwrapParen(e.binLeft))
+  if !(m is OptMember) { return irLMiss("coalesce optional record field node") }
+  if optRecvStagedAt(m.omObj) {
+    return irLMiss("coalesce optional record field staged receiver")
+  }
+  const p = coalOptRecLeafPlanAt(
+    e,
+    m,
+    structIndexOfExpr(m.omObj, lw.irAt),
+    lw.irAt,
+  )
+  if p.orTgtHeap < 0 { return irLMiss("coalesce optional record field plan") }
+  cond(n.cbL, pending)
+  optRecLeafTestOpen()
+  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
+  optRecLeafTestClose(p)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  fbElse()
+  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
+  lwFrames.pop()
+  return optRecLeafRead(p)
 }
 
 // A `boolean | null` niche joining a box, as `emitCoalesceNulBoolJoin` writes it: the slot taken,
@@ -5976,10 +6216,19 @@ export function irLIndexFrom(ix: i32, from: i32): i32 {
   return lwRowOpenAt[id] ?? from
 }
 
+// The arm-site reads whose arms are lowering, each banking one row over its whole chain.
+const lwIdxRowMutes: i32[] = []
+// The payload variable of each arm lowering, innermost last, and the element read its receiver is
+// (-1 for none).
+const lwPayloadVars: i32[] = []
+const lwPayloadRows: i32[] = []
+
 // Banks the element-read row of `Index` node `ix` written from `from` on, as legacy's
 // `emitIndexBanked` does: only where names and the source map are emitted, and only over bytes.
 export function irLIndexRow(ix: i32, from: i32) {
-  if !idxRowsOn() || lwBuf.length <= from { return 0 }
+  if !idxRowsOn() || lwBuf.length <= from || i32ListHas(lwIdxRowMutes, ix) {
+    return 0
+  }
   lwRowAst.push(ix)
   lwRowFrom.push(from)
   lwRowTo.push(lwBuf.length)
@@ -6001,17 +6250,50 @@ export function valtypeOf(r: i32): i32 {
   }
 }
 
+// Whether an arm-site read holds its box in the receiver stash and that box is out `t`.
+function stashedArmSiteReads(t: i32): boolean {
+  for n in lw.irNodes {
+    if n is SArmSite && n.saStash {
+      const b = n.saOps[0]
+      if b is OVar && b.ov == t { return true }
+    }
+  }
+  return false
+}
+
+// Whether number kind `src` to `dst` narrows: to `i32` from any other, or to `i64` from a float.
+function numNarrows(src: i32, dst: i32): boolean {
+  return dst == 1 && src != 1 || dst == 3 && (src == 4 || src == 5)
+}
+
+// The payload and index variables of the function's arm-site reads (`SArmSite`).
+function armSitePayloads(): {[i32]: boolean} {
+  const r: {[i32]: boolean} = Map()
+  for n in lw.irNodes {
+    if n is SArmSite {
+      for v in n.saVars { r[v] = true }
+      if n.saIdx >= 0 { r[n.saIdx] = true }
+    }
+  }
+  return r
+}
+
 // The locals vector legacy's frame layout writes, read once the body has grown the lazy list
 // frame. A variable holding a declared slot must carry the valtype legacy declared there.
 function framedLocals(): u8[] {
   const nLocals = listIdxScratchBase - fbFrameParams - fbEagerScratch
+  const payloads = armSitePayloads()
+  let vi = 0
   for v in lw.irVars {
-    // A `shadow` arm's variable sits in the frame's list scratch, which the frame declares.
+    vi = vi + 1
+    // A `shadow` arm's variable, and an arm site's payload, sit in the frame's list scratch, which
+    // the frame declares.
     if (
       v.vKind == "local"
       && v.vSlot >= fbFrameParams
       && !listFitShadowHolds(v.vSlot)
       && !isRecvStashHolds(v.vSlot)
+      && !payloads.has(vi - 1)
     ) {
       const li = v.vSlot - fbFrameParams
       if li >= nLocals || !runAgrees(v.vRep, li) { irLMiss("locals layout") }
