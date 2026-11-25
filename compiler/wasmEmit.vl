@@ -45588,47 +45588,84 @@ function emitOptCoalesceBoxLeaf(
   exprIx: i32,
   fnIx: i32,
 ) {
+  const p = optBoxLeafPlanOf(e, heap, fi, exprIx, fnIx)
+  if p.obFail != "" { return emitFail(p.obFail) }
+  if emitOptChainIsNull(unwrapParen(e.binLeft), fnIx) < 0 { return -1 }
+  optBoxLeafOpen(p)
+  if p.obBox == "" {
+    if emitExprAsKind(e.binRight, p.obBk, fnIx) < 0 { return -1 }
+  } else if (emitUnionBoxOwed(p.obBox, p.obTy, e.binRight, fnIx) < 0) {
+    return -1
+  }
+  fbElse()
+  if emitOptChainValue(lhs.omObj, fnIx) < 0 { return -1 }
+  return optBoxLeafRead(p)
+}
+
+// How `emitOptCoalesceBoxLeaf` writes `r?.f ?? d` at field `obFi` of struct heap `obHeap`: the
+// result's union box `obBox` and type `obTy`, or, with `obBox` "", the scalar of box tag `obBk`
+// (valtype `obVt`) unboxed from the field's tag `obFk` (value-box heap `obFvb`) and widened.
+// `obFail` names a call legacy refuses.
+export type OptBoxLeafPlan = {
+  obBox: string,
+  obTy: i32,
+  obBk: i32,
+  obVt: i32,
+  obFk: i32,
+  obFvb: i32,
+  obHeap: i32,
+  obFi: i32,
+  obFail: string,
+}
+
+export function optBoxLeafPlanOf(
+  e: BinExpr,
+  heap: i32,
+  fi: i32,
+  exprIx: i32,
+  fnIx: i32,
+): OptBoxLeafPlan {
   const lhsIx = unwrapParen(e.binLeft)
-  let bNm = ""
-  if exprUnion(exprIx, fnIx) { bNm = boxTyName(nodeTyIxOf(exprIx)) }
+  const bNm = if exprUnion(exprIx, fnIx) { boxTyName(nodeTyIxOf(exprIx)) } else { "" }
   // A link `emitCoalesceGo` re-associated out of a chain carries no type of its own; its
   // result is then the leaf's `T | null` with the null removed.
-  let rTy = nodeTyIxOf(exprIx)
-  if rTy < 0 { rTy = tyPeelNul(nodeTyIxOf(lhsIx)) }
+  const rTy = if nodeTyIxOf(exprIx) < 0 { tyPeelNul(nodeTyIxOf(lhsIx)) } else { nodeTyIxOf(exprIx) }
   const bk = boxTagOfTy(rTy)
   const bVt = nulBoxScalarValtype(bk)
-  if bNm == "" && bVt < 0 {
-    return emitFail(
-      "emitProgram: `?.` … `??` over a nullable value-box field has no rep for its result",
-    )
-  }
   // The box holds the FIELD's scalar; a default that widens the result (`?? 2.5` over an
   // `i32 | null` field) converts it after the unbox.
   const fk = boxTagOfTy(tyPeelNul(nodeTyIxOf(lhsIx)))
   const fVb = vbHeapIdxOfKind(fk)
-  if bNm == "" && (fVb < 0 || !scalarKindWidens(fk, bk)) {
-    return emitFail(
-      "emitProgram: `?.` … `??` over a nullable value-box field has no conversion to its result",
-    )
+  const fail = if bNm == "" && bVt < 0 { "emitProgram: `?.` … `??` over a nullable value-box field has no rep for its result" } else if bNm == "" && (fVb < 0 || !scalarKindWidens(fk, bk)) { "emitProgram: `?.` … `??` over a nullable value-box field has no conversion to its result" } else { "" }
+  const p: OptBoxLeafPlan = {
+    obBox: bNm,
+    obTy: nodeTyIxOf(exprIx),
+    obBk: bk,
+    obVt: bVt,
+    obFk: fk,
+    obFvb: fVb,
+    obHeap: heap,
+    obFi: fi,
+    obFail: fail,
   }
-  if emitOptChainIsNull(lhsIx, fnIx) < 0 { return -1 }
-  if bNm == "" {
-    fbIf(bVt)
-    if emitExprAsKind(e.binRight, bk, fnIx) < 0 { return -1 }
-  } else {
-    fbIfRef(uBoxIdx)
-    if (emitUnionBoxOwed(bNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
-      return -1
-    }
-  }
-  fbElse()
-  if emitOptChainValue(lhs.omObj, fnIx) < 0 { return -1 }
-  fbStructGet(heap, fi)
-  if bNm == "" {
+  return p
+}
+
+// After the chain's null test: the `if` of plan `p`'s result, a scalar's valtype or the box.
+export function optBoxLeafOpen(p: OptBoxLeafPlan) {
+  if p.obBox == "" { return fbIf(p.obVt) }
+  return fbIfRef(uBoxIdx)
+}
+
+// After the receiver again, in the present arm: the field's box, unboxed and widened for a scalar
+// result, and the `if`'s end.
+export function optBoxLeafRead(p: OptBoxLeafPlan): i32 {
+  fbStructGet(p.obHeap, p.obFi)
+  if p.obBox == "" {
     fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
-    fbRefCast(fVb)
-    fbStructGet(fVb, 0)
-    emitScalarWiden(fk, bk)
+    fbRefCast(p.obFvb)
+    fbStructGet(p.obFvb, 0)
+    emitScalarWiden(p.obFk, p.obBk)
   }
   fbEnd()
   return 0
@@ -46838,6 +46875,33 @@ function emitCoalesceOptNulRecord(
 // `nsi`: its heap, field and `if` kind (`optLeafKindOf`), or a null `olLeaf` for any other field
 // (a record, a box, a closure or a map, each its own core, or a field with no `if` blocktype).
 export type CoalOptLeafPlan = { olHeap: i32, olFi: i32, olLeaf: VKind | null }
+
+// The box-field plan `emitCoalesceOptNulRecord` writes `p?.f ?? d` at (`e`, node `exprIx`) over
+// nullable struct row `nsi`, or one whose `obFail` names why the field is no union box.
+export function coalOptBoxLeafPlanAt(
+  e: BinExpr,
+  lhs: OptMember,
+  nsi: i32,
+  exprIx: i32,
+  fnIx: i32,
+): OptBoxLeafPlan {
+  const nfi = if nsi >= 0 && nsi < sHeapIdx.length { sFieldIndex(nsi, lhs.omProp) } else { -1 }
+  if nfi < 0 || fieldRowKind(sFieldFlatRow(nsi, nfi)) != "union" {
+    const no: OptBoxLeafPlan = {
+      obBox: "",
+      obTy: -1,
+      obBk: -1,
+      obVt: -1,
+      obFk: -1,
+      obFvb: -1,
+      obHeap: -1,
+      obFi: -1,
+      obFail: "no union box field",
+    }
+    return no
+  }
+  return optBoxLeafPlanOf(e, sHeapIdx[nsi], nfi, exprIx, fnIx)
+}
 
 export function coalOptLeafPlanOf(lhs: OptMember, nsi: i32): CoalOptLeafPlan {
   const no: CoalOptLeafPlan = { olHeap: -1, olFi: -1, olLeaf: null }
