@@ -18116,12 +18116,84 @@ function arrLitLeafIsBool(ix: i32): boolean {
   return nodeAt(ix) is BoolLit
 }
 
-// Lower element `ix` the way the literal's own element loop does for `form`.
+// Lower element `ix` the way the literal's own element loop does for `form`: a constant leaf by
+// its literal alone (`arrLitConstLeafEmit`), anything else through the expression lowering.
 function arrLitDataElemEmit(ix: i32, fnIx: i32, form: i32): i32 {
+  if arrLitElemIsConst(ix) {
+    const rc = arrLitConstLeafEmit(ix, fnIx, form)
+    if rc != -2 { return rc }
+  }
+  // A tagged set's member is its id, as `emitExpr` writes it past a coercion.
+  const tl = fnTagLeafEmitted(ix, fnIx)
+  if (
+    form == ALD_I32
+    && tl >= 0
+    && !exprReadsDeadNever(ix, fnIx)
+    && coerceKindAt(ix, fnIx) == "none"
+  ) {
+    fbI32Const(tl)
+    return 0
+  }
+  return arrLitDataElemExpr(ix, fnIx, form)
+}
+
+// Element `ix` through the expression lowering, widened to the form's number kind.
+function arrLitDataElemExpr(ix: i32, fnIx: i32, form: i32): i32 {
   if form == ALD_I64 { return emitWidened(ix, 3, fnIx) }
   if form == ALD_F32 { return emitWidened(ix, 5, fnIx) }
   if form == ALD_F64 { return emitWidened(ix, 4, fnIx) }
   return emitExpr(ix, fnIx)
+}
+
+// A constant leaf `ix` (`arrLitElemIsConst`) written as `emitExpr` and `emitWidened` write it, read
+// off the literal alone (`arrLitLeafAsItself`): at the wider forms along the widening plan's
+// literal arms (`widenLitAt`) or its plain arm (`emitNumPlain`). -2 where they take another path.
+function arrLitConstLeafEmit(ix: i32, fnIx: i32, form: i32): i32 {
+  if form != ALD_I64 && form != ALD_F32 && form != ALD_F64 {
+    return arrLitLeafAsItself(ix, fnIx)
+  }
+  if arrLitLeafIsBool(unwrapParen(ix)) { return -2 }
+  const dst = if form == ALD_I64 { 3 } else if form == ALD_F64 { 4 } else { 5 }
+  const p = widenPlanOf(ix, dst, fnIx)
+  if p.wpArm == "instLit" || p.wpArm == "floatLit" {
+    return widenLitAt(ix, dst, fnIx)
+  }
+  if p.wpArm != "plain" { return -2 }
+  if boxDstShadowArmed() {
+    const why = numFloorWhy(p.wpSrc, dst, ix, fnIx)
+    boxDstShadowAs(if why == "" { "table" } else { why })
+    numPairShadowNote(p.wpSrc, dst, ix, fnIx)
+  }
+  const rc = arrLitLeafAsItself(ix, fnIx)
+  if rc != 0 { return rc }
+  return numWidenTail(p.wpSrc, dst, ix, fnIx)
+}
+
+// Constant leaf `ix` as `emitExpr` writes it, by its literal alone: a boolean's `i32.const`, a
+// number at its own width (`emitNumLitNode`), a negated one folded (`emitSignedNumLitAt`). -2 where
+// `emitExpr` takes a pre-path or a coercion, or a negation that does not fold.
+function arrLitLeafAsItself(ix: i32, fnIx: i32): i32 {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return -2 }
+  const e = nodeAt(x)
+  if exprPrePathWhy(x, fnIx) != "" || coerceKindAt(x, fnIx) != "none" {
+    return -2
+  }
+  if e is BoolLit {
+    fbI32Const(e.boolVal)
+    return 0
+  }
+  if e is NumLit { return emitNumLitNode(e, x, fnIx) }
+  if e is Unary {
+    const w = numLitTyWidth(x, fnIx)
+    if e.unOp != "-" || !arrLitLeafIsNum(unwrapParen(e.unArg)) || w == "" {
+      return -2
+    }
+    return emitSignedNumLitAt(x, w)
+  }
+  return emitFail(
+    "emitProgram: internal: a data literal's constant leaf is a number, a negated number or a boolean (`arrLitElemIsConst`)",
+  )
 }
 
 // Append the little-endian element bytes the lone constant instruction `ins` denotes to `out`,
