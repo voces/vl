@@ -13242,7 +13242,9 @@ program's exit code or refusal differs between the claims-on and the claimless c
 program both build runs otherwise (`ir-parity.vl --behaviour-only`: exit code, trap and output, or
 a `legacy-wrong:` program's IR-on run against its `@log`/Want). The byte differs are still counted
 (`bytes differ N (informational)`); `$IR_IDENTITY_BYTES=1` restores the byte gate for a lane that
-wants it. The fixpoint, the fuel, seed-size and plumb-shape gates, the Q58 sweeps and the strict
+wants it. The IR shadow rows (`ir shadow`, `ir shadow cases`) report a claimed function's byte
+mismatch the same way (`$IR_SHADOW_BYTES=1` restores that gate); their verifier failures, span
+classes and order check still red. The fixpoint, the fuel, seed-size and plumb-shape gates, the Q58 sweeps and the strict
 witnesses stay.
 
 **Why.** The lanes were spending most of their effort matching legacy's layout quirks, not
