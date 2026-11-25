@@ -4762,6 +4762,18 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !narrowed
       && rep == globalTyRep(scopeTyAt(d, -1))
       && cellRep == globalTyRep(letBindTy(d, -1))
+    // An atom-assignment cell (`atomCellRep`) read at a string is its id, decoded as legacy's
+    // `emitAtomToStr` decodes it.
+    if (
+      cellRep != rep
+      && repNodeAt(cellRep) is RAtom
+      && repPrim(rep) == "str"
+      && atomCellRep(d, rep) == cellRep
+    ) {
+      const id = globalStoredRead(b, g, ix, cellRep, repTyOf(cellRep))
+      if ibMiss != "" { return id }
+      return repTemp(b, { sxV: id, sxAt: ix }, ix, rep)
+    }
     // A list cell the global section declares at the list its initializer built, an instance's
     // (`cellDeclStores`), is read as it is, at that list.
     const declStored = cellRep != rep
@@ -5679,12 +5691,24 @@ function globalRep(g: i32, d: i32): i32 {
   if noted >= 0 { return noted }
   const ht = globalHolderTy(d)
   const r0 = globalTyRep(if ht >= 0 { ht } else { scopeTyAt(d, -1) })
-  const r = if ht < 0 { cellAtStorageRow(d, r0) } else { r0 }
+  const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, r0)) } else { r0 }
   if r >= 0 {
     globalNoteAt(g, d, r)
     if ht >= 0 { ib.irGlobalHeld[g] = true }
   }
   return r
+}
+
+// Global `d`'s cell where the global section declares an i32 cell for a string binding whose
+// initializer is an assignment to an atom cell: that atom, the id the assignment yields; else `r`.
+function atomCellRep(d: i32, r: i32): i32 {
+  if repPrim(r) != "str" || globalCellKind(d) != "i32" { return r }
+  const g = nodeAt(d)
+  if !(g is LetDecl) || g.letInit < 0 { return r }
+  const ai = nodeAt(unwrapParen(g.letInit))
+  if !(ai is BinExpr) || ai.binOp != "=" { return r }
+  const ar = repNodeOfTy(heldTy(exprTyOf(ai.binLeft)))
+  return if repNodeAt(ar) is RAtom { ar } else { r }
 }
 
 // A record global whose checked rep `r` has no struct heap is held at its storage row's rep
@@ -5741,6 +5765,14 @@ function globalNoteAt(g: i32, d: i32, rep: i32) {
 function globalStoreTy(d: i32, rep: i32): i32 {
   const st = letBindTy(d, -1)
   const ht = heldTy(st)
+  // An atom-assignment cell is stored at its atom (`atomCellRep`).
+  if (
+    repNodeAt(rep) is RAtom
+    && atomCellRep(d, repNodeOfTy(ht)) == rep
+    && repTyOf(rep) >= 0
+  ) {
+    return repTyOf(rep)
+  }
   // A list cell declared at the instance list its initializer built is stored at that list.
   if (
     repNodeAt(rep) is RList
