@@ -13116,3 +13116,21 @@ refusal a program sees.
 **Ruled by the coordinator 2026-11-24.** Q57 lets the IR's bytes differ from legacy's where the difference is incidental. It does not permit losing a deliberate codegen property (address folding, bounds-check elision, unboxing, a tail form) even where guest fuel cannot see the loss. So lane IR-N8's memory address fold was ported byte-identically (#9870, option A) rather than accepted as a Q57 divergence, and lane IR-M1's heap identity 4b route B, which would have allocated a closure where legacy writes a direct function tag, was refused (#9881 took route A).
 
 **A named price is not a lost property.** #9841's arm-site operand built once ahead of the chain costs about two local operations per executed arm read, with run fuel unmeasured; the queue read it as a price within Q57, recorded in its refactor note, not a lost property.
+
+## A function's value `if` over a module inferred-null binding is re-asked at the later top-level fill, and a fill of another type is refused (2026-11-24, coordinator ruling) — D17203
+
+**Ruled by the coordinator 2026-11-24**, on the merge queue's referral of lane IR-N4's D17203 pre-review.
+
+**What happens now.** A module-scope `let m = null` binds an open hole, which a later top-level write fills in place. A function's value `if` whose arm reads `m` while it is still the hole (a read across the function boundary is not flow-narrowed) is noted with the join it was typed (`In | null`) and its destination. At the fill, `fillIfHoleNodes` re-derives the join from the filled arm:
+- where the re-derived join fits the destination, or the join already typed, it is re-banked, so a same-type or narrower fill, and a declared destination that holds both, keep running;
+- else the checker refuses at the `if`: "this `if` was typed In | null — the assignment below makes the binding {w: string} | null, so the join is {w: string} | In | null; annotate the binding".
+
+This extends the `??` hole precedent, D1589 (`fillCoalHoleNodes`), which re-asks a `??` over the hole the same way.
+
+**Why.**
+- The checker is one-pass. Consumers already checked against the join's type (`pick(false)?.v`) cannot be re-asked, so widening the join to `T | U | null` after the fact would be unsound. Today that widening shows up as silent wrong output or invalid wasm.
+- The refusal names a contract: annotating the binding runs.
+
+**Where it fires.** Only where the read is not flow-narrowed. Inside a function, the checker already types a read before any write as `null`, so the local spelling's join is a correct `In | null` and runs. Emit now delivers such a read as the destination's null (D17203's emit half, D17204). The refusal is left to a function that reads a module binding a later top-level write fills.
+
+**Rejected alternative.** A new flow-sensitive "still definitely null" arm was rejected: it covers only the straight-line local case, which the existing narrowing already covers, and not the read across a function boundary.

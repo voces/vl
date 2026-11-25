@@ -183,7 +183,17 @@ import { crMisuseNote } from "./check_call_retire"
 import { opIdxDecls, opIdxFns, opIdxOps } from "./check_callee"
 import { crLostAny, crLostNote } from "./check_capture_loss"
 import { crRows } from "./check_capture_rows"
-import { chPendGiven, chPendNodes, chPendTys, mkBinOpHole } from "./check_coal"
+import {
+  chPendGiven,
+  chPendNodes,
+  chPendTys,
+  ihPendGiven,
+  ihPendHoles,
+  ihPendNodes,
+  ihPendOthers,
+  ihPendWant,
+  mkBinOpHole,
+} from "./check_coal"
 import {
   apartHoleJoins,
   cFillActive,
@@ -742,6 +752,52 @@ function fillCoalHoleNodes(ty: i32) {
   return 0
 }
 
+// Re-ask every pending value `if` over the hole `h`, now that it is filled: its join is typed from
+// the open hole, so the join re-derived from the filled arm is re-banked where it fits the
+// destination or the typed join, and is a disagreement to name otherwise.
+function fillIfHoleNodes(h: i32) {
+  let i = 0
+  while i < ihPendNodes.length {
+    if ihPendHoles[i] == h {
+      const ix = ihPendNodes[i]
+      const res = joinTys(h, ihPendOthers[i])
+      const given = ihPendGiven[i]
+      // A nullable destination seeds its inner as the want; the join already reached it nullable.
+      let want = ihPendWant[i]
+      if want >= 0 && tyAdmitsNull(given) { want = joinTys(want, TY_NULL) }
+      if (want >= 0 && assignable(res, want)) || assignable(res, given) {
+        if ix < nodeTyIx.length { nodeTySet(ix, res) }
+      } else {
+        tErr(
+          "this `if` was typed "
+            + tyToStr(given)
+            + " — the assignment below makes the binding "
+            + tyToStr(h)
+            + ", so the join is "
+            + tyToStr(res)
+            + "; annotate the binding",
+          ix,
+        )
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Notes the value `if` at `ix` whose arm types `a` and `b` are one open hole and one settled type,
+// typed `given` and delivered to `want` (-1 for none), for `fillIfHoleNodes` to re-ask at the fill.
+export function noteIfHoleJoin(ix: i32, a: i32, b: i32, given: i32, want: i32) {
+  const ha = tyIsOpenNullHole(a)
+  if ha == tyIsOpenNullHole(b) || given < 0 { return 0 }
+  ihPendNodes.push(ix)
+  ihPendHoles.push(if ha { a } else { b })
+  ihPendOthers.push(if ha { b } else { a })
+  ihPendGiven.push(given)
+  ihPendWant.push(want)
+  return 0
+}
+
 // Fill the open container null hole `slot` from a write or destination of type `vt`: its
 // non-null part becomes `T`, as the `=` arm fills a `let x = null`. A no-op on any other slot.
 export function cnhFill(slot: i32, vt: i32) {
@@ -764,6 +820,7 @@ export function nhFillLinked(h: i32, inner: i32) {
     t.nInner = inner
     tyMutBump(-1, -1) // a null hole filled in place
     fillCoalHoleNodes(h)
+    fillIfHoleNodes(h)
   } else {
     return 0
   }
