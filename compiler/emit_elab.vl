@@ -15008,6 +15008,78 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[], k: i32): i32[] {
   return elabHoleIdentityBind(ix, d, f, names, out)
 }
 
+// Whether `f`'s body reads parameter `p`, or an un-annotated alias of it, through `?.` and never
+// through `.` outside an assignment's target: a `?.` read is nullable at either record, so only then
+// does the adopted record type no read the literal's own record would not.
+function elabHoleParamOptOnly(f: FuncDecl, p: i32): boolean {
+  const decls: i32[] = [p]
+  const lhs: i32[] = []
+  const nodes: i32[] = []
+  const stack: i32[] = [f.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      nodes.push(ix)
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  let grew = true
+  while grew {
+    grew = false
+    for ix in nodes {
+      const n = nodeAt(ix)
+      if n is LetDecl {
+        const vi = parenPeelIx(n.letInit)
+        if (
+          n.letType < 0
+          && !i32ListHas(decls, ix)
+          && vi >= 0
+          && vi < P.nodes.length
+          && nodeAt(vi) is Ident
+          && i32ListHas(decls, identDeclOf(vi))
+        ) {
+          decls.push(ix)
+          grew = true
+        }
+      }
+    }
+  }
+  for ix in nodes {
+    const n = nodeAt(ix)
+    if n is BinExpr {
+      if n.binOp == "=" { lhs.push(parenPeelIx(n.binLeft)) }
+    }
+  }
+  let sawOpt = false
+  for ix in nodes {
+    const n = nodeAt(ix)
+    if n is Member {
+      const o = parenPeelIx(n.memObj)
+      if (
+        o >= 0
+        && o < P.nodes.length
+        && nodeAt(o) is Ident
+        && i32ListHas(decls, identDeclOf(o))
+        && !i32ListHas(lhs, ix)
+      ) {
+        return false
+      }
+    }
+    if n is OptMember {
+      const o = parenPeelIx(n.omObj)
+      if (
+        o >= 0
+        && o < P.nodes.length
+        && nodeAt(o) is Ident
+        && i32ListHas(decls, identDeclOf(o))
+      ) {
+        sawOpt = true
+      }
+    }
+  }
+  return sawOpt
+}
+
 // A hole identity's literal argument the checker adopted at another record binds the parameter's
 // hole at that record, as the monomorphizer pins it, so the instance's types agree with its
 // storage (D17426).
@@ -15024,10 +15096,13 @@ function elabHoleIdentityBind(
   const hp = if ha >= 0 { parenPeelIx(ha) } else { -1 }
   if hp < 0 || hp >= P.nodes.length || !(nodeAt(hp) is ObjLit) { return tys }
   const rt = nodeRepTyIxOf(hp)
-  if rt < 0 || rt >= T.tys.length || tySameSealed(rt, nodeTyIxOf(hp)) { return tys }
+  if rt < 0 || rt >= T.tys.length || tySameSealed(rt, nodeTyIxOf(hp)) {
+    return tys
+  }
   let i = 0
   while i < cn.callArgs.length && i < f.fnParams.length {
     if parenPeelIx(cn.callArgs[i]) == hp {
+      if !elabHoleParamOptOnly(f, f.fnParams[i]) { return tys }
       const hn = elabHoleRootName(nodeTyIxOf(f.fnParams[i]))
       const out = tys.slice(0, tys.length)
       let j = 0

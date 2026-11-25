@@ -13195,7 +13195,9 @@ identity's object-literal argument at the record its call lands on (`recHoleIden
 monomorphizer already pins the argument there (`monoArgRowArmTy`). The elaboration still keyed the
 instance at the literal's own record, so a body read typed by that key (`v?.d` as `i32`) disagreed
 with the storage (`A`'s boxed field). `elabHoleIdentityBind` (emit_elab.vl) now binds the
-parameter's hole at the adopted record when the call's argument is such a literal.
+parameter's hole at the adopted record when the call's argument is such a literal and the body reads
+the parameter only through `?.`. A `.` read keeps the literal's key: at `A` it is `i32 | null`, so a
+body using it as a number (`v.d + 1`, D17047's pin) would no longer check, a runs → not-runs move.
 
 **Why.** It makes the instance's types agree with storage at the one point the binding is chosen,
 which every reader of the instance's types inherits. The alternative, emitting a `?.` read at its
