@@ -30,9 +30,12 @@ The IR never saw `coal`: legacy stopped first, even under `VL_IR_STRICT=1`.
 The arm lives in `emit_classify`, a plan the IR also reads, so the fix is made there and the IR
 claims the arm itself. No legacy-only arm is left at I8.
 
-- **`coalesceLitUnionDefaultIsAtom`:** a read the checker recorded as a wide string literal
-  (`nodeHasWideStrLit`, the atom hook's `wideLit` arm) is the niche's atom when its literal is a
-  member. Legacy's niche cell writes the default through `emitExpr`, which takes the hook.
+- **`coalesceLitUnionDefaultIsAtom`:** a read of an un-annotated `const` whose initializer is a
+  member string literal is the niche's atom. That is the atom hook's `wideLit` arm, read off the
+  declaration (`identDeclOf`), so `emit_classify` takes no new checker import and the
+  phase-state census is unchanged. Legacy's niche cell writes the default through `emitExpr`,
+  which takes the hook. The default node's own type carries the join, not the literal, so it
+  cannot decide this.
 - **IR (`coalNicheCell`):** a default the atom hook writes (`exprPrePathWhy` names it) is built
   with `deliver` at the niche's atom rep. That is the same delivery `const d: K = Z` uses (the
   hook's `wideLit`, `sole`, `chain` and `staged` arms). Every other default is still built with
@@ -47,6 +50,7 @@ Grid: defaults `Z`, `"zz"` and `d`, each at a const binding, an argument, a retu
   and `d` cells print.
 
 Control: `n ?? W` with `const W = "qq"` (not a member) keeps the string arm. It prints the same
-on both trees.
+on both trees, and its IR blocker (`coalesce atom default`) is unchanged; that is the separate
+non-member arm.
 
 Q58 sweep: `tests/cases/literal-unions/coalesce-const-member-default-in-each-position.vl`.
