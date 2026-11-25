@@ -38,10 +38,15 @@ Same census probe and program lists; armed shadow over every program.
 
 Three functions move from `open temp type` to `operand type`, also this lane's class.
 
-## Found and sent on (lane SOUND)
+## The atom cell's read, fixed here (unfiled: D17568)
 
-- `function ret() { return c }` over the atom-assignment global `c` is claimed into an invalid
-  module: the i32 atom cell is returned as a string. This is pre-existing on master.
+`function ret() { return c }` over the atom-assignment global `c` was claimed into an invalid
+module: the i32 atom cell was returned as a string. This was pre-existing on master. SOUND filed it
+and sent it back to this lane. The IR now holds such a cell at its atom (`atomCellRep`), which
+`globalRep` and `globalStoreTy` share. A read at `string` loads the id and delivers it to the
+string, the decode legacy's `emitAtomToStr` writes. Under `$VL_IR_STRICT=1` the witness runs
+valid, and `ret` matches legacy byte for byte. A plain `print(c)` in a function declines cleanly
+(`print operand rep`). The sweep holds both positions.
 
 ## The sweep's other positions
 
