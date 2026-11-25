@@ -395,7 +395,16 @@ import {
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
+  arrLitChunkClose,
+  arrLitChunkOpen,
+  arrLitChunkPlanOf,
+  arrLitChunkStep,
+  arrLitDataClose,
+  arrLitDataOpen,
+  arrLitDataStoreAt,
+  arrLitDataStoreEnd,
   arrLitDataTry,
+  arrLitElemIsConst,
   arrLitHoistGlobal,
   arrLitIsForIter,
   arrLitLongRouteOf,
@@ -404,9 +413,6 @@ import {
   arrLitRefShortTail,
   arrLitShortTail,
   arrLitShortWhy,
-  arrLitStrChunkClose,
-  arrLitStrChunkOpen,
-  arrLitStrChunkStep,
   arrNewDefaultTail,
   arrNewFillStep,
   arrNewLenStash,
@@ -518,6 +524,7 @@ import {
   hoistRowMark,
   hoistRowReads,
   holeBoxHead,
+  holeBoxHeadAhead,
   holeBoxLeads,
   holeBoxTail,
   holeOptBoxHead,
@@ -795,6 +802,7 @@ import {
   variantFieldLitLexes,
 } from "./emit_map_twins"
 import {
+  OptBoxLeafPlan,
   arrLitUnionLongSlot,
   arrLitVariantLongSlot,
   atomFoldSideTail,
@@ -880,12 +888,7 @@ import {
   unionLitIsStashSlot,
   widenTmpSlot,
 } from "./emit_if_arm_values"
-import {
-  ArrLitArm,
-  allocLitChunk,
-  forInLoopAt,
-  forInPairSlotOf,
-} from "./emit_plan_list"
+import { ArrLitArm, forInLoopAt, forInPairSlotOf } from "./emit_plan_list"
 import {
   ListKind,
   bankSpanRow,
@@ -953,6 +956,8 @@ let lwLive: i32[] = []
 let lwLiveEnd: i32[] = []
 let lwFloor = 0
 let lwFloors: i32[] = []
+// The boxes whose spans `boxLeadStage` raised the floor for, innermost last.
+let lwLeadBoxes: i32[] = []
 // The order-stash slots the function's `RStashSet`s opened: literal, layout position, slot.
 let lwStashAt: i32[] = []
 let lwStashFi: i32[] = []
@@ -1040,9 +1045,12 @@ export function irLSkip(o: Opnd) {
   if o is OVar && isTemp(o.ov) {
     if !tempDefined(o.ov) { return irLMiss("temp used before its definition") }
     if !takeUse(o.ov) { return irLMiss("non-stack temp: used twice") }
-    // A field read's receiver is consumed first, as `irLOpnd` writes it.
+    // A field read's receiver, or a narrowed global read's box, is consumed first, as `irLOpnd`
+    // writes it.
     const r = tempRhs(o.ov)
     if r is RGetField { irLSkip(r.gfV) }
+    const base = lw.irSkipBase.get(o.ov) ?? -1
+    if base >= 0 { irLSkip({ ov: base }) }
     lwSeq.push(o.ov)
   }
   return 0
@@ -1857,6 +1865,33 @@ function stashIfBoxHead(id: i32) {
   return 0
 }
 
+// Where node `id` opens a box-lead span, the temps earlier operands left pending, written first
+// as legacy writes those operands before the box's leading tag; each stays for its reader.
+function boxLeadStage(id: i32, pending: i32[]) {
+  if pending.length == 0 { return 0 }
+  let i = 0
+  while i < lw.irBoxLeadFirst.length && lw.irBoxLeadFirst[i] != id { i = i + 1 }
+  if i >= lw.irBoxLeadFirst.length { return 0 }
+  const roots = stageLeadOf([], pending)
+  if lwMiss != "" { return 0 }
+  // The span writes above the roots until its box is written (`boxLeadUnstage`).
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length
+  lwLeadBoxes.push(lw.irBoxLeadBox[i])
+  for r in roots { pending.push(r) }
+  return 0
+}
+
+// After box node `id` is written, the floor its span's staging raised is lowered again.
+function boxLeadUnstage(id: i32) {
+  if lwLeadBoxes.length == 0 || lwLeadBoxes[lwLeadBoxes.length - 1] != id {
+    return 0
+  }
+  lwLeadBoxes.pop()
+  lwFloor = lwFloors.pop() ?? 0
+  return 0
+}
+
 // Where node `id` opens a tag dispatch a box directly follows (`irBoxLeadFirst`), that box's head,
 // ahead of the dispatch, as legacy writes the dispatch under the box's leading tag.
 function dispatchBoxHead(id: i32) {
@@ -1899,7 +1934,7 @@ function joinBoxHead(out: i32, staged: boolean) {
     return 0
   }
   const p = holeBoxPlanOf(bx, lwIfBoxTy.get(out) ?? -1, lw.irAt)
-  if holeBoxLeads(p.hbArm) {
+  if holeBoxHeadAhead(p.hbArm) {
     if staged { lwPushing = true } else { leaf() }
     holeBoxHead(p, bx, lw.irAt)
     lwPushing = false
@@ -2797,15 +2832,18 @@ function fieldTail(at: i32, m: Member) {
 
 // `RBoxNarrow`: the box, then legacy's payload cast to the read's variant, as
 // `emitVariantCoerce`'s box arm writes a narrowed read at a variant destination.
-function boxNarrow(r: RBoxNarrow) {
-  if r.bnCon >= 0 { return boxContainerRead(r) }
+function boxNarrow(r: RBoxNarrow) { return boxNarrowAt(r, false) }
+
+// `boxNarrow`, its box read as `boxNarrowBox` reads it.
+function boxNarrowAt(r: RBoxNarrow, again: boolean) {
+  if r.bnCon >= 0 { return boxContainerRead(r, again) }
   if r.bnAtom >= 0 {
-    irLOpnd(r.bnV)
+    boxNarrowBox(r, again)
     return emitUnionUnboxTail(r.bnAtom)
   }
   const vi = narrowedBoxVariantPlain(r.bnAt, lw.irAt)
   if !narrowedVariantRepIs(vi, r.bnRep) { return irLMiss("box narrow shape") }
-  irLOpnd(r.bnV)
+  boxNarrowBox(r, again)
   return narrowedVariantTail(vi)
 }
 
@@ -3036,7 +3074,7 @@ function armUnbox(r: RArmUnbox) {
 
 // `RBoxNarrow` of a ref list or map arm: the box, then legacy's payload cast to the container,
 // past the list overrides `emitIdentNode` asks first.
-function boxContainerRead(r: RBoxNarrow) {
+function boxContainerRead(r: RBoxNarrow, again: boolean) {
   const e = nodeAt(r.bnAt)
   if !(e is Ident) { return irLMiss("box container read node") }
   match identListOverrideOf(e, r.bnAt, lw.irAt) {
@@ -3045,7 +3083,7 @@ function boxContainerRead(r: RBoxNarrow) {
     }
     "none" => {}
   }
-  irLOpnd(r.bnV)
+  boxNarrowBox(r, again)
   if r.bnCon == RC_MAP { return mapUnionUnboxTail(r.bnAt, lw.irAt) }
   return refArrayUnionUnboxTail(r.bnAt, lw.irAt)
 }
@@ -3274,16 +3312,16 @@ function makeList(r: RMakeList) {
   }
   // A long literal of constants is legacy's data segment, built from the AST's own literals: the
   // operands, immediates the builder held it to, are left unwritten.
+  const la = if r.mlAt >= 0 && r.mlAt < P.nodes.length { nodeAt(r.mlAt) } else { null }
   if (
     arm != "ref"
     && arm != "str"
     && arrLitShortWhy(r.mlAt, fnIx, arm, r.mlElems.length) == "long"
+    && !(la is ArrayLit
+      && arrLitLongRouteOf(la.arrElems, fnIx, arm, lb.lbSlot) != "dataConst")
   ) {
-    if r.mlAt < 0 || r.mlAt >= P.nodes.length {
-      return irLMiss("array long node")
-    }
-    const a = nodeAt(r.mlAt)
-    if !(a is ArrayLit) { return irLMiss("array long node") }
+    if !(la is ArrayLit) { return irLMiss("array long node") }
+    const a = la
     for e in r.mlElems {
       if !(e is OImm) { return irLMiss("array long element") }
     }
@@ -3300,21 +3338,46 @@ function makeList(r: RMakeList) {
     }
     return 0
   }
-  // A string list past the operand cap builds in chunks, as `emitArrStr` does: opened before its
-  // elements, each element then the chunk's flush.
-  if arm == "str" && r.mlElems.length > allocLitChunk() {
-    for e in r.mlElems {
-      if !(e is OImm || e is OStr) { return irLMiss("long list element") }
+  // A long literal with computed elements is the segment of its constants, each computed element
+  // then stored into it in source order (`arrLitDataOpen`); a constant's immediate is unwritten.
+  if (
+    la is ArrayLit
+    && arm != "ref"
+    && arm != "str"
+    && arrLitShortWhy(r.mlAt, fnIx, arm, r.mlElems.length) == "long"
+    && arrLitLongRouteOf(la.arrElems, fnIx, arm, lb.lbSlot) == "dataComputed"
+  ) {
+    if la.arrElems.length != r.mlElems.length {
+      return irLMiss("array long element")
     }
-    const dst = arrLitStrChunkOpen(r.mlElems.length)
+    const dst = arrLitDataOpen(la.arrElems, fnIx, arm, lb.lbSlot)
+    if dst < 0 { return irLMiss("array long data") }
+    let i = 0
+    while i < r.mlElems.length {
+      if arrLitElemIsConst(la.arrElems[i]) {
+        irLSkip(r.mlElems[i])
+      } else {
+        arrLitDataStoreAt(dst, i)
+        irLOpnd(r.mlElems[i])
+        arrLitDataStoreEnd(arm, lb.lbSlot)
+      }
+      i = i + 1
+    }
+    return arrLitDataClose(dst, r.mlElems.length, arm, lb.lbSlot)
+  }
+  // A literal past its arm's chunk size builds in chunks, as the arm's legacy writer does
+  // (`arrLitChunkPlanOf`): opened before its elements, each element then the chunk's flush.
+  const cp = if arm != "ref" { arrLitChunkPlanOf(arm, lb.lbSlot) } else { null }
+  if cp != null && r.mlElems.length > cp.acMax {
+    const dst = arrLitChunkOpen(cp, arm, r.mlElems.length)
     let coff = 0
     let i = 0
     for e in r.mlElems {
       irLOpnd(e)
       i = i + 1
-      coff = arrLitStrChunkStep(dst, coff, i, r.mlElems.length)
+      coff = arrLitChunkStep(cp, dst, coff, i, r.mlElems.length)
     }
-    return arrLitStrChunkClose(dst, r.mlElems.length)
+    return arrLitChunkClose(cp, dst, r.mlElems.length)
   }
   for e in r.mlElems { irLOpnd(e) }
   if arm == "ref" {
@@ -4943,8 +5006,23 @@ function opndAgain(o: Opnd, ix: i32): i32 {
 export function irLReadAgain(ix: i32): boolean {
   if !lw.irReadAgain.has(ix) { return false }
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
-  rhs(lw.irReadAgain[ix] ?? none, false)
+  const r = lw.irReadAgain[ix] ?? none
+  if r is RBoxNarrow {
+    boxNarrowAt(r, true)
+    return true
+  }
+  rhs(r, false)
   return true
+}
+
+// The box narrowed read `r` unboxes: its operand, or, written `again`, the global's read
+// (`irReadBoxed`) where its first read consumed the box temp.
+function boxNarrowBox(r: RBoxNarrow, again: boolean) {
+  if again && lw.irReadBoxed.has(r.bnAt) {
+    const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
+    return rhs(lw.irReadBoxed[r.bnAt] ?? none, false)
+  }
+  return irLOpnd(r.bnV)
 }
 
 // `RRecCopyPure`: legacy's whole copy, its source read as the IR wrote it: whole, where the copy
@@ -5117,11 +5195,13 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
       // A valueless `return` after a call in its tail form writes nothing.
       if !(i > 0 && callReturns(b, i - 1)) {
         const tl = ft[top] && i == b.length - 1 || callReturns(b, i)
+        boxLeadStage(id, pending)
         dispatchBoxHead(id)
         stashIfBoxHead(id)
         const k = ifOpen(id, pending, tl)
         if k == IF_NOT {
           node(id, pending, tl, if i == b.length - 1 { fo[top] } else { -1 })
+          boxLeadUnstage(id)
         }
         if k == IF_ELSE || k == IF_VALUED {
           const n = lw.irNodes[id]
@@ -6232,10 +6312,10 @@ function coalOptBoxLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
     return irLMiss("coalesce optional box field node")
   }
   const m = nodeAt(lhsIx)
-  if !(m is OptMember) || nodeAt(unwrapParen(m.omObj)) is OptMember {
-    return irLMiss("coalesce optional box field node")
-  }
-  if optRecvStagedAt(m.omObj) {
+  if !(m is OptMember) { return irLMiss("coalesce optional box field node") }
+  // A staged base is teed into its stash and read back from it, as the chain walk writes it.
+  const staged = optChainStagesRecv(lhsIx)
+  if optRecvStagedAt(m.omObj) && !staged {
     return irLMiss("coalesce optional box field staged receiver")
   }
   const p = coalOptBoxLeafPlanAt(
@@ -6246,6 +6326,9 @@ function coalOptBoxLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
     lw.irAt,
   )
   if p.obFail != "" { return irLMiss("coalesce optional box field plan") }
+  if staged || nodeAt(unwrapParen(m.omObj)) is OptMember {
+    return coalOptBoxChain(n, lhsIx, m, p, pending)
+  }
   const niche = exprNullableRefNiche(m.omObj, lw.irAt)
   cond(n.cbL, pending)
   fbRefIsNull()
@@ -6260,6 +6343,30 @@ function coalOptBoxLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   fbElse()
   if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
   if niche { fbRefAsNonNull() }
+  lwFrames.pop()
+  return optBoxLeafRead(p)
+}
+
+// `a?.b?.f ?? d` over a union box field, as `emitOptCoalesceBoxLeaf` writes a chain: the chain's
+// null test from its root `cbL` (`emitOptChainIsNull`), the plan's `if`, the default, then the
+// chain's value (`emitOptChainValue`) and the field's box at the result's rep.
+function coalOptBoxChain(
+  n: SCoalBox,
+  lhsIx: i32,
+  m: OptMember,
+  p: OptBoxLeafPlan,
+  pending: i32[],
+): i32 {
+  const r: ROptRead = { orV: n.cbL, orAt: lhsIx, orTag: -1 }
+  const read: boolean[] = [false]
+  lwSeq = []
+  if optChainIsNullAt(r, lhsIx, read) < 0 { return -1 }
+  irLSettle(pending)
+  optBoxLeafOpen(p)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  fbElse()
+  if optChainValueAt(r, m.omObj, read) < 0 { return -1 }
   lwFrames.pop()
   return optBoxLeafRead(p)
 }
@@ -6965,6 +7072,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwRootRun = 0
   lwRootRuns = []
   lwFloors = []
+  lwLeadBoxes = []
   lwStashAt = []
   lwBoxHeadAt = []
   lwIfHeadAt = Map()
@@ -7013,6 +7121,7 @@ type LwFrame = {
   lfLiveEnd: i32[],
   lfFloor: i32,
   lfFloors: i32[],
+  lfLeadBoxes: i32[],
   lfRootRun: i32,
   lfRootRuns: i32[],
   lfSeq: i32[],
@@ -7044,6 +7153,7 @@ function lwSave(): LwFrame {
     lfLiveEnd: lwLiveEnd,
     lfFloor: lwFloor,
     lfFloors: lwFloors,
+    lfLeadBoxes: lwLeadBoxes,
     lfRootRun: lwRootRun,
     lfRootRuns: lwRootRuns,
     lfSeq: lwSeq,
@@ -7076,6 +7186,7 @@ function lwRestore(f: LwFrame) {
   lwLiveEnd = f.lfLiveEnd
   lwFloor = f.lfFloor
   lwFloors = f.lfFloors
+  lwLeadBoxes = f.lfLeadBoxes
   lwRootRun = f.lfRootRun
   lwRootRuns = f.lfRootRuns
   lwSeq = f.lfSeq

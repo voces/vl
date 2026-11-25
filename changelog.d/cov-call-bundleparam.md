@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims a closure that hands on its enclosing frame's bundle parameter:** a function parameter called at two signatures holds a record of its instances (a bundle), and a closure that captures it and hands it to another function (`const k = () => take(a)`) read it as a parameter of its own frame, which it is not. The read is now the closure's capture of that record (`bundleCaptureRead`), as legacy writes it. `bundle parameter read` falls from 18 rows to 0. Filed D17620 (clause 2: the same parameter returned from a closure and handed on meets a key the arrow facts lack) and rewrote D17570 as the general per-member dispatch gap, parked until after I8.

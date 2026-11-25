@@ -1,4 +1,4 @@
-import { recFieldTyOf } from "./emit_rec_field_codes"
+import { nullableRecordTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import {
   asgFieldParks,
   coalFieldPlanOfOpt,
@@ -23,17 +23,32 @@ import {
 } from "./emit_plan_list"
 import { blockHasContinueFor, globalIsNonConst } from "./emit_query"
 import { narrowedArmTyAt } from "./emit_local_scope"
-import { cboxElemTyOfCell, optCallCalleeOfMember } from "./emit_rewrite"
+import {
+  cboxElemTyOfCell,
+  cboxIsWriteLet,
+  optCallCalleeOfMember,
+} from "./emit_rewrite"
 // The IR shadow (ir-design-2026-11.md §5.2, step I0): with the shadow armed, `emitFuncCode`
 // hands each function here after its legacy lowering. The phase-A builder covers I1's set
 // (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
 // globals); any other construct leaves the function uncovered, a counted reason, not an error.
 // A covered function is verified and then discarded: nothing is claimed, so no byte moves.
-import { emitFail, htStructHeap, lbPlanAdd, lbPlanDrop } from "./emit_bytes"
+import {
+  emitFail,
+  emitFailAt,
+  htStructHeap,
+  lbPlanAdd,
+  lbPlanDrop,
+} from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
-import { monoBundleFe, monoBundleReadFe, monoGenericAliasFe } from "./emit_mono"
+import {
+  litAliasTyOrSelf,
+  monoBundleFe,
+  monoBundleReadFe,
+  monoGenericAliasFe,
+} from "./emit_mono"
 import {
   boxTagOfTy,
   repElemTyOfName,
@@ -285,6 +300,7 @@ import {
   armSiteAtLitSet,
   arrCopyCallNamed,
   arrCopyPlanOf,
+  arrLitElemIsConst,
   arrLitLongRouteOf,
   arrLitShortWhy,
   arrLitUnionLongSlot,
@@ -324,6 +340,7 @@ import {
   callRefLegacyPlainKey,
   callRefPlainKey,
   callRefPlainVoid,
+  callRefSplitKind,
   callStmtDispatches,
   callStmtIdentDrops,
   capturedArgArmOf,
@@ -372,6 +389,7 @@ import {
   holderCallRefPlainKey,
   holderCallSigs,
   holderPickOf,
+  holeBoxHeadAhead,
   holeBoxLeads,
   holeBoxTyAt,
   hostCallNamed,
@@ -415,6 +433,7 @@ import {
   mapSetNulBoolVal,
   mapSetRefIntoMono,
   mapSetValArmOf,
+  mapSoftTwinTagFail,
   mapUnboxTailTy,
   memAccessCallNamed,
   memAccessPlanOf,
@@ -524,12 +543,19 @@ import {
   variantRowArmOf,
   zextLoadOf,
 } from "./wasmEmit"
-import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
+import {
+  RefJoin,
+  ifRefJoinOf,
+  strJoinDropsNulAtom,
+  strReppedLitUnionAt,
+} from "./emit_plan_if_join"
 import {
   V128_ATOM_KIND,
   arrLitVariantSlot,
   identUnboxAtomOf,
   listWrapHeapOfKind,
+  narrowedFieldIsUnionBox,
+  narrowedFieldPlain,
   nullInstanceIsResult,
   variantCoerceArmOf,
 } from "./emit_plan_union"
@@ -547,6 +573,7 @@ import {
   identReadArmOf,
   identReadsNull,
   isArmOf,
+  isArmPatTy,
   isBoxGuardPlain,
   isDecidedPlanOf,
   isNulTestImpossible,
@@ -784,7 +811,9 @@ import {
   globalCellHeap,
   globalCellKind,
   globalCellStructIdx,
+  holderHoldsNull,
   holderMemberTy,
+  holderReadPastNull,
   holderRecordTy,
   identIsEnvCapture,
   identNameIsUserBound,
@@ -815,6 +844,7 @@ import {
   readRepMemoAdvance,
   sFieldIsUnionBox,
   sFieldStoreKind,
+  sharedUnionFieldPlan,
   spreadBoxingSource,
   spreadOwnBoxRow,
   stmtIsTailValue,
@@ -836,6 +866,7 @@ import {
   tailIsValueOrNever,
 } from "./emit_fn_scans"
 import {
+  FC_I32,
   LBK_UNION,
   LiFrame,
   VKind,
@@ -846,6 +877,7 @@ import {
   coalLinkChainOf,
   emitErr,
   emitFailed,
+  emitSoftAt,
   emitSoftFail,
   emitSoftMsg,
   fRecRetTy,
@@ -885,6 +917,7 @@ import {
   uTags,
   uVarTyIx,
 } from "./emit_state"
+import { sharedFieldPlanLitTy } from "./emit_obj_lit_fits"
 import {
   cloSigPosOfKey,
   cloSigTypeIdxAt,
@@ -1124,7 +1157,7 @@ function claimable(): boolean {
 // the atom table's mark, so a claim that falls back leaves what legacy then writes as legacy alone
 // would. Seams never nest: an inner claim that wrote inside an outer one that fell back would keep
 // bytes naming atoms the outer rollback forgets, so a second open scope is a compiler bug.
-type ClaimScope = { sfWas: boolean, sfMsg: string, csAtoms: i32 }
+type ClaimScope = { sfWas: boolean, sfMsg: string, sfAt: i32, csAtoms: i32 }
 
 let claimScopeOpen = false
 
@@ -1138,10 +1171,12 @@ function claimScopeBegin(): ClaimScope {
   const s: ClaimScope = {
     sfWas: emitSoftFail,
     sfMsg: emitSoftMsg,
+    sfAt: emitSoftAt,
     csAtoms: litAtomMark(),
   }
   emitSoftFail = true
   emitSoftMsg = ""
+  emitSoftAt = -1
   return s
 }
 
@@ -1153,6 +1188,7 @@ function claimScopeEnd(s: ClaimScope, ok: boolean): string {
   const m = emitSoftMsg
   emitSoftFail = s.sfWas
   emitSoftMsg = s.sfMsg
+  emitSoftAt = s.sfAt
   if !ok {
     litAtomRollback(s.csAtoms)
     readRepMemoAdvance()
@@ -1180,6 +1216,9 @@ function softRefused(what: string): boolean {
 let declUnit = -1
 let declWhat = ""
 let declAt = -1
+// The refusal a decline met, verbatim: a contract the claim raised, or a legacy helper's refusal
+// inside it; "" for a miss.
+let declRefusal = ""
 
 // What the claim for `unit` (a function, or the top-level code's first statement) declined, such
 // as "this statement (is guard)", or "" when it did not decline.
@@ -1191,10 +1230,35 @@ export function irDeclinedFor(unit: i32): string {
 // The node the last decline names: the statement holding a builder miss, else the unit.
 export function irDeclineAt(): i32 { return declAt }
 
+// The refusal the claim for `unit` met, verbatim, or "" when it declined on a miss or did not
+// decline. Such a unit's refusal is that sentence, not "cannot yet lower".
+export function irDeclineRefusalFor(unit: i32): string {
+  if unit < 0 || unit != declUnit { return "" }
+  return declRefusal
+}
+
+// Records the refusal a claim met (the pending unit's), at the node it named when it named one,
+// and answers false, as a decline does.
+function declineRefused(msg: string): boolean {
+  declRefusal = msg
+  if emitSoftAt >= 0 { declAt = emitSoftAt }
+  return false
+}
+
+// Records the lowering's why for a decline: a legacy helper's refusal inside it is that refusal.
+function declineWhy(whole: string, why: string) {
+  declWhat = whole + " (" + why + ")"
+  const at = why.indexOf("`: ")
+  if why.indexOf("a legacy helper refused in ") == 0 && at > 0 {
+    declineRefused(why.slice(at + 3, why.length))
+  }
+}
+
 // Records, once the build is done, that the claim for `unit` declines with what the build missed
 // (or `whole`) unless a later step clears it: a claim that succeeds sets `declUnit` to -1.
 function declinePending(unit: i32, built: string, whole: string) {
   declUnit = unit
+  declRefusal = ""
   declWhat = if built != "" { "this statement (" + built + ")" } else { whole }
   declAt = if built != "" { missAtOr(unit) } else { unit }
 }
@@ -1224,8 +1288,8 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   ibClaimBuild = true
   const built = build(fnIx, fnPos)
   ibClaimBuild = false
-  if softRefused("") { return false }
   declinePending(fnIx, built, "this function")
+  if softRefused("") { return declineRefused(emitSoftMsg) }
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
@@ -1235,8 +1299,7 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   }
   const why = irLowerClaim(ib, globalCtxOf(fnPos), fnPos, out)
   if why != "" {
-    // A legacy helper's refusal inside the lowering is legacy's own message: no note repeats it.
-    declWhat = if why.indexOf("a legacy helper refused in ") == 0 { "" } else { "this function (" + why + ")" }
+    declineWhy("this function", why)
     count("claim fell back: " + why)
     return false
   }
@@ -1287,12 +1350,12 @@ function claimStart(
   ibClaimBuild = true
   const built = buildStart(order, orderGi, poolFill)
   ibClaimBuild = false
-  if softRefused("start ") { return false }
   declinePending(
     if order.length > 0 { order[0] } else { -1 },
     built,
     "this top-level code",
   )
+  if softRefused("start ") { return declineRefused(emitSoftMsg) }
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
@@ -1302,8 +1365,7 @@ function claimStart(
   }
   const why = irLowerClaim(ib, ibGlobalCtx(), -1, out)
   if why != "" {
-    // A legacy helper's refusal inside the lowering is legacy's own message: no note repeats it.
-    declWhat = if why.indexOf("a legacy helper refused in ") == 0 { "" } else { "this top-level code (" + why + ")" }
+    declineWhy("this top-level code", why)
     count("claim fell back: " + why)
     return false
   }
@@ -1368,6 +1430,9 @@ let ibRetNestedTwin = -1
 let ibMiss = ""
 // The innermost statement whose build set `ibMiss`, or -1.
 let ibMissAt = -1
+// The right side of the name write (`x = v`, or a capture-box write `let`) last built, as legacy's
+// `stubWriteRhs`: a generic function read there is the stub cell's own value, not unfixed.
+let ibStubRhs = -1
 let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
@@ -1574,6 +1639,10 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   const vi = if arm == "variant" { isVariantTagPlain(ix, ibFnIx) } else { -1 }
   if ta == "tagAbsent" { return isTagAbsentTest(rep) }
   if arm == "variant" && vi < 0 { return isVariantTest(b, n, ix, rep) }
+  // A test that cannot tell a map from its literal-union twin is legacy's own refusal, raised here.
+  if ta == "softTwin" && emitSoftFail {
+    mapSoftTwinTagFail(n.isObj, isArmPatTy(ix, n, ibFnIx), ibFnIx, ix)
+  }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
   if rep != ibBool { return irBMiss("is result rep") }
   if ta == "lacks" {
@@ -2367,6 +2436,13 @@ function objLitAt(
       continue
     }
     const why = fieldPlainWhy(arm, row, fi, valIx, ks[k])
+    // A fresh `Map()` at another rep than its row's is legacy's own refusal, raised here alike.
+    if why == "object field mapClash" && emitSoftFail {
+      emitFailAt(
+        "emitProgram: a record field holds a fresh `Map()` whose values store functions at one rep while the record's row stores them at another, so the two map types differ; building it at one rep is not done yet",
+        valIx,
+      )
+    }
     if why != "" { return irBMiss(why) }
     const mark = b.length
     starts.push(mark)
@@ -3158,6 +3234,38 @@ function chainLinkTy(ix: i32): i32 {
   return ibLinkIfTy[ix] ?? -1
 }
 
+// The type every arm of un-narrowed union field read `m` stores its literal-union atom at
+// (`sharedFieldPlanLitTy`), where that type reps as an atom; -1 otherwise.
+function sharedFieldAtomTy(m: Member, ix: i32): i32 {
+  const vis: i32[] = []
+  const fis: i32[] = []
+  if sharedUnionFieldPlan(m.memObj, m.memProp, ix, ibFnIx, vis, fis) != FC_I32 {
+    return -1
+  }
+  const st = sharedFieldPlanLitTy(vis, fis)
+  if st < 0 { return -1 }
+  // A lone literal arm type reps as a string; the alias registered at its texts is the atom set.
+  const at = if repNodeAt(repNodeOfTy(st)) is RAtom { st } else { litAliasTyOrSelf(st) }
+  return if at >= 0 && repNodeAt(repNodeOfTy(at)) is RAtom { at } else { -1 }
+}
+
+// Whether field read `ix` is of a narrowed variant row's plain field, not a union box's.
+function strRowField(ix: i32): boolean {
+  return narrowedFieldPlain(ix, ibFnIx) >= 0
+    && !narrowedFieldIsUnionBox(ix, ibFnIx)
+}
+
+// The atom type `let` `d` holds when its initializer is a shared union field read every arm
+// stores as an atom (`sharedFieldAtomTy`), else -1.
+function letSharedFieldAtomTy(d: i32): i32 {
+  const l = nodeAt(d)
+  if !(l is LetDecl) || l.letInit < 0 { return -1 }
+  const iv = unwrapParen(l.letInit)
+  if iv < 0 || iv >= P.nodes.length { return -1 }
+  const m = nodeAt(iv)
+  return if m is Member { sharedFieldAtomTy(m, iv) } else { -1 }
+}
+
 // The rep of `openCoalMapTy`'s type, or -1.
 function openCoalMapRep(ix: i32): i32 {
   const t = openCoalMapTy(ix)
@@ -3327,6 +3435,25 @@ export function exprTyOf(ix: i32): i32 {
     const ft = builtFieldTy(n)
     if ft >= 0 { return ft }
   }
+  // A field read legacy holds as an atom whose own type names no set (a shared union field
+  // joined to one literal) is of the set its arms store (`litAtomMemberTy`).
+  if n is Member && t >= 0 {
+    const tr = repNodeOfTy(t)
+    const atomTy = repNodeAt(tr) is RAtom
+    // A lone literal is the one string type an atom field joins to; a plain string is never one.
+    const loneLit = !atomTy
+      && t != TY_STR
+      && t != TY_NUL_STR
+      && repPrim(tr) == "str"
+    if loneLit && exprIsLitAtom(ix, ibFnIx) {
+      const st = sharedFieldAtomTy(n, ix)
+      if st >= 0 { return st }
+    }
+    // An atom-typed field a row stores as a string beside its base's arm is read as that string.
+    if atomTy && strRowField(ix) && strReppedLitUnionAt(ix, ibFnIx) {
+      return TY_STR
+    }
+  }
   // A direct call typed open, or typed at the closure its callee returns a bundle record for
   // (`fnRetHeldAsBundle`), is of its callee's result as the IR holds it (`resultTy`).
   if t >= 0 && !(n is Call && (irTyOpen(t) || bundleCallOf(n, ix, t))) {
@@ -3405,6 +3532,13 @@ function capturedClosureTy(ix: i32): i32 {
   return if ty >= 0 && repNodeAt(repNodeOfTy(ty)) is RClosure { ty } else { -1 }
 }
 
+// The type local binding `d` holds a returned record whole at in `frame` (`holderRecordTy`): that
+// record, or `| null` beside it where the binding's type holds null, as a map read's miss; else -1.
+function holderHeldRecordTy(d: i32, frame: i32): i32 {
+  const ht = holderRecordTy(d, frame)
+  return if ht >= 0 && holderHoldsNull(d, frame) { nullableRecordTyOf(ht) } else { ht }
+}
+
 // The record type read `ix` of a holding binding is (`holderRecordTy`), where this frame's
 // variable for it, or the module cell of a global one, holds that record; -1 otherwise.
 function holderReadTy(ix: i32): i32 {
@@ -3420,12 +3554,26 @@ function holderReadTy(ix: i32): i32 {
   const ht = holderRecordTy(d, ibFnIx)
   if ht < 0 { return -1 }
   const v = boundVarOf(ix)
-  if v >= 0 { return if ib.irVars[v].vTy == ht { ht } else { -1 } }
+  // A local holding it beside `null` (`holderHeldRecordTy`) is read as it is until narrowed.
+  const vt = if v >= 0 { ib.irVars[v].vTy } else { -1 }
+  const vn = if v >= 0 { repNodeAt(ib.irVars[v].vRep) } else { null }
+  if vt != ht && vn is RNullable && vn.rnInner == repNodeOfTy(ht) {
+    return if holderReadPastNull(ix, ibFnIx) { ht } else { vt }
+  }
+  if v >= 0 { return if vt == ht { ht } else { -1 } }
   // A module holder's read is of the record its cell holds (`globalRep`).
   const g = globalIndexOfSid(sidOfNode(ix))
   if g < 0 { return -1 }
   const mt = holderRecordTy(d, -1)
-  return if mt >= 0 && globalRep(g, d) == repNodeOfTy(mt) { mt } else { -1 }
+  if mt < 0 { return -1 }
+  const cr = globalRep(g, d)
+  if cr == repNodeOfTy(mt) { return mt }
+  // One beside `null` (cell kind `nulstruct`), read narrowed past it, is the record.
+  const cn = repNodeAt(cr)
+  const past = cn is RNullable
+    && cn.rnInner == repNodeOfTy(mt)
+    && holderReadPastNull(ix, ibFnIx)
+  return if past { mt } else { -1 }
 }
 
 // The record a capture `name` of this frame holds where its binding keeps a returned bundle whole
@@ -3612,9 +3760,10 @@ function cellTakesClosure(d: i32, v: i32, src: Opnd): boolean {
 export function irBDeclVar(d: i32): i32 {
   const known = ibDeclVar[d] ?? -1
   if known >= 0 { return known }
-  // Legacy holds a binding of a returned record whole as that record (`letCellKind`), and one
-  // holding a single member of it as that member's closure (`holderMemberTy`).
-  const ht = holderRecordTy(d, ibFnIx)
+  // Legacy holds a binding of a returned record whole as that record (`letCellKind`), `| null`
+  // beside it where its type holds null (`holderHeldRecordTy`), and one holding a single member
+  // of it as that member's closure (`holderMemberTy`).
+  const ht = holderHeldRecordTy(d, ibFnIx)
   const hm = if ht < 0 && (elabHasRetRecords() || bundleAnyNoted()) { holderMemberTy(d, ibFnIx) } else { -1 }
   const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else { heldTy(scopeTyAt(d, ibFnIx)) }
   // A map local is held as legacy stores it, its mv slot off its initializer (`mapSlotHeldTy`).
@@ -3638,7 +3787,10 @@ export function irBDeclVar(d: i32): i32 {
     && !(repNodeAt(rep) is RAtom || atomNullable(rep))
   ) {
     // Held at the type legacy's cell holds (`letAtomCellTy`), the literal set a join of consts keeps.
-    const at = letAtomCellTy(d, ibFnIx)
+    const at0 = letAtomCellTy(d, ibFnIx)
+    const r0 = if at0 >= 0 { repNodeOfTy(heldTy(at0)) } else { -1 }
+    const atom0 = r0 >= 0 && (repNodeAt(r0) is RAtom || atomNullable(r0))
+    const at = if atom0 { at0 } else { letSharedFieldAtomTy(d) }
     const ar = if at >= 0 { repNodeOfTy(heldTy(at)) } else { -1 }
     if ar >= 0 && (repNodeAt(ar) is RAtom || atomNullable(ar)) {
       return declVarAt(d, ar, heldTy(at))
@@ -4739,6 +4891,10 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   // A bundle parameter holds a record of closures each instance types (D14841): read at a member
   // pick (`bundleCallRhs`), or whole as that record where the IR holds it as one.
   if dn is Param && bundleAnyNoted() && bundleParamOfRead(ix, ibFnIx) >= 0 {
+    // A closure's read of an enclosing frame's bundle parameter is its capture of that record.
+    if identReadArmOf(n, ix, ibFnIx, false) == "capture" {
+      return bundleCaptureRead(b, ix)
+    }
     const pv = paramVarAt(localIndexOf(ibFnIx, ix))
     if pv < 0 || !(repNodeAt(ib.irVars[pv].vRep) is RRecord) {
       return irBMiss("bundle parameter read")
@@ -5402,7 +5558,10 @@ function liftCapVarAt(fe: i32, name: string, readRep: i32, atTy: i32): i32 {
 // reads one, or over a fresh environment of its captures as this frame holds them; at type `ty`.
 function cloValue(b: i32[], ix: i32, rep: i32, ty: i32): Opnd {
   const fe = cloValueFeOf(ix)
-  if fe < 0 { return irBMiss(cloValueWhy(ix)) }
+  if fe < 0 {
+    cloUnfixedRefuse(ix)
+    return irBMiss(cloValueWhy(ix))
+  }
   const why = if cloValueIsCore(ix, fe) { closureValueCoreWhy(fe) } else { closureValueWhy(fe) }
   if why != "" { return irBMiss("closure value refused") }
   const env: Opnd[] = if fnEnvIdxOf(fe) >= 0 { cloEnvOf(b, fe, ix) } else { [] }
@@ -5634,6 +5793,12 @@ export function irBNoteFieldReread(ix: i32, k: i32) {
   return 0
 }
 
+// Notes node `ix` as a read the lowering writes again whole, as `rhs` `r` (`irReadAgain`).
+export function irBNoteReadAgain(ix: i32, r: Rhs) {
+  ib.irReadAgain[ix] = r
+  return 0
+}
+
 // The parameter variable holding wasm local `w`, or -1.
 function paramVarAt(w: i32): i32 {
   for v in ib.irParams {
@@ -5667,8 +5832,16 @@ function globalUnboxRead(
     bnAtom: ak,
     bnCon: con,
   }
-  if ak >= 0 { return unboxAtomTemp(b, r, ix, rep) }
-  return irBLetTemp(b, r, ix, rep)
+  // A loop's hoisted receiver reads it again from the global, where the unbox leaves `rep`.
+  if ak < 0 || irBUnboxKindRep(ak, rep) == rep {
+    ib.irReadAgain[ix] = r
+    ib.irReadBoxed[ix] = globalBoxRhs(g, ix)
+  }
+  const t = if ak >= 0 { unboxAtomTemp(b, r, ix, rep) } else { irBLetTemp(b, r, ix, rep) }
+  if t is OVar && box is OVar && t.ov >= 0 && ib.irReadAgain.has(ix) {
+    ib.irSkipBase.set(t.ov, box.ov)
+  }
+  return t
 }
 
 // Box read `r` at `ix` unboxed to its atom kind, read at `rep` (`irBUnboxKindRep`).
@@ -5703,11 +5876,17 @@ function globalBoxAt(b: i32[], g: i32, d: i32, ix: i32, cellRep: i32): Opnd {
   if gm != "" { return irBMiss(gm) }
   return irBLetTempTy(
     b,
-    { ggSym: g, ggNonNull: irBGlobalBoxRecovers(ix), ggNn: -1 },
+    globalBoxRhs(g, ix),
     ix,
     cellRep,
     heldTy(scopeTyAt(d, -1)),
   )
+}
+
+// The read of global `g`'s box at `ix`, recovered where it is not a constant.
+function globalBoxRhs(g: i32, ix: i32): Rhs {
+  const r: Rhs = { ggSym: g, ggNonNull: irBGlobalBoxRecovers(ix), ggNn: -1 }
+  return r
 }
 
 // The box a union global Ident `ix` (declared at `d`) holds, as `emitUnionBoxPush` reads a name
@@ -5813,7 +5992,9 @@ function globalRep(g: i32, d: i32): i32 {
   const noted = irGlobalRepOf(ib, g)
   if noted >= 0 { return noted }
   const ht = globalHolderTy(d)
-  const r0 = globalTyRep(if ht >= 0 { ht } else { scopeTyAt(d, -1) })
+  // A holder's cell beside `null` (cell kind `nulstruct`) is the record's nullable.
+  const ct = if ht >= 0 && globalCellKind(d) == "nulstruct" { nullableRecordTyOf(ht) } else { ht }
+  const r0 = globalTyRep(if ht >= 0 { ct } else { scopeTyAt(d, -1) })
   const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, r0)) } else { r0 }
   if r >= 0 {
     globalNoteAt(g, d, r)
@@ -6036,6 +6217,7 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !(cf is Ident) {
     // A place holding a returned record whole is called at its member, as `emitHolderCall` reads it.
     if holderCallSigs(ix, ibFnIx).length > 0 { return holderCallRhs(b, c, ix) }
+    if callRefPlainKey(ix, ibFnIx) == "" { callSplitRefuse(c, ix) }
     if callRefPlainKey(ix, ibFnIx) == "" { return missRhs("indirect call") }
     // A call straight off a returned record's member, as `emitCallCore` sends it to `emitCallRef`.
     const rx = unwrapParen(c.callFn)
@@ -6078,6 +6260,7 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   // A loop variable holding a function value is a closure call too.
   if d >= 0 && nodeAt(d) is LoopVar { return closureCallRhs(b, c, ix) }
   if lf < 0 && (d < 0 || !(nodeAt(d) is FuncDecl)) {
+    callSplitRefuse(c, ix)
     return missRhs("call of a non-declaration")
   }
   // The function `emitCallCoreUserFn` calls, unless a binding of the name routes it to a closure.
@@ -6754,10 +6937,31 @@ function capturedArgDelivers(arm: CapturedArgArm): boolean {
   }
 }
 
+// A closure call whose function set has no one signature is legacy's own refusal, raised at the
+// call before the claim declines, inside a claim only (`callRefSplitKind`).
+function callSplitRefuse(c: Call, ix: i32) {
+  if !emitSoftFail { return 0 }
+  const k = callRefSplitKind(ix, c.callFn, ibFnIx)
+  if k == 1 {
+    emitFailAt(
+      "emitProgram: this call runs functions that return different types, and one of them is also held where it cannot be stored as one of the functions this value may hold, so the call has no one signature",
+      ix,
+    )
+  }
+  if k == 2 {
+    emitFailAt(
+      "emitProgram: this call runs a function value that may hold any of a set of functions returning different types, held where the instance keeps them at one signature; dispatching such a call per function is not built yet",
+      ix,
+    )
+  }
+  return 0
+}
+
 // A call `ix` through a closure binding that legacy writes plainly (`callRefPlainKey`): the
 // closure, then each argument at its parameter's scalar, string or record rep.
 function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const key = callRefPlainKey(ix, ibFnIx)
+  if key == "" { callSplitRefuse(c, ix) }
   if key == "" { return missRhs("call of a non-declaration") }
   if !legacyPlainAgrees(ix, key) {
     return missRhs("closure call plan disagrees")
@@ -7153,13 +7357,16 @@ export function irBStageLeads(
   // A box over a tag dispatch or a join span has its head written ahead of that span
   // (`dispatchBoxHead`), above any operand staged before it, where legacy writes that operand
   // first (D17564).
-  if dispatchBoxFrom(b, at) || boxLeadSpanFrom(b, at) { return false }
+  const lead = dispatchBoxFrom(b, at) || boxLeadSpanFrom(b, at)
   // A store the operand makes (an assignment as its value) is a statement: an earlier operand
   // read at its use would see the stored value, so it is staged below the store, as below an `if`.
   const store = storeFrom(b, at)
   const coal = coalBoxFrom(b, at, true) || coalBoxFrom(b, at, false)
   const stash = stashSetFrom(b, at) || tagStashFrom(b, at)
-  if !valuedIfFrom(b, at) && !coal && !stash && !store || opndsAreTemps(args) {
+  if (
+    !valuedIfFrom(b, at) && !coal && !stash && !store && !lead
+    || opndsAreTemps(args)
+  ) {
     return true
   }
   let j = 0
@@ -7937,6 +8144,7 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     if callCalleeDead(ix, c, ibFnIx) {
       return { dnAt: ix, dnPad: callEndsNever(ix) }
     }
+    callSplitRefuse(c, ix)
     return missRhs("method " + m.memProp)
   }
   const starts = [b.length]
@@ -9664,9 +9872,6 @@ function boxTempIn(
   }
   // An operand built before the span is written where it is read, below the head legacy writes
   // after it, which would put the two out of order.
-  if asg && endsInTemp(b.slice(0, b.length - asgSpan[2])) {
-    return irBMiss("box of an assignment after an operand")
-  }
   if p.hbArm == "nulNiche" && nulNicheBoxTagOf(p.hbKind, ix, ibFnIx) < 0 {
     return irBMiss("box niche with no arm")
   }
@@ -9743,8 +9948,8 @@ function tagSpanNote(b: i32[], b0: i32, ix: i32) {
 // (`stashIfBoxHead`), as legacy does.
 function boxOfJoinAt(b: i32[], at: i32): boolean {
   let ja = if ifCondLetAt(ib, b, at) { at + 1 } else { at }
-  // A coalesce that stages its operand's leads (`coalArmStagesLeads`) may follow that operand's
-  // own nodes, none of them a statement the lead would be written above.
+  // A coalesce may follow its operand's own nodes, none of them a statement the lead would be
+  // written above: the lowering writes the head ahead of the coalesce, which reads them there.
   let q = ja
   while (
     q < b.length
@@ -9754,14 +9959,7 @@ function boxOfJoinAt(b: i32[], at: i32): boolean {
     q = q + 1
   }
   const qn = if q < b.length { ib.irNodes[b[q]] } else { null }
-  if (
-    q > ja
-    && qn is SCoalBox
-    && coalArmStagesLeads(qn.cbArm)
-    && !ifBelowLeadHas(b, ja, q)
-  ) {
-    ja = q
-  }
+  if (q > ja && qn is SCoalBox && !ifBelowLeadHas(b, ja, q)) { ja = q }
   if b.length < ja + 2 { return false }
   const j = ib.irNodes[b[ja]]
   let out = if j is SIf { j.siOut } else if j is SCoalBox { j.cbOut } else { -1 }
@@ -9779,8 +9977,9 @@ function boxOfJoinAt(b: i32[], at: i32): boolean {
   if !(r is RToBox) { return false }
   const v = r.bxV
   if !(v is OVar) || v.ov != out { return false }
-  // Only a box whose head leads its value has its head written ahead of the join.
-  return holeBoxLeads(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
+  // Only a box whose head leads its value, or takes its slot ahead of it, has that head written
+  // ahead of the join.
+  return holeBoxHeadAhead(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
 }
 
 // Where the delivery built into `b` from `at` on ends in a box whose head leads and its value's
@@ -11124,7 +11323,13 @@ function arrayLit(
   // element's store, or another arm's chunked build, is legacy's.
   const route = if sw == "long" && !strChunk { arrLitLongRouteOf(n.arrElems, ibFnIx, arm, lb.lbSlot) } else { "chunk" }
   const dataConst = sw == "long" && !strChunk && route == "dataConst"
-  if sw == "long" && !strChunk && !dataConst {
+  // Any other long literal of a scalar arm is legacy's chunked build (`arrLitChunkPlanOf`), its
+  // elements built as a short literal's are.
+  const chunk = sw == "long" && !strChunk && route == "chunk" && arm != "ref"
+  // A long literal with computed elements is the segment of its constants, each computed element
+  // stored after (`arrLitDataOpen`): a constant is one immediate, a computed one built as usual.
+  const dataComputed = sw == "long" && !strChunk && route == "dataComputed"
+  if sw == "long" && !strChunk && !dataConst && !chunk && !dataComputed {
     return irBMiss("array long " + route)
   }
   // A `null[]` element seeding an i32 list is the sentinel 2 (`emitArrI32`).
@@ -11158,7 +11363,7 @@ function arrayLit(
   for e in n.arrElems {
     const at = b.length
     starts.push(at)
-    const v = if dataConst { longConstElem(e, er) } else if vslot >= 0 { variantElem(b, e, er, vslot) } else if uslot >= 0 { boxTempIn(
+    const v = if dataConst || dataComputed && arrLitElemIsConst(e) { longConstElem(e, er) } else if vslot >= 0 { variantElem(b, e, er, vslot) } else if uslot >= 0 { boxTempIn(
       b,
       unionElemValue(b, e),
       e,
@@ -12237,8 +12442,13 @@ function coalOptLeafBuild(
   if lp.olLeaf == null && !boxLeaf && !recLeaf {
     return irBMiss("coalesce optional record field")
   }
-  if boxLeaf && nodeAt(unwrapParen(m.omObj)) is OptMember {
-    return irBMiss("coalesce optional box field chain")
+  // A box field at the end of a chain reads the chain's root, whose links the lowering walks
+  // (`emitOptChainIsNull`, `emitOptChainValue`).
+  const chain = boxLeaf && nodeAt(unwrapParen(m.omObj)) is OptMember
+  const rootIx = if chain { optChainRootOf(m.omObj) } else { m.omObj }
+  if rootIx < 0 { return irBMiss("coalesce optional box field chain") }
+  if chain && readOwesNonNullRecover(rootIx, ibFnIx) {
+    return irBMiss("coalesce optional box field chain recover")
   }
   const boxOut = bp != null && bp.obBox != ""
   if recLeaf {
@@ -12253,23 +12463,25 @@ function coalOptLeafBuild(
   if irTyOpen(ty) { return irBMiss("open temp type") }
   // Its value stays on the stack from here, so no temp an operand before it built may wait.
   if endsInTemp(b) { return irBMiss("coalesce optional after an operand") }
-  const r = irBExpr(b, m.omObj)
+  const r = irBExpr(b, rootIx)
   if ibMiss != "" { return r }
   // A receiver legacy re-emits is read again as the builder read it (`irHoistRecv`).
   if !(r is OVar) || r.ov < 0 { return irBMiss("coalesce optional place") }
   // A receiver legacy stages is teed into its `?.` stash and read back from it by the scalar
-  // leaf (`coalOptLeaf`); it is the chain's base itself, since a nested chain's staging is its own.
+  // leaf (`coalOptLeaf`) and the box leaf's chain walk (`coalOptBoxChain`); it is the chain's base
+  // itself, since a nested chain's staging is its own.
   const staged = optChainStagesRecv(lhsIx)
   if (
     staged
-    && (boxLeaf || recLeaf || nodeAt(unwrapParen(m.omObj)) is OptMember)
+    && !boxLeaf
+    && (recLeaf || nodeAt(unwrapParen(m.omObj)) is OptMember)
   ) {
     return irBMiss("coalesce optional staged receiver")
   }
   if (
     !staged
     && ib.irVars[r.ov].vKind == "temp"
-    && !recvReadsAgain(unwrapParen(m.omObj))
+    && !recvReadsAgain(unwrapParen(rootIx))
   ) {
     return irBMiss("coalesce optional place")
   }
@@ -13968,6 +14180,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     ) {
       if irUnionEqHook(ix, ibFnIx) { return unionEq(b, n, ix, rep) }
       if irListEqHook(ix, ibFnIx) { return listEq(b, n, ix, rep) }
+      // Two lists stored apart compare by value across their storages (`xrepEmitPair`).
+      if (
+        (n.binOp == "==" || n.binOp == "!=")
+        && eqRouteOf(n, ix, ibFnIx) == "xrep"
+      ) {
+        return listEq(b, n, ix, rep)
+      }
       const cat = irListCatHook(ix, ibFnIx)
       if cat == "plain" { return listCat(b, n, ix, rep) }
       if cat != "none" { return irBMiss("list concat " + cat) }
@@ -14680,6 +14899,7 @@ function siteBuilt(n0: i32, ix: i32): boolean {
 // target's read. A guarded global's read misses, so the guard-off context
 // legacy re-reads in reads it as the builder's own does.
 function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  if nodeAt(n.binLeft) is Ident { ibStubRhs = unwrapParen(n.binRight) }
   // The nodes it builds are its span, which a box leading its value is written ahead of.
   const b0 = b.length
   const o = assignValueGo(b, n, ix, rep)
@@ -14694,6 +14914,13 @@ function assignValueGo(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if arm == "parked" { return assignValueParked(b, n, ix, rep) }
   if arm == "boxedArm" { return assignValueBoxedArm(b, n, ix, rep) }
   if arm == "widerRow" { return assignValueWider(b, n, ix, rep) }
+  // An assignment whose type no arm delivers is refused by contract, not declined as a gap.
+  if arm == "none" && emitSoftFail {
+    emitFailAt(
+      "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",
+      ix,
+    )
+  }
   if arm != "reRead" { return irBMiss("assignment value " + arm) }
   // The store between an operand already built and the box's re-read would put that operand out of
   // stack order, as `assignValueLit`'s would.
@@ -14923,6 +15150,7 @@ function writesPlaceValue(rhs: i32): boolean {
 
 function assignTo(b: i32[], n: BinExpr, ix: i32) {
   const at = b.length
+  if nodeAt(n.binLeft) is Ident { ibStubRhs = unwrapParen(n.binRight) }
   assignToGo(b, n, ix)
   siteArmNote(b, at, n, ix)
   return 0
@@ -15855,12 +16083,17 @@ function stmtAt(b: i32[], stmts: i32[], i: i32) {
 // is -1 outside a list.
 function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
+  const sn = nodeAt(ix)
+  if sn is LetDecl && sn.letInit >= 0 && cboxIsWriteLet(ix) {
+    ibStubRhs = unwrapParen(sn.letInit)
+  }
   const cut = stmtNode(b, ix, sibs, pos) == IF_CUTS_BLOCK
     && nodeAt(ix) is IfStmt
   if ibMiss != "" && ibMissAt < 0 { ibMissAt = ix }
   if ibMiss != "" && censusGoesOn(ibMiss) {
     ibMiss = ""
     ibMissAt = -1
+    ibStubRhs = -1
   }
   // Legacy writes back a region's length after its last statement, inside that statement's
   // span (`emitStmtIn`).
@@ -15914,7 +16147,7 @@ function holderRecordOf(b: i32[], f: i32): Opnd {
       const gr: Rhs = {
         ggSym: g,
         ggNonNull: globalReadRecovers(sidOfNode(r), r, ibFnIx),
-        ggNn: 0,
+        ggNn: if readOwesNonNullRecover(r, ibFnIx) { 1 } else { 0 },
       }
       ib.irReadAgain[r] = gr
       globalHeldNote(g)
@@ -16640,6 +16873,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibCalleeParamFn = Map()
   ibMiss = ""
   ibMissAt = -1
+  ibStubRhs = -1
   ibMisses = []
   ibReserveEnd = []
   ibReservePushes = []
@@ -17411,6 +17645,7 @@ function buildThunk(fe: i32): string {
   ibRetNestedTwin = -1
   ibMiss = ""
   ibMissAt = -1
+  ibStubRhs = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if fe < 0 || fe >= fnStmts.length { return "thunk target" }
   const d = fnStmts[fe]
@@ -17542,6 +17777,7 @@ function buildEqHelp(si: i32): string {
   ibRetNestedTwin = -1
   ibMiss = ""
   ibMissAt = -1
+  ibStubRhs = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if si < 0 || si >= sHeapIdx.length { return "compare helper row" }
   ib.irName = "@eq " + i32ToStr(si)
@@ -17646,6 +17882,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibRetNestedTwin = -1
   ibMiss = ""
   ibMissAt = -1
+  ibStubRhs = -1
   ibMisses = []
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
@@ -18024,14 +18261,15 @@ function cellDeclStores(gst: i32, rep: i32, vr: i32): boolean {
 }
 
 // Whether global `gst`, a holder legacy keeps a returned record in whole (`globalHolderTy`, cell
-// kind `struct`) and declares nullable as it initializes it at start, takes that record or null.
+// kind `struct` or `nulstruct`) and declares nullable as it initializes it at start, takes that
+// record or null.
 function holderCellTakesNull(gst: i32, rep: i32, vr: i32): boolean {
   const n = repNodeAt(vr)
   return n is RNullable
     && n.rnDisc == 1
     && n.rnInner == rep
     && globalHolderTy(gst) >= 0
-    && globalCellKind(gst) == "struct"
+    && (globalCellKind(gst) == "struct" || globalCellKind(gst) == "nulstruct")
     && globalIsNonConst(gst)
 }
 
@@ -18204,6 +18442,24 @@ function taggedNameCloValue(ix: i32): boolean {
 }
 
 // Why `cloValueFeOf` found no function for closure value `ix`.
+// A generic function read as a value that no call fixes is legacy's own refusal, raised at the
+// read before the claim declines; a stub write's right side is exempt, as legacy's is.
+function cloUnfixedRefuse(ix: i32) {
+  const n = nodeAt(ix)
+  if !(n is Ident) || identReadArmOf(n, ix, ibFnIx, false) != "nonlocal" {
+    return 0
+  }
+  const fe = fnValueFeOf(n, sidOfNode(ix), ix, ibFnIx)
+  if fe >= 0 && emitSoftFail && fnValueArmOf(fe, ix, ibStubRhs) == "unfixed" {
+    emitFailAt(
+      "emitProgram: a generic function taken as a value reaches no call that fixes its type "
+        + "— annotate the destination's function type",
+      ix,
+    )
+  }
+  return 0
+}
+
 function cloValueWhy(ix: i32): string {
   const n = nodeAt(ix)
   if n is FuncDecl { return "closure literal not lifted" }
