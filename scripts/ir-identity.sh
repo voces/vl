@@ -2,8 +2,8 @@
 # Byte identity of what the IR claims, two ways.
 #
 #     scripts/ir-identity.sh <seed-a> <seed-b> [--names]
-#     scripts/ir-identity.sh --cases <seed>
-#     scripts/ir-identity.sh --claimless <seed> [list]
+#     scripts/ir-identity.sh --cases <seed> [--shard i/n]
+#     scripts/ir-identity.sh --claimless <seed> [list] [--shard i/n]
 #     scripts/ir-identity.sh --compare | --compare-errors <list> <dir-a> <dir-b>
 #
 # The first builds every distilled cell (`cells/`, `named/`) and the self-compile under two
@@ -33,7 +33,19 @@
 # proves those still behave alike. `--build-claimless <seed> <out>` writes the claimless compiler alone.
 # Either exits 1 on any other difference. Run from the checkout root; $VL names the host, $JOBS the
 # fan-out (default 4); $VL defaults to the checkout's host. Temp files live under $TMPDIR and are removed on exit.
+# `--shard i/n` keeps every n-th program of each list, starting at the i-th, so n runs partition
+# the lists (CI's ci-ir-identity jobs). $IR_IDENTITY_CLAIMLESS names a claimless compiler
+# `--build-claimless` wrote from this tree, so a second mode in one job does not rebuild it.
 set -euo pipefail
+SHARD=""
+args=()
+while [ $# -gt 0 ]; do
+  if [ "$1" = --shard ]; then SHARD=${2:?usage: --shard i/n}; shift 2; else args+=("$1"); shift; fi
+done
+set -- "${args[@]+"${args[@]}"}"
+if [ -n "$SHARD" ] && ! [[ "$SHARD" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ && ${BASH_REMATCH[1]} -le ${BASH_REMATCH[2]} ]]; then
+  echo "ir-identity: --shard wants i/n with 1 <= i <= n, got '$SHARD'" >&2; exit 2
+fi
 export VL=${VL:-$PWD/scripts/vl-host/target/release/vl}
 # An invalid IR-claimed module is rc 70, never legacy's fallback bytes, so no differ hides behind it.
 export VL_IR_STRICT=1
@@ -217,8 +229,16 @@ if [ "${1:-}" = "--compare-errors" ]; then
   exit
 fi
 
+# Keeps list file $1's share under `--shard i/n`: the lines whose index is i modulo n.
+shard_list() {
+  [ -n "$SHARD" ] || return 0
+  awk -v i="${SHARD%/*}" -v n="${SHARD#*/}" '(NR - 1) % n == i - 1' "$1" > "$1.shard"
+  mv "$1.shard" "$1"
+}
+
 # The checkout's compiler with `CLAIMED` empty, built by seed $1 to $T/claimless.wasm.
 claimless() {
+  if [ -n "${IR_IDENTITY_CLAIMLESS:-}" ]; then cp "$IR_IDENTITY_CLAIMLESS" "$T/claimless.wasm"; return; fi
   cp -r compiler "$T/c0"
   awk '
     /^const CLAIMED: IrFamily\[\] = \[$/ { print "const CLAIMED: IrFamily[] = []"; skip = 1; hit = 1; next }
@@ -245,6 +265,7 @@ if [ "${1:-}" = "--claimless" ]; then
     "$VL" run scripts/ir-i8-census/witnesses.vl --compiler "$SEED" -- "$WIT" \
       docs/internals/inventory docs/internals/inventory-2 >> "$T/list"
   fi
+  shard_list "$T/list"
   build_all "$T/list" "$SEED" "$T/a"
   build_all "$T/list" "$T/claimless.wasm" "$T/b"
   compare_all "$T/list" "$T/a" "$T/b"
@@ -260,11 +281,13 @@ if [ "${1:-}" = "--cases" ]; then
   SEED_A=$SEED SEED_B=$T/claimless.wasm
   { grep -rL '^// @error' --include='*.vl' tests/cases; ls scripts/capability-probes/*.vl; } \
     | sort > "$T/list"
+  shard_list "$T/list"
   build_all "$T/list" "$SEED" "$T/a"
   build_all "$T/list" "$T/claimless.wasm" "$T/b"
   compare_all "$T/list" "$T/a" "$T/b"
   echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd"
   "$VL" run scripts/inventory/witnesses.vl --compiler "$SEED" -- --outcome emit_reject --out "$T/w" > "$T/errs"
+  shard_list "$T/errs"
   # A witness of the test-only refusal hook refuses only under the flag `check-filed-witnesses` passes.
   FLAGS=--test-emit-refusal build_all "$T/errs" "$SEED" "$T/ea"
   FLAGS=--test-emit-refusal build_all "$T/errs" "$T/claimless.wasm" "$T/eb"
@@ -280,6 +303,7 @@ export FLAGS=${3:-}
 SEED_A=$A SEED_B=$B
 D=scripts/silent-sweep/distilled
 ls "$D"/cells/*.vl "$D"/named/*.vl > "$T/list"
+shard_list "$T/list"
 build_all "$T/list" "$A" "$T/a"
 build_all "$T/list" "$B" "$T/b"
 compare_all "$T/list" "$T/a" "$T/b"
