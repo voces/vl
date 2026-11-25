@@ -61,3 +61,11 @@ valued if's value") refuses it, and the prototype dropped 7 claims across 5 func
 prerequisite is a live-stack change in `ir_lower.vl` that lets an operand sit above a valued `if`'s
 value. The builder side should land only after that. (This note came over from #10083, which was
 closed because #10061 had already removed its re-entry.)
+
+## Parked: `for in list union` (coordinator ruling, 2026-11-25)
+
+The class is 4 programs: 3 under tests/cases and the witness of D16897. It is parked behind this
+lane's other items. Legacy's `emitListUnionForLoop` writes a tag chain over the union box and
+lowers the loop body once per arm, each copy under `knownArmEnter(i)`, beside a flat variant
+(`emitListUnionForFlat`). The IR has no such loop shape. Porting it means building the body once per
+arm under per-arm builder state, behind a custom loop header.
