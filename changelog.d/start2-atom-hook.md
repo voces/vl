@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims values the atom hook converts at more destinations:** a const bound to a literal or a one-literal call result stored as a map's value, used as a map key or added to a literal-keyed set, delivered into a `K | null` (an annotated binding, a list beside an `as?`), or handed to an open destination. Each is built by the hook's arm at its atom rep, as `emitExpr` writes it. `pre-path atom hook` falls 8 → 0 on its programs; six of the eight start bodies are now claimed, and the two hole-lambda calls now refuse on the lambda's open parameter (`closure argument box`).
