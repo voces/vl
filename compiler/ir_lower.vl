@@ -254,6 +254,7 @@ import {
   RResultPick,
   RRetNull,
   RRetag,
+  RSharedFieldSet,
   RSharedRead,
   RSimd,
   RSpread,
@@ -420,6 +421,7 @@ import {
   arrNewLenStash,
   arrNewPlanOf,
   arrNewTail,
+  asFailReport,
   asLitTail,
   asMapProbeTrapTail,
   asPropNicheHeapOf,
@@ -673,6 +675,12 @@ import {
   sharedArmModeReads,
   sharedArmTail,
   sharedArmTestTail,
+  sharedFieldArmCast,
+  sharedFieldArmClose,
+  sharedFieldArmTest,
+  sharedFieldArmsEnd,
+  sharedFieldStorePlan,
+  sharedFieldValSlot,
   sharedReadPlainOf,
   sharedReadPlanOf,
   sharedReadStashes,
@@ -924,6 +932,7 @@ import {
   localStructIdx,
   loopBrkDepth,
   loopContDepth,
+  sHeapIdx,
   sTy,
   shIdxFrom,
   shIdxNode,
@@ -1526,6 +1535,7 @@ function rhs(r: Rhs, tail: boolean) {
     RVariantDiscrim => variantDiscrim(r)
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
+    RSharedFieldSet => irLMiss("shared field store value")
     RBoxNarrow => boxNarrow(r)
     RNicheRead => nicheRead(r)
     RArmUnbox => armUnbox(r)
@@ -1681,6 +1691,7 @@ function rawEff(n: SRawOp, pending: i32[], at: i32) {
     "reserve.open" => reserveOpen(n, at)
     "reserve.close" => listBuildClose(n.srImm)
     "sink.put" | "sink.null" | "sink.close" => sinkPairOp(n)
+    "as.fail" => asFailReport(n.srImm)
   }
   return 0
 }
@@ -2177,8 +2188,10 @@ function nulTestOpArm(r: RNulTest): NulTestArm | null {
 // `RNulTest`: the operand, then legacy's tail for the arm `nulTestArmOf` names: the atom
 // sentinel's compare, a nullable ref's `ref.is_null`, or a union box's null tag compare.
 function nulTestOp(r: RNulTest) {
-  const arm = nulTestOpArm(r)
-  if arm == null { return irLMiss("null test node") }
+  const arm0 = nulTestOpArm(r)
+  if arm0 == null { return irLMiss("null test node") }
+  // An optional chain built once as its value is tested at that value's own rep.
+  const arm = if arm0 == "optChain" { repNulTestArm(opRepOf(r.ntV)) } else { arm0 }
   if arm == "atom" {
     irLOpnd(r.ntV)
     return nulTestAtomTail(r.ntInvert)
@@ -2197,6 +2210,15 @@ function nulTestOp(r: RNulTest) {
   }
   // The builder makes `RNulTest` only at the five arms above.
   return irLMiss("null test " + arm)
+}
+
+// The null test a nullable value at rep `vr` takes by its discipline: a ref's or string's
+// `ref.is_null`, a boolean's or atom's sentinel, a union box's tag; "none" for a rep with none.
+function repNulTestArm(vr: i32): NulTestArm {
+  const n = repNodeAt(vr)
+  if n is RBox { return "boxTag" }
+  if !(n is RNullable) { return "none" }
+  return if n.rnDisc == 1 { "nullRef" } else if n.rnDisc == 2 { "bool" } else if n.rnDisc == 3 { "atom" } else if n.rnDisc == 4 { "boxTag" } else { "none" }
 }
 
 // `RListEmpty`: the list, then legacy's emptiness walk over the slots and kind its plan names.
@@ -2719,6 +2741,56 @@ function sharedRead(r: RSharedRead) {
   return 0
 }
 
+// `RSharedFieldSet`: legacy's shared field write. The receiver is staged once or pushed again per
+// arm, and the value staged once or written in its arm. Each arm but the last tests its tag; each
+// casts the payload to its variant and stores the value at its field.
+function sharedFieldSet(r: RSharedFieldSet) {
+  const fnIx = lw.irAt
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const plan = sharedFieldStorePlan(lhsOfAssign(r.shAt), fnIx, vis, fis)
+  if plan == 0 || r.shVs.length != (if plan == 1 { vis.length } else { 1 }) {
+    return irLMiss("shared field store plan")
+  }
+  const slot = if r.shStash { sharedFieldRecvSlot() } else { -1 }
+  if r.shStash {
+    irLOpnd(r.shR)
+    fbLocalSet(slot)
+  }
+  const vslot = if plan == 2 { sharedFieldValSlot(lhsOfAssign(r.shAt), fnIx, vis, fis) } else { -1 }
+  if plan == 2 {
+    irLOpnd(r.shVs[0])
+    fbLocalSet(vslot)
+  }
+  let i = 0
+  while i < vis.length {
+    if i < vis.length - 1 {
+      sharedFieldSetRecv(r, slot)
+      sharedFieldArmTest(vis, i)
+    }
+    sharedFieldSetRecv(r, slot)
+    sharedFieldArmCast(vis, i)
+    if plan == 2 { fbLocalGet(vslot) } else { irLOpnd(r.shVs[i]) }
+    sharedFieldArmClose(vis, fis, i)
+    i = i + 1
+  }
+  return sharedFieldArmsEnd(vis)
+}
+
+// One receiver push of shared field write `r`: its stash slot's box, its global's, else its box
+// local.
+function sharedFieldSetRecv(r: RSharedFieldSet, slot: i32) {
+  if r.shStash { return sharedRecvSlotGet(slot) }
+  if r.shGlobal >= 0 { return globalRead(r.shGlobal, r.shGlobalNonNull) }
+  return irLOpnd(r.shR)
+}
+
+// The target of assignment node `at`, or -1.
+function lhsOfAssign(at: i32): i32 {
+  const a = nodeAt(at)
+  return if a is BinExpr { unwrapParen(a.binLeft) } else { -1 }
+}
+
 // One member's arm of shared read `r`, in its form (`sharedArmModeOf`) as legacy writes it: the
 // head, the receiver where the form reads it, then the tail.
 function sharedReadArm(
@@ -3196,9 +3268,7 @@ function memAccess(r: RMemAccess) {
   if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length {
     return irLMiss("memory access node")
   }
-  const f = nodeAt(c.callFn)
-  if !(f is Ident) { return irLMiss("memory access node") }
-  const p = memAccessPlanOf(f.identName)
+  const p = memAccessPlanOf(r.mmName)
   const ap = irAddrPlan(c, p.mxBase)
   if (
     p.mxOp < 0
@@ -4599,8 +4669,17 @@ function structEq(r: RStructEq) {
   const rB = r.seNul && !rE && !(repNodeAt(opRepOf(r.seR)) is RNullable)
   const lG = !lS && (structEqPlaceSide(r.seL) || lB)
   const rG = !rS && (structEqPlaceSide(r.seR) || rB)
-  const lLoc = if lS || lE || lG { -1 } else { structEqSideLocal(r.seL) }
-  const rLoc = if rS || rE || rG { -1 } else { structEqSideLocal(r.seR) }
+  const lV = if lS || lE || lG { -1 } else { structEqSideLocal(r.seL) }
+  const rV = if rS || rE || rG { -1 } else { structEqSideLocal(r.seR) }
+  // A side held nowhere (an optional chain's value) is written once to a fresh local of its row;
+  // the slot is shared by heap type, so one side at most.
+  const lO = !lS && !lE && !lG && lV < 0 && structEqOnceSide(r.seL)
+  const rO = !rS && !rE && !rG && rV < 0 && structEqOnceSide(r.seR)
+  if lO && rO { return irLMiss("record compare two fresh sides") }
+  const heap = if row >= 0 && row < sHeapIdx.length { sHeapIdx[row] } else { -1 }
+  if (lO || rO) && heap < 0 { return irLMiss("record compare fresh row") }
+  const lLoc = if lO { irOnceRefSlot(heap) } else { lV }
+  const rLoc = if rO { irOnceRefSlot(heap) } else { rV }
   if !lS && !lE && !lG && lLoc < 0 || !rS && !rE && !rG && rLoc < 0 {
     return irLMiss("record compare place")
   }
@@ -4622,6 +4701,14 @@ function structEq(r: RStructEq) {
   const saved = structEqEnter()
   if lS { irLOpnd(r.seL) }
   if rS { irLOpnd(r.seR) }
+  if lO {
+    irLOpnd(r.seL)
+    fbLocalSet(lLoc)
+  }
+  if rO {
+    irLOpnd(r.seR)
+    fbLocalSet(rLoc)
+  }
   structEqPlaceSkip(lG, rG, r)
   const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
   // Two nullable records' compare: the nullness guard and the fields, then `!=`'s `i32.eqz`, as
@@ -4838,6 +4925,9 @@ function irReadsAgain(ix: i32): boolean {
     && m is Member
     && irReadsAgain(unwrapParen(m.memObj))
 }
+
+// Whether record compare side `o` is a temp no variable holds, a value written once to a local.
+function structEqOnceSide(o: Opnd): boolean { return o is OVar && isTemp(o.ov) }
 
 // The local a record compare reads unstashed operand `o` from: a variable's slot, else -1.
 function structEqSideLocal(o: Opnd): i32 {
@@ -5509,6 +5599,11 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       }
       if r is RMapClear {
         mapClear(r)
+        irLSettle(pending)
+        return 0
+      }
+      if r is RSharedFieldSet {
+        sharedFieldSet(r)
         irLSettle(pending)
         return 0
       }

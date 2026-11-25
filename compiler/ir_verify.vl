@@ -1,3 +1,4 @@
+import { i32ListHas } from "./listutil"
 // The IR verifier (ir-design-2026-11.md §2): one linear walk over an `IrFn` that checks rules
 // 1-7: closed reps, rep agreement, types against reps, definitions before uses, control, calls
 // and switch coverage. Rule 10 keeps raw reps and ops (`RRaw`, `RRawOp`, `SRawOp`) and valued
@@ -115,6 +116,7 @@ import {
   RResultPick,
   RRetNull,
   RRetag,
+  RSharedFieldSet,
   RSharedRead,
   RSimd,
   RSpread,
@@ -219,7 +221,7 @@ import {
 import { tyHasTyVar } from "./tyquery"
 import { NICHE_NUL_LIT, NICHE_NUL_MAP } from "./emit_start_block"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
-import { AsExpr, Call, i32ToStr, nodeAt } from "./ast"
+import { AsExpr, Call, P, i32ToStr, nodeAt } from "./ast"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -713,6 +715,36 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RSharedFieldSet => {
+      for v in r.shVs { use(v, at) }
+      if dst >= 0 { return fail(2, at, "a shared field store is a statement") }
+      // A global receiver is read again at each push; its recorded cell is the box, `shR` unread.
+      if r.shGlobal >= 0 {
+        if !boxShaped(irGlobalRepOf(vf, r.shGlobal)) {
+          return fail(2, at, "a shared field store's global receiver is a box")
+        }
+        return 0
+      }
+      use(r.shR, at)
+      // Unstaged, every arm reads the receiver again, and a temp is read once.
+      if (
+        !r.shStash
+        && (!(r.shR is OVar)
+          || r.shR.ov < 0
+          || r.shR.ov >= vf.irVars.length
+          || vf.irVars[r.shR.ov].vKind == "temp")
+      ) {
+        return fail(
+          2,
+          at,
+          "a shared field store's receiver is a variable read more than once",
+        )
+      }
+      if !boxShaped(opRep(r.shR)) {
+        return fail(2, at, "a shared field store's receiver is a box")
+      }
+      0
+    }
     RArmUnbox => {
       use(r.uaV, at)
       if !boxShaped(opRep(r.uaV)) {
@@ -983,10 +1015,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         }
         return 0
       }
+      let si = 0
       for s in r.spSrcs {
-        if opRep(s) != dst {
+        // A group the plan converts is a list at its own element rep (`spConv`).
+        const conv = i32ListHas(r.spConv, si) && repNodeAt(opRep(s)) is RList
+        if opRep(s) != dst && !conv {
           return fail(2, at, "a spread's source rep is not the literal's")
         }
+        si = si + 1
       }
       0
     }
@@ -1386,10 +1422,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RNumWiden => {
       use(r.nwV, at)
-      if (
-        numKindOf(opRep(r.nwV)) != r.nwSrc
-        || dst >= 0 && numKindOf(dst) != r.nwDst
-      ) {
+      // A boolean widens as the i32 0 or 1 it holds.
+      const sk = if repPrim(opRep(r.nwV)) == "bool" { 1 } else { numKindOf(opRep(r.nwV)) }
+      if sk != r.nwSrc || dst >= 0 && numKindOf(dst) != r.nwDst {
         return fail(2, at, "a widening's reps are not its kinds")
       }
       0
@@ -2135,6 +2170,10 @@ function rawEff(e: SRawOp, at: i32) {
     }
     return 0
   }
+  if e.srOp == "as.fail" {
+    const c = if e.srImm >= 0 && e.srImm < P.nodes.length { nodeAt(e.srImm) } else { null }
+    return if e.srArgs.length == 0 && c is AsExpr && c.asMode == "trap" { 0 } else { fail(10, at, "as.fail is not an `as!` cast's report") }
+  }
   if !vf.irHelper { return fail(10, at, "a raw op outside a runtime helper") }
   // Every outstanding push is this effect's leading operands, in push order.
   let k = 0
@@ -2161,7 +2200,7 @@ function rawEff(e: SRawOp, at: i32) {
     "array.copy" => n == 5 && ref0 && rawAt(opRep(a[2]), e.srImm)
     "array.init_data" | "array.fill" => n == 4 && ref0
     "call" => true
-    "reserve.open" | "reserve.close" | "sink.put" | "sink.null" | "sink.close" => false
+    "reserve.open" | "reserve.close" | "sink.put" | "sink.null" | "sink.close" | "as.fail" => false
   }
   if !ok {
     return fail(10, at, e.srOp + " is not over heap type " + i32ToStr(e.srHeap))
@@ -3465,6 +3504,7 @@ function rhsReadsList(r: Rhs): boolean {
       RResultPick |
       RRetNull |
       RRetag |
+      RSharedFieldSet |
       RSharedRead |
       RSimd |
       RSpread |

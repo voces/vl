@@ -639,32 +639,31 @@ Deno.test({
   },
 });
 
-// Outside the set: a `??` over a `null`-typed if-expression and an `as?` over a type parameter
-// each leave their function uncovered, named. A closure parameter, its baked
+// Outside the set: a `??` over a `null`-typed if-expression and an assignment's radix literal
+// widened through an if-expression each leave their function uncovered, named. A closure parameter, its baked
 // callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // An `as!` over a type parameter pinned at no number, which legacy writes as the operand and a
-    // trap inside the expression, is outside the set too.
     const src = `function greet(c: boolean, k: i32): i32 {
   const x = null
   return k + ((if c { x } else { x }) ?? 0)
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv<T>(u: T): i32 {
-  return u as! i32
+function wr(c: boolean): i64 {
+  let x: i64 = 0
+  return x = if c { 0xfffffffe } else { 1 }
 }
 print(greet(true, 1))
 print(ap((x: i32) => x + 1))
-print(cv("s"))
+print(wr(true))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    for (const why of ["expression as"]) {
+    for (const why of ["widen radix"]) {
       if (!rows.has(`uncovered ${why}`)) {
         throw new Error(`want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
       }
