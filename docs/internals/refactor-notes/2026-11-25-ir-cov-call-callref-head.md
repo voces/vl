@@ -51,4 +51,6 @@ back, and every class program is byte-identical under `VL_IR_STRICT=1 VL_IR_SHAD
     and module scope.
   - On master the IR leaves 7 of its functions and the start body uncovered; with this change all
     13 and the start match.
-- **Byte identity:** the program counts are in the PR body.
+- **Byte identity** against the merge-base seed (default build, equal exit codes): `tests/cases` 0
+  of 9,422 differ, distilled + capability probes + witnesses 0 of 18,150, and the self-compile is
+  identical.
