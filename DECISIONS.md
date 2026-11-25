@@ -13219,6 +13219,21 @@ which every reader of the instance's types inherits. The alternative, emitting a
 stored row as a `.` read is (#10001), would have to be repeated in each emitter, and legacy's is
 frozen.
 
+## A concrete `??` checks its default against its destination (2026-11-25, coordinator ruling) — D17565
+
+**Ruled by the coordinator 2026-11-25**, on lane SOUND's trace. A concrete `??` typed its result
+with its literal default widened to the base, so `n ?? "m"` delivered to a `"m" | "n"` binding was
+refused, while the same `??` in a hole function called at `null` ran. The default is now checked
+against the destination, as a valued `if` checks its arms (`coalLitJoinOf`, check_operators.vl),
+when the left side contributes no literal of its own. `function j(x: null) { return x ?? "m" }` at
+`"m" | "n"` stays refused by design: an un-annotated return widens its literal, and the refusal now
+names the annotation that would make it reach (`retWidenedLitNote`). The hole function `j(null)`
+is unchanged.
+
+**Why.** The destination already decides a valued `if`'s literal arms, and a `??` is the same join.
+Widening at the un-annotated return keeps a function's inferred signature independent of its
+callers.
+
 ## Byte identity with legacy stops being a gate; ci-ir-identity grades behaviour (2026-11-25, coordinator ruling)
 
 **Ruled by the coordinator 2026-11-25, after consulting the owner**, ahead of I8 rather than at it.
