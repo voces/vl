@@ -9857,6 +9857,7 @@ export function idxStoreNullUnitUnstamped(
   if u < 0 || u >= P.nodes.length { return false }
   const n = nodeAt(u)
   if n is NullLit { return nullOwnAt(u, fnIx) == NULL_OWN_NONE }
+  if asgYieldsNulHole(u, fnIx) { return true }
   if !boxOperandIsNulNone(rhs, fnIx) { return false }
   return n is BinExpr || n is Call || nullReadDstOwnOf(u, fnIx) < 0
 }
@@ -14770,7 +14771,9 @@ function emitArrI32(arrIx: i32, elems: i32[], fnIx: i32, lbKind: i32) {
         )
       }
     }
-    if nulUnit && isNullTy(nodeTyAt(elems[i], fnIx)) {
+    const eNul = isNullTy(nodeTyAt(elems[i], fnIx))
+      || asgYieldsNulHole(unwrapParen(elems[i]), fnIx)
+    if nulUnit && eNul {
       if !(nodeAt(unwrapParen(elems[i])) is NullLit) {
         if emitExpr(elems[i], fnIx) < 0 { return -1 }
         fbDrop()
@@ -47097,6 +47100,7 @@ export type CoalNulRefsArm = "heap"
   | "armIf"
   | "boxFieldScalar"
   | "cellIf"
+  | "atomJoinStash"
   | "none"
 
 export function coalNulRefsArmOf(
@@ -47146,6 +47150,14 @@ export function coalNulRefsArmOf(
   if cell is Index && exprReReadable(lhsIx) && !exprMap(cell.idxArr, fnIx) {
     return "cellIf"
   }
+  // A `K | null` niche a call yields, joined into a box, is held once in a slot (D17182).
+  if (
+    lhsIx >= 0
+    && exprNulLitUnion(lhsIx, fnIx)
+    && coalesceResultIsBox(exprIx, fnIx)
+  ) {
+    return "atomJoinStash"
+  }
   return "none"
 }
 
@@ -47156,7 +47168,7 @@ export function coalNulRefsHeapOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   return match coalNulRefsArmOf(e, exprIx, fnIx) {
     "heap" => coalNulRefHeapOf(e, unwrapParen(e.binLeft), exprIx, fnIx)
     "mapHeap" => mapTypeIdxOf(coalNulMapShape(e, fnIx))
-    "boxStash" | "pinnedCellIf" | "atomJoinIf" | "numJoinIf" | "armIf" | "boxFieldScalar" | "cellIf" | "none" => -1
+    "boxStash" | "pinnedCellIf" | "atomJoinIf" | "numJoinIf" | "armIf" | "boxFieldScalar" | "cellIf" | "atomJoinStash" | "none" => -1
   }
 }
 
@@ -47195,10 +47207,55 @@ function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
     "armIf" => emitExpr(coalNullArmIf(e, exprIx), fnIx)
     // A record union's shared `scalar | null` field reads as its box (D13280).
     "boxFieldScalar" => emitCoalesceBoxFieldScalar(e, exprIx, fnIx)
+    "atomJoinStash" => emitCoalesceNulAtomJoin(e, exprIx, fnIx)
     "none" => emitFail(
       "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
     )
   }
+}
+
+// The boxed `??` over a `K | null` niche that cannot be read again: the operand is evaluated once
+// into a scratch slot, its null (`-1`) takes the boxed default, and a present atom is boxed as its
+// member string under the union's string arm, as the re-readable join's arm boxes it.
+function emitCoalesceNulAtomJoin(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const why = coalNulAtomJoinWhy(e, fnIx)
+  if why != "" { return emitFailAt(why, exprIx) }
+  const texts = nulLitAtomTexts(unwrapParen(e.binLeft), fnIx)
+  if texts.length == 0 {
+    return emitFailAt(
+      "emitProgram: `??` over a literal union's niche names no member",
+      exprIx,
+    )
+  }
+  const slot = widenTmpSlot(4001)
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  fbLocalTee(slot)
+  fbI32Const(-1)
+  fbI32Bin(70)     // 0x46 i32.eq → null?
+  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
+  if (emitUnionBoxAtRecord("", -1, e.binRight, fnIx) < 0) { return -1 }
+  fbElse()
+  fbI32Rel(RS_TAG, scalarTagOfKind(2))
+  if emitAtomToStrChain(texts, 0, slot) < 0 { return -1 }
+  fbStructNew(uBoxIdx)
+  fbEnd()
+  return 0
+}
+
+// Why `emitCoalesceNulAtomJoin` refuses `e`, or "": the union its result boxes into needs a row
+// and a string arm the member is boxed under, and an arm for its default.
+function coalNulAtomJoinWhy(e: BinExpr, fnIx: i32): string {
+  if boxDstNameAt(e.binRight, fnIx) == "" {
+    return "emitProgram: `??` joins a nullable value into a union the checker recorded no row for"
+  }
+  const joinTy = boxDstTyOf(e.binRight, fnIx)
+  if !coerceTakesAtomAsStr(msSetOfTy(joinTy), joinTy) {
+    return "emitProgram: `??` joins a literal union's member into a union with no string arm"
+  }
+  if !coalJoinDefaultBoxes(joinTy, e.binRight, fnIx) {
+    return "emitProgram: `??` default names no arm of the union its result is"
+  }
+  return ""
 }
 
 // After `??`'s operand box: it into `slot`, its tag tested present opening the box-typed `if`, and

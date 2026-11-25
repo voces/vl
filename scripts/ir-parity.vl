@@ -9,7 +9,10 @@
 // an unlisted byte differ (`ir-divergence-baseline.txt`; `--behaviour-only` passes it), and with
 // `--cross` only where IR on fails to build or runs otherwise where IR off ran clean; 3 on a
 // timeout. `--sample N` keeps a fixed 1-in-N of `cases`. `$JOBS` chunks at once (default 4).
-// Run it from the checkout root.
+// A program the baseline lists with a `legacy-wrong:` mechanism is graded on its IR-on build alone:
+// it passes when that run meets the program's expected output (its `// @log` lines, a `// @trap`
+// as any trap; an inventory row `--files` names, its `Want:`), whatever IR off does.
+// Run it from the checkout root; $IR_DIVERGENCE_BASELINE names another baseline, as for ir-identity.sh.
 
 import { programArgs } from "std:args"
 import { Utf8Error } from "std:utf8"
@@ -24,7 +27,10 @@ import {
   firstLine,
   hasFlag,
   isFile,
+  splitLines,
+  univNl,
 } from "./lib/common"
+import { parseRows, splitFiles } from "./lib/inventory"
 import {
   cellsIn,
   cwd,
@@ -160,6 +166,34 @@ function sampled(files: string[], n: i32): string[] {
   return out
 }
 
+// The baseline key of each inventory witness `--files` materialised: its row's file.
+const ROW_OF: Map<string, string> = Map()
+// The `Want:` block of each such witness, "" when its row has none.
+const WANT_OF: Map<string, string> = Map()
+
+// The entry file of row file `doc`'s witness, written under `tmp`; `ROW_OF` and `WANT_OF` name it.
+function rowWitness(doc: string, tmp: string): string {
+  for r in parseRows(doc, splitLines(univNl(readText(doc)))) {
+    if r.repro == "" { continue }
+    const dir = tmp + "/rows/" + r.id
+    if spawn("mkdir", ["-p", dir]).code != 0 {
+      die("ir-parity: cannot make \{dir}", 2)
+    }
+    const parts = splitFiles(r.repro)
+    let i = 0
+    while i + 1 < parts.length {
+      writeText(dir + "/" + parts[i], parts[i + 1])
+      i = i + 2
+    }
+    const entry = dir + "/" + parts[parts.length - 2]
+    ROW_OF[entry] = doc
+    WANT_OF[entry] = r.want
+    return entry
+  }
+  die("ir-parity: \{doc} holds no row with a Repro block", 2)
+  return ""
+}
+
 function population(
   args: readonly string[],
   seed: string,
@@ -169,7 +203,13 @@ function population(
   const from = argOr(args, "--from", "")
   if files.length > 0 || from != "" {
     const out: string[] = []
-    for f in files { out.push(f) }
+    for f in files {
+      if endsWith(f, ".md") {
+        out.push(rowWitness(f, tmp))
+      } else {
+        out.push(f)
+      }
+    }
     if from != "" {
       for l in split(readText(from), "\n") {
         if l != "" { out.push(l) }
@@ -313,8 +353,48 @@ function clean(s: string): string {
   return join(split(join(split(s, "\t"), " "), "\n"), " ")
 }
 
+// `s` without its trailing newlines.
+function trimNl(s: string): string {
+  let n = s.length
+  while n > 0 && s.slice(n - 1, n) == "\n" { n = n - 1 }
+  return s.slice(0, n)
+}
+
+// The row of a `legacy-wrong` program: its IR-on run against the expected output in `want`
+// (`ok`, `trap` or `none` on the first line, then the stdout).
+function legacyWrong(c: Ctx, f: string, k: string, want: string): string {
+  const nl = want.indexOf("\n")
+  const how = want.slice(0, nl)
+  const out = want.slice(nl + 1, want.length)
+  if how == "none" {
+    return "differs\tlegacy-wrong: no expected output (no // @log, @trap or @run line, no Want)"
+  }
+  const a = c.tmp + "/" + k + ".on.wasm"
+  const ba = build(c, c.on, f, a)
+  if ba.rc == 124 { return "timeout(build on)\t" }
+  if ba.rc != 0 { return "build-fails(on)\tlegacy-wrong: " + clean(ba.err) }
+  const ra = run(c, a)
+  spawn("rm", ["-f", a])
+  if ra.rc == 124 { return "timeout(run on)\t" }
+  if how == "ok" && ra.how != "ok" {
+    return "differs\tlegacy-wrong: on "
+      + clean(ra.how)
+      + ", expected a clean run"
+  }
+  if how == "trap" && !startsWith(ra.how, "trap: ") {
+    return "differs\tlegacy-wrong: on " + clean(ra.how) + ", expected a trap"
+  }
+  if trimNl(ra.out) != trimNl(out) {
+    return "differs\tlegacy-wrong: on vs expected "
+      + clean(firstDiff(ra.out, out))
+  }
+  return "same\tlegacy-wrong, on meets its expected output"
+}
+
 // One program's row: its verdict and detail, the two sides read as `on` and `off`.
 function parity(c: Ctx, f: string, k: string): string {
+  const wf = c.tmp + "/want/" + k
+  if isFile(wf) { return legacyWrong(c, f, k, readText(wf)) }
   const a = c.tmp + "/" + k + ".on.wasm"
   const b = c.tmp + "/" + k + ".off.wasm"
   const ba = build(c, c.on, f, a)
@@ -382,7 +462,8 @@ function chunk(file: string) {
 
 // ── the parent ───────────────────────────────────────────────────────────────────
 
-// The programs `ir-divergence-baseline.txt` lists (`program\tfunction\tmechanism\tPR`).
+// The programs `ir-divergence-baseline.txt` lists (`program\tfunction\tmechanism\tPR`), each
+// `true` when a line of it is `legacy-wrong:`.
 function listed(path: string): Map<string, boolean> {
   const m: Map<string, boolean> = Map()
   if !isFile(path) { return m }
@@ -392,9 +473,28 @@ function listed(path: string): Map<string, boolean> {
     if f.length != 4 {
       die("ir-parity: \{path}: not four tab-separated fields: \{l}", 2)
     }
-    m[f[0]] = true
+    m[f[0]] = (m[f[0]] ?? false) || startsWith(f[2], "legacy-wrong:")
   }
   return m
+}
+
+// The expected output of program `f` as `legacyWrong` reads it: the row's `Want:` for a row
+// witness, else the program's `// @log` lines, `// @trap` or `// @run`.
+function expected(f: string): string {
+  if ROW_OF.has(f) {
+    const w = WANT_OF[f] ?? ""
+    return if w == "" { "none\n" } else { "ok\n" + w }
+  }
+  let how = "none"
+  const out: string[] = []
+  for l in splitLines(univNl(readText(f))) {
+    if l == "// @log" { out.push("\n") }
+    else if startsWith(l, "// @log ") { out.push(l.slice(8, l.length) + "\n") }
+    else if l == "// @trap" || startsWith(l, "// @trap ") { how = "trap" }
+    else if l == "// @run" && how == "none" { how = "ok" }
+  }
+  if how == "none" && out.length > 0 { how = "ok" }
+  return how + "\n" + join(out, "")
 }
 
 function count(m: Map<string, i32>, k: string) { m[k] = (m[k] ?? 0) + 1 }
@@ -456,6 +556,13 @@ function main(args: readonly string[]) {
     spawn("rm", ["-rf", tmp])
     die("ir-parity: cannot build \{SELF}\n\{w.out}\{w.err}", 2)
   }
+  const base = listed(envOr("IR_DIVERGENCE_BASELINE", BASELINE))
+  spawn("mkdir", ["-p", tmp + "/want"])
+  for p in progs {
+    if base[ROW_OF[p] ?? p] ?? false {
+      writeText(tmp + "/want/" + join(split(p, "/"), "_"), expected(p))
+    }
+  }
   const abs = (p: string): string => if startsWith(p, "/") { p } else { root + "/" + p }
   const all = if hasFlag(args, "--run-all") { "1" } else { "0" }
   const head = join(
@@ -508,7 +615,6 @@ function main(args: readonly string[]) {
     )
   }
   sort(rows, (a: string, b: string) => a < b)
-  const base = listed(BASELINE)
   const loose = hasFlag(args, "--behaviour-only")
   const cross = hasFlag(args, "--cross")
   const n: Map<string, i32> = Map()
@@ -517,10 +623,12 @@ function main(args: readonly string[]) {
   const out: string[] = []
   for r in rows {
     const f = split(r, "\t")
+    f[0] = ROW_OF[f[0]] ?? f[0]
     const v = f[1]
     let d = f[2]
+    if startsWith(d, "legacy-wrong, ") { count(n, "legacy-wrong") }
     if v == "same" && startsWith(d, "behaviour") {
-      if base[f[0]] ?? false {
+      if base.has(f[0]) {
         d = d + ", expected divergence"
         count(n, "expected divergence")
       } else {
@@ -568,7 +676,7 @@ function main(args: readonly string[]) {
   }
   parts.push("timeout " + toString(t))
   print(
-    "ir-parity: \{toString(rows.length)} programs: \{join(parts, ", ")}; byte differs behaviourally equal: expected \{toString(n["expected divergence"] ?? 0)}, unlisted \{toString(n["unlisted divergence"] ?? 0)} (rows in \{dest})",
+    "ir-parity: \{toString(rows.length)} programs: \{join(parts, ", ")}; byte differs behaviourally equal: expected \{toString(n["expected divergence"] ?? 0)}, unlisted \{toString(n["unlisted divergence"] ?? 0)}; legacy-wrong meeting expected output \{toString(n["legacy-wrong"] ?? 0)} (rows in \{dest})",
   )
   if red { exit(1) }
   if slow { exit(3) }

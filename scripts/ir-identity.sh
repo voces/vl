@@ -30,7 +30,11 @@
 # (default $TMPDIR/ir-identity-keep/<run>/). A byte differ of a program that
 # scripts/ir-divergence-baseline.txt lists prints `expected divergence f (fns)` and passes when every
 # function whose body differs (`--names` builds, `wasm-dis`) is listed for it; `scripts/ir-parity.vl`
-# proves those still behave alike. `--build-claimless <seed> <out>` writes the claimless compiler alone.
+# proves those still behave alike. A program listed with a `legacy-wrong:` mechanism (O3: legacy's
+# bytes are wrong, the IR's right) may also build under the claims seed where the claimless one
+# refuses (`expected divergence f (legacy-wrong: claimless exit N)`); `ir-parity.vl` proves its
+# IR-on run against the program's expected output instead of against IR off.
+# `--build-claimless <seed> <out>` writes the claimless compiler alone.
 # Either exits 1 on any other difference. Run from the checkout root; $VL names the host, $JOBS the
 # fan-out (default 4); $VL defaults to the checkout's host. Temp files live under $TMPDIR and are removed on exit.
 # `--shard i/n` keeps every n-th program of each list, starting at the i-th, so n runs partition
@@ -158,6 +162,11 @@ expected_divergence() {
   echo "$(paste -sd, "$T/fd")"
 }
 
+# Whether file $1 has a `legacy-wrong:` line in the baseline.
+legacy_wrong() {
+  [ -f "$BASELINE" ] && awk -F '\t' -v f="$(bkey "$1")" '$1 == f && $3 ~ /^legacy-wrong:/ { hit = 1 } END { exit !hit }' "$BASELINE"
+}
+
 # Records file key $3 of dirs $1 and $2 as not identical, so its logs are kept.
 keep() { printf '%s\t%s\n%s\t%s\n' "$1" "$3" "$2" "$3" >> "$T/keep"; }
 
@@ -172,7 +181,9 @@ compare_all() {
     if timed_out "$f" "$2" "$3" "$ra" "$rb" "$k"; then tmo=$((tmo + 1)); continue; fi
     [ "$ra" = "$rb" ] && { [ "$ra" != 0 ] || cmp -s "$2/$k.wasm" "$3/$k.wasm"; } \
       && { [ "$ra" = 0 ] || [ "${ERRCMP:-0}" != 1 ] || cmp -s "$2/$k.err" "$3/$k.err"; } || keep "$2" "$3" "$k"
-    if [ "$ra" != "$rb" ]; then diff=$((diff + 1)); echo "DIFF $f (exit $ra vs $rb)"
+    if [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
+      expd=$((expd + 1)); echo "expected divergence $f (legacy-wrong: claimless exit $rb)"
+    elif [ "$ra" != "$rb" ]; then diff=$((diff + 1)); echo "DIFF $f (exit $ra vs $rb)"
     elif [ "$ra" != 0 ] && [ "${ERRCMP:-0}" = 1 ] && ! cmp -s "$2/$k.err" "$3/$k.err"; then
       diff=$((diff + 1)); echo "DIFF $f (first error: $(cat "$2/$k.err") vs $(cat "$3/$k.err"))"
     elif [ "$ra" != 0 ]; then both=$((both + 1))
@@ -194,7 +205,9 @@ compare_errors() {
     if timed_out "$f" "$2" "$3" "$ra" "$rb" "$k"; then etmo=$((etmo + 1)); continue; fi
     if [ "$ra" != "$rb" ] || { [ "$ra" = 0 ] && ! cmp -s "$2/$k.wasm" "$3/$k.wasm"; } \
       || ! cmp -s "$2/$k.err" "$3/$k.err"; then keep "$2" "$3" "$k"; fi
-    if [ "$ra" != "$rb" ]; then ediff=$((ediff + 1)); echo "DIFF $f (exit $ra vs $rb)"
+    if [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
+      eexpd=$((eexpd + 1)); echo "expected divergence $f (legacy-wrong: claimless exit $rb)"
+    elif [ "$ra" != "$rb" ]; then ediff=$((ediff + 1)); echo "DIFF $f (exit $ra vs $rb)"
     elif [ "$ra" = 0 ] && ! cmp -s "$2/$k.wasm" "$3/$k.wasm" \
       && why=$(expected_divergence "$f" "$2/$k.wasm" "$3/$k.wasm"); then
       eexpd=$((eexpd + 1)); echo "expected divergence $f ($why)"

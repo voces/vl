@@ -29,15 +29,16 @@ function dir(root: string, name: string, builds: Record<string, Build>): string 
 }
 
 /** Runs `ir-identity.sh <mode>` over `a` and `b`; its exit code and stdout. */
-function compare(mode: string, a: Record<string, Build>, b: Record<string, Build>) {
+function compare(mode: string, a: Record<string, Build>, b: Record<string, Build>, baseline = "") {
   const root = Deno.makeTempDirSync();
   try {
     const list = `${root}/list`;
     Deno.writeTextFileSync(list, Object.keys(a).join("\n") + "\n");
     const keep = `${root}/keep`;
+    Deno.writeTextFileSync(`${root}/baseline.txt`, baseline);
     const out = new Deno.Command("bash", {
       args: [SCRIPT, mode, list, dir(root, "a", a), dir(root, "b", b)],
-      env: { IR_IDENTITY_KEEP: keep },
+      env: { IR_IDENTITY_KEEP: keep, IR_DIVERGENCE_BASELINE: `${root}/baseline.txt` },
       stdout: "piped",
       stderr: "piped",
     }).outputSync();
@@ -150,6 +151,35 @@ Deno.test("ir-identity --compare-errors: a timeout is refused there too", () => 
     throw new Error(`want exit 3 and a TIMEOUT, got exit ${r.code}:\n${r.text}`);
   }
 });
+
+// A `legacy-wrong:` line (O3) lets the claims seed build what the claimless one refuses; the same
+// exit differ under any other mechanism, or the claims seed refusing, still reds.
+const LEGACY_WRONG = "t/r.vl\tf@1\tlegacy-wrong: legacy refuses a shape the IR builds\t#0\n";
+for (const mode of ["--compare", "--compare-errors"]) {
+  Deno.test(`ir-identity ${mode}: a legacy-wrong program the claims seed alone builds passes`, () => {
+    const r = compare(mode, { "t/r.vl": { rc: 0, wasm: "bytes" } }, { "t/r.vl": { rc: 1, err: REFUSAL } }, LEGACY_WRONG);
+    if (r.code !== 0 || !r.text.includes("expected divergence t/r.vl (legacy-wrong: claimless exit 1)")) {
+      throw new Error(`want a pass naming legacy-wrong, got exit ${r.code}:\n${r.text}`);
+    }
+  });
+  Deno.test(`ir-identity ${mode}: the same exit differ under another mechanism reds`, () => {
+    const r = compare(
+      mode,
+      { "t/r.vl": { rc: 0, wasm: "bytes" } },
+      { "t/r.vl": { rc: 1, err: REFUSAL } },
+      LEGACY_WRONG.replace("legacy-wrong: ", ""),
+    );
+    if (r.code !== 1 || !r.text.includes("DIFF t/r.vl (exit 0 vs 1)")) {
+      throw new Error(`want a DIFF, got exit ${r.code}:\n${r.text}`);
+    }
+  });
+  Deno.test(`ir-identity ${mode}: a legacy-wrong program the claims seed refuses reds`, () => {
+    const r = compare(mode, { "t/r.vl": { rc: 1, err: REFUSAL } }, { "t/r.vl": { rc: 0, wasm: "bytes" } }, LEGACY_WRONG);
+    if (r.code !== 1 || !r.text.includes("DIFF t/r.vl (exit 1 vs 0)")) {
+      throw new Error(`want a DIFF, got exit ${r.code}:\n${r.text}`);
+    }
+  });
+}
 
 // A listed divergence (`ir-divergence-baseline.txt`, Q57): a byte differ passes as `expected
 // divergence` only when every function whose body differs is listed for that program.
