@@ -1748,6 +1748,8 @@ Deno.test({
       "held-global-read-off-noted-rep": 2,
       "null-into-nullable-record-global": 0,
       "null-into-bool-niche-global": 2,
+      "packed-field-of-i32": 0,
+      "packed-field-of-bool": 2,
       "result-pick-of-i32": 2,
       "result-pick-record-into-i32": 2,
       "record-retag-of-i32": 2,
