@@ -37,6 +37,13 @@ awk '
   END { if (!a || !b || !c) { print "ir-i8-census: a probe anchor in ir_build.vl was not found" > "/dev/stderr"; exit 1 } }
 ' "$T/probe/ir_build.vl" > "$T/ir_build.vl"
 mv "$T/ir_build.vl" "$T/probe/ir_build.vl"
+# Two classes split for the census alone: `is rung` names its rung, and a miss at a node with no
+# rep (`repMissAt`) names the node's kind. The shipped compiler's classes stay unsplit.
+grep -q '^  if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }$' "$T/probe/ir_build.vl" \
+  && grep -q '^  return irBMiss(miss)$' "$T/probe/ir_build.vl" \
+  || { echo "ir-i8-census: a split anchor in ir_build.vl was not found" >&2; exit 1; }
+sed -i -e 's|^  if arm != "variant" \&\& arm != "armTag" { return irBMiss("is rung") }$|  if arm != "variant" \&\& arm != "armTag" { return irBMiss("is rung " + arm) }|' \
+  -e 's|^  return irBMiss(miss)$|  return irBMiss(miss + " of " + irAstKind(ix))|' "$T/probe/ir_build.vl"
 "$VL" build "$T/probe/entry.vl" -o "$T/probe.wasm" --compiler "$SEED" > /dev/null
 
 rm -rf "$OUT/wit"
