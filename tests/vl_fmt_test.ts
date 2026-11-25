@@ -132,7 +132,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     // The inner call's type arguments must not take the place of the outer's: the outer read
-    // their end offsets after parsing its arguments, and printed the inner call twice (D17560).
+    // their end offsets after parsing its arguments, and printed the inner call twice.
     const src = "function a<T>(x: T): T { return x }\n" +
       "function b<T>(x: T): T { return x }\n" +
       "print(a<i32>( b<i32>(3)))\n" +
