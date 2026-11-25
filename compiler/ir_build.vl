@@ -520,7 +520,7 @@ import {
   variantRowArmOf,
   zextLoadOf,
 } from "./wasmEmit"
-import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
+import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom, strReppedLitUnionAt } from "./emit_plan_if_join"
 import {
   V128_ATOM_KIND,
   arrLitVariantSlot,
@@ -760,6 +760,7 @@ import {
   envSlotShift,
   exprIsClosure,
   exprIsLitAtom,
+  sharedUnionFieldPlan,
   exprIsNulNone,
   exprIsStrMethod,
   exprMap,
@@ -863,6 +864,7 @@ import {
   monoInstOrig,
   monoOrigNode,
   mvValKindAt,
+  FC_I32,
   sFieldCount,
   sFieldNames,
   sFieldStart,
@@ -878,6 +880,7 @@ import {
   uTags,
   uVarTyIx,
 } from "./emit_state"
+import { sharedFieldPlanLitTy } from "./emit_obj_lit_fits"
 import {
   cloSigPosOfKey,
   cloSigTypeIdxAt,
@@ -947,7 +950,9 @@ import {
   TY_NEVER,
   TY_NUL_STR,
   TY_STR,
+  litUnionAliasTyOfLitTexts,
   tyIsRecord,
+  tyLitMemberTexts,
   tyScalarBasePrim,
 } from "./check_types"
 import { declSlotPinned } from "./emit_collect"
@@ -3097,6 +3102,32 @@ function chainLinkTy(ix: i32): i32 {
   return ibLinkIfTy[ix] ?? -1
 }
 
+// The type every arm of un-narrowed union field read `m` stores its literal-union atom at
+// (`sharedFieldPlanLitTy`), where that type reps as an atom; -1 otherwise.
+function sharedFieldAtomTy(m: Member, ix: i32): i32 {
+  const vis: i32[] = []
+  const fis: i32[] = []
+  if sharedUnionFieldPlan(m.memObj, m.memProp, ix, ibFnIx, vis, fis) != FC_I32 {
+    return -1
+  }
+  const st = sharedFieldPlanLitTy(vis, fis)
+  if st < 0 { return -1 }
+  // A lone literal arm type reps as a string; the alias registered at its texts is the atom set.
+  const at = if repNodeAt(repNodeOfTy(st)) is RAtom { st } else { litUnionAliasTyOfLitTexts(tyLitMemberTexts(st)) }
+  return if at >= 0 && repNodeAt(repNodeOfTy(at)) is RAtom { at } else { -1 }
+}
+
+// The atom type `let` `d` holds when its initializer is a shared union field read every arm
+// stores as an atom (`sharedFieldAtomTy`), else -1.
+function letSharedFieldAtomTy(d: i32): i32 {
+  const l = nodeAt(d)
+  if !(l is LetDecl) || l.letInit < 0 { return -1 }
+  const iv = unwrapParen(l.letInit)
+  if iv < 0 || iv >= P.nodes.length { return -1 }
+  const m = nodeAt(iv)
+  return if m is Member { sharedFieldAtomTy(m, iv) } else { -1 }
+}
+
 // The rep of `openCoalMapTy`'s type, or -1.
 function openCoalMapRep(ix: i32): i32 {
   const t = openCoalMapTy(ix)
@@ -3265,6 +3296,17 @@ export function exprTyOf(ix: i32): i32 {
   if n is Member && irTyOpen(t) {
     const ft = builtFieldTy(n)
     if ft >= 0 { return ft }
+  }
+  // A field read legacy holds as an atom whose own type names no set (a shared union field
+  // joined to one literal) is of the set its arms store (`litAtomMemberTy`).
+  if n is Member && t >= 0 {
+    const atomTy = repNodeAt(repNodeOfTy(t)) is RAtom
+    if !atomTy && exprIsLitAtom(ix, ibFnIx) {
+      const st = sharedFieldAtomTy(n, ix)
+      if st >= 0 { return st }
+    }
+    // An atom-typed field a row stores as a string beside its base's arm is read as that string.
+    if atomTy && strReppedLitUnionAt(ix, ibFnIx) { return TY_STR }
   }
   // A direct call typed open, or typed at the closure its callee returns a bundle record for
   // (`fnRetHeldAsBundle`), is of its callee's result as the IR holds it (`resultTy`).
@@ -3574,7 +3616,10 @@ export function irBDeclVar(d: i32): i32 {
     && !(repNodeAt(rep) is RAtom || atomNullable(rep))
   ) {
     // Held at the type legacy's cell holds (`letAtomCellTy`), the literal set a join of consts keeps.
-    const at = letAtomCellTy(d, ibFnIx)
+    const at0 = letAtomCellTy(d, ibFnIx)
+    const r0 = if at0 >= 0 { repNodeOfTy(heldTy(at0)) } else { -1 }
+    const atom0 = r0 >= 0 && (repNodeAt(r0) is RAtom || atomNullable(r0))
+    const at = if atom0 { at0 } else { letSharedFieldAtomTy(d) }
     const ar = if at >= 0 { repNodeOfTy(heldTy(at)) } else { -1 }
     if ar >= 0 && (repNodeAt(ar) is RAtom || atomNullable(ar)) {
       return declVarAt(d, ar, heldTy(at))
