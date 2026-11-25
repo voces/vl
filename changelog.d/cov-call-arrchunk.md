@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims a ref list literal past the chunk cap:** a list of records, of union boxes, of a numeric literal union or of a variant longer than 256 elements is built in chunks, as `emitArrRef` builds it, through COV-START's chunk plan (`arrLitChunkPlanOf` at the ref slot). `arrLitRefLongSlot` is the short arms' chunked twin, the variant and union-box per-element slots drop their chunk cap, and the lowering picks the slot once (`refLitSlot`). A chunked list whose elements open a valued `if` stays a named miss (`chunked list valued element`). `array ref` falls from 3 rows to 0.
