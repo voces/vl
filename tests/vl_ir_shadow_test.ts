@@ -1929,6 +1929,8 @@ Deno.test({
       "null-of-place-with-read": 0,
       "null-of-read-off-place": 2,
       "null-of-place-without-read": 2,
+      "spread-boxed-at-box-list": 0,
+      "spread-boxed-at-scalar-list": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
