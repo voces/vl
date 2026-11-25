@@ -32266,32 +32266,26 @@ export function fieldStoreTail(
 // nullable cell) parks nothing, so the assignment's value rung refuses it.
 function asgParkNone() { return 0 }
 
+// The scratch list kind whose value slot parks a field of kind `k` for its assignment's value
+// (`asgParkField`), or null for a kind no scratch local holds.
+function asgParkFieldList(k: VKind | null): ListKind | null {
+  if k == null { return null }
+  return match k {
+    "i32" => "list"
+    "f64" => "f64list"
+    "i64" => "i64list"
+    "f32" => "f32list"
+    "v128" => "v128list"
+    "str" => "strlist"
+    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => null
+  }
+}
+
 // Tees the field value on the stack into a scratch local of its own rep for the assignment's
 // value (`asgParkedSlot`); a field of any other kind parks nothing.
 function asgParkField(k: VKind | null, owner: i32) {
-  if k == null { return asgParkNone() }
-  let lk: ListKind = "list"
-  match k {
-    "i32" => {}
-    "f64" => {
-      lk = "f64list"
-    }
-    "i64" => {
-      lk = "i64list"
-    }
-    "f32" => {
-      lk = "f32list"
-    }
-    "v128" => {
-      lk = "v128list"
-    }
-    "str" => {
-      lk = "strlist"
-    }
-    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
-      return asgParkNone()
-    }
-  }
+  const lk = asgParkFieldList(k)
+  if lk == null { return asgParkNone() }
   const slot = listIdxValSlot(lk, 0)
   fbLocalTee(slot)
   // A tee yields the local's nullable type; the string it holds is non-null.
@@ -32300,6 +32294,31 @@ function asgParkField(k: VKind | null, owner: i32) {
   asgParkedRef = k == "str"
   asgParkedOwner = owner
   return 0
+}
+
+// `fieldStoreTail` for a store whose value its assignment yields: the field value parked first.
+export function fieldStoreParkTail(
+  si: i32,
+  fieldIdx: i32,
+  lhs: i32,
+  rhs: i32,
+  fnIx: i32,
+): i32 {
+  const saved = asgParkWanted
+  asgParkWanted = true
+  const rc = fieldStoreTail(si, fieldIdx, lhs, rhs, fnIx)
+  asgParkWanted = saved
+  return rc
+}
+
+// Whether struct field assignment `asgIx` parks its value for a scratch local to yield
+// (`asgParkField`): its field is of a kind one holds.
+export function asgFieldParks(asgIx: i32, fnIx: i32): boolean {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return false }
+  const sf = fieldStoreStructAt(unwrapParen(a.binLeft), fnIx)
+  return sf.length == 2
+    && asgParkFieldList(sFieldStoreKind(sf[0], sf[1])) != null
 }
 
 // `emitAssign`'s body: an arm applies its target's context and leaves it for the exit to undo.
@@ -43755,6 +43774,67 @@ function emitAsgValue(asgIx: i32, fnIx: i32, unwidenOp: i32): i32 {
   initGuardOff = savedGuardOff
   if asgRc >= 0 && unwidenOp >= 0 { wU8(unwidenOp) }
   return asgRc
+}
+
+// The value element store `asgIx` parked, read back as `emitAsgValueOf`'s parked arm reads it:
+// the store's value slot (`idxStoreTail`'s), recovered where the value bears no null.
+export function asgParkedElemTail(asgIx: i32, fnIx: i32): i32 {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return emitFail("emitProgram: expected an assignment") }
+  const t = nodeAt(a.binLeft)
+  if !(t is Index) {
+    return emitFail("emitProgram: a parked element value has no element target")
+  }
+  const st = idxStorePlanOf(t, fnIx)
+  if st == null {
+    return emitFail("emitProgram: a parked element value has no store plan")
+  }
+  fbLocalGet(listIdxValSlot(st.mfKind, st.slot))
+  if (st.isRef || st.isStr) && !tyBearsNull(nodeTyAt(asgIx, fnIx)) {
+    fbRefAsNonNull()
+  }
+  return 0
+}
+
+// The value map set `asgIx` parked in its value stash (`mapSetTail`), read back as
+// `emitAsgValueOf`'s parked arm reads it: the stash, a reference recovered (the narrowing is the
+// caller's).
+export function asgParkedMapTail(asgIx: i32, fnIx: i32): i32 {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return emitFail("emitProgram: expected an assignment") }
+  const t = nodeAt(unwrapParen(a.binLeft))
+  if !(t is Index) {
+    return emitFail("emitProgram: a parked map value has no map target")
+  }
+  const sh = mapRecvShapeOf(t.idxArr, fnIx)
+  fbLocalGet(mapSetValStashLocal(sh))
+  if (
+    sh >= 0
+    && mvScalarValKind(sh) == null
+    && !tyBearsNull(nodeTyAt(asgIx, fnIx))
+  ) {
+    fbRefAsNonNull()
+  }
+  return 0
+}
+
+// The value struct field store `asgIx` parked (`fieldStoreParkTail`), read back as
+// `emitAsgValueOf`'s parked arm reads it: the scratch slot, a string recovered (no narrowing).
+export function asgParkedFieldTail(asgIx: i32, fnIx: i32): i32 {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return emitFail("emitProgram: expected an assignment") }
+  const sf = fieldStoreStructAt(unwrapParen(a.binLeft), fnIx)
+  if sf.length != 2 {
+    return emitFail("emitProgram: a parked field value has no struct field")
+  }
+  const k = sFieldStoreKind(sf[0], sf[1])
+  const lk = asgParkFieldList(k)
+  if lk == null {
+    return emitFail("emitProgram: a parked field value's kind parks nothing")
+  }
+  fbLocalGet(listIdxValSlot(lk, 0))
+  if k == "str" && !tyBearsNull(nodeTyAt(asgIx, fnIx)) { fbRefAsNonNull() }
+  return 0
 }
 
 // Assignment `exprIx` as a value, on its arm (`asgValueArmOf`).
