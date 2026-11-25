@@ -13187,3 +13187,17 @@ callback's element, D17039). Substituting `T | null` at `never` to `null` in the
 reopen D3178's guarded reads. The IR takes the answer from the same classifier and plan
 (`emit_plan_null.vl`, `mfLoopTail`) rather than mirroring it (R8).
 
+
+## A hole identity's adopted literal argument keys its instance at the adopted record (2026-11-25, coordinator ruling (a)) — D17426, D17047's family
+
+**Ruled by the coordinator 2026-11-25**, on lane SOUND's trace. D17047's close adopts a hole
+identity's object-literal argument at the record its call lands on (`recHoleIdentityArg`), and the
+monomorphizer already pins the argument there (`monoArgRowArmTy`). The elaboration still keyed the
+instance at the literal's own record, so a body read typed by that key (`v?.d` as `i32`) disagreed
+with the storage (`A`'s boxed field). `elabHoleIdentityBind` (emit_elab.vl) now binds the
+parameter's hole at the adopted record when the call's argument is such a literal.
+
+**Why.** It makes the instance's types agree with storage at the one point the binding is chosen,
+which every reader of the instance's types inherits. The alternative, emitting a `?.` read at its
+stored row as a `.` read is (#10001), would have to be repeated in each emitter, and legacy's is
+frozen.
