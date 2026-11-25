@@ -13202,3 +13202,19 @@ a literal default builds the literal's base (`mapCoalLitElem`, check_member_call
 `function j(x) { return x ?? "m" }`, whose `j(null)` delivered to a `"m" | "n"` binding runs and
 would be refused (runs → not-runs). The rule is local to the `.map` element and leaves that
 direct return alone.
+
+## A hole identity's adopted literal argument keys its instance at the adopted record (2026-11-25, coordinator ruling (a)) — D17426, D17047's family
+
+**Ruled by the coordinator 2026-11-25**, on lane SOUND's trace. D17047's close adopts a hole
+identity's object-literal argument at the record its call lands on (`recHoleIdentityArg`), and the
+monomorphizer already pins the argument there (`monoArgRowArmTy`). The elaboration still keyed the
+instance at the literal's own record, so a body read typed by that key (`v?.d` as `i32`) disagreed
+with the storage (`A`'s boxed field). `elabHoleIdentityBind` (emit_elab.vl) now binds the
+parameter's hole at the adopted record when the call's argument is such a literal and the body reads
+the parameter only through `?.`. A `.` read keeps the literal's key: at `A` it is `i32 | null`, so a
+body using it as a number (`v.d + 1`, D17047's pin) would no longer check, a runs → not-runs move.
+
+**Why.** It makes the instance's types agree with storage at the one point the binding is chosen,
+which every reader of the instance's types inherits. The alternative, emitting a `?.` read at its
+stored row as a `.` read is (#10001), would have to be repeated in each emitter, and legacy's is
+frozen.

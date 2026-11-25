@@ -15005,7 +15005,118 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[], k: i32): i32[] {
     }
     i = i + 1
   }
-  return out
+  return elabHoleIdentityBind(ix, d, f, names, out)
+}
+
+// Whether `f`'s body reads parameter `p`, or an un-annotated alias of it, through `?.` and never
+// through `.` outside an assignment's target: a `?.` read is nullable at either record, so only then
+// does the adopted record type no read the literal's own record would not.
+function elabHoleParamOptOnly(f: FuncDecl, p: i32): boolean {
+  const decls: i32[] = [p]
+  const lhs: i32[] = []
+  const nodes: i32[] = []
+  const stack: i32[] = [f.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      nodes.push(ix)
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  let grew = true
+  while grew {
+    grew = false
+    for ix in nodes {
+      if elabLetAliasOf(ix, decls) {
+        decls.push(ix)
+        grew = true
+      }
+    }
+  }
+  for ix in nodes {
+    const t = elabAsgTarget(ix)
+    if t >= 0 { lhs.push(t) }
+  }
+  let sawOpt = false
+  for ix in nodes {
+    if !i32ListHas(lhs, ix) && elabDotReadOf(ix, decls) { return false }
+    if elabOptReadOf(ix, decls) { sawOpt = true }
+  }
+  return sawOpt
+}
+
+// Whether `ix` is an un-annotated `let` that holds a read of one of `decls`, and not yet one of them.
+function elabLetAliasOf(ix: i32, decls: i32[]): boolean {
+  const n = nodeAt(ix)
+  if !(n is LetDecl) || n.letType >= 0 || i32ListHas(decls, ix) { return false }
+  return elabNamesDecl(n.letInit, decls)
+}
+
+// The target of `ix` when it is a plain assignment; -1 otherwise.
+function elabAsgTarget(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if !(n is BinExpr) || n.binOp != "=" { return -1 }
+  return parenPeelIx(n.binLeft)
+}
+
+// Whether `ix` is a `.` read of one of `decls`.
+function elabDotReadOf(ix: i32, decls: i32[]): boolean {
+  const n = nodeAt(ix)
+  if !(n is Member) { return false }
+  return elabNamesDecl(n.memObj, decls)
+}
+
+// Whether `ix` is a `?.` read of one of `decls`.
+function elabOptReadOf(ix: i32, decls: i32[]): boolean {
+  const n = nodeAt(ix)
+  if !(n is OptMember) { return false }
+  return elabNamesDecl(n.omObj, decls)
+}
+
+// Whether `x` is a name that resolves to one of `decls`.
+function elabNamesDecl(x: i32, decls: i32[]): boolean {
+  const o = parenPeelIx(x)
+  if o < 0 || o >= P.nodes.length { return false }
+  const n = nodeAt(o)
+  if !(n is Ident) { return false }
+  return i32ListHas(decls, identDeclOf(o))
+}
+
+// A hole identity's literal argument the checker adopted at another record binds the parameter's
+// hole at that record, as the monomorphizer pins it, so the instance's types agree with its
+// storage (D17426).
+function elabHoleIdentityBind(
+  ix: i32,
+  d: i32,
+  f: FuncDecl,
+  names: string[],
+  tys: i32[],
+): i32[] {
+  const cn = nodeAt(ix)
+  if !(cn is Call) { return tys }
+  const ha = recHoleIdentityArg(ix, d)
+  const hp = if ha >= 0 { parenPeelIx(ha) } else { -1 }
+  if hp < 0 || hp >= P.nodes.length || !(nodeAt(hp) is ObjLit) { return tys }
+  const rt = nodeRepTyIxOf(hp)
+  if rt < 0 || rt >= T.tys.length || tySameSealed(rt, nodeTyIxOf(hp)) {
+    return tys
+  }
+  let i = 0
+  while i < cn.callArgs.length && i < f.fnParams.length {
+    if parenPeelIx(cn.callArgs[i]) == hp {
+      if !elabHoleParamOptOnly(f, f.fnParams[i]) { return tys }
+      const hn = elabHoleRootName(nodeTyIxOf(f.fnParams[i]))
+      const out = tys.slice(0, tys.length)
+      let j = 0
+      while hn != "" && j < names.length && j < out.length {
+        if names[j] == hn { out[j] = rt }
+        j = j + 1
+      }
+      return out
+    }
+    i = i + 1
+  }
+  return tys
 }
 
 // The closed function type of the one instance of the hole lambda read `ax` names, or -1 when it

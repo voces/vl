@@ -134,6 +134,7 @@ import {
   RRecover,
   RStashSet,
   RStrOp,
+  RTagStash,
   RToBox,
   Rhs,
   SArmSite,
@@ -6916,11 +6917,14 @@ export function irBStageLeads(
   if listStageFrom(b, at) || coalBoxFrom(b, at, false) || voidIfFrom(b, at) {
     return false
   }
+  // A box over a tag dispatch has its head written ahead of the dispatch (`dispatchBoxHead`),
+  // above any operand staged before it, where legacy writes that operand first (D17564).
+  if dispatchBoxFrom(b, at) { return false }
   // A store the operand makes (an assignment as its value) is a statement: an earlier operand
   // read at its use would see the stored value, so it is staged below the store, as below an `if`.
   const store = storeFrom(b, at)
   const coal = coalBoxFrom(b, at, true)
-  const stash = stashSetFrom(b, at)
+  const stash = stashSetFrom(b, at) || tagStashFrom(b, at)
   if !valuedIfFrom(b, at) && !coal && !stash && !store || opndsAreTemps(args) {
     return true
   }
@@ -7015,6 +7019,32 @@ function listStageFrom(b: i32[], at: i32): boolean {
   while i < b.length {
     const n = ib.irNodes[b[i]]
     if n is SEffect && n.efRhs is RListStage { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether operands built into `b` from `at` on hold a tag dispatch's stash, which the lowering
+// writes below the operands staged before it (`tagStashEffect`).
+function tagStashFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    const n = ib.irNodes[b[i]]
+    if n is SEffect && n.efRhs is RTagStash { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether operands built into `b` from `at` on hold a tag dispatch's stash under a box the
+// lowering leads (`irBoxLeadBox`).
+function dispatchBoxFrom(b: i32[], at: i32): boolean {
+  if !tagStashFrom(b, at) { return false }
+  let i = at
+  while i < b.length {
+    for x in ib.irBoxLeadBox {
+      if x == b[i] { return true }
+    }
     i = i + 1
   }
   return false
@@ -13464,14 +13494,15 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1)
     if ibMiss != "" { return l }
     // A left operand that is a variable or immediate is staged below a right operand that holds
-    // a valued `if`, a `??` that stages the leads before it, a store or a stash, as it is below a
-    // later argument's (`irBStageLeads`). A `??` that stages nothing and a receiver stage are
-    // written in place, below which nothing is staged.
+    // a valued `if`, a `??` that stages the leads before it, a store, a stash or a tag dispatch's
+    // stash, as it is below a later argument's (`irBStageLeads`). A `??` that stages nothing and
+    // a receiver stage are written in place, below which nothing is staged.
     const lead = [l]
     const below = valuedIfFrom(b, at)
       || coalBoxFrom(b, at, true)
       || storeFrom(b, at)
       || stashSetFrom(b, at)
+      || tagStashFrom(b, at)
     if below && !coalBoxFrom(b, at, false) && !receiverStageFrom(b, at) {
       if !irBStageLeads(b, at, [ls], lead, [n.binLeft]) {
         return irBMiss("staged lead")

@@ -372,9 +372,11 @@ import {
   MapUnionPlan,
   MemAddrPlan,
   OptLeafArm,
+  armSiteArmCast,
   armSiteArmEnter,
   armSiteArmLeave,
   armSiteArmOpen,
+  armSiteArmTest,
   armSiteArmsOf,
   arrCopyBacking,
   arrCopyPlanOf,
@@ -736,6 +738,7 @@ import {
   isArmOf,
   isPreArmOf,
   isRecvStageRep,
+  listIsArmTag,
   litIsArmOf,
   litIsMemberTexts,
   memRecvOwesNonNull,
@@ -2839,11 +2842,15 @@ function armSiteStmt(n: SArmSite, pending: i32[]) {
     lw.irVars[n.saIdx].vSlot = sl
   }
   let bl = -1
+  // A global's box is read again before each arm's tag test and cast, as legacy re-reads the name.
+  const glob = armSiteGlobalOf(n)
   if n.saStash {
     // Legacy takes the stash before it writes the box, so the box's own scratch locals follow it.
     bl = sharedFieldRecvSlot()
     irLOpnd(n.saOps[0])
     fbLocalSet(bl)
+  } else if glob >= 0 {
+    irLSkip(n.saOps[0])
   } else {
     bl = plainVarLocal(n.saOps[0])
     if bl < 0 { irLMiss("arm site receiver") }
@@ -2856,7 +2863,7 @@ function armSiteStmt(n: SArmSite, pending: i32[]) {
   const recvRow = if recv >= 0 && recv < P.nodes.length && nodeAt(recv) is Index { recv } else { -1 }
   let k = 0
   while k < arms.length && lwMiss == "" {
-    const loc = armSiteArmOpen(n.saAt, bl, arms[k], lw.irAt)
+    const loc = if glob >= 0 { armSiteGlobalArmOpen(n.saAt, glob, arms[k]) } else { armSiteArmOpen(n.saAt, bl, arms[k], lw.irAt) }
     if loc < 0 {
       irLMiss("arm site arm")
       break
@@ -2888,6 +2895,26 @@ function armSiteStmt(n: SArmSite, pending: i32[]) {
   livePush(t)
   pending.push(t)
   return 0
+}
+
+// The temp an arm site's named box is when a global's read (`RGlobalGet`) defines it, or -1.
+function armSiteGlobalOf(n: SArmSite): i32 {
+  if n.saStash || n.saOps.length < 1 { return -1 }
+  const o = n.saOps[0]
+  if !(o is OVar) || !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
+  return if tempRhs(o.ov) is RGlobalGet { o.ov } else { -1 }
+}
+
+// `armSiteArmOpen` over the global read defining temp `v`: the read, the arm's tag test, the read
+// again, the cast.
+function armSiteGlobalArmOpen(at: i32, v: i32, m: i32): i32 {
+  const g = tempRhs(v)
+  const t = listIsArmTag(m)
+  if !(g is RGlobalGet) || t < 0 { return irLMiss("arm site global arm") }
+  globalGetRhs(g)
+  armSiteArmTest(at, t, lw.irAt)
+  globalGetRhs(g)
+  return armSiteArmCast(m)
 }
 
 // Takes the element-read rows legacy's writer banked since marks `sp` and `sh` as this lowering's,

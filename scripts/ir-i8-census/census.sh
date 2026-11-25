@@ -5,7 +5,8 @@
 #     scripts/ir-i8-census/census.sh <seed> <out-dir>
 #
 # Populations: the self-compile, distilled cells/ and named/, every tests/cases program, every
-# capability probe, and every inventory witness filed `runs` (witnesses.vl). A throwaway copy of
+# capability probe, every inventory witness filed `runs` (witnesses.vl), and every scripts/ tool
+# (the gate tools are programs I8 must build too). A throwaway copy of
 # compiler/ adds one row per function (`fnc <name>` claimed, `fnu <name> | <miss>` not); it is
 # built with <seed> in a temp dir, never into build/. A function's name carries its module
 # (`$m<id>`) when it is not the entry's, so std functions count once across files.
@@ -31,8 +32,9 @@ rm -rf "$OUT/wit"
 ls scripts/silent-sweep/distilled/cells/*.vl scripts/silent-sweep/distilled/named/*.vl > "$T/distilled"
 find tests/cases -name '*.vl' | sort > "$T/cases"
 ls scripts/capability-probes/*.vl > "$T/probes"
+find scripts -name '*.vl' -not -name '*.matrix.vl' -not -path 'scripts/capability-probes/*' -not -path 'scripts/silent-sweep/distilled/cells/*' -not -path 'scripts/silent-sweep/distilled/named/*' | sort > "$T/scripts"
 if [ -n "${CENSUS_CLASS:-}" ]; then
-  for pop in distilled cases probes witnesses; do
+  for pop in distilled cases probes witnesses scripts; do
     awk -F'\t' -v pop="$pop" -v out="$OUT" '$1 == pop { sub(/^wit\//, out "/wit/", $2); print $2 }' "$CENSUS_CLASS" \
       | grep -Fxf - "$T/$pop" > "$T/$pop.cut" || true
     mv "$T/$pop.cut" "$T/$pop"
@@ -56,10 +58,10 @@ VL_IR_SHADOW=5 "$VL" build compiler/entry.vl -o "$T/self.wasm" --compiler "$T/pr
 else
   rm -f "$OUT/self.rows" "$OUT/self.programs"
 fi
-for pop in distilled cases probes witnesses; do
+for pop in distilled cases probes witnesses scripts; do
   xargs -r -n 100 -P "$JOBS" env VL="$VL" PROBE="$T/probe.wasm" sh "$T/one.sh" < "$T/$pop" > "$OUT/$pop.rows" || true
   wc -l < "$T/$pop" > "$OUT/$pop.programs"
 done
-cat "$T/distilled" "$T/cases" "$T/probes" "$T/witnesses" > "$OUT/programs.txt"
+cat "$T/distilled" "$T/cases" "$T/probes" "$T/witnesses" "$T/scripts" > "$OUT/programs.txt"
 
 scripts/ir-i8-census/summary.sh "$OUT" | tee "$OUT/summary.txt"
