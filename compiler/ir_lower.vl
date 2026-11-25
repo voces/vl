@@ -86,7 +86,13 @@ import {
   nodeAt,
   nodeChildren,
 } from "./ast"
-import { quoteLex, unwrapParen } from "./emit_base"
+import {
+  isRecvStagedIx,
+  isRecvStagedNonNull,
+  isRecvStagedSlot,
+  quoteLex,
+  unwrapParen,
+} from "./emit_base"
 import {
   fieldRowStorageKind,
   sFieldFlatRow,
@@ -159,6 +165,7 @@ import {
   RHoleOptBox,
   RIdentityEq,
   RInitProgress,
+  RIsStaged,
   RJoinNull,
   RListCat,
   RListClear,
@@ -685,6 +692,7 @@ import {
   holeBoxPlanOf,
   isArmOf,
   isPreArmOf,
+  isRecvStageRep,
   litIsArmOf,
   litIsMemberTexts,
   memRecvOwesNonNull,
@@ -790,6 +798,8 @@ import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import {
   ifLinkYieldsNull,
+  isRecvStashHolds,
+  isRecvStashSlot,
   objOrderStashSlot,
   unionLitIsStashSlot,
 } from "./emit_if_arm_values"
@@ -986,6 +996,8 @@ export function irLOpnd(o: Opnd) {
       if !urLocalRead(s) { fbLocalGet(s) }
       // A `shadow` arm's list is the frame's nullable list scratch, read non-null.
       if listFitShadowHolds(s) { fbRefAsNonNull() }
+      // A staged `is` receiver held as a non-null string reads its nullable stash non-null.
+      if isRecvStagedNonNull && s == isRecvStagedSlot { fbRefAsNonNull() }
     }
     OImm => {
       leaf()
@@ -1229,6 +1241,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListFitIs => listFitIs(r)
     RLitArms => litArms(r)
     RNumIs => numIs(r)
+    RIsStaged => isStaged(r)
     RTagIs => {
       leaf()
       tagIsTail(r.tgiId)
@@ -2156,6 +2169,31 @@ function unionLitIs(r: RLitArms, recvIx: i32, lex: string): i32 {
       -1
     }
   }
+}
+
+// `RIsStaged` as `emitIsTest` stages its receiver: the receiver set into its stash slot, which
+// the rungs' variable then names, and the rungs' test written with that receiver staged.
+function isStaged(r: RIsStaged) {
+  const n = nodeAt(r.stAt)
+  if !(n is IsExpr) || r.stVar < 0 || r.stVar >= lw.irVars.length {
+    return irLMiss("is staged node")
+  }
+  if isRecvStagedIx >= 0 { return irLMiss("is staged nested") }
+  if isRecvStageRep(r.stAt, lw.irAt) != r.stKey {
+    return irLMiss("is staged plan")
+  }
+  irLOpnd(r.stV)
+  const slot = isRecvStashSlot(r.stKey)
+  fbLocalSet(slot)
+  lw.irVars[r.stVar].vSlot = slot
+  isRecvStagedIx = unwrapParen(n.isObj)
+  isRecvStagedSlot = slot
+  isRecvStagedNonNull = r.stKey == 3
+  irLOpnd(r.stTest)
+  isRecvStagedIx = -1
+  isRecvStagedSlot = 0
+  isRecvStagedNonNull = false
+  return 0
 }
 
 // `RNumIs` along `numIsPlanOf`, as `emitIsTestNumLit` writes it: the receiver once into its slot
@@ -5842,6 +5880,7 @@ function framedLocals(): u8[] {
       v.vKind == "local"
       && v.vSlot >= fbFrameParams
       && !listFitShadowHolds(v.vSlot)
+      && !isRecvStashHolds(v.vSlot)
     ) {
       const li = v.vSlot - fbFrameParams
       if li >= nLocals || !runAgrees(v.vRep, li) { irLMiss("locals layout") }
