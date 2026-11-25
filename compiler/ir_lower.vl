@@ -351,6 +351,7 @@ import {
   EQ_ROOT_EXPR,
   EqRootPlace,
   EqRootPlan,
+  ForLitHoistTys,
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
@@ -473,6 +474,13 @@ import {
   forInMapStash,
   forInPairInit,
   forInRolledOpen,
+  forLitConstStrOf,
+  forLitHoistAdd,
+  forLitHoistClose,
+  forLitHoistTysOf,
+  forLitHoistable,
+  forLitStrForm,
+  forLitStrPooled,
   forRangeTestOf,
   hoistCandRow,
   hoistReadTail,
@@ -2986,17 +2994,12 @@ function makeList(r: RMakeList) {
   const lb: ListBuild = { lbKind: r.mlKind, lbSlot: r.mlSlot }
   arrLitPrologue(r.mlAt)
   const arm = r.mlArm
-  // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
-  // leaves its elements unwritten, so each must be an immediate.
+  // A `for` walk's iterable of constants reads its module list, as legacy's arm does, built here
+  // from the elements' immediates (`irForLitHoist`).
   if arrLitIsForIter(r.mlAt) {
-    // In the IR's full unroll a range variable is its copy's constant; legacy asks the hoist
-    // inside its copy, which reads the variable as that constant, so the copy is bound first.
-    const g = hoistInRangeCopy(r, fnIx, arm)
+    const g = irForLitHoist(r, fnIx, arm)
     if g == -2 { return -1 }
     if g >= 0 {
-      for e in r.mlElems {
-        if !(e is OImm || e is OStr) { return irLMiss("for iterable element") }
-      }
       for e in r.mlElems { irLSkip(e) }
       return fbGlobalGet(g)
     }
@@ -3056,6 +3059,81 @@ function makeList(r: RMakeList) {
   }
   if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
+}
+
+// `for` iterable `r`'s module list at arm `arm`, as legacy's hoist (`arrLitHoistGlobal`) builds
+// it, each element written alone (`forLitElemAt`). Where one is none the IR can write, legacy's
+// own hoist decides (`hoistInRangeCopy`), and its hoist is then a miss. Its global, -1 where it
+// does not hoist, -2 on a miss.
+function irForLitHoist(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
+  const t = forLitHoistTysOf(arm)
+  const a = if r.mlAt >= 0 && r.mlAt < P.nodes.length { nodeAt(r.mlAt) } else { null }
+  if !(a is ArrayLit) || a.arrElems.length != r.mlElems.length { return -1 }
+  let i = 0
+  while i < r.mlElems.length {
+    if !forLitElemWrites(r.mlElems[i], a.arrElems[i], t) {
+      const g = hoistInRangeCopy(r, fnIx, arm)
+      if g >= 0 {
+        irLMiss("for iterable element")
+        return -2
+      }
+      return g
+    }
+    i = i + 1
+  }
+  if t.fhBack < 0 || !forLitHoistable(r.mlAt, a.arrElems) { return -1 }
+  // A global's read of a `const` string that is not pooled is no one constant: no hoist.
+  i = 0
+  while i < r.mlElems.length {
+    const e = r.mlElems[i]
+    if (
+      e is OVar
+      && isTemp(e.ov)
+      && !forLitStrPooled(forLitConstStrOf(a.arrElems[i], fnIx))
+    ) {
+      return -1
+    }
+    i = i + 1
+  }
+  const init: u8[] = []
+  i = 0
+  while i < r.mlElems.length {
+    const one: u8[] = []
+    const prev = wTarget(one)
+    forLitElemAt(r.mlElems[i], a.arrElems[i], fnIx)
+    wTarget(prev)
+    if lwMiss != "" { return -2 }
+    if !forLitHoistAdd(one, init) { return -1 }
+    i = i + 1
+  }
+  // A variable's read that lowered to a constant is legacy's hoist too, but it reads the element.
+  for e in r.mlElems {
+    if e is OVar && !isTemp(e.ov) {
+      irLMiss("for iterable element")
+      return -2
+    }
+  }
+  return forLitHoistClose(init, r.mlElems.length, t)
+}
+
+// Whether `for` iterable element `e` (node `x`) is one `forLitElemAt` writes as legacy's hoist
+// does: an immediate, a variable's read, or a global's read of a module `const` string literal.
+function forLitElemWrites(e: Opnd, x: i32, t: ForLitHoistTys): boolean {
+  if !(e is OVar) || !isTemp(e.ov) { return true }
+  return tempRhs(e.ov) is RGlobalGet
+    && t.fhBack >= 0
+    && t.fhForm == forLitStrForm()
+    && forLitConstStrOf(x, lw.irAt) >= 0
+}
+
+// Writes `for` iterable element `e` (node `x`) alone: a module `const`'s string literal for a
+// global's read of one (the read itself pure, skipped where the list hoists), else the operand.
+function forLitElemAt(e: Opnd, x: i32, fnIx: i32) {
+  if e is OVar && isTemp(e.ov) {
+    leaf()
+    return emitStrLitAt(forLitConstStrOf(x, fnIx), fnIx)
+  }
+  return irLOpnd(e)
 }
 
 // Legacy's hoist of `for` iterable `r` (`arrLitHoistGlobal`), asked with each range variable its
