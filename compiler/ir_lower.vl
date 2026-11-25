@@ -98,6 +98,7 @@ import {
 } from "./emit_base"
 import {
   fieldRowStorageKind,
+  optChainStagesRecv,
   sFieldFlatRow,
   sFieldTypeAt,
   variantFieldStorageKind,
@@ -351,6 +352,7 @@ import {
   EQ_ROOT_EXPR,
   EqRootPlace,
   EqRootPlan,
+  ForLitHoistTys,
   GlobalCtx,
   MapGetOrArm,
   MapUnionPlan,
@@ -473,6 +475,13 @@ import {
   forInMapStash,
   forInPairInit,
   forInRolledOpen,
+  forLitConstStrOf,
+  forLitHoistAdd,
+  forLitHoistClose,
+  forLitHoistTysOf,
+  forLitHoistable,
+  forLitStrForm,
+  forLitStrPooled,
   forRangeTestOf,
   hoistCandRow,
   hoistReadTail,
@@ -809,6 +818,9 @@ import {
   optRecLeafTestClose,
   optRecLeafTestOpen,
   optRecvStagedAt,
+  optRecvStashCast,
+  optRecvStashGet,
+  optRecvStashTee,
   recordFitPlanOf,
   strMemberEqTail,
   unionLitIsPlanOf,
@@ -1434,10 +1446,7 @@ function rhs(r: Rhs, tail: boolean) {
     RBoxNarrow => boxNarrow(r)
     RNicheRead => nicheRead(r)
     RArmUnbox => armUnbox(r)
-    RRecCopyPure => {
-      leaf()
-      recCopyPureEmit(r.rpAt, lw.irAt)
-    }
+    RRecCopyPure => recCopyPure(r)
     RRecover => recoverRead(r)
     RGetField => getField(r)
     RCallRef => callRef(r, tail)
@@ -2989,17 +2998,12 @@ function makeList(r: RMakeList) {
   const lb: ListBuild = { lbKind: r.mlKind, lbSlot: r.mlSlot }
   arrLitPrologue(r.mlAt)
   const arm = r.mlArm
-  // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
-  // leaves its elements unwritten, so each must be an immediate.
+  // A `for` walk's iterable of constants reads its module list, as legacy's arm does, built here
+  // from the elements' immediates (`irForLitHoist`).
   if arrLitIsForIter(r.mlAt) {
-    // In the IR's full unroll a range variable is its copy's constant; legacy asks the hoist
-    // inside its copy, which reads the variable as that constant, so the copy is bound first.
-    const g = hoistInRangeCopy(r, fnIx, arm)
+    const g = irForLitHoist(r, fnIx, arm)
     if g == -2 { return -1 }
     if g >= 0 {
-      for e in r.mlElems {
-        if !(e is OImm || e is OStr) { return irLMiss("for iterable element") }
-      }
       for e in r.mlElems { irLSkip(e) }
       return fbGlobalGet(g)
     }
@@ -3059,6 +3063,81 @@ function makeList(r: RMakeList) {
   }
   if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
+}
+
+// `for` iterable `r`'s module list at arm `arm`, as legacy's hoist (`arrLitHoistGlobal`) builds
+// it, each element written alone (`forLitElemAt`). Where one is none the IR can write, legacy's
+// own hoist decides (`hoistInRangeCopy`), and its hoist is then a miss. Its global, -1 where it
+// does not hoist, -2 on a miss.
+function irForLitHoist(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
+  const t = forLitHoistTysOf(arm)
+  const a = if r.mlAt >= 0 && r.mlAt < P.nodes.length { nodeAt(r.mlAt) } else { null }
+  if !(a is ArrayLit) || a.arrElems.length != r.mlElems.length { return -1 }
+  let i = 0
+  while i < r.mlElems.length {
+    if !forLitElemWrites(r.mlElems[i], a.arrElems[i], t) {
+      const g = hoistInRangeCopy(r, fnIx, arm)
+      if g >= 0 {
+        irLMiss("for iterable element")
+        return -2
+      }
+      return g
+    }
+    i = i + 1
+  }
+  if t.fhBack < 0 || !forLitHoistable(r.mlAt, a.arrElems) { return -1 }
+  // A global's read of a `const` string that is not pooled is no one constant: no hoist.
+  i = 0
+  while i < r.mlElems.length {
+    const e = r.mlElems[i]
+    if (
+      e is OVar
+      && isTemp(e.ov)
+      && !forLitStrPooled(forLitConstStrOf(a.arrElems[i], fnIx))
+    ) {
+      return -1
+    }
+    i = i + 1
+  }
+  const init: u8[] = []
+  i = 0
+  while i < r.mlElems.length {
+    const one: u8[] = []
+    const prev = wTarget(one)
+    forLitElemAt(r.mlElems[i], a.arrElems[i], fnIx)
+    wTarget(prev)
+    if lwMiss != "" { return -2 }
+    if !forLitHoistAdd(one, init) { return -1 }
+    i = i + 1
+  }
+  // A variable's read that lowered to a constant is legacy's hoist too, but it reads the element.
+  for e in r.mlElems {
+    if e is OVar && !isTemp(e.ov) {
+      irLMiss("for iterable element")
+      return -2
+    }
+  }
+  return forLitHoistClose(init, r.mlElems.length, t)
+}
+
+// Whether `for` iterable element `e` (node `x`) is one `forLitElemAt` writes as legacy's hoist
+// does: an immediate, a variable's read, or a global's read of a module `const` string literal.
+function forLitElemWrites(e: Opnd, x: i32, t: ForLitHoistTys): boolean {
+  if !(e is OVar) || !isTemp(e.ov) { return true }
+  return tempRhs(e.ov) is RGlobalGet
+    && t.fhBack >= 0
+    && t.fhForm == forLitStrForm()
+    && forLitConstStrOf(x, lw.irAt) >= 0
+}
+
+// Writes `for` iterable element `e` (node `x`) alone: a module `const`'s string literal for a
+// global's read of one (the read itself pure, skipped where the list hoists), else the operand.
+function forLitElemAt(e: Opnd, x: i32, fnIx: i32) {
+  if e is OVar && isTemp(e.ov) {
+    leaf()
+    return emitStrLitAt(forLitConstStrOf(x, fnIx), fnIx)
+  }
+  return irLOpnd(e)
 }
 
 // Legacy's hoist of `for` iterable `r` (`arrLitHoistGlobal`), asked with each range variable its
@@ -4130,9 +4209,10 @@ function structEq(r: RStructEq) {
     return irLMiss("record compare place")
   }
   const plan: EqRootPlan = {
-    erL: if lE { structEqElemPlace(r.seL, r.seLIx[0], lG) } else { EQ_ROOT_EXPR },
-    erR: if rE { structEqElemPlace(r.seR, r.seRIx[0], rG) } else { EQ_ROOT_EXPR },
+    erL: if lE { structEqElemPlace(r.seL, r.seLIx[0], lG) } else { structEqRootPlace(n.binLeft, lG) },
+    erR: if rE { structEqElemPlace(r.seR, r.seRIx[0], rG) } else { structEqRootPlace(n.binRight, rG) },
   }
+  if lwMiss != "" { return -1 }
   if plan.erL.epSlot == -2 || plan.erR.epSlot == -2 {
     return irLMiss("record compare element place")
   }
@@ -4291,7 +4371,45 @@ function structEqElemPlace(v: Opnd, i: Opnd, placeRecv: boolean): EqRootPlace {
     epIdx: xs,
     epImm: imm,
     epRows: [],
+    epBytes: [],
   }
+}
+
+// The root place of a record compare side at node `ix` that is no list element: a place side
+// (`place`) the IR reads again (`irReadsAgain`) as those bytes, written once here; any other the
+// operand node legacy reads.
+function structEqRootPlace(ix: i32, place: boolean): EqRootPlace {
+  const u = unwrapParen(ix)
+  if !place || !irReadsAgain(u) { return EQ_ROOT_EXPR }
+  const bs: u8[] = []
+  const prev = wTarget(bs)
+  irHoistRecv(u)
+  wTarget(prev)
+  return {
+    epKind: "bytes",
+    epSlot: -1,
+    epIdx: -1,
+    epImm: 0,
+    epRows: [],
+    epBytes: bs,
+  }
+}
+
+// Whether `irHoistRecv` writes node `ix`'s read again: a variable's, a global's or an element's
+// read the builder noted, or a noted field read of one.
+function irReadsAgain(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if (
+    (lw.irReadVar[ix] ?? -1) >= 0
+    || lw.irReadAgain.has(ix)
+    || lw.irReadElem.has(ix)
+  ) {
+    return true
+  }
+  const m = nodeAt(ix)
+  return lw.irReadField.has(ix)
+    && m is Member
+    && irReadsAgain(unwrapParen(m.memObj))
 }
 
 // The local a record compare reads unstashed operand `o` from: a variable's slot, else -1.
@@ -4480,6 +4598,30 @@ export function irLReadAgain(ix: i32): boolean {
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
   rhs(lw.irReadAgain[ix] ?? none, false)
   return true
+}
+
+// `RRecCopyPure`: legacy's whole copy, its source read as the IR wrote it: whole, where the copy
+// reads it once, or a read written again (`irHoistRecv`); else from the source node.
+function recCopyPure(r: RRecCopyPure) {
+  const src: u8[] = []
+  // A source read once is written here whole, into the bytes the copy reads it as.
+  if r.rpOnce && r.rpV.length > 0 {
+    const prev = wTarget(src)
+    irLOpnd(r.rpV[0])
+    wTarget(prev)
+    if lwMiss != "" { return -1 }
+    return recCopyPureEmit(r.rpAt, lw.irAt, src)
+  }
+  for v in r.rpV { irLSkip(v) }
+  leaf()
+  const u = unwrapParen(r.rpAt)
+  if r.rpV.length > 0 && irReadsAgain(u) {
+    const prev = wTarget(src)
+    irHoistRecv(u)
+    wTarget(prev)
+    if lwMiss != "" { return -1 }
+  }
+  return recCopyPureEmit(r.rpAt, lw.irAt, src)
 }
 
 // The depth a branch to `label` crosses from the innermost frame, or -1.
@@ -5091,7 +5233,7 @@ function optReadLinks(
 function optChainIsNullAt(r: ROptRead, x: i32, read: boolean[]): i32 {
   const m = nodeAt(unwrapParen(x))
   if !(m is OptMember) {
-    if optChainRoot(r, x, read) < 0 { return -1 }
+    if optChainRoot(r, x, read, false) < 0 { return -1 }
     fbRefIsNull()
     return 0
   }
@@ -5108,8 +5250,11 @@ function optChainIsNullAt(r: ROptRead, x: i32, read: boolean[]): i32 {
 function optChainValueAt(r: ROptRead, x: i32, read: boolean[]): i32 {
   const m = nodeAt(unwrapParen(x))
   if !(m is OptMember) {
-    if optChainRoot(r, x, read) < 0 { return -1 }
-    if exprNullableRefNiche(x, lw.irAt) { fbRefAsNonNull() }
+    if optChainRoot(r, x, read, true) < 0 { return -1 }
+    // A staged root's stash read is cast to its record, which recovers it.
+    if !optChainStagesRecv(r.orAt) && exprNullableRefNiche(x, lw.irAt) {
+      fbRefAsNonNull()
+    }
     return 0
   }
   if optChainValueAt(r, m.omObj, read) < 0 { return -1 }
@@ -5119,13 +5264,25 @@ function optChainValueAt(r: ROptRead, x: i32, read: boolean[]): i32 {
   return 0
 }
 
-// Read `r`'s chain root `x`: its operand the first time, then read again (`opndAgain`).
-function optChainRoot(r: ROptRead, x: i32, read: boolean[]): i32 {
+// Read `r`'s chain root `x`: its operand the first time, then read again (`opndAgain`). A root
+// legacy stages (`optChainStagesRecv`) is teed into its stash first and read back from it after,
+// cast to its record where it is read as one (`asRef`), as `emitOptRecvBase` writes it.
+function optChainRoot(
+  r: ROptRead,
+  x: i32,
+  read: boolean[],
+  asRef: boolean,
+): i32 {
+  const staged = optChainStagesRecv(r.orAt)
+  if staged && !fnUses.optRecv { return irLMiss("optional read stash") }
   if !read[0] {
     read[0] = true
     irLOpnd(r.orV)
-    return 0
+    if !staged { return 0 }
+    optRecvStashTee()
+    return if asRef { optRecvStashCast(x, lw.irAt) } else { 0 }
   }
+  if staged { return optRecvStashGet(x, lw.irAt, asRef) }
   return opndAgain(r.orV, x)
 }
 
@@ -5630,17 +5787,23 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   ) {
     return irLMiss("coalesce optional field plan")
   }
-  if optRecvStagedAt(m.omObj) {
-    return irLMiss("coalesce optional field staged receiver")
-  }
   const lp = coalOptLeafPlanOf(m, structIndexOfExpr(m.omObj, lw.irAt))
   if lp.olLeaf == null { return irLMiss("coalesce optional field plan") }
+  // A staged receiver (`optChainStagesRecv`) is teed into its stash, then read back from it cast to
+  // its record, as `emitOptRecvBase` writes it.
+  const staged = optChainStagesRecv(unwrapParen(e.binLeft))
+  if staged && !fnUses.optRecv { return irLMiss("coalesce optional stash") }
   cond(n.cbL, pending)
+  if staged { optRecvStashTee() }
   coalOptLeafOpen(lp)
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   fbElse()
-  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
+  if staged {
+    if optRecvStashGet(m.omObj, lw.irAt, true) < 0 { return -1 }
+  } else if opndAgain(n.cbL, m.omObj) < 0 {
+    return -1
+  }
   lwFrames.pop()
   return coalOptLeafRead(lp)
 }

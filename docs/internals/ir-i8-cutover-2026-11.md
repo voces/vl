@@ -180,7 +180,7 @@ only when the start body is unclaimed. Nothing reaches legacy through the door.
 | latent | the 16 stubbed writers a kept tail calls that no population reaches: a probe or a static check each | INFRA |
 | gate | `scripts/ir-i8-sweep.sh` in CI (`ci-i8-sweep`): no new cause of "newly failing and not unclaimed", and no new static edge into stage B | INFRA |
 | coverage | the census tail to zero unclaimed functions and start bodies | the COV lanes |
-| I8 | one PR: empty the 14 entry points and B minus the keep set, then `dead-exports.vl`, a fixpoint and the full gate | coordinator |
+| I8 | one PR: `ir-i8-sweep.sh scripts/ir-i8-census/keep --apply` (empties the 14 entry points and B minus the keep set, deletes what `dead-exports.vl` lists), the hand deletions its stub and code lists name, `scripts/ir-i8-rebaseline.sh`, then the full gate | INFRA |
 
 The gate ratchets the set of causes, not the count: coverage moves a program from explained to
 unexplained when it claims the last unclaimed function beside a re-entry (coordinator ruling, 2026-11-25).
