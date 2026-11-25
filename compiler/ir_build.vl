@@ -2473,10 +2473,18 @@ function objLitAt(
       && repNodeAt(ks[k]) is RClosure
       && exprPrePathWhy(valIx, ibFnIx) == ""
       && recHeapNoted(rep)
+    // …and so is one at a field that holds such a closure or `null` (`cloNicheTakes`).
+    const nicheClo = !holed
+      && !clo
+      && own < 0
+      && !typed
+      && cloNicheTakes(v1, ks[k], valIx)
+      && recHeapNoted(rep)
     // A record or list the field holds as it stands, apart in no hole, is retagged too.
     const stands = vr != ks[k]
       && !holed
       && !clo
+      && !nicheClo
       && retagsAsStands(vr, ks[k], valIx)
     // A sub-word field (`repSubWord`) takes a plain i32, which the struct's field truncates.
     const packed = repSubWord(ks[k]) && repPrim(vr) == "i32"
@@ -2485,12 +2493,14 @@ function objLitAt(
       && !holed
       && !clo
       && !stands
+      && !nicheClo
       && !packed
       && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr)
     ) {
       return irBMiss("object field coercion")
     }
-    const v = if holed || clo || stands { repTemp(b, { rgV: v1 }, valIx, ks[k]) } else { v1 }
+    const v = if nicheClo { cloNicheRetag(b, v1, ks[k], valIx) } else if holed || clo || stands { repTemp(b, { rgV: v1 }, valIx, ks[k]) } else { v1 }
+    if ibMiss != "" { return v }
     if clo { irCloFieldRetagNote(ib, b[b.length - 1]) }
     layout[fi] = k
     if stashRow >= 0 { src.push(k) }
@@ -6562,8 +6572,11 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         && exprPrePathWhy(cargs[i], ibFnIx) == "") { repTempTy(b, { rgV: a }, cargs[i], pr, pt) } else if irBOpRep(a) != pr && recRetagNoted(irBOpRep(a), pr, cargs[i]) { repTempTy(b, { rgV: a }, cargs[i], pr, pt) } else { a }
       // A union parameter boxes the argument as legacy's `emitUnionBoxOwed` does (the floor); a
       // reference its parameter's valtype holds as it stands is passed as is (`repStoresAs`).
-      const fa = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, cargs[i], pr, -1, fu) } else { ra }
+      const fa0 = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, cargs[i], pr, -1, fu) } else { ra }
       if ibMiss != "" { return missRhs(ibMiss) }
+      // A closure handed to a parameter that holds a closure of its struct or `null` (the niche):
+      // retagged to that closure, then into its niche, as a field's (`objLitAt`).
+      const fa = if cloNicheTakes(fa0, pr, cargs[i]) { cloNicheRetag(b, fa0, pr, cargs[i]) } else { fa0 }
       if (
         irBOpRep(fa) != pr
         && !repNullRefFits(irBOpRep(fa), pr)
@@ -10115,13 +10128,36 @@ function boxIntoOtherUnion(ix: i32, dst: i32, dstTy: i32): boolean {
   return dstTy < 0 || holeBoxPlanOf(ix, dstTy, ibFnIx).hbArm != "pass"
 }
 
-// The union legacy's field writer boxes literal row `row`'s field `fi` at.
 // Whether rep `dst` is the nullable of rep `r`, `r` a scalar.
 function nullableOver(dst: i32, r: i32): boolean {
   const n = repNodeAt(dst)
   return repIsScalar(r) && n is RNullable && n.rnInner == r
 }
 
+// Whether closure value `v` (node `ix`) is retagged into nullable closure rep `dst` by its niche:
+// `dst` holds a closure or `null`, `v` a closure of the one closure struct, delivered plainly.
+function cloNicheTakes(v: Opnd, dst: i32, ix: i32): boolean {
+  const vr = irBOpRep(v)
+  const dn = repNodeAt(dst)
+  return vr != dst
+    && dn is RNullable
+    && dn.rnDisc == 1
+    && repNodeAt(dn.rnInner) is RClosure
+    && repNodeAt(vr) is RClosure
+    && exprPrePathWhy(ix, ibFnIx) == ""
+}
+
+// Closure value `v` (node `ix`) retagged to nullable closure rep `dst`'s closure, then into its
+// niche (`cloNicheTakes`).
+function cloNicheRetag(b: i32[], v: Opnd, dst: i32, ix: i32): Opnd {
+  const dn = repNodeAt(dst)
+  if !(dn is RNullable) { return irBMiss("closure niche rep") }
+  const c = if irBOpRep(v) == dn.rnInner { v } else { repTemp(b, { rgV: v }, ix, dn.rnInner) }
+  if irBOpRep(v) != dn.rnInner { irCloFieldRetagNote(ib, b[b.length - 1]) }
+  return repTemp(b, { rgV: c }, ix, dst)
+}
+
+// The union legacy's field writer boxes literal row `row`'s field `fi` at.
 function fieldSiteTy(arm: ObjLitArm, row: i32, fi: i32): i32 {
   return if arm == "variant" { variantFieldBoxTy(row, fi) } else { structFieldBoxTy(row, fi) }
 }
