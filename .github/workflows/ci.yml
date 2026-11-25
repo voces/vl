@@ -1301,8 +1301,24 @@ jobs:
           docs_only: ${{ steps.docs_check.outputs.docs_only }}
           modes: inherit tree
 
+      # The distribution mechanism is the host's (build.rs staging, the embedded fallback), so a
+      # pull request or push that touches none of scripts/vl-host/, fetch-seed.sh or this file
+      # skips the build and stays green; the nightly and manual runs always build it.
+      - name: Does this change reach the distribution build
+        id: host
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) range="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" ;;
+            push) range="${{ github.event.before }}..${{ github.event.after }}"
+              git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null || range="HEAD~1..HEAD" ;;
+            *) echo "run=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          hit=$(git diff --no-renames --name-only "$range" | grep -E -m1 '^(scripts/vl-host/|scripts/fetch-seed\.sh$|\.github/workflows/ci\.yml$)' || true)
+          if [ -n "$hit" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; echo "distribution build: runs ($hit)"
+          else echo "run=false" >> "$GITHUB_OUTPUT"; echo "distribution build: no host change"; fi
+
       - name: Rustc version (cargo cache key)
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         id: rustc
         run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
 
@@ -1314,7 +1330,7 @@ jobs:
       # restores, builds and saves. One cold wasmtime build after a toolchain bump
       # is the same cost as before the split.
       - name: Restore cargo + vl-host target
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -1331,7 +1347,7 @@ jobs:
       # while `seed` stays the sole writer of the seed pair, which is what
       # keeps the seed cache riding along with the wasm its entries were built from.
       - name: Restore seed compiler wasm
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -1344,13 +1360,13 @@ jobs:
 
       # fetch-seed.sh keeps the restored seed (its `.src` marks a local build), else fetches one.
       - name: Ensure a seed to embed
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         run: ./scripts/fetch-seed.sh
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Verify embedded-seed build (distribution path)
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         run: |
           cargo build --release --features embed-seed --manifest-path scripts/vl-host/Cargo.toml
           probe="$(mktemp -d)"
@@ -1385,7 +1401,7 @@ jobs:
       # is the whole claim. The stale-seed row is the other half: a released `vl`
       # must not become a different compiler because of what sits in the CWD.
       - name: Verify a released `vl` carries std and ignores the CWD
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         run: |
           set -e
           export VL_CACHE_DIR="$(mktemp -d)"
