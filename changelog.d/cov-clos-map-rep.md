@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- IR rep derivation (lane COV-CLOS): a map binding whose declared value type is open, while its mv slot stores a closed type (an un-annotated `Map()` of a two-signature bundle), now has the rep of the map of that slot type, as legacy stores it (`mapSlotHeldTy`). This covers module map globals and map locals. Before, the rep said hole closure while the writes stored bundle records. Over 11,467 programs, 6 more functions are claimed and none is lost; `map read mv value rep` falls from 5 rows to 0 and `map get rep` from 6 to 3. Filed D17582 and D17583, two loud emit refusals on such maps that were already on master.
