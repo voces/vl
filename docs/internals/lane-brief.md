@@ -91,11 +91,15 @@ not list reds that job. ready-check does not cover these:
 ## Landing
 
 - Open the PR ready for review and call `subscribe_pr_activity` on it.
-- When CI is green, send the coordinator
-  ready-check's block (`READY #<pr> <40-char sha>` and its proof lines), using
-  `send_message` to the coordinator's session id from your brief.
-- The coordinator merges. If master moved and GitHub reports a conflict, merge `origin/master` in
-  (merge, not rebase), re-run `gate.sh --fast`, push, and send a new READY that says whether the
-  resolution was mechanical.
+- When CI is green and your proof is done, run `scripts/land-check.sh <pr>`. It checks that every CI
+  run on the head is green, that GitHub reports the PR mergeable, and that master plus the PR
+  typechecks. On `LAND-OK <sha>`, squash-merge it yourself with the GitHub tool's
+  `merge_pull_request`, `expectedHeadSha` set to that sha. Then send the coordinator one line:
+  `LANDED #<pr> <merge sha>` with your class delta (coordinator, 2026-11-25). The coordinator
+  watches master and reverts a red master push at once; the lane then re-lands.
+- Do not self-merge a PR that changes a shared plan's output across many programs, a gate baseline
+  or a ratchet: send READY with the proof lines and the coordinator merges.
+- On `LAND-NO: conflicts with master`, merge `origin/master` in (merge, not rebase), re-run
+  `gate.sh --fast`, push, and run land-check again.
 - After a merge, start your next item. When your brief is done, send `DONE` with what landed, what
   is open, and the census delta.
