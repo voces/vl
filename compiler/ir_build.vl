@@ -629,6 +629,8 @@ import {
   litMemberEqArmOf,
   mapScalarJoinBoxes,
   narrowedMapReadOf,
+  numCastExactSrc,
+  numCastNullNode,
   retRefusedWhy,
   spreadRunLit,
   unionBoxArgReadsMapBox,
@@ -2223,7 +2225,11 @@ function objLitAt(
     starts.push(mark)
     const own = fieldExplicitNullOwn(arm, row, fi, valIx)
     const typed = own < 0 && fieldExplicitNullTyped(arm, row, fi, valIx)
-    const v0 = if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own, nuRead: [] }, valIx, ks[k]) } else if typed { fieldNullTemp(b, row, fi, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
+    // A variant's omitted sentinel field is its field's own null, as legacy's `emitVariantStruct`
+    // writes the minted `null` at the field.
+    const omitOwn = if given < 0 && own < 0 && arm == "variant" { nullOwnOfRep(ks[k]) } else { -1 }
+    const omitNul = omitOwn >= 0 && nullOwnRepFits(omitOwn, ks[k])
+    const v0 = if omitNul { repTemp(b, { nuAt: valIx, nuOwn: omitOwn, nuRead: [] }, valIx, ks[k]) } else if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own, nuRead: [] }, valIx, ks[k]) } else if typed { fieldNullTemp(b, row, fi, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
     if ibMiss != "" { return v0 }
     const vr = irBOpRep(v0)
     // A closure value at a field whose closure rep leaves a part open, or fills one, is the same
@@ -2246,11 +2252,14 @@ function objLitAt(
       && !holed
       && !clo
       && retagsAsStands(vr, ks[k], valIx)
+    // A packed `u8` field takes a plain i32, which the struct's packed field truncates.
+    const packed = repPrim(ks[k]) == "u8" && repPrim(vr) == "i32"
     if (
       vr != ks[k]
       && !holed
       && !clo
       && !stands
+      && !packed
       && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr)
     ) {
       return irBMiss("object field coercion")
@@ -2593,6 +2602,14 @@ function nullReadOwnAt(ix: i32): i32 {
   if exprPrePathWhy(ix, ibFnIx) != "" { return -1 }
   const own = nullReadDstOwnOf(sl, ibFnIx)
   return if own >= 0 { own } else { NULL_READ_STORED }
+}
+
+// The null a sentinel nullable rep `dst` holds, a boolean's or an atom's (`nullOwnRepFits`); -1 for
+// any other rep, whose null the field's delivery writes.
+function nullOwnOfRep(dst: i32): i32 {
+  if boolNullable(dst) { return NULL_OWN_BOOL }
+  if atomNullable(dst) { return NULL_OWN_ATOM }
+  return -1
 }
 
 // Whether rep `dst` holds the null `own` (`NULL_OWN_*`) names, as the verifier's `RNullOf` rule
@@ -13246,8 +13263,29 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32, ty: i32): Opnd {
   if irBOpRep(o) != dst || !repIsScalar(dst) {
     return irBMiss("as operand coercion")
   }
-  if ty >= 0 { return irBLetTempTy(b, { ncV: o, ncAt: ix }, ix, rep, ty) }
-  return irBLetTemp(b, { ncV: o, ncAt: ix }, ix, rep)
+  const miss = numCastMiss(b, n, ix)
+  if ibMiss != "" { return miss }
+  if ty >= 0 {
+    return irBLetTempTy(b, { ncV: o, ncAt: ix, ncMiss: miss }, ix, rep, ty)
+  }
+  return irBLetTemp(b, { ncV: o, ncAt: ix, ncMiss: miss }, ix, rep)
+}
+
+// The null a bare exact `as` at `ix` returns on its sad path, the function's own, as legacy's
+// `numExactCastTail` returns it (`emitReturnValue`); `ov` -1 for any other cast. It builds only
+// temps, which the sad path writes where it reads them.
+function numCastMiss(b: i32[], n: AsExpr, ix: i32): Opnd {
+  const none: Opnd = { ov: -1 }
+  if n.asMode != "prop" || numCastExactSrc(ix, ibFnIx) == "" { return none }
+  const nn = numCastNullNode(ix)
+  if nn < 0 { return irBMiss("as miss null") }
+  const m0 = b.length
+  const v = retDelivered(b, nn)
+  if ibMiss != "" { return v }
+  if irBOpRep(v) != ib.irRetRep || !onlyTempsFrom(b, m0) {
+    return irBMiss("as miss value")
+  }
+  return v
 }
 
 // Legacy's strength-reduced masked shift (`shiftMaskFoldOf`'s [x, k, narrow, m, j]): x at the
@@ -16491,7 +16529,25 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   const noted = irGlobalRepOf(ib, gi)
   const rep = if noted >= 0 { noted } else { globalTyRep(globalHeldTy(gst)) }
   if rep < 0 { return irBMiss("global initializer rep") }
-  const d = deliver(b, init, rep, -1)
+  // A constant list literal whose binding's storage row (`letBindTy`, D14434) is another list, a
+  // wider record's, is built at that row, which the cell then stores.
+  const bindRep = if noted < 0 && gConstExprEmit { globalTyRep(letBindTy(gst, -1)) } else { -1 }
+  const iu = unwrapParen(init)
+  const atBind = bindRep >= 0
+    && bindRep != rep
+    && repNodeAt(bindRep) is RList
+    && iu >= 0
+    && iu < P.nodes.length
+    && nodeAt(iu) is ArrayLit
+  const iv = if atBind { nodeAt(iu) } else { null }
+  const d = if iv is ArrayLit { arrayLit(
+    b,
+    iv,
+    iu,
+    bindRep,
+    arrLitListBuild(iu, ibFnIx),
+    heldTy(letBindTy(gst, -1)),
+  ) } else { deliver(b, init, rep, -1) }
   if ibMiss != "" { return d }
   // A record on the cell's own struct heap, or a declared subtype's, is stored retagged; so is a
   // list or closure the body lanes' retags take, unless legacy already stores it as it stands.
