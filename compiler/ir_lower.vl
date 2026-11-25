@@ -378,6 +378,7 @@ import {
   arrNewTail,
   asLitTail,
   asMapProbeTrapTail,
+  asPropNicheHeapOf,
   atomEqIsTail,
   atomEqTail,
   atomNotNulIsTail,
@@ -553,7 +554,10 @@ import {
   nulTestBoolTail,
   nulTestBoxTagTail,
   nulTestRefTail,
+  numCastExactSrc,
   numCastTail,
+  numExactCastClose,
+  numExactCastHead,
   numIntrTail,
   numUnionBinTail,
   numUnionConvertTail,
@@ -1296,7 +1300,11 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RNumCast => {
       irLOpnd(r.ncV)
-      numCastTail(r.ncAt, lw.irAt)
+      if r.ncMiss is OVar && r.ncMiss.ov < 0 {
+        numCastTail(r.ncAt, lw.irAt)
+      } else {
+        numCastMissTail(r)
+      }
     }
     // The cell's re-read, then the opcode narrowing it back, as `emitAsgValue` writes it.
     RAsgUnwiden => {
@@ -2202,6 +2210,17 @@ function isStaged(r: RIsStaged) {
   isRecvStagedSlot = 0
   isRecvStagedNonNull = false
   return 0
+}
+
+// A bare exact `as`'s tail past its operand, as `numExactCastTail` writes it: the test, then on
+// the sad path the function's own null the builder built (`ncMiss`), returned.
+function numCastMissTail(r: RNumCast): i32 {
+  const src = numCastExactSrc(r.ncAt, lw.irAt)
+  if src == "" { return irLMiss("as miss cast") }
+  const h = numExactCastHead(r.ncAt, src, lw.irAt)
+  if h != 1 { return irLMiss("as miss path") }
+  irLOpnd(r.ncMiss)
+  return numExactCastClose(r.ncAt, src)
 }
 
 // `RNumIs` along `numIsPlanOf`, as `emitIsTestNumLit` writes it: the receiver once into its slot
@@ -5326,8 +5345,10 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   if t < 0 || t >= lw.irVars.length || t >= lwStackVal.length {
     return irLMiss("coalesce box out")
   }
-  const e = nodeAt(n.cbAt)
-  if !(e is BinExpr) { return irLMiss("coalesce box node") }
+  const e0 = nodeAt(n.cbAt)
+  if !(e0 is BinExpr) && !(e0 is AsExpr && n.cbArm == "asProp") {
+    return irLMiss("coalesce box node")
+  }
   // An earlier operand's temps are written below the operand, as a valued `if` stages them.
   const stages = coalArmStagesLeads(n.cbArm)
   const roots = if stages { stageLead(n.cbL, pending) } else { noRoots() }
@@ -5335,8 +5356,22 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   if stages { joinBoxHead(t, true) }
   lwFloors.push(lwFloor)
   lwFloor = lwLive.length - liveCountIn(pending)
+  const got = coalBoxGo(n, pending)
+  lwFloor = lwFloors.pop() ?? 0
+  if got < 0 { return -1 }
+  for r in roots { pending.push(r) }
+  livePush(t)
+  pending.push(t)
+  return 0
+}
+
+// The `??` (or propagating `as`) itself along its arm, inside `coalBox`'s staging.
+function coalBoxGo(n: SCoalBox, pending: i32[]): i32 {
+  const e = nodeAt(n.cbAt)
+  if e is AsExpr { return coalAsProp(n, e, pending) }
+  if !(e is BinExpr) { return irLMiss("coalesce box node") }
   const ba = coalValBoxArm(n.cbArm)
-  const got = if ba != null { coalBoxArm(n, ba, e, pending) } else { match n.cbArm {
+  return if ba != null { coalBoxArm(n, ba, e, pending) } else { match n.cbArm {
     "popOr" => coalPopOr(n, e, pending)
     "listGetOr" => coalListGetOr(n, e, pending)
     "mapIndexGetOr" => coalMapGetOr(n, e, pending)
@@ -5349,16 +5384,25 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
     "nulStr" => coalNulStr(n, e, pending)
+    "asProp" => irLMiss("propagating as over a `??`")
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
   } }
-  lwFloor = lwFloors.pop() ?? 0
-  if got < 0 { return -1 }
-  for r in roots { pending.push(r) }
-  livePush(t)
-  pending.push(t)
-  return 0
+}
+
+// A propagating `as` over a nullable-ref niche, as `emitAsNulNiche` writes it: the plain block at
+// the non-null heap, the operand inside it, the branch out on non-null, then the null path, which
+// returns the function's null.
+function coalAsProp(n: SCoalBox, e: AsExpr, pending: i32[]): i32 {
+  if n.cbArm != "asProp" { return irLMiss("propagating as arm") }
+  const heap = asPropNicheHeapOf(e.asObj, lw.irAt)
+  if heap < 0 { return irLMiss("propagating as heap") }
+  if pending.length > 0 { return irLMiss("propagating as below a temp") }
+  coalNulRefOpen(heap, false)
+  cond(n.cbL, body(n.cbLB, false, -1, true))
+  coalNulRefBranch()
+  return coalNulRefTail(n, -1)
 }
 
 // `l ?? d` along legacy's `boxStash` rung, as `emitCoalesceBoxStash` writes it: the operand box,
