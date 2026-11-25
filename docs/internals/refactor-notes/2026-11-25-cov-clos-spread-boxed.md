@@ -51,3 +51,13 @@ boxed`. The other 6 now miss on a class of their own:
 | `??` operand | `coalesce nulRef default rep` |
 | outer literal element | `array element coercion` |
 | index write | `store operand coercion` |
+
+## Parked: a box over a valued `if` (a lowering prerequisite)
+
+Coordinator ruling, 2026-11-25: "box of a valued if" (23 rows) stays open. It needs a lowering that
+writes a single-use valued `if` as its box operand after the tag. The builder side was prototyped
+(a box lead over the value span). The lowering's stack-order guard in `leaf()` ("operand above a
+valued if's value") refuses it, and the prototype dropped 7 claims across 5 functions. The
+prerequisite is a live-stack change in `ir_lower.vl` that lets an operand sit above a valued `if`'s
+value. The builder side should land only after that. (This note came over from #10083, which was
+closed because #10061 had already removed its re-entry.)
