@@ -492,6 +492,7 @@ import {
   listGetIdxHook,
   listGetIdxLegacy,
   listGetOrOpen,
+  listGetRecvHook,
   listOpRecvHeld,
   listOpStageBase,
   listReserveOpen,
@@ -2259,6 +2260,42 @@ function numIs(r: RNumIs): i32 {
 // last, and beside each the reads of it so far.
 const getIdxOs: Opnd[] = []
 const getIdxReads: i32[] = []
+
+// The `.get` receiver operands `listGetRecvHook` reads while `coalListGetOr` writes legacy's head,
+// innermost last; each read is the operand read again (`opndAgain`).
+const getRecvOs: Opnd[] = []
+
+// Whether receiver operand `o` of node `ix` can be read again at each use: a variable, or a temp
+// whose read the builder recorded (`irHoistRecv`'s tables).
+function recvReadAgainOk(o: Opnd, ix: i32): boolean {
+  if o is OImm { return true }
+  if !(o is OVar) { return false }
+  if !isTemp(o.ov) { return true }
+  return hoistedReadKnown(ix)
+}
+
+// Whether `irHoistRecv` finds a recorded read for node `ix`.
+function hoistedReadKnown(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if (lw.irReadVar[ix] ?? -1) >= 0 { return true }
+  if lw.irReadAgain.has(ix) || lw.irReadElem.has(ix) { return true }
+  if lw.irReadOpt.get(ix) != null { return true }
+  const m = nodeAt(ix)
+  return lw.irReadField.has(ix)
+    && m is Member
+    && hoistedReadKnown(unwrapParen(m.memObj))
+}
+
+// `listGetRecvHook` under `coalListGetOr`: the innermost receiver operand read again.
+function irListGetRecvRead(objIx: i32, _fnIx: i32): i32 {
+  const at = getRecvOs.length - 1
+  if at < 0 {
+    irLMiss("get receiver unset")
+    return -1
+  }
+  if opndAgain(getRecvOs[at], objIx) < 0 { return -1 }
+  return 0
+}
 
 // Hands legacy's `.get` head index operand `o` (`listGetIdxHook`) where it is read at each use: an
 // immediate or a variable, never a temp. Returns whether it did; `irGetIdxEnd` then undoes it.
@@ -5689,7 +5726,20 @@ function coalListGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   irLSettle(pending)
   const ci = n.cbIdx
   const hooked = if ci != null { irGetIdxBegin(ci) } else { false }
+  // The receiver, skipped above, is read again at each of the head's reads where it can be.
+  const call = nodeAt(unwrapParen(e.binLeft))
+  const callee = if call is Call && call.callFn >= 0 { nodeAt(call.callFn) } else { null }
+  const recvIx = if callee is Member { unwrapParen(callee.memObj) } else { -1 }
+  const recvHooked = recvIx >= 0 && recvReadAgainOk(n.cbL, recvIx)
+  if recvHooked {
+    getRecvOs.push(n.cbL)
+    listGetRecvHook = irListGetRecvRead
+  }
   const ek = listGetOrOpen(unwrapParen(e.binLeft), lw.irAt)
+  if recvHooked {
+    getRecvOs.pop()
+    if getRecvOs.length == 0 { listGetRecvHook = listGetIdxLegacy }
+  }
   if hooked { irGetIdxEnd() }
   if ek == null { return irLMiss("listGetOr head") }
   lwFrames.push(-1)
