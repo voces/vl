@@ -83,6 +83,7 @@ import {
   nodeAt,
   nodeSpineChildren,
   spreadArgOf,
+  stmtAlwaysExits,
   tailValueLeaves,
 } from "./ast"
 import {
@@ -4450,9 +4451,29 @@ function loopWriteMayReach(tgt: i32, val: i32, p: i32, pre: i32): boolean {
 // needs the loop to decide is left to the write itself, which refuses what the loop's entry
 // type does not admit.
 function crLoopLeavingWrite(ix: i32, s: i32): i32 {
+  return crLeavingWriteIn(ix, s, false)
+}
+
+// `crLoopLeavingWrite` below `ix`, `inner` once the walk is inside a loop nested in the one asked.
+// For a binding typed `null`, a write the loop's back edge never carries (unreachable, or followed
+// in its block by a `break` or `return` with no `continue` between) leaves nothing at the top.
+function crLeavingWriteIn(ix: i32, s: i32, inner: boolean): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = nodeAt(ix)
   if n is FuncDecl { return -1 }
+  if n is Block && !inner && isNullTy(declTyOf(s)) {
+    const st = n.blkStmts
+    let i = 0
+    while i < st.length {
+      if !stmtLeavesLoopAfter(st, i) {
+        const a = crLeavingWriteIn(st[i], s, isLoopNode(st[i]))
+        if a >= 0 { return a }
+      }
+      if stmtAlwaysExits(st[i]) { return -1 }
+      i = i + 1
+    }
+    return -1
+  }
   if n is BinExpr {
     if n.binOp == "=" && placeKeyOf(n.binLeft) == slotNameOf(s) {
       const store = narWriteStorage(s)
@@ -4481,13 +4502,50 @@ function crLoopLeavingWrite(ix: i32, s: i32): i32 {
     const kids = nodeSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      const a = crLoopLeavingWrite(kids[k], s)
+      const a = crLeavingWriteIn(kids[k], s, inner || isLoopNode(kids[k]))
       if a >= 0 { return a }
       k = k + 1
     }
     cur = elseIfLink(cur)
   }
   return -1
+}
+
+// Whether `ix` is a `while` or `for` loop.
+function isLoopNode(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  return n is WhileStmt || n is ForIn || n is ForRange
+}
+
+// Whether statement `st[i]` of a loop body's block is always followed out of the loop before the
+// back edge: a later `break` or `return` in the block, with no `continue` in `st[i]` or between.
+function stmtLeavesLoopAfter(st: i32[], i: i32): boolean {
+  if holdsContinue(st[i]) { return false }
+  let j = i + 1
+  while j < st.length {
+    const sj = nodeAt(st[j])
+    if sj is BreakStmt || sj is RetStmt { return true }
+    if holdsContinue(st[j]) { return false }
+    j = j + 1
+  }
+  return false
+}
+
+// Whether a `continue` sits anywhere under `ix`, outside a nested function.
+function holdsContinue(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is ContinueStmt { return true }
+  if n is FuncDecl { return false }
+  let cur = ix
+  while cur >= 0 {
+    for k in nodeSpineChildren(cur) {
+      if holdsContinue(k) { return true }
+    }
+    cur = elseIfLink(cur)
+  }
+  return false
 }
 
 // Record at the `&&`/`||` node `ix` the left operand's facts its right operand retired, by a write
