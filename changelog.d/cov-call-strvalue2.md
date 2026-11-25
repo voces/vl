@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **A string-literal compare no longer re-enters the expression emitter:** legacy's `emitStrEqLit`, which a claimed function asks for `xs is S[]`, a record arm told by a literal field, or `as!` / `as?` to a literal arm, writes a plain literal as `emitExpr`'s literal arm does (`emitStrLitValue`), not through `emitStrValue`. Under the I8 sweep the 37 programs whose first stub was `reentry emitStrValue` (INFRA's #10096 red list) no longer reach it; the sweep over every population has none. Legacy's bytes are identical across every population and the self-compile.
