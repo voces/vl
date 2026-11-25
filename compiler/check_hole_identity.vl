@@ -1,0 +1,233 @@
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  LoopVar,
+  MatchExpr,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+  nodeAt,
+  tailValueLeaves,
+} from "./ast"
+import { parenPeelIx } from "./check_places"
+import { strListHas } from "./listutil"
+
+// Whether a call's un-annotated callee hands back the argument it is passed: a hole identity,
+// whose body uses the parameter only as a field's receiver before returning it. Read by the
+// checker's record adoption and by the elaboration, so it holds no checker state.
+
+// The argument of call `p` that `fd`, a non-generic function whose body only rebinds, reads or
+// writes the fields of, and returns an un-annotated parameter, hands back; -1 otherwise.
+export function recHoleIdentityArg(p: i32, fd: i32): i32 {
+  if p < 0 || p >= P.nodes.length || fd < 0 || fd >= P.nodes.length {
+    return -1
+  }
+  const c = nodeAt(p)
+  const f = nodeAt(fd)
+  if !(c is Call) || !(f is FuncDecl) { return -1 }
+  if f.fnTyParams.length > 0 || f.fnRet >= 0 || f.fnBody < 0 { return -1 }
+  for an in c.callArgNames {
+    if an != "" { return -1 }
+  }
+  const b = nodeAt(f.fnBody)
+  if !(b is Block) || b.blkStmts.length == 0 { return -1 }
+  let t = b.blkStmts[b.blkStmts.length - 1]
+  const tn = nodeAt(t)
+  if tn is RetStmt { t = tn.retArg }
+  const v = parenPeelIx(t)
+  if v < 0 || v >= P.nodes.length { return -1 }
+  // A value `if` hands back the same name from every arm (D17563).
+  let name = holeTailName(v)
+  if name == "" { return -1 }
+  // Earlier statements rebind the value to un-annotated names, walked back here. Every other
+  // statement may use the parameter and its aliases only as a field's receiver (D17047).
+  let k = b.blkStmts.length - 2
+  while k >= 0 {
+    const s = nodeAt(b.blkStmts[k])
+    if s is LetDecl {
+      const si = parenPeelIx(s.letInit)
+      if si >= 0 && si < P.nodes.length && s.letType < 0 && s.letName == name {
+        const sn = nodeAt(si)
+        if sn is Ident { name = sn.identName }
+      }
+    }
+    k = k - 1
+  }
+  const names: string[] = [name]
+  let j = 0
+  while j + 1 < b.blkStmts.length {
+    const s = nodeAt(b.blkStmts[j])
+    let alias = false
+    if s is LetDecl {
+      const si = parenPeelIx(s.letInit)
+      if si >= 0 && si < P.nodes.length && s.letType < 0 {
+        const sn = nodeAt(si)
+        if sn is Ident {
+          if strListHas(names, sn.identName) {
+            names.push(s.letName)
+            alias = true
+          }
+        }
+      }
+    }
+    if !alias && !holeUsesOnlyFields(b.blkStmts[j], names) { return -1 }
+    j = j + 1
+  }
+  if !holeJoinUsesOnlyFields(v, names) { return -1 }
+  let i = 0
+  while i < f.fnParams.length && i < c.callArgs.length {
+    const pn = nodeAt(f.fnParams[i])
+    if pn is Param {
+      if pn.parName == name {
+        if pn.parType >= 0 || pn.parRest != 0 { return -1 }
+        return c.callArgs[i]
+      }
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Whether node `ix` uses each of `names` only as the receiver of a field read, a `?.` read or a
+// field write, declares none of them, and returns only one of them. A kind it does not walk (a
+// nested function, a `match`, a literal holding a value) answers false, so the caller declines.
+function holeUsesOnlyFields(ix: i32, names: string[]): boolean {
+  if ix < 0 { return true }
+  if ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  return match n {
+    Ident => !strListHas(names, n.identName)
+    Member => nodeAt(n.memObj) is Ident || holeUsesOnlyFields(n.memObj, names)
+    OptMember => nodeAt(n.omObj) is Ident || holeUsesOnlyFields(n.omObj, names)
+    Call => holeCallUsesOnlyFields(n, names)
+    BinExpr => holeUsesOnlyFields(n.binLeft, names) && holeUsesOnlyFields(n.binRight, names)
+    Unary => holeUsesOnlyFields(n.unArg, names)
+    Paren => holeUsesOnlyFields(n.parInner, names)
+    LetDecl => !strListHas(names, n.letName) && holeUsesOnlyFields(n.letInit, names)
+    NumLit | StrLit | CharLit | BoolLit | NullLit | BreakStmt | ContinueStmt => true
+    IfStmt => holeUsesOnlyFields(n.ifCond, names)
+      && holeUsesOnlyFields(n.ifThen, names)
+      && holeUsesOnlyFields(n.ifElse, names)
+    WhileStmt => holeUsesOnlyFields(n.whileCond, names) && holeUsesOnlyFields(n.whileBody, names)
+    Block => holeStmtsUseOnlyFields(n.blkStmts, names)
+    ForRange => !strListHas(names, n.frVar)
+      && holeUsesOnlyFields(n.frFrom, names)
+      && holeUsesOnlyFields(n.frTo, names)
+      && holeUsesOnlyFields(n.frStep, names)
+      && holeUsesOnlyFields(n.frBody, names)
+    ForIn => !strListHas(names, n.fiVar)
+      && !strListHas(names, n.fiVar2)
+      && holeUsesOnlyFields(n.fiIter, names)
+      && holeUsesOnlyFields(n.fiBody, names)
+    // An early return hands back the parameter itself, as the tail does.
+    RetStmt => holeNamesAlias(n.retArg, names)
+    ErrExpr | Param | TypeRef | FuncDecl | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread | LoopVar => false
+  }
+}
+
+// The name tail `v` hands back: an identifier's, or the one every arm of a value `if` ends in;
+// "" otherwise.
+function holeTailName(v: i32): string {
+  if v < 0 || v >= P.nodes.length { return "" }
+  const vn = nodeAt(v)
+  if vn is Ident { return vn.identName }
+  if !(vn is IfStmt) || vn.ifElse < 0 { return "" }
+  const leaves: i32[] = []
+  tailValueLeaves(v, leaves)
+  let name = ""
+  for lf in leaves {
+    const lp = parenPeelIx(lf)
+    if lp < 0 || lp >= P.nodes.length { return "" }
+    const ln = nodeAt(lp)
+    if !(ln is Ident) || (name != "" && ln.identName != name) { return "" }
+    name = ln.identName
+  }
+  return name
+}
+
+// Whether tail `v`, a name or a value `if` of names, uses `names` elsewhere only as a field's
+// receiver: its conditions and the statements before each arm's value.
+function holeJoinUsesOnlyFields(v: i32, names: string[]): boolean {
+  if holeNamesAlias(v, names) { return true }
+  const vn = nodeAt(v)
+  if !(vn is IfStmt) { return false }
+  return holeUsesOnlyFields(vn.ifCond, names)
+    && holeArmUsesOnlyFields(vn.ifThen, names)
+    && holeArmUsesOnlyFields(vn.ifElse, names)
+}
+
+// An arm of a value `if`: its statements before the last use `names` only as receivers, and the
+// last is a name of them or a nested value `if` of them.
+function holeArmUsesOnlyFields(arm: i32, names: string[]): boolean {
+  if arm < 0 || arm >= P.nodes.length { return false }
+  const an = nodeAt(arm)
+  if !(an is Block) { return holeJoinUsesOnlyFields(parenPeelIx(arm), names) }
+  if an.blkStmts.length == 0 { return false }
+  let i = 0
+  while i + 1 < an.blkStmts.length {
+    if !holeUsesOnlyFields(an.blkStmts[i], names) { return false }
+    i = i + 1
+  }
+  return holeJoinUsesOnlyFields(
+    parenPeelIx(an.blkStmts[an.blkStmts.length - 1]),
+    names,
+  )
+}
+
+// `holeUsesOnlyFields` over each statement of a block.
+function holeStmtsUseOnlyFields(stmts: i32[], names: string[]): boolean {
+  for st in stmts {
+    if !holeUsesOnlyFields(st, names) { return false }
+  }
+  return true
+}
+
+// Whether `x` is a read of one of `names` itself.
+function holeNamesAlias(x: i32, names: string[]): boolean {
+  const v = parenPeelIx(x)
+  if v < 0 || v >= P.nodes.length { return false }
+  const vn = nodeAt(v)
+  return vn is Ident && strListHas(names, vn.identName)
+}
+
+// `holeUsesOnlyFields` over a call's callee and arguments.
+function holeCallUsesOnlyFields(n: Call, names: string[]): boolean {
+  if !holeUsesOnlyFields(n.callFn, names) { return false }
+  for a in n.callArgs {
+    if !holeUsesOnlyFields(a, names) { return false }
+  }
+  return true
+}
