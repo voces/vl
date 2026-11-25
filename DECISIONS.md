@@ -13122,3 +13122,24 @@ This extends the `??` hole precedent, D1589 (`fillCoalHoleNodes`), which re-asks
 **Where it fires.** Only where the read is not flow-narrowed. Inside a function, the checker already types a read before any write as `null`, so the local spelling's join is a correct `In | null` and runs. Emit now delivers such a read as the destination's null (D17203's emit half, D17204). The refusal is left to a function that reads a module binding a later top-level write fills.
 
 **Rejected alternative.** A new flow-sensitive "still definitely null" arm was rejected: it covers only the straight-line local case, which the existing narrowing already covers, and not the read across a function boundary.
+
+## A list of only a never-filled `let x = null`'s values is the `[null]` list (2026-11-24, coordinator ruling) — D17304
+
+**Ruled by the coordinator 2026-11-24**, on the merge queue's referral of lane IR-N9's D17304 scoping.
+
+**The rule.** A `let x = null` that no write fills is the `null` type (D1576), so an un-annotated list
+whose every element is such a value (`[x]`, `[x = null]`, `[x, x]`, `[x, null]`) is the `[null]`
+case. The checker refuses it at the literal with `[null]`'s message (D1832), extended to name the
+binding: "a list of only `null` has no element type: a `let` bound to `null` and never written another
+value is `null`; annotate the list or the binding". Where the destination names the type (a
+`const a: null[]`, a `null[]` parameter, an annotated index store) the list is a `null[]` and runs,
+its elements stored as the `null[]` sentinel.
+
+**Why.**
+- Before, the literal took the hole's type, which has no list rep: the module failed to validate, or,
+  with a closure writing the binding, it ran and printed the sentinel `2` for `null`. That second
+  outcome was silently wrong, so the refusal removes a soundness hole, not a running program.
+- The fill is only known at the end of checking, since a later write fills the hole in place (D2421).
+  So the literal is recorded as a candidate and judged in `flushNullOnlyLits`, where a hole a write
+  filled is that write's `T | null` and its list is not refused.
+- The refusal names a contract: annotating the list or the binding runs.
