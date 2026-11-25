@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- IR coverage (lane COV-CLOS): a union box over a valued join, such as `const j: J = (n ?? 0) as f64` or a map store of `(parse(s) ?? 0) as f64`, is now built by the IR. The value may take one-operand numeric steps (a widening, a plain cast, an op with immediates after the value), and a staged `??` may come after its own operand. The box's tag is written ahead of the join, as legacy writes it. The lowering's stack-order guard is unchanged. `box of a valued if` falls from 42 rows to 30 over 11,452 programs, 7 more functions are claimed, none is lost, and `scripts/sweep.vl`'s `recordOf` is claimed.
