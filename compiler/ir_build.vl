@@ -595,8 +595,10 @@ import {
 } from "./emit_plan_union"
 import {
   SpreadPlan,
+  allocLitChunk,
   arrLitBuildAt,
   arrLitBuiltTyOf,
+  arrLitRefLongSlot,
   arrLitRefShortSlot,
   arrLitTyAt,
   arrLitUnionBoxSlot,
@@ -2474,10 +2476,18 @@ function objLitAt(
       && repNodeAt(ks[k]) is RClosure
       && exprPrePathWhy(valIx, ibFnIx) == ""
       && recHeapNoted(rep)
+    // …and so is one at a field that holds such a closure or `null` (`cloNicheTakes`).
+    const nicheClo = !holed
+      && !clo
+      && own < 0
+      && !typed
+      && cloNicheTakes(v1, ks[k], valIx)
+      && recHeapNoted(rep)
     // A record or list the field holds as it stands, apart in no hole, is retagged too.
     const stands = vr != ks[k]
       && !holed
       && !clo
+      && !nicheClo
       && retagsAsStands(vr, ks[k], valIx)
     // A sub-word field (`repSubWord`) takes a plain i32, which the struct's field truncates.
     const packed = repSubWord(ks[k]) && repPrim(vr) == "i32"
@@ -2486,12 +2496,14 @@ function objLitAt(
       && !holed
       && !clo
       && !stands
+      && !nicheClo
       && !packed
       && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr)
     ) {
       return irBMiss("object field coercion")
     }
-    const v = if holed || clo || stands { repTemp(b, { rgV: v1 }, valIx, ks[k]) } else { v1 }
+    const v = if nicheClo { cloNicheRetag(b, v1, ks[k], valIx) } else if holed || clo || stands { repTemp(b, { rgV: v1 }, valIx, ks[k]) } else { v1 }
+    if ibMiss != "" { return v }
     if clo { irCloFieldRetagNote(ib, b[b.length - 1]) }
     layout[fi] = k
     if stashRow >= 0 { src.push(k) }
@@ -2928,9 +2940,38 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
     if ibMiss != "" { return gv }
     return irBLetTemp(b, { teV: gv, teTag: tag }, ix, rep)
   }
+  const cb = if v < 0 { capturedBoxRaw(b, r) } else { null }
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  if cb != null { return irBLetTemp(b, { teV: cb, teTag: tag }, ix, rep) }
   if v < 0 { return irBMiss("is box not a local") }
   const o: Opnd = { ov: v }
   return irBLetTemp(b, { teV: o, teTag: tag }, ix, rep)
+}
+
+// A captured union box `r` read raw past its narrowing: a lifted function's own parameter, or its
+// environment's field at the box's rep; null where `r` is no captured box.
+function capturedBoxRaw(b: i32[], r: i32): Opnd | null {
+  const n = nodeAt(r)
+  if !(n is Ident) || ibFnIx < 0 || captureSlotOf(n.identName, ibFnIx) < 0 {
+    return null
+  }
+  const fe = fnStmtsPosOf(ibFnIx)
+  const cr = capRepFor(fe, n.identName, -1)
+  const ty = capTyOf(fe, n.identName)
+  if !heldAsBox(cr) || ty < 0 || repNodeOfTy(ty) != cr { return null }
+  if cloLifted(fe) {
+    const lv = liftCapVar(fe, n.identName, -1)
+    if lv < 0 || ib.irVars[lv].vRep != cr { return null }
+    const o: Opnd = { ov: lv }
+    return o
+  }
+  return irBLetTempTy(
+    b,
+    { evSlot: captureSlotOf(n.identName, ibFnIx), evAt: r },
+    r,
+    cr,
+    ty,
+  )
 }
 
 // A member receiver's test at its storage: the field read as the storage read, its declared box.
@@ -3033,7 +3074,13 @@ function boxTestTagOf(
     return 0
   }
   const r = unwrapParen(n.isObj)
-  if localIndexOf(ibFnIx, r) < 0 && globalBoxSymOf(identDeclOf(r), r) < 0 {
+  const rn = if r >= 0 && r < P.nodes.length { nodeAt(r) } else { null }
+  const cap = rn is Ident && captureSlotOf(rn.identName, ibFnIx) >= 0
+  if (
+    localIndexOf(ibFnIx, r) < 0
+    && globalBoxSymOf(identDeclOf(r), r) < 0
+    && !cap
+  ) {
     irBMiss("is box not a local")
     return 0
   }
@@ -3724,6 +3771,12 @@ export function irBLetTempTy(
 export function irBBoxLocal(b: i32[], ix: i32): Opnd {
   const d = identDeclOf(ix)
   const w = localIndexOf(ibFnIx, ix)
+  // A capture's box is its lifted parameter or its environment field (`capturedBoxRaw`).
+  if w < 0 {
+    const cb = capturedBoxRaw(b, ix)
+    if ibMiss != "" { return irBMiss(ibMiss) }
+    if cb != null { return cb }
+  }
   if d >= 0 && w < 0 { return globalBoxRead(b, d, ix) }
   if d < 0 || w < 0 { return irBMiss("box receiver") }
   const dn = nodeAt(d)
@@ -6243,6 +6296,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
     return strFromBytesRhs(b, c, ix)
   }
+  if d < 0 && trapCallNamed(c, ibFnIx) && tplStrHoleOf(c, ibFnIx) < 0 {
+    return trapCallRhs(b, c, ix)
+  }
   if d < 0 && numIntrCallReached(c, cf, ibFnIx) && tplStrHoleOf(c, ibFnIx) < 0 {
     if cf.identName == "fromCodePoint" || cf.identName == "fromCodePoints" {
       return fromCpRhs(b, c, cf, ix)
@@ -6577,8 +6633,11 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         && exprPrePathWhy(cargs[i], ibFnIx) == "") { repTempTy(b, { rgV: a }, cargs[i], pr, pt) } else if irBOpRep(a) != pr && recRetagNoted(irBOpRep(a), pr, cargs[i]) { repTempTy(b, { rgV: a }, cargs[i], pr, pt) } else { a }
       // A union parameter boxes the argument as legacy's `emitUnionBoxOwed` does (the floor); a
       // reference its parameter's valtype holds as it stands is passed as is (`repStoresAs`).
-      const fa = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, cargs[i], pr, -1, fu) } else { ra }
+      const fa0 = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, cargs[i], pr, -1, fu) } else { ra }
       if ibMiss != "" { return missRhs(ibMiss) }
+      // A closure handed to a parameter that holds a closure of its struct or `null` (the niche):
+      // retagged to that closure, then into its niche, as a field's (`objLitAt`).
+      const fa = if cloNicheTakes(fa0, pr, cargs[i]) { cloNicheRetag(b, fa0, pr, cargs[i]) } else { fa0 }
       if (
         irBOpRep(fa) != pr
         && !repNullRefFits(irBOpRep(fa), pr)
@@ -8322,6 +8381,23 @@ function trapStmt(b: i32[], c: Call, ix: i32) {
   return 0
 }
 
+// `__trap__(msg?)` read as a value: its message streamed, then legacy's `unreachable` for the
+// value, padded where the call ends a `never` (`emitCallCoreTrap`, `callEndsNever`).
+function trapCallRhs(b: i32[], c: Call, ix: i32): Rhs {
+  if c.callArgs.length > 1 { return missRhs("trap arguments") }
+  if c.callArgs.length == 1 {
+    if printArmOf(c.callArgs[0], ibFnIx) != "str" {
+      return missRhs("trap message")
+    }
+    const v = irBExpr(b, c.callArgs[0])
+    if ibMiss != "" { return missRhs("trap message") }
+    if repPrim(irBOpRep(v)) != "str" { return missRhs("trap message rep") }
+    irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+  }
+  const r: Rhs = { dnAt: ix, dnPad: callEndsNever(ix) }
+  return r
+}
+
 // Places the blocks a nullable print opens (`RPrintOpen`, arm `arm`) at index `at` of body `b`,
 // before the operand statements built from there.
 function printOpenAt(b: i32[], at: i32, arm: i32, ix: i32) {
@@ -9186,8 +9262,9 @@ function eqOperandRaw(b: i32[], ix: i32): Opnd {
   return deliver(b, ix, repNodeOfTy(ty), ty)
 }
 
-// A `==`/`!=` legacy writes on its numeric tail (`eqRouteOf`'s `numeric`) over a `boolean | null` niche and a bool or another
-// niche: each operand's i32 cell, then the plain compare.
+// A `==`/`!=` legacy writes on its numeric tail (`eqRouteOf`'s `numeric`) over a `boolean | null`
+// niche and a bool or another niche, or over two operands at one `i32` or `bool` cell (a function
+// set's ids): each operand's cell, then the plain compare.
 function nicheBoolEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const p = binPrimOp(n.binOp, false)
   if p == null { return irBMiss("operator " + n.binOp) }
@@ -9200,13 +9277,12 @@ function nicheBoolEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const rr = irBOpRep(r)
   const ln = repBoolNiche(lr)
   const rn = repBoolNiche(rr)
-  if (
-    !(ln || rn)
-    || !(ln || repPrim(lr) == "bool")
-    || !(rn || repPrim(rr) == "bool")
-  ) {
-    return irBMiss(OPERAND_TYPE)
-  }
+  const lp = repPrim(lr)
+  const cell = lr == rr && lp != null && (lp == "i32" || lp == "bool")
+  const niche = (ln || rn)
+    && (ln || repPrim(lr) == "bool")
+    && (rn || repPrim(rr) == "bool")
+  if !cell && !niche { return irBMiss(OPERAND_TYPE) }
   return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
 }
 
@@ -10136,13 +10212,36 @@ function boxIntoOtherUnion(ix: i32, dst: i32, dstTy: i32): boolean {
   return dstTy < 0 || holeBoxPlanOf(ix, dstTy, ibFnIx).hbArm != "pass"
 }
 
-// The union legacy's field writer boxes literal row `row`'s field `fi` at.
 // Whether rep `dst` is the nullable of rep `r`, `r` a scalar.
 function nullableOver(dst: i32, r: i32): boolean {
   const n = repNodeAt(dst)
   return repIsScalar(r) && n is RNullable && n.rnInner == r
 }
 
+// Whether closure value `v` (node `ix`) is retagged into nullable closure rep `dst` by its niche:
+// `dst` holds a closure or `null`, `v` a closure of the one closure struct, delivered plainly.
+function cloNicheTakes(v: Opnd, dst: i32, ix: i32): boolean {
+  const vr = irBOpRep(v)
+  const dn = repNodeAt(dst)
+  return vr != dst
+    && dn is RNullable
+    && dn.rnDisc == 1
+    && repNodeAt(dn.rnInner) is RClosure
+    && repNodeAt(vr) is RClosure
+    && exprPrePathWhy(ix, ibFnIx) == ""
+}
+
+// Closure value `v` (node `ix`) retagged to nullable closure rep `dst`'s closure, then into its
+// niche (`cloNicheTakes`).
+function cloNicheRetag(b: i32[], v: Opnd, dst: i32, ix: i32): Opnd {
+  const dn = repNodeAt(dst)
+  if !(dn is RNullable) { return irBMiss("closure niche rep") }
+  const c = if irBOpRep(v) == dn.rnInner { v } else { repTemp(b, { rgV: v }, ix, dn.rnInner) }
+  if irBOpRep(v) != dn.rnInner { irCloFieldRetagNote(ib, b[b.length - 1]) }
+  return repTemp(b, { rgV: c }, ix, dst)
+}
+
+// The union legacy's field writer boxes literal row `row`'s field `fi` at.
 function fieldSiteTy(arm: ObjLitArm, row: i32, fi: i32): i32 {
   return if arm == "variant" { variantFieldBoxTy(row, fi) } else { structFieldBoxTy(row, fi) }
 }
@@ -11290,17 +11389,21 @@ function arrayLit(
   if arm == "spread" { return spreadLit(b, n, ix, rep, lb, bt) }
   // A ref list builds along `emitArrRef`'s short arms (`arrLitRefShortSlot`) or not at all: each
   // element as is, or each boxed by its record, which `deliver` writes at the box rep.
+  // …or, past the chunk cap, the short arms' chunked twin (`arrLitRefLongSlot`).
+  const short = if arm == "ref" { arrLitRefShortSlot(ix, ibFnIx, lb) } else { -1 }
+  const lslot = if arm == "ref" && short < 0 && arrLitVariantSlot(ix, ibFnIx, lb) < 0 { arrLitRefLongSlot(ix, ibFnIx, lb) } else { -1 }
   // …or a non-null variant's, each element a literal built at the variant's row or a value of it.
   // …or, along legacy's general path, each element coerced to the variant's row all the same.
-  const vshort = if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 { arrLitVariantSlot(ix, ibFnIx, lb) } else { -1 }
-  const vslot = if vshort < 0 && arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 { arrLitVariantLongSlot(ix, ibFnIx, lb) } else { vshort }
+  const vshort = if arm == "ref" && short < 0 { arrLitVariantSlot(ix, ibFnIx, lb) } else { -1 }
+  const vslot = if vshort < 0 && arm == "ref" && short < 0 && lslot < 0 { arrLitVariantLongSlot(ix, ibFnIx, lb) } else { vshort }
   // …or a union-box slot's per-element build, each element boxed into the slot's union.
-  const uslot = if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 && vslot < 0 { arrLitUnionLongSlot(ix, n.arrElems, ibFnIx, lb) } else { -1 }
+  const uslot = if arm == "ref" && short < 0 && vslot < 0 && lslot < 0 { arrLitUnionLongSlot(ix, n.arrElems, ibFnIx, lb) } else { -1 }
   if (
     arm == "ref"
     && arrLitRefShortSlot(ix, ibFnIx, lb) < 0
     && vslot < 0
     && uslot < 0
+    && lslot < 0
   ) {
     return irBMiss("array ref")
   }
@@ -11393,6 +11496,15 @@ function arrayLit(
     const ve = if holed { repTemp(b, { rgV: v }, e, er) } else { v }
     if irBOpRep(ve) != er { return irBMiss("array element coercion") }
     elems.push(ve)
+  }
+  // A chunked ref list writes each chunk's flush between its elements, which a valued `if`'s out,
+  // waiting on the stack below the elements after it, cannot cross.
+  if (
+    arm == "ref"
+    && starts.length > allocLitChunk()
+    && ifBelowLeadHas(b, starts[0], b.length)
+  ) {
+    return irBMiss("chunked list valued element")
   }
   const r: Rhs = {
     mlElems: elems,
