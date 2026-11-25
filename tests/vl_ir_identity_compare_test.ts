@@ -28,8 +28,15 @@ function dir(root: string, name: string, builds: Record<string, Build>): string 
   return d;
 }
 
-/** Runs `ir-identity.sh <mode>` over `a` and `b`; its exit code and stdout. */
-function compare(mode: string, a: Record<string, Build>, b: Record<string, Build>, baseline = "") {
+/** Runs `ir-identity.sh <mode>` over `a` and `b`; its exit code and stdout. `bytes` restores the
+ * byte gate (`$IR_IDENTITY_BYTES=1`); by default a byte differ is informational. */
+function compare(
+  mode: string,
+  a: Record<string, Build>,
+  b: Record<string, Build>,
+  baseline = "",
+  bytes = false,
+) {
   const root = Deno.makeTempDirSync();
   try {
     const list = `${root}/list`;
@@ -38,7 +45,11 @@ function compare(mode: string, a: Record<string, Build>, b: Record<string, Build
     Deno.writeTextFileSync(`${root}/baseline.txt`, baseline);
     const out = new Deno.Command("bash", {
       args: [SCRIPT, mode, list, dir(root, "a", a), dir(root, "b", b)],
-      env: { IR_IDENTITY_KEEP: keep, IR_DIVERGENCE_BASELINE: `${root}/baseline.txt` },
+      env: {
+        IR_IDENTITY_KEEP: keep,
+        IR_DIVERGENCE_BASELINE: `${root}/baseline.txt`,
+        IR_IDENTITY_BYTES: bytes ? "1" : "0",
+      },
       stdout: "piped",
       stderr: "piped",
     }).outputSync();
@@ -111,10 +122,26 @@ Deno.test("ir-identity --compare-errors: a witness refused for another reason re
   }
 });
 
-Deno.test("ir-identity --compare-errors: a witness both seeds build to other bytes reds", () => {
-  const r = compare("--compare-errors", { ...ERRORS, "t/e3.vl": { rc: 0, wasm: "other" } }, ERRORS);
+Deno.test("ir-identity --compare-errors: under the byte gate, a witness both seeds build to other bytes reds", () => {
+  const r = compare("--compare-errors", { ...ERRORS, "t/e3.vl": { rc: 0, wasm: "other" } }, ERRORS, "", true);
   if (r.code !== 1 || !r.text.includes("DIFF t/e3.vl\n")) {
     throw new Error(`want t/e3.vl to red on its bytes, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+// Byte identity is not a gate (coordinator ruling 2026-11-25): a byte differ is counted and handed
+// to the behaviour check, never a DIFF by itself.
+Deno.test("ir-identity --compare-errors: by default a witness both seeds build to other bytes is informational", () => {
+  const r = compare("--compare-errors", { ...ERRORS, "t/e3.vl": { rc: 0, wasm: "other" } }, ERRORS);
+  if (r.code !== 0 || r.text.includes("DIFF") || !r.text.includes("bytes differ 1 (informational)")) {
+    throw new Error(`want a pass counting one byte differ, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+Deno.test("ir-identity --compare: by default a program both build to other bytes is informational", () => {
+  const r = compare("--compare", { ...CASES, "t/ok.vl": { rc: 0, wasm: "other" } }, CASES);
+  if (r.code !== 0 || r.text.includes("DIFF") || !r.text.includes("bytes differ 1 (informational)")) {
+    throw new Error(`want a pass counting one byte differ, got exit ${r.code}:\n${r.text}`);
   }
 });
 
@@ -131,11 +158,13 @@ Deno.test("ir-identity --compare: a one-sided timeout is a TIMEOUT, refused, nev
   }
 });
 
-Deno.test("ir-identity --compare: a differ beside a timeout still reds as a differ", () => {
+Deno.test("ir-identity --compare: under the byte gate, a differ beside a timeout still reds as a differ", () => {
   const r = compare(
     "--compare",
     { "t/ok.vl": { rc: 0, wasm: "one" }, "t/r.vl": { rc: 1, err: REFUSAL, log: "x" } },
     { "t/ok.vl": { rc: 0, wasm: "two", log: "y" }, "t/r.vl": { rc: 124, err: "" } },
+    "",
+    true,
   );
   if (r.code !== 1 || !r.text.includes("DIFF t/ok.vl") || !r.text.includes("TIMEOUT t/r.vl (b)")) {
     throw new Error(`want exit 1 with the DIFF and the TIMEOUT, got exit ${r.code}:\n${r.text}`);
@@ -234,6 +263,8 @@ function divergedAt(baseline: string, file: (root: string) => string, dis: strin
         IR_DIVERGENCE_BASELINE: b,
         WASM_DIS: dis,
         IR_IDENTITY_WIT: `${root}/wit`,
+        // A listed divergence is read through wasm-dis only under the byte gate.
+        IR_IDENTITY_BYTES: "1",
       },
       stdout: "piped",
       stderr: "piped",

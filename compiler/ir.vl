@@ -575,8 +575,14 @@ export type RMapGet = {
   mtWhole: boolean,
 }
 // `m.keys()` or, under `miVals`, `m.values()` at call `miAt` over map variable `miV`, which legacy's
-// writer reads three times (`mapListStep`): a fresh list of the live entries.
-export type RMapIter = { miV: Opnd, miAt: i32, miVals: boolean }
+// writer reads three times (`mapListStep`): a fresh list of the live entries. Under `miOnce` the
+// receiver is a temp no read repeats, evaluated once into a local the three reads take.
+export type RMapIter = {
+  miV: Opnd,
+  miAt: i32,
+  miVals: boolean,
+  miOnce: boolean,
+}
 // A scalar map read `m[k]` against operand `mqOther` at compare node `mqAt` (`scalarMapEqPlanOf`'s
 // `read` arm): map global `mqSym` (recovered for `mqNonNull`) or receiver `mqLoc`, key `mqKey`;
 // a miss equals nothing. An i32 0 or 1.
@@ -894,12 +900,12 @@ export function sIf(
 }
 export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 // Whether a `??` along arm `a` stages an earlier operand's temps below its operand: a niche
-// cell's `if`, a nullable reference's block, a boxed binding's tag test and a call's box stash
-// read only that operand before they open.
+// cell's `if`, a nullable reference's block, a boxed binding's tag test, a call's box stash and a
+// union field's test read only that operand before they open.
 export function coalArmStagesLeads(a: CoalValArm): boolean {
   return match a {
-    "litUnion" | "nulBool" | "nulRef" | "nulStr" | "asProp" | "nulBoolJoin" | "valBox" | "valScalar" | "callBox" | "callScalar" | "boxStash" => true
-    "boolPop" | "valNoKind" | "elem" | "callNoKind" | "next" | "popOr" | "listGetOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "optBoxLeaf" | "optRecLeaf" | "optMapField" | "nulAtomJoin" | "boxFieldScalar" => false
+    "litUnion" | "nulBool" | "nulRef" | "nulStr" | "asProp" | "nulBoolJoin" | "valBox" | "valScalar" | "callBox" | "callScalar" | "boxStash" | "fieldBox" | "fieldVal" => true
+    "boolPop" | "valNoKind" | "elem" | "callNoKind" | "next" | "popOr" | "listGetOr" | "mapIndexGetOr" | "optLeaf" | "optBoxLeaf" | "optRecLeaf" | "optMapField" | "nulAtomJoin" | "boxFieldScalar" => false
   }
 }
 // An integer `match` chain written as one `br_table` (`IntSwitchPlan`): operand `isOn` less
@@ -1114,6 +1120,11 @@ export type IrFn = {
   irUnbankedRead: i32,
   // A global read the builder built, by the read's node: written again as it stands.
   irReadAgain: {[i32]: Rhs},
+  // The box read a global's narrowed unbox in `irReadAgain` takes when written again, by the read's
+  // node: the global's read, in place of the box temp its first read consumed.
+  irReadBoxed: {[i32]: Rhs},
+  // The box temp each such read's temp reads, by that temp: a skip of the read consumes it first.
+  irSkipBase: {[i32]: i32},
   // A list read the builder built at a node over a variable or an immediate, written again as built.
   irReadElem: {[i32]: Rhs},
   // How many times the lowering has read the receiver of the literal arms it is writing.
@@ -1221,6 +1232,8 @@ export function irFnNew(at: i32, name: string): IrFn {
     irBoxLeadBox: [],
     irBoxLeadN: [],
     irReadAgain: Map(),
+    irReadBoxed: Map(),
+    irSkipBase: Map(),
     irReadElem: Map(),
     irLitReads: 0,
     irReadField: Map(),
@@ -2138,7 +2151,9 @@ function rhsText(r: Rhs): string {
       + opndText(r.mqKey)
       + "] "
       + opndText(r.mqOther)
-    RMapIter => (if r.miVals { "map.values " } else { "map.keys " }) + opndText(r.miV)
+    RMapIter => (if r.miVals { "map.values " } else { "map.keys " })
+      + (if r.miOnce { "once " } else { "" })
+      + opndText(r.miV)
     RStrOp => "str." + r.soOp + "(" + opndsText(r.soArgs) + ")"
     RStructEq => "struct_eq("
       + opndsText(opndsCat([r.seL, r.seR], opndsCat(r.seLIx, r.seRIx)))
@@ -2904,6 +2919,24 @@ export function recRowRetag(src: i32, dst: i32, hs: {[i32]: i32}): boolean {
   recHeapsNote(hs, src)
   recHeapsNote(hs, dst)
   return repsLowerAlike(src, dst, hs) || recFieldsWiden(src, dst, hs)
+}
+
+// Whether plain record rep `src`, with no heap of its own, held on heap `h` (a list's element storage
+// legacy lays out) stands at plain record rep `dst` on `h` as `recRowRetag` admits; where it does,
+// `src` is noted at `h` in `hs`, so the retag's check reads the same heap.
+export function recRowRetagOn(
+  src: i32,
+  dst: i32,
+  h: i32,
+  hs: {[i32]: i32},
+): boolean {
+  if h < 0 || heapNotedOr(hs, src) >= 0 || heapNotedOr(hs, dst) != h {
+    return false
+  }
+  hs[src] = h
+  if recRowRetag(src, dst, hs) { return true }
+  hs[src] = -1
+  return false
 }
 
 // Whether record temp `v` at plain record rep `src`, built at a struct heap (`irVarHeapOf`) its rep

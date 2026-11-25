@@ -223,26 +223,35 @@ posts the red list there; this table is the latest, by owner.
 
 | as of | what fails | count | owner |
 |---|---|---:|---|
-| master 7ddd7d14 | self-compile (`ir-i8-self-list.sh`) | 0 units | done |
-| master 7ddd7d14 | re-entry causes (`ir-i8-sweep.sh`: newly failing with nothing the seed leaves unclaimed) | 0 | done |
-| master 7ddd7d14 | programs reaching an unclaimed function (`emitFuncBody`) | 545 | the COV lanes, by census class |
-| master 7ddd7d14 | programs reaching an unclaimed start body or global initializer (`emitStartGlobalInitValue` 279, `emitStmt` 101, `emitStartGlobalInit` 6, `emitVariantCoerce` 4) | 390 | COV-START, CENSUS |
-| master 7ddd7d14 | `reentry emitDelivered` (each program also has an unclaimed unit) | 44 | COV-IS |
-| master 7ddd7d14 | tools that are programs: `scripts/plumb-shape-cost.vl` (`runTimed`) | 1 | COV-CLOS |
-| master 7ddd7d14 | ratchets with no reading: plumb-shape-cost | 1 | follows the tool above |
-| master 7ddd7d14 | stubs still called after `--apply` | 14 | INFRA |
-| regeneration 4 | witnesses that were silent invalid wasm and now refuse loudly | 14 | a soundness gain, kept |
+| regeneration 6, master cd223066 | self-compile (`ir-i8-self-list.sh`) | 0 units | done |
+| regeneration 6 | stub hits (`i8 stub emitExpr`, all const-cell initializers) | 3 programs | COV-START |
+| regeneration 6 | corpus oracle programs refused as unclaimed (`cannot yet lower`) | 634 | the COV lanes, by class |
+| regeneration 6 | distilled classes that stopped running | 38 (171 cells) | the COV lanes, by class |
+| regeneration 6 | witnesses runs → emit_reject | 236 | the COV lanes, by class |
+| regeneration 6 | `hoisted receiver read` in top-level code (the std probes) | 15 | CENSUS |
+| regeneration 6 | tools that are programs: `scripts/plumb-shape-cost.vl:842` (`coalesce field after an operand`) | 1 | COV-UNION (#10154, merged since) |
+| regeneration 6 | contract refusals that read `cannot yet lower` | 11 cases, 6 sentences | INFRA (the contract-refusal PR) |
+| regeneration 6 | `--test-emit-refusal` no longer refuses: four position guards measure nothing | 1 hook | INFRA |
+| regeneration 6 | witnesses that were silent invalid wasm and now refuse loudly | 11 | a soundness gain, kept |
 
-The program counts are `ir-i8-sweep.sh` on master 7ddd7d14: 979 of 27,569 programs newly fail (cases
-668, witnesses 253, distilled 44, probes 14), every one on a unit the seed leaves unclaimed. The I8
-draft retires the instruments that compare against legacy: the IR shadow, box-destination shadow,
-claims-off fallback and door-guard tests, and `self-ir-misses`.
+Since regeneration 5 the oracle fell from 665 to 634, distilled from 43 classes to 38, the
+witnesses' runs → emit_reject from 247 to 236 and the native shards from 94 failures to 85. An
+unclaimed refusal now reads `the compiler cannot yet lower this statement (<class>)` at the
+statement the claim declined (#10146), and `cannot yet lower` is in the scoreboard's admission
+list, so every such refusal counts as clause-2 debt. The most frequent classes are box ladder 17,
+hoisted receiver read 15, object field coercion 14, argument coercion 13 and string operand after
+another 13. `ci-i8-sweep` reads 20 static edges into stage B (24 at regeneration 5), none new. The
+I8 draft retires the instruments that compare against legacy: the IR shadow, box-destination
+shadow, claims-off fallback and door-guard tests, `self-ir-misses`, and the full-gate shadow and
+parity rows.
 
-`ci-ir-identity` compares the I8 compiler against master's fetched seed for the I8 PR only. In that
-PR or the one right after it, the job becomes behaviour parity: each program's run output against
-its `@log`/Want (`ir-parity --behaviour-only`), with the byte comparison dropped (merge-queue §Q57),
-because a byte check against the previous seed would red every later codegen change (coordinator
-ruling, 2026-11-25).
+`ci-ir-identity` is behaviour parity now, not at I8 (coordinator ruling, 2026-11-25; DECISIONS.md).
+A differing exit code or refusal reds; a program both sides build to other bytes is counted as
+informational and run on both (`ir-parity.vl --behaviour-only`), which reds when its exit, trap or
+output differs, or when a `legacy-wrong:` program's IR-on run misses its `@log`/Want. At I8 the
+claimless side is master's fetched seed for that PR only; afterwards there is no claimless side,
+and each program's run is graded against its `@log`/Want alone. A program that prints nothing is
+graded by exit code and validity: 316 of the 26,238 programs the job covers.
 
 ## 8. The I8 PR's checklist (a plan; nothing is deleted before the I8 PR)
 
@@ -288,7 +297,7 @@ I8 (testing-strategy.md's kill-matrix rule). A check with no survivor is convert
 
 | check | where it runs | what it compares | at I8 | the survivor that catches its breakage |
 |---|---|---|---|---|
-| `ci-ir-identity` (`ir-identity.sh --cases` / `--claimless`, `ir-identity-annotate.sh`) | ci.yml, 4 shards; the queue | claims-on bytes against the same tree's claimless build | **convert**: against master's fetched seed for the I8 PR only, then behaviour parity (`ir-parity --behaviour-only`, run output against `@log`/Want; §7) | itself, converted |
+| `ci-ir-identity` (`ir-identity.sh --cases` / `--claimless`, `ir-identity-annotate.sh`) | ci.yml, 4 shards; the queue | claims-on behaviour against the same tree's claimless build; bytes informational (done 2026-11-25) | **convert** the claimless side: master's fetched seed for the I8 PR only, then each program's run against its `@log`/Want alone (§7) | itself, converted |
 | `ir-parity.vl --cross` (`ir claim cross`), `tests/vl_ir_identity_compare_test.ts`, `vl_ir_parity_legacy_wrong_test.ts` | gate.sh full; ci-native | claimed against claimless runs; the comparators' controls | **convert** to `--behaviour-only` over the same populations; the tests keep their controls on the behaviour grading | themselves, converted |
 | the claims-off fallback tests (`vl_ir_claim_fallback_test`, `vl_claim_fallback_wasm_test`, `playground_claim_fallback_test`) | ci-native; the ci.yml editor step | an invalid claimed module falls back to legacy (rc 70 under strict) | **convert** to one test per host that an invalid module (the `$VL_FAULT_INJECT` seam) is rc 70 with the validator's message | themselves, converted |
 | `scripts/ir-divergence-baseline.txt` (17 rows) | read by `ir-identity.sh`, `ir-parity.vl`, `ir-shadow.vl` | the listed byte differences between claimed and claimless builds | **retire** | behaviour parity: a `legacy-wrong:` row's program keeps its `@log`/Want, and parity grades it |
@@ -302,6 +311,8 @@ I8 (testing-strategy.md's kill-matrix rule). A check with no survivor is convert
 | `self-ir-misses.vl` and its baseline | gate.sh; ci.yml | IR misses in the self-compile | **retire**; **re-aim** mutant `selfirmiss` at `native fixpoint` | `native-fixpoint.sh`: a miss is an `emitUnclaimed` refusal, so the self-compile fails |
 | `claim-refusal-survey.sh` (sweep.yml `claim-refusal`) | sweep label | a refused claim against the claimless build | **retire** | the `@emit-error` cases and the `emit_reject` witnesses, as for `--pop refusals` |
 | `ir-driver-census.sh`, `ir-only-census.vl`, `ir-i8-census/` (`census.sh`, `probe-patch.sh`, `stub-reach.sh`) | by hand | where legacy is still reached | **retire** with the I8 tools; `ir-i8-sweep.sh` and `ir-i8-self-list.sh` go one PR later, once nothing reads them | none needed: these are discovery instruments, not gates, and nothing they measure exists after I8 |
+| `vl_inst_key_shadow`, `vl_union_key_licence`, the fn-ret shadow test | ci-native | an instance key or a rep against legacy's rep shadow report | **retire** | behaviour parity and the native fixpoint: with no legacy rep shadow there is nothing to compare, and a wrong key or rep is a wrong output |
+| `--test-emit-refusal` (the emit-refusal hook) and the four guards that use it (`selfhost_native_diag_pos` ×2, `vl_emit_diag_position`, the editor's positioned emit diagnostic, `vl_check_codegen`) | ci-native, checks-suites | that an emit refusal is positioned and reported | **convert**: the hook refuses in the IR, so the guards keep measuring | themselves, converted |
 | `ci-verdict.sh` `TREE_SKIPS`, `ci_verdict_test`, `ci_proof_test`'s local rows | ci.yml | job and row names | **follow** the renames and retirements above | themselves |
 
 Behaviour parity is the conversion target for `ci-ir-identity` and `--cross`, and the survivor most
