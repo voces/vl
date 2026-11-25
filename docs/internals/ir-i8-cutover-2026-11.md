@@ -178,9 +178,12 @@ only when the start body is unclaimed. Nothing reaches legacy through the door.
 | port | `emitArmSiteAt` (22), `emitDelivered` (7), `emitCoerceAtomPayload` (3) | COV-IS |
 | const | `emitConstCellInit`'s remaining `emitExpr` arm (8 programs) | COV-START |
 | latent | the 16 stubbed writers a kept tail calls that no population reaches: a probe or a static check each | INFRA |
-| gate | `scripts/ir-i8-sweep.sh` in CI, ratcheting "newly failing and not unclaimed" (681) down | INFRA |
+| gate | `scripts/ir-i8-sweep.sh` in CI (`ci-i8-sweep`): no new cause of "newly failing and not unclaimed", and no new static edge into stage B | INFRA |
 | coverage | the census tail to zero unclaimed functions and start bodies | the COV lanes |
 | I8 | one PR: empty the 14 entry points and B minus the keep set, then `dead-exports.vl`, a fixpoint and the full gate | coordinator |
+
+The gate ratchets the set of causes, not the count: coverage moves a program from explained to
+unexplained when it claims the last unclaimed function beside a re-entry (coordinator ruling, 2026-11-25).
 
 A port makes the tail take an IR-lowered operand in place of its `emitExpr` call. The rehearsal
 found two more re-entries in its last keep round: `refListReadAt` (4) goes to COV-CLOS, which owns
