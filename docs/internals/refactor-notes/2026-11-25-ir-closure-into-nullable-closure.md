@@ -27,11 +27,13 @@ function. Without them the field's closure rep is the lambda's own, and master c
 
 ## Left in the two classes
 
-- `argument coercion`: a map whose values legacy stores at a wider record's row, a different
+- `argument coercion`: a map whose values legacy builds at a wider record's row, a different
   `RMap` rep on one wasm struct (D13902, `map-binding-keeps-own-type-when-read-so`,
-  `union-valued-maps-share-one-struct`). `refRepValtype` names no valtype for a map, so
-  `repStoresAs` cannot see that the two lower alike. Teaching it maps changes what the verifier
-  calls stored alike across many programs, so that is a coordinator question, not a lane fix.
+  `union-valued-maps-share-one-struct`). Legacy picks that struct per binding (the cell's
+  `letCellSlot`), and `letBindTy` does not record it here, so the IR has no storage row for the
+  map cell. A map valtype in `refRepValtype` is no fix: both reps' `repOfTy` slot is -1
+  (unresolved), and keyed by each rep's own type the two slots differ. This is a storage-row gap
+  for map cells.
   Also: a list of records at another row (D14381), a list of strings into a list of
   `string | null` (`elem-storage-class-widening-runs`), and instance records
   (`record-pattern-bool-i32-instances`).
