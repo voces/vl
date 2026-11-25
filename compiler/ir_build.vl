@@ -33,7 +33,12 @@ import { emitFail, htStructHeap, lbPlanAdd, lbPlanDrop } from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
-import { monoBundleFe, monoBundleReadFe, monoGenericAliasFe } from "./emit_mono"
+import {
+  litAliasTyOrSelf,
+  monoBundleFe,
+  monoBundleReadFe,
+  monoGenericAliasFe,
+} from "./emit_mono"
 import {
   boxTagOfTy,
   repElemTyOfName,
@@ -524,12 +529,19 @@ import {
   variantRowArmOf,
   zextLoadOf,
 } from "./wasmEmit"
-import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
+import {
+  RefJoin,
+  ifRefJoinOf,
+  strJoinDropsNulAtom,
+  strReppedLitUnionAt,
+} from "./emit_plan_if_join"
 import {
   V128_ATOM_KIND,
   arrLitVariantSlot,
   identUnboxAtomOf,
   listWrapHeapOfKind,
+  narrowedFieldIsUnionBox,
+  narrowedFieldPlain,
   nullInstanceIsResult,
   variantCoerceArmOf,
 } from "./emit_plan_union"
@@ -815,6 +827,7 @@ import {
   readRepMemoAdvance,
   sFieldIsUnionBox,
   sFieldStoreKind,
+  sharedUnionFieldPlan,
   spreadBoxingSource,
   spreadOwnBoxRow,
   stmtIsTailValue,
@@ -836,6 +849,7 @@ import {
   tailIsValueOrNever,
 } from "./emit_fn_scans"
 import {
+  FC_I32,
   LBK_UNION,
   LiFrame,
   VKind,
@@ -885,6 +899,7 @@ import {
   uTags,
   uVarTyIx,
 } from "./emit_state"
+import { sharedFieldPlanLitTy } from "./emit_obj_lit_fits"
 import {
   cloSigPosOfKey,
   cloSigTypeIdxAt,
@@ -1174,10 +1189,42 @@ function softRefused(what: string): boolean {
   return true
 }
 
+// The last claim's decline: its unit, what it declined, and the node that names. Set once a
+// claim's build is done, cleared when the claim succeeds, and read by a refusal of the same unit.
+// A unit no claim declined reads "".
+let declUnit = -1
+let declWhat = ""
+let declAt = -1
+
+// What the claim for `unit` (a function, or the top-level code's first statement) declined, such
+// as "this statement (is guard)", or "" when it did not decline.
+export function irDeclinedFor(unit: i32): string {
+  if unit < 0 || unit != declUnit { return "" }
+  return declWhat
+}
+
+// The node the last decline names: the statement holding a builder miss, else the unit.
+export function irDeclineAt(): i32 { return declAt }
+
+// Records, once the build is done, that the claim for `unit` declines with what the build missed
+// (or `whole`) unless a later step clears it: a claim that succeeds sets `declUnit` to -1.
+function declinePending(unit: i32, built: string, whole: string) {
+  declUnit = unit
+  declWhat = if built != "" { "this statement (" + built + ")" } else { whole }
+  declAt = if built != "" { missAtOr(unit) } else { unit }
+}
+
+// The node a builder miss names: the statement holding it, else the unit.
+function missAtOr(unit: i32): i32 {
+  if ibMissAt >= 0 { return ibMissAt }
+  return unit
+}
+
 // The claim seam, before legacy lowers the function at `fnIx` (`fnStmts` slot `fnPos`): when the
 // builder covers it and every node is claimed, the lowering writes its code entry onto `out` and
 // this answers true, so legacy does not run. Armed, legacy always runs and the shadow checks it.
 export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
+  declUnit = -1
   // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
   const s = claimScopeBegin()
@@ -1193,6 +1240,7 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   const built = build(fnIx, fnPos)
   ibClaimBuild = false
   if softRefused("") { return false }
+  declinePending(fnIx, built, "this function")
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
@@ -1202,9 +1250,12 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   }
   const why = irLowerClaim(ib, globalCtxOf(fnPos), fnPos, out)
   if why != "" {
+    // A legacy helper's refusal inside the lowering is legacy's own message: no note repeats it.
+    declWhat = if why.indexOf("a legacy helper refused in ") == 0 { "" } else { "this function (" + why + ")" }
     count("claim fell back: " + why)
     return false
   }
+  declUnit = -1
   count("claimed")
   return true
 }
@@ -1232,6 +1283,7 @@ export function irClaimStart(
   poolFill: boolean,
   out: u8[],
 ): boolean {
+  declUnit = -1
   if !irStartClaimOn() { return false }
   const s = claimScopeBegin()
   const ok = claimStart(order, orderGi, poolFill, out)
@@ -1251,6 +1303,11 @@ function claimStart(
   const built = buildStart(order, orderGi, poolFill)
   ibClaimBuild = false
   if softRefused("start ") { return false }
+  declinePending(
+    if order.length > 0 { order[0] } else { -1 },
+    built,
+    "this top-level code",
+  )
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
@@ -1260,9 +1317,12 @@ function claimStart(
   }
   const why = irLowerClaim(ib, ibGlobalCtx(), -1, out)
   if why != "" {
+    // A legacy helper's refusal inside the lowering is legacy's own message: no note repeats it.
+    declWhat = if why.indexOf("a legacy helper refused in ") == 0 { "" } else { "this top-level code (" + why + ")" }
     count("claim fell back: " + why)
     return false
   }
+  declUnit = -1
   count("claimed start")
   return true
 }
@@ -1321,6 +1381,8 @@ let ibFnPos = -1
 // its row, so the return's miss names that case; -1 when none.
 let ibRetNestedTwin = -1
 let ibMiss = ""
+// The innermost statement whose build set `ibMiss`, or -1.
+let ibMissAt = -1
 let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
@@ -3111,6 +3173,38 @@ function chainLinkTy(ix: i32): i32 {
   return ibLinkIfTy[ix] ?? -1
 }
 
+// The type every arm of un-narrowed union field read `m` stores its literal-union atom at
+// (`sharedFieldPlanLitTy`), where that type reps as an atom; -1 otherwise.
+function sharedFieldAtomTy(m: Member, ix: i32): i32 {
+  const vis: i32[] = []
+  const fis: i32[] = []
+  if sharedUnionFieldPlan(m.memObj, m.memProp, ix, ibFnIx, vis, fis) != FC_I32 {
+    return -1
+  }
+  const st = sharedFieldPlanLitTy(vis, fis)
+  if st < 0 { return -1 }
+  // A lone literal arm type reps as a string; the alias registered at its texts is the atom set.
+  const at = if repNodeAt(repNodeOfTy(st)) is RAtom { st } else { litAliasTyOrSelf(st) }
+  return if at >= 0 && repNodeAt(repNodeOfTy(at)) is RAtom { at } else { -1 }
+}
+
+// Whether field read `ix` is of a narrowed variant row's plain field, not a union box's.
+function strRowField(ix: i32): boolean {
+  return narrowedFieldPlain(ix, ibFnIx) >= 0
+    && !narrowedFieldIsUnionBox(ix, ibFnIx)
+}
+
+// The atom type `let` `d` holds when its initializer is a shared union field read every arm
+// stores as an atom (`sharedFieldAtomTy`), else -1.
+function letSharedFieldAtomTy(d: i32): i32 {
+  const l = nodeAt(d)
+  if !(l is LetDecl) || l.letInit < 0 { return -1 }
+  const iv = unwrapParen(l.letInit)
+  if iv < 0 || iv >= P.nodes.length { return -1 }
+  const m = nodeAt(iv)
+  return if m is Member { sharedFieldAtomTy(m, iv) } else { -1 }
+}
+
 // The rep of `openCoalMapTy`'s type, or -1.
 function openCoalMapRep(ix: i32): i32 {
   const t = openCoalMapTy(ix)
@@ -3279,6 +3373,25 @@ export function exprTyOf(ix: i32): i32 {
   if n is Member && irTyOpen(t) {
     const ft = builtFieldTy(n)
     if ft >= 0 { return ft }
+  }
+  // A field read legacy holds as an atom whose own type names no set (a shared union field
+  // joined to one literal) is of the set its arms store (`litAtomMemberTy`).
+  if n is Member && t >= 0 {
+    const tr = repNodeOfTy(t)
+    const atomTy = repNodeAt(tr) is RAtom
+    // A lone literal is the one string type an atom field joins to; a plain string is never one.
+    const loneLit = !atomTy
+      && t != TY_STR
+      && t != TY_NUL_STR
+      && repPrim(tr) == "str"
+    if loneLit && exprIsLitAtom(ix, ibFnIx) {
+      const st = sharedFieldAtomTy(n, ix)
+      if st >= 0 { return st }
+    }
+    // An atom-typed field a row stores as a string beside its base's arm is read as that string.
+    if atomTy && strRowField(ix) && strReppedLitUnionAt(ix, ibFnIx) {
+      return TY_STR
+    }
   }
   // A direct call typed open, or typed at the closure its callee returns a bundle record for
   // (`fnRetHeldAsBundle`), is of its callee's result as the IR holds it (`resultTy`).
@@ -3591,7 +3704,10 @@ export function irBDeclVar(d: i32): i32 {
     && !(repNodeAt(rep) is RAtom || atomNullable(rep))
   ) {
     // Held at the type legacy's cell holds (`letAtomCellTy`), the literal set a join of consts keeps.
-    const at = letAtomCellTy(d, ibFnIx)
+    const at0 = letAtomCellTy(d, ibFnIx)
+    const r0 = if at0 >= 0 { repNodeOfTy(heldTy(at0)) } else { -1 }
+    const atom0 = r0 >= 0 && (repNodeAt(r0) is RAtom || atomNullable(r0))
+    const at = if atom0 { at0 } else { letSharedFieldAtomTy(d) }
     const ar = if at >= 0 { repNodeOfTy(heldTy(at)) } else { -1 }
     if ar >= 0 && (repNodeAt(ar) is RAtom || atomNullable(ar)) {
       return declVarAt(d, ar, heldTy(at))
@@ -7106,9 +7222,10 @@ export function irBStageLeads(
   if listStageFrom(b, at) || coalBoxFrom(b, at, false) || voidIfFrom(b, at) {
     return false
   }
-  // A box over a tag dispatch has its head written ahead of the dispatch (`dispatchBoxHead`),
-  // above any operand staged before it, where legacy writes that operand first (D17564).
-  if dispatchBoxFrom(b, at) { return false }
+  // A box over a tag dispatch or a join span has its head written ahead of that span
+  // (`dispatchBoxHead`), above any operand staged before it, where legacy writes that operand
+  // first (D17564).
+  if dispatchBoxFrom(b, at) || boxLeadSpanFrom(b, at) { return false }
   // A store the operand makes (an assignment as its value) is a statement: an earlier operand
   // read at its use would see the stored value, so it is staged below the store, as below an `if`.
   const store = storeFrom(b, at)
@@ -7229,6 +7346,18 @@ function tagStashFrom(b: i32[], at: i32): boolean {
 // lowering leads (`irBoxLeadBox`).
 function dispatchBoxFrom(b: i32[], at: i32): boolean {
   if !tagStashFrom(b, at) { return false }
+  let i = at
+  while i < b.length {
+    for x in ib.irBoxLeadBox {
+      if x == b[i] { return true }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether operands built into `b` from `at` on end a box-lead span (`irBoxLeadBox`).
+function boxLeadSpanFrom(b: i32[], at: i32): boolean {
   let i = at
   while i < b.length {
     for x in ib.irBoxLeadBox {
@@ -7719,7 +7848,7 @@ function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
 
 // `m.keys()` or `m.values()` as legacy's writer takes it: the map variable as itself, or a read
 // written again as the builder read it (`recvReadsAgain`), since that writer reads its receiver
-// once per step.
+// once per step; any other receiver is evaluated once (`miOnce`).
 function mapIterRhs(b: i32[], m: Member, ix: i32): Rhs {
   if mapShapeOfExpr(m.memObj, ibFnIx) == -3 {
     return missRhs("map iter value type")
@@ -7727,17 +7856,21 @@ function mapIterRhs(b: i32[], m: Member, ix: i32): Rhs {
   const at = b.length
   const v = irBExpr(b, m.memObj)
   if ibMiss != "" { return missRhs("method operand") }
-  const again = v is OVar
-    && v.ov >= 0
-    && ib.irVars[v.ov].vKind == "temp"
-    && recvReadsAgain(unwrapParen(m.memObj))
-  if (b.length != at && !again) || !(v is OVar) {
+  const temp = v is OVar && v.ov >= 0 && ib.irVars[v.ov].vKind == "temp"
+  const again = temp && recvReadsAgain(unwrapParen(m.memObj))
+  if !(v is OVar) || b.length != at && !temp {
     return missRhs("map iter receiver")
   }
   if !(repNodeAt(irBOpRep(v)) is RMap) {
     return missRhs("map iter receiver rep")
   }
-  const r: Rhs = { miV: v, miAt: ix, miVals: m.memProp == "values" }
+  const once = temp && !again
+  const r: Rhs = {
+    miV: v,
+    miAt: ix,
+    miVals: m.memProp == "values",
+    miOnce: once,
+  }
   return r
 }
 
@@ -9078,6 +9211,13 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   }
   // Else the storage read is that null, the local as it stands (`identReadArmOf` past the null).
   if nro == NULL_READ_STORED {
+    // A union destination whose box plan writes the null's own tag leaves the storage unread.
+    if (
+      heldAsBox(dst)
+      && holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx).hbArm == "null"
+    ) {
+      return boxTemp(b, { oiRep: ibNoValue, oiBits: 0 }, ix, dst)
+    }
     const sv = exprAt(b, ix, true)
     if ibMiss == "" && irBOpRep(sv) != dst {
       return irBMiss("null read storage rep")
@@ -9330,7 +9470,12 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   }
   const v = widenTo(b, exprAt(b, ix, true), ix, dst, dstTy)
   ib.irUnbankedRead = outer
-  if ibMiss == "" && boxLeadsAt(b, at) && !boxOfJoinAt(b, at) {
+  if (
+    ibMiss == ""
+    && boxLeadsAt(b, at)
+    && !boxOfJoinAt(b, at)
+    && !boxLeadSpanAt(b, at)
+  ) {
     ifBelowLeadIn(b, at, leadFirstAt(b), "box of a valued if")
   }
   // A `null`-typed value is the bottom ref, which a nullable reference holds as it stands (D1567).
@@ -9708,6 +9853,41 @@ function boxOfJoinAt(b: i32[], at: i32): boolean {
   if !(v is OVar) || v.ov != out { return false }
   // Only a box whose head leads its value has its head written ahead of the join.
   return holeBoxLeads(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
+}
+
+// Where the delivery built into `b` from `at` on ends in a box whose head leads and its value's own
+// nodes write no statement but valued `if`s and `??`s that stage their leads, notes them as the
+// span the lowering writes that head ahead of (`irBoxLeadFirst`), as legacy writes the whole value
+// under it, and answers true.
+function boxLeadSpanAt(b: i32[], at: i32): boolean {
+  const bx = b.length - 1
+  if bx <= at { return false }
+  const n = ib.irNodes[b[bx]]
+  if !(n is SLet) { return false }
+  const r = n.lRhs
+  if (
+    !(r is RToBox)
+    || !holeBoxLeads(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
+  ) {
+    return false
+  }
+  for x in ib.irBoxLeadBox {
+    if x == b[bx] { return false }
+  }
+  // Only a span that holds a join under the head, which would otherwise refuse.
+  if !ifBelowLeadHas(b, at, bx) { return false }
+  let i = at
+  while i < bx {
+    const m = ib.irNodes[b[i]]
+    const join = m is SIf && m.siOut >= 0
+      || m is SCoalBox && coalArmStagesLeads(m.cbArm)
+    if !join && ifBelowLeadHas(b, i, i + 1) { return false }
+    i = i + 1
+  }
+  ib.irBoxLeadFirst.push(b[at])
+  ib.irBoxLeadBox.push(b[bx])
+  ib.irBoxLeadN.push(bx - at)
+  return true
 }
 
 // Whether the delivery built into `b` from `at` on ends in a box whose plan writes its tag ahead of
@@ -12002,9 +12182,8 @@ function coalField(
   if recvIx < 0 { return irBMiss("coalesce field node") }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
-  // Its value stays on the stack from here, so no temp an operand before it built may wait.
-  if endsInTemp(b) { return irBMiss("coalesce field after an operand") }
-  // A box legacy unwraps itself is read at its storage, not narrowed.
+  // A box legacy unwraps itself is read at its storage, not narrowed. An operand built before it
+  // is written below the field's test (`coalArmStagesLeads`).
   const r = if p.cfCast >= 0 { storageReadOf(b, recvIx) } else { irBExpr(b, recvIx) }
   if ibMiss != "" { return r }
   // A receiver legacy re-emits is read again as the builder read it (`irHoistRecv`).
@@ -15742,7 +15921,11 @@ function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
   const cut = stmtNode(b, ix, sibs, pos) == IF_CUTS_BLOCK
     && nodeAt(ix) is IfStmt
-  if ibMiss != "" && censusGoesOn(ibMiss) { ibMiss = "" }
+  if ibMiss != "" && ibMissAt < 0 { ibMissAt = ix }
+  if ibMiss != "" && censusGoesOn(ibMiss) {
+    ibMiss = ""
+    ibMissAt = -1
+  }
   // Legacy writes back a region's length after its last statement, inside that statement's
   // span (`emitStmtIn`).
   if reserveEnds(ix) {
@@ -16520,6 +16703,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibCalleeParamAt = Map()
   ibCalleeParamFn = Map()
   ibMiss = ""
+  ibMissAt = -1
   ibMisses = []
   ibReserveEnd = []
   ibReservePushes = []
@@ -17290,6 +17474,7 @@ function buildThunk(fe: i32): string {
   ibFnPos = -1
   ibRetNestedTwin = -1
   ibMiss = ""
+  ibMissAt = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if fe < 0 || fe >= fnStmts.length { return "thunk target" }
   const d = fnStmts[fe]
@@ -17420,6 +17605,7 @@ function buildEqHelp(si: i32): string {
   ibFnPos = -1
   ibRetNestedTwin = -1
   ibMiss = ""
+  ibMissAt = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if si < 0 || si >= sHeapIdx.length { return "compare helper row" }
   ib.irName = "@eq " + i32ToStr(si)
@@ -17523,6 +17709,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibFnPos = -1
   ibRetNestedTwin = -1
   ibMiss = ""
+  ibMissAt = -1
   ibMisses = []
   ibDeclVar = Map()
   ibLiftCapDecl = Map()

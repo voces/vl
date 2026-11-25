@@ -194,7 +194,11 @@ const logsOf = (s: string) =>
   [...s.matchAll(/^\s*\/\/\s*@log (.*)$/gm)].map((m) => m[1]);
 const emitErrorsOf = (s: string) =>
   [...s.matchAll(/^\s*\/\/\s*@emit-error (.*)$/gm)].map((m) => m[1]);
-const foldMsg = (s: string) => s.toLowerCase().replace(/`/g, "'");
+/** A refusal's `note: the IR declined …` line is context, not the refusal: no expectation matches it. */
+const foldMsg = (s: string) =>
+  s.split("\n")
+    .filter((l) => !l.trimStart().startsWith("note: the IR declined"))
+    .join("\n").toLowerCase().replace(/`/g, "'");
 /** The first `@name` on any directive-shaped line, whatever the name. */
 const anyDirective = (s: string) => /^\s*\/\/\s*@(\S+)/m.exec(s)?.[1];
 
