@@ -737,3 +737,102 @@ Deno.test({
     }
   },
 });
+
+// A PR that fixes a filed row must not red the gate: under `--gate` a row that now prints its
+// `Want:` block passes and is named for closure. Any other movement still fails, and without
+// `--gate` (the auditing reading) a fixed row is MOVED.
+Deno.test({
+  name:
+    "check-filed-witnesses: --gate passes a row that now meets its Want and fails any other movement",
+  ignore: !ENABLED,
+  fn: async () => {
+    const row = (
+      id: string,
+      want: string | null,
+      status = "loud check reject",
+    ) =>
+      `### ${id} — a row whose witness prints 7
+**${status}**
+
+Repro:
+
+${ind("print(7)")}
+` + (want === null ? "" : `
+Want:
+
+${ind(want)}
+`);
+    const dir = await Deno.makeTempDir({ prefix: "vl_cfw_gate_" });
+    try {
+      const docsOf = async (name: string, rows: Record<string, string>) => {
+        const d = `${dir}/${name}`;
+        await Deno.mkdir(d);
+        for (const [id, body] of Object.entries(rows)) {
+          await Deno.writeTextFile(`${d}/${id}.md`, body);
+        }
+        return d;
+      };
+      const met = await docsOf("met", { D1: row("D1", "7") });
+      const line = "D1 now meets its Want: close it";
+      const g = await port(["--strict", "--gate", met], {
+        GITHUB_ACTIONS: "true",
+      });
+      if (
+        g.code !== 0 || !g.out.includes(line) ||
+        !g.out.includes("::warning file=") ||
+        !g.out.includes(
+          "1 graded · 0 as filed · 0 MOVED · 0 not graded · 0 UNPARSED · 1 meet their Want\n",
+        )
+      ) {
+        throw new Error(
+          `--strict --gate on a row meeting its Want: want exit 0, the closure line and its annotation, got ${g.code}:\n${g.out}`,
+        );
+      }
+      // Without `--gate` the report is today's: the row is MOVED and the summary has no count.
+      const s = await port(["--strict", met]);
+      if (
+        s.code !== 1 || !s.out.includes("1 MOVED") || s.out.includes(line) ||
+        s.out.includes("meet their Want")
+      ) {
+        throw new Error(
+          `--strict alone on the same row: want exit 1 and MOVED, got ${s.code}:\n${s.out}`,
+        );
+      }
+      // A row filed `runs` that prints its Want did not move: it is as filed, never met.
+      const kept = await docsOf("kept", {
+        D1: row("D1", "7", "runs today and must keep running"),
+      });
+      const k = await port(["--strict", "--gate", kept]);
+      if (
+        k.code !== 0 || k.out.includes(line) ||
+        !k.out.includes("1 as filed · 0 MOVED") ||
+        !k.out.includes("UNPARSED · 0 meet their Want\n")
+      ) {
+        throw new Error(
+          `--gate on a row filed runs: want exit 0, as filed and none met, got ${k.code}:\n${k.out}`,
+        );
+      }
+      // Failing controls: beside the met row, a row printing other than its Want, and a row
+      // with no Want that now runs. Each alone reds `--gate`.
+      for (
+        const [name, other] of [
+          ["mismatch", row("D2", "8")],
+          ["unpinned", row("D2", null)],
+        ] as const
+      ) {
+        const d = await docsOf(name, { D1: row("D1", "7"), D2: other });
+        const r = await port(["--strict", "--gate", d]);
+        if (
+          r.code !== 1 || !r.out.includes("· 1 MOVED ·") ||
+          !r.out.includes("UNPARSED · 1 meet their Want\n")
+        ) {
+          throw new Error(
+            `--gate with a ${name} row: want exit 1, one MOVED and one met, got ${r.code}:\n${r.out}`,
+          );
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
