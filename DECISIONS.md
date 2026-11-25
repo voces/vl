@@ -13123,6 +13123,27 @@ This extends the `??` hole precedent, D1589 (`fillCoalHoleNodes`), which re-asks
 
 **Rejected alternative.** A new flow-sensitive "still definitely null" arm was rejected: it covers only the straight-line local case, which the existing narrowing already covers, and not the read across a function boundary.
 
+## A list of only a never-filled `let x = null`'s values is the `[null]` list (2026-11-24, coordinator ruling) — D17304
+
+**Ruled by the coordinator 2026-11-24**, on the merge queue's referral of lane IR-N9's D17304 scoping.
+
+**The rule.** A `let x = null` that no write fills is the `null` type (D1576), so an un-annotated list
+whose every element is such a value (`[x]`, `[x = null]`, `[x, x]`, `[x, null]`) is the `[null]`
+case. The checker refuses it at the literal with `[null]`'s message (D1832), extended to name the
+binding: "a list of only `null` has no element type: a binding of `null` that is never written another
+value is `null`; annotate the list or the binding". A `const n = null` is the same hole (D17447; unfiled: D17447 — S2's row lands on `s2-d17445`). Where the destination names the type (a
+`const a: null[]`, a `null[]` parameter, an annotated index store) the list is a `null[]` and runs,
+its elements stored as the `null[]` sentinel.
+
+**Why.**
+- Before, the literal took the hole's type, which has no list rep: the module failed to validate, or,
+  with a closure writing the binding, it ran and printed the sentinel `2` for `null`. That second
+  outcome was silently wrong, so the refusal removes a soundness hole, not a running program.
+- The fill is only known at the end of checking, since a later write fills the hole in place (D2421).
+  So the literal is recorded as a candidate and judged in `flushNullOnlyLits`, where a hole a write
+  filled is that write's `T | null` and its list is not refused.
+- The refusal names a contract: annotating the list or the binding runs.
+
 ## A call refused for its argument count is typed by the callee's declared return (2026-11-25, coordinator ruling) — D17481
 
 **Ruled by the coordinator 2026-11-25**, on lane O2's D17481. Recovery after `wrong number of arguments` types the call by the callee's declared return, not `<error>`, as TypeScript does. What reads the result is checked against that type, so an independent true error still reports: `const s: string = mk(1, 2)` gives the arity error and `cannot assign A to 's'`, which is wrong at any arity. `<error>` would absorb such checks and hide them.
