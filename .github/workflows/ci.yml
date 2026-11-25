@@ -187,6 +187,7 @@ jobs:
       bin_key: ${{ steps.keys.outputs.bin }}
       rustc: ${{ steps.keys.outputs.rustc }}
       ir_identity: ${{ steps.ir.outputs.identity }}
+      cost: ${{ steps.ir.outputs.cost }}
     steps:
       # The seed's compiled forms live in a private cache outside the checkout (DECISIONS.md,
       # "The seed sidecar lives only in the user's private cache"); the seed cache steps save it.
@@ -233,14 +234,18 @@ jobs:
       # Whether ci-ir-identity has anything to prove: a pull request that changes none of the
       # programs it builds, the compiler that builds them or the baseline that reads them skips
       # its steps (still green). Every other event runs it.
-      - name: Does this change reach the IR identity proof
+      - name: Does this change reach the IR identity proof, or ci-cost part 1
         id: ir
         run: |
-          if [ "${{ github.event_name }}" != pull_request ]; then echo "identity=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "${{ github.event_name }}" != pull_request ]; then printf 'identity=true\ncost=true\n' >> "$GITHUB_OUTPUT"; exit 0; fi
           re='^(compiler/|std/|tests/cases/|scripts/capability-probes/|scripts/silent-sweep/distilled/(cells|named)/|scripts/vl-host/|docs/internals/inventory(-2)?/|scripts/ir-identity\.sh$|scripts/ir-divergence-baseline\.txt$|scripts/inventory/witnesses\.vl$|scripts/ir-i8-census/witnesses\.vl$|\.github/workflows/ci\.yml$)'
           hit=$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" | grep -E -m1 "$re" || true)
           if [ -n "$hit" ]; then echo "identity=true" >> "$GITHUB_OUTPUT"; echo "ir identity: runs ($hit)"
           else echo "identity=false" >> "$GITHUB_OUTPUT"; echo "ir identity: no compiler, std, program or baseline change"; fi
+          # ci-cost part 1's plumb-shape and scaling ratchets read the compiler, std and their own inputs.
+          re='^(compiler/|std/|scripts/vl-host/|scripts/plumb-shape|tests/vl_scaling_shape_test\.ts$|\.github/workflows/ci\.yml$)'
+          hit=$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" | grep -E -m1 "$re" || true)
+          if [ -n "$hit" ]; then echo "cost=true" >> "$GITHUB_OUTPUT"; else echo "cost=false" >> "$GITHUB_OUTPUT"; fi
 
       - name: Record the tested tree
         if: github.event_name == 'pull_request'
@@ -934,22 +939,29 @@ jobs:
       fail-fast: false
       matrix:
         part: ["1", "2"]
+    # Part 1 (plumb-shape, the first scaling shard) runs its steps only when the seed job says a
+    # pull request reaches them; part 2 (the L2 tripwire) always does. Skipped steps stay green.
+    env:
+      RUN: ${{ matrix.part != '1' || needs.seed.outputs.cost == 'true' }}
     steps:
       - name: Seed cache location
         run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v5
+        if: env.RUN == 'true'
 
       - id: setup-deno-6
+        if: env.RUN == 'true'
         continue-on-error: true
         uses: denoland/setup-deno@v2
         with:
           deno-version-file: .dvmrc
       # github.com release downloads 504 intermittently; npm carries the same pinned build.
-      - if: steps.setup-deno-6.outcome == 'failure'
+      - if: env.RUN == 'true' && steps.setup-deno-6.outcome == 'failure'
         run: npm i -g deno@$(tr -d ' \r\nv' < .dvmrc) && deno --version
 
       - name: Cache Deno modules
+        if: env.RUN == 'true'
         uses: actions/cache@v5
         with:
           path: ~/.cache/deno
@@ -958,6 +970,7 @@ jobs:
             deno-${{ runner.os }}-
 
       - name: Restore vl-host binary
+        if: env.RUN == 'true'
         uses: actions/cache/restore@v5
         with:
           path: scripts/vl-host/target/release/vl
@@ -965,6 +978,7 @@ jobs:
           fail-on-cache-miss: true
 
       - name: Restore the proven seed
+        if: env.RUN == 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -977,6 +991,7 @@ jobs:
       # Restore-only: `seed` wrote this key, so the two fuel JITs become links. Not
       # `fail-on-cache-miss`: a sidecar is a cache, so a miss costs the warm below, never a grade.
       - name: Restore the fuel sidecars
+        if: env.RUN == 'true'
         uses: actions/cache/restore@v5
         with:
           path: build/fuel-sidecars
@@ -985,6 +1000,7 @@ jobs:
       # Near-instant after the restore above; it re-warms only what the restore missed, and is
       # the net for a runner that refuses the pinned `$VL_ISA` level.
       - name: Warm the seed's sidecars
+        if: env.RUN == 'true'
         run: |
           grep -m1 'model name' /proc/cpuinfo
           bash scripts/warm-seed.sh --fuel --stash build/fuel-sidecars
@@ -993,13 +1009,14 @@ jobs:
       # binaryen here, so `-O`'s wasm-opt step is skipped; the tool reads each build's
       # rusage through GNU time, which it refuses to run without.
       - name: Plumb-shape cost (ratchet)
-        if: matrix.part == '1'
+        if: env.RUN == 'true' && (matrix.part == '1')
         run: |
           test -x /usr/bin/time || (sudo apt-get update -q && sudo apt-get install -y -q time)
           scripts/vl-host/target/release/vl run scripts/plumb-shape-cost.vl --compiler build/vl-compiler.wasm -- --check --require-fuel
 
       # Same-work-different-shape program pairs graded on the ratio of their guest fuel.
       - name: Cost ratchets (scaling shape)
+        if: env.RUN == 'true'
         run: deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_scaling_shape_test.ts
         env:
           SELFHOST_NATIVE_ALIGN: "1"
@@ -1008,7 +1025,7 @@ jobs:
       # The base master's L2 readings, keyed inside by its compiler/ tree and the host, so any
       # earlier cache is safe to restore; each run saves what it measured.
       - name: Cache the base masters' L2 fuel
-        if: matrix.part == '2'
+        if: env.RUN == 'true' && (matrix.part == '2')
         uses: actions/cache@v5
         with:
           path: ~/.cache/vl/base-fuel
@@ -1023,7 +1040,7 @@ jobs:
       # bootstrap step late (D1090); the seed job's fixpoint proves the bytes, not the cost.
       # On the shard that carries no plumb build.
       - name: Self-compile fuel (L2 tripwire)
-        if: matrix.part == '2'
+        if: env.RUN == 'true' && (matrix.part == '2')
         run: |
           git fetch --no-tags --depth=100 origin master:refs/remotes/origin/master || true
           git fetch --no-tags --deepen=100 origin || true
