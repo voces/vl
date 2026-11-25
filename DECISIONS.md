@@ -13143,7 +13143,7 @@ This extends the `??` hole precedent, D1589 (`fillCoalHoleNodes`), which re-asks
 whose every element is such a value (`[x]`, `[x = null]`, `[x, x]`, `[x, null]`) is the `[null]`
 case. The checker refuses it at the literal with `[null]`'s message (D1832), extended to name the
 binding: "a list of only `null` has no element type: a binding of `null` that is never written another
-value is `null`; annotate the list or the binding". A `const n = null` is the same hole (D17447; unfiled: D17447 — S2's row lands on `s2-d17445`). Where the destination names the type (a
+value is `null`; annotate the list or the binding". A `const n = null` is the same hole (D17447). Where the destination names the type (a
 `const a: null[]`, a `null[]` parameter, an annotated index store) the list is a `null[]` and runs,
 its elements stored as the `null[]` sentinel.
 
