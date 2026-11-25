@@ -1,3 +1,0 @@
-## Type system (Track A)
-
-- **Receiver overloading within one module (O1 extended, ruling D1–D2 of 2026-11-23):** one module may declare several same-named `self`-functions whose first parameters differ in kind (`function min(self: F32x4, …)` beside `function min(self: U8x16, …)`); a method call picks by the receiver, `import { min }` binds the whole set, and the type-bound rung and structural bounds pick from it. Every member is minted `min@F32x4` (internal; `--names` and `wasm-dis` only), so modules with no such set compile byte-identical. A plain call with two local candidates, a generic `self: T` beside a concrete candidate, and same-kind heads stay refused, naming the method spelling or both candidates.
