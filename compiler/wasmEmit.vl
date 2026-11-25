@@ -25596,7 +25596,7 @@ function asCastRoot(exprIx: i32): i32 {
 // The `null` node bare `as` cast `exprIx` hands `emitReturnValue` on a miss: the one its check
 // minted and delivered (`asMissNullOf`), reached through a mono copy's source node (`nodeSrc`);
 // -1, through `emitFail`, where the check minted none.
-function numCastNullNode(exprIx: i32): i32 {
+export function numCastNullNode(exprIx: i32): i32 {
   let at = exprIx
   let depth = 0
   while at >= 0 && depth < 8 {
@@ -25655,8 +25655,20 @@ function numCastSrcFail(src: string): i32 {
 }
 
 // After `numExactCastKind`'s operand: staged once, since the test reads it up to three times,
-// then the test, the mode's sad path and the conversion.
+// then the test, the mode's sad path and the conversion. A bare `as` returns the function's own
+// null on its sad path, built through `emitReturnValue`.
 export function numExactCastTail(exprIx: i32, srcIn: string, fnIx: i32): i32 {
+  const h = numExactCastHead(exprIx, srcIn, fnIx)
+  if h != 1 { return h }
+  const missNull = numCastNullNode(exprIx)
+  if missNull < 0 { return -1 }
+  if emitReturnValue(missNull, fnIx) < 0 { return -1 }
+  return numExactCastClose(exprIx, srcIn)
+}
+
+// `numExactCastTail` up to a bare `as`'s returned null: 0 once written whole (`as?`, `as!`), 1
+// where the null comes next and then `numExactCastClose`, -1 failed.
+export function numExactCastHead(exprIx: i32, srcIn: string, fnIx: i32): i32 {
   const e = nodeAt(exprIx)
   if !(e is AsExpr) {
     return emitFail("emitProgram: a numeric cast's tail lost its cast")
@@ -25697,23 +25709,42 @@ export function numExactCastTail(exprIx: i32, srcIn: string, fnIx: i32): i32 {
   }
   fbI32Eqz()
   fbIf(64) // if (void) — the SAD path, the only place the two remaining modes differ
-  if e.asMode == "trap" {
-    // The DOMAIN is what the author wrote, so `x as! u8` says `as! u8`, not `as! i32`. An
-    // integral float out of i32's or i64's range fails exactly where the conversion below
-    // traps, so it traps there and the host names the range (SP-056).
-    if emitNumCastTrapMsg(exprIx, dom) < 0 { return -1 }
-    if !integral || dom != tgt { fbUnreachable() }
-  } else {
-    // A bare `as` PROPAGATES. The checker proved the enclosing function returns something
-    // `null` fits, so the value to hand back is that function's own null — built through
-    // `emitReturnValue`, which is where every nullable-return seed already lives.
-    const missNull = numCastNullNode(exprIx)
-    if missNull < 0 { return -1 }
-    if emitReturnValue(missNull, fnIx) < 0 { return -1 }
-    fbReturn()
+  return match e.asMode {
+    "trap" => {
+      // The DOMAIN is what the author wrote, so `x as! u8` says `as! u8`, not `as! i32`. An
+      // integral float out of i32's or i64's range fails exactly where the conversion below
+      // traps, so it traps there and the host names the range (SP-056).
+      if emitNumCastTrapMsg(exprIx, dom) < 0 { return -1 }
+      if !integral || dom != tgt { fbUnreachable() }
+      fbEnd()
+      emitNumExactConvert(src, tgt)
+    }
+    // A bare `as` PROPAGATES: the checker proved the enclosing function returns something `null`
+    // fits, so the sad path hands back that function's own null, which the caller writes next.
+    "prop" => 1
+    "null" | "wrap" => emitFail("emitProgram: an exact cast's sad path met `as?` or `as%`")
   }
+}
+
+// After a bare exact `as`'s returned null: the `return`, the sad path's end and the conversion.
+export function numExactCastClose(exprIx: i32, srcIn: string): i32 {
+  fbReturn()
   fbEnd()
-  return emitNumExactConvert(src, tgt)
+  const src = if srcIn == "i32" { "i64" } else { srcIn }
+  return emitNumExactConvert(src, asExprNumTgtName(exprIx))
+}
+
+// The source a numeric `as` at `exprIx` is tested exactly from where `numCastTail` writes it by
+// `numExactCastTail`, else "".
+export function numCastExactSrc(exprIx: i32, fnIx: i32): string {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) || numCastKindOf(exprIx, fnIx) < 0 { return "" }
+  return match asCastArmOf(exprIx, fnIx) {
+    "exact" => asExprNumSrcName(exprIx)
+    "holeExact" => asExprHolePinSrc(exprIx, fnIx)
+    "holeOpt" => holeOptExactSrc(exprIx, fnIx)
+    "plain" | "wrap" | "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" | "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "union" | "notCast" => ""
+  }
 }
 
 // The sad path of `as!` or bare `as` over a type parameter pinned at no number: the value is
