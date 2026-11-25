@@ -1390,14 +1390,14 @@ print(fb([1, 2, 3]) + fc([1, 2]) + fh([4]))
   },
 });
 
-// An integer `abs` is legacy's staged `select`, not one instruction: a named miss, never a
-// byte mismatch.
+// An integer `abs` is legacy's staged `select` (`intSelTail`), not one instruction: the IR writes
+// the same tail after its operand, so the function is covered and matches.
 Deno.test({
-  name: "ir shadow: an integer abs is a named miss",
+  name: "ir shadow: an integer abs is covered by the shared select tail and matches",
   ignore,
   fn: () => {
     const { rows } = run(`function ab(x: i32): i32 { return abs(x) }\nprint(ab(-4))\n`, true);
-    const want = "uncovered intrinsic intAbs";
+    const want = "matched";
     if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
