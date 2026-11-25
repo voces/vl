@@ -121,6 +121,7 @@ import {
   RListStage,
   RMakeRec,
   RMapDelete,
+  RNulNoneBox,
   RRecover,
   RStashSet,
   RStrOp,
@@ -3550,6 +3551,9 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
     const p = intSwitchPlanOf(ix0, ibFnIx)
     if p != null && p.ispElse >= 0 { return valuedSwitch(b, ix0, p, rep0) }
   }
+  if ty0 < 0 && ifExprPlainWhy(ix0, ibFnIx) == "null join" {
+    return nullJoinIf(b, n0, ix0, rep0)
+  }
   const rj = ifRefJoinOf(ix0, ibFnIx)
   const rk = rj.rjKind
   if ty0 < 0 && rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
@@ -3735,6 +3739,53 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
     return irBMiss("union if record join row")
   }
   return refIfLink(b, n, ix, jr, ty, kind, rj.rjSlot, false)
+}
+
+// A `null`-typed value `if`, as legacy's `emitAllNullIf` writes it: the `if` for its effects alone,
+// then the destination's null (`emitNullAt`).
+function nullJoinIf(b: i32[], n: IfStmt, ix: i32, rep: i32): Opnd {
+  ifForEffect(b, n, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  const own = nullOwnAt(ix, ibFnIx)
+  if own < 0 || !nullOwnRepFits(own, rep) {
+    return irBMiss("null unit read rep")
+  }
+  return repTemp(b, { nuAt: ix, nuOwn: own, nuRead: [] }, ix, rep)
+}
+
+// `emitIfForEffect`: the conditions as a void `if` chain, each arm's prelude and its `null`-typed
+// value for effect (`nulNoneEffect`), an `else if` its next link.
+function ifForEffect(b: i32[], n: IfStmt, ix: i32) {
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+  const thenB = effectArm(n.ifThen)
+  if ibMiss != "" { return 0 }
+  const elseB: i32[] = []
+  if n.ifElse >= 0 {
+    const en = nodeAt(n.ifElse)
+    if en is IfStmt {
+      ifForEffect(elseB, en, n.ifElse)
+    } else {
+      for k in effectArm(n.ifElse) { elseB.push(k) }
+    }
+    if ibMiss != "" { return 0 }
+  }
+  irBNode(b, sIf(c, thenB, elseB, -1, n.ifElse >= 0), -1, ibNoValue, ix)
+  return 0
+}
+
+// One arm of `ifForEffect`: its prelude, then its value for effect.
+function effectArm(blockIx: i32): i32[] {
+  const body: i32[] = []
+  armPrelude(body, blockIx)
+  if ibMiss != "" { return body }
+  const tv = ifArmValueExpr(blockIx)
+  if tv < 0 {
+    irBMiss("null join arm value")
+    return body
+  }
+  nulNoneEffect(body, tv, blockIx, null)
+  return body
 }
 
 // A value `if` on the union join's rung, as legacy's `emitUnionIfValue` writes it: a chain of `if`s
@@ -6756,13 +6807,14 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
 }
 
 // Whether the operands built into `b` from `at` up to `to` write a statement legacy would write
-// below a lead opened before them: a valued `if`, a boxed `??` or a stash.
+// below a lead opened before them: an `if` (valued, or a `null` join's for effect), a boxed `??`
+// or a stash.
 function ifBelowLeadHas(b: i32[], at: i32, to: i32): boolean {
   let i = at
   while i < to {
     const n = ib.irNodes[b[i]]
     if (
-      n is SIf && n.siOut >= 0
+      n is SIf
       || n is SCoalBox
       || n is SEffect && n.efRhs is RStashSet
       || storeAt(n)
@@ -8828,6 +8880,8 @@ function boxLeadsAt(b: i32[], at: i32): boolean {
   const n = ib.irNodes[b[b.length - 1]]
   if !(n is SLet) { return false }
   const r = n.lRhs
+  // A `null`-typed call's box writes its tag ahead of the call (`emitNulNoneBoxPayload`).
+  if r is RNulNoneBox { return r.nnPay }
   if !(r is RToBox) { return false }
   const arm = holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm
   return arm != "pass" && arm != "memberBox"
