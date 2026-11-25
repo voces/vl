@@ -239,8 +239,8 @@ behaviour_check() {
   local rc=0
   "$VL" run scripts/ir-parity.vl --compiler "$1" -- --seed "$1" --claimless "$2" \
     --from "$T/bdiff" --behaviour-only --out "$T/parity.tsv" > "$T/parity.log" 2>&1 || rc=$?
-  grep -E '^ir-parity: [0-9]+ programs' "$T/parity.log" | sed 's/^ir-parity/behaviour/'
-  grep -vP '^ir-parity: [0-9]+ programs|\tsame\t' "$T/parity.log" | sed 's/^/BEHAVIOUR /'
+  grep -E '^ir-parity: [0-9]+ programs' "$T/parity.log" | sed 's/^ir-parity/behaviour/' || true
+  grep -vP '^ir-parity: [0-9]+ programs|\tsame\t' "$T/parity.log" | sed 's/^/BEHAVIOUR /' || true
   case "$rc" in
     0) ;;
     3) btmo=1 ;;
