@@ -1,10 +1,9 @@
 name: CI
 
 on:
-  # `vl-queue/**`: the merge queue pushes the exact tree it is gating, and the run's
-  # `ci-proof` job lets scripts/gate.sh skip the rows this workflow already ran on it.
+  # A push run is master's alone: the merge queue's `vl-queue/**` pushes retired with it (O2).
   push:
-    branches: [master, "vl-queue/**"]
+    branches: [master]
   pull_request:
   # Nightly: a full run, `ci-cost` included, on a tree nobody pushed.
   schedule:
@@ -20,11 +19,14 @@ env:
   VL_IR_STRICT: "1"
 
 # A new push to a pull request cancels that PR's older run, which only proves a superseded head.
-# Every other event gets a group of its own (its run id), so a master, queue, nightly or manual
-# run is never cancelled and never displaced while pending. A cancelled previous head reads
-# `cancelled` to scripts/ci-verdict.sh, so the new run takes `full`, never `inherit`.
+# Master pushes share one group that never cancels: at most one master run runs and one waits,
+# and a newer push replaces the waiting one, so a run covers every merge since the last and the
+# revert-on-red backstop bisects within that batch (coordinator ruling, 2026-11-25, after a full
+# run per merge left 60 runs queued). Nightly and manual runs get a group of their own (the run
+# id), never cancelled or displaced. A cancelled previous head reads `cancelled` to
+# scripts/ci-verdict.sh, so the new run takes `full`, never `inherit`.
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (github.event_name == 'push' && github.ref == 'refs/heads/master') && 'master' || format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -54,7 +56,7 @@ jobs:
         uses: ./.github/actions/docs-only
 
       # An inherited run (a clean catch-up merge whose previous head passed) skips the
-      # heavy steps; this job's steps are not ones the queue's `gated` skips.
+      # heavy steps.
       - name: Decide what this run repeats
         id: verdict
         uses: ./.github/actions/ci-verdict
@@ -159,13 +161,11 @@ jobs:
   # compiler source — never on an earlier rung, and never on a seed it built itself.
   #
   # `seed` outputs `heavy` (false for a docs-only or an inherited run, which skip every
-  # downstream job), `gated` and `tree`. `gated` is true only on a master push of a tree the
-  # merge queue's scripts/gate.sh already passed (scripts/ci-verdict.sh), and skips just the
-  # three jobs gate.sh runs whole: ci-native, ci-release-shape, ci-cost. `tree` is true only on
+  # downstream job) and `tree`. `tree` is true only on
   # a master push whose tree the squashed PR's own green run tested, and skips the jobs that
   # run proved: ci-native, ci-release-shape, checks, checks-suites, ci-embed-seed; seed and
   # ci-cost (a master reading caught #5373's hang) still run. tests/ci_verdict_test.ts holds
-  # both lists.
+  # the list.
   # ---------------------------------------------------------------------------
   seed:
     runs-on: ubuntu-latest
@@ -174,20 +174,21 @@ jobs:
     # takes about a minute warm and a few minutes on a cold cargo build.
     timeout-minutes: 30
     # `actions: read` lets a master run find and download a pull request's proven seed, and
-    # read a PR head's CI verdict; `statuses` and `pull-requests` read the queue's mark.
+    # read a PR head's CI verdict; `pull-requests` and `checks` read the squashed PR's run.
     permissions:
       contents: read
       actions: read
-      statuses: read
       pull-requests: read
       checks: read
     outputs:
       heavy: ${{ steps.verdict.outputs.heavy }}
-      gated: ${{ steps.verdict.outputs.gated }}
       tree: ${{ steps.verdict.outputs.tree }}
       seed_key: ${{ steps.keys.outputs.seed }}
       bin_key: ${{ steps.keys.outputs.bin }}
       rustc: ${{ steps.keys.outputs.rustc }}
+      ir_identity: ${{ steps.ir.outputs.identity }}
+      cost: ${{ steps.ir.outputs.cost }}
+      i8_sweep: ${{ steps.ir.outputs.sweep }}
     steps:
       # The seed's compiled forms live in a private cache outside the checkout (DECISIONS.md,
       # "The seed sidecar lives only in the user's private cache"); the seed cache steps save it.
@@ -231,6 +232,25 @@ jobs:
       # master push of the squash can ask whether it would re-test the same tree with the same
       # keys (scripts/ci-verdict.sh) without parsing logs. Equal trees give equal hashFiles
       # parts of both keys; rustc is the one input the tree does not fix.
+      # Whether ci-ir-identity has anything to prove: a pull request that changes none of the
+      # programs it builds, the compiler that builds them or the baseline that reads them skips
+      # its steps (still green). Every other event runs it.
+      - name: Does this change reach the IR identity proof, or ci-cost part 1
+        id: ir
+        run: |
+          if [ "${{ github.event_name }}" != pull_request ]; then printf 'identity=true\ncost=true\nsweep=true\n' >> "$GITHUB_OUTPUT"; exit 0; fi
+          re='^(compiler/|std/|tests/cases/|scripts/capability-probes/|scripts/silent-sweep/distilled/(cells|named)/|scripts/vl-host/|docs/internals/inventory(-2)?/|scripts/ir-identity\.sh$|scripts/ir-divergence-baseline\.txt$|scripts/inventory/witnesses\.vl$|scripts/ir-i8-census/witnesses\.vl$|\.github/workflows/ci\.yml$)'
+          hit=$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" | grep -E -m1 "$re" || true)
+          if [ -n "$hit" ]; then echo "identity=true" >> "$GITHUB_OUTPUT"; echo "ir identity: runs ($hit)"
+          else echo "identity=false" >> "$GITHUB_OUTPUT"; echo "ir identity: no compiler, std, program or baseline change"; fi
+          # ci-i8-sweep reads the same inputs plus its own tool, keep-list and baselines.
+          hit=$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" | grep -E -m1 "$re|^scripts/ir-i8-sweep\.sh\$|^scripts/ir-i8-census/" || true)
+          if [ -n "$hit" ]; then echo "sweep=true" >> "$GITHUB_OUTPUT"; else echo "sweep=false" >> "$GITHUB_OUTPUT"; fi
+          # ci-cost part 1's plumb-shape and scaling ratchets read the compiler, std and their own inputs.
+          re='^(compiler/|std/|scripts/vl-host/|scripts/plumb-shape|tests/vl_scaling_shape_test\.ts$|\.github/workflows/ci\.yml$)'
+          hit=$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" | grep -E -m1 "$re" || true)
+          if [ -n "$hit" ]; then echo "cost=true" >> "$GITHUB_OUTPUT"; else echo "cost=false" >> "$GITHUB_OUTPUT"; fi
+
       - name: Record the tested tree
         if: github.event_name == 'pull_request'
         run: |
@@ -315,7 +335,7 @@ jobs:
       # downstream job instead.
       - name: Cache the fuel sidecars
         id: fuelcache
-        if: steps.verdict.outputs.heavy == 'true' && github.event_name != 'pull_request' && steps.verdict.outputs.gated != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && github.event_name != 'pull_request'
         uses: actions/cache@v5
         with:
           path: build/fuel-sidecars
@@ -367,7 +387,7 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-native:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true' && needs.seed.outputs.tree != 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -766,7 +786,7 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-release-shape:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true' && needs.seed.outputs.tree != 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -910,13 +930,12 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-cost:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
+    if: needs.seed.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 12
     # On master a newer commit cancels the older one's reading, part by part: nothing reads a
     # master reading but the run itself, and the baselines are committed files. Any other ref
-    # (a pull request, or a `vl-queue/**` tree whose reading ci-proof needs) gets a group of
-    # its own.
+    # (a pull request) gets a group of its own.
     concurrency:
       group: ${{ github.ref == 'refs/heads/master' && format('ci-cost-master-{0}', matrix.part) || format('ci-cost-{0}-{1}', github.run_id, matrix.part) }}
       cancel-in-progress: ${{ github.ref == 'refs/heads/master' }}
@@ -924,22 +943,29 @@ jobs:
       fail-fast: false
       matrix:
         part: ["1", "2"]
+    # Part 1 (plumb-shape, the first scaling shard) runs its steps only when the seed job says a
+    # pull request reaches them; part 2 (the L2 tripwire) always does. Skipped steps stay green.
+    env:
+      RUN: ${{ matrix.part != '1' || needs.seed.outputs.cost == 'true' }}
     steps:
       - name: Seed cache location
         run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v5
+        if: env.RUN == 'true'
 
       - id: setup-deno-6
+        if: env.RUN == 'true'
         continue-on-error: true
         uses: denoland/setup-deno@v2
         with:
           deno-version-file: .dvmrc
       # github.com release downloads 504 intermittently; npm carries the same pinned build.
-      - if: steps.setup-deno-6.outcome == 'failure'
+      - if: env.RUN == 'true' && steps.setup-deno-6.outcome == 'failure'
         run: npm i -g deno@$(tr -d ' \r\nv' < .dvmrc) && deno --version
 
       - name: Cache Deno modules
+        if: env.RUN == 'true'
         uses: actions/cache@v5
         with:
           path: ~/.cache/deno
@@ -948,6 +974,7 @@ jobs:
             deno-${{ runner.os }}-
 
       - name: Restore vl-host binary
+        if: env.RUN == 'true'
         uses: actions/cache/restore@v5
         with:
           path: scripts/vl-host/target/release/vl
@@ -955,6 +982,7 @@ jobs:
           fail-on-cache-miss: true
 
       - name: Restore the proven seed
+        if: env.RUN == 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -967,6 +995,7 @@ jobs:
       # Restore-only: `seed` wrote this key, so the two fuel JITs become links. Not
       # `fail-on-cache-miss`: a sidecar is a cache, so a miss costs the warm below, never a grade.
       - name: Restore the fuel sidecars
+        if: env.RUN == 'true'
         uses: actions/cache/restore@v5
         with:
           path: build/fuel-sidecars
@@ -975,6 +1004,7 @@ jobs:
       # Near-instant after the restore above; it re-warms only what the restore missed, and is
       # the net for a runner that refuses the pinned `$VL_ISA` level.
       - name: Warm the seed's sidecars
+        if: env.RUN == 'true'
         run: |
           grep -m1 'model name' /proc/cpuinfo
           bash scripts/warm-seed.sh --fuel --stash build/fuel-sidecars
@@ -983,13 +1013,14 @@ jobs:
       # binaryen here, so `-O`'s wasm-opt step is skipped; the tool reads each build's
       # rusage through GNU time, which it refuses to run without.
       - name: Plumb-shape cost (ratchet)
-        if: matrix.part == '1'
+        if: env.RUN == 'true' && (matrix.part == '1')
         run: |
           test -x /usr/bin/time || (sudo apt-get update -q && sudo apt-get install -y -q time)
           scripts/vl-host/target/release/vl run scripts/plumb-shape-cost.vl --compiler build/vl-compiler.wasm -- --check --require-fuel
 
       # Same-work-different-shape program pairs graded on the ratio of their guest fuel.
       - name: Cost ratchets (scaling shape)
+        if: env.RUN == 'true'
         run: deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_scaling_shape_test.ts
         env:
           SELFHOST_NATIVE_ALIGN: "1"
@@ -998,7 +1029,7 @@ jobs:
       # The base master's L2 readings, keyed inside by its compiler/ tree and the host, so any
       # earlier cache is safe to restore; each run saves what it measured.
       - name: Cache the base masters' L2 fuel
-        if: matrix.part == '2'
+        if: env.RUN == 'true' && (matrix.part == '2')
         uses: actions/cache@v5
         with:
           path: ~/.cache/vl/base-fuel
@@ -1013,7 +1044,7 @@ jobs:
       # bootstrap step late (D1090); the seed job's fixpoint proves the bytes, not the cost.
       # On the shard that carries no plumb build.
       - name: Self-compile fuel (L2 tripwire)
-        if: matrix.part == '2'
+        if: env.RUN == 'true' && (matrix.part == '2')
         run: |
           git fetch --no-tags --depth=100 origin master:refs/remotes/origin/master || true
           git fetch --no-tags --deepen=100 origin || true
@@ -1140,6 +1171,177 @@ jobs:
           JOBS: "4"
 
   # ---------------------------------------------------------------------------
+  # ci-ir-identity — what the IR claims, byte for byte against the same tree's compiler with
+  # `CLAIMED` empty (scripts/ir-identity.sh): `--cases` over tests/cases, the capability probes
+  # and the emit-reject witnesses, and `--claimless` over the distilled corpus and the `runs`
+  # witnesses, each dealt across the shards by `--shard i/N`. A differ the divergence baseline
+  # does not list reds the job and names the program in an error annotation. A pull request
+  # that touches none of its inputs (seed's `ir_identity`) runs no step and stays green.
+  # ---------------------------------------------------------------------------
+  ci-ir-identity:
+    needs: seed
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      RUN: ${{ needs.seed.outputs.ir_identity }}
+    steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        if: env.RUN == 'true'
+
+      # A listed divergence is read through wasm-dis; this job has no node_modules.
+      - name: Cache native binaryen
+        if: env.RUN == 'true'
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/vl/binaryen-*
+          key: binaryen-${{ runner.os }}-${{ hashFiles('scripts/fetch-binaryen.sh') }}
+
+      - name: Native binaryen
+        if: env.RUN == 'true'
+        run: |
+          d=$(bash scripts/fetch-binaryen.sh)
+          echo "WASM_DIS=$d/wasm-dis" >> "$GITHUB_ENV"
+
+      - name: Restore vl-host binary
+        if: env.RUN == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        if: env.RUN == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            ${{ runner.temp }}/vl-seed-cache
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      - name: Warm the seed's sidecars
+        if: env.RUN == 'true'
+        run: bash scripts/warm-seed.sh
+
+      # One claimless compiler serves both modes.
+      - name: Build the claimless compiler
+        if: env.RUN == 'true'
+        run: |
+          bash scripts/ir-identity.sh --build-claimless build/vl-compiler.wasm "$RUNNER_TEMP/claimless.wasm"
+          echo "IR_IDENTITY_CLAIMLESS=$RUNNER_TEMP/claimless.wasm" >> "$GITHUB_ENV"
+
+      - name: IR identity, tests/cases and probes (--cases)
+        if: env.RUN == 'true'
+        run: |
+          set -o pipefail
+          rc=0
+          bash scripts/ir-identity.sh --cases build/vl-compiler.wasm --shard ${{ matrix.shard }}/4 | tee "$RUNNER_TEMP/cases.log" || rc=$?
+          bash scripts/ir-identity-annotate.sh "--cases" "$RUNNER_TEMP/cases.log"
+          exit "$rc"
+        env:
+          JOBS: "4"
+          IR_IDENTITY_KEEP: ${{ runner.temp }}/ir-identity-keep/cases
+
+      - name: IR identity, distilled corpus and runs witnesses (--claimless)
+        if: env.RUN == 'true' && !cancelled()
+        run: |
+          set -o pipefail
+          rc=0
+          bash scripts/ir-identity.sh --claimless build/vl-compiler.wasm --shard ${{ matrix.shard }}/4 | tee "$RUNNER_TEMP/claimless.log" || rc=$?
+          bash scripts/ir-identity-annotate.sh "--claimless" "$RUNNER_TEMP/claimless.log"
+          exit "$rc"
+        env:
+          JOBS: "4"
+          IR_IDENTITY_KEEP: ${{ runner.temp }}/ir-identity-keep/claimless
+
+      - name: Upload the logs of every non-identical program
+        if: failure() && env.RUN == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: ir-identity-keep-${{ matrix.shard }}
+          path: ${{ runner.temp }}/ir-identity-keep
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # ci-i8-sweep — the I8 cutover rehearsed on every compiler change (scripts/ir-i8-sweep.sh). First
+  # the static half: no kept tail or ir*.vl file may gain a call into stage B (edges-baseline.txt).
+  # Then stage B minus scripts/ir-i8-census/keep.txt is emptied and swept and every population runs
+  # under it; a program that newly fails with nothing the seed leaves unclaimed may not have a cause
+  # (a re-entry tail, a stub, a fallback reason) sweep-baseline.txt does not list. Counts are not
+  # graded: coverage moves programs from explained to unexplained (coordinator ruling, 2026-11-25).
+  # A pull request that touches none of its inputs runs no step and stays green.
+  # ---------------------------------------------------------------------------
+  ci-i8-sweep:
+    needs: seed
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RUN: ${{ needs.seed.outputs.i8_sweep }}
+    steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        if: env.RUN == 'true'
+
+      - name: Restore vl-host binary
+        if: env.RUN == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        if: env.RUN == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            ${{ runner.temp }}/vl-seed-cache
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      - name: Warm the seed's sidecars
+        if: env.RUN == 'true'
+        run: bash scripts/warm-seed.sh
+
+      - name: I8 static edges into stage B (none new)
+        if: env.RUN == 'true'
+        run: bash scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep.txt --edges --check --out "$RUNNER_TEMP/ir-i8-edges"
+
+      - name: I8 sweep (no new unexplained cause)
+        if: env.RUN == 'true' && !cancelled()
+        run: bash scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep.txt --check --out "$RUNNER_TEMP/ir-i8-sweep"
+        env:
+          JOBS: "4"
+
+      - name: Upload the sweep's report
+        if: always() && env.RUN == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: ir-i8-sweep
+          path: |
+            ${{ runner.temp }}/ir-i8-sweep/*.txt
+            ${{ runner.temp }}/ir-i8-sweep/*.tsv
+            ${{ runner.temp }}/ir-i8-edges/*.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # ci-embed-seed — the release DISTRIBUTION build (roadmap H-M2), gated on every
   # push instead of only at release time.
   #
@@ -1188,8 +1390,24 @@ jobs:
           docs_only: ${{ steps.docs_check.outputs.docs_only }}
           modes: inherit tree
 
+      # The distribution mechanism is the host's (build.rs staging, the embedded fallback), so a
+      # pull request or push that touches none of scripts/vl-host/, fetch-seed.sh or this file
+      # skips the build and stays green; the nightly and manual runs always build it.
+      - name: Does this change reach the distribution build
+        id: host
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) range="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" ;;
+            push) range="${{ github.event.before }}..${{ github.event.after }}"
+              git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null || range="HEAD~1..HEAD" ;;
+            *) echo "run=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          hit=$(git diff --no-renames --name-only "$range" | grep -E -m1 '^(scripts/vl-host/|scripts/fetch-seed\.sh$|\.github/workflows/ci\.yml$)' || true)
+          if [ -n "$hit" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; echo "distribution build: runs ($hit)"
+          else echo "run=false" >> "$GITHUB_OUTPUT"; echo "distribution build: no host change"; fi
+
       - name: Rustc version (cargo cache key)
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         id: rustc
         run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
 
@@ -1201,7 +1419,7 @@ jobs:
       # restores, builds and saves. One cold wasmtime build after a toolchain bump
       # is the same cost as before the split.
       - name: Restore cargo + vl-host target
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -1218,7 +1436,7 @@ jobs:
       # while `seed` stays the sole writer of the seed pair, which is what
       # keeps the seed cache riding along with the wasm its entries were built from.
       - name: Restore seed compiler wasm
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -1231,13 +1449,13 @@ jobs:
 
       # fetch-seed.sh keeps the restored seed (its `.src` marks a local build), else fetches one.
       - name: Ensure a seed to embed
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         run: ./scripts/fetch-seed.sh
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Verify embedded-seed build (distribution path)
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         run: |
           cargo build --release --features embed-seed --manifest-path scripts/vl-host/Cargo.toml
           probe="$(mktemp -d)"
@@ -1272,7 +1490,7 @@ jobs:
       # is the whole claim. The stale-seed row is the other half: a released `vl`
       # must not become a different compiler because of what sits in the CWD.
       - name: Verify a released `vl` carries std and ignores the CWD
-        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true' && steps.host.outputs.run == 'true'
         run: |
           set -e
           export VL_CACHE_DIR="$(mktemp -d)"
@@ -1321,46 +1539,3 @@ jobs:
             exit 1
           fi
           echo "a released vl: std out of the binary from $probe, dump round-trips, CWD ignored"
-
-  # ---------------------------------------------------------------------------
-  # ci-proof — on a merge queue push only, the line scripts/ci-proof.sh reads to let
-  # scripts/gate.sh skip the rows this run covered on the same tree: the tree, the sha256 of
-  # the seed every job restored, and the rustc that built the host. It prints nothing unless
-  # every job it needs passed, and a run that skipped a job (docs-only, gated) proves nothing.
-  # tests/ci_proof_test.ts holds `needs` to every other job in this file.
-  # ---------------------------------------------------------------------------
-  ci-proof:
-    needs: [ci, seed, ci-native, checks, checks-suites, ci-release-shape, ci-cost, ci-distilled, ci-witnesses, ci-embed-seed]
-    if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/vl-queue/')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Seed cache location
-        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
-
-      - name: Every job this proof covers passed
-        env:
-          NEEDS: ${{ toJSON(needs) }}
-          HEAVY: ${{ needs.seed.outputs.heavy }}
-          GATED: ${{ needs.seed.outputs.gated }}
-        run: |
-          bad=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"' <<< "$NEEDS")
-          [ -z "$bad" ] || { echo "no proof: $bad"; exit 1; }
-          [ "$HEAVY" = true ] && [ "$GATED" != true ] || { echo "no proof: heavy=$HEAVY gated=$GATED"; exit 1; }
-
-      - uses: actions/checkout@v5
-
-      - name: Restore the proven seed
-        uses: actions/cache/restore@v5
-        with:
-          path: |
-            build/vl-compiler.wasm
-            build/vl-compiler.wasm.src
-            ${{ runner.temp }}/vl-seed-cache
-          key: ${{ needs.seed.outputs.seed_key }}
-          fail-on-cache-miss: true
-
-      - name: Proof line
-        env:
-          RUSTC: ${{ needs.seed.outputs.rustc }}
-        run: |
-          echo "ci-proof: tree $(git rev-parse HEAD^{tree}) seed $(sha256sum build/vl-compiler.wasm | cut -d' ' -f1) rustc $RUSTC"

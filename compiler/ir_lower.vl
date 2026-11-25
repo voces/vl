@@ -86,7 +86,13 @@ import {
   nodeAt,
   nodeChildren,
 } from "./ast"
-import { quoteLex, unwrapParen } from "./emit_base"
+import {
+  isRecvStagedIx,
+  isRecvStagedNonNull,
+  isRecvStagedSlot,
+  quoteLex,
+  unwrapParen,
+} from "./emit_base"
 import {
   fieldRowStorageKind,
   sFieldFlatRow,
@@ -159,6 +165,7 @@ import {
   RHoleOptBox,
   RIdentityEq,
   RInitProgress,
+  RIsStaged,
   RJoinNull,
   RListCat,
   RListClear,
@@ -371,6 +378,7 @@ import {
   arrNewTail,
   asLitTail,
   asMapProbeTrapTail,
+  asPropNicheHeapOf,
   atomEqIsTail,
   atomEqTail,
   atomNotNulIsTail,
@@ -476,6 +484,7 @@ import {
   idxRowsOn,
   idxSpanOn,
   initBitOf,
+  intSelTail,
   listBuildClose,
   listGetOrOpen,
   listOpRecvHeld,
@@ -543,7 +552,10 @@ import {
   nulTestBoolTail,
   nulTestBoxTagTail,
   nulTestRefTail,
+  numCastExactSrc,
   numCastTail,
+  numExactCastClose,
+  numExactCastHead,
   numIntrTail,
   numUnionBinTail,
   numUnionConvertTail,
@@ -685,6 +697,7 @@ import {
   holeBoxPlanOf,
   isArmOf,
   isPreArmOf,
+  isRecvStageRep,
   litIsArmOf,
   litIsMemberTexts,
   memRecvOwesNonNull,
@@ -790,6 +803,8 @@ import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import {
   ifLinkYieldsNull,
+  isRecvStashHolds,
+  isRecvStashSlot,
   objOrderStashSlot,
   unionLitIsStashSlot,
 } from "./emit_if_arm_values"
@@ -986,6 +1001,8 @@ export function irLOpnd(o: Opnd) {
       if !urLocalRead(s) { fbLocalGet(s) }
       // A `shadow` arm's list is the frame's nullable list scratch, read non-null.
       if listFitShadowHolds(s) { fbRefAsNonNull() }
+      // A staged `is` receiver held as a non-null string reads its nullable stash non-null.
+      if isRecvStagedNonNull && s == isRecvStagedSlot { fbRefAsNonNull() }
     }
     OImm => {
       leaf()
@@ -1218,7 +1235,12 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RNumIntr => {
       for a in r.nxArgs { irLOpnd(a) }
-      numIntrTail(r.nxOp)
+      match r.nxSel {
+        "op" => numIntrTail(r.nxOp)
+        "abs" => intSelTail("abs", r.nxWide)
+        "min" => intSelTail("min", r.nxWide)
+        "max" => intSelTail("max", r.nxWide)
+      }
     }
     RSimd => simd(r)
     RTagStash => irLMiss("tag stash as a value")
@@ -1229,6 +1251,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListFitIs => listFitIs(r)
     RLitArms => litArms(r)
     RNumIs => numIs(r)
+    RIsStaged => isStaged(r)
     RTagIs => {
       leaf()
       tagIsTail(r.tgiId)
@@ -1275,7 +1298,11 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RNumCast => {
       irLOpnd(r.ncV)
-      numCastTail(r.ncAt, lw.irAt)
+      if r.ncMiss is OVar && r.ncMiss.ov < 0 {
+        numCastTail(r.ncAt, lw.irAt)
+      } else {
+        numCastMissTail(r)
+      }
     }
     // The cell's re-read, then the opcode narrowing it back, as `emitAsgValue` writes it.
     RAsgUnwiden => {
@@ -2042,6 +2069,9 @@ function listEmpty(r: RListEmpty) {
 // a `memberEq` the `litMember` rung writes as its one member's compare (`emitLitMemberEq`).
 function litArmsPlanHolds(r: RLitArms, n: IsExpr): boolean {
   if litIsArmOf(r.liAt, n, lw.irAt) == r.liArm { return true }
+  if r.liArm == "numBox" && isArmOf(r.liAt, lw.irAt, 0, false) == "floatLits" {
+    return true
+  }
   if r.liArm == "boxLits" && isArmOf(r.liAt, lw.irAt, 0, false) == "armTag" {
     return tagIsArmOf(r.liAt, n, lw.irAt) == "boxLitSet"
   }
@@ -2153,6 +2183,42 @@ function unionLitIs(r: RLitArms, recvIx: i32, lex: string): i32 {
       -1
     }
   }
+}
+
+// `RIsStaged` as `emitIsTest` stages its receiver: the receiver set into its stash slot, which
+// the rungs' variable then names, and the rungs' test written with that receiver staged.
+function isStaged(r: RIsStaged) {
+  const n = nodeAt(r.stAt)
+  if !(n is IsExpr) || r.stVar < 0 || r.stVar >= lw.irVars.length {
+    return irLMiss("is staged node")
+  }
+  if isRecvStagedIx >= 0 { return irLMiss("is staged nested") }
+  if isRecvStageRep(r.stAt, lw.irAt) != r.stKey {
+    return irLMiss("is staged plan")
+  }
+  irLOpnd(r.stV)
+  const slot = isRecvStashSlot(r.stKey)
+  fbLocalSet(slot)
+  lw.irVars[r.stVar].vSlot = slot
+  isRecvStagedIx = unwrapParen(n.isObj)
+  isRecvStagedSlot = slot
+  isRecvStagedNonNull = r.stKey == 3
+  irLOpnd(r.stTest)
+  isRecvStagedIx = -1
+  isRecvStagedSlot = 0
+  isRecvStagedNonNull = false
+  return 0
+}
+
+// A bare exact `as`'s tail past its operand, as `numExactCastTail` writes it: the test, then on
+// the sad path the function's own null the builder built (`ncMiss`), returned.
+function numCastMissTail(r: RNumCast): i32 {
+  const src = numCastExactSrc(r.ncAt, lw.irAt)
+  if src == "" { return irLMiss("as miss cast") }
+  const h = numExactCastHead(r.ncAt, src, lw.irAt)
+  if h != 1 { return irLMiss("as miss path") }
+  irLOpnd(r.ncMiss)
+  return numExactCastClose(r.ncAt, src)
 }
 
 // `RNumIs` along `numIsPlanOf`, as `emitIsTestNumLit` writes it: the receiver once into its slot
@@ -3429,6 +3495,8 @@ function mapGet(r: RMapGet) {
     "unionBox" => {
       mapProbeHead(nd.idxArr, r.mtSym, r.mtNonNull, r.mtLoc, r.mtKey)
       if mapGetUnionBoxTail() < 0 { return -1 }
+      // The box plan's whole read writes no narrowing unbox after it.
+      if r.mtWhole { return 0 }
     }
     "helper" => {
       const fi = mapGetHelperFnOf(
@@ -4145,6 +4213,7 @@ function boxOp(r: RToBox) {
     || p.hbArm == "clo"
     || p.hbArm == "atomAsStr"
     || p.hbArm == "retag"
+    || p.hbArm == "mapBox"
   ) {
     irLOpnd(r.bxV)
   } else {
@@ -5233,8 +5302,10 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   if t < 0 || t >= lw.irVars.length || t >= lwStackVal.length {
     return irLMiss("coalesce box out")
   }
-  const e = nodeAt(n.cbAt)
-  if !(e is BinExpr) { return irLMiss("coalesce box node") }
+  const e0 = nodeAt(n.cbAt)
+  if !(e0 is BinExpr) && !(e0 is AsExpr && n.cbArm == "asProp") {
+    return irLMiss("coalesce box node")
+  }
   // An earlier operand's temps are written below the operand, as a valued `if` stages them.
   const stages = coalArmStagesLeads(n.cbArm)
   const roots = if stages { stageLead(n.cbL, pending) } else { noRoots() }
@@ -5242,8 +5313,22 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   if stages { joinBoxHead(t, true) }
   lwFloors.push(lwFloor)
   lwFloor = lwLive.length - liveCountIn(pending)
+  const got = coalBoxGo(n, pending)
+  lwFloor = lwFloors.pop() ?? 0
+  if got < 0 { return -1 }
+  for r in roots { pending.push(r) }
+  livePush(t)
+  pending.push(t)
+  return 0
+}
+
+// The `??` (or propagating `as`) itself along its arm, inside `coalBox`'s staging.
+function coalBoxGo(n: SCoalBox, pending: i32[]): i32 {
+  const e = nodeAt(n.cbAt)
+  if e is AsExpr { return coalAsProp(n, e, pending) }
+  if !(e is BinExpr) { return irLMiss("coalesce box node") }
   const ba = coalValBoxArm(n.cbArm)
-  const got = if ba != null { coalBoxArm(n, ba, e, pending) } else { match n.cbArm {
+  return if ba != null { coalBoxArm(n, ba, e, pending) } else { match n.cbArm {
     "popOr" => coalPopOr(n, e, pending)
     "listGetOr" => coalListGetOr(n, e, pending)
     "mapIndexGetOr" => coalMapGetOr(n, e, pending)
@@ -5256,16 +5341,25 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
     "nulStr" => coalNulStr(n, e, pending)
+    "asProp" => irLMiss("propagating as over a `??`")
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
   } }
-  lwFloor = lwFloors.pop() ?? 0
-  if got < 0 { return -1 }
-  for r in roots { pending.push(r) }
-  livePush(t)
-  pending.push(t)
-  return 0
+}
+
+// A propagating `as` over a nullable-ref niche, as `emitAsNulNiche` writes it: the plain block at
+// the non-null heap, the operand inside it, the branch out on non-null, then the null path, which
+// returns the function's null.
+function coalAsProp(n: SCoalBox, e: AsExpr, pending: i32[]): i32 {
+  if n.cbArm != "asProp" { return irLMiss("propagating as arm") }
+  const heap = asPropNicheHeapOf(e.asObj, lw.irAt)
+  if heap < 0 { return irLMiss("propagating as heap") }
+  if pending.length > 0 { return irLMiss("propagating as below a temp") }
+  coalNulRefOpen(heap, false)
+  cond(n.cbL, body(n.cbLB, false, -1, true))
+  coalNulRefBranch()
+  return coalNulRefTail(n, -1)
 }
 
 // `l ?? d` along legacy's `boxStash` rung, as `emitCoalesceBoxStash` writes it: the operand box,
@@ -5839,6 +5933,7 @@ function framedLocals(): u8[] {
       v.vKind == "local"
       && v.vSlot >= fbFrameParams
       && !listFitShadowHolds(v.vSlot)
+      && !isRecvStashHolds(v.vSlot)
     ) {
       const li = v.vSlot - fbFrameParams
       if li >= nLocals || !runAgrees(v.vRep, li) { irLMiss("locals layout") }

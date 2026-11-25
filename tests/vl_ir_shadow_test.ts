@@ -217,6 +217,37 @@ Deno.test({
   },
 });
 
+// Verifier rule 2's reference niche pairs: a list's, closure's and map's niche read verifies at its
+// own `A | null`, and reds at either other shape's (`irShadowCorrupt(10)` forward, `(11)` back).
+Deno.test({
+  name: "ir shadow: a reference niche read verifies at its own shape and at no other",
+  ignore,
+  fn: () => {
+    const kinds = [
+      "type U = i32[] | null | string\nfunction f(u: U) {\n  if u is string { return 0 }\n  const l = u\n" +
+      "  return if l == null { 1 } else { l.length }\n}\nprint(f([1]))\n",
+      "type F = (a: i32) => i32\ntype U = F | null | string\nfunction f(u: U) {\n  if u is string { return 0 }\n" +
+      "  const c = u\n  return if c == null { 1 } else { c(2) }\n}\nprint(f((a: i32) => a))\n",
+      "type M = {[string]: i32}\ntype U = M | null | i32\nfunction f(u: U) {\n  if u is i32 { return 0 }\n" +
+      "  const m = u\n  return if m == null { 1 } else { m.length }\n}\nconst mm: M = Map()\nprint(f(mm))\n",
+    ];
+    const want = "a niche read is at its niche's rep";
+    for (const src of kinds) {
+      const ok = run(src, true);
+      const m = ok.rows.get("matched") ?? 0;
+      if (failures(ok.rows).length > 0 || m < 1 || m !== ok.rows.get("covered")) {
+        throw new Error(`want every covered function matched, got ${JSON.stringify([...ok.rows])}\n${src}`);
+      }
+      for (const k of [10, 11]) {
+        const { rows } = run(src, true, k);
+        if (!failures(rows).some((r) => r.includes(want))) {
+          throw new Error(`want control ${k} to red with "${want}", got ${JSON.stringify([...rows])}\n${src}`);
+        }
+      }
+    }
+  },
+});
+
 // A nullable record compare's element side banks the element-read rows of its null tests and
 // fields: with them dropped (control 5) the row's spans count reds.
 Deno.test({
@@ -1390,14 +1421,14 @@ print(fb([1, 2, 3]) + fc([1, 2]) + fh([4]))
   },
 });
 
-// An integer `abs` is legacy's staged `select`, not one instruction: a named miss, never a
-// byte mismatch.
+// An integer `abs` is legacy's staged `select` (`intSelTail`), not one instruction: the IR writes
+// the same tail after its operand, so the function is covered and matches.
 Deno.test({
-  name: "ir shadow: an integer abs is a named miss",
+  name: "ir shadow: an integer abs is covered by the shared select tail and matches",
   ignore,
   fn: () => {
     const { rows } = run(`function ab(x: i32): i32 { return abs(x) }\nprint(ab(-4))\n`, true);
-    const want = "uncovered intrinsic intAbs";
+    const want = "matched";
     if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -1748,6 +1779,8 @@ Deno.test({
       "held-global-read-off-noted-rep": 2,
       "null-into-nullable-record-global": 0,
       "null-into-bool-niche-global": 2,
+      "record-into-its-niche-global": 0,
+      "other-record-into-niche-global": 2,
       "result-pick-of-i32": 2,
       "result-pick-record-into-i32": 2,
       "record-retag-of-i32": 2,
@@ -3140,27 +3173,21 @@ Deno.test({
   },
 });
 
-// A stored literal boxed into a union stays legacy's (the box writes its tag ahead of the store,
-// which the builder writes as a statement first); one after a call operand builds and matches,
-// the call's value staged below the store as legacy writes it first.
+// A stored literal boxed into a union builds with the box's tag written ahead of the store, as
+// legacy writes it; one after a call operand builds and matches, the call's value staged below the
+// store as legacy writes it first.
 const ASG_VALUE_LIT_MISSES =
   `function boxed(c: boolean) {\n  let x: i32 | null = null\n  return if c { x = 5 }\n}\nfunction k() { return 3 }\nfunction h(p: i32, q: i32) { return p + q }\nlet f: f32 = 0.5\nfunction lead() { return h(k(), f = 4) }\nprint(boxed(true) ?? 0)\nprint(lead())\n`;
 Deno.test({
-  name: "ir shadow: a boxed stored literal stays a named miss; one after a call operand matches",
+  name: "ir shadow: a boxed stored literal and one after a call operand build and match",
   ignore,
   fn: () => {
     const { rc, rows } = run(ASG_VALUE_LIT_MISSES, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if (
-      (rows.get("uncovered box of an assignment") ?? 0) !== 1 ||
-      (rows.get("covered") ?? 0) !== 3 ||
-      (rows.get("matched") ?? 0) !== 3
-    ) {
-      throw new Error(
-        `want boxed uncovered by name, lead, k and h matched, got ${JSON.stringify([...rows])}`,
-      );
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want boxed, lead, k and h covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -3189,7 +3216,7 @@ Deno.test({
 
 // A returned bundle's record held by a `const` and used at one signature takes that member
 // (`holderMemberTy`), in a plain and a generic function, and matches. A call straight off the
-// result stays a named indirect-call miss.
+// result takes its member too (`resultMemberCallRhs`).
 const ONE_MEMBER_HOLDER =
   `function lap(f) {\n  print(f(2.5))\n  print(f(3))\n  return f\n}\nfunction plain(k: i32) {\n  const r = lap((a) => a + k)\n  print(r(4))\n}\nfunction gen<T>(x: T, k: i32) {\n  const r = lap((a) => a + k)\n  print(r(1))\n  print(x)\n}\nfunction direct(k: i32) {\n  print(lap((a) => a + k)(7))\n}\nplain(5)\ngen("s", 20)\ndirect(1)\n`;
 Deno.test({
@@ -3206,8 +3233,8 @@ Deno.test({
     if ((rows.get("covered") ?? 0) !== (rows.get("matched") ?? 0)) {
       throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
     }
-    if ((rows.get("uncovered indirect call") ?? 0) !== 1) {
-      throw new Error(`want direct a named indirect-call miss, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("uncovered indirect call") ?? 0) !== 0 || (rows.get("covered") ?? 0) !== (rows.get("fns") ?? -1)) {
+      throw new Error(`want every function covered, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -3319,17 +3346,17 @@ Deno.test({
   ignore,
   fn: () => {
     const src = Deno.readTextFileSync(
-      new URL("./cases/unions/layout-family-string-field-read-as-atom-hazards-runs.vl", import.meta.url),
+      new URL("./cases/unions/shared-nullable-scalar-field-read.vl", import.meta.url),
     );
     const one = run(src, 1);
     const detail = run(src, 2);
     const plain = run(src, 0);
     const rows1 = [...one.rows.keys()];
-    if (rows1.some((k) => k.startsWith("detail ")) || one.rows.get("uncovered rep ?") !== 1) {
-      throw new Error(`want mode 1's one \`uncovered rep ?\` and no detail row, got ${JSON.stringify([...one.rows])}`);
+    if (rows1.some((k) => k.startsWith("detail ")) || one.rows.get("uncovered rep unsup") !== 1) {
+      throw new Error(`want mode 1's one \`uncovered rep unsup\` and no detail row, got ${JSON.stringify([...one.rows])}`);
     }
-    if (detail.rows.get("detail rep ? of string in mat") !== 1) {
-      throw new Error(`want the detail row naming the string node in mat, got ${JSON.stringify([...detail.rows])}`);
+    if (detail.rows.get("detail rep unsup of member in X") !== 1) {
+      throw new Error(`want the detail row naming the member node in X, got ${JSON.stringify([...detail.rows])}`);
     }
     if (one.out.length !== plain.out.length || one.out.some((b, i) => b !== plain.out[i])) {
       throw new Error("want the armed shadow's module byte-identical to the unarmed one");

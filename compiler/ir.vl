@@ -302,10 +302,13 @@ export type ROptRead = { orV: Opnd, orAt: i32, orTag: i32 }
 export type RAsgUnwiden = { uwV: Opnd, uwOp: i32, uwAt: i32 }
 // A numeric `as` at cast node `ncAt` over operand `ncV`, built at the kind `numCastKindOf`
 // names; legacy's `numCastTail` writes the conversion, and an `as!`'s test and trap.
-export type RNumCast = { ncV: Opnd, ncAt: i32 }
+// A numeric `as` at node `ncAt` over `ncV`; a bare exact `as`'s miss returns `ncMiss`, the
+// function's own null (`ov` -1 where it has none).
+export type RNumCast = { ncV: Opnd, ncAt: i32, ncMiss: Opnd }
 // `bxV` boxed into union `bxTy`, which delivery node `bxAt` delivers into: the one the checker
 // records there, or a direct call's parameter union where it records none; `bxFree` whether
-// `bxAt` has no effect, so an immediate may stand for it.
+// `bxAt` has no effect left to write (an assignment's store is its span), so an immediate may
+// stand for it.
 export type RToBox = { bxV: Opnd, bxAt: i32, bxTy: i32, bxFree: boolean }
 // `u as? N` over a type parameter boxing scalar `hxV` at cast node `hxAt` (`holeOptShapeOf`'s
 // "box"), whose tag legacy writes ahead of the operand (`holeOptBoxHead`, `holeOptBoxTail`).
@@ -483,8 +486,15 @@ export type RLitArms = { liV: Opnd, liArm: LitIsArm, liAt: i32 }
 // `niV is K` over a numeric literal union at `is` test `niAt`, along `numIsPlanOf`: the receiver read
 // once into a slot, or once per member.
 export type RNumIs = { niV: Opnd, niAt: i32 }
-// A numeric intrinsic at call `nxAt`: its operands, then its one instruction `nxOp`
-// (`numIntrPlanOf`).
+// `is` test `stAt` whose receiver legacy evaluates once into its stash (`isRecvStageRep` key
+// `stKey`): `stV` into that slot, which variable `stVar` then names, and the rungs' bool `stTest`.
+export type RIsStaged = {
+  stV: Opnd,
+  stVar: i32,
+  stKey: i32,
+  stTest: Opnd,
+  stAt: i32,
+}
 // A binary operator at node `nbAt` on legacy's `numUnion` route, over its non-literal sides in
 // order (a literal side is written at each member's width, so it has no operand).
 export type RNumUnionBin = { nbArgs: Opnd[], nbAt: i32 }
@@ -495,7 +505,17 @@ export type RNumUnionConvert = { nuV: Opnd, nuTo: i32, nuAt: i32 }
 // rung writes it (`emitNulNoneBoxPayload`): with `nnPay`, call `nnV` is the payload, else the
 // bottom ref is.
 export type RNulNoneBox = { nnV: Opnd, nnPay: boolean, nnAt: i32 }
-export type RNumIntr = { nxArgs: Opnd[], nxOp: i32, nxAt: i32 }
+// A numeric intrinsic at call `nxAt`: its operands, then its one instruction `nxOp`
+// (`numIntrPlanOf`) at `nxSel` "op", or an integer `abs`/`min`/`max`'s select (`intSelTail`),
+// at i64 when `nxWide`.
+export type RNumIntr = {
+  nxArgs: Opnd[],
+  nxOp: i32,
+  nxSel: NumIntrSel,
+  nxWide: boolean,
+  nxAt: i32,
+}
+export type NumIntrSel = "op" | "abs" | "min" | "max"
 // A SIMD intrinsic at call `sdAt`: its value operands, then its one instruction and any lane
 // immediates (`simdTail`). As the builder planned it, a load or store has `sdMemBase` operands (1
 // or 2, else 0); any other op takes operands at `sdPrims` and leaves `sdResPrim` ("" for none).
@@ -525,10 +545,10 @@ export type RMapGetOr = {
   mgForm: i32,
   mgDef: Opnd,
 }
-// A bare `m[k]` at Index `mtAt`: global `mtSym` (recovered for `mtNonNull`) or receiver `mtLoc`, key
-// `mtKey`, by `mapGetArmOf`. `mtBox` the box plan's atom kind (else -1); `mtRow` where legacy banks
-// the element-read row; `mtTrap` traps on a miss (`emitAsMapProbeTrap`); `mtPrint` (a scalar kind,
-// else -1) prints the read (`print`'s `mapScalar` arm).
+// A bare `m[k]` at Index `mtAt` (global `mtSym`, else receiver `mtLoc`; key `mtKey`), by
+// `mapGetArmOf`: `mtBox` the box plan's atom kind or -1, `mtRow` banks the element-read row,
+// `mtTrap` traps on a miss, `mtPrint` (a scalar kind or -1) prints it, and `mtWhole` reads a
+// union-valued map's box past its narrowing (`emitMapGetUnionBox`).
 export type RMapGet = {
   mtSym: i32,
   mtNonNull: boolean,
@@ -539,6 +559,7 @@ export type RMapGet = {
   mtRow: boolean,
   mtTrap: boolean,
   mtPrint: i32,
+  mtWhole: boolean,
 }
 // `m.keys()` or, under `miVals`, `m.values()` at call `miAt` over map variable `miV`, which legacy's
 // writer reads three times (`mapListStep`): a fresh list of the live entries.
@@ -686,6 +707,7 @@ export type Rhs = RAfterEffects
   | RHoleOptBox
   | RIdentityEq
   | RInitProgress
+  | RIsStaged
   | RJoinNull
   | RListCat
   | RListClear
@@ -860,7 +882,7 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 // before they open.
 export function coalArmStagesLeads(a: CoalValArm): boolean {
   return match a {
-    "litUnion" | "nulBool" | "nulRef" | "nulStr" | "nulBoolJoin" | "valBox" | "valScalar" => true
+    "litUnion" | "nulBool" | "nulRef" | "nulStr" | "asProp" | "nulBoolJoin" | "valBox" | "valScalar" => true
     "boolPop" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "listGetOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "boxStash" | "boxFieldScalar" => false
   }
 }
@@ -1419,6 +1441,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RHoleOptBox |
       RIdentityEq |
       RInitProgress |
+      RIsStaged |
       RJoinNull |
       RListCat |
       RListClear |
@@ -1806,7 +1829,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     REqHelp => [r.ehL, r.ehR]
     RNumWiden => [r.nwV]
     ROptRead => [r.orV]
-    RNumCast => [r.ncV]
+    RNumCast => if r.ncMiss is OVar && r.ncMiss.ov < 0 { [r.ncV] } else { [r.ncV, r.ncMiss] }
     RAsgUnwiden => [r.uwV]
     RNumIntr => r.nxArgs
     RNumUnionBin => r.nbArgs
@@ -1846,6 +1869,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListFitIs => [r.lsV]
     RLitArms => [r.liV]
     RNumIs => [r.niV]
+    RIsStaged => [r.stV, r.stTest]
     RUnionConcreteEq => [r.ucBox, r.ucOther]
     RUnionEq => [r.ueL, r.ueR]
     RUnionVariantEq => [r.uvBox, r.uvOther]
@@ -2016,7 +2040,12 @@ function rhsText(r: Rhs): string {
     RListFitIs => "list fit " + opndText(r.lsV)
     RLitArms => "lit arms " + r.liArm + " " + opndText(r.liV)
     RNumIs => "num is " + opndText(r.niV)
-    RNumIntr => "intrinsic " + i32ToStr(r.nxOp) + "(" + opndsText(r.nxArgs) + ")"
+    RIsStaged => "is staged " + opndText(r.stV) + " " + opndText(r.stTest)
+    RNumIntr => "intrinsic "
+      + (if r.nxSel == "op" { i32ToStr(r.nxOp) } else { r.nxSel })
+      + "("
+      + opndsText(r.nxArgs)
+      + ")"
     RNumUnionBin => "num_union(" + opndsText(r.nbArgs) + ")"
     RNumUnionConvert => "num_union_convert " + opndText(r.nuV)
     RNulNoneBox => "nul_none_box " + (if r.nnPay { opndText(r.nnV) } else { "bottom" })
@@ -2287,7 +2316,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
     SCoalBox => match n.cbArm {
       "popOr" | "listGetOr" => "list"
       "nulRef" | "boxStash" => "box"
-      "litUnion" | "nulBool" | "boxFieldScalar" | "nulStr" | "nulBoolJoin" => "box"
+      "litUnion" | "nulBool" | "boxFieldScalar" | "nulStr" | "asProp" | "nulBoolJoin" => "box"
       "fieldBox" | "fieldVal" | "optLeaf" => "record"
       "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
@@ -2317,6 +2346,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       REqHelp |
       RHoleOptBox |
       RIdentityEq |
+      RIsStaged |
       RJoinNull |
       RLitArms |
       RNulNicheEq |

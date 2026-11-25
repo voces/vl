@@ -1,0 +1,3 @@
+## Infrastructure (Track F)
+
+- **`scripts/ir-i8-sweep.sh <keep-list>`, the I8 cutover as one re-runnable command:** in a throwaway tree it empties stage B minus the keep-list (`stub-reach.sh`), deletes what `dead-exports.vl --list` names and the module lets nothing reads, builds and refreshes to a fixpoint, and runs every population, reporting newly failing programs by the first stub they hit and IR needs (claims that fall back on a stub); `--grow` adds those needs to the keep-list. `scripts/ir-i8-census/keep.txt` starts from the CENSUS lane's 90 IR tails. Nothing is deleted from the checkout.

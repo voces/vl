@@ -534,9 +534,12 @@ import {
   TyArray,
   TyErr,
   TyFunc,
+  TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
+  TyPrim,
   TyUnion,
   TyVar,
   mkArrayTy,
@@ -546,6 +549,7 @@ import {
   mkNullableTy,
   mkObjTy,
   nestParentOf,
+  nomNameOfTy,
   objFieldType,
   tvSlotBound,
   tyArrayElemIx,
@@ -565,6 +569,7 @@ import {
   tyMentionsTyVarNamed,
   tyPinElem,
   tyPrintsAsRef,
+  tyReachesEmptyHole,
   tyRefusesArrayWrite,
   tySame,
   tyToStr,
@@ -1801,6 +1806,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
         const rAt = solvePlain(nNames, nTys, ix, sd, cfn.identName)
         rAt.kinds = 1 << SS_RET
         ifaceSolveAt(rAt, SS_RET, SS_RET)
+        const pN: string[] = []
+        const pT: i32[] = []
+        unboundCallPinsOf(n, sd, nNames, pN, pT)
+        if pN.length > 0 { retTy = nullForNeverArm(substTyDeep(retTy, pN, pT)) }
       }
     }
   }
@@ -2939,6 +2948,92 @@ function callFtyArgAssign(
       unboundDefaultNote(nodeTyIxOf(n.callFn), at),
     )
   }
+}
+
+// The open parameters of `names` that call `n` of declaration `d` fixes, into `outN`/`outT`: each
+// argument at a parameter naming one has a concrete type, so nothing later binds it. Each binds
+// `never`, no value having it, or the record a row slot only a `null` reaches stands for (D16377).
+function unboundCallPinsOf(
+  n: Call,
+  d: i32,
+  names: string[],
+  outN: string[],
+  outT: i32[],
+) {
+  const f = nodeAt(d)
+  if !(f is FuncDecl) { return 0 }
+  for tp in names {
+    if openParamArgsFixed(f, n, tp) {
+      const t = if elabNullOnlyTp(f, n, tp) { elabNullOnlyPin(d, strListIndexOf(f.fnTyParams, tp), tp) } else { TY_NEVER }
+      outN.push(tp)
+      outT.push(if t < 0 { TY_NEVER } else { t })
+    }
+  }
+  return 0
+}
+
+// Whether every argument of call `n` at a parameter of `f` naming `tp` has a type with no hole
+// and no type variable: a hole argument binds `tp` once its own call settles (D6500).
+function openParamArgsFixed(f: FuncDecl, n: Call, tp: string): boolean {
+  let i = 0
+  while i < f.fnParams.length {
+    const pt = nodeTyIxOf(f.fnParams[i])
+    if pt >= 0 && pt < T.tys.length && tyMentionsTyVarNamed(pt, tp) {
+      if i >= n.callArgs.length { return false }
+      const at = nodeTyIxOf(n.callArgs[i])
+      if at < 0 || at >= T.tys.length || tyHasHole(at) || tyHasTyVar(at) {
+        return false
+      }
+      if tyReachesEmptyHole(at) { return false }
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `ty` with each `X | null` whose `X` is `never` read as `null`, through lists, maps and records:
+// a call's result holds no value of the `never` arm. An instance keeps the arm (D3178).
+function nullForNeverArm(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const t = tyAt(ty)
+  return match t {
+    TyNullable => if t.nInner == TY_NEVER { TY_NULL } else { ty }
+    TyArray => {
+      const e = nullForNeverArm(tyElemOf(t))
+      if e == tyElemOf(t) { ty }
+      else if t.aRead == 1 { mkArrayViewTy(e) }
+      else { mkArrayTy(e) }
+    }
+    TyMap => {
+      const v = nullForNeverArm(tyValOf(t))
+      if v == tyValOf(t) { ty } else { mkMapTy(tyKeyOf(t), v, t.mSet) }
+    }
+    TyObj => nullForNeverFields(ty, t)
+    // A union, function or parameter keeps its `never` members, as the substitution leaves them.
+    TyUnion => ty
+    TyFunc => ty
+    TyVar => ty
+    TyPrim => ty
+    TyLit => ty
+    TyErr => ty
+    TyNeg => ty
+  }
+}
+
+// `nullForNeverArm` over record `t` at `ty`, a nominal record left as it is declared.
+function nullForNeverFields(ty: i32, t: TyObj): i32 {
+  if nomNameOfTy(ty) != "" { return ty }
+  const out: i32[] = []
+  let changed = false
+  for f in t.objFieldTypes {
+    const f2 = nullForNeverArm(f)
+    if f2 != f { changed = true }
+    out.push(f2)
+  }
+  if !changed { return ty }
+  const nn: string[] = []
+  for n in t.objFieldNames { nn.push(n) }
+  return mkObjTy(nn, out)
 }
 
 // A call of a generic that binds none of its type parameters is the instance at their default
