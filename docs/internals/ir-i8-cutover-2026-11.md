@@ -124,7 +124,7 @@ Run the sweep after coverage is complete and the prerequisites have landed, in o
 4. Build, refresh to a fixpoint, and run the full gate. A refusal anywhere in the five populations
    means coverage was not complete, and the cutover waits.
 
-`scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep.txt` runs steps 1 to 3 and step 4's build,
+`scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep` runs steps 1 to 3 and step 4's build,
 self-compile fixpoint and populations in a throwaway tree. It reports each newly failing program by
 the first stub it hits, and each claim that falls back on a stub as an IR need (`--grow` adds those
 to the keep-list). The keep-list holds the legacy tails the IR still calls, each with its reason.
@@ -172,7 +172,7 @@ only when the start body is unclaimed. Nothing reaches legacy through the door.
 
 | step | what | owner |
 |---|---|---|
-| keep | the 113 shared tails stay (`scripts/ir-i8-census/keep.txt`: the rehearsal's 109 plus 4 that COV-UNION's #10051 drew in); a later no-behaviour PR may move them to their own module | INFRA (the list), CENSUS (its growth) |
+| keep | the 113 shared tails stay (`scripts/ir-i8-census/keep/`, one file per function: the rehearsal's 109 plus 4 that COV-UNION's #10051 drew in); a later no-behaviour PR may move them to their own module | INFRA (the list), CENSUS (its growth) |
 | port | `emitStrValue` (47 programs, blocks the self-compile; first), `emitChainRead` (50), `rcReadSource` (309) | COV-CALL |
 | port | `arrLitDataElemEmit` (150), `emitListGetIdx` (58), `emitListGetRecv` (17), `pushMapRecvRef` (2), `emitIdxIndex` (1) | COV-CLOS |
 | port | `emitArmSiteAt` (22), `emitDelivered` (7), `emitCoerceAtomPayload` (3) | COV-IS |
@@ -184,6 +184,30 @@ only when the start body is unclaimed. Nothing reaches legacy through the door.
 
 The gate ratchets the set of causes, not the count: coverage moves a program from explained to
 unexplained when it claims the last unclaimed function beside a re-entry (coordinator ruling, 2026-11-25).
+
+**The static edges go to zero by hook** (coordinator ruling, 2026-11-25). Every edge from a kept
+function into stage B lies under one IR hook: the call where the claim path enters a legacy tail
+that takes an expression index. Porting the hook leaves its whole kept subtree unreached, so
+`dead-exports.vl` takes it and the keep list shrinks; the edge baseline only falls.
+
+| IR hook | edges under it (the causes among them) | owner |
+|---|---|---|
+| `armSite` → `emitArmSiteAt` → `emitUnionCoerce` | the union-coercion tree (`emitArmSiteAt`, `emitCoerceAtomPayload`, `pushMapRecvRef`) | COV-IS |
+| `structEq` → `nulStructEqGuardTail` | `emitChainRead`, `refListReadAt`, `emitIdxIndex`, `emitNulIsNullTest` | COV-UNION |
+| `lowerList` → `coerceTail` → `emitRecCopyInto` | `rcReadSource`, `emitRecCopyFields` | COV-CALL |
+| `hoistInRangeCopy` → `arrLitHoistGlobal` | `arrLitDataElemExpr`, `emitStrValue` | COV-CLOS, COV-CALL |
+| `coalListGetOr` → `listGetOrOpen` | `emitListGetIdx`, `emitListGetRecv` | COV-CLOS |
+| `emitConstCellInit` → `emitUnionBoxOwed` | `emitDelivered`, `emitUnionBoxArg` | COV-START |
+| `numCastTail` → `numExactCastTail` → `emitReturnValue` | none: unreachable, cut | INFRA |
+| `irFitTail` | `emitRecordFitIs`, `fitRecvRead` | INFRA |
+| `rhs` → `emitAsUnionTagged` → `emitAsOneListTail` | `emitListFitAt` | INFRA |
+| none (`structEqStage`, kept with no IR root) | its `emitExpr` call | INFRA (off the keep list) |
+
+**An edge the IR provably never takes may stay until I8** (coordinator ruling, 2026-11-25). A kept
+helper that legacy also calls, such as `fitRecvRead`'s `emitExpr` fallback, keeps its arm until the
+I8 PR deletes it. The edge goes in `scripts/ir-i8-census/edges-proven.txt` with its proof, and the
+target before I8 is zero unproven edges. Its guard is the sweep: `--check` reds when any program
+reaches a proven edge, so a broken proof surfaces in CI rather than at I8.
 
 A port makes the tail take an IR-lowered operand in place of its `emitExpr` call. The rehearsal
 found two more re-entries in its last keep round: `refListReadAt` (4) goes to COV-CLOS, which owns
