@@ -172,9 +172,9 @@ only when the start body is unclaimed. Nothing reaches legacy through the door.
 
 | step | what | owner |
 |---|---|---|
-| keep | the 109 shared tails stay (`scripts/ir-i8-census/keep.txt`); a later no-behaviour PR may move them to their own module | INFRA (the list), CENSUS (its growth) |
+| keep | the 113 shared tails stay (`scripts/ir-i8-census/keep.txt`: the rehearsal's 109 plus 4 that COV-UNION's #10051 drew in); a later no-behaviour PR may move them to their own module | INFRA (the list), CENSUS (its growth) |
 | port | `emitStrValue` (47 programs, blocks the self-compile; first), `emitChainRead` (50), `rcReadSource` (309) | COV-CALL |
-| port | `arrLitDataElemEmit` (150), `emitListGetIdx` (58), `emitListGetRecv` (17), `pushMapRecvRef` (2) | COV-CLOS |
+| port | `arrLitDataElemEmit` (150), `emitListGetIdx` (58), `emitListGetRecv` (17), `pushMapRecvRef` (2), `emitIdxIndex` (1) | COV-CLOS |
 | port | `emitArmSiteAt` (22), `emitDelivered` (7), `emitCoerceAtomPayload` (3) | COV-IS |
 | const | `emitConstCellInit`'s remaining `emitExpr` arm (8 programs) | COV-START |
 | latent | the 16 stubbed writers a kept tail calls that no population reaches: a probe or a static check each | INFRA |
