@@ -1,0 +1,3 @@
+## Infrastructure (Track F)
+
+- **The I8 PR's tooling:** `ir-i8-sweep.sh <keep> --apply` writes the swept tree (stage B minus the keep list emptied, what `dead-exports.vl` lists deleted, unread module lets gone) over `compiler/` and lists the stubs still called with their callers and the test, script or LSP code naming a deleted function; on master today it deletes 576 functions and 6 lets (about 16,000 lines in 27 files), the result builds, and 14 stubs and 8 code files remain. `scripts/ir-i8-rebaseline.sh` then takes every ratchet's new reading from a fixpoint seed in one step, refusing to write one that rose.

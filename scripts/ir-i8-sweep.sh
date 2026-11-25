@@ -4,6 +4,12 @@
 #     scripts/ir-i8-sweep.sh <keep-list> [--grow] [--pops self,distilled,cases,probes,witnesses]
 #                            [--out <dir>] [--max-iter N] [--check | --write-baseline]
 #     scripts/ir-i8-sweep.sh <keep-list> --edges [--check | --write-baseline]
+#     scripts/ir-i8-sweep.sh <keep-list> --apply [--out <dir>]
+#
+# --apply is the I8 PR's own step: (a) and (b) below with no sweep instrumentation, written over
+# compiler/ (an emptied module deleted, then fmt), with no build. It lists each stub still called
+# and its callers (<out>/apply-stubs.txt: the arms deleted by hand), and each test, script or LSP
+# file naming a deleted function (<out>/apply-code.txt); scripts/ir-i8-rebaseline.sh follows it.
 #
 # (a) stub-reach.sh's stage B, minus <keep-list>: the 14 entry points and every emitter function
 #     that calls an emptied one are emptied, each to `emitFail("i8 stub <name>")`
@@ -43,16 +49,15 @@
 # Writes <out>/report.txt (the summary and the stub table), <out>/failing.tsv (pop, program, stub),
 # <out>/fell.tsv (pop, program, a fallback reason new under the sweep), <out>/ir-stub-edges.txt,
 # <out>/needs.tsv (stub, programs), <out>/tree (the swept compiler/), <out>/compiler.wasm (built from it)
-# and <out>/deleted.txt. Exit 0
-# when no program newly fails, 1 when one does, 2 when the tree does not build. It deletes nothing
-# in the checkout. Run from the checkout root after scripts/refresh-compiler.sh; $VL names the
-# host, $JOBS the fan-out (default 4).
+# and <out>/deleted.txt. Exit 0 when no program newly fails, 1 when one does, 2 when the tree
+# does not build. Without --apply it deletes nothing in the checkout. Run from the checkout root
+# after scripts/refresh-compiler.sh; $VL names the host, $JOBS the fan-out (default 4).
 set -euo pipefail
 KEEP=${1:?usage: scripts/ir-i8-sweep.sh <keep-list> [--grow] [--pops LIST] [--out DIR] [--max-iter N]}
 shift
 PROVEN_FILE=${IR_I8_PROVEN:-scripts/ir-i8-census/edges-proven.txt}
 proven_edges() { [ -f "$PROVEN_FILE" ] && awk -F'\t' '!/^#/ && NF { print $1 "\t" $2 }' "$PROVEN_FILE" | sort -u || true; }
-EDGES=0 GROW=0 POPS=self,distilled,cases,probes,witnesses OUT=build/ir-i8-sweep MAXIT=30 RATCHET=""
+EDGES=0 APPLY=0 GROW=0 POPS=self,distilled,cases,probes,witnesses OUT=build/ir-i8-sweep MAXIT=30 RATCHET=""
 # The lists are one entry per file, so concurrent PRs add or delete a file rather than edit a
 # shared line: keep/<fn> holds its reason, causes/<slug> its cause, edges/<caller>--<callee> nothing.
 CAUSES_DIR=${IR_I8_SWEEP_BASELINE:-scripts/ir-i8-census/causes}
@@ -66,6 +71,7 @@ while [ $# -gt 0 ]; do
     --max-iter) MAXIT=${2:?}; shift 2 ;;
     --check|--write-baseline) RATCHET=$1; shift ;;
     --edges) EDGES=1; shift ;;
+    --apply) APPLY=1; shift ;;
     *) echo "ir-i8-sweep: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -126,10 +132,40 @@ ONE
 }
 
 # One run over keep-list $KEEP; sets RC.
+# --apply: the swept tree, without the sweep's tags and hit counters, written over compiler/. A
+# module left with no declaration goes. Then fmt, and the residue: each stub still called (its
+# callers are the arms the I8 PR deletes by hand) and each deleted name a file outside compiler/ names.
+apply_tree() {
+  local f n
+  cp "$T"/tree/compiler/*.vl compiler/
+  for f in compiler/*.vl; do
+    grep -qE '^(export|function|let|const|type|declare|extern)[ {*]' "$f" || { git rm -q "$f"; echo "apply: deleted empty module $f"; }
+  done
+  "$VL" fmt -w $(git diff --name-only -- 'compiler/*.vl') > /dev/null
+  cp "$OUT/deleted.txt" "$OUT/apply-deleted.txt"
+  echo "apply: $(grep -vc '	let ' "$OUT/deleted.txt") functions and $(grep -c '	let ' "$OUT/deleted.txt" || true) lets deleted; $(git diff --shortstat -- compiler/)"
+  grep -ohE 'emitFail\("i8 stub [A-Za-z0-9_]+"\)' compiler/*.vl | sed -E 's/.*i8 stub ([A-Za-z0-9_]+).*/\1/' | sort -u > "$T/left"
+  echo "apply: $(grep -c . "$T/left" || true) stubs still called (delete their callers' arms, or keep them):"
+  for n in $(cat "$T/left"); do
+    echo "  $n <- $(grep -lE "(^|[^A-Za-z0-9_.])$n\(" compiler/*.vl | xargs -r grep -hE "^(export )?function |(^|[^A-Za-z0-9_.])$n\(" | awk -v n="$n" '/^(export )?function /{ f = $0; sub(/^(export )?function /, "", f); sub(/[ (<].*/, "", f); next } f != n { print f }' | sort -u | paste -sd' ')"
+  done > "$OUT/apply-stubs.txt"
+  cat "$OUT/apply-stubs.txt"
+  cut -f2 "$OUT/deleted.txt" | sed 's/^let //' | sort -u > "$T/gonenames"
+  # Code that names one (a test, a script, the LSP) must change in the I8 PR; a case's comment,
+  # a census table or a doc only goes stale, so it is listed apart.
+  git grep -nwF -f "$T/gonenames" -- 'tests/*.ts' 'scripts/*.vl' 'scripts/*.sh' 'scripts/*.ts' 'lsp/*.ts' \
+    ':!scripts/ir-i8-census' ':!scripts/ir-i8-sweep.sh' ':!scripts/capability-probes' \
+    | awk '{ l = $0; sub(/^[^:]*:[^:]*:/, "", l) } l !~ /^[ \t]*(\/\/|#|\*)/' > "$OUT/apply-code.txt" || true
+  git grep -nwF -f "$T/gonenames" -- tests scripts lsp ':!*.ts' ':!scripts/*.vl' ':!scripts/*.sh' \
+    ':!scripts/ir-i8-census' > "$OUT/apply-mentions.txt" || true
+  echo "apply: $(cut -d: -f1 "$OUT/apply-code.txt" | sort -u | grep -c . || true) code files name a deleted function ($OUT/apply-code.txt); $(cut -d: -f1 "$OUT/apply-mentions.txt" | sort -u | grep -c . || true) other files mention one ($OUT/apply-mentions.txt)"
+  cut -d: -f1 "$OUT/apply-code.txt" | sort | uniq -c | sort -rn
+}
 run() {
   rm -rf "$T/tree" "$T/reach"
   STUB_KEEP="$KEEP" STUB_BODIES=scripts/ir-i8-census/stub-bodies.txt STUB_TREE="$T/tree" STUB_ONLY_B=1 \
     bash scripts/ir-i8-census/stub-reach.sh "$T/reach" | tee "$T/stage" >&2
+  if [ "$APPLY" = 0 ]; then
   # Re-entry tags: inside each kept function and the start and constant-cell writers, a call of
   # emitExpr or emitWidened becomes emitExprRe/emitWidenedRe naming its caller.
   { awk '!/^#/ && NF { print $1 }' "$KEEP"; printf '%s\n' emitStartGlobalInit emitStartGlobalInitValue emitConstCellInit; } > "$T/tagged"
@@ -205,6 +241,7 @@ VL
     END { if (!b || !c) { print "ir-i8-sweep: an i8 hit anchor in ir_build.vl was not found" > "/dev/stderr"; exit 1 } }' \
     "$T/tree/compiler/ir_build.vl" > "$T/f.new"
   { echo 'import { i8HitReset, i8HitTake } from "./emit_bytes"'; cat "$T/f.new"; } > "$T/tree/compiler/ir_build.vl"
+  fi
   # The static IR-to-stub edges: stubbed functions an ir*.vl file calls by name.
   grep -ohE 'emitFail\("i8 stub [A-Za-z0-9_]+"\)' "$T"/tree/compiler/*.vl | sed -E 's/.*i8 stub ([A-Za-z0-9_]+).*/\1/' | sort -u > "$T/stubs"
   grep -ohE '[A-Za-z_][A-Za-z0-9_]*\(' "$T"/tree/compiler/ir*.vl | tr -d '(' | sort -u | comm -12 - "$T/stubs" > "$OUT/ir-stub-edges.txt"
@@ -276,6 +313,7 @@ VL
     mv "$T/f.new" "$f"
   done
   rm -rf "$OUT/tree"; cp -r "$T/tree/compiler" "$OUT/tree"
+  if [ "$APPLY" = 1 ]; then apply_tree; exit 0; fi
   # (c) Build, then the self-compile to a fixpoint.
   if ! "$VL" build "$T/tree/compiler/entry.vl" -o "$T/b1.wasm" --compiler "$SEED" > "$T/build.log" 2>&1; then
     { cat "$T/stage"; echo "deleted: $(grep -vc '	let ' "$OUT/deleted.txt") functions, $lets lets"
@@ -399,7 +437,7 @@ if [ "$EDGES" = 1 ]; then
   echo "ir-i8-sweep: edges $(wc -l < "$OUT/edges.txt") ($np proven, $(( $(wc -l < "$OUT/edges.txt") - np )) unproven), none new: ok"; exit 0
 fi
 
-lists
+[ "$APPLY" = 1 ] || lists
 it=1
 while :; do
   run
