@@ -254,6 +254,7 @@ import {
   RResultPick,
   RRetNull,
   RRetag,
+  RSharedFieldSet,
   RSharedRead,
   RSimd,
   RSpread,
@@ -420,6 +421,7 @@ import {
   arrNewLenStash,
   arrNewPlanOf,
   arrNewTail,
+  asFailReport,
   asLitTail,
   asMapProbeTrapTail,
   asPropNicheHeapOf,
@@ -490,6 +492,7 @@ import {
   envCacheSlotOfFe,
   eqElemNullTestOk,
   eqHelpTail,
+  eqRouteOf,
   f64RemCallTail,
   f64RemOperandTail,
   fieldStoreArmOf,
@@ -533,6 +536,7 @@ import {
   holeOptBoxTail,
   hostCallTail,
   identListOverrideOf,
+  identityMixedTail,
   identityOperandTail,
   idxRowsOn,
   idxSpanOn,
@@ -672,6 +676,12 @@ import {
   sharedArmModeReads,
   sharedArmTail,
   sharedArmTestTail,
+  sharedFieldArmCast,
+  sharedFieldArmClose,
+  sharedFieldArmTest,
+  sharedFieldArmsEnd,
+  sharedFieldStorePlan,
+  sharedFieldValSlot,
   sharedReadPlainOf,
   sharedReadPlanOf,
   sharedReadStashes,
@@ -886,6 +896,7 @@ import {
 import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import {
+  identityArmSlot,
   ifLinkYieldsNull,
   isRecvStashHolds,
   isRecvStashSlot,
@@ -1524,6 +1535,7 @@ function rhs(r: Rhs, tail: boolean) {
     RVariantDiscrim => variantDiscrim(r)
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
+    RSharedFieldSet => irLMiss("shared field store value")
     RBoxNarrow => boxNarrow(r)
     RNicheRead => nicheRead(r)
     RArmUnbox => armUnbox(r)
@@ -1679,6 +1691,7 @@ function rawEff(n: SRawOp, pending: i32[], at: i32) {
     "reserve.open" => reserveOpen(n, at)
     "reserve.close" => listBuildClose(n.srImm)
     "sink.put" | "sink.null" | "sink.close" => sinkPairOp(n)
+    "as.fail" => asFailReport(n.srImm)
   }
   return 0
 }
@@ -2731,6 +2744,56 @@ function sharedRead(r: RSharedRead) {
   return 0
 }
 
+// `RSharedFieldSet`: legacy's shared field write. The receiver is staged once or pushed again per
+// arm, and the value staged once or written in its arm. Each arm but the last tests its tag; each
+// casts the payload to its variant and stores the value at its field.
+function sharedFieldSet(r: RSharedFieldSet) {
+  const fnIx = lw.irAt
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const plan = sharedFieldStorePlan(lhsOfAssign(r.shAt), fnIx, vis, fis)
+  if plan == 0 || r.shVs.length != (if plan == 1 { vis.length } else { 1 }) {
+    return irLMiss("shared field store plan")
+  }
+  const slot = if r.shStash { sharedFieldRecvSlot() } else { -1 }
+  if r.shStash {
+    irLOpnd(r.shR)
+    fbLocalSet(slot)
+  }
+  const vslot = if plan == 2 { sharedFieldValSlot(lhsOfAssign(r.shAt), fnIx, vis, fis) } else { -1 }
+  if plan == 2 {
+    irLOpnd(r.shVs[0])
+    fbLocalSet(vslot)
+  }
+  let i = 0
+  while i < vis.length {
+    if i < vis.length - 1 {
+      sharedFieldSetRecv(r, slot)
+      sharedFieldArmTest(vis, i)
+    }
+    sharedFieldSetRecv(r, slot)
+    sharedFieldArmCast(vis, i)
+    if plan == 2 { fbLocalGet(vslot) } else { irLOpnd(r.shVs[i]) }
+    sharedFieldArmClose(vis, fis, i)
+    i = i + 1
+  }
+  return sharedFieldArmsEnd(vis)
+}
+
+// One receiver push of shared field write `r`: its stash slot's box, its global's, else its box
+// local.
+function sharedFieldSetRecv(r: RSharedFieldSet, slot: i32) {
+  if r.shStash { return sharedRecvSlotGet(slot) }
+  if r.shGlobal >= 0 { return globalRead(r.shGlobal, r.shGlobalNonNull) }
+  return irLOpnd(r.shR)
+}
+
+// The target of assignment node `at`, or -1.
+function lhsOfAssign(at: i32): i32 {
+  const a = nodeAt(at)
+  return if a is BinExpr { unwrapParen(a.binLeft) } else { -1 }
+}
+
 // One member's arm of shared read `r`, in its form (`sharedArmModeOf`) as legacy writes it: the
 // head, the receiver where the form reads it, then the tail.
 function sharedReadArm(
@@ -3208,9 +3271,7 @@ function memAccess(r: RMemAccess) {
   if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length {
     return irLMiss("memory access node")
   }
-  const f = nodeAt(c.callFn)
-  if !(f is Ident) { return irLMiss("memory access node") }
-  const p = memAccessPlanOf(f.identName)
+  const p = memAccessPlanOf(r.mmName)
   const ap = irAddrPlan(c, p.mxBase)
   if (
     p.mxOp < 0
@@ -4563,12 +4624,18 @@ function closureEq(r: RClosureEq) {
 }
 
 // `RIdentityEq`: legacy's `emitIdentityBin`, each operand then its payload tail, `ref.eq`, and
-// `i32.eqz` for `!==`.
+// `i32.eqz` for `!==`; on the per-arm route, `emitIdentityMixed`'s staged compare.
 function identityEq(r: RIdentityEq) {
   const n = nodeAt(r.ieAt)
   if !(n is BinExpr) { return irLMiss("identity compare node") }
   irLOpnd(r.ieL)
   identityOperandTail(n.binLeft, lw.irAt)
+  if eqRouteOf(n, r.ieAt, lw.irAt) == "identMixed" {
+    fbLocalSet(identityArmSlot(0))
+    irLOpnd(r.ieR)
+    identityOperandTail(n.binRight, lw.irAt)
+    return identityMixedTail(n)
+  }
   irLOpnd(r.ieR)
   identityOperandTail(n.binRight, lw.irAt)
   fbRefEq()
@@ -5515,6 +5582,11 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       }
       if r is RMapClear {
         mapClear(r)
+        irLSettle(pending)
+        return 0
+      }
+      if r is RSharedFieldSet {
+        sharedFieldSet(r)
         irLSettle(pending)
         return 0
       }

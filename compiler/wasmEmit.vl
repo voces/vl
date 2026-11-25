@@ -13442,28 +13442,97 @@ function emitSharedFieldAssign(memIx: i32, valIx: i32, fnIx: i32) {
     fbLocalSet(vslot)
     let i = 0
     while i < vis.length {
-      const last = i == vis.length - 1
-      if !last {
-        if emitSharedFieldRecv(m.memObj, fnIx, rslot) < 0 { return -1 }
-        fbStructGet(uBoxIdx, 0) // field 0: tag
-        fbI32Rel(RS_TAG, uTags[vis[i]])
-        fbI32Bin(70)            // 0x46 i32.eq
-        fbIf(64)                // 0x40 void
-      }
-      if emitSharedFieldRecv(m.memObj, fnIx, rslot) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-      fbRefCast(variantHeap(vis[i]))
+      if sharedFieldArmOpen(m.memObj, fnIx, rslot, vis, i) < 0 { return -1 }
       fbLocalGet(vslot)
-      fbStructSet(variantHeap(vis[i]), fis[i])
-      if !last { fbElse() }
+      sharedFieldArmClose(vis, fis, i)
       i = i + 1
     }
-    let e = 0
-    while e < vis.length - 1 {
-      fbEnd()
-      e = e + 1
-    }
+    sharedFieldArmsEnd(vis)
     return 1
+  }
+  return 0
+}
+
+// The shared field write's plan for field store `memIx` (`sharedFieldAssignPlanOf`), its members'
+// variant rows into `vis` and field indices into `fis`: 0 none, 1 a value per arm, 2 one value.
+export function sharedFieldStorePlan(
+  memIx: i32,
+  fnIx: i32,
+  vis: i32[],
+  fis: i32[],
+): i32 {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return 0 }
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, vis, fis)
+  return sharedFieldAssignPlanOf(code, vis, fis)
+}
+
+// The one-value plan's staging slot for field store `memIx` (`sharedFieldStorePlan` 2), which its
+// arms read the value from.
+export function sharedFieldValSlot(
+  memIx: i32,
+  fnIx: i32,
+  vis: i32[],
+  fis: i32[],
+): i32 {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return -1 }
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, [], [])
+  return objOrderStashSlot(
+    variantFieldStorageKind(vis[0], fis[0]),
+    code,
+    uFieldStorageSlot(vis[0], fis[0]),
+  )
+}
+
+// Arm `i` of a shared field write over receiver `recvIx` (staged in `rslot`, or -1 to re-read it):
+// all but the last test the box's tag, then each casts the payload to its variant. The arm's value
+// and `sharedFieldArmClose` follow.
+function sharedFieldArmOpen(
+  recvIx: i32,
+  fnIx: i32,
+  rslot: i32,
+  vis: i32[],
+  i: i32,
+): i32 {
+  if i < vis.length - 1 {
+    if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
+    sharedFieldArmTest(vis, i)
+  }
+  if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
+  return sharedFieldArmCast(vis, i)
+}
+
+// After a shared field write's receiver box: the test of arm `i`'s tag, opening its `if`. Legacy
+// and the IR share it, as they share `sharedFieldArmCast` and `sharedFieldArmClose`.
+export function sharedFieldArmTest(vis: i32[], i: i32) {
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Rel(RS_TAG, uTags[vis[i]])
+  fbI32Bin(70)            // 0x46 i32.eq
+  fbIf(64)                // 0x40 void
+  return 0
+}
+
+// After a shared field write's receiver box: its payload cast to arm `i`'s variant.
+export function sharedFieldArmCast(vis: i32[], i: i32) {
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(variantHeap(vis[i]))
+  return 0
+}
+
+// After arm `i`'s value: its store, and the `else` to the next arm.
+export function sharedFieldArmClose(vis: i32[], fis: i32[], i: i32) {
+  fbStructSet(variantHeap(vis[i]), fis[i])
+  if i < vis.length - 1 { fbElse() }
+  return 0
+}
+
+// After the last arm: the `end` of each tag test.
+export function sharedFieldArmsEnd(vis: i32[]) {
+  let e = 0
+  while e < vis.length - 1 {
+    fbEnd()
+    e = e + 1
   }
   return 0
 }
@@ -13483,27 +13552,12 @@ function emitSharedFieldAssignPerArm(
   fbLocalSet(rslot)
   let i = 0
   while i < vis.length {
-    const last = i == vis.length - 1
-    if !last {
-      if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 0) // field 0: tag
-      fbI32Rel(RS_TAG, uTags[vis[i]])
-      fbI32Bin(70)            // 0x46 i32.eq
-      fbIf(64)                // 0x40 void
-    }
-    if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(variantHeap(vis[i]))
+    if sharedFieldArmOpen(recvIx, fnIx, rslot, vis, i) < 0 { return -1 }
     if emitVariantFieldValue(vis[i], fis[i], valIx, fnIx) < 0 { return -1 }
-    fbStructSet(variantHeap(vis[i]), fis[i])
-    if !last { fbElse() }
+    sharedFieldArmClose(vis, fis, i)
     i = i + 1
   }
-  let e = 0
-  while e < vis.length - 1 {
-    fbEnd()
-    e = e + 1
-  }
+  sharedFieldArmsEnd(vis)
   return 1
 }
 
@@ -26061,6 +26115,11 @@ function emitNumExactConvert(src: string, tgt: string) {
 // The `as!` trap's reason, `as! <tgt> at <line>:<col>: not exact`, printed by the one
 // `__as_fail__` body from the site's place and the domain's row, so a site costs one call
 // (SP-056). Line 0 names no place. The caller emits the trap itself.
+// `as!` cast `exprIx`'s failure report over its domain, ahead of its trap (`emitNumCastTrapMsg`).
+export function asFailReport(exprIx: i32): i32 {
+  return emitNumCastTrapMsg(exprIx, asExprNumCastDomain(exprIx))
+}
+
 function emitNumCastTrapMsg(exprIx: i32, tgt: string) {
   if gHelpAsFail < 0 || gImports < 4 {
     return emitFail(
@@ -26304,7 +26363,7 @@ function emitHoleNumCastMiss(e: AsExpr, exprIx: i32, fnIx: i32) {
   if emitExpr(e.asObj, fnIx) < 0 { return -1 }
   fbDrop()
   if e.asMode == "trap" {
-    if emitNumCastTrapMsg(exprIx, asExprNumCastDomain(exprIx)) < 0 { return -1 }
+    if asFailReport(exprIx) < 0 { return -1 }
     fbUnreachable()
     return 0
   }
@@ -28400,13 +28459,18 @@ function zextLoadMasked(x: i32, fnIx: i32): i32 {
 
 // Lowers the expression `zextLoadOf` matched to its one zero-extending i64 load of `callIx`'s
 // width, the call's own address and memarg offset kept.
+// The `_i64` load intrinsic a zero-extending fold over load call `callIx` writes.
+export function zextLoadName(callIx: i32): string {
+  const w = zextLoadWidth(identCalleeAt(callIx))
+  if w == 8 { return "__load_u8_i64__" }
+  if w == 16 { return "__load_u16_i64__" }
+  return "__load_u32_i64__"
+}
+
 function emitZextLoad(callIx: i32, fnIx: i32) {
   const c = nodeAt(callIx)
   if c is Call {
-    const w = zextLoadWidth(identCalleeAt(callIx))
-    let nm = "__load_u32_i64__"
-    if w == 8 { nm = "__load_u8_i64__" }
-    if w == 16 { nm = "__load_u16_i64__" }
+    const nm = zextLoadName(callIx)
     const off = emitMemAddr(c, 1, fnIx, nm)
     if off < 0 { return -1 }
     fbMemAccess(memLoadOpcode(nm), memLoadAlignExp(nm), off)
@@ -44445,11 +44509,17 @@ export function identityOperandUnboxes(ix: i32, fnIx: i32): boolean {
 // as an `eqref`; two closures compare by declaration and environment, anything else by
 // `ref.eq`, which already holds a record against a function, or either against `null`, apart.
 function emitIdentityMixed(e: BinExpr, fnIx: i32) {
+  if emitIdentityOperand(e.binLeft, fnIx) < 0 { return -1 }
+  fbLocalSet(identityArmSlot(0))
+  if emitIdentityOperand(e.binRight, fnIx) < 0 { return -1 }
+  return identityMixedTail(e)
+}
+
+// After a per-arm identity's left payload is staged and its right payload is on the stack: the
+// compare `emitIdentityMixed` writes. Legacy and the IR share it.
+export function identityMixedTail(e: BinExpr) {
   const a = identityArmSlot(0)
   const b = identityArmSlot(1)
-  if emitIdentityOperand(e.binLeft, fnIx) < 0 { return -1 }
-  fbLocalSet(a)
-  if emitIdentityOperand(e.binRight, fnIx) < 0 { return -1 }
   fbLocalSet(b)
   fbLocalGet(a)
   fbRefTest(cloStructIdx)
