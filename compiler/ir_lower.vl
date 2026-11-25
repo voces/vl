@@ -393,7 +393,16 @@ import {
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
+  arrLitChunkClose,
+  arrLitChunkOpen,
+  arrLitChunkPlanOf,
+  arrLitChunkStep,
+  arrLitDataClose,
+  arrLitDataOpen,
+  arrLitDataStoreAt,
+  arrLitDataStoreEnd,
   arrLitDataTry,
+  arrLitElemIsConst,
   arrLitHoistGlobal,
   arrLitIsForIter,
   arrLitLongRouteOf,
@@ -402,9 +411,6 @@ import {
   arrLitRefShortTail,
   arrLitShortTail,
   arrLitShortWhy,
-  arrLitStrChunkClose,
-  arrLitStrChunkOpen,
-  arrLitStrChunkStep,
   arrNewDefaultTail,
   arrNewFillStep,
   arrNewLenStash,
@@ -878,12 +884,7 @@ import {
   unionLitIsStashSlot,
   widenTmpSlot,
 } from "./emit_if_arm_values"
-import {
-  ArrLitArm,
-  allocLitChunk,
-  forInLoopAt,
-  forInPairSlotOf,
-} from "./emit_plan_list"
+import { ArrLitArm, forInLoopAt, forInPairSlotOf } from "./emit_plan_list"
 import {
   ListKind,
   bankSpanRow,
@@ -3266,16 +3267,16 @@ function makeList(r: RMakeList) {
   }
   // A long literal of constants is legacy's data segment, built from the AST's own literals: the
   // operands, immediates the builder held it to, are left unwritten.
+  const la = if r.mlAt >= 0 && r.mlAt < P.nodes.length { nodeAt(r.mlAt) } else { null }
   if (
     arm != "ref"
     && arm != "str"
     && arrLitShortWhy(r.mlAt, fnIx, arm, r.mlElems.length) == "long"
+    && !(la is ArrayLit
+      && arrLitLongRouteOf(la.arrElems, fnIx, arm, lb.lbSlot) != "dataConst")
   ) {
-    if r.mlAt < 0 || r.mlAt >= P.nodes.length {
-      return irLMiss("array long node")
-    }
-    const a = nodeAt(r.mlAt)
-    if !(a is ArrayLit) { return irLMiss("array long node") }
+    if !(la is ArrayLit) { return irLMiss("array long node") }
+    const a = la
     for e in r.mlElems {
       if !(e is OImm) { return irLMiss("array long element") }
     }
@@ -3292,21 +3293,46 @@ function makeList(r: RMakeList) {
     }
     return 0
   }
-  // A string list past the operand cap builds in chunks, as `emitArrStr` does: opened before its
-  // elements, each element then the chunk's flush.
-  if arm == "str" && r.mlElems.length > allocLitChunk() {
-    for e in r.mlElems {
-      if !(e is OImm || e is OStr) { return irLMiss("long list element") }
+  // A long literal with computed elements is the segment of its constants, each computed element
+  // then stored into it in source order (`arrLitDataOpen`); a constant's immediate is unwritten.
+  if (
+    la is ArrayLit
+    && arm != "ref"
+    && arm != "str"
+    && arrLitShortWhy(r.mlAt, fnIx, arm, r.mlElems.length) == "long"
+    && arrLitLongRouteOf(la.arrElems, fnIx, arm, lb.lbSlot) == "dataComputed"
+  ) {
+    if la.arrElems.length != r.mlElems.length {
+      return irLMiss("array long element")
     }
-    const dst = arrLitStrChunkOpen(r.mlElems.length)
+    const dst = arrLitDataOpen(la.arrElems, fnIx, arm, lb.lbSlot)
+    if dst < 0 { return irLMiss("array long data") }
+    let i = 0
+    while i < r.mlElems.length {
+      if arrLitElemIsConst(la.arrElems[i]) {
+        irLSkip(r.mlElems[i])
+      } else {
+        arrLitDataStoreAt(dst, i)
+        irLOpnd(r.mlElems[i])
+        arrLitDataStoreEnd(arm, lb.lbSlot)
+      }
+      i = i + 1
+    }
+    return arrLitDataClose(dst, r.mlElems.length, arm, lb.lbSlot)
+  }
+  // A literal past its arm's chunk size builds in chunks, as the arm's legacy writer does
+  // (`arrLitChunkPlanOf`): opened before its elements, each element then the chunk's flush.
+  const cp = if arm != "ref" { arrLitChunkPlanOf(arm, lb.lbSlot) } else { null }
+  if cp != null && r.mlElems.length > cp.acMax {
+    const dst = arrLitChunkOpen(cp, arm, r.mlElems.length)
     let coff = 0
     let i = 0
     for e in r.mlElems {
       irLOpnd(e)
       i = i + 1
-      coff = arrLitStrChunkStep(dst, coff, i, r.mlElems.length)
+      coff = arrLitChunkStep(cp, dst, coff, i, r.mlElems.length)
     }
-    return arrLitStrChunkClose(dst, r.mlElems.length)
+    return arrLitChunkClose(cp, dst, r.mlElems.length)
   }
   for e in r.mlElems { irLOpnd(e) }
   if arm == "ref" {

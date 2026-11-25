@@ -14657,7 +14657,8 @@ function emitArrStr(arrIx: i32, elems: i32[], fnIx: i32) {
     fbGlobalGet(hStr)
     return 0
   }
-  const dstStr = arrLitStrChunkOpen(elems.length)
+  const cpStr = strChunkPlan()
+  const dstStr = arrLitChunkOpen(cpStr, "str", elems.length)
   let coffStr = 0
   let i = 0
   while i < elems.length {
@@ -14671,33 +14672,99 @@ function emitArrStr(arrIx: i32, elems: i32[], fnIx: i32) {
     // falls through to the first element's type only when no context rule fires.
     if emitStrValue(elems[i], fnIx) < 0 { return -1 }
     i = i + 1
-    coffStr = arrLitStrChunkStep(dstStr, coffStr, i, elems.length)
+    coffStr = arrLitChunkStep(cpStr, dstStr, coffStr, i, elems.length)
   }
-  if dstStr >= 0 { return arrLitStrChunkClose(dstStr, elems.length) }
+  if dstStr >= 0 { return arrLitChunkClose(cpStr, dstStr, elems.length) }
   return arrLitShortTail("str", elems.length)
 }
 
-// A string-list literal of `n` elements past the operand cap (`allocLitChunk`) opens its chunked
-// build here, before its first element, and returns the destination slot; -1, writing nothing,
-// for a literal short enough for one `array.new_fixed`.
-export function arrLitStrChunkOpen(n: i32): i32 {
-  if n <= allocLitChunk() { return -1 }
-  return arrLitChunkStart("strlist", 0, mkArrTy(), n, false)
+// A long list literal's chunked build at arm `arm` (`slot` its packed row or ref-list slot): the
+// backing, wrapper and chunk size its legacy arm builds with. Elements are the caller's, written
+// between the open and each step, so any element writer builds on it. Null for an arm that has
+// no chunked build.
+export type ArrChunkPlan = {
+  acSlot: i32,
+  acBack: i32,
+  acWrap: i32,
+  acMax: i32,
 }
 
-// After element `i` of `n` of an open string-list chunk at `dst` (`coff` the chunk's first
-// element): the chunk closed and the next opened where it is full. Returns the new start; a `dst`
-// of -1 writes nothing.
-export function arrLitStrChunkStep(dst: i32, coff: i32, i: i32, n: i32): i32 {
+export function arrLitChunkPlanOf(
+  arm: ArrLitArm,
+  slot: i32,
+): ArrChunkPlan | null {
+  return match arm {
+    "i32" => { acSlot: 0, acBack: aTy(), acWrap: lTy(), acMax: NEW_FIXED_MAX }
+    "f32" => { acSlot: 0, acBack: fa32Ty(), acWrap: fl32Ty(), acMax: NEW_FIXED_MAX }
+    "f64" => { acSlot: 0, acBack: fa64Ty(), acWrap: fl64Ty(), acMax: NEW_FIXED_MAX }
+    "i64" => { acSlot: 0, acBack: ia64Ty(), acWrap: il64Ty(), acMax: NEW_FIXED_MAX }
+    "u8" => {
+      acSlot: slot,
+      acBack: pkBackAt(slot),
+      acWrap: pkWrapAt(slot),
+      acMax: NEW_FIXED_MAX,
+    }
+    "v128" => { acSlot: 0, acBack: fa128Ty(), acWrap: fl128Ty(), acMax: NEW_FIXED_MAX }
+    "str" => strChunkPlan()
+    "ref" => if slot >= 0 && slot < rlBackIdx.length { {
+      acSlot: slot,
+      acBack: rlBackIdx[slot],
+      acWrap: rlWrapIdx[slot],
+      acMax: allocLitChunk(),
+    } } else { null }
+    "notLit" | "spread" | "clash" | "emptyHole" => null
+  }
+}
+
+// Arm `arm`'s lazy-frame list kind for its chunked build's scratch slot.
+function chunkKindOf(arm: ArrLitArm): ListKind {
+  return match arm {
+    "u8" => "u8list"
+    "f32" => "f32list"
+    "f64" => "f64list"
+    "i64" => "i64list"
+    "v128" => "v128list"
+    "str" => "strlist"
+    "ref" => "reflist"
+    "i32" | "notLit" | "spread" | "clash" | "emptyHole" => "list"
+  }
+}
+
+// The string arm's chunk plan, chunked at the allocation cap (`allocLitChunk`).
+function strChunkPlan(): ArrChunkPlan {
+  return {
+    acSlot: 0,
+    acBack: mkArrTy(),
+    acWrap: mkListTy(),
+    acMax: allocLitChunk(),
+  }
+}
+
+// Opens plan `p`'s chunked build of `n` elements at arm `arm`, before the first; the destination slot, or -1,
+// writing nothing, where `n` fits one `array.new_fixed`.
+export function arrLitChunkOpen(p: ArrChunkPlan, arm: ArrLitArm, n: i32): i32 {
+  if n <= p.acMax { return -1 }
+  return arrLitChunkStart(chunkKindOf(arm), p.acSlot, p.acBack, n, false)
+}
+
+// After element `i` of `n` of plan `p`'s build at `dst` (`coff` the open chunk's first element):
+// the chunk flushed and the next opened where it is full. The new start; -1 `dst` writes nothing.
+export function arrLitChunkStep(
+  p: ArrChunkPlan,
+  dst: i32,
+  coff: i32,
+  i: i32,
+  n: i32,
+): i32 {
   if dst < 0 { return coff }
-  return arrLitChunkFlushAt(dst, mkArrTy(), coff, i, n, allocLitChunk())
+  return arrLitChunkFlushAt(dst, p.acBack, coff, i, n, p.acMax)
 }
 
-// The chunk-built string list at `dst` of `n` elements, wrapped.
-export function arrLitStrChunkClose(dst: i32, n: i32): i32 {
+// Plan `p`'s chunk-built list at `dst` of `n` elements, wrapped.
+export function arrLitChunkClose(p: ArrChunkPlan, dst: i32, n: i32): i32 {
   fbLocalGet(dst)
   fbRefAsNonNull() // the chunk-built backing
-  return arrLitLenCap(n, mkListTy())
+  return arrLitLenCap(n, p.acWrap)
 }
 
 // The ref-list arm of `emitArrUnder`: the element slot comes from a threaded annotation, else
@@ -18024,18 +18091,50 @@ export function arrLitDataTry(
 // whatever its length (D3417). Returns 1 when the backing is on the stack, 0 when some element
 // is not one constant instruction (nothing emitted), -1 when an element fails to lower.
 function arrLitDataBuild(elems: i32[], fnIx: i32, form: i32, backTy: i32): i32 {
+  const computed = arrLitDataComputed(elems, fnIx, form)
+  if computed == null { return 0 }
+  const d = arrLitDataSegWrite(elems, fnIx, form, backTy, computed)
+  if d <= 0 || computed.length == 0 { return d }
+  // The computed elements are stored after the segment builds the backing, in source order,
+  // so a literal of any length with some computed elements stays a few bytes per such element.
+  const dst = arrLitDataHold(form)
+  for at in computed {
+    arrLitDataStoreAt(dst, at)
+    if arrLitDataElemEmit(elems[at], fnIx, form) < 0 { return -1 }
+    fbArraySet(backTy)
+  }
+  fbLocalGet(dst)
+  fbRefAsNonNull()
+  return 1
+}
+
+// The indices of long literal `elems`' computed elements at data form `form`, in source order;
+// null where one neither is a constant nor stores after the segment (`arrLitDataStores`).
+function arrLitDataComputed(elems: i32[], fnIx: i32, form: i32): i32[] | null {
   const computed: i32[] = []
   let i = 0
   while i < elems.length {
     if !arrLitElemIsConst(elems[i]) {
-      if !arrLitDataStores(elems[i], fnIx, form) { return 0 }
+      if !arrLitDataStores(elems[i], fnIx, form) { return null }
       computed.push(i)
     }
     i = i + 1
   }
+  return computed
+}
+
+// The backing of `elems` at `form` from one data segment, each `computed` element's slot zero:
+// 1 on the stack, 0 where some constant is not one instruction (nothing written), -1 on failure.
+function arrLitDataSegWrite(
+  elems: i32[],
+  fnIx: i32,
+  form: i32,
+  backTy: i32,
+  computed: i32[],
+): i32 {
   const parts: { b: u8[] }[] = [{ b: [] }]
   let n = 0
-  i = 0
+  let i = 0
   let ci = 0
   while i < elems.length {
     if parts[parts.length - 1].b.length >= LIT_PART { parts.push({ b: [] }) }
@@ -18059,23 +18158,66 @@ function arrLitDataBuild(elems: i32[], fnIx: i32, form: i32, backTy: i32): i32 {
   fbI32Const(0)            // segment offset
   fbI32Const(elems.length) // element count
   fbArrayNewData(backTy, seg)
-  if computed.length == 0 { return 1 }
-  // The computed elements are stored after the segment builds the backing, in source order,
-  // so a literal of any length with some computed elements stays a few bytes per such element.
+  return 1
+}
+
+// The segment-built backing on the stack, held in a fresh scratch slot of form `form`'s list kind,
+// which it returns.
+function arrLitDataHold(form: i32): i32 {
   liKinds.push(arrLitDataKind(form))
   liSlots.push(0)
   liBack.push(1)
   const dst = listIdxScratchBase + liKinds.length
   fbLocalSet(dst)
-  for at in computed {
-    fbLocalGet(dst)
-    fbI32Const(at)
-    if arrLitDataElemEmit(elems[at], fnIx, form) < 0 { return -1 }
-    fbArraySet(backTy)
+  return dst
+}
+
+// A long literal with computed elements (route `dataComputed`) built as `arrLitDataTry` builds
+// it, its elements the caller's: `arrLitDataOpen` writes the segment and holds it, then each
+// computed element is stored (`arrLitDataStoreAt`, the element at the arm's width,
+// `arrLitDataStoreEnd`), then `arrLitDataClose`. The open's slot, or -1 where it writes nothing.
+export function arrLitDataOpen(
+  elems: i32[],
+  fnIx: i32,
+  arm: ArrLitArm,
+  row: i32,
+): i32 {
+  const form = arrLitDataFormOf(arm, row)
+  if form < 0 { return -1 }
+  const computed = arrLitDataComputed(elems, fnIx, form)
+  if computed == null || computed.length == 0 { return -1 }
+  if (
+    arrLitDataSegWrite(elems, fnIx, form, arrLitDataBackOf(arm, row), computed)
+    <= 0
+  ) {
+    return -1
   }
+  return arrLitDataHold(form)
+}
+
+// The head of the store of element `at` into the held backing `dst`; the element follows.
+export function arrLitDataStoreAt(dst: i32, at: i32): i32 {
+  fbLocalGet(dst)
+  fbI32Const(at)
+  return 0
+}
+
+// The store of an element at arm `arm` (row `row`) into its held backing.
+export function arrLitDataStoreEnd(arm: ArrLitArm, row: i32): i32 {
+  fbArraySet(arrLitDataBackOf(arm, row))
+  return 0
+}
+
+// The held backing `dst` of `n` elements, wrapped at arm `arm` (row `row`).
+export function arrLitDataClose(
+  dst: i32,
+  n: i32,
+  arm: ArrLitArm,
+  row: i32,
+): i32 {
   fbLocalGet(dst)
   fbRefAsNonNull()
-  return 1
+  return arrLitWrap(n, arrLitDataWrapOf(arm, row))
 }
 
 // The data segment holding the `n` bytes of `parts`: the one a literal of the same bytes already
@@ -18339,7 +18481,7 @@ function arrLitWrap(n: i32, wrapTy: i32): i32 {
 }
 
 // Whether element `ix` is a number literal, a negated one, or a boolean literal, in parens or not.
-function arrLitElemIsConst(ix: i32): boolean {
+export function arrLitElemIsConst(ix: i32): boolean {
   const x = unwrapParen(ix)
   if x < 0 || x >= P.nodes.length { return false }
   const e = nodeAt(x)
