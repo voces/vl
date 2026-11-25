@@ -1,4 +1,4 @@
-# I8a: twin-row record lists in a const cell (2026-11-25, lane COV-START)
+# I8a: the last const cell fallbacks, twin-row lists and nested-union literals (2026-11-25, lane COV-START)
 
 After #10053, 7 programs still sent a const cell to legacy's `emitExpr` (armed shadow, all 27,421
 programs). Five of them hold a list literal of struct literals beside two declared records of one
@@ -38,13 +38,25 @@ Same probe and program lists on both sides:
 | tests/cases start bodies claimed | 7,711 | 7,712 |
 | armed shadow mismatch, fail and fallback rows | 25 | 25, the same rows |
 
-## Left
+## The last two: a literal no union arm names (box ladder)
 
-`box ladder`, 2 programs:
-- `objects/record-literal-in-binding-wider-than-field-arm.vl`
-- `unions/nested-union-arm-literal.vl`
+`const x: Parsed = { kind: "rect", w: 3.0, h: 1.0 }` with `type Parsed = Shape | ParseError`, and
+D15094's literal with a field its arm drops.
+- `Parsed`'s union row lists only its direct variant: the nested `Shape`'s arms are in `Shape`'s
+  row. So `unionArmVariantForObj` finds no arm, and the shared box plan (`holeBoxPlanOf`) fell to
+  `ladder`.
+- Legacy's next rung, `emitUnionCoerceRecord`, boxes the literal as the variant its context names
+  (`objVariantRowCtx`, through `emitUnionBox` = `emitUnionBoxAs`). The plan's `obj` arm now takes
+  that row, so the IR builds it. Legacy reads the same plan, and its `obj` arm is `emitUnionBoxAs`
+  too: master's claimless build against the head's, over 359 union and object programs, differs
+  in 0.
+- Function bodies of the same shape are claimed with it.
 
-In both, a literal with no variant of its own goes into a union whose arm is itself a union.
-`holeBoxPlanOf`'s `obj` rung (`unionArmVariantForObj`) finds no arm there, since it does not
-flatten the nested union, so the plan falls to the ladder (rung 6). Function bodies with the same
-shape miss identically.
+| reading | twin-row head | head |
+|---|---:|---:|
+| programs with a const cell miss | 2 | 0 |
+| tests/cases distinct functions claimed | 44,290 | 44,296 |
+| witnesses distinct functions claimed | 11,461 | 11,463 |
+| armed shadow mismatch, fail and fallback rows | 25 | 25, the same rows |
+
+No const cell falls back to legacy's `emitExpr` on any of the 27,421 programs.
