@@ -381,7 +381,7 @@ run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh
 # `--self-test` first: the grader's outcome vocabulary and its `Want:` output rule are each
 # seen to fire on specimens before the rows are graded by them. The grader is the VL port;
 # the Python stays beside it, and tests/vl_check_filed_witnesses_test.ts holds them equal.
-run "filed witnesses"          bash -c "\"$VL\" run scripts/check-filed-witnesses.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/check-filed-witnesses.vl --compiler \"$SEED\" -- --strict docs/internals/inventory docs/internals/inventory-2"
+run "filed witnesses"          bash -c "\"$VL\" run scripts/check-filed-witnesses.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/check-filed-witnesses.vl --compiler \"$SEED\" -- --strict --gate docs/internals/inventory docs/internals/inventory-2"
 # THE OTHER HALF: a row that stopped EXISTING. #2405 resolved a conflict in the inventory's
 # tail and deleted a ROW, with its citations left standing, and every gate was green —
 # the instruments above all read the rows that are there. ~0.2s, and it also runs inside
