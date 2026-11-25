@@ -34,6 +34,10 @@ through legacy's `armSiteWrite` → `emitArmSiteAt`, whose per-arm read is `emit
     as legacy does.
 - **Rows**: the chain banks one element-read row. An element-read receiver, read as an arm's
   payload, banks its own row, as legacy's `emitIndexBanked` does over the overridden read.
+- **Read-rep memo**: `readRepOf`'s memo is keyed by node and function, not by the per-arm override.
+  An answer recorded inside an arm made the box read as the arm's list after it: the order check
+  found a build after legacy missing `index none` where the build before claimed. Entering and
+  leaving an arm (`armSiteArmEnter`/`Leave`, `irBArmSiteArm`) advances the memo.
 - **Legacy**:
   - `armSiteWrite`'s operand state (`armIdxNode`/`Local`/`Imm`, `emitArmIdx`, `ARM_IDX_*`) existed
     only for the IR, so it is removed, and `armSiteWrite` is private again. `emitIdxIndex` stays a
@@ -70,3 +74,15 @@ Position sweeps (Q58): `unions/arm-site-hoisted-index-positions.vl` and
 `unions/arm-site-narrowed-receiver-positions.vl` already deliver the read at a scalar and a union
 argument, a nested call, a concat, an interpolation, a return, a `let`, an `if` arm, a `??` and a
 record field. `arrays/is-list-arm-read-at-numeric-literal-set.vl` covers the literal-set arms.
+
+## The I8 sweep (`scripts/ir-i8-sweep.sh`, every population, `--grow`)
+
+- `keep.txt` loses 19 tails only the arm-site re-entry reached: `armSiteWrite`, `emitArmSiteAt`,
+  the `emitUnionCoerce` family, `emitCoerceAtomPayload`, and the map-key writers through
+  `pushMapRecvRef`. `--grow` re-added none of them. It added `arrLitDataElemExpr` (ir-tail) and
+  `emitInstMapReadIsNull` (ir-sentinel).
+- Causes go from 14 to 11: `reentry emitArmSiteAt`, `reentry emitCoerceAtomPayload` and
+  `reentry pushMapRecvRef` leave. `reentry arrLitDataElemEmit` is now spelled
+  `reentry arrLitDataElemExpr`: #10058 moved that re-entry into the new function, so it is the
+  same cause.
+- Static edges go from 55 to 33.
