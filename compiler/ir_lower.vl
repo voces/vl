@@ -92,6 +92,7 @@ import {
   i32ToStr,
   nodeAt,
   nodeChildren,
+  spreadArgOf,
 } from "./ast"
 import {
   isRecvStagedIx,
@@ -646,6 +647,8 @@ import {
   simdMemTail,
   simdRowIsMem,
   simdTail,
+  spreadBoxedGroupTail,
+  spreadGroupSlotAt,
   spreadGroupStash,
   spreadJoinGroups,
   stageListRecvTail,
@@ -852,6 +855,7 @@ import {
   forInPairSlotOf,
 } from "./emit_plan_list"
 import {
+  ListKind,
   bankSpanRow,
   bankedRowsDrop,
   callRefDepth,
@@ -3302,6 +3306,7 @@ function spreadList(r: RSpread) {
   const fnIx = lw.irAt
   const lb: ListBuild = { lbKind: r.spKind, lbSlot: r.spSlot }
   arrLitPrologue(r.spAt)
+  if r.spBoxRow >= 0 { return spreadBoxedList(r, fnIx) }
   const p = spreadPlanOf(r.spAt, fnIx, lb)
   if p.spWhy != "" || p.spSrcs.length != r.spSrcs.length {
     return irLMiss("spread plan")
@@ -3331,6 +3336,39 @@ function spreadList(r: RSpread) {
     p.spRow,
     seq,
   )
+}
+
+// `RSpread` along legacy's boxing arm: each group's list brought to the union-box row by
+// `spreadBoxedGroupTail` and stashed, then the join, as `emitArrSpreadBoxed` writes them.
+function spreadBoxedList(r: RSpread, fnIx: i32): i32 {
+  const row = r.spBoxRow
+  const kk: ListKind = "reflist"
+  const wrap = spreadWrapIdx(kk, row)
+  const back = spreadBackIdx(kk, row)
+  if wrap < 0 || back < 0 { return irLMiss("spread pair") }
+  if r.spAt < 0 || r.spAt >= P.nodes.length { return irLMiss("spread node") }
+  const a = nodeAt(r.spAt)
+  if !(a is ArrayLit) { return irLMiss("spread node") }
+  const seq = liKinds.length
+  const slots: i32[] = []
+  const rows: i32[] = []
+  let g = 0
+  while g < r.spSrcs.length {
+    irLOpnd(r.spSrcs[g])
+    const grp = r.spGroups[g]
+    let isSrc = false
+    for e in a.arrElems {
+      if spreadArgOf(e) == grp { isSrc = true }
+    }
+    if spreadBoxedGroupTail(grp, isSrc, row, fnIx) < 0 { return -1 }
+    const gs = spreadGroupSlotAt(r.spAt, g, kk, row, seq)
+    if gs < 0 { return -1 }
+    fbLocalSet(gs)
+    slots.push(gs)
+    rows.push(row)
+    g = g + 1
+  }
+  return spreadJoinGroups(r.spAt, slots, rows, wrap, back, kk, row, seq)
 }
 
 // The module global map walk receiver `recvIx` names, or -1: a bare name with no local in `fnIx`
@@ -6425,6 +6463,11 @@ function siteArmMintAt(id: i32) {
 function spreadPairMintAt(id: i32) {
   const nt = lw.irSpreadPair[id]
   if nt == null { return 0 }
+  if nt.sqBoxRow >= 0 {
+    spreadWrapIdx("reflist", nt.sqBoxRow)
+    spreadBackIdx("reflist", nt.sqBoxRow)
+    return 0
+  }
   const lb: ListBuild = { lbKind: nt.sqKind, lbSlot: nt.sqSlot }
   elabSpreadNote(nt.sqAt)
   const p = spreadPlanOf(nt.sqAt, lw.irAt, lb)

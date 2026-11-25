@@ -466,6 +466,7 @@ import {
   simdOperandPrim,
   simdResultPrim,
   simdRowIsMem,
+  spreadBoxedGroupIsRun,
   srWrappedMask,
   startInitArmOf,
   stmtWritesNothing,
@@ -563,6 +564,7 @@ import {
   spreadBoxDestRow,
   spreadPairKnown,
   spreadPlanOf,
+  spreadRefPairKnown,
 } from "./emit_plan_list"
 import {
   annTyOf,
@@ -796,6 +798,7 @@ import {
   sFieldIsUnionBox,
   sFieldStoreKind,
   spreadBoxingSource,
+  spreadOwnBoxRow,
   stmtIsTailValue,
   structIndexOfExpr,
   structIndexOfObjCtx,
@@ -815,6 +818,7 @@ import {
   tailIsValueOrNever,
 } from "./emit_fn_scans"
 import {
+  LBK_UNION,
   LiFrame,
   VKind,
   cboxReadsCell,
@@ -10724,7 +10728,8 @@ function variantCoerced(b: i32[], e: i32, rep: i32, ty: i32, vi: i32): Opnd {
 
 // A spread literal along legacy's plain arm (`spreadPlanOf`): each item group, a spread source or a
 // run of plain elements as legacy's run literal, built raw as legacy emits it at the literal's own
-// list rep and row, into slots its recorded ordinal keys. A boxing or converting literal is a miss.
+// list rep and row, into slots its recorded ordinal keys; a boxing literal along `spreadBoxedLit`.
+// A converting literal is a miss.
 function spreadLit(
   b: i32[],
   n: ArrayLit,
@@ -10733,15 +10738,16 @@ function spreadLit(
   lb: ListBuild,
   bt: i32,
 ): Opnd {
-  if (
-    spreadBoxDestRow(n.arrElems, ibFnIx, lb) >= 0
-    || spreadBoxingSource(ix, ibFnIx) >= 0
-  ) {
-    return irBMiss("array spread boxed")
-  }
-  // Legacy notes the literals the spread holds before its plan, so each is typed at its holder's
+  // Legacy notes the literals the spread holds first (`emitArrAt`), so each is typed at its holder's
   // element; the plan asked without that note mints the literals' own lists. The note is idempotent.
   elabSpreadNote(ix)
+  const destRow = spreadBoxDestRow(n.arrElems, ibFnIx, lb)
+  if destRow >= 0 { return spreadBoxedLit(b, n, ix, rep, lb, bt, destRow) }
+  if spreadBoxingSource(ix, ibFnIx) >= 0 {
+    const own = spreadOwnBoxRow(ix, n.arrElems, ibFnIx)
+    if own < 0 { return irBMiss("array spread boxed") }
+    return spreadBoxedLit(b, n, ix, rep, lb, bt, own)
+  }
   const p = spreadPlanOf(ix, ibFnIx, lb)
   if p.spWhy != "" { return irBMiss("array spread plan") }
   for k in p.spSrcKinds {
@@ -10790,6 +10796,7 @@ function spreadLit(
       sqAt: ix,
       sqKind: lb.lbKind,
       sqSlot: lb.lbSlot,
+      sqBoxRow: -1,
     }
     ib.irSpreadPair[b[at]] = nt
   }
@@ -10800,11 +10807,108 @@ function spreadLit(
     spKind: lb.lbKind,
     spSlot: lb.lbSlot,
     spAt: ix,
+    spBoxRow: -1,
   }
   // A minted literal (a variadic push's run) has no checker type; it holds its build's.
   const own = heldTy(exprTyOf(ix))
   const ty = if irTyHeldOpen(own, rep) && bt >= 0 { heldTy(bt) } else { own }
   return irBLetTempTy(b, r, ix, rep, ty)
+}
+
+// A spread literal along legacy's boxing arm (`emitArrSpreadBoxed`) at union-box row `row`: each
+// group built as `emitSpreadGroupBoxed` builds it, a run or linked literal at the literal's own
+// rep, a source as itself, which the lowering then boxes or retags to the row.
+function spreadBoxedLit(
+  b: i32[],
+  n: ArrayLit,
+  ix: i32,
+  rep: i32,
+  lb: ListBuild,
+  bt: i32,
+  row: i32,
+): Opnd {
+  if !(repNodeAt(rep) is RList) { return irBMiss("array rep") }
+  const grps: i32[] = []
+  const isSrc: boolean[] = []
+  let run: i32[] = []
+  for e in n.arrElems {
+    const src = spreadArgOf(e)
+    if src >= 0 {
+      if run.length > 0 {
+        grps.push(spreadRunLit(run, ix, ix, n.pos))
+        isSrc.push(false)
+        run = []
+      }
+      grps.push(src)
+      isSrc.push(true)
+    } else {
+      run.push(e)
+    }
+  }
+  if run.length > 0 {
+    grps.push(spreadRunLit(run, ix, ix, n.pos))
+    isSrc.push(false)
+  }
+  const at = b.length
+  const srcs: Opnd[] = []
+  let g = 0
+  while g < grps.length {
+    const v = spreadBoxedGroup(b, grps[g], isSrc[g], row, rep, ix)
+    if ibMiss != "" { return v }
+    srcs.push(v)
+    g = g + 1
+  }
+  // An unminted pair is minted where legacy's boxing arm asks it, before the first group's writing.
+  if !spreadRefPairKnown(row) && b.length > at {
+    const nt: SpreadPairNote = {
+      sqAt: ix,
+      sqKind: lb.lbKind,
+      sqSlot: lb.lbSlot,
+      sqBoxRow: row,
+    }
+    ib.irSpreadPair[b[at]] = nt
+  }
+  if ifBelowLead(b, at, "array spread short-circuit operand") { return srcs[0] }
+  const r: Rhs = {
+    spSrcs: srcs,
+    spGroups: grps,
+    spKind: lb.lbKind,
+    spSlot: lb.lbSlot,
+    spAt: ix,
+    spBoxRow: row,
+  }
+  const own = heldTy(exprTyOf(ix))
+  const ty = if irTyHeldOpen(own, rep) && bt >= 0 { heldTy(bt) } else { own }
+  return irBLetTempTy(b, r, ix, rep, ty)
+}
+
+// Group `grp` of a boxing spread as `emitSpreadGroupBoxed` builds it before its tail: a run or a
+// linked literal at the union-box row `row` (the literal's rep `rep`) unless its typed build
+// takes it, any other source as itself; a literal source at another build is a miss.
+function spreadBoxedGroup(
+  b: i32[],
+  grp: i32,
+  isSrc: boolean,
+  row: i32,
+  rep: i32,
+  ix: i32,
+): Opnd {
+  const lit = unwrapParen(grp)
+  if lit < 0 { return irBMiss("array spread source") }
+  const ln = nodeAt(lit)
+  if !(ln is ArrayLit) { return irBExpr(b, grp) }
+  const ba = arrLitBuildAt(lit, arrLitTyAt(lit, ibFnIx), ibFnIx)
+  const tb = ba.baBuild
+  if tb != null {
+    const lrep = if ba.baTy >= 0 { repNodeOfTy(ba.baTy) } else { exprRepOf(lit) }
+    if lrep < 0 { return irBMiss("array spread literal source rep") }
+    return arrayLit(b, ln, lit, lrep, tb, ba.baTy)
+  }
+  if !spreadBoxedGroupIsRun(grp, isSrc) {
+    return irBMiss("array spread boxed literal source")
+  }
+  const gb: ListBuild = { lbKind: LBK_UNION, lbSlot: row }
+  return arrayLit(b, ln, lit, rep, gb, exprTyOf(ix))
 }
 
 // Group `g`'s list `src` of literal `ix` (rep `rep`) built as `emitSpreadGroup` emits it: a list
