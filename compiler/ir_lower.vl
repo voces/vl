@@ -1033,9 +1033,10 @@ export function irLSkip(o: Opnd) {
   if o is OVar && isTemp(o.ov) {
     if !tempDefined(o.ov) { return irLMiss("temp used before its definition") }
     if !takeUse(o.ov) { return irLMiss("non-stack temp: used twice") }
-    // A field read's receiver is consumed first, as `irLOpnd` writes it.
+    // A field read's receiver, or a narrowed read's box, is consumed first, as `irLOpnd` writes it.
     const r = tempRhs(o.ov)
     if r is RGetField { irLSkip(r.gfV) }
+    if r is RBoxNarrow { irLSkip(r.bnV) }
     lwSeq.push(o.ov)
   }
   return 0
@@ -2787,12 +2788,12 @@ function fieldTail(at: i32, m: Member) {
 function boxNarrow(r: RBoxNarrow) {
   if r.bnCon >= 0 { return boxContainerRead(r) }
   if r.bnAtom >= 0 {
-    irLOpnd(r.bnV)
+    boxNarrowBox(r)
     return emitUnionUnboxTail(r.bnAtom)
   }
   const vi = narrowedBoxVariantPlain(r.bnAt, lw.irAt)
   if !narrowedVariantRepIs(vi, r.bnRep) { return irLMiss("box narrow shape") }
-  irLOpnd(r.bnV)
+  boxNarrowBox(r)
   return narrowedVariantTail(vi)
 }
 
@@ -3032,7 +3033,7 @@ function boxContainerRead(r: RBoxNarrow) {
     }
     "none" => {}
   }
-  irLOpnd(r.bnV)
+  boxNarrowBox(r)
   if r.bnCon == RC_MAP { return mapUnionUnboxTail(r.bnAt, lw.irAt) }
   return refArrayUnionUnboxTail(r.bnAt, lw.irAt)
 }
@@ -4892,8 +4893,24 @@ function opndAgain(o: Opnd, ix: i32): i32 {
 export function irLReadAgain(ix: i32): boolean {
   if !lw.irReadAgain.has(ix) { return false }
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
+  const outer = lwAgainAt
+  lwAgainAt = ix
   rhs(lw.irReadAgain[ix] ?? none, false)
+  lwAgainAt = outer
   return true
+}
+
+// The node `irLReadAgain` is writing again, or -1.
+let lwAgainAt = -1
+
+// The box narrowed read `r` unboxes: its operand, or the global's read (`irReadBoxed`) where the
+// read is written again and its first read consumed the box temp.
+function boxNarrowBox(r: RBoxNarrow) {
+  if lwAgainAt == r.bnAt && lw.irReadBoxed.has(r.bnAt) {
+    const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
+    return rhs(lw.irReadBoxed[r.bnAt] ?? none, false)
+  }
+  return irLOpnd(r.bnV)
 }
 
 // `RRecCopyPure`: legacy's whole copy, its source read as the IR wrote it: whole, where the copy
