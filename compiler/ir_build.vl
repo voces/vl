@@ -33,6 +33,7 @@ import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleFe, monoBundleReadFe, monoGenericAliasFe } from "./emit_mono"
 import {
+  boxTagOfTy,
   repElemTyOfName,
   repRecordFieldNames,
   slotRowTyOf,
@@ -118,6 +119,7 @@ import {
   PStaged,
   PrimOp,
   PushRecv,
+  RAsgParked,
   RBoxNarrow,
   RCall,
   RCallRef,
@@ -4234,6 +4236,17 @@ function refIfLink(
   return o
 }
 
+// Whether if-arm `blockIx` ends in an assignment whose value is a wider record written into a
+// name (`asgValueArmOf` "widerRow").
+function ifArmWiderWrite(blockIx: i32): boolean {
+  const tv = unwrapParen(ifArmValueExpr(blockIx))
+  if tv < 0 || tv >= P.nodes.length { return false }
+  const n = nodeAt(tv)
+  return n is BinExpr
+    && n.binOp == "="
+    && asgValueArmOf(tv, ibFnIx) == "widerRow"
+}
+
 // One arm of `ifRefExpr`: its value as itself at `rep`, an atom decoded to it, or the join's null,
 // written to out `t`.
 function refIfArm(
@@ -4245,7 +4258,10 @@ function refIfArm(
   nul: boolean,
 ): i32[] {
   const body: i32[] = []
-  const arm = refIfArmOf(blockIx, ibFnIx, kind, slot, nul)
+  const arm0 = refIfArmOf(blockIx, ibFnIx, kind, slot, nul)
+  // A wider record written into a name is a value (`assignValueWider`), which legacy's arm planner
+  // reads as a statement and refuses: the IR builds it as the arm's plain value.
+  const arm = if arm0 == "noValue" && ifArmWiderWrite(blockIx) { "plain" } else { arm0 }
   if arm != "plain" && arm != "atomStr" && arm != "null" && arm != "unbox" {
     irBMiss("ref if arm " + arm)
     return body
@@ -9378,6 +9394,24 @@ function nulReadDropped(b: i32[], v: Opnd): boolean {
   return true
 }
 
+// Where the last node of `b` defines `v` as the unbox of an assignment's parked box
+// (`assignValueBoxedArm`): that node dropped and the box returned; else null.
+function parkedBoxOf(b: i32[], v: Opnd): Opnd | null {
+  if !(v is OVar) || b.length < 2 { return null }
+  const n = ib.irNodes[b[b.length - 1]]
+  if !(n is SLet) || n.lDst != v.ov { return null }
+  const r = n.lRhs
+  if !(r is RBoxNarrow) || r.bnAtom < 0 { return null }
+  const pv = r.bnV
+  if !(pv is OVar) || !(repNodeAt(irBOpRep(pv)) is RBox) { return null }
+  const pn = ib.irNodes[b[b.length - 2]]
+  if !(pn is SLet) || pn.lDst != pv.ov || !(pn.lRhs is RAsgParked) {
+    return null
+  }
+  b.pop()
+  return pv
+}
+
 // `boxTemp` for `v` built at variant row `at`, or at its own layout where `at` is -1.
 function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   return boxTempIn(b, v, ix, dst, at, holeBoxTyAt(ix, ibFnIx))
@@ -9407,6 +9441,15 @@ function boxTempIn(
     return repTemp(b, { nnV: v, nnPay: false, nnAt: ix }, ix, dst)
   }
   const p = holeBoxPlanOf(ix, uTy, ibFnIx)
+  // An assignment's value unboxed from the box its store parked, where the plan passes a box: that
+  // box itself, the unbox dropped (legacy passes the unboxed value, which no box holds).
+  if p.hbArm == "pass" {
+    const pb = parkedBoxOf(b, v)
+    if pb != null {
+      // The parked box is the hole's box under its own union's rep: the same box (`RStage`).
+      return if irBOpRep(pb) == dst { pb } else { irBLetTempTy(b, { sgV: pb }, ix, dst, repTyOf(dst)) }
+    }
+  }
   const why = boxPlanWhy(p, v, ix)
   if why != "" { return irBMiss(why) }
   // A box that writes its tag ahead of its value writes it ahead of an assignment's store, which
@@ -14165,6 +14208,8 @@ function assignValueGo(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if arm == "lit" { return assignValueLit(b, n, ix, rep) }
   if arm == "nullLit" { return assignValueNullLit(b, n, ix, rep) }
   if arm == "parked" { return assignValueParked(b, n, ix, rep) }
+  if arm == "boxedArm" { return assignValueBoxedArm(b, n, ix, rep) }
+  if arm == "widerRow" { return assignValueWider(b, n, ix, rep) }
   if arm != "reRead" { return irBMiss("assignment value " + arm) }
   // The store between an operand already built and the box's re-read would put that operand out of
   // stack order, as `assignValueLit`'s would.
@@ -14229,17 +14274,8 @@ function assignValueParked(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !(t is Index) && !(t is Member) {
     return irBMiss("assignment value parked target")
   }
-  const at = b.length
-  assignTo(b, n, ix)
+  const src = parkedStore(b, n, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
-  const last = if b.length > at { ib.irNodes[b[b.length - 1]] } else { null }
-  const ms = if last is SEffect { last.efRhs } else { null }
-  if !(last is SListSet) && !(last is SSetField) && !(ms is RMapSet) {
-    return irBMiss("assignment value parked store")
-  }
-  if last is SSetField { last.sfPark = true }
-  if ms is RMapSet { ms.msPark = true }
-  const src = if last is SListSet { irBOpRep(last.lsSrc) } else if last is SSetField { irBOpRep(last.sfSrc) } else if ms is RMapSet { irBOpRep(ms.msVal) } else { -1 }
   const sn = repNodeAt(src)
   // A value narrower than its slot is narrowed back by the one opcode legacy writes after it.
   const uw = asgReadUnwidenOp(ix, ibFnIx)
@@ -14252,6 +14288,65 @@ function assignValueParked(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("assignment value parked rep")
   }
   return irBLetTemp(b, { apAt: ix }, ix, rep)
+}
+
+// Assignment `ix`'s store built into `b`, a field's or a map's marked to park its value; the rep
+// the store holds the value at (a miss where the store is none of those).
+function parkedStore(b: i32[], n: BinExpr, ix: i32): i32 {
+  const at = b.length
+  assignTo(b, n, ix)
+  if ibMiss != "" { return -1 }
+  const last = if b.length > at { ib.irNodes[b[b.length - 1]] } else { null }
+  const ms = if last is SEffect { last.efRhs } else { null }
+  if !(last is SListSet) && !(last is SSetField) && !(ms is RMapSet) {
+    irBMiss("assignment value parked store")
+    return -1
+  }
+  if last is SSetField { last.sfPark = true }
+  if ms is RMapSet { ms.msPark = true }
+  return if last is SListSet { irBOpRep(last.lsSrc) } else if last is SSetField { irBOpRep(last.sfSrc) } else if ms is RMapSet { irBOpRep(ms.msVal) } else { -1 }
+}
+
+// An assignment as a value its element store or map set parks as a union box (`asgValueArmOf`
+// "boxedArm"): the box read back and recovered (`RAsgParked`), then unboxed to the value's arm
+// (`RBoxNarrow`), as `emitAsgValueOf` writes it.
+function assignValueBoxedArm(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  if !(nodeAt(n.binLeft) is Index) {
+    return irBMiss("assignment value boxedArm target")
+  }
+  const tag = boxTagOfTy(nodeTyAt(ix, ibFnIx))
+  if tag < 0 { return irBMiss("assignment value boxedArm tag") }
+  const src = parkedStore(b, n, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  if !(repNodeAt(src) is RBox) {
+    return irBMiss("assignment value boxedArm rep")
+  }
+  const p = irBLetTempTy(b, { apAt: ix }, ix, src, repTyOf(src))
+  return irBLetTemp(
+    b,
+    { bnV: p, bnAt: ix, bnRep: rep, bnAtom: tag, bnCon: -1 },
+    ix,
+    rep,
+  )
+}
+
+// An assignment as a value whose name's record the right side's wider record extends
+// (`asgValueArmOf` "widerRow"): the store, the name re-read at its own record, then cast to the
+// wider row (`RRecDown`), as `emitAsgValueOf` writes it (D16105).
+function assignValueWider(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const t = nodeAt(n.binLeft)
+  if !(t is Ident) { return irBMiss("assignment value widerRow target") }
+  if !(repNodeAt(rep) is RRecord) {
+    return irBMiss("assignment value widerRow rep")
+  }
+  assignTo(b, n, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  const m = asgReReadEnter(ix)
+  const rr = repNodeOfTy(exprTyOf(n.binLeft))
+  const o = identRead(b, t, n.binLeft, rr, asgReReadSeated(n.binLeft))
+  asgReReadLeave(m)
+  if ibMiss != "" { return o }
+  return irBLetTemp(b, { rdV: o, rdAt: ix }, ix, rep)
 }
 
 // An assignment of `null` the checker types `null` (`asgValueArmOf` "nullLit"): the store, then
