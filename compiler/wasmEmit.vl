@@ -14034,7 +14034,7 @@ const SPREAD_ORDINAL_CAP = 524000
 
 // Spread literal `arrIx`'s frame slot for item group `g`: keyed by its recorded ordinal, else,
 // for a literal no collect walk met, by the emission sequence `seq`.
-function spreadGroupSlotAt(
+export function spreadGroupSlotAt(
   arrIx: i32,
   g: i32,
   kk: ListKind,
@@ -14199,25 +14199,55 @@ function emitArrSpreadBoxed(arrIx: i32, row: i32, fnIx: i32) {
   return spreadJoinGroups(arrIx, slots, groupRows, wrap, back, kk, row, seq)
 }
 
-// One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`. A list
-// literal source linked to the literal it is spread into is built there, as a run is (D16701).
+// One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`: the group
+// as `emitSpreadGroup` builds it, then `spreadBoxedGroupTail`.
 function emitSpreadGroupBoxed(
   grp: i32,
   isSrc: boolean,
   row: i32,
   fnIx: i32,
 ): i32 {
-  const lit = unwrapParen(grp)
-  if (
-    !isSrc
-    || lit >= 0 && nodeAt(lit) is ArrayLit && elabSpreadRunHolderOf(lit) >= 0
-  ) {
+  if spreadBoxedGroupIsRun(grp, isSrc) {
     return emitSpreadGroup(grp, fnIx, LBK_UNION, row)
   }
   const k = mfRecvKindOf(grp, fnIx)
   if k == "reflist" {
     const s = refListSlotOfExpr(grp, fnIx)
     if emitSpreadGroup(grp, fnIx, LBK_REF, s) < 0 { return -1 }
+    return spreadBoxedGroupTail(grp, isSrc, row, fnIx)
+  }
+  // Unreachable past `spreadSrcBoxes`, which admits only a scalar source whose element is a
+  // member or widens to one.
+  if k == null || k == "u8list" || spreadSrcBoxAtom(grp, row, fnIx) < 0 {
+    return emitFailAt(
+      "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
+      grp,
+    )
+  }
+  if emitSpreadGroup(grp, fnIx, pendingKindOfList(k, 0), 0) < 0 { return -1 }
+  return spreadBoxedGroupTail(grp, isSrc, row, fnIx)
+}
+
+// Whether group `grp` of a boxing spread is built at its union-box row itself: a run, or a list
+// literal source linked to the literal it is spread into (D16701).
+export function spreadBoxedGroupIsRun(grp: i32, isSrc: boolean): boolean {
+  if !isSrc { return true }
+  const lit = unwrapParen(grp)
+  return lit >= 0 && nodeAt(lit) is ArrayLit && elabSpreadRunHolderOf(lit) >= 0
+}
+
+// Brings boxing spread group `grp`, on the stack as built, to union-box row `row`: a ref list
+// retagged or widened, a scalar list boxed per element. Returns 0, or -1 once failed.
+export function spreadBoxedGroupTail(
+  grp: i32,
+  isSrc: boolean,
+  row: i32,
+  fnIx: i32,
+): i32 {
+  if spreadBoxedGroupIsRun(grp, isSrc) { return 0 }
+  const k = mfRecvKindOf(grp, fnIx)
+  if k == "reflist" {
+    const s = refListSlotOfExpr(grp, fnIx)
     if s == row || rlUnionRowCovers(s, row) { return 0 }
     if rlUnionRowRetags(s, row) { return emitUnionListRetagTop(s, row, grp) }
     if rlWidenTagOf(s, row) < 0 {
@@ -14229,15 +14259,12 @@ function emitSpreadGroupBoxed(
     return emitRefListWidenTop(s, row)
   }
   const ak = spreadSrcBoxAtom(grp, row, fnIx)
-  // Unreachable past `spreadSrcBoxes`, which admits only a scalar source whose element is a
-  // member or widens to one.
   if k == null || k == "u8list" || ak < 0 {
     return emitFailAt(
       "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
       grp,
     )
   }
-  if emitSpreadGroup(grp, fnIx, pendingKindOfList(k, 0), 0) < 0 { return -1 }
   return emitScalarListBoxTop(
     listKindElemKind(k),
     ak,
