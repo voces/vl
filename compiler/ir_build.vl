@@ -139,6 +139,7 @@ import {
   RToBox,
   Rhs,
   SArmSite,
+  SArmWrite,
   SAssign,
   SBlock,
   SBoundsCheck,
@@ -637,6 +638,7 @@ import {
   ifJoinAdaptsScalar,
   isArmRank,
   letIfInitSinks,
+  letIfInitTy,
   litArmsReadsOf,
   litIsBoxLexes,
   litMemberEqArmOf,
@@ -796,6 +798,7 @@ import {
   nulLitAtomTexts,
   nullableTyOf,
   optChainStructIdxOf,
+  placeRecordSigs,
   readOwesNonNullRecover,
   readRepMemoAdvance,
   sFieldIsUnionBox,
@@ -4294,9 +4297,9 @@ function refIfArmNiches(v: Opnd, tv: i32, rep: i32): boolean {
 }
 
 // A nullable or union binding's `if` initializer as legacy writes it per arm (`emitLetIfInit`, rep
-// `pa`): a box binding seeded with the null box, then a void `if` chain whose arms each deliver
-// their value into `v` and whose missing `else` writes the cell's null.
-function letIfArms(b: i32[], ifIx: i32, v: i32, pa: i32) {
+// `pa`, a box's union `uty`): a box binding seeded with the null box, then a void `if` chain whose
+// arms each deliver their value into `v` and whose missing `else` writes the cell's null.
+function letIfArms(b: i32[], ifIx: i32, v: i32, pa: i32, uty: i32) {
   const vr = ib.irVars[v].vRep
   // `letIfInitRep`'s cells: a union box (a nullable one, discipline 4, the same `{tag, payload}`),
   // `string | null`, `boolean | null`. Only the box is not defaultable, so only it is seeded.
@@ -4304,16 +4307,16 @@ function letIfArms(b: i32[], ifIx: i32, v: i32, pa: i32) {
   const fits = if pa == 0 { heldAsBox(vr) } else if pa == 1 { strNullable(vr) } else { boolNullable(vr) }
   if !fits { return skip("declaration if per arm rep") }
   if pa == 0 { nullInto(b, ifIx, v, vr, own) }
-  return letIfArmLink(b, ifIx, v, vr, own)
+  return letIfArmLink(b, ifIx, v, vr, own, uty)
 }
 
 // A union binding's `if` initializer under the binding sink (`emitUnionIfBindingSink`): a void
 // `if` chain whose arms each put their box into the sink pair, a missing `else` the null, then the
 // binding's one box built from the pair into `v`.
-function letIfSinkArms(b: i32[], ifIx: i32, v: i32) {
+function letIfSinkArms(b: i32[], ifIx: i32, v: i32, uty: i32) {
   const vr = ib.irVars[v].vRep
   if !heldAsBox(vr) { return skip("declaration if per arm rep") }
-  letIfSinkLink(b, ifIx, v, vr)
+  letIfSinkLink(b, ifIx, v, vr, uty)
   if ibMiss != "" { return 0 }
   irBNode(
     b,
@@ -4326,12 +4329,12 @@ function letIfSinkArms(b: i32[], ifIx: i32, v: i32) {
 }
 
 // One link of `letIfSinkArms` (`emitUnionIfBindingSinkLink`).
-function letIfSinkLink(b: i32[], ifIx: i32, v: i32, vr: i32) {
+function letIfSinkLink(b: i32[], ifIx: i32, v: i32, vr: i32, uty: i32) {
   const n = nodeAt(unwrapParen(ifIx))
   if !(n is IfStmt) { return skip("declaration if per arm node") }
   const c = irBExpr(b, n.ifCond)
   if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
-  const thenB = letIfSinkBody(n.ifThen, v, vr)
+  const thenB = letIfSinkBody(n.ifThen, v, vr, uty)
   if ibMiss != "" { return 0 }
   const elseB: i32[] = []
   if n.ifElse < 0 {
@@ -4346,18 +4349,28 @@ function letIfSinkLink(b: i32[], ifIx: i32, v: i32, vr: i32) {
     if ifJoinAdaptsScalar(n.ifElse, ibFnIx) {
       return skip("declaration if per arm scalar link")
     }
-    letIfSinkLink(elseB, n.ifElse, v, vr)
+    letIfSinkLink(elseB, n.ifElse, v, vr, uty)
   } else {
-    for x in letIfSinkBody(n.ifElse, v, vr) { elseB.push(x) }
+    for x in letIfSinkBody(n.ifElse, v, vr, uty) { elseB.push(x) }
   }
   if ibMiss != "" { return 0 }
   irBNode(b, sIf(c, thenB, elseB, -1, true), -1, ibNoValue, ifIx)
   return 0
 }
 
-// One arm of `letIfSinkLink`: its prelude, then its value delivered at `v`'s box and put into the
-// sink pair.
-function letIfSinkBody(blockIx: i32, v: i32, vr: i32): i32[] {
+// Arm value `tv` delivered into `v`'s rep `vr`; into a box of union `uty` (not -1), one the
+// checker records no box at is then boxed there, as `emitUnionBoxOwed` writes it (`boxOwedAt`).
+function armBoxDeliver(b: i32[], tv: i32, vr: i32, uty: i32): Opnd {
+  const x = deliver(b, tv, vr, -1)
+  if uty < 0 || ibMiss != "" || irBOpRep(x) == vr || boxOwedAt(tv, ibFnIx) {
+    return x
+  }
+  return boxTempIn(b, x, tv, vr, -1, uty)
+}
+
+// One arm of `letIfSinkLink`: its prelude, then its value boxed at `v`'s union `uty`
+// (`armBoxDeliver`), as `emitUnionArmToPair` writes it, and put into the sink pair.
+function letIfSinkBody(blockIx: i32, v: i32, vr: i32, uty: i32): i32[] {
   const body: i32[] = []
   const blk = nodeAt(blockIx)
   const tv = ifArmValueExpr(blockIx)
@@ -4376,7 +4389,7 @@ function letIfSinkBody(blockIx: i32, v: i32, vr: i32): i32[] {
     }
     return body
   }
-  const x = deliver(body, tv, vr, -1)
+  const x = armBoxDeliver(body, tv, vr, uty)
   if ibMiss == "" && irBOpRep(x) != vr {
     skip("declaration if per arm coercion")
   }
@@ -4400,12 +4413,19 @@ function nullInto(b: i32[], at: i32, v: i32, vr: i32, own: i32) {
 }
 
 // One link of `letIfArms` (`emitNullableIfBindingLink`).
-function letIfArmLink(b: i32[], ifIx: i32, v: i32, vr: i32, own: i32) {
+function letIfArmLink(
+  b: i32[],
+  ifIx: i32,
+  v: i32,
+  vr: i32,
+  own: i32,
+  uty: i32,
+) {
   const n = nodeAt(unwrapParen(ifIx))
   if !(n is IfStmt) { return skip("declaration if per arm node") }
   const c = irBExpr(b, n.ifCond)
   if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
-  const thenB = letIfArmBody(n.ifThen, v, vr)
+  const thenB = letIfArmBody(n.ifThen, v, vr, uty)
   if ibMiss != "" { return 0 }
   const elseB: i32[] = []
   if n.ifElse < 0 {
@@ -4414,17 +4434,18 @@ function letIfArmLink(b: i32[], ifIx: i32, v: i32, vr: i32, own: i32) {
     if ifJoinAdaptsScalar(n.ifElse, ibFnIx) {
       return skip("declaration if per arm scalar link")
     }
-    letIfArmLink(elseB, n.ifElse, v, vr, own)
+    letIfArmLink(elseB, n.ifElse, v, vr, own, uty)
   } else {
-    for x in letIfArmBody(n.ifElse, v, vr) { elseB.push(x) }
+    for x in letIfArmBody(n.ifElse, v, vr, uty) { elseB.push(x) }
   }
   if ibMiss != "" { return 0 }
   irBNode(b, sIf(c, thenB, elseB, -1, true), -1, ibNoValue, ifIx)
   return 0
 }
 
-// One arm of `letIfArmLink`: its prelude, then its value delivered into `v`.
-function letIfArmBody(blockIx: i32, v: i32, vr: i32): i32[] {
+// One arm of `letIfArmLink`: its prelude, then its value delivered into `v` (`armBoxDeliver`), as
+// `emitNulArmToLocal` writes it.
+function letIfArmBody(blockIx: i32, v: i32, vr: i32, uty: i32): i32[] {
   const body: i32[] = []
   const blk = nodeAt(blockIx)
   const tv = ifArmValueExpr(blockIx)
@@ -4443,7 +4464,7 @@ function letIfArmBody(blockIx: i32, v: i32, vr: i32): i32[] {
     }
     return body
   }
-  const x = deliver(body, tv, vr, -1)
+  const x = armBoxDeliver(body, tv, vr, uty)
   if ibMiss == "" && irBOpRep(x) != vr {
     skip("declaration if per arm coercion")
   }
@@ -6559,6 +6580,15 @@ function calleeIsCapture(fx: i32): boolean {
   return n is Ident && identReadArmOf(n, fx, ibFnIx, false) == "capture"
 }
 
+// Whether `emitCallCore` sends call `ix` of a field to `emitCallRef`: a closure, a place holding a
+// returned record whole, or a returned record's member.
+function fieldCallRoutesRef(c: Call, ix: i32): boolean {
+  if exprIsClosure(c.callFn, ibFnIx) || placeRecordSigs(ix, ibFnIx).length > 0 {
+    return true
+  }
+  return callResultMemberTy(unwrapParen(c.callFn), ibFnIx) >= 0
+}
+
 // Bundle callee `fx` read through a capture of this frame, at the record its capture holds; else a
 // named miss.
 function bundleCaptureRead(b: i32[], fx: i32): Opnd {
@@ -7585,6 +7615,11 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   } else if !exprIsStrMethod(ix, ibFnIx, "slice") {
     // A function-valued field of a record, called through its closure as legacy's `emitCallRef`.
     if callRefPlainKey(ix, ibFnIx) != "" { return closureCallRhs(b, c, ix) }
+    // A field holding a returned record whole, which `emitCallCore` sends to `emitCallRef`, is
+    // called at its member, as `emitHolderCall` reads it.
+    if holderCallSigs(ix, ibFnIx).length > 0 && fieldCallRoutesRef(c, ix) {
+      return holderCallRhs(b, c, ix)
+    }
     // A call through a field no function reaches is `unreachable` (`emitNullCalleeCall`), padded
     // with a second where the call is typed `never` (`callEndsNever`).
     if callCalleeDead(ix, c, ibFnIx) {
@@ -12526,6 +12561,7 @@ function nodeAssigns(ni: i32, v: i32): boolean {
     SIf => bodyAssigns(n.siThen, v) || bodyAssigns(n.siElse, v)
     SCoalBox => coalBoxAssigns(n, v)
     SArmSite => n.saOut == v
+    SArmWrite => armsAssign(n.awArms, v)
     SBlock => bodyAssigns(n.bkBody, v)
     SLoop => bodyAssigns(n.lpBody, v)
     SForIn => n.xfVar == v || n.xfVar2 == v || bodyAssigns(n.xfBody, v)
@@ -12556,6 +12592,14 @@ function nodeAssigns(ni: i32, v: i32): boolean {
 // per-level `nodeAssigns` frame stays as small as its other arms need.
 function coalBoxAssigns(n: SCoalBox, v: i32): boolean {
   return bodyAssigns(n.cbNull, v) || bodyAssigns(n.cbLB, v)
+}
+
+// Whether any arm body in `arms` assigns `v`.
+function armsAssign(arms: i32[][], v: i32): boolean {
+  for a in arms {
+    if bodyAssigns(a, v) { return true }
+  }
+  return false
 }
 
 function bodyAssigns(body: i32[], v: i32): boolean {
@@ -14325,13 +14369,62 @@ function storeValue(b: i32[], x: i32, rep: i32, at: i32): Opnd {
   return repTemp(b, { nuAt: at, nuOwn: NULL_OWN_NONE, nuRead: [] }, at, rep)
 }
 
+// A store through a box of list arms inside `is K[]` (`SArmWrite`): per arm, the store built over
+// the arm's payload variable, the receiver read as it (`ibArmRecvVar`) and typed at the arm.
+function elemArmWrite(b: i32[], n: BinExpr, t: Index, ix: i32) {
+  if ibArmRecvVar >= 0 { return skip("store arm write nested") }
+  const recv = unwrapParen(t.idxArr)
+  if recv < 0 || recv >= P.nodes.length || !(nodeAt(recv) is Ident) {
+    return skip("store arm write receiver")
+  }
+  const v = irBExpr(b, recv)
+  if ibMiss != "" { return 0 }
+  // Legacy reads the box again by its name at each arm: a variable's local, or a global the
+  // lowering reads again (`irHoistRecv`).
+  if (
+    !(v is OVar)
+    || v.ov < 0
+    || ib.irVars[v.ov].vKind == "temp" && !recvReadsAgain(recv)
+  ) {
+    return skip("store arm write receiver")
+  }
+  const bodies: i32[][] = []
+  const vars: i32[] = []
+  for m in armIndexWriteArmsOf(t, ibFnIx) {
+    const pr = repNodeOfTy(m)
+    if pr < 0 { return skip("store arm write arm") }
+    const pv = irVarNew(ib, pr, m, "local", -1)
+    const ab: i32[] = []
+    const mark = luOvEnter(recv, m)
+    readRepMemoAdvance()
+    ibArmRecvIx = recv
+    ibArmRecvVar = pv
+    elemStore(ab, n, t, ix)
+    ibArmRecvIx = -1
+    ibArmRecvVar = -1
+    luOvLeave(mark)
+    readRepMemoAdvance()
+    if ibMiss != "" { return 0 }
+    bodies.push(ab)
+    vars.push(pv)
+  }
+  irBNode(
+    b,
+    { awV: v, awAt: ix, awArms: bodies, awVars: vars },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  return 0
+}
+
 // `xs[i] = v` that legacy writes as the plain store (`idxStoreOtherWhy`): receiver, index and
 // value in source order, then the store, whose guard runs after the value. A union list's value that
 // owes no box is boxed at the site's union (`idxStoreSiteBoxes`), as legacy's `emitUnionBoxArg`.
 function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   // Legacy writes a store through a box of list arms per arm before any other plan.
   if armIndexWriteArmsOf(t, ibFnIx).length > 0 {
-    return skip("store arm write")
+    return elemArmWrite(b, n, t, ix)
   }
   // Legacy takes a map store before it plans an element store.
   if exprMap(t.idxArr, ibFnIx) {
@@ -14400,9 +14493,6 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   }
   const va = if arm == "struct" { fieldStoreValueArmOf(sf[0], sf[1], n.binRight, ibFnIx) } else { variantFieldStoreValueArmOf(sf[0], sf[1], n.binRight, ibFnIx) }
   if !fieldStoreValueDelivers(va) { return skip("field store value " + va) }
-  if va == "armDelivery" && narrowedArmNeedsUnbox(n.binRight, ibFnIx) {
-    return skip("field store arm unbox")
-  }
   const rt = nodeTyAt(t.memObj, ibFnIx)
   const r = repNodeOfTy(rt)
   if !(repNodeAt(r) is RRecord) { return skip("field store receiver") }
@@ -15357,9 +15447,10 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     // Legacy writes a nullable or union binding's `if` initializer in each arm.
     const pa = letIfInitPerArmRep(ix, ibFnIx)
     if pa == 0 && letIfInitSinks(n.letInit, ibFnIx) {
-      return letIfSinkArms(b, n.letInit, v)
+      return letIfSinkArms(b, n.letInit, v, letIfInitTy(n, ibFnIx))
     }
-    if pa >= 0 { return letIfArms(b, n.letInit, v, pa) }
+    if pa > 0 { return letIfArms(b, n.letInit, v, pa, -1) }
+    if pa == 0 { return letIfArms(b, n.letInit, v, pa, letIfInitTy(n, ibFnIx)) }
     // Legacy's own binding arm reads a union-valued map's box past `emitExpr`, banking no
     // element-read row (`letNulMapReadUnionBox`).
     // A `const` legacy keeps the bounded part of for later memory addresses (`emitLetPlainInit`).
@@ -15514,7 +15605,11 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     const v = if (ibMiss == ""
       && irBOpRep(built) != ib.irRetRep
       && (listRetag(irBOpRep(built), ib.irRetRep)
-      || holeRetagNoted(irBOpRep(built), ib.irRetRep, retHoleMap(irBOpRep(built)))
+      || holeRetagNoted(
+      irBOpRep(built),
+      ib.irRetRep,
+      retHoleMap(irBOpRep(built)) || nulCloPair(irBOpRep(built), ib.irRetRep),
+    )
       || recRetag(irBOpRep(built), ib.irRetRep)
       || recRetagNoted(irBOpRep(built), ib.irRetRep, n.retArg)
       || recValRetagNoted(built, ib.irRetRep))
@@ -15852,7 +15947,13 @@ function tailArm(blockIx: i32): i32[] {
     skip("return refused")
     return body
   }
-  const v = retRecover(body, deliver(body, last, ib.irRetRep, -1), last)
+  const v0 = retRecover(body, deliver(body, last, ib.irRetRep, -1), last)
+  if ibMiss != "" { return body }
+  // A scalar arm value at a boxed result is boxed at the result's union, the box plan legacy's
+  // owed box writes (`emitUnionBoxOwed`).
+  const v = if irBOpRep(v0) != ib.irRetRep
+    && heldAsBox(ib.irRetRep)
+    && repPrim(irBOpRep(v0)) != null { boxTempIn(body, v0, last, ib.irRetRep, -1, ib.irRetTy) } else { v0 }
   if ibMiss != "" { return body }
   if irBOpRep(v) != ib.irRetRep {
     skip("tail coercion")
@@ -17530,6 +17631,18 @@ function recValRetagNoted(o: Opnd, dst: i32): boolean {
   for k in repNodeKids(src) { recHeapsNote(ib.irRecHeap, k) }
   for k in repNodeKids(dst) { recHeapsNote(ib.irRecHeap, k) }
   return recValRetag(ib, o.ov, src, dst)
+}
+
+// Whether reps `a` and `b` are both a closure's ref niche, which a hole may leave open in either.
+function nulCloPair(a: i32, b: i32): boolean {
+  const x = repNodeAt(a)
+  const y = repNodeAt(b)
+  return x is RNullable
+    && y is RNullable
+    && x.rnDisc == 1
+    && y.rnDisc == 1
+    && repNodeAt(x.rnInner) is RClosure
+    && repNodeAt(y.rnInner) is RClosure
 }
 
 // Whether a returned value at rep `r` is a map, whose closures a hole may leave open in the

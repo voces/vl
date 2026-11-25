@@ -37100,7 +37100,7 @@ export function letIfInitRep(slotKind: VKind, nulTy: i32): i32 {
 }
 
 // The type `emitLetIfInit` names a binding's union by: its annotation, else its joined `if`.
-function letIfInitTy(s: LetDecl, fnIx: i32): i32 {
+export function letIfInitTy(s: LetDecl, fnIx: i32): i32 {
   if s.letType >= 0 { return nodeTyIxOf(s.letType) }
   return nodeTyAt(s.letInit, fnIx)
 }
@@ -42725,7 +42725,7 @@ let luOvLocNodes: i32[] = []
 let luOvLocSlots: i32[] = []
 
 // Overrides read `ix` to local `slot`; returns the mark `luOvLocalLeave` restores to.
-function luOvLocalEnter(ix: i32, slot: i32): i32 {
+export function luOvLocalEnter(ix: i32, slot: i32): i32 {
   const mark = luOvLocNodes.length
   luOvLocNodes.push(ix)
   luOvLocSlots.push(slot)
@@ -42733,7 +42733,7 @@ function luOvLocalEnter(ix: i32, slot: i32): i32 {
 }
 
 // Drops every local override pushed since `mark`.
-function luOvLocalLeave(mark: i32) {
+export function luOvLocalLeave(mark: i32) {
   while luOvLocNodes.length > mark {
     luOvLocNodes.pop()
     luOvLocSlots.pop()
@@ -42887,6 +42887,47 @@ function emitArmIndexWrite(fnIx: i32, a: BinExpr, target: Index): i32 {
   return 1
 }
 
+// Arm `m`'s head in the `is K[]` store chain (`emitArmIndexWriteAt`), its receiver box on the
+// stack: the box's tag tested against the arm's, opening the arm's `if`.
+export function armIndexWriteTest(m: i32): i32 {
+  const t = listIsArmTag(m)
+  if t < 0 { return armIndexWriteNoWrapper() }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, t)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)
+  return 0
+}
+
+// Arm `m`'s payload, its receiver box on the stack again: cast to the arm's list into the arm's
+// wrapper local, which it returns; -1 where the arm has none.
+export function armIndexWritePayload(m: i32): i32 {
+  const heap = armHeapOf(m)
+  const loc = armWrapLocal(m)
+  if heap < 0 || loc < 0 { return armIndexWriteNoWrapper() }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbLocalSet(loc)
+  return loc
+}
+
+// An arm's store, a statement in the chain, parks its value slot (`idxStoreTail`): read and dropped.
+export function armIndexWriteDrop(target: Index, fnIx: i32): i32 {
+  const st = idxStorePlanOf(target, fnIx)
+  if st == null {
+    return emitFail("emitProgram: an arm's store has no store plan")
+  }
+  fbLocalGet(listIdxValSlot(st.mfKind, st.slot))
+  fbDrop()
+  return 0
+}
+
+function armIndexWriteNoWrapper() {
+  return emitFail(
+    "emitProgram: a union-of-lists arm has no wrapper to store through",
+  )
+}
+
 function emitArmIndexWriteAt(
   fnIx: i32,
   a: BinExpr,
@@ -42900,23 +42941,11 @@ function emitArmIndexWriteAt(
     return 0
   }
   const m = arms[i]
-  const t = listIsArmTag(m)
-  const heap = armHeapOf(m)
-  const loc = armWrapLocal(m)
-  if t < 0 || heap < 0 || loc < 0 {
-    return emitFail(
-      "emitProgram: a union-of-lists arm has no wrapper to store through",
-    )
-  }
   if emitExpr(recv, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, t)
-  fbI32Bin(70) // 0x46 i32.eq
-  fbIf(64)
+  if armIndexWriteTest(m) < 0 { return -1 }
   if emitExpr(recv, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1)
-  fbRefCast(heap)
-  fbLocalSet(loc)
+  const loc = armIndexWritePayload(m)
+  if loc < 0 { return -1 }
   const mark = luOvEnter(recv, m)
   const lmark = luOvLocalEnter(recv, loc)
   const r = emitAssignIndex(fnIx, a, target)

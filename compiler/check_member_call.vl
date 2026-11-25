@@ -7,6 +7,7 @@ import { rowSlotBound } from "./check_row_param"
 import { openKeyReadNote, openReadNote } from "./check_side_rows"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
 import { cwFnValueDeclOf } from "./check_write_scan"
+import { recFnValueLeaves } from "./check_type_shape"
 import { recLitOnlyDeclOf } from "./check_rec_fresh"
 import { declTyOf } from "./check_nar_store"
 import { ctnWrRecvPut } from "./check_decl_scan"
@@ -17,7 +18,10 @@ import { lmMembersAt, luOwnRecv } from "./check_list_union"
 import { ivSeedWidth } from "./check_intrinsic_values"
 import {
   ArrayLit,
+  BinExpr,
+  BoolLit,
   Call,
+  CharLit,
   FuncDecl,
   Ident,
   IfStmt,
@@ -26,10 +30,12 @@ import {
   MC_RUNG_SELF_FN,
   MatchExpr,
   Member,
+  NumLit,
   P,
   Param,
   Paren,
   Spread,
+  StrLit,
   binderNameAt,
   callHasTyArgs,
   callIsRestPacked,
@@ -266,11 +272,13 @@ import {
   TyArray,
   TyErr,
   TyFunc,
+  TyLit,
   TyMap,
   TyObj,
   TyPrim,
   TyUnion,
   TyVar,
+  litBaseTy,
   mkArrayTy,
   mkFuncTy,
   mkNullableTy,
@@ -1369,6 +1377,36 @@ function pushSpreadFreshList(
   return true
 }
 
+// The element `.map` builds from un-annotated callback `cb` returning `ret`: a single literal
+// that every value the callback returns takes as a `??`'s literal default is its base, as the
+// callback's inferred signature types it (D17561).
+function mapCoalLitElem(cb: i32, ret: i32): i32 {
+  if cb < 0 || cb >= P.nodes.length || ret < 0 || ret >= T.tys.length {
+    return ret
+  }
+  const f = nodeAt(cb)
+  const rt = tyAt(ret)
+  if !(f is FuncDecl) || f.fnRet >= 0 || !(rt is TyLit) { return ret }
+  const leaves = recFnValueLeaves(cb)
+  if leaves.length == 0 { return ret }
+  for lf in leaves {
+    const b = parenPeelIx(lf)
+    if b < 0 || b >= P.nodes.length { return ret }
+    const bn = nodeAt(b)
+    if !(bn is BinExpr) || bn.binOp != "??" || !scalarLitNode(bn.binRight) {
+      return ret
+    }
+  }
+  return litBaseTy(rt)
+}
+
+function scalarLitNode(x: i32): boolean {
+  const p = parenPeelIx(x)
+  if p < 0 || p >= P.nodes.length { return false }
+  const n = nodeAt(p)
+  return n is StrLit || n is NumLit || n is CharLit || n is BoolLit
+}
+
 // `.map(fn)` / `.filter(pred)` over `rt`'s element: the callback's arity and parameter are
 // checked, and the answer is the list of its return or the receiver's list type for `filter`.
 // `TY_ERR` after a refusal of the argument count or a non-function callback.
@@ -1505,7 +1543,7 @@ function memberCallMapFilterTy(
         )
         return TY_ERR
       }
-      return mkArrayTy(cbRet)
+      return mkArrayTy(mapCoalLitElem(cargs[0], cbRet))
     }
   }
   tErr(prop + " expects a function, got " + tyToStr(cbTy), ix)
