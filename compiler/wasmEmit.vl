@@ -47724,6 +47724,86 @@ function emitCoalesceOptNulVariant(
   return 0
 }
 
+// `m[k]?.f ?? d`'s read of field `prop` off map value row `omSl`: the value's heap and the
+// field's index, and the leaf kind its `if` carries; `ofFail` names why legacy refuses, else "".
+export type OptMapFieldPlan = {
+  ofHeap: i32,
+  ofFi: i32,
+  ofLeaf: VKind | null,
+  ofFail: string,
+}
+
+export function optMapFieldPlanOf(prop: string, omSl: i32): OptMapFieldPlan {
+  if !mvValIsRecord(omSl) {
+    return {
+      ofHeap: -1,
+      ofFi: -1,
+      ofLeaf: null,
+      ofFail: "emitProgram: `?.` needs a struct-valued map",
+    }
+  }
+  // An arm-valued map's row is its variant's (`mvValStructIdx` is -1 there), read through the
+  // layout identity the store and `??` default seeds take.
+  let omHeap = -1
+  let omFi = -1
+  let omNum = -1
+  const omVi = mvValVariantOf(omSl)
+  if omVi >= 0 {
+    omFi = variantFieldIndex(omVi, prop)
+    if omFi >= 0 {
+      omHeap = variantHeap(omVi)
+      omNum = variantFieldNumKind(omVi, omFi)
+    }
+  } else {
+    const omSi = mvValStructIdxOf(omSl)
+    const fi = sFieldIndex(omSi, prop)
+    if fi >= 0 && omSi >= 0 && omSi < sHeapIdx.length {
+      omFi = fi
+      omHeap = sHeapIdx[omSi]
+      omNum = fieldRowNumKind(sFieldStart[omSi] + fi)
+    }
+  }
+  if omFi < 0 {
+    return {
+      ofHeap: -1,
+      ofFi: -1,
+      ofLeaf: null,
+      ofFail: "emitProgram: `?.` field is not on the map's value struct",
+    }
+  }
+  const omLeaf = optLeafKindOf(omNum, false)
+  if omLeaf == null {
+    return {
+      ofHeap: -1,
+      ofFi: -1,
+      ofLeaf: null,
+      ofFail: "emitProgram: `?.` over a map read has no `if` blocktype for this field's rep",
+    }
+  }
+  return { ofHeap: omHeap, ofFi: omFi, ofLeaf: omLeaf, ofFail: "" }
+}
+
+// After the probe, `m[k]?.f ?? d`'s hit arm along plan `p` up to its `else`: the entry's `if` at
+// the leaf's blocktype, then the field off the entry's (non-null) value.
+export function optMapFieldHit(p: OptMapFieldPlan) {
+  const k = p.ofLeaf
+  if k == null {
+    return emitFail("emitProgram: `?.` over a map read has no plan")
+  }
+  pushMapScr(5)                // entry
+  fbIfForOptLeaf(k)            // if (entry != 0 → hit), at the field's blocktype
+  pushMapVals()
+  fbStructGet(cmValsWrap(), 0) // vals backing
+  pushMapScr(5)                // entry
+  fbI32Const(1)
+  fbI32Bin(107)                // i32.sub (entry - 1)
+  fbArrayGet(cmValsBack())     // (ref null <value struct>)
+  fbRefAsNonNull()             // a live entry's value is non-null
+  fbStructGet(p.ofHeap, p.ofFi)
+  fbElse()
+  return 0
+}
+
 // `m[k]?.f ?? d` over a map whose value row is `omSl`: probe, then the field off the hit's
 // value or the default. Returns -1 on a failure, else 0.
 function emitCoalesceOptMapField(
@@ -47733,60 +47813,13 @@ function emitCoalesceOptMapField(
   omSl: i32,
   fnIx: i32,
 ) {
-  if !mvValIsRecord(omSl) {
-    return emitFail("emitProgram: `?.` needs a struct-valued map")
-  }
-  // The variant half of the value row, the same either/or the store seed and the `??`
-  // default seed have carried since D34. `mvValStructIdx` is -1 for an arm-valued map
-  // (`collectS` skips a union member), so this site needs `variantFieldIndex` /
-  // `variantFieldTypeAt` / `variantHeap` — arm-for-arm twins of the struct accessor beside it, since a missing branch answered -1 and blamed the wrong field.
-  let omHeap = -1
-  let omFi = -1
-  let omNum = -1
-  // …through the layout identity (D123), the same read the store and `??`
-  // default seeds take: the field lookup must run against the row whose heap the
-  // vals element holds.
-  const omVi = mvValVariantOf(omSl)
-  if omVi >= 0 {
-    omFi = variantFieldIndex(omVi, lhs.omProp)
-    if omFi >= 0 {
-      omHeap = variantHeap(omVi)
-      omNum = variantFieldNumKind(omVi, omFi)
-    }
-  } else {
-    const omSi = mvValStructIdxOf(omSl)
-    // `sFieldIndex` bounds its own index (a row of -1 answers -1), so the heap read
-    // below is reached only for a row that named the field.
-    omFi = sFieldIndex(omSi, lhs.omProp)
-    if omFi >= 0 {
-      if omSi < 0 { return -1 }
-      omHeap = sHeapIdx[omSi]
-      omNum = fieldRowNumKind(sFieldStart[omSi] + omFi)
-    }
-  }
-  if omFi < 0 {
-    return emitFail("emitProgram: `?.` field is not on the map's value struct")
-  }
-  const omLeaf = optLeafKindOf(omNum, false)
-  if omLeaf == null {
-    return emitFail(
-      "emitProgram: `?.` over a map read has no `if` blocktype for this field's rep",
-    )
-  }
+  const p = optMapFieldPlanOf(lhs.omProp, omSl)
+  const k = p.ofLeaf
+  if k == null { return emitFail(p.ofFail) }
   if emitMapPrep(omInner.idxArr, omInner.idxIndex, fnIx) < 0 { return -1 }
-  pushMapScr(5)                // entry
-  fbIfForOptLeaf(omLeaf)       // if (entry != 0 → hit), at the field's blocktype
-  pushMapVals()
-  fbStructGet(cmValsWrap(), 0) // vals backing
-  pushMapScr(5)                // entry
-  fbI32Const(1)
-  fbI32Bin(107)                // i32.sub (entry - 1)
-  fbArrayGet(cmValsBack())     // (ref null <value struct>)
-  fbRefAsNonNull()             // a live entry's value is non-null
-  fbStructGet(omHeap, omFi)    // .f — the arm's `variantHeap` row or the struct's
-  fbElse()                     // else
-  if emitOptLeafDefault(e.binRight, omLeaf, fnIx) < 0 { return -1 }
-  fbEnd()                      // end (if)
+  if optMapFieldHit(p) < 0 { return -1 }
+  if emitOptLeafDefault(e.binRight, k, fnIx) < 0 { return -1 }
+  fbEnd()
   return 0
 }
 
@@ -48056,11 +48089,23 @@ function emitCoalesceNulAtomJoin(e: BinExpr, exprIx: i32, fnIx: i32) {
   }
   const slot = widenTmpSlot(4001)
   if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  coalNulAtomJoinOpen(slot)
+  if (emitUnionBoxAtRecord("", -1, e.binRight, fnIx) < 0) { return -1 }
+  return coalNulAtomJoinPresent(texts, slot)
+}
+
+// After the `K | null` niche's operand: it teed into `slot`, its null (`-1`) tested, opening the
+// `if` at the result's box.
+export function coalNulAtomJoinOpen(slot: i32) {
   fbLocalTee(slot)
   fbI32Const(-1)
   fbI32Bin(70)     // 0x46 i32.eq → null?
   fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
-  if (emitUnionBoxAtRecord("", -1, e.binRight, fnIx) < 0) { return -1 }
+}
+
+// After the boxed default: the `else` boxing the atom in `slot` as its member string, one of
+// `texts`, under the union's string arm, then the `end`.
+export function coalNulAtomJoinPresent(texts: string[], slot: i32) {
   fbElse()
   fbI32Rel(RS_TAG, scalarTagOfKind(2))
   if emitAtomToStrChain(texts, 0, slot) < 0 { return -1 }
@@ -48071,7 +48116,7 @@ function emitCoalesceNulAtomJoin(e: BinExpr, exprIx: i32, fnIx: i32) {
 
 // Why `emitCoalesceNulAtomJoin` refuses `e`, or "": the union its result boxes into needs a row
 // and a string arm the member is boxed under, and an arm for its default.
-function coalNulAtomJoinWhy(e: BinExpr, fnIx: i32): string {
+export function coalNulAtomJoinWhy(e: BinExpr, fnIx: i32): string {
   if boxDstNameAt(e.binRight, fnIx) == "" {
     return "emitProgram: `??` joins a nullable value into a union the checker recorded no row for"
   }

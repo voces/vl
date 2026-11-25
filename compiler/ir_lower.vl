@@ -39,6 +39,8 @@ import {
   capCellTargetOf,
   exprMap,
   exprNullableRefNiche,
+  mapShapeOfExpr,
+  nulLitAtomTexts,
   nulVariantIdxOfExpr,
   optChainStructIdxOf,
 } from "./emit_classify"
@@ -796,6 +798,8 @@ import {
   coalFieldRecvStash,
   coalFieldUnbox,
   coalFieldValOpen,
+  coalNulAtomJoinOpen,
+  coalNulAtomJoinPresent,
   coalNulBoolJoinOpen,
   coalNulBoolJoinPresent,
   coalNulBoolJoinReserve,
@@ -838,6 +842,8 @@ import {
   numLitOnceStash,
   optBoxLeafOpen,
   optBoxLeafRead,
+  optMapFieldHit,
+  optMapFieldPlanOf,
   optRecLeafRead,
   optRecLeafTestClose,
   optRecLeafTestOpen,
@@ -862,6 +868,7 @@ import {
   isRecvStashSlot,
   objOrderStashSlot,
   unionLitIsStashSlot,
+  widenTmpSlot,
 } from "./emit_if_arm_values"
 import {
   ArrLitArm,
@@ -6011,6 +6018,8 @@ function coalBoxGo(n: SCoalBox, pending: i32[]): i32 {
     "optLeaf" => coalOptLeaf(n, e, pending)
     "optBoxLeaf" => coalOptBoxLeaf(n, e, pending)
     "optRecLeaf" => coalOptRecLeaf(n, e, pending)
+    "optMapField" => coalOptMapField(n, e, pending)
+    "nulAtomJoin" => coalNulAtomJoin(n, e, pending)
     "nulBoolJoin" => coalNulBoolJoin(n, pending)
     "boxStash" => coalBoxStash(n, e, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
@@ -6048,6 +6057,20 @@ function coalBoxStash(n: SCoalBox, _e: BinExpr, pending: i32[]): i32 {
   lwFrames.pop()
   fbEnd()
   return 0
+}
+
+// `l ?? d` over a `K | null` niche joined into a box, as `emitCoalesceNulAtomJoin` writes it: the
+// operand teed into its slot and tested null, the boxed default, then the member string boxed.
+function coalNulAtomJoin(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const texts = nulLitAtomTexts(unwrapParen(e.binLeft), lw.irAt)
+  if texts.length == 0 { return irLMiss("coalesce atom join member") }
+  const slot = widenTmpSlot(4001)
+  cond(n.cbL, pending)
+  coalNulAtomJoinOpen(slot)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  return coalNulAtomJoinPresent(texts, slot)
 }
 
 // `o.v ?? d` over a value-union record field along `coalFieldPlanOf`, as `emitCoalesceUnionField`
@@ -6113,6 +6136,35 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   }
   lwFrames.pop()
   return coalOptLeafRead(lp)
+}
+
+// `m[k]?.f ?? d` as `emitCoalesceOptMapField` writes it: the probe, the hit's field off the
+// entry's value (`optMapFieldHit`), then the default writing the slotless out, and the `end`.
+function coalOptMapField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const mp = n.cbMap
+  if mp == null { return irLMiss("coalesce optional map probe") }
+  const fnIx = lw.irAt
+  const lhsIx = unwrapParen(e.binLeft)
+  const m = if lhsIx >= 0 { nodeAt(lhsIx) } else { null }
+  if !(m is OptMember) || coalOptArmOf(lhsIx, fnIx) != "mapField" {
+    return irLMiss("coalesce optional map field plan")
+  }
+  const rd = nodeAt(m.omObj)
+  if !(rd is Index) { return irLMiss("coalesce optional map field plan") }
+  const p = optMapFieldPlanOf(m.omProp, mapShapeOfExpr(rd.idxArr, fnIx))
+  if p.ofLeaf == null { return irLMiss("coalesce optional map field plan") }
+  if mp.prSym >= 0 && userGlobalReadClass(mp.prSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map read of a global not read plainly")
+  }
+  lwSeq = []
+  mapProbeHead(rd.idxArr, mp.prSym, mp.prNonNull, n.cbL, mp.prKey)
+  irLSettle(pending)
+  if optMapFieldHit(p) < 0 { return -1 }
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  fbEnd()
+  return 0
 }
 
 // `p?.f ?? d` over a union box field, as `emitOptCoalesceBoxLeaf` writes it over an unstaged base
