@@ -18,6 +18,7 @@ import {
   emitOptLeafTail,
   emitOptLinkNullClose,
   emitOptLinkNullOpen,
+  emitOptLinkValueTail,
   optLeafArmOf,
 } from "./wasmEmit"
 import { pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
@@ -355,6 +356,7 @@ import {
   MapGetOrArm,
   MapUnionPlan,
   MemAddrPlan,
+  OptLeafArm,
   armSiteWrite,
   arrCopyBacking,
   arrCopyPlanOf,
@@ -424,6 +426,7 @@ import {
   emitEnvCacheClose,
   emitEnvCacheDrop,
   emitEnvCacheOpen,
+  emitEqRootIsNull,
   emitFoldedConstRead,
   emitForInCursorInit,
   emitMapGetScalarBoxTail,
@@ -549,7 +552,11 @@ import {
   nulNicheEqWhy,
   nulNoneBoxHead,
   nulNoneBoxTail,
-  nulStructEqGuardTail,
+  nulStructEqFieldsAt,
+  nulStructEqGuardBoth,
+  nulStructEqGuardClose,
+  nulStructEqGuardMid,
+  nulStructEqGuardOpen,
   nulTestAtomTail,
   nulTestBoolTail,
   nulTestBoxTagTail,
@@ -4106,7 +4113,7 @@ function structEq(r: RStructEq) {
   // Two nullable records' compare: the nullness guard and the fields, then `!=`'s `i32.eqz`, as
   // `emitNulNicheEqBin` writes it after the guarded block.
   if r.seNul {
-    if nulStructEqGuardTail(n.binLeft, n.binRight, roots, row, fnIx, plan) < 0 {
+    if structEqNulGuard(r, n, roots, row, plan, lG, rG) < 0 {
       return irLMiss("nullable record compare fields")
     }
     structEqLeave(saved)
@@ -4119,6 +4126,81 @@ function structEq(r: RStructEq) {
   }
   structEqRowsBank(plan.erL.epRows, plan.erR.epRows)
   return 0
+}
+
+// `nulStructEqGuardTail` over the IR's own null tests where it holds the side (`structEqSideNul`):
+// the `$out` block, both sides' tests, the disagreement's 0, the left's test again, both-null's 1,
+// then legacy's field-wise compare.
+function structEqNulGuard(
+  r: RStructEq,
+  n: BinExpr,
+  roots: i32[],
+  row: i32,
+  plan: EqRootPlan,
+  lG: boolean,
+  rG: boolean,
+): i32 {
+  nulStructEqGuardOpen()
+  if structEqSideNul(r.seL, n.binLeft, roots[0], plan.erL, lG) < 0 { return -1 }
+  if structEqSideNul(r.seR, n.binRight, roots[1], plan.erR, rG) < 0 {
+    return -1
+  }
+  nulStructEqGuardMid()
+  if structEqSideNul(r.seL, n.binLeft, roots[0], plan.erL, lG) < 0 { return -1 }
+  nulStructEqGuardBoth()
+  if nulStructEqFieldsAt(roots[0], roots[1], row, lw.irAt, plan) < 0 {
+    return -1
+  }
+  nulStructEqGuardClose()
+  return 0
+}
+
+// One side's null test in a nullable-record compare, as `emitEqIsNull` writes it along
+// `nulTestArmOf`: a folded arm's constant, or the side read again (its variable's local, or a
+// place the builder re-reads, `irHoistRecv`) and the arm's tail. A stashed or element side, and
+// an arm reading anything else, is legacy's (`emitEqRootIsNull`).
+function structEqSideNul(
+  o: Opnd,
+  ix: i32,
+  root: i32,
+  place: EqRootPlace,
+  placeSide: boolean,
+): i32 {
+  const fnIx = lw.irAt
+  if root == -2 || root == -3 || place.epKind == "elem" {
+    return emitEqRootIsNull(root, ix, fnIx, place)
+  }
+  const arm = nulTestArmOf(ix, fnIx, false, false)
+  if arm == "nnfold" || arm == "none" {
+    fbI32Const(0)
+    return 0
+  }
+  if arm == "nulfold" {
+    fbI32Const(1)
+    return 0
+  }
+  if (
+    arm != "nullRef"
+    && arm != "nulStr"
+    && arm != "bool"
+    && arm != "atom"
+    && arm != "boxTag"
+  ) {
+    return emitEqRootIsNull(root, ix, fnIx, place)
+  }
+  if placeSide {
+    if irHoistRecv(unwrapParen(ix)) < 0 { return -1 }
+  } else {
+    const loc = structEqSideLocal(o)
+    if loc < 0 { return irLMiss("nullable record compare side") }
+    fbLocalGet(loc)
+  }
+  if arm == "bool" { return if nulTestBoolTail(false) < 0 { -1 } else { 0 } }
+  if arm == "atom" { return if nulTestAtomTail(false) < 0 { -1 } else { 0 } }
+  if arm == "boxTag" {
+    return if nulTestBoxTagTail(false) < 0 { -1 } else { 0 }
+  }
+  return if nulTestRefTail(false) < 0 { -1 } else { 0 }
 }
 
 // `REqHelp`: `__eq_<row>__`'s compare, which reads its operands at their parameter slots.
@@ -4313,6 +4395,8 @@ function irHoistRecv(ix: i32): i32 {
     if irHoistRecv(unwrapParen(m.memObj)) < 0 { return -1 }
     return fieldTail(ix, m)
   }
+  const o = lw.irReadOpt.get(ix)
+  if o != null { return optReadGo(o, true) }
   irLMiss("hoisted receiver read")
   return -1
 }
@@ -4932,34 +5016,76 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
 // and the leaf's head, then the base as non-null (its niche recovered) and the leaf's tail.
 function optRead(r: ROptRead) {
   if r.orTag >= 0 { return optFieldIs(r) }
+  return optReadGo(r, false)
+}
+
+// `optRead`'s untagged read, written `again` (its root read again from the first, `irHoistRecv`).
+function optReadGo(r: ROptRead, again: boolean): i32 {
   const arm = optLeafArmOf(r.orAt, lw.irAt)
   if arm == "fail" { return irLMiss("optional read arm") }
+  const m = nodeAt(r.orAt)
+  if !(m is OptMember) { return irLMiss("optional read node") }
+  return optReadLinks(r, m, arm, [again])
+}
+
+// `optReadGo`'s chain test, leaf head, value and tail.
+// `read[0]`: whether the root has been read once (`optChainRoot`).
+function optReadLinks(
+  r: ROptRead,
+  m: OptMember,
+  arm: OptLeafArm,
+  read: boolean[],
+): i32 {
   if arm != "nonNull" {
-    irLOpnd(r.orV)
-    fbRefIsNull()
-    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r, true) }
-    emitOptLinkNullClose(r.orAt, lw.irAt)
+    if optChainIsNullAt(r, r.orAt, read) < 0 { return -1 }
     emitOptLeafHead(r.orAt, lw.irAt)
-    optReadBase(r, true)
-  } else {
-    optReadBase(r, false)
   }
+  if optChainValueAt(r, m.omObj, read) < 0 { return -1 }
   emitOptLeafTail(r.orAt, lw.irAt)
   return 0
 }
 
-// The optional read's base as `emitOptChainValue` pushes an unstaged one, `again` once the null
-// test has read it (a temp's read written again, `opndAgain`): its niche recovered.
-function optReadBase(r: ROptRead, again: boolean) {
-  const m = nodeAt(r.orAt)
-  if !(m is OptMember) { return irLMiss("optional read node") }
-  if again {
-    if opndAgain(r.orV, m.omObj) < 0 { return -1 }
-  } else {
-    irLOpnd(r.orV)
+// `emitOptChainIsNull` over read `r`'s chain at `x`: each link's receiver test, then its own field
+// test where the field has a null; the root's null test at the bottom.
+function optChainIsNullAt(r: ROptRead, x: i32, read: boolean[]): i32 {
+  const m = nodeAt(unwrapParen(x))
+  if !(m is OptMember) {
+    if optChainRoot(r, x, read) < 0 { return -1 }
+    fbRefIsNull()
+    return 0
   }
-  if exprNullableRefNiche(m.omObj, lw.irAt) { fbRefAsNonNull() }
+  if optChainIsNullAt(r, m.omObj, read) < 0 { return -1 }
+  if emitOptLinkNullOpen(x, lw.irAt) && optChainValueAt(r, m.omObj, read) < 0 {
+    return -1
+  }
+  emitOptLinkNullClose(x, lw.irAt)
   return 0
+}
+
+// `emitOptChainValue` over read `r`'s chain at `x`: the root, its niche recovered, then each link's
+// field, recovered non-null.
+function optChainValueAt(r: ROptRead, x: i32, read: boolean[]): i32 {
+  const m = nodeAt(unwrapParen(x))
+  if !(m is OptMember) {
+    if optChainRoot(r, x, read) < 0 { return -1 }
+    if exprNullableRefNiche(x, lw.irAt) { fbRefAsNonNull() }
+    return 0
+  }
+  if optChainValueAt(r, m.omObj, read) < 0 { return -1 }
+  if emitOptLinkValueTail(x, lw.irAt) < 0 {
+    return irLMiss("optional link field")
+  }
+  return 0
+}
+
+// Read `r`'s chain root `x`: its operand the first time, then read again (`opndAgain`).
+function optChainRoot(r: ROptRead, x: i32, read: boolean[]): i32 {
+  if !read[0] {
+    read[0] = true
+    irLOpnd(r.orV)
+    return 0
+  }
+  return opndAgain(r.orV, x)
 }
 
 // A tagged `ROptRead` as legacy's `optField` arm writes it over an unstaged base: its null test,
