@@ -190,13 +190,13 @@ compare_all() {
       && { [ "$ra" = 0 ] || [ "${ERRCMP:-0}" != 1 ] || cmp -s "$2/$k.err" "$3/$k.err"; } || keep "$2" "$3" "$k"
     if [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
       expd=$((expd + 1)); echo "expected divergence $f (legacy-wrong: claimless exit $rb)"
-      echo "$f" >> "$T/bdiff"
+      bkey "$f" >> "$T/bdiff"
     elif [ "$ra" != "$rb" ]; then diff=$((diff + 1)); echo "DIFF $f (exit $ra vs $rb)"
     elif [ "$ra" != 0 ] && [ "${ERRCMP:-0}" = 1 ] && ! cmp -s "$2/$k.err" "$3/$k.err"; then
       diff=$((diff + 1)); echo "DIFF $f (first error: $(cat "$2/$k.err") vs $(cat "$3/$k.err"))"
     elif [ "$ra" != 0 ]; then both=$((both + 1))
     elif cmp -s "$2/$k.wasm" "$3/$k.wasm"; then same=$((same + 1))
-    elif [ "$BYTES" != 1 ]; then bytes=$((bytes + 1)); echo "$f" >> "$T/bdiff"
+    elif [ "$BYTES" != 1 ]; then bytes=$((bytes + 1)); bkey "$f" >> "$T/bdiff"
     elif need_dis "$f" && why=$(expected_divergence "$f" "$2/$k.wasm" "$3/$k.wasm"); then
       expd=$((expd + 1)); echo "expected divergence $f ($why)"
     else diff=$((diff + 1)); echo "DIFF $f${why:+ ($why)}"; fi
