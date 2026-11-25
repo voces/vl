@@ -96,6 +96,6 @@ fi
 [ -e node_modules ] || ln -s "$MAIN/node_modules" node_modules
 [ -e scripts/vl-host/target ] || ln -s "$MAIN/scripts/vl-host/target" scripts/vl-host/target
 disasm_check
-bash scripts/refresh-compiler.sh
+bash scripts/refresh-compiler.sh --allow-refetch
 host_check
 echo "agent-setup: ready (vl: $VL, seed: build/vl-compiler.wasm)"

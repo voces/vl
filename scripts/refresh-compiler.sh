@@ -17,6 +17,11 @@
 # re-proves the refreshed result. (Pass --no-fallback to fail on a missing seed
 # too, e.g. in an environment with no network.)
 #
+# STALE WARM SEED: a seed that cannot compile current source is a loud failure, exit 1, the
+# seed untouched. Only --allow-refetch (CI's restored caches, agent setup) replaces it with a
+# fetched `seed-latest` and retries once: a silent swap built the source with another compiler
+# and looked like a fixpoint (coordinator ruling, 2026-11-25).
+#
 # STALE-SEED FAILURE: a seed (cached or fetched) that predates a language
 # construct newly used BY THE COMPILER ITSELF cannot compile current source (e.g.
 # "unsupported statement in body" after the compiler starts using a feature only
@@ -58,16 +63,18 @@ VL="${VL:-scripts/vl-host/target/release/vl}"
 SEED="${SEED:-build/vl-compiler.wasm}"
 OUT="${OUT:-build/vl-compiler.wasm}"
 FALLBACK=1
+ALLOW_REFETCH=0
 PROVE=0
 WARM_FUEL=--fuel
 FUEL_STASH=""
 for arg in "$@"; do
   case "$arg" in
     --no-fallback) FALLBACK=0 ;;
+    --allow-refetch) ALLOW_REFETCH=1 ;;
     --prove-fixpoint) PROVE=1 ;;
     --no-fuel-sidecars) WARM_FUEL="" ;;
     --fuel-stash=*) FUEL_STASH="${arg#--fuel-stash=}" ;;
-    *) echo "usage: refresh-compiler.sh [--no-fallback] [--prove-fixpoint] [--no-fuel-sidecars] [--fuel-stash=<dir>]" >&2; exit 2 ;;
+    *) echo "usage: refresh-compiler.sh [--no-fallback] [--allow-refetch] [--prove-fixpoint] [--no-fuel-sidecars] [--fuel-stash=<dir>]" >&2; exit 2 ;;
   esac
 done
 
@@ -133,6 +140,12 @@ if selfcompile; then ok=1; fi
 # fails and we have not already fetched fresh this run, re-fetch `seed-latest`
 # (republished on every master push) and retry the self-compile ONCE before failing
 # loud. This makes the refresh robust to the CI seed-cache staleness race.
+if [ "$ok" = 0 ] && [ "$fetched" = 0 ] && [ "$ALLOW_REFETCH" = 0 ]; then
+  echo "ERROR: the seed $SEED cannot compile compiler/*.vl (read the diagnostics above)." >&2
+  echo "  It is unchanged. A source that does not compile is the common cause; a stale cached" >&2
+  echo "  seed is the other, and scripts/fetch-seed.sh (or --allow-refetch) replaces it." >&2
+  exit 1
+fi
 if [ "$ok" = 0 ] && [ "$FALLBACK" = 1 ] && [ "$fetched" = 0 ]; then
   echo "  seed cannot compile current source — may be a stale CACHED seed;" >&2
   echo "  re-fetching the rolling seed-latest and retrying once..." >&2
