@@ -7524,21 +7524,46 @@ function mapIterRhs(b: i32[], m: Member, ix: i32): Rhs {
 
 // A list `.slice` on legacy's arm (`callIsArrSlice`): the receiver, then its i32 bounds.
 function listSliceRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  const starts = [b.length]
   const v = irBExpr(b, m.memObj)
   if ibMiss != "" { return missRhs("method operand") }
   if !(repNodeAt(irBOpRep(v)) is RList) { return missRhs("slice receiver rep") }
-  const at = b.length
-  const args: Opnd[] = []
-  for a in c.callArgs { args.push(irBExpr(b, a)) }
-  if ibMiss != "" { return missRhs("method operand") }
-  if ifBelowLead(b, at, "slice short-circuit operand") {
-    return missRhs("slice short-circuit operand")
+  const ops = [v]
+  if !stagedOperands(b, ops, starts, [m.memObj], c.callArgs, "slice short-circuit operand") {
+    return missRhs(ibMiss)
   }
+  const args = ops.slice(1)
   for a in args {
     if repPrim(irBOpRep(a)) != "i32" { return missRhs("slice bound coercion") }
   }
-  const r: Rhs = { scV: v, scArgs: args, scAt: ix }
+  const r: Rhs = { scV: ops[0], scArgs: args, scAt: ix }
   return r
+}
+
+// Builds the operands `ixs` after `ops` (built from `starts`, for nodes `opIxs`), each earlier
+// operand staged below a later one that holds a valued `if`, a `??`, a store or a stash, as a
+// call's arguments are (`irBStageLeads`). False, with `why` the miss, when one cannot be.
+function stagedOperands(
+  b: i32[],
+  ops: Opnd[],
+  starts: i32[],
+  opIxs: i32[],
+  ixs: i32[],
+  why: string,
+): boolean {
+  for a in ixs {
+    const at = b.length
+    starts.push(at)
+    const o = irBExpr(b, a)
+    if ibMiss != "" { return false }
+    if !irBStageLeads(b, at, starts, ops, opIxs) {
+      irBMiss(why)
+      return false
+    }
+    ops.push(o)
+    opIxs.push(a)
+  }
+  return true
 }
 
 // A string method legacy's call ladder takes by name (`exprIsStrMethod`): its receiver and
@@ -7625,12 +7650,11 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     }
     return missRhs("method " + m.memProp)
   }
+  const starts = [b.length]
   const args: Opnd[] = [irBExpr(b, m.memObj)]
-  const at = b.length
-  for a in c.callArgs { args.push(irBExpr(b, a)) }
   if ibMiss != "" { return missRhs("method operand") }
-  if ifBelowLead(b, at, "method short-circuit operand") {
-    return missRhs("method short-circuit operand")
+  if !stagedOperands(b, args, starts, [m.memObj], c.callArgs, "method short-circuit operand") {
+    return missRhs(ibMiss)
   }
   // The receiver is a string, a needle a string, and every other argument an i32.
   const argPrim = if op == "indexof" || op == "includes" { "str" } else { "i32" }
@@ -13422,9 +13446,15 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1)
     if ibMiss != "" { return l }
     // A left operand that is a variable or immediate is staged below a right operand that holds
-    // a valued `if`, as it is below a later argument's (`irBStageLeads`).
+    // a valued `if`, a `??` that stages the leads before it, a store or a stash, as it is below a
+    // later argument's (`irBStageLeads`). A `??` that stages nothing and a receiver stage are
+    // written in place, below which nothing is staged.
     const lead = [l]
-    if valuedIfFrom(b, at) && !inPlaceFrom(b, at) {
+    const below = valuedIfFrom(b, at)
+      || coalBoxFrom(b, at, true)
+      || storeFrom(b, at)
+      || stashSetFrom(b, at)
+    if below && !coalBoxFrom(b, at, false) && !receiverStageFrom(b, at) {
       if !irBStageLeads(b, at, [ls], lead, [n.binLeft]) {
         return irBMiss("staged lead")
       }
