@@ -4171,8 +4171,8 @@ function structEq(r: RStructEq) {
     return irLMiss("record compare place")
   }
   const plan: EqRootPlan = {
-    erL: if lE { structEqElemPlace(r.seL, r.seLIx[0], lG) } else { structEqRootPlace(n.binLeft, lG) },
-    erR: if rE { structEqElemPlace(r.seR, r.seRIx[0], rG) } else { structEqRootPlace(n.binRight, rG) },
+    erL: if lE { structEqElemPlace(r.seL, r.seLIx[0], lG, n.binLeft) } else { structEqRootPlace(n.binLeft, lG) },
+    erR: if rE { structEqElemPlace(r.seR, r.seRIx[0], rG, n.binRight) } else { structEqRootPlace(n.binRight, rG) },
   }
   if lwMiss != "" { return -1 }
   if plan.erL.epSlot == -2 || plan.erR.epSlot == -2 {
@@ -4317,14 +4317,25 @@ function structEqRowsBank(lRows: i32[], rRows: i32[]) {
   return 0
 }
 
-// The `elem` root place of a record compare side read as a ref list element: receiver `v` from
-// its local, or re-read from its expression (`epSlot` -1) where it is a place, and index `i`
-// from its local, an immediate, or its expression (`epIdx` -2) where it is a place; `epSlot` -2
-// where one has neither.
-function structEqElemPlace(v: Opnd, i: Opnd, placeRecv: boolean): EqRootPlace {
-  const vs = if placeRecv { -1 } else { structEqSideLocal(v) }
+// The `elem` root place of a record compare side `ix` read as a ref list element: receiver `v`
+// from its local, or re-read where it is a place, as the bytes the IR reads it again with
+// (`irReadsAgain`, `epSlot` -3) or from its expression (-1); index `i` likewise from its local, an
+// immediate, its bytes (`epIdx` -3) or its expression (-2). `epSlot` -2 where one has neither.
+function structEqElemPlace(
+  v: Opnd,
+  i: Opnd,
+  placeRecv: boolean,
+  ix: i32,
+): EqRootPlace {
+  const el = eqElemRootOf(ix)
+  const nd = if el >= 0 { nodeAt(el) } else { null }
+  const recvIx = if nd is Index { unwrapParen(nd.idxArr) } else { -1 }
+  const idxIx = if nd is Index { unwrapParen(nd.idxIndex) } else { -1 }
+  const rBytes = placeRecv && recvIx >= 0 && irReadsAgain(recvIx)
+  const vs = if rBytes { -3 } else if placeRecv { -1 } else { structEqSideLocal(v) }
   const placeIdx = structEqPlaceSide(i)
-  const xs = if i is OImm { -1 } else if placeIdx { -2 } else { structEqSideLocal(i) }
+  const iBytes = placeIdx && idxIx >= 0 && irReadsAgain(idxIx)
+  const xs = if i is OImm { -1 } else if iBytes { -3 } else if placeIdx { -2 } else { structEqSideLocal(i) }
   const imm = if i is OImm { i.oiBits as% i32 } else { 0 }
   const bad = vs < 0 && !placeRecv || !(i is OImm) && xs == -1
   return {
@@ -4333,8 +4344,31 @@ function structEqElemPlace(v: Opnd, i: Opnd, placeRecv: boolean): EqRootPlace {
     epIdx: xs,
     epImm: imm,
     epRows: [],
-    epBytes: [],
+    epBytes: if rBytes { readAgainBytes(recvIx) } else { [] },
+    epIdxBytes: if iBytes { readAgainBytes(idxIx) } else { [] },
   }
+}
+
+// The list element read a compare side `ix` roots its field chain at: the side, or the receiver
+// under its field reads; -1 where that root is no list read.
+function eqElemRootOf(ix: i32): i32 {
+  let u = unwrapParen(ix)
+  while u >= 0 && u < P.nodes.length {
+    const m = nodeAt(u)
+    if m is Index { return u }
+    if !(m is Member) { return -1 }
+    u = unwrapParen(m.memObj)
+  }
+  return -1
+}
+
+// The bytes `irHoistRecv` reads node `ix` again with, written aside rather than in place.
+function readAgainBytes(ix: i32): u8[] {
+  const bs: u8[] = []
+  const prev = wTarget(bs)
+  irHoistRecv(ix)
+  wTarget(prev)
+  return bs
 }
 
 // The root place of a record compare side at node `ix` that is no list element: a place side
@@ -4343,17 +4377,14 @@ function structEqElemPlace(v: Opnd, i: Opnd, placeRecv: boolean): EqRootPlace {
 function structEqRootPlace(ix: i32, place: boolean): EqRootPlace {
   const u = unwrapParen(ix)
   if !place || !irReadsAgain(u) { return EQ_ROOT_EXPR }
-  const bs: u8[] = []
-  const prev = wTarget(bs)
-  irHoistRecv(u)
-  wTarget(prev)
   return {
     epKind: "bytes",
     epSlot: -1,
     epIdx: -1,
     epImm: 0,
     epRows: [],
-    epBytes: bs,
+    epBytes: readAgainBytes(u),
+    epIdxBytes: [],
   }
 }
 
