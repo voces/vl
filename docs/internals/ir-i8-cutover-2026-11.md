@@ -185,6 +185,24 @@ only when the start body is unclaimed. Nothing reaches legacy through the door.
 The gate ratchets the set of causes, not the count: coverage moves a program from explained to
 unexplained when it claims the last unclaimed function beside a re-entry (coordinator ruling, 2026-11-25).
 
+**The static edges go to zero by hook** (coordinator ruling, 2026-11-25). Every edge from a kept
+function into stage B lies under one IR hook: the call where the claim path enters a legacy tail
+that takes an expression index. Porting the hook leaves its whole kept subtree unreached, so
+`dead-exports.vl` takes it and the keep list shrinks; the edge baseline only falls.
+
+| IR hook | edges under it (the causes among them) | owner |
+|---|---|---|
+| `armSite` → `emitArmSiteAt` → `emitUnionCoerce` | the union-coercion tree (`emitArmSiteAt`, `emitCoerceAtomPayload`, `pushMapRecvRef`) | COV-IS |
+| `structEq` → `nulStructEqGuardTail` | `emitChainRead`, `refListReadAt`, `emitIdxIndex`, `emitNulIsNullTest` | COV-UNION |
+| `lowerList` → `coerceTail` → `emitRecCopyInto` | `rcReadSource`, `emitRecCopyFields` | COV-CALL |
+| `hoistInRangeCopy` → `arrLitHoistGlobal` | `arrLitDataElemExpr`, `emitStrValue` | COV-CLOS, COV-CALL |
+| `coalListGetOr` → `listGetOrOpen` | `emitListGetIdx`, `emitListGetRecv` | COV-CLOS |
+| `emitConstCellInit` → `emitUnionBoxOwed` | `emitDelivered`, `emitUnionBoxArg` | COV-START |
+| `numCastTail` → `numExactCastTail` → `emitReturnValue` | none: unreachable, cut | INFRA |
+| `irFitTail` | `emitRecordFitIs`, `fitRecvRead` | INFRA |
+| `rhs` → `emitAsUnionTagged` → `emitAsOneListTail` | `emitListFitAt` | INFRA |
+| none (`structEqStage`, kept with no IR root) | its `emitExpr` call | INFRA (off the keep list) |
+
 A port makes the tail take an IR-lowered operand in place of its `emitExpr` call. The rehearsal
 found two more re-entries in its last keep round: `refListReadAt` (4) goes to COV-CLOS, which owns
 lists, and `emitNulIsNullTest` (2) to COV-IS, which owns nulls. Per-family staging (§4) buys nothing:

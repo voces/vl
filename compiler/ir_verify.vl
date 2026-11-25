@@ -16,7 +16,6 @@ import {
   Opnd,
   PStaged,
   RAfterEffects,
-  RArmSite,
   RArmUnbox,
   RAsTail,
   RAsUnion,
@@ -136,6 +135,7 @@ import {
   RVariantChain,
   RVariantDiscrim,
   Rhs,
+  SArmSite,
   SAssign,
   SBlock,
   SBoundsCheck,
@@ -666,31 +666,6 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const sn = repNodeAt(opRep(r.srV))
       if !(sn is RBox) && !(sn is RNullable && sn.rnDisc == 4) {
         return fail(2, at, "a shared read's receiver is a box")
-      }
-      0
-    }
-    RArmSite => {
-      for o in r.asOps { use(o, at) }
-      if (
-        r.asOps.length < 1
-        || r.asOps.length > 2
-        || !boxShaped(opRep(r.asOps[0]))
-      ) {
-        return fail(
-          2,
-          at,
-          "an arm-site read takes a union box, then at most an index or key",
-        )
-      }
-      if r.asOps.length == 2 {
-        const kr = opRep(r.asOps[1])
-        if kr != vfI32 && kr != vfStr {
-          return fail(
-            2,
-            at,
-            "an arm-site read's index is an i32 and its key a string",
-          )
-        }
       }
       0
     }
@@ -2188,6 +2163,38 @@ function coalOptLeafWhy(n: SCoalBox): string {
   return ""
 }
 
+// An optional box field's `??` re-reads its receiver and yields a scalar or the union's box.
+function coalOptBoxLeafWhy(n: SCoalBox): string {
+  if !(n.cbL is OVar) {
+    return "an optional box field `??` re-reads no variable"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "an optional box field `??` writes no variable"
+  }
+  const r = vf.irVars[o].vRep
+  if repPrim(r) == null && !(repNodeAt(r) is RBox) {
+    return "an optional box field `??` yields no scalar or box"
+  }
+  return ""
+}
+
+// An optional record field's `??` re-reads its receiver and yields a record or its nullable.
+function coalOptRecLeafWhy(n: SCoalBox): string {
+  if !(n.cbL is OVar) {
+    return "an optional record field `??` re-reads no variable"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "an optional record field `??` writes no variable"
+  }
+  const r = repNodeAt(vf.irVars[o].vRep)
+  if !(r is RRecord || r is RNullable && repNodeAt(r.rnInner) is RRecord) {
+    return "an optional record field `??` yields no record"
+  }
+  return ""
+}
+
 // A `boolean | null` niche's join `??` reads the niche and yields the union's box.
 function coalNulBoolJoinWhy(n: SCoalBox): string {
   if !repBoolNiche(opRep(n.cbL)) {
@@ -2580,6 +2587,8 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
     "litUnion" | "nulBool" => coalNicheWhy(n)
     "fieldBox" | "fieldVal" => coalFieldWhy(n)
     "optLeaf" => coalOptLeafWhy(n)
+    "optBoxLeaf" => coalOptBoxLeafWhy(n)
+    "optRecLeaf" => coalOptRecLeafWhy(n)
     "nulBoolJoin" => coalNulBoolJoinWhy(n)
     "boxStash" => coalBoxStashWhy(n)
     "boxFieldScalar" => coalBoxFieldScalarWhy(n)
@@ -2593,6 +2602,45 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
   while vfDefLog.length > nDefs {
     const d = vfDefLog.pop() ?? -1
     if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
+  }
+  return 0
+}
+
+// An arm-site read's checks: its box, then at most an index or key, and per arm a payload variable
+// and a body that writes the out.
+function armSiteCheck(n: SArmSite, id: i32) {
+  for o in n.saOps { use(o, id) }
+  if n.saOps.length < 1 || n.saOps.length > 2 || !boxShaped(opRep(n.saOps[0])) {
+    return fail(
+      2,
+      id,
+      "an arm-site read takes a union box, then at most an index or key",
+    )
+  }
+  if n.saOps.length == 2 {
+    const kr = opRep(n.saOps[1])
+    if kr != vfI32 && kr != vfStr {
+      return fail(
+        2,
+        id,
+        "an arm-site read's index is an i32 and its key a string",
+      )
+    }
+  }
+  if n.saOut < 0 || n.saOut >= vf.irVars.length {
+    return fail(4, id, "an arm-site read writes no variable")
+  }
+  if n.saArms.length == 0 || n.saArms.length != n.saVars.length {
+    return fail(2, id, "an arm-site read has a payload per arm")
+  }
+  for v in n.saVars {
+    if v < 0 || v >= vf.irVars.length || vf.irVars[v].vKind != "local" {
+      return fail(4, id, "an arm-site arm's payload is a local")
+    }
+  }
+  for a in n.saArms {
+    nested(a)
+    endsWriting(a, n.saOut, id)
   }
   return 0
 }
@@ -2799,6 +2847,7 @@ function stmt(id: i32, prev: i32) {
     }
     SIf => ifSpine(id)
     SCoalBox => coalBoxCheck(n, id)
+    SArmSite => armSiteCheck(n, id)
     SSwitch => switchCheck(n, id)
     SIntSwitch => intSwitchCheck(n, id)
     SBr => {
@@ -2969,7 +3018,8 @@ function touchesList(n: IrNode): boolean {
     SListSet | SBoundsCheck => true
     SLet => rhsReadsList(n.lRhs)
     SEffect => rhsReadsList(n.efRhs)
-    SAssign |
+    SArmSite |
+      SAssign |
       SBlock |
       SBr |
       SCellSet |
@@ -3164,7 +3214,6 @@ function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
     RAfterEffects |
-      RArmSite |
       RArmUnbox |
       RAsTail |
       RAsUnion |

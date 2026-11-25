@@ -18,7 +18,7 @@ import {
   sharedFieldArmTag,
 } from "./emit_obj_lit_fits"
 import { armFieldElemTyIx, armFieldStoreTy, sFieldStoreTy } from "./emit_state"
-import { exprPackedRow } from "./emit_classify"
+import { exprPackedRow, readRepMemoAdvance } from "./emit_classify"
 import { unMemPeelAliasWrapper } from "./emit_union_tykey_text"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { unionArmRowOfTy } from "./emit_local_slots"
@@ -15348,7 +15348,6 @@ function emitMapRecvKey(recvIx: i32, keyIx: i32, fnIx: i32) {
   let kr = 0
   if arm == "atom" { kr = emitAtomToStr(keyIx, fnIx) }
   else if arm == "i64" { kr = emitScalarValue(keyIx, fnIx, "i64") }
-  else if keyIx == armIdxNode && armIdxNode >= 0 { kr = emitArmIdx(fnIx) }
   else { kr = emitExpr(keyIx, fnIx) }
   if kr < 0 { return -1 }
   return mapRecvKeyTail(mshape)
@@ -22497,26 +22496,58 @@ export function nulStructEqGuardTail(
 ) {
   const lRoot = roots[0]
   const rRoot = roots[1]
-  fbBlock(127) // block i32 — $out
+  nulStructEqGuardOpen()
   if emitEqRootIsNull(lRoot, lIx, fnIx, rp.erL) < 0 { return -1 }
   if emitEqRootIsNull(rRoot, rIx, fnIx, rp.erR) < 0 { return -1 }
+  nulStructEqGuardMid()
+  if emitEqRootIsNull(lRoot, lIx, fnIx, rp.erL) < 0 { return -1 }
+  nulStructEqGuardBoth()
+  if nulStructEqFieldsAt(lRoot, rRoot, si, fnIx, rp) < 0 { return -1 }
+  nulStructEqGuardClose()
+  return 0
+}
+
+// `nulStructEqGuardTail`'s parts, in order: the `$out` block, then the two sides' null tests;
+// `Mid` answers 0 where they disagree; the left's test again; `Both` answers 1 where it is null;
+// the field-wise compare (`nulStructEqFieldsAt`); `Close` ends the block.
+export function nulStructEqGuardOpen() {
+  fbBlock(127) // block i32 — $out
+  return 0
+}
+
+export function nulStructEqGuardMid() {
   fbI32Bin(71) // 0x47 i32.ne — the two sides disagree on nullness
   fbIf(64)
   fbI32Const(0)
   fbBr(1) // → $out
   fbEnd()
-  if emitEqRootIsNull(lRoot, lIx, fnIx, rp.erL) < 0 { return -1 }
+  return 0
+}
+
+export function nulStructEqGuardBoth() {
   fbIf(64)
   fbI32Const(1) // both null ⇒ equal
   fbBr(1) // → $out
   fbEnd()
-  const pathSi: i32[] = []
-  const pathFi: i32[] = []
-  if (emitStructEqRec(lRoot, rRoot, si, pathSi, pathFi, fnIx, rp) < 0) {
-    return -1
-  }
+  return 0
+}
+
+export function nulStructEqGuardClose() {
   fbEnd()
   return 0
+}
+
+// The field-wise compare of a nullable-record compare at eq row `si`, from roots `lRoot`/`rRoot`.
+export function nulStructEqFieldsAt(
+  lRoot: i32,
+  rRoot: i32,
+  si: i32,
+  fnIx: i32,
+  rp: EqRootPlan,
+): i32 {
+  const pathSi: i32[] = []
+  const pathFi: i32[] = []
+  return emitStructEqRec(lRoot, rRoot, si, pathSi, pathFi, fnIx, rp)
 }
 
 // The stash slots `structEqEnter` saved, restored after a compare that is not `structEqTail`'s.
@@ -22760,7 +22791,12 @@ function structEqSlot(row: i32, side: i32): i32 {
 
 // `emitEqIsNull` over a compare root: a stashed operand is tested off its slot, and an `elem`
 // place's element (`eqElemNullTestOk`) is read through the place, its row banked.
-function emitEqRootIsNull(root: i32, ix: i32, fnIx: i32, place: EqRootPlace) {
+export function emitEqRootIsNull(
+  root: i32,
+  ix: i32,
+  fnIx: i32,
+  place: EqRootPlace,
+) {
   if root == -2 || root == -3 {
     fbLocalGet(if root == -2 { eqStashL } else { eqStashR })
     fbRefIsNull()
@@ -27172,13 +27208,23 @@ export function numCastTail(exprIx: i32, fnIx: i32): i32 {
   return match asCastArmOf(exprIx, fnIx) {
     "plain" => numPlainCastTail(numCastSrcRepOf(e.asObj, fnIx), e.asTy)
     "wrap" => numWrapCastTail(exprIx, fnIx)
-    "exact" => numExactCastTail(exprIx, asExprNumSrcName(exprIx), fnIx)
+    "exact" => numExactCastIrTail(exprIx, asExprNumSrcName(exprIx), fnIx)
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => numCastNoTail()
-    "holeExact" => numExactCastTail(exprIx, asExprHolePinSrc(exprIx, fnIx), fnIx)
-    "holeOpt" => if holeOptExactSrc(exprIx, fnIx) != "" { numExactCastTail(exprIx, holeOptExactSrc(exprIx, fnIx), fnIx) } else { numPlainCastTail(numCastSrcRepOf(e.asObj, fnIx), asExprNumTgtName(exprIx)) }
+    "holeExact" => numExactCastIrTail(exprIx, asExprHolePinSrc(exprIx, fnIx), fnIx)
+    "holeOpt" => if holeOptExactSrc(exprIx, fnIx) != "" { numExactCastIrTail(exprIx, holeOptExactSrc(exprIx, fnIx), fnIx) } else { numPlainCastTail(numCastSrcRepOf(e.asObj, fnIx), asExprNumTgtName(exprIx)) }
     "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => numCastNoTail()
     "union" | "notCast" => numCastNoTail()
   }
+}
+
+// `numExactCastTail` for the IR, which never owes the function's null here: a bare exact `as`
+// carries it as `ncMiss` and takes `numCastMissTail`.
+function numExactCastIrTail(exprIx: i32, srcIn: string, fnIx: i32): i32 {
+  const h = numExactCastHead(exprIx, srcIn, fnIx)
+  if h != 1 { return h }
+  return emitFail(
+    "emitProgram: a bare exact `as` reached `numCastTail` without its returned null",
+  )
 }
 
 function numCastNoTail() {
@@ -33506,6 +33552,7 @@ type MfSrcTys = {
   srcBack: i32,
   srcElemRef: boolean,
   srcSlot: i32,
+  srcNulUnit: boolean,
 }
 
 // The interned signature of `.map`/`.filter` callback `argIx`: the lifted function `cbFe`'s, or
@@ -33574,6 +33621,7 @@ function mfRefused(why: string): MfPlan {
     srcBack: -1,
     srcElemRef: false,
     srcSlot: -1,
+    srcNulUnit: false,
   }
   const dst: MfDstTys = { dstWrap: -1, dstBack: -1 }
   const p: MfPlan = {
@@ -33615,6 +33663,20 @@ export function mapFilterWhy(callIx: i32, fnIx: i32): string {
   }
   if cbn is Ident { return "" }
   return "map callback expression"
+}
+
+// Whether `.map`/`.filter` over receiver `recvIx` reads a `null[]` element, stored as the
+// `boolean | null` sentinel (D4671), for callback `argIx` whose element parameter is `nullref`:
+// the loop then hands the callback the bottom ref in its place (D17039).
+function mfNulUnitToRef(
+  recvIx: i32,
+  argIx: i32,
+  cbFe: i32,
+  fnIx: i32,
+): boolean {
+  if !arrElemIsNullUnitAt(recvIx, fnIx) { return false }
+  const key = if cbFe >= 0 { cloSigKeyExt(cbFe) } else { mfCallbackCloKey(argIx, fnIx) }
+  return key != "" && sigParamKindAt(key, 0) == "nulnone"
 }
 
 // The plan of `.map`/`.filter` call `callIx`, asked where legacy's arm asks it.
@@ -33663,6 +33725,7 @@ export function mapFilterPlanOf(callIx: i32, fnIx: i32): MfPlan {
   if !fnUses.mapFilter || p.mfSrcL < 0 || p.mfDstL < 0 {
     return mfRefused("emitProgram: .map/.filter scratch frame not reserved")
   }
+  p.mfSrc.srcNulUnit = mfNulUnitToRef(callee.memObj, c.callArgs[0], cbFe, fnIx)
   p.mfIsMap = callee.memProp == "map"
   p.mfRecv = callee.memObj
   p.mfCb = c.callArgs[0]
@@ -33722,6 +33785,7 @@ export function mfLoopTail(p: MfPlan, cL: i32) {
   const iL = mfScratchBase
   const nL = mfScratchBase + 1
   const jL = mfScratchBase + 2
+  mfNulUnit = p.mfSrc.srcNulUnit
   fbLocalSet(cL)
   // n = src.len
   fbLocalGet(srcL)
@@ -33779,6 +33843,7 @@ export function mfLoopTail(p: MfPlan, cL: i32) {
     fbStructGet(cloStructIdx, 0) // env
     fbLocalGet(eL)
     if srcElemRef { fbRefAsNonNull() }
+    mfNulUnitSwap()
     fbLocalGet(cL)
     fbStructGet(cloStructIdx, 1) // the callee's wasm function index
     fbCallIndirect(sig, gFnTableIdx)
@@ -35199,6 +35264,16 @@ function emitMfElem(
 // The ref-list slot `emitMfElem` reads from, for a read-side retag of its union boxes; -1 outside
 // a `.map`/`.filter` loop or where the source is not a ref list.
 let mfSrcSlot = -1
+// The current loop's `srcNulUnit`, set by `mfLoopTail`.
+let mfNulUnit = false
+
+// Replace the `null[]` element on the stack with the bottom ref its callback takes.
+function mfNulUnitSwap() {
+  if !mfNulUnit { return 0 }
+  fbDrop()
+  fbRefNullNone()
+  return 0
+}
 // The view destination `emitMfElem` reads each element through, as a callback's write to the
 // source must be seen by the next read (D3028); -1 where the source cannot be a view.
 let mfSvDst = -1
@@ -35264,6 +35339,7 @@ function emitMfInvoke(
   fbLocalGet(cL)
   fbStructGet(cloStructIdx, 0)     // env
   emitMfElem(srcL, iL, srcWrap, srcBack, srcElemRef)
+  mfNulUnitSwap()
   fbLocalGet(cL)
   fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
   fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
@@ -40677,9 +40753,6 @@ export function wasmEmitStateReset() {
   callRefLegacyPlain = Map()
   callRefLastPlain = false
   luOvLocNodes = []
-  armIdxNode = -1
-  armIdxLocal = -1
-  armIdxImm = 0
   knownArmDecl = []
   knownArmIdx = []
   forInPairBox = null
@@ -42399,25 +42472,12 @@ function emitArmSite(idxIx: i32, fnIx: i32): i32 {
     if emitExpr(recv, fnIx) < 0 { return -1 }
     fbLocalSet(slot)
   }
-  return armSiteWrite(idxIx, slot, ARM_IDX_NODE, 0, fnIx)
+  return armSiteWrite(idxIx, slot, fnIx)
 }
 
-// The index operand `armSiteWrite` takes: the read's own index node, a local, an immediate, or
-// the node's string literal.
-export const ARM_IDX_NODE = -1
-export const ARM_IDX_IMM = -2
-export const ARM_IDX_STR = -3
-
 // The tag chain of arm-site read `idxIx` after its receiver: the box in local `slot`, or the name
-// re-read when -1. The read's index or key is local `ixLocal`, immediate `ixImm` (`ARM_IDX_IMM`),
-// its string literal (`ARM_IDX_STR`) or its own node. 1 when emitted, -1 on failure.
-export function armSiteWrite(
-  idxIx: i32,
-  slot: i32,
-  ixLocal: i32,
-  ixImm: i32,
-  fnIx: i32,
-): i32 {
+// re-read when -1. 1 when emitted, -1 on failure.
+function armSiteWrite(idxIx: i32, slot: i32, fnIx: i32): i32 {
   const recv = armSiteRecv(idxIx)
   if (
     idxIx < 0
@@ -42429,30 +42489,15 @@ export function armSiteWrite(
   }
   const arms = ctnArmsAt(nodeTyAt(recv, fnIx))
   const u = nodeTyAt(idxIx, fnIx)
-  // A read at a numeric literal set is at the set's scalar rep, never boxed (D17001).
-  const uName = if numLitUnionBaseName(u) != "" { "" } else { boxTyName(u) }
-  // An element union that is no box is a string (a literal union joined with `string`) or an
-  // atom (two literal unions); each arm's element is delivered at that rep.
-  const k = if uName == "" { repSigKindOfTy(u) } else { "union" }
-  // A map arm's read of a nullable string is that string ref at every arm.
-  const nulStr = k == "nulstr" && arms.length > 0 && tyAt(arms[0]) is TyMap
-  if k != "union" && k != "str" && k != "i32" && !nulStr {
+  const uName = armSiteUName(idxIx, fnIx)
+  if !armSiteRepHolds(idxIx, fnIx) {
     return emitFail(
       "emitProgram: a union-of-lists element read has no element union box",
     )
   }
   const outer = idxSpanNode
   idxSpanNode = idxIx
-  // An operand stands for the read's index or key; the node itself leaves the writer's state alone.
-  const on = armSiteOpndNode(idxIx)
-  const opnd = ixLocal != ARM_IDX_NODE && on >= 0
-  if opnd {
-    armIdxNode = on
-    armIdxLocal = ixLocal
-    armIdxImm = ixImm
-  }
   const r = emitArmSiteAt(idxIx, recv, slot, arms, 0, u, uName, fnIx)
-  if opnd { armIdxNode = -1 }
   idxSpanNode = outer
   return r
 }
@@ -42470,25 +42515,9 @@ export function armSiteOpndNode(site: i32): i32 {
   }
 }
 
-// The index node an `armSiteWrite` operand stands for, and that operand; -1 outside one.
-let armIdxNode = -1
-let armIdxLocal = -1
-let armIdxImm = 0
-
-// Writes list read `nd`'s index: the arm-site writer's operand where it stands for the node.
+// Writes list read `nd`'s index.
 function emitIdxIndex(nd: Index, fnIx: i32): i32 {
-  if nd.idxIndex != armIdxNode || armIdxNode < 0 {
-    return emitExpr(nd.idxIndex, fnIx)
-  }
-  return emitArmIdx(fnIx)
-}
-
-// The arm-site writer's index operand.
-function emitArmIdx(fnIx: i32): i32 {
-  if armIdxLocal >= 0 { fbLocalGet(armIdxLocal) }
-  else if armIdxLocal == ARM_IDX_STR { return emitStrLitAt(armIdxNode, fnIx) }
-  else { fbI32Const(armIdxImm) }
-  return 0
+  return emitExpr(nd.idxIndex, fnIx)
 }
 
 // The reads `emitArmSiteAt` overrides to an arm's unboxed payload, and the local each
@@ -42627,6 +42656,15 @@ function emitNumRepNarrow(from: VKind, to: VKind): i32 {
   )
 }
 
+// `emitNumRepNarrow` between number kinds (1 i32, 3 i64, 4 f64, 5 f32), as `widenPlanOf` names them.
+export function numNarrowTail(src: i32, dst: i32): i32 {
+  const ks: VKind[] = ["i32", "i32", "i32", "i64", "f64", "f32"]
+  if src < 1 || src > 5 || dst < 1 || dst > 5 || src == 2 || dst == 2 {
+    return emitFail("emitProgram: a numeric narrowing names no number kind")
+  }
+  return emitNumRepNarrow(ks[src], ks[dst])
+}
+
 // The list arms `emitArmIndexWrite` stores `target` through, or none: an identifier receiver whose
 // box of list arms no list-union rewrite overrides.
 export function armIndexWriteArmsOf(target: Index, fnIx: i32): i32[] {
@@ -42713,38 +42751,11 @@ function emitArmSiteAt(
     return 1
   }
   const m = arms[i]
-  const t = listIsArmTag(m)
   const e = armSiteTyOf(idxIx, m, fnIx)
-  if t < 0 || e < 0 {
-    return emitFail(
-      "emitProgram: a union-of-lists arm has no box tag or element to read",
-    )
-  }
-  const loc = armWrapLocal(m)
-  const heap = armHeapOf(m)
-  if loc < 0 || heap < 0 {
-    return emitFail(
-      "emitProgram: a union-of-lists arm has no wrapper to read through",
-    )
-  }
-  if armRecvPush(recv, slot, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, t)
-  fbI32Bin(70) // 0x46 i32.eq
+  const loc = armSiteArmOpen(idxIx, slot, m, fnIx)
+  if loc < 0 { return -1 }
   const k: VKind = if uName == "" { repSigKindOfTy(u) ?? "i32" } else { "union" }
-  if uName != "" {
-    fbIfRef(uBoxIdx)
-  } else {
-    fbOpenIf()
-    fbValtype(k, -1)
-  }
-  if armRecvPush(recv, slot, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1)
-  fbRefCast(heap)
-  fbLocalSet(loc)
-  const mark = luOvEnter(recv, m)
-  luOvEnter(idxIx, e)
-  const lmark = luOvLocalEnter(recv, loc)
+  armSiteArmEnter(idxIx, m, loc, fnIx)
   let r = 0
   if uName != "" {
     r = emitUnionCoerce(uName, u, idxIx, fnIx)
@@ -42762,8 +42773,7 @@ function emitArmSiteAt(
       r = emitNumRepNarrow(repSigKindOfTy(e) ?? k, k)
     }
   }
-  luOvLocalLeave(lmark)
-  luOvLeave(mark)
+  armSiteArmLeave()
   if r < 0 { return -1 }
   fbElse()
   if emitArmSiteAt(idxIx, recv, slot, arms, i + 1, u, uName, fnIx) < 0 {
@@ -42771,6 +42781,97 @@ function emitArmSiteAt(
   }
   fbEnd()
   return 1
+}
+
+// Whether arm-site read `idxIx` has a rep each arm delivers into: its union's box, or for an element
+// union that is no box a string (a literal union joined with `string`) or an atom (two literal
+// unions); a map arm's read of a nullable string is that string ref at every arm.
+export function armSiteRepHolds(idxIx: i32, fnIx: i32): boolean {
+  if armSiteUName(idxIx, fnIx) != "" { return true }
+  const k = repSigKindOfTy(nodeTyAt(idxIx, fnIx))
+  const arms = armSiteArmsOf(idxIx, fnIx)
+  const nulStr = k == "nulstr" && arms.length > 0 && tyAt(arms[0]) is TyMap
+  return k == "str" || k == "i32" || nulStr
+}
+
+// The box name arm-site read `idxIx`'s value is delivered into, "" for a scalar or string rep.
+function armSiteUName(idxIx: i32, fnIx: i32): string {
+  const u = nodeTyAt(idxIx, fnIx)
+  // A read at a numeric literal set is at the set's scalar rep, never boxed (D17001).
+  return if numLitUnionBaseName(u) != "" { "" } else { boxTyName(u) }
+}
+
+// Opens arm `m` of arm-site read `idxIx`'s tag chain over the box in local `slot` (the name re-read
+// when -1): its tag test, the arm's `if` at the read's rep, the payload cast into the arm's wrapper
+// local, which it returns; -1 on failure.
+export function armSiteArmOpen(idxIx: i32, slot: i32, m: i32, fnIx: i32): i32 {
+  const recv = armSiteRecv(idxIx)
+  const t = listIsArmTag(m)
+  if t < 0 || armSiteTyOf(idxIx, m, fnIx) < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no box tag or element to read",
+    )
+  }
+  const loc = armWrapLocal(m)
+  const heap = armHeapOf(m)
+  if loc < 0 || heap < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no wrapper to read through",
+    )
+  }
+  if armRecvPush(recv, slot, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, t)
+  fbI32Bin(70) // 0x46 i32.eq
+  if armSiteUName(idxIx, fnIx) != "" {
+    fbIfRef(uBoxIdx)
+  } else {
+    fbOpenIf()
+    fbValtype(repSigKindOfTy(nodeTyAt(idxIx, fnIx)) ?? "i32", -1)
+  }
+  if armRecvPush(recv, slot, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbLocalSet(loc)
+  return loc
+}
+
+// The override marks `armSiteArmEnter` pushed, innermost last, two per arm.
+const armOvMarks: i32[] = []
+
+// Reads arm-site read `idxIx` at arm `m`: its receiver at `m` and in local `loc`, the read at the
+// arm's element. `armSiteArmLeave` drops it.
+export function armSiteArmEnter(idxIx: i32, m: i32, loc: i32, fnIx: i32) {
+  const recv = armSiteRecv(idxIx)
+  const e = armSiteTyOf(idxIx, m, fnIx)
+  const mark = luOvEnter(recv, m)
+  luOvEnter(idxIx, e)
+  armOvMarks.push(mark)
+  armOvMarks.push(luOvLocalEnter(recv, loc))
+  // The read-rep memo's key names no override, so what it holds is forgotten across one.
+  readRepMemoAdvance()
+  return 0
+}
+
+export function armSiteArmLeave() {
+  luOvLocalLeave(armOvMarks.pop() ?? 0)
+  luOvLeave(armOvMarks.pop() ?? 0)
+  readRepMemoAdvance()
+  return 0
+}
+
+// The arms of arm-site read `idxIx`, in tag-chain order, and what the read yields at arm `m`.
+export function armSiteArmsOf(idxIx: i32, fnIx: i32): i32[] {
+  return ctnArmsAt(nodeTyAt(armSiteRecv(idxIx), fnIx))
+}
+
+export function armSiteElemTyOf(idxIx: i32, m: i32, fnIx: i32): i32 {
+  return armSiteTyOf(idxIx, m, fnIx)
+}
+
+// Whether arm-site read `idxIx` is at a numeric literal set, whose arms convert to its rep.
+export function armSiteAtLitSet(idxIx: i32, fnIx: i32): boolean {
+  return numLitUnionBaseName(nodeTyAt(idxIx, fnIx)) != ""
 }
 
 // ── numeric-union dispatch ─────────────────────────────────────────────────────
@@ -45808,47 +45909,84 @@ function emitOptCoalesceBoxLeaf(
   exprIx: i32,
   fnIx: i32,
 ) {
+  const p = optBoxLeafPlanOf(e, heap, fi, exprIx, fnIx)
+  if p.obFail != "" { return emitFail(p.obFail) }
+  if emitOptChainIsNull(unwrapParen(e.binLeft), fnIx) < 0 { return -1 }
+  optBoxLeafOpen(p)
+  if p.obBox == "" {
+    if emitExprAsKind(e.binRight, p.obBk, fnIx) < 0 { return -1 }
+  } else if (emitUnionBoxOwed(p.obBox, p.obTy, e.binRight, fnIx) < 0) {
+    return -1
+  }
+  fbElse()
+  if emitOptChainValue(lhs.omObj, fnIx) < 0 { return -1 }
+  return optBoxLeafRead(p)
+}
+
+// How `emitOptCoalesceBoxLeaf` writes `r?.f ?? d` at field `obFi` of struct heap `obHeap`: the
+// result's union box `obBox` and type `obTy`, or, with `obBox` "", the scalar of box tag `obBk`
+// (valtype `obVt`) unboxed from the field's tag `obFk` (value-box heap `obFvb`) and widened.
+// `obFail` names a call legacy refuses.
+export type OptBoxLeafPlan = {
+  obBox: string,
+  obTy: i32,
+  obBk: i32,
+  obVt: i32,
+  obFk: i32,
+  obFvb: i32,
+  obHeap: i32,
+  obFi: i32,
+  obFail: string,
+}
+
+export function optBoxLeafPlanOf(
+  e: BinExpr,
+  heap: i32,
+  fi: i32,
+  exprIx: i32,
+  fnIx: i32,
+): OptBoxLeafPlan {
   const lhsIx = unwrapParen(e.binLeft)
-  let bNm = ""
-  if exprUnion(exprIx, fnIx) { bNm = boxTyName(nodeTyIxOf(exprIx)) }
+  const bNm = if exprUnion(exprIx, fnIx) { boxTyName(nodeTyIxOf(exprIx)) } else { "" }
   // A link `emitCoalesceGo` re-associated out of a chain carries no type of its own; its
   // result is then the leaf's `T | null` with the null removed.
-  let rTy = nodeTyIxOf(exprIx)
-  if rTy < 0 { rTy = tyPeelNul(nodeTyIxOf(lhsIx)) }
+  const rTy = if nodeTyIxOf(exprIx) < 0 { tyPeelNul(nodeTyIxOf(lhsIx)) } else { nodeTyIxOf(exprIx) }
   const bk = boxTagOfTy(rTy)
   const bVt = nulBoxScalarValtype(bk)
-  if bNm == "" && bVt < 0 {
-    return emitFail(
-      "emitProgram: `?.` … `??` over a nullable value-box field has no rep for its result",
-    )
-  }
   // The box holds the FIELD's scalar; a default that widens the result (`?? 2.5` over an
   // `i32 | null` field) converts it after the unbox.
   const fk = boxTagOfTy(tyPeelNul(nodeTyIxOf(lhsIx)))
   const fVb = vbHeapIdxOfKind(fk)
-  if bNm == "" && (fVb < 0 || !scalarKindWidens(fk, bk)) {
-    return emitFail(
-      "emitProgram: `?.` … `??` over a nullable value-box field has no conversion to its result",
-    )
+  const fail = if bNm == "" && bVt < 0 { "emitProgram: `?.` … `??` over a nullable value-box field has no rep for its result" } else if bNm == "" && (fVb < 0 || !scalarKindWidens(fk, bk)) { "emitProgram: `?.` … `??` over a nullable value-box field has no conversion to its result" } else { "" }
+  const p: OptBoxLeafPlan = {
+    obBox: bNm,
+    obTy: nodeTyIxOf(exprIx),
+    obBk: bk,
+    obVt: bVt,
+    obFk: fk,
+    obFvb: fVb,
+    obHeap: heap,
+    obFi: fi,
+    obFail: fail,
   }
-  if emitOptChainIsNull(lhsIx, fnIx) < 0 { return -1 }
-  if bNm == "" {
-    fbIf(bVt)
-    if emitExprAsKind(e.binRight, bk, fnIx) < 0 { return -1 }
-  } else {
-    fbIfRef(uBoxIdx)
-    if (emitUnionBoxOwed(bNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
-      return -1
-    }
-  }
-  fbElse()
-  if emitOptChainValue(lhs.omObj, fnIx) < 0 { return -1 }
-  fbStructGet(heap, fi)
-  if bNm == "" {
+  return p
+}
+
+// After the chain's null test: the `if` of plan `p`'s result, a scalar's valtype or the box.
+export function optBoxLeafOpen(p: OptBoxLeafPlan) {
+  if p.obBox == "" { return fbIf(p.obVt) }
+  return fbIfRef(uBoxIdx)
+}
+
+// After the receiver again, in the present arm: the field's box, unboxed and widened for a scalar
+// result, and the `if`'s end.
+export function optBoxLeafRead(p: OptBoxLeafPlan): i32 {
+  fbStructGet(p.obHeap, p.obFi)
+  if p.obBox == "" {
     fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
-    fbRefCast(fVb)
-    fbStructGet(fVb, 0)
-    emitScalarWiden(fk, bk)
+    fbRefCast(p.obFvb)
+    fbStructGet(p.obFvb, 0)
+    emitScalarWiden(p.obFk, p.obBk)
   }
   fbEnd()
   return 0
@@ -47027,30 +47165,20 @@ function emitCoalesceOptNulRecord(
   // not one: a record slot is `(ref null $S)` at both declarations (D1180), and `o?.f ??
   // d` must yield `d` when the field is null too — receiver-null or field-null, short-circuited through one i32 `if` so `struct.get` never runs on a null receiver.
   if eqKindIsRecord(nfKind) {
-    const ntg = sFieldTgtStructIdx(nsi, nfi)
-    if ntg < 0 {
+    const rp = optRecLeafPlanOf(e, nsi, nfi, fnIx)
+    if rp.orTgtHeap < 0 {
       return emitFail(
         "emitProgram: `?.` over a nested-struct field names no struct row",
       )
     }
-    const nDefNul = coalesceDefaultNullable(e.binRight, fnIx)
     if emitOptRecvBase(lhs.omObj, fnIx, false) < 0 { return -1 }
-    fbRefIsNull() // the receiver
-    fbIf(127)
-    fbI32Const(1)
-    fbElse()
+    optRecLeafTestOpen()
     if emitOptRecvBase(lhs.omObj, fnIx, true) < 0 { return -1 }
-    fbStructGet(nHeap, nfi)
-    fbRefIsNull() // the field slot
-    fbEnd()
-    fbIfRefNul(sHeapIdx[ntg], nDefNul)
+    optRecLeafTestClose(rp)
     if emitExpr(e.binRight, fnIx) < 0 { return -1 }
     fbElse()
     if emitOptRecvBase(lhs.omObj, fnIx, true) < 0 { return -1 }
-    fbStructGet(nHeap, nfi)
-    if !nDefNul { fbRefAsNonNull() }
-    fbEnd()
-    return 0
+    return optRecLeafRead(rp)
   }
   if nfKind == "union" {
     return emitOptCoalesceBoxLeaf(e, lhs, nHeap, nfi, exprIx, fnIx)
@@ -47077,6 +47205,107 @@ function emitCoalesceOptNulRecord(
 // `nsi`: its heap, field and `if` kind (`optLeafKindOf`), or a null `olLeaf` for any other field
 // (a record, a box, a closure or a map, each its own core, or a field with no `if` blocktype).
 export type CoalOptLeafPlan = { olHeap: i32, olFi: i32, olLeaf: VKind | null }
+
+// How `emitCoalesceOptNulRecord` writes `p?.f ?? d` over a record field `orFi` of struct heap
+// `orHeap`: the field's own row's heap `orTgtHeap` (-1 for none) blocks the `if`, nullable when the
+// default is (`orDefNul`), else the field is recovered non-null.
+export type OptRecLeafPlan = {
+  orHeap: i32,
+  orFi: i32,
+  orTgtHeap: i32,
+  orDefNul: boolean,
+}
+
+export function optRecLeafPlanOf(
+  e: BinExpr,
+  nsi: i32,
+  nfi: i32,
+  fnIx: i32,
+): OptRecLeafPlan {
+  const ntg = sFieldTgtStructIdx(nsi, nfi)
+  const p: OptRecLeafPlan = {
+    orHeap: sHeapIdx[nsi],
+    orFi: nfi,
+    orTgtHeap: if ntg >= 0 && ntg < sHeapIdx.length { sHeapIdx[ntg] } else { -1 },
+    orDefNul: coalesceDefaultNullable(e.binRight, fnIx),
+  }
+  return p
+}
+
+// The record-field plan over nullable struct row `nsi`, or one whose `orTgtHeap` is -1 where the
+// field is no record.
+export function coalOptRecLeafPlanAt(
+  e: BinExpr,
+  lhs: OptMember,
+  nsi: i32,
+  fnIx: i32,
+): OptRecLeafPlan {
+  const nfi = if nsi >= 0 && nsi < sHeapIdx.length { sFieldIndex(nsi, lhs.omProp) } else { -1 }
+  if nfi < 0 || !eqKindIsRecord(fieldRowKind(sFieldFlatRow(nsi, nfi))) {
+    const no: OptRecLeafPlan = {
+      orHeap: -1,
+      orFi: -1,
+      orTgtHeap: -1,
+      orDefNul: false,
+    }
+    return no
+  }
+  return optRecLeafPlanOf(e, nsi, nfi, fnIx)
+}
+
+// After the receiver: its null test, answering true for a null receiver, else (the receiver next)
+// testing the field slot, which a record leaves nullable at every declaration (D1180).
+export function optRecLeafTestOpen() {
+  fbRefIsNull() // the receiver
+  fbIf(127)
+  fbI32Const(1)
+  fbElse()
+  return 0
+}
+
+// After the receiver again: the field slot's null test, then the `if` both arms of `p` yield.
+export function optRecLeafTestClose(p: OptRecLeafPlan) {
+  fbStructGet(p.orHeap, p.orFi)
+  fbRefIsNull() // the field slot
+  fbEnd()
+  return fbIfRefNul(p.orTgtHeap, p.orDefNul)
+}
+
+// After the receiver a third time, in the present arm: the field, recovered non-null unless the
+// default is nullable, and the `if`'s end.
+export function optRecLeafRead(p: OptRecLeafPlan): i32 {
+  fbStructGet(p.orHeap, p.orFi)
+  if !p.orDefNul { fbRefAsNonNull() }
+  fbEnd()
+  return 0
+}
+
+// The box-field plan `emitCoalesceOptNulRecord` writes `p?.f ?? d` at (`e`, node `exprIx`) over
+// nullable struct row `nsi`, or one whose `obFail` names why the field is no union box.
+export function coalOptBoxLeafPlanAt(
+  e: BinExpr,
+  lhs: OptMember,
+  nsi: i32,
+  exprIx: i32,
+  fnIx: i32,
+): OptBoxLeafPlan {
+  const nfi = if nsi >= 0 && nsi < sHeapIdx.length { sFieldIndex(nsi, lhs.omProp) } else { -1 }
+  if nfi < 0 || fieldRowKind(sFieldFlatRow(nsi, nfi)) != "union" {
+    const no: OptBoxLeafPlan = {
+      obBox: "",
+      obTy: -1,
+      obBk: -1,
+      obVt: -1,
+      obFk: -1,
+      obFvb: -1,
+      obHeap: -1,
+      obFi: -1,
+      obFail: "no union box field",
+    }
+    return no
+  }
+  return optBoxLeafPlanOf(e, sHeapIdx[nsi], nfi, exprIx, fnIx)
+}
 
 export function coalOptLeafPlanOf(lhs: OptMember, nsi: i32): CoalOptLeafPlan {
   const no: CoalOptLeafPlan = { olHeap: -1, olFi: -1, olLeaf: null }
