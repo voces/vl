@@ -6,9 +6,9 @@
 # rows = functions + start bodies, counted as summary.sh counts them and summed over populations;
 # a module-level `claim fell back` (no function row holds it) counts one row for its program.
 # Lanes follow the coordinator's ownership list of 2026-11-25 (if joins to COV-CLOS, unions and
-# most `??` arms to COV-UNION, the lead-staging family, start-only classes and orphans to CENSUS),
-# by nearest family. A witness path is written from `wit/` on, since each census regenerates
-# the witnesses.
+# most `??` arms to COV-UNION, the lead-staging family, other start-only classes and orphans to
+# CENSUS), by nearest family. A witness path is written from `wit/` on, since each census
+# regenerates the witnesses.
 # Feed one list back as `CENSUS_CLASS=<file> scripts/ir-i8-census/census.sh <seed> <out>`.
 #
 #     scripts/ir-i8-census/class-programs.sh <out-dir> [top]     # top: the first <top> rows only
@@ -34,9 +34,14 @@ done | awk -F'\t' -v out="$OUT/classes" '
     if (c ~ /^(global |rep |list reserve|float literal|unary |operator |string literal|array long|array new|staged literal|local slot|for range|zero-extending|expression as|trap message|returned trap|integer negation|simd |push |assignment target|store element|pre-path |arm site|expression null|tail arm)/) return "COV-START"
     return "CENSUS"
   }
-  # A class only start bodies miss on, outside the COV-START family, goes to CENSUS (coordinator
-  # ruling, 2026-11-25): its function owner never meets it.
-  function owner(w) { return (dist[w] == 0 && st[w] > 0 && lane(w) != "COV-START") ? "CENSUS" : lane(w) }
+  # A class only start bodies miss on goes to CENSUS unless COV-START owns it or it is a `??` or union
+  # class, which COV-UNION takes (coordinator rulings, 2026-11-25): its function owner never meets it.
+  function owner(w,   l) {
+    l = lane(w)
+    if (dist[w] > 0 || st[w] == 0 || l == "COV-START") return l
+    if (w ~ /^(coalesce |union |optional read|assignment value|store arm)/) return "COV-UNION"
+    return "CENSUS"
+  }
   function norm(w) {
     sub(/^read of [A-Za-z0-9_$]+$/, "read of <name>", w)
     sub(/^claim fell back: .*list delivery.*/, "claim fell back: list delivery", w)
