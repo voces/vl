@@ -1629,6 +1629,7 @@ import {
   mapTyValIsNullUnit,
   mapTyValLitUnionTexts,
   tyIsNulStrBoxUnion,
+  tyIsNullUnit,
 } from "./check_ty_rep"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
 import { vrValueInert } from "./value_reach"
@@ -33376,6 +33377,7 @@ type MfSrcTys = {
   srcBack: i32,
   srcElemRef: boolean,
   srcSlot: i32,
+  srcNulUnit: boolean,
 }
 
 // The interned signature of `.map`/`.filter` callback `argIx`: the lifted function `cbFe`'s, or
@@ -33444,6 +33446,7 @@ function mfRefused(why: string): MfPlan {
     srcBack: -1,
     srcElemRef: false,
     srcSlot: -1,
+    srcNulUnit: false,
   }
   const dst: MfDstTys = { dstWrap: -1, dstBack: -1 }
   const p: MfPlan = {
@@ -33485,6 +33488,23 @@ export function mapFilterWhy(callIx: i32, fnIx: i32): string {
   }
   if cbn is Ident { return "" }
   return "map callback expression"
+}
+
+// Whether `.map`/`.filter` over receiver `recvIx` reads a `null[]` element, stored as the
+// `boolean | null` sentinel (D4671), for callback `argIx` whose element parameter is `nullref`:
+// the loop then hands the callback the bottom ref in its place (D17039).
+function mfNulUnitToRef(
+  recvIx: i32,
+  argIx: i32,
+  cbFe: i32,
+  fnIx: i32,
+): boolean {
+  const rt = nodeTyAt(recvIx, fnIx)
+  if rt < 0 || rt >= T.tys.length { return false }
+  const ra = tyAt(nonNullTy(rt))
+  if !(ra is TyArray) || !tyIsNullUnit(tyElemOf(ra)) { return false }
+  const key = if cbFe >= 0 { cloSigKeyExt(cbFe) } else { mfCallbackCloKey(argIx, fnIx) }
+  return key != "" && sigParamKindAt(key, 0) == "nulnone"
 }
 
 // The plan of `.map`/`.filter` call `callIx`, asked where legacy's arm asks it.
@@ -33533,6 +33553,7 @@ export function mapFilterPlanOf(callIx: i32, fnIx: i32): MfPlan {
   if !fnUses.mapFilter || p.mfSrcL < 0 || p.mfDstL < 0 {
     return mfRefused("emitProgram: .map/.filter scratch frame not reserved")
   }
+  p.mfSrc.srcNulUnit = mfNulUnitToRef(callee.memObj, c.callArgs[0], cbFe, fnIx)
   p.mfIsMap = callee.memProp == "map"
   p.mfRecv = callee.memObj
   p.mfCb = c.callArgs[0]
@@ -33592,6 +33613,7 @@ export function mfLoopTail(p: MfPlan, cL: i32) {
   const iL = mfScratchBase
   const nL = mfScratchBase + 1
   const jL = mfScratchBase + 2
+  mfNulUnit = p.mfSrc.srcNulUnit
   fbLocalSet(cL)
   // n = src.len
   fbLocalGet(srcL)
@@ -33649,6 +33671,7 @@ export function mfLoopTail(p: MfPlan, cL: i32) {
     fbStructGet(cloStructIdx, 0) // env
     fbLocalGet(eL)
     if srcElemRef { fbRefAsNonNull() }
+    mfNulUnitSwap()
     fbLocalGet(cL)
     fbStructGet(cloStructIdx, 1) // the callee's wasm function index
     fbCallIndirect(sig, gFnTableIdx)
@@ -35069,6 +35092,16 @@ function emitMfElem(
 // The ref-list slot `emitMfElem` reads from, for a read-side retag of its union boxes; -1 outside
 // a `.map`/`.filter` loop or where the source is not a ref list.
 let mfSrcSlot = -1
+// The current loop's `srcNulUnit`, set by `mfLoopTail`.
+let mfNulUnit = false
+
+// Replace the `null[]` element on the stack with the bottom ref its callback takes.
+function mfNulUnitSwap() {
+  if !mfNulUnit { return 0 }
+  fbDrop()
+  fbRefNullNone()
+  return 0
+}
 // The view destination `emitMfElem` reads each element through, as a callback's write to the
 // source must be seen by the next read (D3028); -1 where the source cannot be a view.
 let mfSvDst = -1
@@ -35134,6 +35167,7 @@ function emitMfInvoke(
   fbLocalGet(cL)
   fbStructGet(cloStructIdx, 0)     // env
   emitMfElem(srcL, iL, srcWrap, srcBack, srcElemRef)
+  mfNulUnitSwap()
   fbLocalGet(cL)
   fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
   fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
