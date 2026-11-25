@@ -1811,6 +1811,19 @@ function isTagChain(b: i32[], n: IsExpr, ix: i32, rep: i32, tags: i32[]): Opnd {
   return acc
 }
 
+// Whether every node body `b` gained from `at` on is a temp's definition, none a statement.
+function onlyTempsFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    const nd = ib.irNodes[b[i]]
+    if !(nd is SLet) || nd.lDst < 0 || ib.irVars[nd.lDst].vKind != "temp" {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
 // One tag of `isTagChain`: the receiver read again, then its box's tag compared with `tag`.
 function tagChainTest(b: i32[], n: IsExpr, ix: i32, rep: i32, tag: i32): Opnd {
   const v = irBExpr(b, n.isObj)
@@ -12394,11 +12407,22 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     // `null` side other than a name read, which legacy runs for its effect, is legacy's.
     const nt = binNulNameTestOf(n, ibFnIx)
     if nt != null && eqRouteOf(n, ix, ibFnIx) == "nulName" {
-      const ns = if nt.bnRef == n.binRight { n.binLeft } else { n.binRight }
-      if !nulNoneWritesNothing(ns) {
-        return irBMiss("null name test of a non-name null side")
+      const nulLeft = nt.bnRef == n.binRight
+      const ns = if nulLeft { n.binLeft } else { n.binRight }
+      if nulNoneWritesNothing(ns) { return nulTest(b, n, nt, ix, rep) }
+      // A left `null` side runs for its effect ahead of the test (`emitNulNameTestBin`).
+      if !nulLeft { return irBMiss("null name test of a non-name null side") }
+      const effs: Opnd[] = []
+      const e0 = b.length
+      const e = nulNoneEffect(b, ns, ix, effs)
+      if ibMiss != "" { return e }
+      // A store in it is a statement written where it stands, not with the effects.
+      if !onlyTempsFrom(b, e0) {
+        return irBMiss("null name test of a null side that stores")
       }
-      return nulTest(b, n, nt, ix, rep)
+      const t = nulTest(b, n, nt, ix, rep)
+      if ibMiss != "" || effs.length == 0 { return t }
+      return irBLetTemp(b, { aeEff: effs, aeV: t, aeAt: ix }, ix, rep)
     }
     if n.binOp == "??" { return coalesce(b, n, ix, rep, cell) }
     // Legacy declares a string compare's locals for a side the checker typed `string` and holds as
