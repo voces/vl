@@ -18,8 +18,8 @@ reads it once.
   - A name's source (a variable or a global, no capture, `recCopySourceIsName`) is built and
     skipped. Its read is written again (`irHoistRecv`) where `irReadsAgain` holds.
   - Any other source keeps legacy's read from the node.
-- `recCopyPureEmit(exprIx, fnIx, src)` holds those bytes in `rcSrcBytes` around the copy, as it
-  holds `coerceHeld`. `rcReadSource` appends them (`wBytes`) in place of `emitExpr`.
+- `recCopyPureEmit(exprIx, fnIx, src)` holds those bytes in `RcElem.srcRead` around the copy (no
+  new module state), as it holds `coerceHeld`. `rcReadSource` appends them (`wBytes`) in place of `emitExpr`.
 - `irReadsAgain` is the predicate the `emitChainRead` port (branch `cov-call-reentry-chainread`, now
   COV-UNION's) adds too. Whichever lands second drops its copy.
 
