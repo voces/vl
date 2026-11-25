@@ -3797,6 +3797,36 @@ function recHoleIdentityAt(p: i32, fd: i32, srcTy: i32, dstTy: i32): boolean {
   return true
 }
 
+// Whether node `ix` uses each of `names` only as the receiver of a field read, a `?.` read or a
+// field write, and declares none of them. A kind it does not walk (a nested function, a loop, a
+// literal holding a value) answers false, so the caller declines.
+function holeUsesOnlyFields(ix: i32, names: string[]): boolean {
+  if ix < 0 { return true }
+  if ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  return match n {
+    Ident => !strListHas(names, n.identName)
+    Member => nodeAt(n.memObj) is Ident || holeUsesOnlyFields(n.memObj, names)
+    OptMember => nodeAt(n.omObj) is Ident || holeUsesOnlyFields(n.omObj, names)
+    Call => holeCallUsesOnlyFields(n, names)
+    BinExpr => holeUsesOnlyFields(n.binLeft, names) && holeUsesOnlyFields(n.binRight, names)
+    Unary => holeUsesOnlyFields(n.unArg, names)
+    Paren => holeUsesOnlyFields(n.parInner, names)
+    LetDecl => !strListHas(names, n.letName) && holeUsesOnlyFields(n.letInit, names)
+    NumLit | StrLit | CharLit | BoolLit | NullLit => true
+    ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => false
+  }
+}
+
+// `holeUsesOnlyFields` over a call's callee and arguments.
+function holeCallUsesOnlyFields(n: Call, names: string[]): boolean {
+  if !holeUsesOnlyFields(n.callFn, names) { return false }
+  for a in n.callArgs {
+    if !holeUsesOnlyFields(a, names) { return false }
+  }
+  return true
+}
+
 // Adopts object literal `ap` at the record a value of `srcTy` lands on in `dstTy` when it fits
 // there; true when it does.
 function recHoleAdoptLit(ap: i32, srcTy: i32, dstTy: i32): boolean {
@@ -3806,8 +3836,8 @@ function recHoleAdoptLit(ap: i32, srcTy: i32, dstTy: i32): boolean {
   return true
 }
 
-// The argument of call `p` that `fd`, a non-generic function whose body only rebinds and returns
-// an un-annotated parameter, hands back; -1 otherwise.
+// The argument of call `p` that `fd`, a non-generic function whose body only rebinds, reads or
+// writes the fields of, and returns an un-annotated parameter, hands back; -1 otherwise.
 export function recHoleIdentityArg(p: i32, fd: i32): i32 {
   if p < 0 || p >= P.nodes.length || fd < 0 || fd >= P.nodes.length {
     return -1
@@ -3828,18 +3858,40 @@ export function recHoleIdentityArg(p: i32, fd: i32): i32 {
   if v < 0 || v >= P.nodes.length { return -1 }
   const vn = nodeAt(v)
   if !(vn is Ident) { return -1 }
-  // Earlier statements may only rebind the value to un-annotated names, walked back here.
+  // Earlier statements rebind the value to un-annotated names, walked back here. Every other
+  // statement may use the parameter and its aliases only as a field's receiver (D17047).
   let name = vn.identName
   let k = b.blkStmts.length - 2
   while k >= 0 {
     const s = nodeAt(b.blkStmts[k])
-    if !(s is LetDecl) || s.letType >= 0 { return -1 }
-    const si = parenPeelIx(s.letInit)
-    if si < 0 || si >= P.nodes.length { return -1 }
-    const sn = nodeAt(si)
-    if !(sn is Ident) { return -1 }
-    if s.letName == name { name = sn.identName }
+    if s is LetDecl {
+      const si = parenPeelIx(s.letInit)
+      if si >= 0 && si < P.nodes.length && s.letType < 0 && s.letName == name {
+        const sn = nodeAt(si)
+        if sn is Ident { name = sn.identName }
+      }
+    }
     k = k - 1
+  }
+  const names: string[] = [name]
+  let j = 0
+  while j + 1 < b.blkStmts.length {
+    const s = nodeAt(b.blkStmts[j])
+    let alias = false
+    if s is LetDecl {
+      const si = parenPeelIx(s.letInit)
+      if si >= 0 && si < P.nodes.length && s.letType < 0 {
+        const sn = nodeAt(si)
+        if sn is Ident {
+          if strListHas(names, sn.identName) {
+            names.push(s.letName)
+            alias = true
+          }
+        }
+      }
+    }
+    if !alias && !holeUsesOnlyFields(b.blkStmts[j], names) { return -1 }
+    j = j + 1
   }
   let i = 0
   while i < f.fnParams.length && i < c.callArgs.length {
