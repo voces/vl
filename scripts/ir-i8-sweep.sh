@@ -300,7 +300,7 @@ VL
     # Their pure writes go too, each a single line.
     cut -f3 "$T/unread" | sort -u > "$T/unread.names"
     for f in "$T"/tree/compiler/*.vl; do
-      awk -v re="$PURE_WRITE" 'FILENAME == ARGV[1] { gone[$1] = 1; next }
+      PURE_WRITE="$PURE_WRITE" awk 'BEGIN { re = ENVIRON["PURE_WRITE"] } FILENAME == ARGV[1] { gone[$1] = 1; next }
         $0 ~ re { nm = $0; sub(/^ */, "", nm); sub(/[^A-Za-z0-9_].*/, "", nm); if (nm in gone) next }
         { print }' "$T/unread.names" "$f" > "$T/f.new"
       mv "$T/f.new" "$f"
