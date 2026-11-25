@@ -880,6 +880,7 @@ import {
   urSlot,
   urVal,
   vkIsNonNullRef,
+  wBytes,
   wDropBack,
   wLen,
   wNegateConstFrom,
@@ -8011,10 +8012,29 @@ function emitOptRecvBase(exprIx: i32, fnIx: i32, asRef: boolean) {
       return emitFailAt("emitProgram: `?.` receiver stash not reserved", exprIx)
     }
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
-    fbLocalTee(optRecvSlot)
+    optRecvStashTee()
     optRecvStagedSet = true
   }
   if !asRef { return 0 }
+  return optRecvStashCast(exprIx, fnIx)
+}
+
+// A staged `?.` receiver's value into its stash, kept on the stack.
+export function optRecvStashTee() {
+  fbLocalTee(optRecvSlot)
+  return 0
+}
+
+// A staged `?.` receiver `exprIx` read back from its stash, cast (`asRef`) to its record's heap.
+// 0, or -1 for a receiver with no struct row.
+export function optRecvStashGet(exprIx: i32, fnIx: i32, asRef: boolean): i32 {
+  fbLocalGet(optRecvSlot)
+  if !asRef { return 0 }
+  return optRecvStashCast(exprIx, fnIx)
+}
+
+// The cast of a staged `?.` receiver `exprIx`, just read, to its record's heap.
+export function optRecvStashCast(exprIx: i32, fnIx: i32): i32 {
   const sri = structIndexOfExpr(exprIx, fnIx)
   if sri < 0 {
     return emitFailAt(
@@ -22184,17 +22204,18 @@ function lcatBaseOfRep(kind: i32, slot: i32) {
   return lcatBases[i]
 }
 
-// Where a struct compare's field chain reads each side's root: `expr` the operand node (legacy's);
-// `local` local `epSlot`; `elem` a ref list element read over receiver local `epSlot` (its
-// expression where -1) and index local `epIdx` (its expression where -2, `epImm` where -1).
-// Each `elem` read writes its element-read row into `epRows` as node, from, to.
-export type EqRootKind = "expr" | "local" | "elem"
+// Where a struct compare's field chain reads each side's root: `expr` the operand node; `local`
+// local `epSlot`; `elem` a ref list element over receiver local `epSlot` (its expression at -1) and
+// index local `epIdx` (expression at -2, `epImm` at -1), its read row banked in `epRows`; `bytes`
+// the read the IR wrote once (`epBytes`), appended again at each field.
+export type EqRootKind = "expr" | "local" | "elem" | "bytes"
 export type EqRootPlace = {
   epKind: EqRootKind,
   epSlot: i32,
   epIdx: i32,
   epImm: i32,
   epRows: i32[],
+  epBytes: u8[],
 }
 export type EqRootPlan = { erL: EqRootPlace, erR: EqRootPlace }
 
@@ -22204,6 +22225,7 @@ export const EQ_ROOT_EXPR: EqRootPlace = {
   epIdx: -1,
   epImm: 0,
   epRows: [],
+  epBytes: [],
 }
 
 export const EQ_ROOTS_EXPR: EqRootPlan = {
@@ -22246,6 +22268,7 @@ function emitChainRead(
       0
     }
     "elem" => emitChainRootElem(rootIx, fnIx, place)
+    "bytes" => wBytes(place.epBytes)
   }
   if rd < 0 { return -1 }
   let k = 0
@@ -22838,6 +22861,13 @@ export function emitEqRootIsNull(
     && nulTestArmOf(ix, fnIx, false, false) == "nullRef"
   ) {
     if emitChainRootElem(ix, fnIx, place) < 0 { return -1 }
+    return if nulTestRefTail(false) < 0 { -1 } else { 0 }
+  }
+  if (
+    place.epKind == "bytes"
+    && nulTestArmOf(ix, fnIx, false, false) == "nullRef"
+  ) {
+    wBytes(place.epBytes)
     return if nulTestRefTail(false) < 0 { -1 } else { 0 }
   }
   return emitEqIsNull(ix, fnIx)
