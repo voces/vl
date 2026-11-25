@@ -2,15 +2,16 @@
 // claimed module the engine refuses is compiled again with IR claims off, so legacy's refusal, or
 // legacy's bytes, is the answer. The native host's half is tests/vl_ir_claim_fallback_test.ts.
 //
-// The escape is real on the seed: the control below compiles to an invalid module with claims on,
-// and legacy refuses it with claims off. The LSP's `compile` (the playground's Run path) then
-// answers with legacy's refusal. A module corrupted only while claims are on stands in for a claim
-// legacy builds. No assertion library, per CLAUDE.md.
+// The control below once compiled to an invalid module with claims on; the claim now raises legacy's
+// refusal itself (`bundlePickRefused`), and legacy refuses it with claims off too. The LSP's
+// `compile` (the playground's Run path) answers with that refusal and the claim's note. A module
+// corrupted only while claims are on stands in for a claim legacy builds. No assertion library, per
+// CLAUDE.md.
 //
 // Run with:  deno test -A tests/vl_claim_fallback_wasm_test.ts
 
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
-import { FELL_BACK, needsClaimsOff, withClaimsOff } from "../lsp/src/claimFallback.ts";
+import { FELL_BACK, withClaimsOff } from "../lsp/src/claimFallback.ts";
 import { COMPILER, exists, ROOT } from "./support/tree.ts";
 
 const ignore = !exists(COMPILER);
@@ -30,14 +31,14 @@ const pushSrc = (exp: Exports, src: string) => {
 const bytesOf = (exp: Exports) => Uint8Array.from({ length: exp.rbyteLen() }, (_, i) => exp.rbyteAt(i));
 
 Deno.test({
-  name: "claim fallback (wasm): the control's claimed module is invalid, and legacy refuses it",
+  name: "claim fallback (wasm): the control's claim refuses it, and so does legacy",
   ignore,
   fn: () => {
     const exp = fresh();
     pushSrc(exp, CONTROL);
     const rc = exp.compileSrc();
-    if (rc !== 0 || !needsClaimsOff(exp, bytesOf(exp))) {
-      throw new Error(`want rc 0 with an invalid claimed module, got rc ${rc}`);
+    if (rc !== 3) {
+      throw new Error(`want the claim's emit refusal (rc 3) with claims on, got rc ${rc}`);
     }
     pushSrc(exp, CONTROL);
     const legacy = withClaimsOff(exp, () => exp.compileSrc());
@@ -50,7 +51,7 @@ Deno.test({
   ignore,
   fn: async () => {
     const { bytes, diagnostics } = await createWasmChecker(fresh).compile(CONTROL, "main.vl", noSiblings);
-    const note = "an IR claim wrote an invalid module (main.vl:9:1: the emitted module failed to validate inside the module's top-level code: ";
+    const note = "an IR claim refused inside `@start` (emitProgram: a function returning a parameter called at two signatures";
     if (bytes !== undefined || !diagnostics.some((d) => d.message.includes(REFUSAL)) || !diagnostics.some((d) => d.message.startsWith(note))) {
       throw new Error(`want no bytes and legacy's refusal, got ${bytes?.length} bytes and ${JSON.stringify(diagnostics.map((d) => d.message))}`);
     }
