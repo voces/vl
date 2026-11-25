@@ -23,10 +23,14 @@ Deno.test("refresh-compiler: a seed that cannot compile the source exits 1 and i
       throw new Error(`want exit 1, got ${out.code}:\n${text}`);
     }
     if (text.includes("re-fetching")) {
-      throw new Error(`want no re-fetch without --allow-refetch, got:\n${text}`);
+      throw new Error(
+        `want no re-fetch without --allow-refetch, got:\n${text}`,
+      );
     }
     if (!text.includes("--allow-refetch")) {
-      throw new Error(`want the message to name --allow-refetch, got:\n${text}`);
+      throw new Error(
+        `want the message to name --allow-refetch, got:\n${text}`,
+      );
     }
     const kept = await Deno.readTextFile(seed);
     if (kept !== "not a compiler") {
