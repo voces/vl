@@ -39,9 +39,12 @@ Census probe (`$VL_IR_SHADOW=5`), same program lists on both sides.
 
 | reading | master | head |
 |---|---:|---:|
-| start bodies claimed, tests/cases | 7,846 | see PR |
-| start bodies claimed, witnesses | 5,048 | see PR |
+| start bodies claimed, tests/cases | 7,846 | 7,849 |
+| start bodies claimed, witnesses | 5,047 | 5,053 |
+| start bodies claimed, distilled | 9,739 | 9,740 |
+| start bodies claimed, probes | 268 | 268 |
 | functions newly unclaimed, any population | | 0 |
+| armed shadow (`$VL_IR_SHADOW=1`) mismatch, fail and fallback rows | 23 | 23, the same rows |
 
 ## Moved, not claimed
 
