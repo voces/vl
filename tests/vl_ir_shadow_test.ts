@@ -1421,14 +1421,14 @@ print(fb([1, 2, 3]) + fc([1, 2]) + fh([4]))
   },
 });
 
-// An integer `abs` is legacy's staged `select`, not one instruction: a named miss, never a
-// byte mismatch.
+// An integer `abs` is legacy's staged `select` (`intSelTail`), not one instruction: the IR writes
+// the same tail after its operand, so the function is covered and matches.
 Deno.test({
-  name: "ir shadow: an integer abs is a named miss",
+  name: "ir shadow: an integer abs is covered by the shared select tail and matches",
   ignore,
   fn: () => {
     const { rows } = run(`function ab(x: i32): i32 { return abs(x) }\nprint(ab(-4))\n`, true);
-    const want = "uncovered intrinsic intAbs";
+    const want = "matched";
     if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -3216,7 +3216,7 @@ Deno.test({
 
 // A returned bundle's record held by a `const` and used at one signature takes that member
 // (`holderMemberTy`), in a plain and a generic function, and matches. A call straight off the
-// result stays a named indirect-call miss.
+// result takes its member too (`resultMemberCallRhs`).
 const ONE_MEMBER_HOLDER =
   `function lap(f) {\n  print(f(2.5))\n  print(f(3))\n  return f\n}\nfunction plain(k: i32) {\n  const r = lap((a) => a + k)\n  print(r(4))\n}\nfunction gen<T>(x: T, k: i32) {\n  const r = lap((a) => a + k)\n  print(r(1))\n  print(x)\n}\nfunction direct(k: i32) {\n  print(lap((a) => a + k)(7))\n}\nplain(5)\ngen("s", 20)\ndirect(1)\n`;
 Deno.test({
@@ -3233,8 +3233,8 @@ Deno.test({
     if ((rows.get("covered") ?? 0) !== (rows.get("matched") ?? 0)) {
       throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
     }
-    if ((rows.get("uncovered indirect call") ?? 0) !== 1) {
-      throw new Error(`want direct a named indirect-call miss, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("uncovered indirect call") ?? 0) !== 0 || (rows.get("covered") ?? 0) !== (rows.get("fns") ?? -1)) {
+      throw new Error(`want every function covered, got ${JSON.stringify([...rows])}`);
     }
   },
 });

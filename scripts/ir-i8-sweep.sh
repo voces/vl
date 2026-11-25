@@ -13,9 +13,15 @@
 #     (the self-compile, first). Every population then runs `vl check --codegen` under that compiler
 #     and under the seed. A program that fails only under the tree is newly failing, grouped by the
 #     first stub it hits. A claim that falls back on, or refuses inside, a stub is an IR need.
-# --grow appends each IR need that is not an entry point to <keep-list> (reason `ir-tail`) and runs
-# again, until a run finds none or --max-iter (default 30) runs have passed.
+# A kept function's (and the start and constant-cell writers') call of `emitExpr` or `emitWidened`
+# is rewritten to a stub naming its caller (`i8 reentry <caller>`): those callers are the port list.
+# A claim that falls back for a reason the seed's run of that program does not show is reported
+# too, since a stubbed helper that returns a sentinel makes the IR decline with its own reason,
+# beside the stubbed functions the IR files call by name (the static IR-to-stub edges).
+# --grow appends each IR need that is a stub, not an entry point or a re-entry, to <keep-list>
+# (reason `ir-tail`) and runs again, until a run finds none or --max-iter (default 30) have passed.
 # Writes <out>/report.txt (the summary and the stub table), <out>/failing.tsv (pop, program, stub),
+# <out>/fell.tsv (pop, program, a fallback reason new under the sweep), <out>/ir-stub-edges.txt,
 # <out>/needs.tsv (stub, programs), <out>/tree (the swept compiler/), <out>/compiler.wasm (built from it)
 # and <out>/deleted.txt. Exit 0
 # when no program newly fails, 1 when one does, 2 when the tree does not build. It deletes nothing
@@ -43,7 +49,7 @@ ENTRY="emitBlockValueAs emitBlockValueAsGo emitExpr emitExprAsElem emitExprAsKin
 T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
 mkdir -p "$OUT"
-export VL_STD="${VL_STD:-$PWD/std}" VL_IR_STRICT=1
+export VL_STD="${VL_STD:-$PWD/std}" VL_IR_STRICT=1 T
 
 # Each population's program list, once.
 lists() {
@@ -61,9 +67,14 @@ scan() {
 VL_IR_SHADOW=5 "$VL" check --codegen --compiler "$C" "$@" 2>&1 > /dev/null | awk '
   /^\[ERROR\]: / { msg = $0; sub(/^\[ERROR\]: /, "", msg); next }
   msg != "" && /^  at [^ ]+:[0-9]+:[0-9]+/ { f = $2; sub(/:[0-9]+:[0-9]+$/, "", f); print f "\t" msg; fflush(); msg = ""; next }
-  /^\[ir\] / && /i8 stub [A-Za-z0-9_]+/ && /(claim fell back|IR claim refused)/ {
+  /^\[ir\] / && /i8 (stub|reentry) [A-Za-z0-9_]+/ && /(claim fell back|IR claim refused)/ {
     h = $0; sub(/^\[ir\] /, "", h); sub(/: [0-9]+\t.*/, "", h)
-    match($0, /i8 stub [A-Za-z0-9_]+/); print h "\tNEED " substr($0, RSTART + 8, RLENGTH - 8); fflush()
+    match($0, /i8 (stub|reentry) [A-Za-z0-9_]+/); w = substr($0, RSTART + 3, RLENGTH - 3)
+    sub(/^stub /, "", w); print h "\tNEED " w; fflush(); next
+  }
+  /^\[ir\] / && /\tclaim fell back: / {
+    h = $0; sub(/^\[ir\] /, "", h); sub(/: [0-9]+\t.*/, "", h)
+    r = $0; sub(/.*\tclaim fell back: /, "", r); print h "\tFELL " r; fflush()
   }'
 ONE
   xargs -r -n 100 -P "$JOBS" env VL="$VL" C="$1" sh "$T/one.sh" < "$2" || true
@@ -74,6 +85,50 @@ run() {
   rm -rf "$T/tree" "$T/reach"
   STUB_KEEP="$KEEP" STUB_BODIES=scripts/ir-i8-census/stub-bodies.txt STUB_TREE="$T/tree" STUB_ONLY_B=1 \
     bash scripts/ir-i8-census/stub-reach.sh "$T/reach" | tee "$T/stage" >&2
+  # Re-entry tags: inside each kept function and the start and constant-cell writers, a call of
+  # emitExpr or emitWidened becomes emitExprRe/emitWidenedRe naming its caller.
+  { awk '!/^#/ && NF { print $1 }' "$KEEP"; printf '%s\n' emitStartGlobalInit emitStartGlobalInitValue emitConstCellInit; } > "$T/tagged"
+  for f in "$T"/tree/compiler/*.vl; do
+    awk -v base="$(basename "$f")" 'FILENAME == ARGV[1] { tag[$1] = 1; next }
+      function tagcall(l, name, re,   out, p, pre) {
+        out = ""
+        while ((p = index(l, name "(")) > 0) {
+          pre = (p > 1) ? substr(l, p - 1, 1) : ""
+          if (pre ~ /[A-Za-z0-9_.]/) { out = out substr(l, 1, p + length(name)); l = substr(l, p + length(name) + 1); continue }
+          out = out substr(l, 1, p - 1) re "(\"" cur "\", "; l = substr(l, p + length(name) + 1); hit[re] = 1
+        }
+        return out l
+      }
+      /^(export )?function [A-Za-z0-9_]+[ (<]/ { cur = $0; sub(/^(export )?function /, "", cur); sub(/[ (<].*/, "", cur) }
+      /^}/ { print; cur = ""; next }
+      cur != "" && (cur in tag) && $0 !~ /^ *\/\// { l = tagcall($0, "emitExpr", "emitExprRe"); l = tagcall(l, "emitWidened", "emitWidenedRe"); print l; next }
+      { print }
+      END { for (k in hit) print k > (ENVIRON["T"] "/uses." base) }' "$T/tagged" "$f" > "$T/f.new"
+    mv "$T/f.new" "$f"
+  done
+  cat >> "$T/tree/compiler/wasmEmit.vl" <<'VL'
+
+// The sweep's re-entry tags: a kept function that still lowers an operand through legacy.
+export function emitExprRe(caller: string, exprIx: i32, fnIx: i32): i32 {
+  emitFail("i8 reentry " + caller)
+  return 0
+}
+
+export function emitWidenedRe(caller: string, ix: i32, dst: i32, fnIx: i32): i32 {
+  emitFail("i8 reentry " + caller)
+  return 0
+}
+VL
+  for u in "$T"/uses.*; do
+    [ -e "$u" ] || continue
+    b=${u##*/uses.}; [ "$b" = wasmEmit.vl ] && continue
+    { echo "import { $(sort "$u" | paste -sd, | sed 's/,/, /g') } from \"./wasmEmit\""; cat "$T/tree/compiler/$b"; } > "$T/f.new"
+    mv "$T/f.new" "$T/tree/compiler/$b"
+  done
+  rm -f "$T"/uses.*
+  # The static IR-to-stub edges: stubbed functions an ir*.vl file calls by name.
+  grep -ohE 'emitFail\("i8 stub [A-Za-z0-9_]+"\)' "$T"/tree/compiler/*.vl | sed -E 's/.*i8 stub ([A-Za-z0-9_]+).*/\1/' | sort -u > "$T/stubs"
+  grep -ohE '[A-Za-z_][A-Za-z0-9_]*\(' "$T"/tree/compiler/ir*.vl | tr -d '(' | sort -u | comm -12 - "$T/stubs" > "$OUT/ir-stub-edges.txt"
   # (a) Delete what nothing reaches: each listed function from its header through its closing `}`,
   # with the comment block directly above it.
   "$VL" run scripts/dead-exports.vl -- --list --root "$T/tree" > "$T/dead"
@@ -152,7 +207,8 @@ run() {
   local fix="no" c="$T/b1.wasm" i=2
   while [ $i -le 4 ]; do
     if ! VL_IR_SHADOW=5 "$VL" build "$T/tree/compiler/entry.vl" -o "$T/b$i.wasm" --compiler "$c" > "$T/self.log" 2>&1; then
-      fix="self-compile fails at step $i: $(grep -m1 -oE 'i8 stub [A-Za-z0-9_]+' "$T/self.log" || grep -m1 '^\[ERROR\]' "$T/self.log" || echo '?')"
+      fix="self-compile fails at step $i: $(grep -oE 'i8 (stub|reentry) [A-Za-z0-9_]+' "$T/self.log" | sort | uniq -c | sort -rn | awk '{ printf "%s%s %s (%d)", (NR > 1 ? ", " : ""), $3, $4, $1 }' || true)"
+      [ "$fix" != "self-compile fails at step $i: " ] || fix="$fix$(grep -m1 '^\[ERROR\]' "$T/self.log" || echo '?')"
       break
     fi
     if cmp -s "$c" "$T/b$i.wasm"; then fix="yes (step $i)"; break; fi
@@ -160,21 +216,25 @@ run() {
   done
   cp "$c" "$OUT/compiler.wasm"
   # The populations: the self-compile's own result, then each list under both compilers.
-  : > "$T/failing" ; : > "$T/needs"
+  : > "$T/failing" ; : > "$T/needs" ; : > "$T/fell"
   grep -E '(claim fell back|IR claim refused).*i8 stub [A-Za-z0-9_]+' "$T/self.log" \
     | grep -oE 'i8 stub [A-Za-z0-9_]+' | sed 's/^i8 stub /self\tcompiler\/entry.vl\t/' >> "$T/needs" || true
-  [ "$fix" != "${fix#self-compile fails}" ] && printf 'self\tcompiler/entry.vl\t%s\n' "$(grep -m1 -oE 'i8 stub [A-Za-z0-9_]+' "$T/self.log" | sed 's/i8 stub //' || echo other)" >> "$T/failing"
+  [ "$fix" != "${fix#self-compile fails}" ] && printf 'self\tcompiler/entry.vl\t%s\n' "$(grep -m1 -oE 'i8 (stub|reentry) [A-Za-z0-9_]+' "$T/self.log" | sed -E 's/i8 (stub )?//' || echo other)" >> "$T/failing"
   for pop in ${POPS//,/ }; do
     [ "$pop" = self ] && continue
     [ -s "$T/base.$pop" ] || scan "$SEED" "$T/$pop" > "$T/base.$pop"
     scan "$c" "$T/$pop" > "$T/sweep.$pop"
     grep $'\tNEED ' "$T/sweep.$pop" | awk -F'\t' -v p="$pop" '{ sub(/^NEED /, "", $2); print p "\t" $1 "\t" $2 }' >> "$T/needs" || true
-    awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 !~ /^NEED /) bad[$1] = 1; next }
-      $2 ~ /^NEED / || ($1 in bad) || ($1 in seen) { next }
-      { seen[$1] = 1; s = "other"; if (match($2, /i8 stub [A-Za-z0-9_]+/)) s = substr($2, RSTART + 8, RLENGTH - 8); print p "\t" $1 "\t" s }' \
+    awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 !~ /^(NEED|FELL) /) bad[$1] = 1; next }
+      $2 ~ /^(NEED|FELL) / || ($1 in bad) || ($1 in seen) { next }
+      { seen[$1] = 1; s = "other"; if (match($2, /i8 (stub|reentry) [A-Za-z0-9_]+/)) { s = substr($2, RSTART + 3, RLENGTH - 3); sub(/^stub /, "", s) }; print p "\t" $1 "\t" s }' \
       "$T/base.$pop" "$T/sweep.$pop" >> "$T/failing"
+    # A fallback reason the seed's run of the same program does not show.
+    awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 ~ /^FELL /) had[$1 "\t" $2] = 1; next }
+      $2 ~ /^FELL / && !(($1 "\t" $2) in had) && $2 !~ /i8 (stub|reentry)/ { sub(/^FELL /, "", $2); print p "\t" $1 "\t" $2 }' \
+      "$T/base.$pop" "$T/sweep.$pop" >> "$T/fell"
   done
-  cp "$T/failing" "$OUT/failing.tsv"
+  cp "$T/failing" "$OUT/failing.tsv"; sort -u "$T/fell" > "$OUT/fell.tsv"
   sort -u "$T/needs" | awk -F'\t' '{ n[$3]++ } END { for (k in n) print k "\t" n[k] }' | sort -t$'\t' -k2,2nr > "$OUT/needs.tsv"
   {
     cat "$T/stage"
@@ -185,9 +245,13 @@ run() {
       echo "$pop: $(wc -l < "$T/$pop") programs, $(awk -F'\t' -v p="$pop" '$1 == p' "$T/failing" | wc -l) newly failing"
     done
     echo "newly failing, by the first stub hit (programs):"
-    cut -f3 "$T/failing" | sort | uniq -c | sort -rn | awk '{ printf "  %6d  %s\n", $1, $2 }'
-    echo "IR needs (claims that fell back on or refused inside a stub; programs):"
+    cut -f3 "$T/failing" | sort | uniq -c | sort -rn | awk '{ n = $1; $1 = ""; printf "  %6d %s\n", n, $0 }'
+    echo "IR needs (claims that fell back on or refused inside a stub or a re-entry; programs):"
     awk -F'\t' '{ printf "  %6d  %s\n", $2, $1 }' "$OUT/needs.tsv"
+    echo "IR fallbacks the seed does not show, by reason (programs; trace each to a stub below):"
+    sort -u "$T/fell" | cut -f3 | sort | uniq -c | sort -rn | awk '{ n = $1; $1 = ""; printf "  %6d %s\n", n, $0 }'
+    echo "static IR-to-stub edges (stubbed functions an ir*.vl file calls by name): $(wc -l < "$OUT/ir-stub-edges.txt")"
+    sed 's/^/  /' "$OUT/ir-stub-edges.txt"
   } > "$OUT/report.txt"
   if [ -s "$T/failing" ]; then RC=1; else RC=0; fi
 }
@@ -198,7 +262,7 @@ while :; do
   run
   echo "== run $it: $(grep -c . "$OUT/failing.tsv" 2>/dev/null || echo 0) newly failing, $(grep -c . "$OUT/needs.tsv" 2>/dev/null || echo 0) IR needs" >&2
   [ "$GROW" = 1 ] && [ "$RC" != 2 ] || break
-  new=$(cut -f1 "$OUT/needs.tsv" | grep -vxF -f <(tr ' ' '\n' <<< "$ENTRY") | grep -vxF -f <(awk '!/^#/ && NF { print $1 }' "$KEEP") || true)
+  new=$(cut -f1 "$OUT/needs.tsv" | grep -v '^reentry ' | grep -vxF -f <(tr ' ' '\n' <<< "$ENTRY") | grep -vxF -f <(awk '!/^#/ && NF { print $1 }' "$KEEP") || true)
   [ -n "$new" ] || break
   for n in $new; do echo "$n ir-tail" >> "$KEEP"; done
   echo "== grew the keep-list by $(wc -w <<< "$new"): $(tr '\n' ' ' <<< "$new")" >&2
