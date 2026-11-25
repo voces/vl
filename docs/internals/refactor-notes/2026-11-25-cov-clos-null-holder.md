@@ -61,16 +61,30 @@ with `cmp`. The PR body lists each program whose bytes change, with its output b
 Every output change is a trap becoming the correct value. No program writes an invalid module on
 either seed.
 
+## Census: master → head, over 11,500 files (8,387 programs with rows)
+
+| | master | head |
+|---|---:|---:|
+| claimed functions | 114,247 | 114,259 |
+| lost | | 0 |
+| `declaration coercion` | 13 | 3 |
+| `global read coercion` | 11 | 9 |
+
+The 12 functions gained:
+* the 6 local holders above;
+* `@start` and `@init` of two programs whose module holder now reads its cell as it is;
+* `inFn` of the new matrix test;
+* `fromLet`/`viaGet`/`viaIndex` of `map-of-bundles-held-at-slot-positions.vl`, the #10144 test's
+  locals.
+
 ## Q58 position sweep
 
-`tests/cases/maps/map-of-bundles-nullable-holder.vl`, the same output claims-off and claimed:
+`tests/cases/maps/map-of-bundles-nullable-holder.vl` covers module and function holders, each by
+index and by `get`, key missing and present, called through after narrowing. It also covers a
+module holder captured by a lambda, key missing and present, and a map of plain values beside them.
+It prints the same output claims-off and claimed; master traps on it. A function's holder captured
+by a lambda is refused on master too (D17585).
 
-| position | base | head |
-|---|---|---|
-| module holder by index, key missing | trap | `map miss` |
-| module holder by `get`, key present | `2` | `2` |
-| module holder captured by a lambda, null-tested | trap | `false` |
-| function holder by `get`, key missing | trap (at the declaration) | `map miss` |
-| function holder by index, key present | `7.5` (on its own) | `7.5` |
-| map of plain values, missing and present | `map miss`, `11` | same |
-| function holder captured by a lambda | refused | refused: D17585, pre-existing |
+`tests/cases/closures/*-missing-key.vl` are the miss-key variants of the 16 programs whose claimed
+functions held the trap. Each prints the miss, where master traps. The one exception is the
+read-before-init variant, which still traps by design.
