@@ -39,21 +39,30 @@ not complete.
   own null (`nullOwnOfRep`). A `string | null` field keeps the delivery's reference null; the
   string owner mismatched legacy's bytes.
 
+- **An empty literal no row keys** (the d16121 cells, a map of hole functions pushed into an
+  annotated list) is built at slot 0, the row `arrRefSlotOf` falls back to and the cell is declared
+  at. The fallback now lives in the shared plan `arrLitRefPlainSlot`, so both emitters read one
+  decision.
+- **The armed start shadow's frame.** `const x = @B { const w = "q"; w + "z" }` matched when
+  claimed but mismatched under the armed shadow (`prefix or locals`). The shadow built the IR's
+  start after legacy's `fbEndFunc`, so the declared locals' types were stale. It now reopens the
+  start frame as the claim path does. Row: `start-block-init-in-the-start-frame.vl`. This also
+  clears D3224's start mismatch.
+
 ## Measured, master 75ea62ad → head
 
 Same probe, same program lists:
 
 | reading | master | head |
 |---|---:|---:|
-| programs with a const cell miss | 18 | 13 |
+| programs with a const cell miss | 18 | 7 |
 | tests/cases functions claimed (distinct) | 44,383 | 44,385 |
 | tests/cases start bodies claimed | 7,710 | 7,711 |
-| armed shadow mismatch, fail and fallback rows | 26 | 26, the same rows |
+| armed shadow mismatch, fail and fallback rows | 26 | 25 (D3224's start mismatch gone) |
 
 ## Left
 
 | miss | programs | the shape |
 |---|---:|---|
-| `array ref` | 6 | an empty `[]` at a list of maps of hole-fn closures. Legacy builds it at slot 0, "some other list's row" (`arrRefSlotOf`), since a map whose value type is still open keys no row. Not a claim to match byte for byte. |
-| `array element coercion` | 5 | a record list beside twin rows of one layout (D2938, D6731, D6772): the element is built at the nullable-field row `J`, and the list holds the non-null `{f: {v: i32}}` on the same heap |
-| `box ladder` | 2 | the shared box plan's ladder arm (`boxPlanWhy`) |
+| `array element coercion` | 5 | a record list beside twin rows of one layout (D2938, D6731, D6772): the element is built at the nullable-field row `J`, and the list holds the non-null `{f: {v: i32}}` on the same heap. Retagging nullable to non-null on a shared heap is not a rep the verifier can admit. |
+| `box ladder` | 2 | the shared box plan's ladder arm (`boxPlanWhy`), legacy's long union coerce |
