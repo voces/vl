@@ -27,4 +27,8 @@ that is not a call. On master `bc95de5c4` it is the first miss of 17 functions a
 - **D17201 closed**: a `null`-typed name in a value `if` arm boxed into `A | B | null`. The claimless
   build refuses it at emit ("ref valtype with no interned shape"); the claimed build now runs and
   prints its `Want:`. The parity gate's refusals population showed it as `build-fails(off)` until
-  the row was closed, and it then leaves that population (112 → 111 programs).
+  the row was closed, and it then leaves that population (112 → 111 programs). Filed `runs`, it is
+  in `ir-identity.sh --claimless`'s population, where the claimless build refuses it. So
+  `scripts/ir-divergence-baseline.txt` lists it as legacy-wrong (O3): `--claimless` reports
+  `expected divergence … (legacy-wrong: claimless exit 1)`, and `ir-parity.vl --files` reports
+  `legacy-wrong, on meets its expected output`.
