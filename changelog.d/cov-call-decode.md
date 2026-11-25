@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **The IR decides a `for` literal's hoist over string globals itself:** a `for s in [A, B]` whose elements are module string `const`s built by concatenation (or any string global's read) no longer asks legacy's hoist, which re-entered `emitStrValue`. The IR writes each read through its own `RGlobalGet` lowering, and `forLitHoistAdd` decides as it does for legacy. This was the I8 self-compile's first blocker (`decodeArities`): `ir-i8-sweep.sh keep --pops self` now reaches a self-compile fixpoint with nothing unexplained. Legacy's bytes are identical across every population and the self-compile.

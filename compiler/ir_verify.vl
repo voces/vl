@@ -19,6 +19,7 @@ import {
   RArmUnbox,
   RAsTail,
   RAsUnion,
+  RAsgParked,
   RAsgUnwiden,
   RAtomEq,
   RAtomSole,
@@ -211,7 +212,7 @@ import {
   repsLowerAlike,
 } from "./ir"
 import { tyHasTyVar } from "./tyquery"
-import { NICHE_NUL_MAP } from "./emit_start_block"
+import { NICHE_NUL_LIT, NICHE_NUL_MAP } from "./emit_start_block"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { AsExpr, Call, i32ToStr, nodeAt } from "./ast"
 
@@ -306,6 +307,8 @@ function eqSideRep(o: Opnd, ix: Opnd[]): i32 {
 function nicheRefFits(k: i32, dst: i32): boolean {
   const dn = repNodeAt(dst)
   if !(dn is RNullable) { return false }
+  // A literal union's niche is its atom id, `-1` for null.
+  if k == NICHE_NUL_LIT { return dn.rnDisc == 3 }
   const inner = repNodeAt(dn.rnInner)
   if k == NICHE_NUL_MAP { return inner is RMap }
   if k == 11 { return inner is RClosure }
@@ -921,6 +924,15 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if !(repNodeAt(dst) is RList) {
         return fail(2, at, "a spread literal of a non-list rep")
       }
+      // A boxing spread's group is any list, which the lowering boxes or retags to the row.
+      if r.spBoxRow >= 0 {
+        for s in r.spSrcs {
+          if !(repNodeAt(opRep(s)) is RList) {
+            return fail(2, at, "a boxing spread's source is not a list")
+          }
+        }
+        return 0
+      }
       for s in r.spSrcs {
         if opRep(s) != dst {
           return fail(2, at, "a spread's source rep is not the literal's")
@@ -1296,6 +1308,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    // The parked slot is the store's own value, built at this rep (`assignValueParked`).
+    RAsgParked => 0
     RAsgUnwiden => {
       use(r.uwV, at)
       if !unwidenAgrees(r.uwOp, opRep(r.uwV), dst) {
@@ -2576,6 +2590,13 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
     lbPrev = lid
   }
   if !mapArm { use(n.cbL, id) }
+  const ci = n.cbIdx
+  if ci != null {
+    if n.cbArm != "listGetOr" {
+      return fail(2, id, "a `??` holds a `.get` index off the list-read arm")
+    }
+    use(ci, id)
+  }
   if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
     return fail(4, id, "a boxed `??` writes no variable")
   }
@@ -3217,6 +3238,7 @@ function rhsReadsList(r: Rhs): boolean {
       RArmUnbox |
       RAsTail |
       RAsUnion |
+      RAsgParked |
       RAsgUnwiden |
       RAtomEq |
       RAtomSole |

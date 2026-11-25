@@ -13,11 +13,19 @@ T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
 export VL_BIN="$VL"
 
-# A fixpoint: a second refresh builds the same bytes as the first.
+# A fixpoint, proved here: the seed builds compiler/ into its own bytes. refresh-compiler.sh's exit
+# alone does not prove it, since a seed that cannot compile the source is replaced by a fetched one.
 scripts/refresh-compiler.sh > "$T/r1.log" 2>&1 || { echo "rebaseline: refresh failed (see a rerun of scripts/refresh-compiler.sh)"; exit 2; }
-cp "$SEED" "$T/s1.wasm"
-scripts/refresh-compiler.sh > "$T/r2.log" 2>&1 || { echo "rebaseline: second refresh failed"; exit 2; }
-cmp -s "$SEED" "$T/s1.wasm" || { echo "rebaseline: no fixpoint after two refreshes"; exit 2; }
+grep -q 're-fetching' "$T/r1.log" && { echo "rebaseline: the seed could not compile the source; refresh fell back to a fetched seed"; exit 2; }
+# Two steps: the first self-build after a codegen change may differ from the seed once.
+for step in 1 2; do
+  if ! "$VL" build compiler/entry.vl -o "$T/self.wasm" --compiler "$SEED" > "$T/self.log" 2>&1; then
+    echo "rebaseline: the seed does not build compiler/ (no fixpoint):"; grep -v '^ \+[0-9]*:\|^ \+at ' "$T/self.log" | head -5 | sed 's/^/    /'; exit 2
+  fi
+  cmp -s "$SEED" "$T/self.wasm" && break
+  [ "$step" = 2 ] && { echo "rebaseline: no fixpoint: two self-builds still differ"; exit 2; }
+  cp "$T/self.wasm" "$SEED"
+done
 echo "rebaseline: fixpoint seed $(wc -c < "$SEED") bytes"
 
 ROSE=""
