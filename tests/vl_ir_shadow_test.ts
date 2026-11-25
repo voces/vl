@@ -2677,14 +2677,11 @@ print(gn[0])
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
-      throw new Error(`want two, glob, field, index covered and matched, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
+      throw new Error(`want two, glob, field, index, nest covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (
-      rows.get("uncovered push late receiver") !== 1 ||
-      rows.get("uncovered short-circuit argument after another") !== 1
-    ) {
-      throw new Error(`want nest and arg left to legacy by name, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered short-circuit argument after another") !== 1) {
+      throw new Error(`want arg left to legacy by name, got ${JSON.stringify([...rows])}`);
     }
   },
 });

@@ -11,6 +11,7 @@ import { printUnionPlan } from "./emit_fn_scans"
 import {
   armIdxSlot,
   irOnceRefSlot,
+  irOnceSlot,
   sharedFieldRecvSlot,
 } from "./emit_union_casts"
 import { mapRecvScalarBoxKindIn, mapRecvTyIn } from "./emit_ty_canon"
@@ -38,7 +39,7 @@ import {
   luOvLocalLeave,
   optLeafArmOf,
 } from "./wasmEmit"
-import { pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
+import { atomPayloadTail, pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
 import {
   armSiteRecv,
   capCellTargetOf,
@@ -216,6 +217,7 @@ import {
   RMakeClo,
   RMakeList,
   RMakeRec,
+  RMapClear,
   RMapDelete,
   RMapEq,
   RMapFilter,
@@ -315,6 +317,7 @@ import {
   repPrim,
 } from "./ir"
 import {
+  VT_ANYREF,
   fbArrayCopy,
   fbArrayFill,
   fbArrayGet,
@@ -488,6 +491,7 @@ import {
   envCacheSlotOfFe,
   eqElemNullTestOk,
   eqHelpTail,
+  eqRouteOf,
   f64RemCallTail,
   f64RemOperandTail,
   fieldStoreArmOf,
@@ -531,6 +535,7 @@ import {
   holeOptBoxTail,
   hostCallTail,
   identListOverrideOf,
+  identityMixedTail,
   identityOperandTail,
   idxRowsOn,
   idxSpanOn,
@@ -546,6 +551,7 @@ import {
   listReserveOpen,
   loopHoistCands,
   loopHoistClose,
+  mapClearTail,
   mapDeleteTail,
   mapGetArmOf,
   mapGetHelperFnOf,
@@ -753,6 +759,7 @@ import {
   voidTailCallee,
 } from "./wasmEmit"
 import {
+  HoleBox,
   arrLitVariantSlot,
   atomEqPlanOf,
   holeBoxPlanOf,
@@ -881,6 +888,7 @@ import {
 import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import {
+  identityArmSlot,
   ifLinkYieldsNull,
   isRecvStashHolds,
   isRecvStashSlot,
@@ -1326,6 +1334,7 @@ function rhs(r: Rhs, tail: boolean) {
       got
     }
     RMapHas => mapHas(r)
+    RMapClear => irLMiss("map clear value")
     RMapDelete => mapDelete(r)
     RMapEq => mapEq(r)
     RMapIter => mapIter(r)
@@ -1866,8 +1875,7 @@ function stashIfBoxHead(id: i32) {
   const at = lwIfHeadAt.get(out) ?? -1
   if at >= 0 && !i32ListHas(lwBoxHeadAt, at) { return stashBoxHead(at) }
   // A valued `if`'s box head follows the operands staged ahead of it (`valuedIfOpen`), as does a
-  // `??`'s that stages them (`coalBox`).
-  if n is SCoalBox && !coalArmStagesLeads(n.cbArm) { joinBoxHead(out, false) }
+  // `??`'s (`coalBox`).
   return 0
 }
 
@@ -1931,7 +1939,14 @@ function dispatchBoxHeadOf(boxId: i32) {
 function joinBoxHead(out: i32, staged: boolean) {
   if !lwIfHeadBuilt { stashIfHeadsNote() }
   const bx = lwIfBoxAt.get(out) ?? -1
-  if bx < 0 || i32ListHas(lwBoxHeadAt, unwrapParen(bx)) { return 0 }
+  // A late box (`irBoxLate`) writes its own head after its value.
+  if (
+    bx < 0
+    || i32ListHas(lwBoxHeadAt, unwrapParen(bx))
+    || i32ListHas(lw.irBoxLate, unwrapParen(bx))
+  ) {
+    return 0
+  }
   const p = holeBoxPlanOf(bx, lwIfBoxTy.get(out) ?? -1, lw.irAt)
   if holeBoxHeadAhead(p.hbArm) {
     if staged { lwPushing = true } else { leaf() }
@@ -4231,6 +4246,16 @@ function mapDelete(r: RMapDelete) {
   return mapDeleteTail()
 }
 
+// `RMapClear`: the global, its recovery and the op context, then legacy's reset in place.
+function mapClear(r: RMapClear) {
+  if r.mcSym >= 0 && userGlobalReadClass(r.mcSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map clear of a global not read plainly")
+  }
+  mapRecvRead(r.mcSym, r.mcNonNull, r.mcLoc)
+  mapRecvRefTail(r.mcRecv, lw.irAt)
+  return mapClearTail(mapRecvShapeOf(r.mcRecv, lw.irAt))
+}
+
 // `RMapSet`: the global, its recovery, the key and the op context, then the value and legacy's
 // store tail, as `emitMapSetV` writes them.
 function mapSet(r: RMapSet) {
@@ -4526,12 +4551,18 @@ function closureEq(r: RClosureEq) {
 }
 
 // `RIdentityEq`: legacy's `emitIdentityBin`, each operand then its payload tail, `ref.eq`, and
-// `i32.eqz` for `!==`.
+// `i32.eqz` for `!==`; on the per-arm route, `emitIdentityMixed`'s staged compare.
 function identityEq(r: RIdentityEq) {
   const n = nodeAt(r.ieAt)
   if !(n is BinExpr) { return irLMiss("identity compare node") }
   irLOpnd(r.ieL)
   identityOperandTail(n.binLeft, lw.irAt)
+  if eqRouteOf(n, r.ieAt, lw.irAt) == "identMixed" {
+    fbLocalSet(identityArmSlot(0))
+    irLOpnd(r.ieR)
+    identityOperandTail(n.binRight, lw.irAt)
+    return identityMixedTail(n)
+  }
   irLOpnd(r.ieR)
   identityOperandTail(n.binRight, lw.irAt)
   fbRefEq()
@@ -4866,6 +4897,7 @@ function boxOp(r: RToBox) {
   const fnIx = lw.irAt
   const p = holeBoxPlanOf(r.bxAt, r.bxTy, fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
+  if i32ListHas(lw.irBoxLate, unwrapParen(r.bxAt)) { return boxLate(r, p) }
   // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
   if !i32ListHas(lwBoxHeadAt, unwrapParen(r.bxAt)) {
     if p.hbArm != "pass" && p.hbArm != "memberBox" && p.hbArm != "retag" {
@@ -4890,6 +4922,7 @@ function boxOp(r: RToBox) {
     || p.hbArm == "atomAsStr"
     || p.hbArm == "retag"
     || p.hbArm == "mapBox"
+    || p.hbArm == "mapScalar"
   ) {
     irLOpnd(r.bxV)
   } else {
@@ -4898,6 +4931,32 @@ function boxOp(r: RToBox) {
   if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
   if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
   return holeBoxTail(p, r.bxAt, fnIx)
+}
+
+// A late box (`irBoxLate`): its value and payload conversion, held in an `anyref` local
+// (`irOnceSlot`), then the plan's tag, the payload again and the box. Only a plan whose head is
+// its tag alone takes this; any other refuses.
+function boxLate(r: RToBox, p: HoleBox) {
+  const fnIx = lw.irAt
+  const tagOnly = p.hbArm == "atom"
+    || p.hbArm == "atomAsStr"
+    || p.hbArm == "atomList"
+    || p.hbArm == "rec"
+    || p.hbArm == "obj"
+    || p.hbArm == "refList"
+  if !tagOnly { return irLMiss("box of a valued if at plan " + p.hbArm) }
+  irLOpnd(r.bxV)
+  if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
+  if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
+  if p.hbArm == "atom" || p.hbArm == "atomList" { atomPayloadTail(p.hbKind) }
+  const any: u8[] = [VT_ANYREF]
+  const s = irOnceSlot(any)
+  fbLocalSet(s)
+  holeBoxHead(p, r.bxAt, fnIx)
+  lwBoxHeadAt.push(unwrapParen(r.bxAt))
+  fbLocalGet(s)
+  fbStructNew(uBoxIdx)
+  return 0
 }
 
 // Opens legacy's header hoists for the loop over `condIx` and `bodyIx`, its rows and header
@@ -5448,6 +5507,11 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
+      if r is RMapClear {
+        mapClear(r)
+        irLSettle(pending)
+        return 0
+      }
       if r is RMapFilter { return mapFilterDropped(r, pending) }
       if r is RMapSet {
         mapSet(r)
@@ -5851,9 +5915,15 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   return IF_DONE
 }
 
-function noRoots(): i32[] {
-  const r: i32[] = []
-  return r
+// The operands a `??` reads in place: its left, and a fused map read's key or a list read's
+// index, which stay above any earlier operand it stages.
+function coalReads(n: SCoalBox): Opnd[] {
+  const cs: Opnd[] = [n.cbL]
+  const mp = n.cbMap
+  if mp != null { cs.push(mp.prKey) }
+  const ix = n.cbIdx
+  if ix != null { cs.push(ix) }
+  return cs
 }
 
 // Writes the temps an earlier operand left pending below the valued `if` about to open on `c`,
@@ -6092,11 +6162,12 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   if !(e0 is BinExpr) && !(e0 is AsExpr && n.cbArm == "asProp") {
     return irLMiss("coalesce box node")
   }
-  // An earlier operand's temps are written below the operand, as a valued `if` stages them.
+  // An earlier operand's temps are written below the operand, and the box head after them, as
+  // legacy writes that operand first.
   const stages = coalArmStagesLeads(n.cbArm)
-  const roots = if stages { stageLead(n.cbL, pending) } else { noRoots() }
+  const roots = stageLeadOf(coalReads(n), pending)
   if lwMiss != "" { return -1 }
-  if stages { joinBoxHead(t, true) }
+  joinBoxHead(t, stages || roots.length > 0)
   lwFloors.push(lwFloor)
   lwFloor = lwLive.length - liveCountIn(pending)
   const got = coalBoxGo(n, pending)
