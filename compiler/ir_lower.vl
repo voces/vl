@@ -1041,9 +1041,12 @@ export function irLSkip(o: Opnd) {
   if o is OVar && isTemp(o.ov) {
     if !tempDefined(o.ov) { return irLMiss("temp used before its definition") }
     if !takeUse(o.ov) { return irLMiss("non-stack temp: used twice") }
-    // A field read's receiver is consumed first, as `irLOpnd` writes it.
+    // A field read's receiver, or a narrowed global read's box, is consumed first, as `irLOpnd`
+    // writes it.
     const r = tempRhs(o.ov)
     if r is RGetField { irLSkip(r.gfV) }
+    const base = lw.irSkipBase.get(o.ov) ?? -1
+    if base >= 0 { irLSkip({ ov: base }) }
     lwSeq.push(o.ov)
   }
   return 0
@@ -2819,15 +2822,18 @@ function fieldTail(at: i32, m: Member) {
 
 // `RBoxNarrow`: the box, then legacy's payload cast to the read's variant, as
 // `emitVariantCoerce`'s box arm writes a narrowed read at a variant destination.
-function boxNarrow(r: RBoxNarrow) {
-  if r.bnCon >= 0 { return boxContainerRead(r) }
+function boxNarrow(r: RBoxNarrow) { return boxNarrowAt(r, false) }
+
+// `boxNarrow`, its box read as `boxNarrowBox` reads it.
+function boxNarrowAt(r: RBoxNarrow, again: boolean) {
+  if r.bnCon >= 0 { return boxContainerRead(r, again) }
   if r.bnAtom >= 0 {
-    irLOpnd(r.bnV)
+    boxNarrowBox(r, again)
     return emitUnionUnboxTail(r.bnAtom)
   }
   const vi = narrowedBoxVariantPlain(r.bnAt, lw.irAt)
   if !narrowedVariantRepIs(vi, r.bnRep) { return irLMiss("box narrow shape") }
-  irLOpnd(r.bnV)
+  boxNarrowBox(r, again)
   return narrowedVariantTail(vi)
 }
 
@@ -3058,7 +3064,7 @@ function armUnbox(r: RArmUnbox) {
 
 // `RBoxNarrow` of a ref list or map arm: the box, then legacy's payload cast to the container,
 // past the list overrides `emitIdentNode` asks first.
-function boxContainerRead(r: RBoxNarrow) {
+function boxContainerRead(r: RBoxNarrow, again: boolean) {
   const e = nodeAt(r.bnAt)
   if !(e is Ident) { return irLMiss("box container read node") }
   match identListOverrideOf(e, r.bnAt, lw.irAt) {
@@ -3067,7 +3073,7 @@ function boxContainerRead(r: RBoxNarrow) {
     }
     "none" => {}
   }
-  irLOpnd(r.bnV)
+  boxNarrowBox(r, again)
   if r.bnCon == RC_MAP { return mapUnionUnboxTail(r.bnAt, lw.irAt) }
   return refArrayUnionUnboxTail(r.bnAt, lw.irAt)
 }
@@ -4963,8 +4969,23 @@ function opndAgain(o: Opnd, ix: i32): i32 {
 export function irLReadAgain(ix: i32): boolean {
   if !lw.irReadAgain.has(ix) { return false }
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
-  rhs(lw.irReadAgain[ix] ?? none, false)
+  const r = lw.irReadAgain[ix] ?? none
+  if r is RBoxNarrow {
+    boxNarrowAt(r, true)
+    return true
+  }
+  rhs(r, false)
   return true
+}
+
+// The box narrowed read `r` unboxes: its operand, or, written `again`, the global's read
+// (`irReadBoxed`) where its first read consumed the box temp.
+function boxNarrowBox(r: RBoxNarrow, again: boolean) {
+  if again && lw.irReadBoxed.has(r.bnAt) {
+    const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
+    return rhs(lw.irReadBoxed[r.bnAt] ?? none, false)
+  }
+  return irLOpnd(r.bnV)
 }
 
 // `RRecCopyPure`: legacy's whole copy, its source read as the IR wrote it: whole, where the copy
