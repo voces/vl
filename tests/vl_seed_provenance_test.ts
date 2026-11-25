@@ -244,7 +244,7 @@ Deno.test("seed provenance: the graders consult it", async () => {
   // The guard is worthless if nobody calls it. Assert the wiring rather than trusting it —
   // a helper with a green self-test and no caller is the shape this repo has shipped before.
   const callers: [string, string][] = [
-    ["check-filed-witnesses.vl", "provenance(moved.length)"],
+    ["check-filed-witnesses.vl", "provenance(reported)"],
     ["survey-regrade.vl", "= provenance("],
   ];
   for (const [f, call] of callers) {
