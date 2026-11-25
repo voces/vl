@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Fixed D17447 and D17039** (clause 1, check-clean invalid wasm): a generic's `[x]` with `x: T | null`, called with only `null` (`f(null)`), built its `null[]` list with the parameter's `nullref` where the list stores the i32 sentinel; and `.map`/`.filter` over a `null[]` handed a callback taking `null` the stored sentinel. A `never | null` is now the `null` unit to the shared classifiers, a `null[]` element's null is the list's sentinel, and the map loop hands such a callback the bottom ref (coordinator ruling). Filed D17561 (a hole function's `.map` callback with an un-annotated return over its `null[]` list).

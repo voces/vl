@@ -13172,3 +13172,18 @@ closure inside it was the defect and is gone.
 **Why.** Dropping the initializer's narrowing would reject programs the language accepts today.
 Keeping the analysis but caching the module root's walk across functions does not pay: the checker
 edits the arena in place between the asks, so a kept walk is stale (measured: no fuel moved).
+
+## A `never | null` is the `null` unit to the shared plans' classifiers (2026-11-25, coordinator ruling) — D17447, D17039
+
+**Ruled by the coordinator 2026-11-25**, on lane SOUND's proposal. An instance keeps `T | null` at
+`T = never` as written (D3178), so its parameter is a nullable `never`, while a list of it is the
+`null[]` list stored as the `boolean | null` i32 sentinel (D4671). `tyIsNullUnit` (check_ty_rep.vl)
+names `never | null` the `null` unit, and the null plans read a `null[]` element's null as that
+sentinel; `.map`/`.filter`'s shared plan hands a callback taking `null` the bottom ref.
+
+**Why.** It keeps D3178's instance-as-written rule, it is local to the classifiers every emitter
+asks, and it covers both the delivery side (a list literal's element, D17447) and the read side (a
+callback's element, D17039). Substituting `T | null` at `never` to `null` in the instance would
+reopen D3178's guarded reads. The IR takes the answer from the same classifier and plan
+(`emit_plan_null.vl`, `mfLoopTail`) rather than mirroring it (R8).
+
