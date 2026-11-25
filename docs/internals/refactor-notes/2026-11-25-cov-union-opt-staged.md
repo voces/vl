@@ -23,5 +23,7 @@ stays a named miss.
   element, a call's result, a field over an element; a return, an argument, a binding, a loop, an
   `if`; the call counted once): `bind` and `cond` missed before, both claimed after; output equal
   to master's.
-- The sweep's first spelling, a map read's `?.` over the box field, is refused by legacy itself:
-  filed as D17541.
+- Legacy refuses the sweep's first spelling, `m[k]?.f ?? d` with `f` a value-union box on the map's
+  record value: `emitCoalesceOptMapField` has no leaf for a box field (`optLeafKindOf`); the same
+  read through a local runs. Not filed (lane brief O3); the IR claim for the fused map read's box
+  leaf would close it.
