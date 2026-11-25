@@ -1241,10 +1241,7 @@ function rhs(r: Rhs, tail: boolean) {
   match r {
     RPrimOp => primOp(r)
     RCall => call(r, tail)
-    RGlobalGet => {
-      globalRead(r.ggSym, r.ggNonNull)
-      if r.ggNn > 0 { fbRefAsNonNull() }
-    }
+    RGlobalGet => globalGetRhs(r)
     RMapGetOr => mapGetOr(r)
     RMapGet => {
       const from = irLAt()
@@ -3071,7 +3068,7 @@ function irForLitHoist(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
   if !(a is ArrayLit) || a.arrElems.length != r.mlElems.length { return -1 }
   let i = 0
   while i < r.mlElems.length {
-    if !forLitElemWrites(r.mlElems[i], a.arrElems[i], t) {
+    if !forLitElemWrites(r.mlElems[i], t) {
       const g = hoistInRangeCopy(r, fnIx, arm)
       if g >= 0 {
         irLMiss("for iterable element")
@@ -3082,17 +3079,12 @@ function irForLitHoist(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
     i = i + 1
   }
   if t.fhBack < 0 || !forLitHoistable(r.mlAt, a.arrElems) { return -1 }
-  // A global's read of a `const` string that is not pooled is no one constant: no hoist.
+  // A global's read of a `const` string literal that is not pooled is no one constant: no hoist.
   i = 0
   while i < r.mlElems.length {
     const e = r.mlElems[i]
-    if (
-      e is OVar
-      && isTemp(e.ov)
-      && !forLitStrPooled(forLitConstStrOf(a.arrElems[i], fnIx))
-    ) {
-      return -1
-    }
+    const sx = if e is OVar && isTemp(e.ov) { forLitConstStrOf(a.arrElems[i], fnIx) } else { -1 }
+    if sx >= 0 && !forLitStrPooled(sx) { return -1 }
     i = i + 1
   }
   const init: u8[] = []
@@ -3116,24 +3108,37 @@ function irForLitHoist(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
   return forLitHoistClose(init, r.mlElems.length, t)
 }
 
-// Whether `for` iterable element `e` (node `x`) is one `forLitElemAt` writes as legacy's hoist
-// does: an immediate, a variable's read, or a global's read of a module `const` string literal.
-function forLitElemWrites(e: Opnd, x: i32, t: ForLitHoistTys): boolean {
+// Whether `for` iterable element `e` is one `forLitElemAt` writes as legacy's hoist
+// does: an immediate, a variable's read, or a string global's read.
+function forLitElemWrites(e: Opnd, t: ForLitHoistTys): boolean {
   if !(e is OVar) || !isTemp(e.ov) { return true }
   return tempRhs(e.ov) is RGlobalGet
     && t.fhBack >= 0
     && t.fhForm == forLitStrForm()
-    && forLitConstStrOf(x, lw.irAt) >= 0
 }
 
 // Writes `for` iterable element `e` (node `x`) alone: a module `const`'s string literal for a
-// global's read of one (the read itself pure, skipped where the list hoists), else the operand.
+// global's read of one, any other global's read as itself (each pure, skipped where the list
+// hoists), else the operand.
 function forLitElemAt(e: Opnd, x: i32, fnIx: i32) {
   if e is OVar && isTemp(e.ov) {
-    leaf()
-    return emitStrLitAt(forLitConstStrOf(x, fnIx), fnIx)
+    const sx = forLitConstStrOf(x, fnIx)
+    if sx >= 0 {
+      leaf()
+      return emitStrLitAt(sx, fnIx)
+    }
+    const r = tempRhs(e.ov)
+    if !(r is RGlobalGet) { return irLMiss("for iterable element") }
+    return globalGetRhs(r)
   }
   return irLOpnd(e)
+}
+
+// `RGlobalGet`: the global's read, then the recover its consumer owes.
+function globalGetRhs(r: RGlobalGet) {
+  globalRead(r.ggSym, r.ggNonNull)
+  if r.ggNn > 0 { fbRefAsNonNull() }
+  return 0
 }
 
 // Legacy's hoist of `for` iterable `r` (`arrLitHoistGlobal`), asked with each range variable its
