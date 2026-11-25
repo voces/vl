@@ -11811,6 +11811,7 @@ function coalesce(
     return v
   }
   if arm == "mapScalarJoin" { return coalMapScalarJoin(b, n, ix, rep) }
+  if arm == "boxRuntime" { return coalBoxRuntime(b, n, ix, rep) }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
 }
@@ -12251,8 +12252,6 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   }
   const boxOut = arm == "valBox" || arm == "callBox"
   if boxOut != heldAsBox(rep) { return irBMiss("coalesce box result rep") }
-  const ty = outTyOf(ix, rep)
-  if irTyOpen(ty) { return irBMiss("open temp type") }
   // Its value stays on the stack from here, so no temp an operand before it built may wait,
   // unless the lowering writes that temp below the tag test (`coalArmStagesLeads`).
   if endsInTemp(b) && !coalArmStagesLeads(arm) {
@@ -12260,6 +12259,35 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   }
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
+  return coalBoxNode(b, n, lhsIx, ix, rep, arm, l)
+}
+
+// `l ?? d` whose operand the checker narrowed to `null` though it may have been written since (a
+// loop, a closure, a call): the box read at its storage, then the value-box `??` over it.
+function coalBoxRuntime(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const lhsIx = unwrapParen(n.binLeft)
+  if endsInTemp(b) { return irBMiss("coalesce box after an operand") }
+  const mark = storageReadEnter(lhsIx)
+  const l = irBExpr(b, n.binLeft)
+  storageReadLeave(mark)
+  if ibMiss != "" { return l }
+  const arm: CoalValArm = if heldAsBox(rep) { "valBox" } else { "valScalar" }
+  return coalBoxNode(b, n, lhsIx, ix, rep, arm, l)
+}
+
+// A value-box `??` over box `l` built for `lhsIx` along `arm`: the default built into its null arm,
+// so it runs only there, and the `SCoalBox` writing out `cbOut`.
+function coalBoxNode(
+  b: i32[],
+  n: BinExpr,
+  lhsIx: i32,
+  ix: i32,
+  rep: i32,
+  arm: CoalValArm,
+  l: Opnd,
+): Opnd {
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
   if !heldAsBox(irBOpRep(l)) { return irBMiss("coalesce box operand rep") }
   // A binding's box is read again as the builder read it (`irHoistRecv`).
   if arm == "valBox" || arm == "valScalar" {
