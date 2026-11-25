@@ -38,7 +38,7 @@ Same census probe and program lists; armed shadow over every program.
 
 Three functions move from `open temp type` to `operand type`, also this lane's class.
 
-## The atom cell's read, fixed here (unfiled: D17568)
+## The atom cell's read, fixed here (D17568)
 
 `function ret() { return c }` over the atom-assignment global `c` was claimed into an invalid
 module: the i32 atom cell was returned as a string. This was pre-existing on master. SOUND filed it
