@@ -13343,9 +13343,7 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   const st = idxStorePlanOf(t, ibFnIx)
   if st == null { return skip("store plan") }
   // Legacy writes an unstamped unit into a `null[]` as its sentinel, apart from the value's emit.
-  if idxStoreNullUnitUnstamped(t.idxArr, n.binRight, ibFnIx) {
-    return skip("store null unit sentinel")
-  }
+  const nulStore = idxStoreNullUnitUnstamped(t.idxArr, n.binRight, ibFnIx)
   const why = idxStoreOtherWhy(st, n.binRight, ibFnIx)
   if why != "" { return skip(why) }
   const site = idxStoreSiteBoxes(st, n.binRight, ibFnIx)
@@ -13360,10 +13358,15 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   const i = irBExpr(b, t.idxIndex)
   const ln = repNodeAt(irBOpRep(v))
   if !(ln is RList) { return skip("store operand coercion") }
-  // A packed list's element is stored as a plain i32, which its backing truncates.
-  const er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
+  // A packed list's element is stored as a plain i32, which its backing truncates; a `null[]`'s
+  // as its i32 storage's sentinel.
+  const er = if repPrim(ln.rlsElem) == "u8" || repPrim(ln.rlsElem) == "null" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const xat = b.length
-  const x = if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
+  // Its sentinel is an i32 only where the list's own rep holds `null[]`'s i32 storage.
+  if nulStore && repPrim(ln.rlsElem) != "null" {
+    return skip("store null unit sentinel rep")
+  }
+  const x = if nulStore { nulSentinelStore(b, n.binRight, er) } else if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
   if ibMiss != "" { return 0 }
   if ifBelowLeadIn(b, at, xat, "store short-circuit operand") { return 0 }
   if repPrim(irBOpRep(i)) != "i32" || irBOpRep(x) != er {
@@ -16547,6 +16550,17 @@ function nulSentinelElem(b: i32[], e: i32, er: i32): Opnd {
   const v = irBExpr(b, e)
   if ibMiss != "" { return v }
   return irBLetTempTy(b, { aeEff: [v], aeV: two, aeAt: e }, e, er, TY_I32)
+}
+
+// An unstamped `null` stored into a `null[]`, as `emitIdxStoreValue` writes it: the value for its
+// effect (`emitNulNoneForEffect`, nothing for a `null` or a name read), then the sentinel 2.
+function nulSentinelStore(b: i32[], x: i32, er: i32): Opnd {
+  const two: Opnd = { oiRep: er, oiBits: 2 }
+  const effs: Opnd[] = []
+  const e = nulNoneEffect(b, x, x, effs)
+  if ibMiss != "" { return e }
+  if effs.length == 0 { return two }
+  return irBLetTempTy(b, { aeEff: effs, aeV: two, aeAt: x }, x, er, TY_I32)
 }
 
 function allStrLits(es: i32[]): boolean {
