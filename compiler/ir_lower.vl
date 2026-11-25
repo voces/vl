@@ -522,6 +522,7 @@ import {
   hoistRowMark,
   hoistRowReads,
   holeBoxHead,
+  holeBoxHeadAhead,
   holeBoxLeads,
   holeBoxTail,
   holeOptBoxHead,
@@ -1924,7 +1925,7 @@ function joinBoxHead(out: i32, staged: boolean) {
   const bx = lwIfBoxAt.get(out) ?? -1
   if bx < 0 || i32ListHas(lwBoxHeadAt, unwrapParen(bx)) { return 0 }
   const p = holeBoxPlanOf(bx, lwIfBoxTy.get(out) ?? -1, lw.irAt)
-  if holeBoxLeads(p.hbArm) {
+  if holeBoxHeadAhead(p.hbArm) {
     if staged { lwPushing = true } else { leaf() }
     holeBoxHead(p, bx, lw.irAt)
     lwPushing = false
@@ -6275,7 +6276,9 @@ function coalOptBoxLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   }
   const m = nodeAt(lhsIx)
   if !(m is OptMember) { return irLMiss("coalesce optional box field node") }
-  if optRecvStagedAt(m.omObj) || optChainStagesRecv(lhsIx) {
+  // A staged base is teed into its stash and read back from it, as the chain walk writes it.
+  const staged = optChainStagesRecv(lhsIx)
+  if optRecvStagedAt(m.omObj) && !staged {
     return irLMiss("coalesce optional box field staged receiver")
   }
   const p = coalOptBoxLeafPlanAt(
@@ -6286,7 +6289,7 @@ function coalOptBoxLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
     lw.irAt,
   )
   if p.obFail != "" { return irLMiss("coalesce optional box field plan") }
-  if nodeAt(unwrapParen(m.omObj)) is OptMember {
+  if staged || nodeAt(unwrapParen(m.omObj)) is OptMember {
     return coalOptBoxChain(n, lhsIx, m, p, pending)
   }
   const niche = exprNullableRefNiche(m.omObj, lw.irAt)
@@ -6640,6 +6643,13 @@ function ret(n: SReturn, pending: i32[]) {
     return fbReturnOp()
   }
   if retAfterEffectsTail(n.rtV, pending) { return 0 }
+  // A returned `__trap__` is its `unreachable`, which legacy writes with no `return` after it.
+  const tv = n.rtV
+  if tv is OVar && isTemp(tv.ov) && retIsTrap(tempRhs(tv.ov)) {
+    irLOpnd(tv)
+    irLSettle(pending)
+    return 0
+  }
   // A call retagged into its `K | null` is the same i32, so legacy tail-calls it too.
   const outer = retagOf(n.rtV)
   const inner = if outer >= 0 { retagOperand(outer) } else { n.rtV }
@@ -6661,6 +6671,17 @@ function ret(n: SReturn, pending: i32[]) {
   }
   cond(n.rtV, pending)
   return sinkExit()
+}
+
+// Whether `r` is a `__trap__` call read as a value (`trapCallRhs`), not a dead read's `unreachable`.
+function retIsTrap(r: Rhs): boolean {
+  if !(r is RDeadNever) || r.dnAt < 0 || r.dnAt >= P.nodes.length {
+    return false
+  }
+  const c = nodeAt(r.dnAt)
+  if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length { return false }
+  const f = nodeAt(c.callFn)
+  return f is Ident && f.identName == "__trap__"
 }
 
 // Whether returned `v` is a call after effects (`RAfterEffects`), now written as legacy writes it:
