@@ -13188,6 +13188,21 @@ reopen D3178's guarded reads. The IR takes the answer from the same classifier a
 (`emit_plan_null.vl`, `mfLoopTail`) rather than mirroring it (R8).
 
 
+## A `.map` over a `??` callback with a literal default builds the default's base (2026-11-25, coordinator ruling) — D17561
+
+**Ruled by the coordinator 2026-11-25**, on COV-UNION's finding and lane SOUND's trace. Inside a hole
+function's instance, a `??`'s deferred result at a `null` pin is the default's own literal type
+(`coalJoinAtPin`), so `[x].map((e) => e ?? "m")` was typed `"m"[]` and stored as atom ids, while the
+callback's inferred signature, as the emitter lowers it, returns `string`. The `.map`'s element now
+follows the callback's signature: an un-annotated callback whose every returned value is a `??` with
+a literal default builds the literal's base (`mapCoalLitElem`, check_member_call.vl).
+
+**Why.** A callback that returns a literal directly is already typed at its base, and so is the same
+`.map` over a concrete `null[]` list. Widening at `coalJoinAtPin` instead would also widen
+`function j(x) { return x ?? "m" }`, whose `j(null)` delivered to a `"m" | "n"` binding runs and
+would be refused (runs → not-runs). The rule is local to the `.map` element and leaves that
+direct return alone.
+
 ## A hole identity's adopted literal argument keys its instance at the adopted record (2026-11-25, coordinator ruling (a)) — D17426, D17047's family
 
 **Ruled by the coordinator 2026-11-25**, on lane SOUND's trace. D17047's close adopts a hole
