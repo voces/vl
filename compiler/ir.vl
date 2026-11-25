@@ -89,6 +89,7 @@ export type RCall = {
 // `crSig`: the `$fnsig` type index; `crVoid`: the key returns nothing; `crDrop`: a call statement
 // drops its result, as legacy decides (`callRefPlainVoid`); `crNever`: the callee never returns,
 // so the call is followed by `unreachable` and has no tail form (`callEndsNever`).
+// `crHead`: `crFn` is an `RCallRefHead` temp, which wrote the callee, its stash and env already.
 export type RCallRef = {
   crFn: Opnd,
   crSig: i32,
@@ -96,7 +97,11 @@ export type RCallRef = {
   crVoid: boolean,
   crDrop: boolean,
   crNever: boolean,
+  crHead: boolean,
 }
+// Closure `chFn`'s call head (`callRefStash`, `callRefEnvOpen`), staged ahead of an argument that
+// writes a statement, as legacy writes the head before its arguments. Read once, by its `RCallRef`.
+export type RCallRefHead = { chFn: Opnd }
 // A host call (`hostCallPlanOf`): its arguments at the plan's widths, then a `call` of import
 // `chImport`, which leaves nothing when `chVoid`, and `unreachable` after it when `chNever`.
 export type RCallHost = {
@@ -303,6 +308,9 @@ export type RAsgUnwiden = { uwV: Opnd, uwOp: i32, uwAt: i32 }
 // An assignment `apAt` as a value its store parked (`asgValueArmOf` "parked"): the element store's,
 // field store's or map set's parked slot read back and recovered, as `emitAsgValueOf` reads it.
 export type RAsgParked = { apAt: i32 }
+// Record `rdV`, an assignment `rdAt`'s re-read, cast to the wider row its right side extends
+// (`asgNameWiderRow`), as `emitAsgValueOf`'s `widerRow` arm writes it (D16105).
+export type RRecDown = { rdV: Opnd, rdAt: i32 }
 // A numeric `as` at cast node `ncAt` over operand `ncV`, built at the kind `numCastKindOf`
 // names; legacy's `numCastTail` writes the conversion, and an `as!`'s test and trap.
 // A numeric `as` at node `ncAt` over `ncV`; a bare exact `as`'s miss returns `ncMiss`, the
@@ -691,6 +699,7 @@ export type Rhs = RAfterEffects
   | RCall
   | RCallHost
   | RCallRef
+  | RCallRefHead
   | RCast
   | RCellGet
   | RCellNew
@@ -765,6 +774,7 @@ export type Rhs = RAfterEffects
   | RPrintOpen
   | RRawOp
   | RRecCopyPure
+  | RRecDown
   | RRecordFitIs
   | RRecover
   | RRel
@@ -1445,6 +1455,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
     RCall => r.caNever
     RCallHost => r.chNever
     RCallRef => r.crNever
+    RCallRefHead => false
     RAfterEffects |
       RArmUnbox |
       RAsTail |
@@ -1533,6 +1544,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RPrintOpen |
       RRawOp |
       RRecCopyPure |
+      RRecDown |
       RRecordFitIs |
       RRecover |
       RRel |
@@ -1841,6 +1853,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RPrimOp => r.poArgs
     RCall => opndsCat(r.caCaps, r.caArgs)
     RCallRef => opndsCat([r.crFn], r.crArgs)
+    RCallRefHead => [r.chFn]
     RCallHost => r.chArgs
     RTest => [r.teV]
     RRecordFitIs => [r.rfV]
@@ -1893,6 +1906,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     ROptRead => [r.orV]
     RNumCast => if r.ncMiss is OVar && r.ncMiss.ov < 0 { [r.ncV] } else { [r.ncV, r.ncMiss] }
     RAsgParked => []
+    RRecDown => [r.rdV]
     RAsgUnwiden => [r.uwV]
     RNumIntr => r.nxArgs
     RNumUnionBin => r.nbArgs
@@ -1975,6 +1989,7 @@ function rhsText(r: Rhs): string {
       + opndsText(r.caArgs)
       + ")"
       + (if r.caNever { " never" } else { "" })
+    RCallRefHead => "call_ref.head " + opndText(r.chFn)
     RCallRef => "call_ref "
       + opndText(r.crFn)
       + "("
@@ -2031,6 +2046,7 @@ function rhsText(r: Rhs): string {
       + (if r.orTag >= 0 { " is tag " + i32ToStr(r.orTag) } else { "" })
     RNumCast => "cast " + opndText(r.ncV)
     RAsgParked => "asg parked"
+    RRecDown => "rec down " + opndText(r.rdV)
     RAsgUnwiden => "unwiden " + opndText(r.uwV)
     RToBox => "box " + opndText(r.bxV)
     RHoleOptBox => "hole opt box " + opndText(r.hxV)
@@ -2529,9 +2545,11 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RMakeRec |
       ROptRead |
       RRecCopyPure |
+      RRecDown |
       RStashSet => "record"
     RBundlePick |
       RCallRef |
+      RCallRefHead |
       REnvDrop |
       REnvGet |
       RHandPick |
