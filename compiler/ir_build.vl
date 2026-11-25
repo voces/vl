@@ -33,6 +33,7 @@ import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleFe, monoBundleReadFe, monoGenericAliasFe } from "./emit_mono"
 import {
+  boxTagOfTy,
   repElemTyOfName,
   repRecordFieldNames,
   slotRowTyOf,
@@ -14001,6 +14002,7 @@ function assignValueGo(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if arm == "lit" { return assignValueLit(b, n, ix, rep) }
   if arm == "nullLit" { return assignValueNullLit(b, n, ix, rep) }
   if arm == "parked" { return assignValueParked(b, n, ix, rep) }
+  if arm == "boxedArm" { return assignValueBoxedArm(b, n, ix, rep) }
   if arm != "reRead" { return irBMiss("assignment value " + arm) }
   // The store between an operand already built and the box's re-read would put that operand out of
   // stack order, as `assignValueLit`'s would.
@@ -14065,17 +14067,8 @@ function assignValueParked(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !(t is Index) && !(t is Member) {
     return irBMiss("assignment value parked target")
   }
-  const at = b.length
-  assignTo(b, n, ix)
+  const src = parkedStore(b, n, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
-  const last = if b.length > at { ib.irNodes[b[b.length - 1]] } else { null }
-  const ms = if last is SEffect { last.efRhs } else { null }
-  if !(last is SListSet) && !(last is SSetField) && !(ms is RMapSet) {
-    return irBMiss("assignment value parked store")
-  }
-  if last is SSetField { last.sfPark = true }
-  if ms is RMapSet { ms.msPark = true }
-  const src = if last is SListSet { irBOpRep(last.lsSrc) } else if last is SSetField { irBOpRep(last.sfSrc) } else if ms is RMapSet { irBOpRep(ms.msVal) } else { -1 }
   const sn = repNodeAt(src)
   // A value narrower than its slot is narrowed back by the one opcode legacy writes after it.
   const uw = asgReadUnwidenOp(ix, ibFnIx)
@@ -14088,6 +14081,46 @@ function assignValueParked(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("assignment value parked rep")
   }
   return irBLetTemp(b, { apAt: ix }, ix, rep)
+}
+
+// Assignment `ix`'s store built into `b`, a field's or a map's marked to park its value; the rep
+// the store holds the value at (a miss where the store is none of those).
+function parkedStore(b: i32[], n: BinExpr, ix: i32): i32 {
+  const at = b.length
+  assignTo(b, n, ix)
+  if ibMiss != "" { return -1 }
+  const last = if b.length > at { ib.irNodes[b[b.length - 1]] } else { null }
+  const ms = if last is SEffect { last.efRhs } else { null }
+  if !(last is SListSet) && !(last is SSetField) && !(ms is RMapSet) {
+    irBMiss("assignment value parked store")
+    return -1
+  }
+  if last is SSetField { last.sfPark = true }
+  if ms is RMapSet { ms.msPark = true }
+  return if last is SListSet { irBOpRep(last.lsSrc) } else if last is SSetField { irBOpRep(last.sfSrc) } else if ms is RMapSet { irBOpRep(ms.msVal) } else { -1 }
+}
+
+// An assignment as a value its element store or map set parks as a union box (`asgValueArmOf`
+// "boxedArm"): the box read back and recovered (`RAsgParked`), then unboxed to the value's arm
+// (`RBoxNarrow`), as `emitAsgValueOf` writes it.
+function assignValueBoxedArm(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  if !(nodeAt(n.binLeft) is Index) {
+    return irBMiss("assignment value boxedArm target")
+  }
+  const tag = boxTagOfTy(nodeTyAt(ix, ibFnIx))
+  if tag < 0 { return irBMiss("assignment value boxedArm tag") }
+  const src = parkedStore(b, n, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  if !(repNodeAt(src) is RBox) {
+    return irBMiss("assignment value boxedArm rep")
+  }
+  const p = irBLetTempTy(b, { apAt: ix }, ix, src, repTyOf(src))
+  return irBLetTemp(
+    b,
+    { bnV: p, bnAt: ix, bnRep: rep, bnAtom: tag, bnCon: -1 },
+    ix,
+    rep,
+  )
 }
 
 // An assignment of `null` the checker types `null` (`asgValueArmOf` "nullLit"): the store, then
