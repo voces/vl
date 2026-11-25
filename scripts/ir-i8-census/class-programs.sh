@@ -39,7 +39,7 @@ done | awk -F'\t' -v out="$OUT/classes" '
   function owner(w,   l) {
     l = lane(w)
     if (dist[w] > 0 || st[w] == 0 || l == "COV-START") return l
-    if (w ~ /^(coalesce |union |optional read|assignment value|store arm)/) return "COV-UNION"
+    if (w ~ /^(coalesce |union (compare|cast|staged)|optional read|assignment value|store arm)/) return "COV-UNION"
     return "CENSUS"
   }
   function norm(w) {
