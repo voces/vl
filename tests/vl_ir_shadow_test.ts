@@ -248,6 +248,28 @@ Deno.test({
   },
 });
 
+// Verifier rule 10's call head: a closure call whose argument writes a statement stages its head
+// (`RCallRefHead`) ahead of it, and that head is read only as its call's callee. Read as a plain
+// callee (`irShadowCorrupt(12)`), it reds.
+Deno.test({
+  name: "ir shadow: a staged call_ref head is read only by its call",
+  ignore,
+  fn: () => {
+    const src = "function mk() {\n  print(\"mk\")\n  return 2.5\n}\nfunction m() {\n" +
+      "  let f: (f64) => f64 = (x) => x * 2.0\n  let b: f64 = 0.5\n  print(f(b = mk()))\n  print(b)\n}\nm()\n";
+    const ok = run(src, true);
+    const m = ok.rows.get("matched") ?? 0;
+    if (failures(ok.rows).length > 0 || m < 1 || m !== ok.rows.get("covered")) {
+      throw new Error(`want every covered function matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const want = "a call_ref head read anywhere but as its call's callee";
+    const { rows } = run(src, true, 12);
+    if (!failures(rows).some((r) => r.includes(want))) {
+      throw new Error(`want control 12 to red with "${want}", got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A nullable record compare's element side banks the element-read rows of its null tests and
 // fields: with them dropped (control 5) the row's spans count reds.
 Deno.test({
@@ -1907,6 +1929,8 @@ Deno.test({
       "null-of-place-with-read": 0,
       "null-of-read-off-place": 2,
       "null-of-place-without-read": 2,
+      "spread-boxed-at-box-list": 0,
+      "spread-boxed-at-scalar-list": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
