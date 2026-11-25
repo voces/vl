@@ -11,11 +11,17 @@
 # drivers (`$BAR`): the writers of a subexpression. C also empties every ir*.vl function, so what
 # B keeps and C does not is what the IR alone holds. The graph is name-level, so it overstates
 # edges and understates deletions. Run from the checkout root; $VL names the host.
+# A stub returns `emitFail("i8 stub <name>")`, so a build that reaches it names it. For
+# `scripts/ir-i8-sweep.sh`: $STUB_KEEP names a file whose first column joins `$BAR` (a kept name is
+# neither emptied nor propagated through); $STUB_BODIES a file of `<name>\t<body>` lines, the body a
+# stub returns where `emitFail`'s i32 does not type (`\n` splits lines); $STUB_TREE a dir that gets
+# stage B's compiler/ and roots; $STUB_ONLY_B=1 skips stage C.
 set -euo pipefail
 OUT=${1:-}
 VL=${VL:-$PWD/scripts/vl-host/target/release/vl}
 SEED_SET="emitBlockValueAs emitBlockValueAsGo emitExpr emitExprAsElem emitExprAsKind emitExprRaw emitFuncBody emitStmt emitStmtGo emitStmtIn emitStmtTail emitStmts emitStmtsTail emitWidened"
 BAR=${BAR:-emitFuncCode emitStartBodyCode emitStartGlobalInit emitStartGlobalInitValue emitConstCellInit buildCodePayload emitModule emitProgram emitProgramRun}
+if [ -n "${STUB_KEEP:-}" ]; then BAR="$BAR $(grep -v '^#' "$STUB_KEEP" | awk 'NF { print $1 }' | tr '\n' ' ')"; fi
 T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
 
@@ -30,16 +36,24 @@ awk '
 
 # Empties the body of every function named in STUB, keeping its header.
 cat > "$T/stub.awk" <<'AWK'
-BEGIN { n = split(STUB, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+BEGIN {
+  n = split(STUB, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1
+  if (BODIES != "") while ((getline l < BODIES) > 0) {
+    if (l ~ /^#/ || l !~ /\t/) continue
+    t = index(l, "\t"); k = substr(l, 1, t - 1); b = substr(l, t + 1); gsub(/\\n/, "\n  ", b); body[k] = "  " b
+  }
+}
+function stub(name) { return (name in body) ? body[name] : "  return emitFail(\"i8 stub " name "\")" }
 {
   if (!skip && !pend && match($0, /^(export )?function [A-Za-z0-9_]+[ (<]/)) {
     s = $0; sub(/^(export )?function /, "", s); sub(/[ (<].*/, "", s)
     if (s in want) {
-      if ($0 ~ /\{$/) { print; print "  return emitFail(\"i8 stub\")"; skip = 1; next }
+      cur = s
+      if ($0 ~ /\{$/) { print; print stub(cur); skip = 1; next }
       pend = 1; print; next
     }
   }
-  if (pend) { print; if ($0 ~ /\{$/) { print "  return emitFail(\"i8 stub\")"; pend = 0; skip = 1 }; next }
+  if (pend) { print; if ($0 ~ /\{$/) { print stub(cur); pend = 0; skip = 1 }; next }
   if (skip) { if ($0 ~ /^}/) { print; skip = 0 }; next }
   print
 }
@@ -51,7 +65,7 @@ stage() {
   mkdir -p "$root/scripts"
   cp -r compiler "$root/"
   cp "$T/roots" "$root/scripts/roots.txt"
-  for f in $files; do awk -v STUB="$set" -f "$T/stub.awk" "$f" > "$root/$f"; done
+  for f in $files; do awk -v STUB="$set" -v BODIES="${STUB_BODIES:-}" -f "$T/stub.awk" "$f" > "$root/$f"; done
   "$VL" run scripts/dead-exports.vl -- --list --root "$root" > "$T/$name.dead"
   local emptied
   emptied=$(( $(ls compiler/*.vl | grep -v '/ir' | xargs cat | wc -l) - $(ls "$root"/compiler/*.vl | grep -v '/ir' | xargs cat | wc -l) ))
@@ -92,5 +106,7 @@ WRITERS=$(awk -F'\t' -v seed="$SEED_SET" -v bar="$BAR" '
     for (k in s) printf "%s ", k
   }' "$T/edges")
 stage B "$WRITERS" "$EMIT"
+if [ -n "${STUB_TREE:-}" ]; then mkdir -p "$STUB_TREE"; cp -r "$T/B/compiler" "$T/B/scripts" "$STUB_TREE/"; fi
+[ "${STUB_ONLY_B:-0}" = 1 ] && exit 0
 IR_ALL=$(grep -ohE '^(export )?function [A-Za-z0-9_]+' compiler/ir*.vl | sed -E 's/^(export )?function //' | tr '\n' ' ')
 stage C "$WRITERS $IR_ALL" "$EMIT $(ls compiler/ir*.vl | tr '\n' ' ')"

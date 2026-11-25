@@ -11045,6 +11045,18 @@ reads as `F<i32, i32>(5)`, so the return check then refuses `i32` into `boolean`
 ambiguous was the alternative; it was not taken because it refuses programs like `G(5)` that the
 design permits, and the binding is sound (each parameter gets the only type the program gives it).
 A caller who means the parameters to differ writes the type arguments.
+
+**Extended 2026-11-25 (D17445; ruled by the coordinator, a delegated design decision): the open
+parameter binds `never` in the call's result type too.** `wrap<T>(t: T | null, b)` called as
+`wrap(null, false)` typed its result `{x: T | i32 | null}` while its instance bound `T` to `never`
+(D3178), so the site and the instance stored the field differently. The result now substitutes the
+same `never`, and a member the substitution makes `never` drops: `T | null` reads `null`,
+`T | i32` reads `i32`, so `wrap(null, false).x ?? -1` is `5`. It is the minimal binding, since
+`null` fits `T | null` for every `T`, and it is unobservable for values. A parameter bound only
+through a hole argument is left open, since that argument's own call binds it (D6500). Writing
+into a `never` slot of the result is a check refusal, never a build: `push` into a `never[]` says
+the list holds no value and asks for a type at the call or the binding. An instance keeps
+`T | null` at `never` as written, so its guarded reads stay dead and check clean (D3178).
 ## A plain build drops the functions no root reaches (2026-10-23)
 
 **The rule.** `vl build` and `vl run` emit, for every function no root reaches, a three-byte
@@ -13131,7 +13143,7 @@ This extends the `??` hole precedent, D1589 (`fillCoalHoleNodes`), which re-asks
 whose every element is such a value (`[x]`, `[x = null]`, `[x, x]`, `[x, null]`) is the `[null]`
 case. The checker refuses it at the literal with `[null]`'s message (D1832), extended to name the
 binding: "a list of only `null` has no element type: a binding of `null` that is never written another
-value is `null`; annotate the list or the binding". A `const n = null` is the same hole (D17447; unfiled: D17447 — S2's row lands on `s2-d17445`). Where the destination names the type (a
+value is `null`; annotate the list or the binding". A `const n = null` is the same hole (D17447). Where the destination names the type (a
 `const a: null[]`, a `null[]` parameter, an annotated index store) the list is a `null[]` and runs,
 its elements stored as the `null[]` sentinel.
 
