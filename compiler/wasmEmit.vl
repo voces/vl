@@ -30100,54 +30100,50 @@ function emitCallCoreTrap(c: Call, fnIx: i32) {
   return 0
 }
 
-// The direct call node a UFCS `self`-method call `o.f(args)` rewrites to, `f(o, args)` with
-// named arguments shifted past the receiver, or -1 when `f` takes no leading `self`.
-function emitCallCoreUfcsNode(callIx: i32, c: Call, um: Member) {
-  // a UFCS member-call normally lowers to a direct `Ident` call before emission;
-  // this fallback re-derives the same direct call should it reach emit unrewritten.
-  // D1120 — at the site, the same node the merge walk keys on.
+// The function a UFCS `self`-method call `o.f(args)` names, or "" when `f` takes no leading
+// `self` (D1120: asked at the site, the node the merge walk keys on).
+export function ufcsCallName(callIx: i32, c: Call, um: Member): string {
   let uName = ufcsAliasAtSite(callIx, um.memProp)
   const ud = memberDeclOf(callIx)
   if ud >= 0 {
-    if memberMethodOf(callIx) != ud { return -1 }
+    if memberMethodOf(callIx) != ud { return "" }
     uName = binderNameAt(ud)
   }
   const uTarget = fnIndexOf(uName)
-  if uTarget >= 0 {
-    const uFn = nodeAt(fnStmts[uTarget])
-    if uFn is FuncDecl {
-      const uParams = uFn.fnParams
-      if uParams.length == c.callArgs.length + 1 {
-        const uP0 = nodeAt(uParams[0])
-        if uP0 is Param {
-          if uP0.parName == "self" {
-            const uArgs: i32[] = []
-            uArgs.push(um.memObj)
-            let ua = 0
-            while ua < c.callArgs.length {
-              uArgs.push(c.callArgs[ua])
-              ua = ua + 1
-            }
-            // The injected receiver is an UNNAMED slot-0 positional; any
-            // named args shift right with it ("" rides slot 0) so the
-            // rebuilt direct call reorders them around the receiver
-            // exactly as the host does.
-            const uNames: string[] = []
-            if hasNamedArgs(c.callArgNames) {
-              uNames.push("")
-              let un = 0
-              while un < c.callArgNames.length {
-                uNames.push(c.callArgNames[un])
-                un = un + 1
-              }
-            }
-            return mkCallN(mkIdent(uName, -1), uArgs, uNames, -1)
-          }
-        }
-      }
+  if uTarget < 0 { return "" }
+  const uFn = nodeAt(fnStmts[uTarget])
+  if !(uFn is FuncDecl) || uFn.fnParams.length != c.callArgs.length + 1 {
+    return ""
+  }
+  const uP0 = nodeAt(uFn.fnParams[0])
+  return if uP0 is Param && uP0.parName == "self" { uName } else { "" }
+}
+
+// The direct call node a UFCS `self`-method call `o.f(args)` rewrites to, `f(o, args)` with
+// named arguments shifted past the receiver, or -1 when `f` takes no leading `self`. A UFCS call
+// normally lowers to a direct `Ident` call before emission; this re-derives it should it not.
+function emitCallCoreUfcsNode(callIx: i32, c: Call, um: Member) {
+  const uName = ufcsCallName(callIx, c, um)
+  if uName == "" { return -1 }
+  const uArgs: i32[] = []
+  uArgs.push(um.memObj)
+  let ua = 0
+  while ua < c.callArgs.length {
+    uArgs.push(c.callArgs[ua])
+    ua = ua + 1
+  }
+  // The injected receiver is an unnamed slot-0 positional; any named args shift right with it
+  // ("" rides slot 0) so the rebuilt direct call reorders them around the receiver as the host does.
+  const uNames: string[] = []
+  if hasNamedArgs(c.callArgNames) {
+    uNames.push("")
+    let un = 0
+    while un < c.callArgNames.length {
+      uNames.push(c.callArgNames[un])
+      un = un + 1
     }
   }
-  return -1
+  return mkCallN(mkIdent(uName, -1), uArgs, uNames, -1)
 }
 
 // Whether a call of `callee`, a name no function in scope owns, is a closure-valued callee
@@ -30306,6 +30302,37 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   }
 }
 
+// Whether call `c`'s callee, or the receiver of its field, is typed `null` or `never` in this
+// instance, so no function is reached: a guard leaves it dead (D3197, D16841), or an instance binds
+// a type parameter to `never` (D3178).
+export function calleeTypedDead(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return false }
+  const t = nodeTyAt(c.callFn, fnIx)
+  if t == TY_NULL || t == TY_NEVER { return true }
+  const um = nodeAt(c.callFn)
+  if !(um is Member) { return false }
+  const ot = nodeTyAt(um.memObj, fnIx)
+  return ot == TY_NEVER || ot == TY_NULL
+}
+
+// Whether `emitCallCore` writes call `callIx` of non-name callee `c` as `emitNullCalleeCall`: no
+// closure, place record, result member or UFCS rung takes it, and `calleeTypedDead`.
+export function callCalleeDead(callIx: i32, c: Call, fnIx: i32): boolean {
+  if (
+    c.callFn < 0
+    || nodeAt(c.callFn) is Ident
+    || exprIsClosure(c.callFn, fnIx)
+  ) {
+    return false
+  }
+  if placeRecordSigs(callIx, fnIx).length > 0 { return false }
+  if callResultMemberTy(unwrapParen(c.callFn), fnIx) >= 0 { return false }
+  const um = nodeAt(c.callFn)
+  if um is OptMember { return false }
+  if um is Member && ufcsCallName(callIx, c, um) != "" { return false }
+  return calleeTypedDead(c, fnIx)
+}
+
 // A call through a value this instance types `null` itself, which a guard leaves dead: the
 // stack-polymorphic `unreachable` stands in for its result (D3197).
 function emitNullCalleeCall(): i32 {
@@ -30350,16 +30377,7 @@ function emitCallCore(callIx: i32, fnIx: i32) {
         callIx,
       )
     }
-    if nodeTyAt(c.callFn, fnIx) == TY_NULL { return emitNullCalleeCall() }
-    // An instance binding a type parameter to `never` reaches no call through it (D3178).
-    if nodeTyAt(c.callFn, fnIx) == TY_NEVER { return emitNullCalleeCall() }
-    if um is Member && nodeTyAt(um.memObj, fnIx) == TY_NEVER {
-      return emitNullCalleeCall()
-    }
-    // A `?.` guard's arm over a receiver this instance types `null` is dead (D16841).
-    if um is Member && nodeTyAt(um.memObj, fnIx) == TY_NULL {
-      return emitNullCalleeCall()
-    }
+    if calleeTypedDead(c, fnIx) { return emitNullCalleeCall() }
     return emitFail("emitProgram: callee is not a function name")
   }
   return emitFail("emitProgram: expected a call expression")
