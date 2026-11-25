@@ -176,6 +176,7 @@ import {
   irRecHeapNote,
   irRecHeapNoteOne,
   irRecHeapOf,
+  irRhsOpnds,
   irSigNote,
   irSigOf,
   irSpanNote,
@@ -9180,6 +9181,21 @@ function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   return boxTempAt(b, v, ix, dst, -1)
 }
 
+// Whether read `v` can be left unread: an immediate or a variable, or a temp `b` defined last by
+// a leaf that reads no operand, which is dropped.
+function nulReadDropped(b: i32[], v: Opnd): boolean {
+  if v is OImm { return true }
+  if !(v is OVar) || v.ov < 0 { return false }
+  if ib.irVars[v.ov].vKind != "temp" { return true }
+  if b.length == 0 { return false }
+  const n = ib.irNodes[b[b.length - 1]]
+  if !(n is SLet) || n.lDst != v.ov || irRhsOpnds(n.lRhs).length > 0 {
+    return false
+  }
+  b.pop()
+  return true
+}
+
 // `boxTemp` for `v` built at variant row `at`, or at its own layout where `at` is -1.
 function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   return boxTempIn(b, v, ix, dst, at, holeBoxTyAt(ix, ibFnIx))
@@ -9198,10 +9214,15 @@ function boxTempIn(
   // A `null`-typed call is the box ladder's first rung (`emitNulNoneBoxPayload`), the call its
   // payload; any other `null`-typed value stays legacy's.
   if exprIsNulNone(ix, ibFnIx) && heldAsBox(dst) {
-    if !(nodeAt(unwrapParen(ix)) is Call) {
+    if nodeAt(unwrapParen(ix)) is Call {
+      return repTemp(b, { nnV: v, nnPay: true, nnAt: ix }, ix, dst)
+    }
+    // A name read or a bare `null` writes nothing; its payload is the bottom ref, and the read
+    // built for it (a leaf reading no operand) is dropped unread.
+    if !nulNoneWritesNothing(ix) || !nulReadDropped(b, v) {
       return irBMiss("box of a null-typed value")
     }
-    return repTemp(b, { nnV: v, nnPay: true, nnAt: ix }, ix, dst)
+    return repTemp(b, { nnV: v, nnPay: false, nnAt: ix }, ix, dst)
   }
   const p = holeBoxPlanOf(ix, uTy, ibFnIx)
   const why = boxPlanWhy(p, v, ix)
