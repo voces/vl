@@ -133,6 +133,7 @@ import {
   RStrOp,
   RToBox,
   Rhs,
+  SArmSite,
   SAssign,
   SBlock,
   SBoundsCheck,
@@ -268,6 +269,7 @@ import {
   VariantIsArm,
   VariantRowArm,
   armIndexWriteArmsOf,
+  armSiteAtLitSet,
   arrCopyCallNamed,
   arrCopyPlanOf,
   arrLitLongRouteOf,
@@ -701,6 +703,8 @@ import {
   elabInstTyAt,
   elabSpreadNote,
   isStorageRead,
+  luOvEnter,
+  luOvLeave,
   readNarrowedStoreAt,
   storageReadEnter,
   storageReadLeave,
@@ -713,6 +717,7 @@ import {
 } from "./emit_value_sites"
 import {
   armSiteReads,
+  armSiteRecv,
   asgLitUnionMemberReRead,
   asgReReadEnter,
   asgReReadLeave,
@@ -1796,6 +1801,54 @@ function stagedKeyHolds(k: i32, r: i32): boolean {
   return k == 3 && repPrim(r) == "str"
 }
 
+// While an arm-site read's arm builds (`irBArmSiteArm`): node `ibArmRecvIx` reads the arm's
+// payload variable `ibArmRecvVar`, and node `ibArmIdxIx` the operand in `ibArmIdxOps`, if any.
+let ibArmRecvIx = -1
+let ibArmRecvVar = -1
+let ibArmIdxIx = -1
+let ibArmIdxOps: Opnd[] = []
+
+// Arm `m` of arm-site read `ix` built into `b` and delivered at `rep`, as legacy's arm lowers it:
+// the read at element type `e`, its receiver at `m` read as payload variable `pv`, and its index
+// or key node `on` read as `io`'s one operand (none for a `.length`).
+export function irBArmSiteArm(
+  b: i32[],
+  ix: i32,
+  m: i32,
+  e: i32,
+  pv: i32,
+  on: i32,
+  io: Opnd[],
+  rep: i32,
+): Opnd {
+  if ibArmRecvVar >= 0 { return irBMiss("arm site nested") }
+  // A box read is boxed at the read's own union, as legacy's `emitUnionCoerce` boxes it.
+  const u = nodeTyAt(ix, ibFnIx)
+  // A read at a numeric literal set takes each arm's member at the set's own rep (D17001).
+  const lit = armSiteAtLitSet(ix, ibFnIx)
+  const mark = luOvEnter(armSiteRecv(ix), m)
+  luOvEnter(ix, e)
+  ibArmRecvIx = armSiteRecv(ix)
+  ibArmRecvVar = pv
+  ibArmIdxIx = on
+  ibArmIdxOps = io
+  let d = if heldAsBox(rep) || lit { exprAt(b, ix, false) } else { deliver(b, ix, rep, -1) }
+  if heldAsBox(rep) && ibMiss == "" && irBOpRep(d) != rep {
+    d = boxTempIn(b, d, ix, rep, -1, u)
+  }
+  const sk = numKindOf(irBOpRep(d))
+  if lit && ibMiss == "" && irBOpRep(d) != rep && sk > 0 && numKindOf(rep) > 0 {
+    const nw: Rhs = { nwV: d, nwSrc: sk, nwDst: numKindOf(rep), nwAt: ix }
+    d = irBLetTempTy(b, nw, ix, rep, repTyOf(rep))
+  }
+  ibArmRecvIx = -1
+  ibArmRecvVar = -1
+  ibArmIdxIx = -1
+  ibArmIdxOps = []
+  luOvLeave(mark)
+  return d
+}
+
 // The staged receiver's read (`isStagedTest`), as `emitExpr` reads it past its dead-never and
 // coercion arms: the stash's variable.
 function stagedRecvRead(ix: i32): Opnd {
@@ -2440,7 +2493,9 @@ function writesInPlaceFrom(b: i32[], at: i32): boolean {
   let i = at
   while i < b.length {
     const n = ib.irNodes[b[i]]
-    if n is SIf && n.siOut >= 0 || n is SCoalBox { return true }
+    if n is SIf && n.siOut >= 0 || n is SCoalBox || n is SArmSite {
+      return true
+    }
     i = i + 1
   }
   return false
@@ -6920,7 +6975,7 @@ function storeFrom(b: i32[], at: i32): boolean {
 function valuedIfOut(b: i32[], v: i32): boolean {
   for id in b {
     const n = ib.irNodes[id]
-    if n is SIf && n.siOut == v { return true }
+    if n is SIf && n.siOut == v || n is SArmSite && n.saOut == v { return true }
   }
   return false
 }
@@ -6947,12 +7002,12 @@ function coalBoxOut(b: i32[], v: i32): boolean {
   return false
 }
 
-// Whether operands built into `b` from `at` on hold a valued `if`.
+// Whether operands built into `b` from `at` on hold a valued `if` (an arm-site read's chain is one).
 function valuedIfFrom(b: i32[], at: i32): boolean {
   let i = at
   while i < b.length {
     const n = ib.irNodes[b[i]]
-    if n is SIf && n.siOut >= 0 { return true }
+    if n is SIf && n.siOut >= 0 || n is SArmSite { return true }
     i = i + 1
   }
   return false
@@ -7007,6 +7062,7 @@ function ifBelowLeadHas(b: i32[], at: i32, to: i32): boolean {
     if (
       n is SIf
       || n is SCoalBox
+      || n is SArmSite
       || n is SEffect && n.efRhs is RStashSet
       || storeAt(n)
     ) {
@@ -8115,7 +8171,7 @@ function pushStage(
   let i = at
   while ibMiss == "" && i < xAt {
     const n = ib.irNodes[b[i]]
-    if n is SIf && n.siOut >= 0 || n is SCoalBox {
+    if n is SIf && n.siOut >= 0 || n is SCoalBox || n is SArmSite {
       irBMiss("push short-circuit receiver")
     }
     i = i + 1
@@ -12019,6 +12075,7 @@ function nodeAssigns(ni: i32, v: i32): boolean {
     SAssign => n.asDst == v
     SIf => bodyAssigns(n.siThen, v) || bodyAssigns(n.siElse, v)
     SCoalBox => coalBoxAssigns(n, v)
+    SArmSite => n.saOut == v
     SBlock => bodyAssigns(n.bkBody, v)
     SLoop => bodyAssigns(n.lpBody, v)
     SForIn => n.xfVar == v || n.xfVar2 == v || bodyAssigns(n.xfBody, v)
@@ -12365,6 +12422,13 @@ export function irBExpr(b: i32[], ix: i32): Opnd { return exprAt(b, ix, false) }
 function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
   if ibMiss != "" || ix < 0 { return irBMiss("no node") }
   if ibStagedVar >= 0 && ix == isRecvStagedIx { return stagedRecvRead(ix) }
+  if ibArmRecvVar >= 0 {
+    if ix == ibArmRecvIx {
+      const o: Opnd = { ov: ibArmRecvVar }
+      return o
+    }
+    if ix == ibArmIdxIx && ibArmIdxOps.length == 1 { return ibArmIdxOps[0] }
+  }
   const pre = exprPrePathWhy(ix, ibFnIx)
   if pre == "pre-path coercion" { return coerced(b, ix, cell) }
   return exprAtPre(b, ix, cell, pre)

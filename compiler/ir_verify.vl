@@ -16,7 +16,6 @@ import {
   Opnd,
   PStaged,
   RAfterEffects,
-  RArmSite,
   RArmUnbox,
   RAsTail,
   RAsUnion,
@@ -136,6 +135,7 @@ import {
   RVariantChain,
   RVariantDiscrim,
   Rhs,
+  SArmSite,
   SAssign,
   SBlock,
   SBoundsCheck,
@@ -666,31 +666,6 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const sn = repNodeAt(opRep(r.srV))
       if !(sn is RBox) && !(sn is RNullable && sn.rnDisc == 4) {
         return fail(2, at, "a shared read's receiver is a box")
-      }
-      0
-    }
-    RArmSite => {
-      for o in r.asOps { use(o, at) }
-      if (
-        r.asOps.length < 1
-        || r.asOps.length > 2
-        || !boxShaped(opRep(r.asOps[0]))
-      ) {
-        return fail(
-          2,
-          at,
-          "an arm-site read takes a union box, then at most an index or key",
-        )
-      }
-      if r.asOps.length == 2 {
-        const kr = opRep(r.asOps[1])
-        if kr != vfI32 && kr != vfStr {
-          return fail(
-            2,
-            at,
-            "an arm-site read's index is an i32 and its key a string",
-          )
-        }
       }
       0
     }
@@ -2596,6 +2571,45 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
   return 0
 }
 
+// An arm-site read's checks: its box, then at most an index or key, and per arm a payload variable
+// and a body that writes the out.
+function armSiteCheck(n: SArmSite, id: i32) {
+  for o in n.saOps { use(o, id) }
+  if n.saOps.length < 1 || n.saOps.length > 2 || !boxShaped(opRep(n.saOps[0])) {
+    return fail(
+      2,
+      id,
+      "an arm-site read takes a union box, then at most an index or key",
+    )
+  }
+  if n.saOps.length == 2 {
+    const kr = opRep(n.saOps[1])
+    if kr != vfI32 && kr != vfStr {
+      return fail(
+        2,
+        id,
+        "an arm-site read's index is an i32 and its key a string",
+      )
+    }
+  }
+  if n.saOut < 0 || n.saOut >= vf.irVars.length {
+    return fail(4, id, "an arm-site read writes no variable")
+  }
+  if n.saArms.length == 0 || n.saArms.length != n.saVars.length {
+    return fail(2, id, "an arm-site read has a payload per arm")
+  }
+  for v in n.saVars {
+    if v < 0 || v >= vf.irVars.length || vf.irVars[v].vKind != "local" {
+      return fail(4, id, "an arm-site arm's payload is a local")
+    }
+  }
+  for a in n.saArms {
+    nested(a)
+    endsWriting(a, n.saOut, id)
+  }
+  return 0
+}
+
 // Checks node `id`, the node before it in its body `prev` (-1 for the first).
 function stmt(id: i32, prev: i32) {
   if vfRule != 0 { return 0 }
@@ -2798,6 +2812,7 @@ function stmt(id: i32, prev: i32) {
     }
     SIf => ifSpine(id)
     SCoalBox => coalBoxCheck(n, id)
+    SArmSite => armSiteCheck(n, id)
     SSwitch => switchCheck(n, id)
     SIntSwitch => intSwitchCheck(n, id)
     SBr => {
@@ -2968,7 +2983,8 @@ function touchesList(n: IrNode): boolean {
     SListSet | SBoundsCheck => true
     SLet => rhsReadsList(n.lRhs)
     SEffect => rhsReadsList(n.efRhs)
-    SAssign |
+    SArmSite |
+      SAssign |
       SBlock |
       SBr |
       SCellSet |
@@ -3163,7 +3179,6 @@ function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
     RAfterEffects |
-      RArmSite |
       RArmUnbox |
       RAsTail |
       RAsUnion |

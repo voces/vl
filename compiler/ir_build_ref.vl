@@ -22,6 +22,7 @@ import {
   SLet,
   StrOp,
   coalArmStagesLeads,
+  irVarNew,
   repBoxCore,
   repPrim,
   repWhat,
@@ -40,6 +41,7 @@ import {
   holeCloTy,
   ifBelowLeadOf,
   irArmSiteHook,
+  irBArmSiteArm,
   irBAtomKindRep,
   irBBoxLocal,
   irBExpr,
@@ -116,7 +118,10 @@ import {
   REF_READ_CONTAINER,
   SRT_NARROW,
   SRT_NONE,
+  armSiteArmsOf,
+  armSiteElemTyOf,
   armSiteOpndNode,
+  armSiteRepHolds,
   eqRouteOf,
   exprReadsDeadNever,
   idxArmOf,
@@ -351,8 +356,9 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
 }
 
 // Read `ix` through a box of lists or maps (`armSiteRecv`: an element, `.length`, `.has` or
-// `.get`): the box, and an index or key legacy's tag chain writes again in each arm, so a variable,
-// an immediate or the key's literal (`RArmSite`). A box no name holds is stashed once, as legacy's.
+// `.get`) on legacy's tag chain (`SArmSite`): the box, and an index or key each arm reads again, so
+// a variable, an immediate, the key's literal, or a value set once; per arm, the read built over
+// the arm's payload. A box no name holds is stashed once, as legacy's.
 function armSiteRead(b: i32[], ix: i32, rep: i32): Opnd {
   const recv = armSiteRecv(ix)
   if recv < 0 || recv >= P.nodes.length { return irBMiss("arm site receiver") }
@@ -380,8 +386,57 @@ function armSiteRead(b: i32[], ix: i32, rep: i32): Opnd {
     if !readsAgain(i) && !lit && !once { return irBMiss("arm site operand") }
     ops.push(i)
   }
-  const r: Rhs = { asOps: ops, asAt: ix, asStash: !named }
-  return irBLetTempTy(b, r, ix, rep, repTyOf(rep))
+  const ty = repTyOf(rep)
+  if ty < 0 || irTyOpen(ty) { return irBMiss("open temp type") }
+  // An index set once is read in the arms as a variable on legacy's index stash.
+  let iv = -1
+  const io: Opnd[] = []
+  if ops.length == 2 {
+    const i = ops[1]
+    if i is OVar && irBFn().irVars[i.ov].vKind == "temp" {
+      iv = irVarNew(irBFn(), irBOpRep(i), repTyOf(irBOpRep(i)), "local", -1)
+      const o: Opnd = { ov: iv }
+      io.push(o)
+    } else {
+      io.push(i)
+    }
+  }
+  const arms = armSiteArmsOf(ix, irBFnIx())
+  if arms.length == 0 { return irBMiss("arm site arms") }
+  if !armSiteRepHolds(ix, irBFnIx()) { return irBMiss("arm site element rep") }
+  const t = irVarNew(irBFn(), rep, ty, "local", -1)
+  const bodies: i32[][] = []
+  const vars: i32[] = []
+  for m in arms {
+    const e = armSiteElemTyOf(ix, m, irBFnIx())
+    const pr = repNodeOfTy(m)
+    if e < 0 || pr < 0 { return irBMiss("arm site arm") }
+    const pv = irVarNew(irBFn(), pr, m, "local", -1)
+    const ab: i32[] = []
+    const d = irBArmSiteArm(ab, ix, m, e, pv, on, io, rep)
+    if missed(d) { return d }
+    if irBOpRep(d) != rep { return irBMiss("arm site arm rep") }
+    irBNode(ab, { asDst: t, asSrc: d }, -1, irBNoValue(), ix)
+    bodies.push(ab)
+    vars.push(pv)
+  }
+  irBNode(
+    b,
+    {
+      saOps: ops,
+      saAt: ix,
+      saStash: !named,
+      saArms: bodies,
+      saVars: vars,
+      saIdx: iv,
+      saOut: t,
+    },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // Operand `o`, or the variable it stages where the last node of `b` is its `RStage` over a
