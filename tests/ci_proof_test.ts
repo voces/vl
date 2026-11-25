@@ -246,8 +246,9 @@ Deno.test("ci-proof: the proof job waits on every job, and the counts are ci.yml
       "want ci-proof to fail unless every need passed on a heavy, ungated run, got another check",
     );
   }
-  if (!/^ {4}branches: \[master, "vl-queue\/\*\*"\]$/m.test(ci)) {
-    throw new Error("want ci.yml's push trigger to name vl-queue/**, got none");
+  // The queue's vl-queue/** pushes retired with it (O2): a push run is master's alone.
+  if (!/^ {4}branches: \[master\]$/m.test(ci)) {
+    throw new Error("want ci.yml's push trigger to name master alone, got another list");
   }
   const docsOnly = Deno.readTextFileSync(
     `${ROOT}/.github/actions/docs-only/action.yml`,

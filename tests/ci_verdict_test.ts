@@ -220,6 +220,8 @@ function runJobs(over: Record<string, string> = {}): string {
     "ci-distilled",
     "ci-witnesses (1)",
     "ci-witnesses (2)",
+    "ci-ir-identity (1)",
+    "ci-ir-identity (2)",
     "ci-proof",
   ];
   return JSON.stringify({
@@ -299,6 +301,11 @@ Deno.test({
 
       const write = (k: string, v: string) =>
         Deno.writeTextFileSync(`${fake}/${k}.json`, v);
+      // The jobs an inherited run must have passed: every top-level job but ci-proof.
+      Deno.writeTextFileSync(
+        `${dir}/ci.yml`,
+        "on: push\njobs:\n  ci:\n    runs-on: x\n  seed:\n    runs-on: x\n  ci-ir-identity:\n    runs-on: x\n  ci-proof:\n    runs-on: x\n",
+      );
       const pr = (head: string) => ({
         EVENT: "pull_request",
         ACTION: "synchronize",
@@ -306,6 +313,7 @@ Deno.test({
         PR_HEAD: head,
         PR_BEFORE: before,
         PR_BASE: base,
+        CI_YML: `${dir}/ci.yml`,
       });
       const push = { EVENT: "push", REF: "refs/heads/master", SHA: squash };
       const cases: [string, Record<string, string>, string, () => void][] = [
@@ -313,7 +321,43 @@ Deno.test({
           "clean catch-up, previous head green",
           pr(clean),
           "inherit",
-          () => write(`runs-${before}`, runs("success")),
+          () => {
+            write(`runs-${before}`, runs("success"));
+            write("jobs-99", runJobs());
+          },
+        ],
+        [
+          "clean catch-up, previous head green but it ran no job ci.yml added since",
+          pr(clean),
+          "full",
+          () =>
+            write(
+              "jobs-99",
+              JSON.stringify({
+                jobs: JSON.parse(runJobs()).jobs.filter((j: { name: string }) =>
+                  !j.name.startsWith("ci-ir-identity")
+                ),
+              }),
+            ),
+        ],
+        [
+          "clean catch-up, previous head green but it skipped a job",
+          pr(clean),
+          "full",
+          () =>
+            write(
+              "jobs-99",
+              runJobs({
+                "ci-ir-identity (1)": "skipped",
+                "ci-ir-identity (2)": "skipped",
+              }),
+            ),
+        ],
+        [
+          "clean catch-up, previous head green, its jobs unreadable",
+          pr(clean),
+          "full",
+          () => Deno.removeSync(`${fake}/jobs-99.json`),
         ],
         [
           "clean catch-up, previous head red",
@@ -472,6 +516,8 @@ Deno.test({
                 "ci-distilled": "skipped",
                 "ci-witnesses (1)": "skipped",
                 "ci-witnesses (2)": "skipped",
+                "ci-ir-identity (1)": "skipped",
+                "ci-ir-identity (2)": "skipped",
               }),
             ),
         ],
