@@ -5,7 +5,9 @@
 #   full     run everything.
 #   inherit  a same-repository pull_request `synchronize` whose new head is a CLEAN merge of
 #            the previous head with a commit of the base branch (what `gh pr update-branch`
-#            and the queue's git fallback push), and whose previous head's CI run passed.
+#            and the queue's git fallback push), and whose previous head's CI run passed with
+#            a successful job for every job this tree's ci.yml names (but INHERIT_EXEMPT): a
+#            job added since, or one that run skipped, was never proved, so it runs.
 #            The run carries that verdict instead of re-running it.
 #   gated    a push to master whose commit is the squash of PR N, whose PR head carries the
 #            merge queue's `vl-queue/gate` status naming THIS commit's tree, and whose PR
@@ -17,11 +19,15 @@
 #            skips TREE_SKIPS; seed, ci, ci-cost and publish-seed still run.
 #
 # Env (ci.yml passes the github context): EVENT ACTION REF SHA REPO HEAD_REPO PR_HEAD
-# PR_BEFORE PR_BASE; MODES (default "inherit gated tree"); VERDICT_WAIT, VERDICT_POLL (seconds).
+# PR_BEFORE PR_BASE; MODES (default "inherit gated tree"); VERDICT_WAIT, VERDICT_POLL (seconds);
+# CI_YML (default .github/workflows/ci.yml), whose top-level jobs an inherited run must have passed.
 set -uo pipefail
 
 MODES=${MODES:-inherit gated tree}
 # The jobs a `tree` verdict skips on master; each must have passed on the PR's run.
+# The jobs no pull_request run starts, so an inherited run needs none of them.
+INHERIT_EXEMPT="ci-proof"
+CI_YML=${CI_YML:-.github/workflows/ci.yml}
 TREE_SKIPS="ci-native ci-release-shape checks checks-suites ci-distilled ci-witnesses ci-ir-identity ci-embed-seed"
 WAIT=${VERDICT_WAIT:-180}
 POLL=${VERDICT_POLL:-15}
@@ -64,6 +70,19 @@ if [ "${EVENT:-}" = pull_request ]; then
     full "the merge's tree is not the clean merge of its parents"
   v=$(ci_verdict "$PR_BEFORE")
   [ "$v" = success ] || full "previous head ${PR_BEFORE:0:9} CI is $v"
+  [ -f "$CI_YML" ] || full "no $CI_YML to list the jobs an inherited run must have passed"
+  id=$(gh api "repos/$REPO/actions/runs?head_sha=$PR_BEFORE&event=pull_request&per_page=50" --jq '
+    [.workflow_runs[] | select(.path | startswith(".github/workflows/ci.yml"))]
+    | sort_by(.created_at) | last | .id' 2>/dev/null) || id=""
+  [[ "$id" =~ ^[0-9]+$ ]] || full "the run of previous head ${PR_BEFORE:0:9} could not be read"
+  jobs=$(gh api "repos/$REPO/actions/runs/$id/jobs?filter=latest&per_page=100" \
+    --jq '.jobs[] | "\(.id)\t\(.conclusion)\t\(.name)"' 2>/dev/null) ||
+    full "the jobs of run $id could not be read"
+  for j in $(awk '/^jobs:/ { on = 1; next } on && /^[^ #]/ { on = 0 } on && /^  [a-z][a-z0-9-]*:$/ { sub(/:$/, ""); print $1 }' "$CI_YML"); do
+    [[ " $INHERIT_EXEMPT " == *" $j "* ]] && continue
+    awk -F'\t' -v j="$j" '($3 == j || index($3, j " (") == 1) && $2 == "success" {f = 1} END {exit !f}' <<< "$jobs" ||
+      full "run $id of previous head ${PR_BEFORE:0:9} passed no $j job (added since, or skipped), so it proves nothing for it"
+  done
   say inherit "clean catch-up merge; previous head ${PR_BEFORE:0:9} CI passed"
 fi
 
