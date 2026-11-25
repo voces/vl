@@ -8,8 +8,19 @@ import { mfCallbackLocal } from "./emit_union_casts"
 
 import { fbRefAsNonNull } from "./emit_bytes"
 import { unwrapParen } from "./emit_base"
-import { BinExpr, Call, Index, Member, Node, P, WhileStmt, nodeAt } from "./ast"
+import {
+  BinExpr,
+  Call,
+  ForRange,
+  Index,
+  Member,
+  Node,
+  P,
+  WhileStmt,
+  nodeAt,
+} from "./ast"
 import { fbDrop } from "./emit_bytes"
+import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import {
   OImm,
   PStaged,
@@ -31,13 +42,16 @@ import {
   SListSet,
 } from "./ir"
 import {
+  LoopOpened,
   irLAt,
   irLFn,
   irLIndexFrom,
   irLIndexRow,
+  irLMakeClo,
   irLMiss,
   irLOpnd,
   irLReadAgain,
+  irLRecvOpnd,
   irLSkip,
   irLoopHoistOpen,
 } from "./ir_lower"
@@ -52,8 +66,11 @@ import {
   emitArrLenHeld,
   emitClosureValue,
   emitEqNonNullCore,
+  emitListGetViewSync,
   fcpBackingTail,
   fcpLenTail,
+  fcpSpillTail,
+  forRangeStaticStep,
   fromCpTail,
   idxArmOf,
   idxCellReadIsNull,
@@ -63,6 +80,11 @@ import {
   listCatTail,
   listEqOperandTail,
   listEqTail,
+  listFitGrowLenClose,
+  listFitGrowLenOpen,
+  listFitGrowLenRowOf,
+  listGetStageEnter,
+  listGetStageRestore,
   listOpRecvHeld,
   listOpStageBase,
   loopHoistClose,
@@ -79,6 +101,8 @@ import {
   pushManyTail,
   pushPlainWhy,
   pushValueTail,
+  rangeProofClose,
+  rangeProofOpen,
   rawStrGetTail,
   rawStrHoistOf,
   refListGetTail,
@@ -89,7 +113,9 @@ import {
   sliceRecvTail,
   stageListRecvTail,
   strAccAppendTail,
+  strBytesTail,
   strCatTail,
+  strCpAtTail,
   strCpLenTail,
   strEqFirstOf,
   strEqLitForm,
@@ -100,6 +126,7 @@ import {
   strFromBytesTail,
   strInPlaceMode,
   strIndexOfTail,
+  strIsCharBoundaryTail,
   strListGetTail,
   strListHoistOf,
   strListReadsNonNull,
@@ -112,6 +139,7 @@ import { idxStorePlanOf, pushPlanOf } from "./emit_plan_list"
 import { scalarListElemKind } from "./emit_value_sites"
 import { exprNullableRefArray, refListSlotOfExpr } from "./emit_classify"
 import { rlRowsMinted } from "./emit_state"
+import { callSpillsFcpArg } from "./emit_fn_scans"
 
 // Why the IR does not lower list read `idxIx`, or "" when it does: legacy's own arm decision
 // (`idxArmOf`) took a scalar list, collected and not a view, a string or `(string | null)` list,
@@ -155,7 +183,10 @@ function lowerList(r: Rhs): i32 {
   if r is RListSlice { return lowerListSlice(r) }
   if !(r is RListGet) { return irLMiss("list rhs") }
   const from = irLIndexFrom(r.lgAt, irLAt())
+  // A read the builder built at its storage is lowered at it, as legacy writes it there.
+  const mark = storageReadEnter(if r.lgStored { r.lgAt } else { -1 })
   const got = lowerGet(r)
+  storageReadLeave(mark)
   irLIndexRow(r.lgAt, from)
   return got
 }
@@ -168,29 +199,29 @@ function lowerGet(r: RListGet): i32 {
   const arm = idxArmOf(nd, fnIx)
   if arm == "string" {
     const sz = rawStrHoistOf(nd.idxArr)
-    if sz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
-    irLOpnd(r.lgIx)
+    irLRecvOpnd(r.lgV, nd.idxArr, sz >= 0, r.lgAgain)
+    irLRecvOpnd(r.lgIx, nd.idxIndex, false, r.lgAgain)
     return rawStrGetTail(sz)
   }
   // A `(string | null)` element is recovered non-null only where the checker types it so.
   if arm == "str" || arm == "nulstr" {
     const lz = strListHoistOf(nd)
-    if lz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
-    irLOpnd(r.lgIx)
+    irLRecvOpnd(r.lgV, nd.idxArr, lz >= 0, r.lgAgain)
+    irLRecvOpnd(r.lgIx, nd.idxIndex, false, r.lgAgain)
     return strListGetTail(nd, lz, strListReadsNonNull(r.lgAt, arm == "nulstr"))
   }
   if arm == "ref" {
     const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
     const rz = refListHoistOf(nd, rslot)
-    if rz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
-    irLOpnd(r.lgIx)
+    irLRecvOpnd(r.lgV, nd.idxArr, rz >= 0, r.lgAgain)
+    irLRecvOpnd(r.lgIx, nd.idxIndex, false, r.lgAgain)
     return refListGetTail(nd, r.lgAt, fnIx, rslot, rz)
   }
   const ek = scalarListElemKind(nd.idxArr, fnIx)
   if ek == null { return irLMiss("list read element") }
   const hz = scalarListHoistOf(nd, ek, fnIx)
-  if hz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
-  irLOpnd(r.lgIx)
+  irLRecvOpnd(r.lgV, nd.idxArr, hz >= 0, r.lgAgain)
+  irLRecvOpnd(r.lgIx, nd.idxIndex, false, r.lgAgain)
   return scalarListGetTail(nd, ek, fnIx, hz)
 }
 
@@ -268,6 +299,12 @@ export function irLowerRefListSet(n: SListSet, at: i32): i32 {
 // `RListPop`: the receiver held or staged as for a push, then legacy's scalar or ref pop tail, at a
 // value position when `want`.
 function lowerPop(r: RListPop, want: boolean): i32 {
+  if r.lqIx.length > 0 {
+    const sv = listGetStageEnter(r.lqAt)
+    const got = lowerListGetCall(r, want)
+    listGetStageRestore(sv)
+    return got
+  }
   const fnIx = irLFn().irAt
   const pq = popAnyPlanOf(r.lqAt, fnIx)
   if pq == null { return irLMiss("pop plan") }
@@ -283,6 +320,44 @@ function lowerPop(r: RListPop, want: boolean): i32 {
   }
   // A statement drops what the tail left, as legacy's statement caller does.
   const got = if pq.pqElemRef { popRefTail(r.lqAt, lIdx, pq.pqWrap, pq.pqBack, -1, pq.pqRefSlot, fnIx) } else { popScalarTail(r.lqAt, pq.pqRecv, lIdx, pq.pqWrap, pq.pqBack, -1, want, fnIx) }
+  if got < 0 { return -1 }
+  if !want && got == 0 { fbDrop() }
+  return 0
+}
+
+// `RListPop` with an index, a `.get(i)`: the receiver as for a pop, the view sync, then legacy's
+// tail, which writes the index from the call; the index operand is consumed without being written.
+// The tail leaves `T | null` as at a value; a statement drops it.
+function lowerListGetCall(r: RListPop, want: boolean): i32 {
+  const fnIx = irLFn().irAt
+  const pq = popAnyPlanOf(r.lqAt, fnIx)
+  if pq == null { return irLMiss("get plan") }
+  const c = nodeAt(r.lqAt)
+  if !(c is Call) || c.callFn < 0 || c.callArgs.length != 1 {
+    return irLMiss("get call")
+  }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) { return irLMiss("get call") }
+  let lIdx = listOpRecvHeld(pq.pqRecv, fnIx, ".get")
+  if lIdx == -2 { return irLMiss("get receiver") }
+  if lIdx >= 0 {
+    irLSkip(r.lqV)
+  } else {
+    irLOpnd(r.lqV)
+    const sb = listOpStageBase(pq.pqBase, pq.pqRefSlot)
+    stageListRecvTail(pq.pqRecv, fnIx, sb)
+    lIdx = sb + 3
+  }
+  const ek = scalarListElemKind(callee.memObj, fnIx)
+  emitListGetViewSync(
+    lIdx,
+    if ek == "i32" { null } else { ek },
+    callee.memObj,
+    fnIx,
+  )
+  irLSkip(r.lqIx[0])
+  const gi = c.callArgs[0]
+  const got = if pq.pqElemRef { popRefTail(r.lqAt, lIdx, pq.pqWrap, pq.pqBack, gi, pq.pqRefSlot, fnIx) } else { popScalarTail(r.lqAt, pq.pqRecv, lIdx, pq.pqWrap, pq.pqBack, gi, true, fnIx) }
   if got < 0 { return -1 }
   if !want && got == 0 { fbDrop() }
   return 0
@@ -326,7 +401,17 @@ function lowerMapFilter(r: RMapFilter): i32 {
   const cL = mfCallbackLocal()
   irLOpnd(r.hfV)
   mfRecvTail(p, fnIx)
-  if r.hfC is OImm { emitClosureValue(p.mfCbFe, fnIx) } else { irLOpnd(r.hfC) }
+  if r.hfEnv.length > 0 {
+    // A capturing callback: its closure from the captures, as `RMakeClo` writes it.
+    const c = nodeAt(r.hfAt)
+    const cb = if c is Call && c.callArgs.length == 1 { unwrapParen(c.callArgs[0]) } else { -1 }
+    if cb < 0 { return irLMiss("map callback") }
+    irLMakeClo({ mcFn: p.mfCbFe, mcEnv: r.hfEnv, mcAt: cb })
+  } else if r.hfC is OImm {
+    emitClosureValue(p.mfCbFe, fnIx)
+  } else {
+    irLOpnd(r.hfC)
+  }
   return mfLoopTail(p, cL)
 }
 
@@ -400,6 +485,9 @@ function lowerStr(r: RStrOp): i32 {
     "acc" => if strInPlaceMode(r.soAt, fnIx) < 0 { strAccAppendTail(r.soAt, fnIx) } else { irLMiss("string accumulator") }
     "slice" => strSliceTail()
     "cplen" => strCpLenTail()
+    "cpat" => strCpAtTail()
+    "charbound" => strIsCharBoundaryTail()
+    "bytes" => strBytesTail()
     "indexof" => strIndexOfTail(false)
     "includes" => strIndexOfTail(true)
     "lt" => if e is BinExpr { strOrderTail(e) } else { irLMiss("string operator node") }
@@ -430,6 +518,8 @@ function lowerStr(r: RStrOp): i32 {
     "fromcp" => fromCpTail()
     "frombytes" => strFromBytesTail()
     "fromcps" => {
+      // A list legacy spills is read once, into the spill slot (`callSpillsFcpArg`).
+      if callSpillsFcpArg(r.soAt) { return fcpSpillTail() }
       fcpBackingTail()
       // The list's second read: a global's read written again, a local's variable read again.
       if !irLReadAgain(fcpArgOf(e)) { irLOpnd(r.soArgs[0]) }
@@ -451,6 +541,18 @@ function lowerStr(r: RStrOp): i32 {
 function lowerLen(r: RListLen): i32 {
   const m = nodeAt(r.llAt)
   if !(m is Member) { return irLMiss("list length node") }
+  // Outside a pushing arm's region, the length is its grow row's once that is filled.
+  const g = listFitGrowLenRowOf(m, irLFn().irAt)
+  if g >= 0 { listFitGrowLenOpen(g) }
+  const rc = lowerLenOf(r, m)
+  if g >= 0 && listFitGrowLenClose(g) < 0 {
+    return irLMiss("list fit grow length")
+  }
+  return rc
+}
+
+// The receiver's own `.length`: a live hoist's, or the receiver and legacy's tail.
+function lowerLenOf(r: RListLen, m: Member): i32 {
   const hz = arrLenHoistOf(m, irLFn().irAt)
   if hz >= 0 {
     irLSkip(r.llV)
@@ -460,13 +562,31 @@ function lowerLen(r: RListLen): i32 {
   return arrLenTail(m, irLFn().irAt)
 }
 
-// The list-header hoists of the loop statement at `at`, opened as legacy's loop opens them.
-function loopOpen(at: i32): i32 {
-  if at < 0 { return 0 }
+// The list-header hoists of the loop statement at `at`, and a range loop's proof, opened as
+// legacy's loop opens them.
+function loopOpen(at: i32): LoopOpened {
+  const none: LoopOpened = { loHoists: 0, loProofs: 0 }
+  if at < 0 { return none }
   const s = nodeAt(at)
+  // A range loop's hoists then its proof open after its bounds (`emitForRangeStmt`).
+  if s is ForRange {
+    const h = irLoopHoistOpen(-1, s.frBody, at, -1)
+    if h < 0 { return { loHoists: -1, loProofs: 0 } }
+    const p = rangeProofOpen(s, at, forRangeStaticStep(s), false)
+    return { loHoists: h, loProofs: p }
+  }
   // A labelled block opens no loop, so it hoists nothing (`emitLabelBlock`).
-  if !(s is WhileStmt) || s.whileBlk != 0 { return 0 }
-  return irLoopHoistOpen(s.whileCond, s.whileBody, -1, -1)
+  if !(s is WhileStmt) || s.whileBlk != 0 { return none }
+  return {
+    loHoists: irLoopHoistOpen(s.whileCond, s.whileBody, -1, -1),
+    loProofs: 0,
+  }
+}
+
+// Closes what `loopOpen` opened: its hoists, then its proofs, as legacy closes them.
+function loopClose(n: LoopOpened): i32 {
+  loopHoistClose(n.loHoists)
+  return rangeProofClose(n.loProofs)
 }
 // A bounds check is fused into the `RListGet` after it, which writes the guard; its operand
 // reads consume nothing, so the temps it names stay pending for that read.
@@ -478,6 +598,6 @@ export function irLowerRefBounds(n: SBoundsCheck, pending: i32[]): i32 {
   return lowerBounds(n, pending)
 }
 
-export function irLowerRefLoopOpen(at: i32): i32 { return loopOpen(at) }
+export function irLowerRefLoopOpen(at: i32): LoopOpened { return loopOpen(at) }
 
-export function irLowerRefLoopClose(n: i32): i32 { return loopHoistClose(n) }
+export function irLowerRefLoopClose(n: LoopOpened): i32 { return loopClose(n) }

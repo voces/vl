@@ -1,10 +1,12 @@
 // Run the repro filed under every defect heading of a docs inventory and report which rows
 // no longer behave as filed. A row's status line files an outcome, its `Repro:` block is the
 // witness, and an optional `Want:` block or `// PRINTS` line pins the output; `--strict`
-// also fails on a row it cannot grade. The row grammar is `scripts/lib/inventory.vl`. A repro's
-// `// file: batch-*.vl` files are checked before its entry in one `--batch --codegen` call.
+// also fails on a row it cannot grade, and `--gate` passes a row that now prints its `Want:`
+// block exactly, naming it for closure (a row with no `Want:` block never qualifies). The row
+// grammar is `scripts/lib/inventory.vl`. A repro's `// file: batch-*.vl` files are checked
+// before its entry in one `--batch --codegen` call.
 //
-//     vl run scripts/check-filed-witnesses.vl -- [--strict] [--json OUT] [--shard K/N] <doc-or-dir>...
+//     vl run scripts/check-filed-witnesses.vl -- [--strict] [--gate] [--json OUT] [--shard K/N] <doc-or-dir>...
 //     vl run scripts/check-filed-witnesses.vl -- --self-test
 //
 // Run it from the checkout root. Rows are graded in chunks of one `vl check --codegen --batch`
@@ -121,7 +123,7 @@ function namesParseError(status: string): boolean {
 const INVALID_MARKERS = [
   "Invalid input WebAssembly code", "wasm validation", "failed to parse",
   "type mismatch: expected", "WebAssembly translation error",
-  "validation error",
+  "validation error", "the emitted module failed to validate",
 ]
 const TRAP_MARKERS = [
   "wasm trap", "unreachable", "out of bounds", "divide by zero",
@@ -1142,13 +1144,20 @@ function jobsFromEnv(): i32 {
   return 4
 }
 
-const USAGE = "usage: vl run scripts/check-filed-witnesses.vl -- [--strict] [--json OUT] [--shard K/N] <doc-or-dir>...\n       vl run scripts/check-filed-witnesses.vl -- --self-test\nRun from the checkout root; `$JOBS` rows at a time (default 4).\nExit 0 when every row behaves as filed, 1 when one MOVED, or, under --strict, cannot be\ngraded, 2 when the seed's provenance refuses the reading."
+const USAGE = "usage: vl run scripts/check-filed-witnesses.vl -- [--strict] [--gate] [--json OUT] [--shard K/N] <doc-or-dir>...\n       vl run scripts/check-filed-witnesses.vl -- --self-test\nRun from the checkout root; `$JOBS` rows at a time (default 4).\nExit 0 when every row behaves as filed (under --gate, or now meets its Want), 1 when one\nMOVED, or, under --strict, cannot be graded, 2 when the seed's provenance refuses the reading."
 
 // `--shard K/N` keeps every N-th row from the K-th, `@@repeat` rows dealt first, so the N shards
 // partition the rows; shard 1 alone also reports the unparsed headings.
+// A moved row that runs and prints exactly its `Want:` block: the fix it waited for landed.
+// Without a `Want:` block nothing pins the value, so such a row is not one.
+function meetsWant(g: Graded): boolean {
+  return g.actual == "runs" && g.row.wantLabels > 0
+}
+
 function mainReport(
   docs: string[],
   strict: boolean,
+  gate: boolean,
   outJson: string,
   shardK: i32,
   shardN: i32,
@@ -1268,10 +1277,13 @@ function mainReport(
     k = k + 1
   }
   const moved: Graded[] = []
+  const met: Graded[] = []
   let mismatch = 0
   let w = 4
   for g in results {
-    if g.actual != g.declared { moved.push(g) }
+    if g.actual != g.declared {
+      if gate && meetsWant(g) { met.push(g) } else { moved.push(g) }
+    }
     if g.actual == "wrong_output" { mismatch = mismatch + 1 }
     if g.row.id.cpLen() > w { w = g.row.id.cpLen() }
   }
@@ -1281,6 +1293,7 @@ function mainReport(
   for g in results {
     let verdict = "** MOVED **"
     if g.actual == g.declared { verdict = "as filed" }
+    else if gate && meetsWant(g) { verdict = "meets its Want" }
     print(
       "\{padTo(g.row.id, w)}  \{padTo(g.declared, 22)} \{padTo(g.actual, 22)} \{verdict}",
     )
@@ -1290,13 +1303,32 @@ function mainReport(
       "\{padTo(g.row.id, w)}  \{padTo("-", 22)} \{padTo("-", 22)} not graded (\{g.why})",
     )
   }
+  let metPart = ""
+  if gate { metPart = " · \{toString(met.length)} meet their Want" }
   print(
-    "\n\{toString(results.length)} graded · \{toString(results.length - moved.length)} as filed · \{toString(moved.length)} MOVED · \{toString(ungradable.length)} not graded · \{toString(unparsed.length)} UNPARSED",
+    "\n\{toString(results.length)} graded · \{toString(results.length - moved.length - met.length)} as filed · \{toString(moved.length)} MOVED · \{toString(ungradable.length)} not graded · \{toString(unparsed.length)} UNPARSED\{metPart}",
   )
   print(
     "\{toString(wantChecked)} output-checked against Want · \{toString(mismatch)} output mismatch",
   )
-  const prov = provenance(moved.length)
+  // Every moved row, closures included, is refused against a seed of unknown provenance.
+  const reported = moved.length + met.length
+  const prov = provenance(reported)
+  if met.length > 0 {
+    print(
+      "\nRows that now meet their Want - the PR that fixed them closes them:",
+    )
+    const ci = getEnv("GITHUB_ACTIONS") == "true"
+    for g in met {
+      const at = "\{g.row.doc}:\{toString(g.row.line)}"
+      print("  \{g.row.id} now meets its Want: close it (\{at})")
+      if ci {
+        print(
+          "::warning file=\{g.row.doc},line=\{toString(g.row.line)}::\{g.row.id} now meets its Want: close it",
+        )
+      }
+    }
+  }
   if moved.length > 0 {
     print(
       "\nRows whose filed behaviour no longer reproduces — re-grade the doc:",
@@ -1501,6 +1533,7 @@ function main(args: string[]): i32 {
   }
   let outJson = ""
   let strict = false
+  let gate = false
   let shardK = 1
   let shardN = 1
   const docs: string[] = []
@@ -1534,6 +1567,7 @@ function main(args: string[]): i32 {
       continue
     }
     if a == "--strict" { strict = true }
+    else if a == "--gate" { gate = true }
     else if a == "--self-test" { return selfTest() }
     else { docs.push(a) }
     i = i + 1
@@ -1547,7 +1581,7 @@ function main(args: string[]): i32 {
     print(refused)
     return 2
   }
-  return mainReport(docs, strict, outJson, shardK, shardN)
+  return mainReport(docs, strict, gate, outJson, shardK, shardN)
 }
 
 const argv = programArgs()

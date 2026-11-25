@@ -9,7 +9,7 @@
 //
 //   push  — the push receiver's strict cast is dropped at the door because the shared tails a
 //           fragment calls read the flag live; a whole-function push whose receiver unboxes a
-//           list arm misses instead (`recvReadsListPayload`), since its receiver is read earlier.
+//           list arm is the IR's, its receiver's temps written under the strict cast.
 //
 // Loads the real seed (`build/vl-compiler.wasm`); absent, the seed halves self-ignore.
 //
@@ -140,8 +140,14 @@ function namedMisses(r: Map<string, number>): number {
   return n;
 }
 
+// Whether every function a build met is covered and matched legacy's bytes, with no named miss.
+function allMatched(r: Map<string, number>): boolean {
+  const fns = r.get("fns") ?? 0;
+  return fns > 0 && namedMisses(r) === 0 && r.get("covered") === fns && r.get("matched") === fns;
+}
+
 Deno.test({
-  name: "ir door guard: a list-arm narrowing in a push receiver is not the IR's yet",
+  name: "ir door guard: a push into a list arm an `is` narrowed is the IR's and matches",
   ignore,
   fn: () => {
     const r = rows(`function f(u: i32[] | string): i32 {
@@ -154,18 +160,17 @@ Deno.test({
 print(f([3]))
 print(f("s"))
 `);
-    // Uncovered by a named miss, whichever the build meets first: the `is` rung covers now, and
-    // the push through the narrowed list arm still misses.
-    if (namedMisses(r) < 1 || r.has("matched")) {
-      throw new Error(`want the list-arm narrowing's push left uncovered, got ${JSON.stringify([...r])}`);
+    // Matching legacy's bytes is matching its strict receiver cast (`listCastForPush`, D4949).
+    if (!allMatched(r)) {
+      throw new Error(`want the list-arm narrowing's push covered and matched, got ${JSON.stringify([...r])}`);
     }
   },
 });
 
-// A whole-function push reads its receiver before the push, where legacy's strict cast is not
-// set, so a receiver that unboxes a list arm misses (`recvReadsListPayload`).
+// A whole-function push reads its receiver before the push, so the IR writes the receiver's own
+// temps under legacy's strict cast (`recvReadsListPayload`, `tempRhsWrite`).
 Deno.test({
-  name: "ir: a push whose receiver unboxes a list arm is legacy's",
+  name: "ir: a push whose receiver unboxes a list arm is the IR's and matches",
   ignore,
   fn: () => {
     const r = rows(`function f(u: i32[] | string): i32 {
@@ -175,11 +180,10 @@ Deno.test({
 const xs: i32[] = [3]
 print(f(xs))
 `);
-    if ((r.get("uncovered push receiver payload cast") ?? 0) < 1) {
-      throw new Error(`want the push receiver's payload cast to miss, got ${JSON.stringify([...r])}`);
+    if (!allMatched(r)) {
+      throw new Error(`want the push receiver's payload cast covered and matched, got ${JSON.stringify([...r])}`);
     }
-    // An element narrowed to a list arm: the element's own unbox (`idxNarrowAtomKind`) must keep
-    // the push legacy's, by whichever named miss the build meets first.
+    // An element narrowed to a list arm: its push is the IR's too, past the element's own unbox.
     const el = rows(`function g(xs: (i32[] | string)[]): i32 {
   if xs[0] is i32[] {
     xs[0].push(1)
@@ -188,8 +192,8 @@ print(f(xs))
 }
 print(g([[3], "s"]))
 `);
-    if (namedMisses(el) < 1 || el.has("matched")) {
-      throw new Error(`want the narrowed element's push left to legacy, got ${JSON.stringify([...el])}`);
+    if (!allMatched(el)) {
+      throw new Error(`want the narrowed element's push covered and matched, got ${JSON.stringify([...el])}`);
     }
   },
 });
@@ -209,8 +213,8 @@ print(f())
   },
 });
 
-// A local the fragment never declared takes its rep from the type; legacy's cell here is the
-// literal set's atom (D14757). The fragment must miss, not write the atom into a string list.
+// Legacy's cell here is the literal set's atom (D14757), where the variable is declared too
+// (`letAtomCellTy`). The fragment must miss, not write the atom into a string list.
 Deno.test({
   name: "ir door: a local whose legacy cell is not its type's rep misses",
   ignore,
@@ -224,7 +228,8 @@ function main(c: boolean) {
 }
 main(true)
 `);
-    if ((r.get("node-in array: miss atom cell local rep") ?? 0) < 1) {
+    const missed = [...r.keys()].filter((k) => k.startsWith("node-in array: miss"));
+    if (missed.length < 1) {
       throw new Error(`want the atom cell's read to miss, got ${show(r)}`);
     }
     const differ = [...r.keys()].filter((k) => k.startsWith("node-in array: differ"));

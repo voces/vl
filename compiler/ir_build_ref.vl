@@ -1,35 +1,45 @@
+import { variantFieldTypeAt } from "./emit_atom_kinds"
+
 // `ir_build_ref.vl` — the IR builder's reference values and list reads (ir-design-2026-11.md
 // §5.3, I2's list half). A `str` or a list of unpacked primitives may be a variable, parameter
 // or result. A list read on legacy's plain guarded path builds `SBoundsCheck` then `RListGet`
 // over the same operands; the lowering takes its scratch slots from the shared lazy list frame.
 // Every other element or member read is a named miss. `irRefInstall` sets the hooks.
 
-import { BinExpr, Ident, Index, LetDecl, Member, P, nodeAt } from "./ast"
+import { BinExpr, Call, Ident, Index, LetDecl, Member, P, nodeAt } from "./ast"
 import {
   IrFn,
   OImm,
   OStr,
   OVar,
   Opnd,
+  RStage,
   RTagStash,
   Rhs,
   SCoalBox,
   SEffect,
   SIf,
+  SLet,
   StrOp,
+  coalArmStagesLeads,
+  repBoxCore,
   repPrim,
   repWhat,
 } from "./ir"
-import { unwrapParen } from "./emit_base"
-import { letBindIsAtom, letBindIsNulAtom, localIndexOf } from "./emit_classify"
-import { isStorageRead } from "./emit_elab"
+import { exprEffectFree, unwrapParen } from "./emit_base"
+import { localIndexOf, structIndexOfExpr } from "./emit_classify"
+import { repStructRowIsOrTwin } from "./emit_shape_rows"
+import { isStorageRead, storageReadEnter, storageReadLeave } from "./emit_elab"
 import { identDeclOf } from "./symbols"
 import {
-  atomNullable,
+  boxedNullable,
   declRowReadTy,
   deliverStr,
+  exprTyOf,
+  heldAsBox,
   holeCloTy,
   ifBelowLeadOf,
+  irArmSiteHook,
   irBAtomKindRep,
   irBBoxLocal,
   irBExpr,
@@ -45,6 +55,7 @@ import {
   irBNode,
   irBNoteFieldReread,
   irBOpRep,
+  irBOpenLocalReadRep,
   irBStageLeads,
   irBUnboxKindRep,
   irInPlaceHook,
@@ -53,10 +64,12 @@ import {
   irListEqHook,
   irMemberHook,
   irNodeInShadow,
+  irOpenMemberRepHook,
   irStrBinHook,
   irUnionEqHook,
   irVarRepOkHook,
   mapGetBare,
+  recvReadsAgain,
   storedReadOf,
 } from "./ir_build"
 import {
@@ -67,8 +80,12 @@ import {
   irLowerListHook,
   irLowerListSetHook,
 } from "./ir_lower"
-import { irBoundsRuleHook } from "./ir_verify"
-import { openRepTakes, undeclaredRepTakes } from "./ir_verify_facts"
+import { irBoundsRuleHook, irTyOpen } from "./ir_verify"
+import {
+  openRepTakes,
+  repStoresAs,
+  undeclaredRepTakes,
+} from "./ir_verify_facts"
 import {
   irLowerRefBounds,
   irLowerRefEffect,
@@ -87,6 +104,7 @@ import {
   RMap,
   RNullable,
   RRecord,
+  RUnsup,
   repNodeAt,
   repNodeKids,
   repNodeOfTy,
@@ -97,7 +115,10 @@ import { nodeTyAt } from "./emit_capture_frames"
 import {
   REF_READ_CONTAINER,
   SRT_NARROW,
+  SRT_NONE,
+  armSiteOpndNode,
   eqRouteOf,
+  exprReadsDeadNever,
   idxArmOf,
   irNodeInShadowHook,
   listCatRouteOf,
@@ -117,6 +138,7 @@ import {
   strListReadsNonNull,
   strOrderSwaps,
   strSiteOfRhsAsked,
+  unionBoxTailLeavesBox,
   unionFieldNarrowUnboxOf,
   unionFieldUnboxKindOf,
   unionUnionEqArmOf,
@@ -128,12 +150,19 @@ import {
 } from "./emit_plan_union"
 import {
   narrowedFieldPlain,
+  nulVariantFieldPlain,
   structFieldPlain,
   unionEqNameless,
   unionUnionEqStagedOf,
   variantFieldPlain,
 } from "./emit_plan_union"
-import { exprIsLitAtom, exprIsStrConcat, exprMap } from "./emit_classify"
+import {
+  armSiteReads,
+  armSiteRecv,
+  exprIsLitAtom,
+  exprIsStrConcat,
+  exprMap,
+} from "./emit_classify"
 import { exprIsStrEq, exprIsStrOrder } from "./emit_fn_scans"
 
 // The corrupt mode that drops every bounds check, rule 8's failing control, and the mode armed.
@@ -155,30 +184,47 @@ function refRepOk(r: i32, _ty: i32): boolean {
 
 function missed(o: Opnd): boolean { return o is OVar && o.ov < 0 }
 
-// Whether a tagged call's stash is among the receiver nodes `b` holds from `at`: legacy writes the
-// callee, of any expression, and its stash inside the element read it receives.
-function tagStashLeads(f: IrFn, b: i32[], at: i32): boolean {
+// Whether a tagged call's stash, a valued `if` or a staging `??` is among the receiver nodes `b`
+// holds from `at`: legacy writes the receiver, of any expression, inside the element read it
+// receives.
+function receiverStmtLeads(f: IrFn, b: i32[], at: i32): boolean {
   let j = at
   while j < b.length {
-    const n = f.irNodes[b[j]]
-    if n is SEffect && n.efRhs is RTagStash { return true }
+    if tagStashAt(f, b[j]) || valuedIfAt(f, b[j]) || stagingCoalAt(f, b[j]) {
+      return true
+    }
     j = j + 1
   }
   return false
 }
 
+// Whether node `id` is a statement writing a tagged call's stash.
+function tagStashAt(f: IrFn, id: i32): boolean {
+  const n = f.irNodes[id]
+  return n is SEffect && n.efRhs is RTagStash
+}
+
+// Whether node `id` is a valued `if`.
+function valuedIfAt(f: IrFn, id: i32): boolean {
+  const n = f.irNodes[id]
+  return n is SIf && n.siOut >= 0
+}
+
+// Whether node `id` is a `??` that writes the operands staged before it below its `if`
+// (`coalArmStagesLeads`), as a valued `if` does.
+function stagingCoalAt(f: IrFn, id: i32): boolean {
+  const n = f.irNodes[id]
+  return n is SCoalBox && coalArmStagesLeads(n.cbArm)
+}
+
 // Legacy's row spans a whole element read `ix`, a receiver a fused coalesce, a valued `if` or a
-// tagged call's stash (`tagStashLeads`) writes as a statement from `b[at]` included: notes that
-// statement as its start.
+// tagged call's stash (`receiverStmtLeads`) writes as a statement from `b[at]` included: notes
+// that statement as its start.
 function idxRowOpenNote(b: i32[], at: i32, ix: i32) {
   if b.length <= at { return 0 }
   const f = irBFn()
   const lead = f.irNodes[b[at]]
-  if (
-    lead is SCoalBox
-    || lead is SIf && lead.siOut >= 0
-    || tagStashLeads(f, b, at)
-  ) {
+  if (lead is SCoalBox || receiverStmtLeads(f, b, at)) {
     f.irIdxRowAt[ix] = b[at]
     f.irRowOpens[b[at]] = true
     f.irHasRowOpens = true
@@ -190,6 +236,7 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
   const n = nodeAt(ix)
   if !(n is Index) { return irBMiss("expression") }
   const fnIx = irBFnIx()
+  if armSiteReads(ix, fnIx) { return armSiteRead(b, ix, rep) }
   if exprMap(n.idxArr, fnIx) { return mapGetBare(b, ix, rep) }
   const why = listIdxPlainWhy(ix, fnIx)
   if why != "" { return irBMiss(why) }
@@ -231,14 +278,23 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
     && idxArmOf(n, fnIx) == "ref"
     && listElemStaysNullable(n.idxArr, fnIx)
     && listReadProvedNonNull(ix)
-  // An element read at an open type takes the element as it is stored (`openRepTakes`), or, of
-  // a list read at its declared storage (`storedReadOf`), as that wrapper's array holds it.
+  // An element read at an open type takes the element as it is stored (`openRepTakes`), as does
+  // one of a list read at its declared storage (`storedReadOf`) or a ref element stored alike that
+  // is no box pair (a box pair is `boxView`'s).
   const ety = nodeTyAt(ix, fnIx)
   const declared = v is OVar && storedReadOf(n.idxArr) == v.ov
   const stored = vr is RList
     && vr.rlsElem != rep
     && (openRepTakes(ety, rep, vr.rlsElem)
-    || declared && undeclaredRepTakes(ety, rep, vr.rlsElem))
+    || declared && undeclaredRepTakes(ety, rep, vr.rlsElem)
+    || idxArmOf(n, fnIx) == "ref"
+    && repStoresAs(rep, vr.rlsElem)
+    && !(heldAsBox(vr.rlsElem) && heldAsBox(rep)))
+  // A union box element read at a narrower union's box is the same box (`RStage`).
+  const boxView = vr is RList
+    && vr.rlsElem != rep
+    && heldAsBox(vr.rlsElem)
+    && heldAsBox(rep)
   if (
     vr is RList
     && vr.rlsElem != rep
@@ -247,6 +303,7 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
     && !nicheNarrowed
     && !refRecovered
     && !stored
+    && !boxView
     && !refUnboxedAt(n, ix, fnIx, rep)
   ) {
     return irBMiss("index element coercion")
@@ -256,14 +313,81 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
   if refCorrupt != CORRUPT_DROP_BOUNDS {
     irBNode(b, { bcV: v, bcIx: i }, -1, irBNoValue(), ix)
   }
-  const r: Rhs = { lgV: v, lgIx: i, lgAt: ix }
-  // A read over a variable and an immediate or variable index can be written again as built; a
-  // stored element's read is the same read, at the element's storage rep.
-  if readsAgain(v) && readsAgain(i) { irBFn().irReadElem[ix] = r }
+  const stRead = isStorageRead(ix)
+  const r: Rhs = { lgV: v, lgIx: i, lgAt: ix, lgStored: stRead, lgAgain: false }
+  // A read whose receiver and index are each an immediate, a variable, or a temp whose read is
+  // written again as built can be written again as built; a stored element's read is the same.
+  const vAgain = readsAgain(v)
+    || v is OVar && recvReadsAgain(unwrapParen(n.idxArr))
+  const iAgain = readsAgain(i)
+    || i is OVar && recvReadsAgain(unwrapParen(n.idxIndex))
+  if vAgain && iAgain {
+    irBFn().irReadElem[ix] = {
+      lgV: v,
+      lgIx: i,
+      lgAt: ix,
+      lgStored: stRead,
+      lgAgain: true,
+    }
+  }
   if stored && vr is RList {
     return irBLetTempTy(b, r, ix, vr.rlsElem, repTyOf(vr.rlsElem))
   }
+  if boxView && vr is RList {
+    const el = irBLetTempTy(b, r, ix, vr.rlsElem, repTyOf(vr.rlsElem))
+    return irBLetTemp(b, { sgV: el }, ix, rep)
+  }
+  // A read asked at its element's storage, not its narrowing, is typed at that rep.
+  if vr is RList && rep == vr.rlsElem && rep != repNodeOfTy(ety) {
+    return irBLetTempTy(b, r, ix, rep, repTyOf(rep))
+  }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// Read `ix` through a box of lists or maps (`armSiteRecv`: an element, `.length`, `.has` or
+// `.get`): the box, and an index or key legacy's tag chain writes again in each arm, so a variable,
+// an immediate or the key's literal (`RArmSite`). A box no name holds is stashed once, as legacy's.
+function armSiteRead(b: i32[], ix: i32, rep: i32): Opnd {
+  const recv = armSiteRecv(ix)
+  if recv < 0 || recv >= P.nodes.length { return irBMiss("arm site receiver") }
+  const named = nodeAt(recv) is Ident
+  const v0 = irBExpr(b, recv)
+  if missed(v0) { return irBMiss("arm site receiver") }
+  // A narrowed name read as the same box (`RStage`) is that name: legacy's arms re-read the name.
+  const v = if named { stagedVar(b, v0) } else { v0 }
+  if named && !(v is OVar && readsAgain(v)) {
+    return irBMiss("arm site operand")
+  }
+  const ops: Opnd[] = [v]
+  const on = armSiteOpndNode(ix)
+  if on >= 0 {
+    const i = irBExpr(b, on)
+    if missed(i) { return irBMiss("index operand") }
+    // A map arm's key is written as its literal: a plain string key needs no conversion. An index
+    // that calls and writes nothing is built once ahead of the chain, where legacy writes it again
+    // in the one arm that runs (Q57: the same value, read before the tag test).
+    const lit = i is OStr && i.osAt == on
+    const once = !readsAgain(i)
+      && !lit
+      && exprEffectFree(on)
+      && repPrim(irBOpRep(i)) == "i32"
+    if !readsAgain(i) && !lit && !once { return irBMiss("arm site operand") }
+    ops.push(i)
+  }
+  const r: Rhs = { asOps: ops, asAt: ix, asStash: !named }
+  return irBLetTempTy(b, r, ix, rep, repTyOf(rep))
+}
+
+// Operand `o`, or the variable it stages where the last node of `b` is its `RStage` over a
+// re-readable variable: that node is dropped, and the variable read in its place.
+function stagedVar(b: i32[], o: Opnd): Opnd {
+  if !(o is OVar) || b.length == 0 { return o }
+  const nd = irBFn().irNodes[b[b.length - 1]]
+  if !(nd is SLet) || nd.lDst != o.ov { return o }
+  const r = nd.lRhs
+  if !(r is RStage) || !readsAgain(r.sgV) { return o }
+  b.pop()
+  return r.sgV
 }
 
 // Whether operand `o` reads the same where it is written again: an immediate, or a variable's read.
@@ -286,14 +410,23 @@ function refUnboxedAt(n: Index, ix: i32, fnIx: i32, rep: i32): boolean {
   return u >= 0 && irBAtomKindRep(u, rep)
 }
 
-// Whether a union-box field read `ix` leaves rep `rep` by the unbox legacy writes after it
-// (`unionFieldNarrowUnboxOf`): the box itself, or the atom it unboxes to. A container is a miss.
-function narrowUnboxRepIs(ix: i32, rep: i32): boolean {
+// Whether a union-box field read `ix` of member `n` off variant record `r` leaves rep `rep` by the
+// unbox legacy writes after it (`unionFieldNarrowUnboxOf`): the box itself, as a box or as the
+// nullable boxed on that field's box (`boxedNullable`), or the atom it unboxes to.
+function narrowUnboxRepIs(ix: i32, r: i32, n: Member, rep: i32): boolean {
   return match unionFieldNarrowUnboxOf(ix, irBFnIx()) {
     "container" => false
     "atom" | "unbox" => irBAtomKindRep(unionFieldUnboxKindOf(ix, irBFnIx()), rep)
-    "none" => repNodeAt(rep) is RBox
+    "none" => repNodeAt(rep) is RBox || boxedNullable(rep) && fieldBoxOf(r, n, rep)
   }
+}
+
+// Whether boxed nullable `rep` rides the box variant record `r` stores field `n` in.
+function fieldBoxOf(r: i32, n: Member, rep: i32): boolean {
+  const k = repRecordKidOf(r, nodeTyAt(n.memObj, irBFnIx()), n.memProp)
+  const ks = repNodeKids(r)
+  if k < 0 || k >= ks.length { return false }
+  return ks[k] == rep || repBoxCore(ks[k]) == repBoxCore(rep)
 }
 
 // Whether a narrowed variant field `n` of record rep `r` reads at `rep` as its tail writes it: the
@@ -334,15 +467,48 @@ function holeCloFieldRead(b: i32[], n: Member, ix: i32, k: i32): Opnd {
   )
 }
 
+// Field read `ix` at its storage, the box its declared union holds, as legacy reads a narrowed
+// field's receiver.
+function storedBoxRead(b: i32[], ix: i32): Opnd {
+  const mark = storageReadEnter(ix)
+  const v = irBExpr(b, ix)
+  storageReadLeave(mark)
+  if missed(v) { return v }
+  // A storage read is the field's declared box itself: a box, or a boxed nullable, whose null is a
+  // tag of the same `{tag, payload}` struct (`heldAsBox`).
+  if !heldAsBox(irBOpRep(v)) { return irBMiss("narrowed field receiver rep") }
+  return v
+}
+
+// The type receiver `o` is built at: an open-typed call, or a field of one, at the type `irBExpr`
+// builds it at (`exprTyOf`); else its own type.
+function builtRecvTy(o: i32): i32 {
+  const u = unwrapParen(o)
+  const t = nodeTyAt(u, irBFnIx())
+  if u < 0 || !irTyOpen(t) { return t }
+  return if nodeAt(u) is Call || nodeAt(u) is Member { exprTyOf(u) } else { t }
+}
+
 // A member read, routed by its receiver's rep: a record's own `length` field never reaches a
 // list or string arm.
 function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   const n = nodeAt(ix)
   if !(n is Member) { return irBMiss("expression") }
+  // A `.length` legacy takes per arm of a box of lists or maps (`memberLengthArmOf`).
+  if (
+    n.memProp == "length"
+    && memberLengthArmOf(n, ix, irBFnIx()) == "armSite"
+    && armSiteReads(ix, irBFnIx())
+  ) {
+    return armSiteRead(b, ix, rep)
+  }
   // A receiver held at legacy's declared row (`declRowReadTy`) is read at that row.
   const dt = declRowReadTy(n.memObj)
-  const ot = if dt >= 0 { dt } else { nodeTyAt(n.memObj, irBFnIx()) }
-  const r = repNodeOfTy(ot)
+  const ot = if dt >= 0 { dt } else { builtRecvTy(n.memObj) }
+  // A hole receiver is read at the rep its parameter is held at (`irBOpenLocalReadRep`).
+  const r0 = repNodeOfTy(ot)
+  const hr = if repNodeAt(r0) is RUnsup { holeRecvBox(irBOpenLocalReadRep(n.memObj)) } else { -1 }
+  const r = if hr >= 0 { hr } else { r0 }
   if repNodeAt(r) is RList {
     if n.memProp != "length" { return irBMiss("list member") }
     if !refRepOk(r, -1) { return irBMiss("list length rep") }
@@ -359,13 +525,16 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   if repPrim(r) == "str" {
     if n.memProp != "length" { return irBMiss("string member " + n.memProp) }
     const sv = irBExpr(b, n.memObj)
-    if missed(sv) || !(sv is OVar) { return irBMiss("string length receiver") }
+    if missed(sv) || !(sv is OVar || sv is OStr) {
+      return irBMiss("string length receiver")
+    }
     return irBLetTemp(b, { llV: sv, llAt: ix }, ix, rep)
   }
   // A plain field read off a struct or a bare variant.
   const fnIx = irBFnIx()
   const plain = variantFieldPlain(ix, fnIx) >= 0
     || structFieldPlain(ix, fnIx) >= 0
+    || nulVariantFieldPlain(ix, fnIx) >= 0
   if repNodeAt(r) is RRecord && plain {
     const k = repRecordKidOf(r, ot, n.memProp)
     if k < 0 { return irBMiss("field kid") }
@@ -381,13 +550,41 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     // tail writes the read's recover (`readOwesNonNullRecover`), as for any member read.
     const kn = repNodeAt(kr)
     const narrowed = kn is RNullable && kn.rnInner == rep
-    if kr != rep && !own && !narrowed { return irBMiss("field read coercion") }
+    // An atom field read as its literal's string is read at the atom; its consumer decodes it.
+    const atomStr = kn is RAtom
+      && repPrim(rep) == "str"
+      && !own
+      && exprIsLitAtom(ix, fnIx)
+    // A literal set stored as its string and read as its atom is read at the string it is.
+    const strAtom = repPrim(kr) == "str" && repNodeAt(rep) is RAtom && !own
+    // A field whose stored kid rep is not the read's own is read at the kid, as legacy reads the
+    // stored row; its consumer takes the temp at that rep.
+    const atKid = kr != rep && !own && !narrowed && !atomStr && !strAtom
+    // The box read below, declined before its receiver is built where it reaches D17076.
+    const nullBox = own
+      && repPrim(rep) == "null"
+      && unionBoxTailLeavesBox(ix, fnIx)
+    if nullBox && letListElement(n.memObj) {
+      return irBMiss("box field of a let list's element")
+    }
     const rv = irBExpr(b, n.memObj)
     if missed(rv) { return rv }
-    // A receiver held at its storage row (D14426) lays its fields out as that row does.
-    if irBOpRep(rv) != r { return irBMiss("field read of a stored row") }
+    // A receiver held at its storage row (D14426) reads that row's field, where it holds the read's
+    // own rep or the union box the read unboxes.
+    const sk = if irBOpRep(rv) == r { k } else { storedRowKid(n, irBOpRep(rv), fnIx) }
+    const skr = if sk >= 0 { repNodeKids(irBOpRep(rv))[sk] } else { -1 }
+    if sk < 0 || sk != k { return irBMiss("field read of a stored row") }
     irBNoteFieldReread(ix, k)
     const ur = if own { irBUnboxKindRep(unionFieldUnboxKindOf(ix, fnIx), rep) } else { rep }
+    const sn = repNodeAt(skr)
+    const boxRead = sn is RNullable
+      && sn.rnDisc == 4
+      && (rep == sn.rnInner || repPrim(rep) == "null")
+    // A stored row's union box under a plain read of the same field: legacy's tail unboxes it.
+    const boxUnbox = sn is RBox && kr == rep
+    if skr != kr && own && !boxRead && !boxUnbox {
+      return irBMiss("field read of a stored row's box")
+    }
     const gf: Rhs = {
       gfV: rv,
       gfIx: k,
@@ -397,25 +594,53 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
       gfShared: false,
     }
     if ur != rep { return irBLetStrTemp(b, gf, ix) }
+    if atomStr || strAtom { return irBLetTempTy(b, gf, ix, kr, repTyOf(kr)) }
+    // The read at the kid is at the operand's own stored row (`skr`), the row legacy reads.
+    if atKid { return irBLetTempTy(b, gf, ix, skr, repTyOf(skr)) }
+    // A `null`-typed read whose field tail leaves the box writes nothing after it: the read is
+    // that box, the `null` member nothing unboxes to.
+    if (
+      own
+      && repPrim(rep) == "null"
+      && (sn is RBox || boxRead)
+      && unionBoxTailLeavesBox(ix, fnIx)
+    ) {
+      return irBLetTempTy(b, gf, ix, skr, repTyOf(skr))
+    }
+    if skr != kr && !own { return irBLetTempTy(b, gf, ix, skr, repTyOf(skr)) }
+    // A raw read at the field's storage (`rawFieldRepOf`) is typed at that rep.
+    if rep == kr && rep != repNodeOfTy(nodeTyAt(ix, fnIx)) {
+      return irBLetTempTy(b, gf, ix, rep, repTyOf(rep))
+    }
     return irBLetTemp(b, gf, ix, rep)
   }
   // A field read off a box local narrowed to one variant.
   const idx = narrowedFieldPlain(ix, irBFnIx())
   if repNodeAt(r) is RRecord && idx >= 0 {
     if narrowedFieldIsUnionBox(ix, irBFnIx()) {
-      if !narrowUnboxRepIs(ix, rep) {
+      if !narrowUnboxRepIs(ix, r, n, rep) {
+        // A boxed nullable on another box than the field's is the narrower refusal.
+        if boxedNullable(rep) {
+          return irBMiss("narrowed field unbox nullable disc")
+        }
         return irBMiss("narrowed field unbox rep")
       }
     } else if !fieldReadsAt(r, n, rep) {
       return irBMiss("narrowed field read coercion")
     }
-    const bv = irBBoxLocal(b, n.memObj)
+    const bv = if nodeAt(n.memObj) is Ident { irBBoxLocal(b, n.memObj) } else { storedBoxRead(b, n.memObj) }
     if missed(bv) { return bv }
+    // A raw read at the field's storage (`rawFieldRepOf`) is typed at that rep.
+    if rep != repNodeOfTy(nodeTyAt(ix, irBFnIx())) {
+      return irBLetTempTy(b, { bfV: bv, bfAt: ix }, ix, rep, repTyOf(rep))
+    }
     return irBLetTemp(b, { bfV: bv, bfAt: ix }, ix, rep)
   }
   // A shared field read over an un-narrowed box local, on legacy's plain dispatch.
   if repNodeAt(r) is RBox && sharedReadPlainOf(ix, irBFnIx()) {
-    if rep != repNodeOfTy(nodeTyAt(ix, irBFnIx())) {
+    const openRead = repNodeAt(repNodeOfTy(nodeTyAt(ix, irBFnIx()))) is RUnsup
+      && rep == openMemberRep(ix)
+    if rep != repNodeOfTy(nodeTyAt(ix, irBFnIx())) && !openRead {
       return irBMiss("shared read rep")
     }
     // The tail decides the read's rep: an unbox leaves its atom's, nothing else changes the box.
@@ -454,6 +679,7 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
       srGlobal: -1,
       srGlobalNonNull: false,
     }
+    if openRead { return irBLetTempTy(b, sr, ix, rep, repTyOf(rep)) }
     return irBLetTemp(b, sr, ix, rep)
   }
   // A grow candidate's arm turns on legacy's emit-time stash read, which the IR never asks.
@@ -464,18 +690,6 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     return irBMiss("member length grow candidate")
   }
   return irBMiss("member " + repWhat(r))
-}
-
-// Whether part `ix` is a read of a binding whose cell legacy holds as the atom, not its `K | null`
-// niche (`letBindIsAtom`): a read narrowed past the cell's members, decoded off the cell.
-function partReadsAtomCell(ix: i32, fnIx: i32): boolean {
-  const u = unwrapParen(ix)
-  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is Ident) { return false }
-  const d = identDeclOf(u)
-  return d >= 0
-    && nodeAt(d) is LetDecl
-    && letBindIsAtom(d, fnIx)
-    && !letBindIsNulAtom(d, fnIx)
 }
 
 // A string `+` chain, `==`/`!=` or ordering, its operands built in legacy's push order: an
@@ -515,16 +729,12 @@ function buildStrBin(b: i32[], ix: i32, rep: i32): Opnd {
   const starts: i32[] = []
   for p in parts {
     const from = b.length
-    // A literal-union atom part decodes to its member string, as legacy's `emitStrValue` widens
-    // it (`exprIsLitAtom`), through the delivery's atom decode, which names a `K | null` part's
-    // miss; its rep must agree, except a read of an atom cell narrowed past its members.
-    const litAtom = exprIsLitAtom(p, fnIx)
-    const pr = repNodeOfTy(nodeTyAt(p, fnIx))
-    const atomRep = repNodeAt(pr) is RAtom || atomNullable(pr)
-    if litAtom != atomRep && !(litAtom && partReadsAtomCell(p, fnIx)) {
-      return irBMiss("string atom part route")
-    }
-    const a = if litAtom { deliverStr(b, p) } else { irBExpr(b, p) }
+    // A literal-union part decodes to its member string through the delivery's atom decode, as
+    // legacy's `emitStrValue` widens it (`exprIsLitAtom`), whatever its type's rep, and a dead
+    // `never` part is legacy's `unreachable` in place, delivered at the string it stands for; any
+    // other part is built as legacy's `emitExpr` writes it and must arrive a string.
+    const dead = exprReadsDeadNever(p, fnIx)
+    const a = if exprIsLitAtom(p, fnIx) || dead { deliverStr(b, p) } else { irBExpr(b, p) }
     if missed(a) { return a }
     // Legacy writes every operand in place, so a valued `if` past the first sits above the others.
     if args.length > 0 && !irBStageLeads(b, from, starts, args, parts) {
@@ -571,6 +781,8 @@ export function irRefInstall() {
   irVarRepOkHook = refRepOk
   irIndexHook = buildIndex
   irMemberHook = buildMember
+  irArmSiteHook = armSiteRead
+  irOpenMemberRepHook = openMemberRep
   irStrBinHook = buildStrBin
   irInPlaceHook = strInPlaceModeAsked
   irUnionEqHook = unionEqOf
@@ -585,4 +797,55 @@ export function irRefInstall() {
   irLoopCloseHook = irLowerRefLoopClose
   irBoundsRuleHook = irBoundsRule
   return 0
+}
+
+// The kid of stored row `sr` that member read `n` reads, or -1 where legacy reads another row:
+// legacy reads the receiver's struct row (`structIndexOfExpr`), the row `sr` is stored under.
+function storedRowKid(n: Member, sr: i32, fnIx: i32): i32 {
+  if !(repNodeAt(sr) is RRecord) { return -1 }
+  if !repStructRowIsOrTwin(repTyOf(sr), structIndexOfExpr(n.memObj, fnIx)) {
+    return -1
+  }
+  return repRecordKidOf(sr, repTyOf(sr), n.memProp)
+}
+
+// The rep of shared field read `ix` off a hole parameter held as a box, where every arm stores the
+// field at one scalar type and no tail changes it; -1 otherwise.
+function openMemberRep(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if !(n is Member) { return -1 }
+  const r = holeRecvBox(irBOpenLocalReadRep(n.memObj))
+  if r < 0 || !(repNodeAt(r) is RBox) || !sharedReadPlainOf(ix, irBFnIx()) {
+    return -1
+  }
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const code = sharedReadPlanOf(ix, irBFnIx(), vis, fis)
+  if sharedReadTailOf(code, vis, fis, ix, irBFnIx()) != SRT_NONE { return -1 }
+  const t = variantFieldTypeAt(vis[0], fis[0])
+  let i = 1
+  while i < vis.length {
+    if variantFieldTypeAt(vis[i], fis[i]) != t { return -1 }
+    i = i + 1
+  }
+  const fr = if t >= 0 { repNodeOfTy(t) } else { -1 }
+  return if fr >= 0 && repPrim(fr) != null { fr } else { -1 }
+}
+
+// A hole receiver's rep `r` as a field read takes it: a nullable box is the box its read is narrowed
+// to past the null (a `?.` operand), which the box read recovers; any other rep as it stands.
+function holeRecvBox(r: i32): i32 {
+  if r < 0 { return r }
+  const n = repNodeAt(r)
+  return if n is RNullable && repNodeAt(n.rnInner) is RBox { n.rnInner } else { r }
+}
+
+// Whether `ix` reads an element of a `let`-bound list, which a branch may reassign (D17076).
+function letListElement(ix: i32): boolean {
+  const e = nodeAt(unwrapParen(ix))
+  if !(e is Index) || !(nodeAt(unwrapParen(e.idxArr)) is Ident) { return false }
+  const d = identDeclOf(unwrapParen(e.idxArr))
+  if d < 0 { return false }
+  const dn = nodeAt(d)
+  return dn is LetDecl && dn.letKw == "let"
 }

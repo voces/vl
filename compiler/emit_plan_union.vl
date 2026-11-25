@@ -152,6 +152,7 @@ import {
   exprStruct,
   exprU8Array,
   exprUnion,
+  exprValueTyAt,
   exprVariantIndex,
   identCellVKind,
   identReadAtomKindAt,
@@ -276,7 +277,11 @@ import {
   rlSlotOfTyOrTwin,
   uFieldTgtStructIdx,
 } from "./emit_shape_rows"
-import { ListBuild } from "./emit_ref_list_kinds"
+import {
+  ListBuild,
+  emptyArrUnionArmKind,
+  emptyArrUnionArmSlot,
+} from "./emit_ref_list_kinds"
 import { RC_MAP, RC_REF_LIST, readAtomKindOfTy } from "./emit_start_block"
 import {
   LBK_REF,
@@ -305,6 +310,7 @@ import {
   lTy,
   mkListTy,
   monoOrigNode,
+  mvValKindAt,
   pkKindOfRow,
   pkRowOfKind,
   pkTwinCodeOfRow,
@@ -1456,11 +1462,20 @@ export function isVariantTagPlain(isIx: i32, fnIx: i32): i32 {
 export function nullInstanceIsResult(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return -1 }
-  if !isNullTy(instanceReadTyOf(nd.isObj, fnIx)) { return -1 }
+  if !nullOnlyTy(instanceReadTyOf(nd.isObj, fnIx)) { return -1 }
   if !exprReReadable(unwrapParen(nd.isObj)) { return -1 }
   const nlt = isVarTyIxOf(isIx)
   if nlt < 0 || nlt >= T.tys.length || tyAt(nlt) is TyVar { return -1 }
   return if tyAdmitsNull(nlt) { 1 } else { 0 }
+}
+
+// Whether `t` holds only `null`: the `null` type, or `never | null`, which an instance a `null`
+// binds at `never` reads its `T | null` parameter as (D17092).
+function nullOnlyTy(t: i32): boolean {
+  if isNullTy(t) { return true }
+  if t < 0 || t >= T.tys.length { return false }
+  const n = tyAt(t)
+  return n is TyNullable && n.nInner == TY_NEVER
 }
 
 // The rep a membership test's receiver is staged at (D12060), or -1 to read it in place: a
@@ -1678,13 +1693,18 @@ export function memReadArmOf(memIx: i32, fnIx: i32): MemReadArm {
   return if nulVariantIdxOfExpr(m.memObj, fnIx) >= 0 { "nulVariant" } else { "shared" }
 }
 
-// The variant field `emitExpr` reads off a narrowed box local in `emitNarrowedMem`'s plain form,
-// or -1: no null-unit or niche read, no `length`, a box receiver read raw. A union-box field's
-// unbox is `narrowedMemTail`'s, at the rep `unionFieldNarrowUnboxOf` decides.
+// The variant field `emitExpr` reads off a narrowed box local, field or element in
+// `emitNarrowedMem`'s plain form, or -1: no null-unit or niche read, no `length`, a box receiver
+// read raw. A union-box field's unbox is `narrowedMemTail`'s, at the rep
+// `unionFieldNarrowUnboxOf` decides.
 export function narrowedFieldPlain(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
   if !memberReadPlain(memIx, fnIx) || !(m is Member) { return -1 }
-  if !(nodeAt(m.memObj) is Ident) || memReadArmOf(memIx, fnIx) != "narrowed" {
+  const o = nodeAt(unwrapParen(m.memObj))
+  if (
+    !(o is Ident || o is Member || o is Index)
+    || memReadArmOf(memIx, fnIx) != "narrowed"
+  ) {
     return -1
   }
   const vi = memNarrowVariantIndex(memIx, fnIx)
@@ -2076,6 +2096,7 @@ export type HoleBoxArm = "null"
   | "mapScalar"
   | "map"
   | "clo"
+  | "retag"
   | "ladder"
 
 export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
@@ -2128,10 +2149,17 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     return if iv >= 0 { holeBox("rec", iv, -1) } else { ladder }
   }
   // `emitUnionBoxArgGo`'s map-get rung: a map read delivers its miss as the union's own box. A
-  // literal-union read that rung leaves to the ladder takes the atom rungs below, as legacy's does.
+  // read of no union value, which that rung leaves to the ladder, takes the rungs below, as
+  // legacy's does.
   if bare is Index && exprMap(bare.idxArr, fnIx) {
     const mp = mapReadBoxPlanOf(exprIx, unionTy, fnIx)
-    if mp.hbArm != "ladder" || !exprIsLitAtom(exprIx, fnIx) { return mp }
+    // A map whose values are stored as boxes falls through to legacy: it hands its box on, so
+    // only a read of a value stored as itself reaches the rungs below.
+    const msh = mapShapeOfExpr(bare.idxArr, fnIx)
+    const boxStored = msh >= 0 && mvValKindAt(msh) == "union"
+    if mp.hbArm != "ladder" || exprUnion(exprIx, fnIx) || boxStored {
+      return mp
+    }
   }
   // `emitUnionMapArmBox`: a map rides the box under its map arm's tag, which its writer reads.
   if (
@@ -2143,6 +2171,11 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   if exprUnion(exprIx, fnIx) { return holePassPlanOf(exprIx, unionTy, fnIx) }
   if memberBoxPasses(exprIx, unionTy, fnIx) {
     return holeBox("memberBox", -1, -1)
+  }
+  // A name read the checker typed `null` is the union's null, as a `null` literal is, whatever
+  // record its binding's storage holds (a later write may fill the binding with another).
+  if bare is Ident && isNullTy(nodeTyIxOf(bareIx)) {
+    return holeBox("null", -1, -1)
   }
   // `emitUnionArmValueBox`'s two plain rungs: a record boxed as itself under its arm.
   const rv = recArmPlainOf(unionTy, exprIx, fnIx)
@@ -2162,10 +2195,11 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   if nulBoolBoxesInto(boxDstName("", unionTy), unionTy, bareIx, fnIx) {
     return holeBox("nulBool", 1, -1)
   }
-  // `emitUnionBoxNulNiche`: a `V | null` ref niche into a union that admits `null` boxes its null
-  // as the union's and its value under its arm's tag, which its writer reads (or declines).
+  // `emitUnionBoxNulNiche`: a `V | null` ref niche (a nullable closure too) into a union that
+  // admits `null` boxes its null as the union's and its value under its arm's tag, which its
+  // writer reads (or declines).
   if (
-    coalesceNulRefNicheOperand(bareIx, fnIx)
+    (coalesceNulRefNicheOperand(bareIx, fnIx) || exprNulClosure(bareIx, fnIx))
     && !exprNulBool(bareIx, fnIx)
     && !exprIsNulNone(exprIx, fnIx)
     && unionSetHasNullTy(boxDstName("", unionTy), unionTy)
@@ -2196,6 +2230,9 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   }
   // `emitUnionCoerceUnder`'s literal rung, or the null-typed value's.
   if bare is NullLit { return holeBox("null", -1, -1) }
+  // `emitUnionCoerceList`'s empty-list rung: an empty `[]` under the list arm the checker adopted.
+  const et = if boxDstName("", unionTy) != "" { emptyArrUnionArmTag(unionTy, exprIx, fnIx) } else { -1 }
+  if et >= 0 { return holeBox("refList", et, -1) }
   // `emitUnionCoerceRefArray`'s first rung: a ref-element list under its own ref-list arm's tag.
   const rs = refArrCarrierSlotOf(unionTy, exprIx, bareIx, fnIx)
   if rs >= 0 {
@@ -2373,6 +2410,21 @@ function refArrCarrierSlotOf(
   return if unionHasRefArrayArmSlot(unionTy, slot) { slot } else { -1 }
 }
 
+// The tag an empty `[]` boxes under in `unionTy`: the list arm the checker adopted it as, where
+// the union has no `i32[]` arm the value-atom ladder would take (D2202); -1 for none.
+export function emptyArrUnionArmTag(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const bare = nodeAt(unwrapParen(exprIx))
+  if !(bare is ArrayLit) || bare.arrElems.length != 0 { return -1 }
+  if unionHasAtomOfTy(unionTy, "i32", true) { return -1 }
+  const k = emptyArrUnionArmKind(exprIx)
+  // "string[]", the tag a `(string | null)[]` arm shares.
+  if k == "strlist" { return scalarTagOfKind(9) }
+  if k != "reflist" { return -1 }
+  const slot = emptyArrUnionArmSlot(exprIx)
+  if !unionHasRefArrayArmSlot(unionTy, slot) { return -1 }
+  return refArrBoxTagOf(exprIx, fnIx, slot, unionTy)
+}
+
 // Whether list literal `exprIx` reaches `unionTy`'s value-atom box, every list rung before it
 // (`emitUnionCoerceList`: the empty literal, its own ref-list arm, a map or nested element, an arm
 // built through) declining it.
@@ -2380,9 +2432,14 @@ function listLitTakesAtomBox(unionTy: i32, exprIx: i32, fnIx: i32): boolean {
   const bx = unwrapParen(exprIx)
   if bx < 0 || bx >= P.nodes.length { return false }
   const bare = nodeAt(bx)
-  if !(bare is ArrayLit) || bare.arrElems.length == 0 { return false }
+  if !(bare is ArrayLit) { return false }
   if unionHasRefArrayArmSlot(unionTy, arrLitRefSlotAtTy(bx, fnIx)) {
     return false
+  }
+  // An empty literal the empty-list rung declines (`emptyArrUnionArmTag`: a scalar list arm).
+  if bare.arrElems.length == 0 {
+    return emptyArrUnionArmTag(unionTy, exprIx, fnIx) < 0
+      && listLitRefArmSlotOf(unionTy, exprIx, fnIx) < 0
   }
   const e0 = bare.arrElems[0]
   if exprMap(e0, fnIx) { return false }
@@ -2518,10 +2575,22 @@ function holePassPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     return ladder
   }
   if narrowBoxWideArmOf(unionTy, exprIx, fnIx) >= 0 { return ladder }
-  if !boxPassesAsTy(unionBoxTyIxOfExpr(exprIx, fnIx), exprIx, unionTy) {
-    return ladder
+  const sty = unionBoxTyIxOfExpr(exprIx, fnIx)
+  if !boxPassesAsTy(sty, exprIx, unionTy) {
+    // `emitUnionBoxArg`'s tail: a box whose only debt is its members' retag is written as itself,
+    // then rebuilt at `unionTy` (`emitBoxAtomRetagMembers`).
+    return if boxRetagsOnly(sty, exprIx, unionTy) { holeBox("retag", unionTy, -1) } else { ladder }
   }
   return holeBox("pass", -1, -1)
+}
+
+// Whether a box of union `sty` delivered at `exprIx` into `unionTy` owes only its members' retag:
+// no arm re-tagged to a wider record, and a member retag the checker records none of.
+function boxRetagsOnly(sty: i32, exprIx: i32, unionTy: i32): boolean {
+  const ft: i32[] = []
+  wideRetagPairsOfTy(sty, unionTy, ft, [])
+  if ft.length > 0 || deliveryRetagHas(exprIx) { return false }
+  return boxRetagArmsOfTys(sty, unionTy, [], [])
 }
 
 // Whether a box of union `sty`, delivered at `exprIx` into `unionTy`, keeps every member's tag: no
@@ -3112,6 +3181,14 @@ function widenPlan(arm: WidenArm, src: i32, wide: string): WidenPlan {
 // classifier may mint on its first ask, so none is asked that the order does not reach.
 export function widenPlanOf(ix: i32, dst: i32, fnIx: i32): WidenPlan {
   const inner = unwrapParen(ix)
+  // An operator over a `never` operand computes at its other operand's width (D17064).
+  if inner >= 0 && inner < P.nodes.length && nodeTyAt(inner, fnIx) == TY_NEVER {
+    const nb = nodeAt(inner)
+    const nw = if nb is BinExpr { neverBinWidth(nb, fnIx) } else { "" }
+    if nw == "i64" { return widenPlan("plain", 3, "") }
+    if nw == "f64" { return widenPlan("plain", 4, "") }
+    if nw == "f32" { return widenPlan("plain", 5, "") }
+  }
   const instLit = cexLitPeel(ix) >= 0 && fnInPinnedInstance(fnIx)
   if instLit && dst != 4 { return widenPlan("instLit", -1, "") }
   if dst == 5 && cexLitPeel(ix) >= 0 && isFloatLitExpr(inner) {
@@ -3301,13 +3378,14 @@ export function variantCoerceArmOf(
   return if variantHasCrossTagFits(vi, exprIx, fnIx) { "crossTag" } else { "box" }
 }
 
-// The variant a box local's plain read `ix` unboxes to at a destination of that variant
-// (`variantCoerceArmOf`'s `box`), or -1.
+// The variant a box local's or module global's plain read `ix` unboxes to at a destination of
+// that variant (`variantCoerceArmOf`'s `box`), or -1.
 export function narrowedBoxVariantPlain(ix: i32, fnIx: i32): i32 {
   const n = nodeAt(ix)
-  if !(n is Ident) || identReadArmOf(n, ix, fnIx, false) != "local" {
-    return -1
-  }
+  if !(n is Ident) { return -1 }
+  const arm = identReadArmOf(n, ix, fnIx, false)
+  const global = arm == "nonlocal" && globalIndexOfSid(sidOfNode(ix)) >= 0
+  if arm != "local" && !global { return -1 }
   const vi = narrowedStructArmVi(ix, fnIx)
   if vi < 0 || variantCoerceArmOf(vi, ix, fnIx) != "box" { return -1 }
   return vi
@@ -3613,9 +3691,10 @@ export function nulRecvNeedsRecover(exprIx: i32, fnIx: i32) {
   return nulCollWrapHeap(exprIx, fnIx) != -1
 }
 
-// Whether `emitExpr` reads member `memIx` through `emitMem`'s plain arms: no null-unit or niche
-// read, no `length` but a record's own field, no two-list use, and a receiver read raw unless it is
-// a field read, which recovers itself.
+// Whether `emitMem` reads member `memIx` through its plain arms: no niche read, no `length` but a
+// record's own field, no two-list use, and a receiver read raw unless it is a field read, which
+// recovers itself. A null-unit read answers for the read `emitNulNoneRead` drops; the IR routes the
+// null-unit read itself in `exprAtPre`.
 function memberReadPlain(memIx: i32, fnIx: i32): boolean {
   const m = nodeAt(memIx)
   if !(m is Member) { return false }
@@ -3623,7 +3702,6 @@ function memberReadPlain(memIx: i32, fnIx: i32): boolean {
     const la = memberLengthArmOf(m, memIx, fnIx)
     if la != "field" && la != "mem" { return false }
   }
-  if readMayBeNulUnit(memIx) && exprIsNulNone(memIx, fnIx) { return false }
   if placeNicheAtomKind(memIx, fnIx) >= 0 { return false }
   // A field read's or a name's receiver recovers in its own read (`emitReadRecover`), in parens
   // too; any other receiver owing one is not plain.
@@ -3695,6 +3773,20 @@ export function lengthIsField(m: Member, memIx: i32, fnIx: i32): boolean {
   return listFitGrowRow(o, -1, fnIx) < 0 && !armSiteReads(memIx, fnIx)
 }
 
+// The field a plain member read off a narrowed `V | null` receiver reads, along
+// `emitMemNulVariantRead` (`ref.as_non_null`, the field, its recover), or -1; a union-box field is
+// not taken.
+export function nulVariantFieldPlain(memIx: i32, fnIx: i32): i32 {
+  const m = nodeAt(memIx)
+  if !memberReadPlain(memIx, fnIx) || !(m is Member) { return -1 }
+  if memReadArmOf(memIx, fnIx) != "nulVariant" { return -1 }
+  const vi = nulVariantIdxOfExpr(m.memObj, fnIx)
+  if vi < 0 || vi >= uFieldStart.length { return -1 }
+  const idx = variantFieldIndex(vi, m.memProp)
+  if idx < 0 || fieldRowIsUnionBox(uFieldStart[vi] + idx) { return -1 }
+  return if fieldStoresRead(uFieldStart[vi] + idx, memIx, fnIx) { idx } else { -1 }
+}
+
 // The field `emitExpr` reads off a bare variant receiver in `emitMemVariantRead`'s plain form,
 // or -1: a plain member read, no narrowed box, and no union-box field to unbox.
 export function variantFieldPlain(memIx: i32, fnIx: i32): i32 {
@@ -3706,7 +3798,11 @@ export function variantFieldPlain(memIx: i32, fnIx: i32): i32 {
   const idx = variantFieldIndex(vi, m.memProp)
   if idx < 0 { return -1 }
   if fieldRowIsUnionBox(uFieldStart[vi] + idx) { return idx }
-  return if fieldStoresRead(uFieldStart[vi] + idx, memIx, fnIx) { idx } else { -1 }
+  if fieldStoresRead(uFieldStart[vi] + idx, memIx, fnIx) { return idx }
+  if fieldStoresReadAtom(uFieldStart[vi] + idx, memIx, fnIx) { return idx }
+  if fieldStoresReadStr(uFieldStart[vi] + idx, memIx, fnIx) { return idx }
+  const tgt = uFieldTgtStructIdx(vi, idx)
+  return if rowStoresArmRead(uFieldStart[vi] + idx, tgt, memIx, fnIx) { idx } else { -1 }
 }
 
 // Whether flat field row `row` stores the kind member read `memIx` records, or its nullable twin
@@ -3716,7 +3812,26 @@ function fieldStoresRead(row: i32, memIx: i32, fnIx: i32): boolean {
   const rk = repOfNode(memIx, fnIx).rdKind
   if sk == null { return false }
   if sk == rk || sk == "nulstr" && rk == "str" { return true }
+  // A `boolean | null` field narrowed to its boolean is read as the i32 its niche holds.
+  if sk == "nulbool" && rk == "i32" && !nodeTyIsNullable(memIx) { return true }
+  // A `never` field holds no value, and its slot stores the default i32 (D15530).
+  if sk == "i32" && nodeTyAt(memIx, fnIx) == TY_NEVER { return true }
   return vkNonNullRefTwin(sk) == rk && readOwesNonNullRecover(memIx, fnIx)
+}
+
+// Whether flat field row `row` stores the atom of a literal read `memIx` records as a string: the
+// field tail leaves the atom, which the delivery decodes (`emitAtomToStr`).
+function fieldStoresReadAtom(row: i32, memIx: i32, fnIx: i32): boolean {
+  return fieldRowStorageKind(row) == "i32"
+    && repOfNode(memIx, fnIx).rdKind == "str"
+    && exprIsLitAtom(memIx, fnIx)
+}
+
+// Whether flat field row `row` stores as a string the atom read `memIx` records: a literal set its
+// layout family lays out at the string; the field tail leaves the string its consumer takes.
+function fieldStoresReadStr(row: i32, memIx: i32, fnIx: i32): boolean {
+  return fieldRowStorageKind(row) == "str"
+    && repOfNode(memIx, fnIx).rdKind == "i32"
 }
 
 // Whether struct field read `memIx` recovers its receiver to its non-null ref before the field:
@@ -3746,16 +3861,19 @@ export function structFieldPlain(memIx: i32, fnIx: i32): i32 {
     return if memReadBoxAmbiguous(memIx, fnIx) { -1 } else { idx }
   }
   if fieldStoresRead(sFieldStart[si] + idx, memIx, fnIx) { return idx }
-  return if fieldStoresArmRead(si, idx, memIx, fnIx) { idx } else { -1 }
+  if fieldStoresReadAtom(sFieldStart[si] + idx, memIx, fnIx) { return idx }
+  if fieldStoresReadStr(sFieldStart[si] + idx, memIx, fnIx) { return idx }
+  const tgt = sFieldTgtStructIdx(si, idx)
+  return if rowStoresArmRead(sFieldStart[si] + idx, tgt, memIx, fnIx) { idx } else { -1 }
 }
 
-// Whether struct row `si`'s nullable record field `idx` holds the union arm read `memIx` records:
-// a `nulstruct` slot whose target heap is the arm's, read as `X | null` or, recovered, as `X`.
-function fieldStoresArmRead(si: i32, idx: i32, memIx: i32, fnIx: i32): boolean {
-  if fieldRowStorageKind(sFieldStart[si] + idx) != "nulstruct" { return false }
+// Whether flat field row `row`, a nullable record whose target struct is `t`, holds the union arm
+// read `memIx` records: a `nulstruct` slot whose target heap is the arm's, read as `X | null` or,
+// recovered, as `X`.
+function rowStoresArmRead(row: i32, t: i32, memIx: i32, fnIx: i32): boolean {
+  if fieldRowStorageKind(row) != "nulstruct" { return false }
   const rk = repOfNode(memIx, fnIx).rdKind
   const vi = if rk == "nulvariant" { nulVariantIdxOfExpr(memIx, fnIx) } else if rk == "variant" && readOwesNonNullRecover(memIx, fnIx) { exprVariantIndex(memIx, fnIx) } else { -1 }
-  const t = sFieldTgtStructIdx(si, idx)
   if vi < 0 || t < 0 || t >= sHeapIdx.length { return false }
   return sHeapIdx[t] == variantHeap(vi)
 }
@@ -4000,4 +4118,14 @@ export function arrLitVariantSlot(arrIx: i32, fnIx: i32, lb: ListBuild): i32 {
     }
   }
   return rslot
+}
+
+// The scalar width an operator with one `never` operand works at: the other operand's prim, or ""
+// where neither or both are `never` (D17064).
+export function neverBinWidth(e: BinExpr, fnIx: i32): string {
+  const lt = exprValueTyAt(e.binLeft, fnIx)
+  const rt = exprValueTyAt(e.binRight, fnIx)
+  const one = if lt == TY_NEVER { rt } else if rt == TY_NEVER { lt } else { -1 }
+  if one < 0 || one == TY_NEVER { return "" }
+  return tyScalarBasePrim(one) ?? ""
 }

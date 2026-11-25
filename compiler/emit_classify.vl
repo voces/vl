@@ -21,7 +21,7 @@ import { valueTailLeaves } from "./check_num_adopt"
 import { callBuiltTy } from "./check_store_rep"
 import { emitFail } from "./emit_bytes"
 import { unRowOfTyKey } from "./emit_union_tykey"
-import { constBindsLitSet, forInBindTy } from "./check_leaf_steps"
+import { constLitSetTy, forInBindTy } from "./check_leaf_steps"
 import {
   bundleCallSig,
   bundleRetParamOf,
@@ -738,6 +738,7 @@ import {
   vkIsPlainList,
 } from "./emit_sig_tokens"
 import {
+  NICHE_NUL_MAP,
   RC_MAP,
   RC_REF_LIST,
   coalesceChainLeftmost,
@@ -808,7 +809,7 @@ import {
   cloLiftCapN,
   cloLiftWrName,
   cloLiftWriteSlot,
-  coalLinkChains,
+  coalLinkChainOf,
   emitCurFnIx,
   emitCurFnPos,
   emitPhaseReached,
@@ -1818,7 +1819,11 @@ export function readOwesNonNullRecover(exprIx: i32, fnIx: i32): boolean {
   const tw = vkNonNullRefTwin(ck)
   if tw == null { return false }
   const d = repOfNode(exprIx, fnIx)
-  return d.rdKind == tw
+  if d.rdKind == tw { return true }
+  // A record's two niches are one heap once a declared struct is also an arm (D3593), so a
+  // nullable record cell read at the other record rep recovers too.
+  return (ck == "nulvariant" || ck == "nulstruct")
+    && (d.rdKind == "struct" || d.rdKind == "variant")
 }
 
 // Can the cell the read at `exprIx` names hold null, whatever the read narrows to? A
@@ -2583,8 +2588,17 @@ export function letBindIsAtom(letIx: i32, fnIx: i32): boolean {
   return bcClaims[r] && bcRep[r].rdAtom == 1
 }
 
+// The type binding `letIx`'s atom cell holds where `letBindIsAtom`: the literal set its join of
+// consts keeps (`constLitSetTy`), else its own (`letBindTy`, the annotated or `K | null` rungs); -1
+// for a binding that is no atom cell.
+export function letAtomCellTy(letIx: i32, fnIx: i32): i32 {
+  if !letBindIsAtom(letIx, fnIx) { return -1 }
+  const s = constLitSetTy(letIx)
+  return if s >= 0 { s } else { letBindTy(letIx, fnIx) }
+}
+
 // Whether binding `letIx`'s cell is the `K | null` niche: the atom with `-1` for null.
-export function letBindIsNulAtom(letIx: i32, fnIx: i32): boolean {
+function letBindIsNulAtom(letIx: i32, fnIx: i32): boolean {
   const r = bindCellFill(letIx, fnIx)
   if r < 0 || r >= bcClaims.length || !bcClaims[r] { return false }
   return bcRep[r].rdAtom == 1 && bcRep[r].rdNul == 3
@@ -2710,7 +2724,7 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
     || letInitIsLitAtom(letIx, fnIx)
     && !letHoldsBox(letIx, fnIx)
     && !letWidensToString(letIx, fnIx)
-    || constBindsLitSet(letIx)
+    || constLitSetTy(letIx) >= 0
   if atom || letSpellsNulAtom(letIx, fnIx) {
     const aty = letBindTy(letIx, fnIx)
     const niche = !atom || (aty >= 0 && tyIsNulLitUnionNiche(aty))
@@ -2998,9 +3012,18 @@ export function letCellSlot(stmtIx: i32, fnIx: i32, k: VKind): i32 {
   if letBindRepClaims(stmtIx, fnIx) { return letBindRepSlot(stmtIx, fnIx) }
   return match k {
     "struct" => structIndexOfLet(stmtIx, fnIx)
-    "variant" => letObjLitVariantIdx(stmtIx, fnIx)
+    "variant" => letArmCellRow(stmtIx, fnIx)
     _ => repSlotOfKind(k, letBindTy(stmtIx, fnIx))
   }
+}
+
+// The variant row binding `stmtIx`'s arm cell (`letCellKind` "variant") holds, `letCellSlot`'s
+// answer for it, minting nothing.
+export function letArmCellRow(stmtIx: i32, fnIx: i32): i32 {
+  const hr = holderRecordRow(stmtIx, fnIx)
+  if hr >= 0 { return hr }
+  if letBindRepClaims(stmtIx, fnIx) { return letBindRepSlot(stmtIx, fnIx) }
+  return letObjLitVariantIdx(stmtIx, fnIx)
 }
 
 // Mints the row a binding's list-of-lists cell names when nothing has yet: a global cell, or a
@@ -3190,6 +3213,26 @@ export function asgYieldsNullLit(asgIx: i32): boolean {
   const r = unwrapParen(a.binRight)
   if r < 0 || !(nodeAt(r) is NullLit) { return false }
   return tyPrimNameOf(nodeTyIxOf(asgIx)) == "null"
+}
+
+// True if assignment `asgIx` in `fnIx` writes the `null` unit (the literal, or a value
+// `exprIsNulNone` names, D17162) into a name whose type is the never-filled `let x = null` hole
+// (`TyNullable(-1)`, which is `null`): the value is the unit (D17120). A closure's captured name
+// is excluded; its write is D17300's.
+export function asgYieldsNulHole(asgIx: i32, fnIx: i32): boolean {
+  if asgIx < 0 || asgIx >= P.nodes.length { return false }
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return false }
+  if a.binOp != "=" || a.binCompound != "" { return false }
+  const r = unwrapParen(a.binRight)
+  if r < 0 || r >= P.nodes.length { return false }
+  if !(nodeAt(r) is NullLit) && !exprIsNulNone(r, fnIx) { return false }
+  const l = nodeAt(unwrapParen(a.binLeft))
+  if !(l is Ident) || identIsEnvCapture(fnIx, l.identName) { return false }
+  const ty = nodeTyIxOf(asgIx)
+  if ty < 0 { return false }
+  const t = tyAt(ty)
+  return t is TyNullable && t.nInner < 0
 }
 
 // The width of the checker's type of assignment `asgIx` when its value is its right side's
@@ -6419,9 +6462,19 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   // A `K | null` niche place holds the atom of the member written, which its re-read yields
   // (D16343).
   if exprNulLitUnion(a.binLeft, fnIx) { return true }
+  if asgLitUnionMemberReRead(asgIx, fnIx) { return true }
   // A place wider than the right side is re-read and taken back to the right side's rep, as a
   // name's is (D14820).
   return asgReadUnwidenOp(asgIx, fnIx) >= 0
+}
+
+// Whether the write at `asgIx` stores one member of a literal-union place, typed as that lone
+// literal: the place holds the member's atom, which its re-read yields (D17340).
+export function asgLitUnionMemberReRead(asgIx: i32, fnIx: i32): boolean {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) || a.binOp != "=" || a.binCompound != "" { return false }
+  return tyIsLitUnion(nodeTyAt(a.binLeft, fnIx))
+    && tyIsBareStrLit(nodeTyAt(asgIx, fnIx))
 }
 
 // True if the statement at `stmtIx` is a bare value expression usable as an implicit
@@ -8450,7 +8503,7 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       // emitter minted re-associating a chain has no type and reads the chain's rep.
       if e.binOp == "??" {
         const cu = unwrapParen(exprIx)
-        const ch = coalLinkChains.get(cu) ?? -1
+        const ch = coalLinkChainOf(cu)
         const j = if ch >= 0 { ch } else { cu }
         return nodeRepIsAtom(j, fnIx) || nodeRepIsNulAtom(j, fnIx)
       }
@@ -9016,8 +9069,14 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
   if e is Ident || e is Member || e is Index || e is Call {
     return kindIn(readRepOf(exprIx, fnIx).rrStore, READ_NUL_NONE_KINDS)
   }
-  // A `?.` read off the `null` unit reads `null` (D16338).
-  if e is OptMember { return exprIsNulNone(e.omObj, fnIx) }
+  // A `?.` read off the `null` unit reads `null` (D16338), and so does one whose leaf field holds
+  // the `null` unit, whichever the receiver is.
+  if e is OptMember {
+    if exprIsNulNone(e.omObj, fnIx) { return true }
+    const osi = optChainStructIdxOf(e.omObj, fnIx)
+    const ofi = if osi < 0 { -1 } else { sFieldIndex(osi, e.omProp) }
+    return ofi >= 0 && fieldRowKind(sFieldStart[osi] + ofi) == "nulnone"
+  }
   // A value `if` or a `??` is the `null` unit exactly when its join reps as one.
   if (
     e is IfStmt
@@ -9326,7 +9385,15 @@ function variantRowOfRead(ix: i32, fnIx: i32): i32 {
   const own = nodeTyAt(ix, fnIx)
   if own < 0 || own >= T.tys.length || tyAt(own) is TyNullable { return -1 }
   if identStoreVKind(ix, fnIx) != "nulvariant" { return -1 }
-  return repVariantShapeRowOf(sty.nInner)
+  const inner = repVariantShapeRowOf(sty.nInner)
+  if inner >= 0 { return inner }
+  // A record stored on an arm's row (D3593) names no row by its own type; its cell does.
+  if identReadsGlobal(ix) {
+    const gl = globalLetOfRead(fnIx, ix)
+    return if gl >= 0 { globalCellStructIdx(gl) } else { -1 }
+  }
+  const slot = declaredSlotOf(ix)
+  return if slot >= 0 && slot < localStructIdx.length { localStructIdx[slot] } else { -1 }
 }
 
 // The type the binding a read names is stored at, where that is another record than the read's
@@ -10320,9 +10387,15 @@ export function luArmIndexReads(ix: i32, fnIx: i32): boolean {
 export function armSiteReads(ix: i32, fnIx: i32): boolean {
   const recv = armSiteRecv(ix)
   if recv < 0 { return false }
-  // The receiver is a name, or (for `.length`) an element read that is itself such a box.
+  // The receiver is a name, a call whose result is such a box (D17102, D17443), or (for `.length`)
+  // an element read that is itself one; a receiver that is no name is read once into the stash.
   const named = nodeAt(recv) is Ident && exprUnion(recv, fnIx)
-  if !named && !(nodeAt(ix) is Member && luArmIndexBoxes(recv, fnIx)) {
+  const called = nodeAt(recv) is Call && exprUnion(recv, fnIx)
+  if (
+    !named
+    && !called
+    && !(nodeAt(ix) is Member && luArmIndexBoxes(recv, fnIx))
+  ) {
     return false
   }
   return ctnArmsAt(nodeTyAt(recv, fnIx)).length > 0
@@ -11495,14 +11568,35 @@ function unionNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
 }
 
 // The niche kind the read `ix` converts its box to: 1 for `boolean | null`, 2 for `string | null`,
+// a list's box tag for `L[] | null`, 11 for a nullable closure, `NICHE_NUL_MAP` for a nullable map,
 // when the checker narrowed it to exactly that niche out of a wider storage type (D2590), else -1.
-// A read of the storage itself (`storageReadEnter`) converts nothing.
+// A read of the storage itself converts nothing.
 export function nicheReadKindAt(ix: i32, fnIx: i32): i32 {
   if isStorageRead(ix) { return -1 }
   if readNarrowedStoreAt(ix, fnIx) < 0 { return -1 }
   if nodeTyIsNulBool(ix) { return 1 }
   if nodeRepIs(ix, "nulstr", fnIx) { return 2 }
-  return -1
+  const t = nodeTyAt(ix, fnIx)
+  if nulMapTy(t) { return NICHE_NUL_MAP }
+  return nulRefBoxTagOf(t)
+}
+
+// Whether `t` is `M | null` for a map type `M`.
+function nulMapTy(t: i32): boolean {
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyNullable) { return false }
+  const inner = nonNullTy(t)
+  return inner >= 0 && tyAt(inner) is TyMap
+}
+
+// The box tag of `A` where `t` is `A | null` for a list or function type `A` riding a union box as
+// a value atom, else -1: such a value's null is the reference's own, so its niche is `A | null`.
+function nulRefBoxTagOf(t: i32): i32 {
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyNullable) { return -1 }
+  const inner = nonNullTy(t)
+  if inner < 0 || !(tyAt(inner) is TyArray || tyAt(inner) is TyFunc) {
+    return -1
+  }
+  return boxTagOfTy(inner)
 }
 
 // The niche kind a field or cell read at `exprIx` converts to: the read is narrowed to a niche
@@ -13338,6 +13432,11 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   }
   if e is Call {
     if e.callFn < 0 { return -1 }
+    // A call an arm of a union of maps overrides reads as that arm's map (D17443).
+    if luOvOn != 0 {
+      const ov = luOvTyOf(exprIx)
+      if ov >= 0 && tyAt(ov) is TyMap { return mapArmShapeOfTy(ov) }
+    }
     const callee = nodeAt(e.callFn)
     if callee is Ident {
       if callee.identName == "Set" {
@@ -15356,6 +15455,18 @@ function readRepKinds(ix: i32, fnIx: i32): ReadRep {
       rrStore: st,
       rrRead: "nulstr",
       rrKind: "nulstr",
+      rrConv: 2,
+      rrStoreTy: -1,
+      rrMv: -1,
+    }
+  }
+  // A list's niche reads at the nullable list its own type reps as.
+  if nk >= 0 {
+    const lk = repOfNode(rx, fnIx).rdKind
+    return {
+      rrStore: st,
+      rrRead: lk ?? "",
+      rrKind: lk,
       rrConv: 2,
       rrStoreTy: -1,
       rrMv: -1,

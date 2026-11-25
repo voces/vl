@@ -32,6 +32,8 @@ case "$PWD" in */.claude/worktrees/*) [ "${GATE_IN_WORKTREE:-0}" = 1 ] || [[ " $
 # "toString is not exported" read from the main repo's pre-rename std, while the
 # same command with VL_STD pinned passed). Callers may still override.
 export VL_STD="${VL_STD:-$PWD/std}"
+# An invalid IR-claimed module is a loud rc 70 in every row, never legacy's fallback bytes.
+export VL_IR_STRICT=1
 # scripts/compat/ stands in for a GNU tool a host lacks (macOS has no `timeout`). It goes LAST
 # on PATH, so wherever the real tool exists (Linux, CI) it still wins and nothing changes.
 export PATH="$PATH:$PWD/scripts/compat"
@@ -129,25 +131,28 @@ mem_budget_mb() {
   local b=$(( avail - total / 10 - 1024 )); [ "$b" -gt 0 ] || b=1
   echo "$b"
 }
-# Peak RSS of each row's whole process tree, measured 2026-11-07 on 4 cores and 15 GiB with
-# the gate fanned out (the worst of two runs, rounded up). `filed witnesses` is a cold run;
-# `self-compile pair` builds two self-compiles at ~4 GiB each unless the build handed it one.
+# Peak RSS of each row's whole process tree with the row running alone, on 4 cores and 15 GiB,
+# rounded up (refactor-notes/2026-11-24-ir-claims-heavy-witnesses.md). `filed witnesses` is a cold
+# run; `self-compile pair` builds two self-compiles at ~4 GiB each unless the build handed it one.
 row_mem() {
   case "$1" in
-    "filed witnesses") echo 8000 ;;
-    "ci-native") echo 4000 ;;
+    "filed witnesses") echo 9600 ;;
+    "ci-native") echo 4800 ;;
     "self-compile pair") [ -n "${SELF_COMPILE_PAIR:-}" ] && echo 1400 || echo 4700 ;;
-    "lint-self + fmt") echo 2400 ;;
-    "distilled corpus") echo 1700 ;;
+    "lint-self + fmt") echo 3600 ;;
+    "distilled corpus") echo 4800 ;;
     "rep-fuzz") echo 1600 ;;
-    "deno task test"|"plumb-shape cost") echo 1400 ;;
-    "ir shadow"|"ir shadow cases") echo 1300 ;;
+    "deno task test") echo 4300 ;;
+    "plumb-shape cost") echo 1400 ;;
+    "ir shadow"|"ir shadow cases") echo 1600 ;;
     "ir shadow suite") echo 600 ;;
     "lsp suites (ci list)") echo 1100 ;;
-    "scaling shape") echo 900 ;;
+    "scaling shape") echo 1000 ;;
     "capability probes"|"kind-ladder sets") echo 800 ;;
     "dead-export budget"|"render-parse budget") echo 600 ;;
-    "late demands") echo 500 ;;
+    "late demands"|"phase state") echo 500 ;;
+    "self ir misses") echo 4400 ;;
+    "ir claims"|"ir claim refusals"|"ir claim cross") echo 4600 ;;
     "lsp typecheck"|"inventory refs") echo 400 ;;
     *) echo 200 ;;
   esac
@@ -310,6 +315,9 @@ run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED"
 # The late-demand RATCHET: elaboration keys minted after `elabRun` returned, per file,
 # against scripts/late-demands-baseline.txt. `$VL_BIN` makes the sweep use this host.
 run "late demands"             env VL_BIN="$VL" "$VL" run scripts/late-demands.vl --compiler "$SEED" -- --check --seed "$SEED"
+# The self-compile IR-miss RATCHET: compiler functions the IR builder misses (the blocker census,
+# `$VL_IR_SHADOW=4`), against scripts/self-ir-misses-baseline.txt, which only lowers. One self-check.
+run "self ir misses"           env VL_BIN="$VL" "$VL" run scripts/self-ir-misses.vl --compiler "$SEED" -- --check --seed "$SEED"
 # The phase-state RATCHET (L5): hidden-argument globals, cross-phase tables and the checker
 # symbols other phases import, per module, against scripts/phase-state-baseline.txt.
 run "phase state"              "$VL" run scripts/phase-state-census.vl --compiler "$SEED" -- --check
@@ -373,7 +381,7 @@ run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh
 # `--self-test` first: the grader's outcome vocabulary and its `Want:` output rule are each
 # seen to fire on specimens before the rows are graded by them. The grader is the VL port;
 # the Python stays beside it, and tests/vl_check_filed_witnesses_test.ts holds them equal.
-run "filed witnesses"          bash -c "\"$VL\" run scripts/check-filed-witnesses.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/check-filed-witnesses.vl --compiler \"$SEED\" -- --strict docs/internals/inventory docs/internals/inventory-2"
+run "filed witnesses"          bash -c "\"$VL\" run scripts/check-filed-witnesses.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/check-filed-witnesses.vl --compiler \"$SEED\" -- --strict --gate docs/internals/inventory docs/internals/inventory-2"
 # THE OTHER HALF: a row that stopped EXISTING. #2405 resolved a conflict in the inventory's
 # tail and deleted a ROW, with its citations left standing, and every gate was green —
 # the instruments above all read the rows that are there. ~0.2s, and it also runs inside
@@ -409,6 +417,14 @@ run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shado
 run "ir shadow cases"          "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --cases --prepost
 # The shipped claim, disarmed: a claimed function emits the IR's bytes, so any fallback reds.
 run "ir claims"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --claims
+# A claim never skips a refusal legacy raises: every program legacy refuses at emit (`@emit-error`
+# cases, tests/ir-claim-fallback, the emit_reject witnesses) is refused alike with claims on and
+# off, strict, held at 0 differs (coordinator ruling 2026-11-24). About 57 CPU-s.
+run "ir claim refusals"        "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop refusals --out "$LOGS/ir-claim-refusals.tsv"
+# The invariant G3 exists for: a shipped build is never invalid, refused or running otherwise where
+# the claimless build builds and runs clean (coordinator ruling 2026-11-24). Every capability probe
+# and IR pin, and a fixed 1-in-12 of tests/cases. About 135 CPU-s in the gate.
+run "ir claim cross"           "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop cases,probes,pins --sample 12 --cross --out "$LOGS/ir-claim-cross.tsv"
 
 # THE OOM WATCH. A kill the kernel made during the run fails the gate, whatever the rows read:
 # a test that expected a failure, or a grader that reads a refusal, takes a killed child for one.

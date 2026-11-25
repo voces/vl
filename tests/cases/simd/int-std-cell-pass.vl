@@ -1,0 +1,107 @@
+// @run
+// @log 150
+// @log 420758
+// @log true
+// A byte-wide cell pass over 4096 cells with `std:simd`'s integer shapes, checked against a
+// scalar loop over the same cells: regrowth toward a per-cell cap, depletion, an owner-and-
+// terrain count, and a widening sum. The pinned checksums are the same on every engine.
+import { Buffer, loadU16, loadU8, store16, store8 } from "std:buffer"
+import { loadU16x8, loadU8x16, splatU16, splatU8, storeU8x16 } from "std:simd"
+
+const N = 4096
+const forage = Buffer(N)
+const cap = Buffer(N)
+const soil = Buffer(N)
+const terrain = Buffer(N)
+const owner = Buffer(N * 2)
+const forage2 = Buffer(N)
+const soil2 = Buffer(N)
+
+let seed = 12345
+
+// The next byte of a fixed linear congruential sequence.
+function nextByte() {
+  seed = seed * 1103515245 + 12345
+  return (seed >>> 16) & 255
+}
+
+function fill() {
+  let i = 0
+  while i < N {
+    store8(forage, i, nextByte())
+    store8(cap, i, nextByte())
+    store8(soil, i, nextByte())
+    store8(terrain, i, nextByte() & 3)
+    store16(owner, i * 2, (nextByte() & 7) * 8191)
+    i = i + 1
+  }
+}
+
+// The vector pass: 16 cells per step for the bytes, 8 for the u16 owner column.
+function simdPass(rate: i32, use: i32, who: i32, kind: i32) {
+  const r = splatU8(rate)
+  const u = splatU8(use)
+  const w = splatU16(who)
+  const k = splatU16(kind)
+  let count = 0
+  let total = 0
+  let i = 0
+  while i < N {
+    const f = (loadU8x16(forage, i).addSat(r)).min(loadU8x16(cap, i))
+    storeU8x16(forage2, i, f)
+    storeU8x16(soil2, i, loadU8x16(soil, i).subSat(u))
+    const t = loadU8x16(terrain, i)
+    const lowHit = (loadU16x8(owner, i * 2).eq(w)).and(t.widenLow().eq(k))
+    const highHit = (loadU16x8(owner, i * 2 + 16).eq(w)).and(
+      t.widenHigh().eq(k),
+    )
+    count = count + popcnt(lowHit.bitmask()) + popcnt(highHit.bitmask())
+    const pairs = f.widenLow() + f.widenHigh()
+    const quads = pairs.widenLow() + pairs.widenHigh()
+    total = total + lanesSum(quads as! v128)
+    i = i + 16
+  }
+  return [count, total]
+}
+
+// The sum of four i32 lanes.
+function lanesSum(v: v128) {
+  return __extract_lane_i32x4__(v, 0)
+    + __extract_lane_i32x4__(v, 1)
+    + __extract_lane_i32x4__(v, 2)
+    + __extract_lane_i32x4__(v, 3)
+}
+
+// The same pass one cell at a time; answers how many cells differ from the vector pass's output.
+function scalarPass(rate: i32, use: i32, who: i32, kind: i32) {
+  let count = 0
+  let total = 0
+  let differ = 0
+  let i = 0
+  while i < N {
+    let f = loadU8(forage, i) + rate
+    if f > 255 { f = 255 }
+    const c = loadU8(cap, i)
+    if c < f { f = c }
+    let s = loadU8(soil, i) - use
+    if s < 0 { s = 0 }
+    if f != loadU8(forage2, i) || s != loadU8(soil2, i) { differ = differ + 1 }
+    if loadU16(owner, i * 2) == who && loadU8(terrain, i) == kind {
+      count = count + 1
+    }
+    total = total + f
+    i = i + 1
+  }
+  return [count, total, differ]
+}
+
+function main() {
+  fill()
+  const v = simdPass(40, 30, 3 * 8191, 2)
+  const s = scalarPass(40, 30, 3 * 8191, 2)
+  print(v[0])
+  print(v[1])
+  print(s[0] == v[0] && s[1] == v[1] && s[2] == 0)
+}
+
+main()

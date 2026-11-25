@@ -3537,6 +3537,72 @@ function parseFuncTail(
   return parseFuncBodyAndBuild(dname, typarams, params, ret, nameTok, funcPos)
 }
 
+// Receiver overloading within one module (O1, `receiver-overloading.md`): when two or more
+// top-level `self`-functions share a name, every one is minted `name@Recv` (`ast.opDeclName`),
+// so the name-keyed tables hold one entry each and no symbol depends on declaration order.
+// The merge binds the plain name to the set; whether the heads may coexist is its question.
+function ovMintLocalSets(stmts: i32[]) {
+  const seen: {[string]: i32} = Map()
+  const dup: string[] = []
+  for si in stmts {
+    const n = nodeAt(si)
+    if n is FuncDecl {
+      const c = seen[n.fnName] ?? 0
+      if c == 1 { dup.push(n.fnName) }
+      seen[n.fnName] = c + 1
+    }
+  }
+  for nm in dup {
+    if ovMintableName(nm) && ovAllSelfFns(stmts, nm) {
+      for sj in stmts {
+        const d = nodeAt(sj)
+        if d is FuncDecl {
+          if d.fnName == nm {
+            d.fnName = opDeclName(nm, selfAnnName(d.fnParams))
+          }
+        }
+      }
+    }
+  }
+}
+
+// Whether `nm` is an ordinary identifier: an operator or getter name is keyed already.
+function ovMintableName(nm: string): boolean {
+  if nm == "" || isBinOpFuncName(nm) { return false }
+  if nm == OP_INDEX_GET || nm == OP_INDEX_SET { return false }
+  let i = 0
+  while i < nm.length {
+    if nm[i] == '@' || nm[i] == '.' { return false }
+    i = i + 1
+  }
+  return true
+}
+
+// Whether every top-level function named `nm` takes an annotated `self` first.
+function ovAllSelfFns(stmts: i32[], nm: string): boolean {
+  for si in stmts {
+    const n = nodeAt(si)
+    if n is FuncDecl {
+      if n.fnName == nm && selfAnnName(n.fnParams) == "" { return false }
+    }
+  }
+  return true
+}
+
+// The annotation spelling of a parameter list's first parameter when it is an annotated
+// `self`, else "".
+function selfAnnName(params: i32[]): string {
+  if params.length == 0 { return "" }
+  const p0 = nodeAt(params[0])
+  if p0 is Param {
+    if p0.parName == "self" && p0.parType >= 0 && p0.parRest == 0 {
+      const tr = nodeAt(p0.parType)
+      if tr is TypeRef { return tr.tyName }
+    }
+  }
+  return ""
+}
+
 // The minted name for a binary-operator function — the operator plus `self`'s annotation
 // spelling (`+@Vec3`), or the bare operator when `self` has no TypeRef. It raises no
 // diagnostic: a missing/misnamed `self` is caught by `parseFuncTail`'s arity/`self`-name
@@ -5499,6 +5565,7 @@ export function parseProgram() {
       stmts.push(parseStmt())
     }
   }
+  ovMintLocalSets(stmts)
   // D1045 — the hoist. A body-scoped declaration is also a top-level statement of the
   // program, which is what makes the checker's passes register it and the emitter mint its
   // rep, all of which read `progStmts` and only `progStmts`. Appended, so a hoisted

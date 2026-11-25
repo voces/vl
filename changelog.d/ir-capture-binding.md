@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage: a start body's closures over module-block locals, and bundles captured whole.** A start body's own bindings are now the block-locals in its statements, so a closure there captures them. The cause was `ownBinding`, which knew only a function's body. A captured bundle parameter, or a binding that keeps a returned bundle, is held as its record (`capTyOf`), and a call through such a capture picks its member (`bundleCaptureRead`). On master 75db3649, `start: closure env capture unbound` drops from 30 to 2, `closure env capture rep record vs closure` from 13 to 0, and `bundle callee` from 21 to 0. Legacy's bytes don't change.

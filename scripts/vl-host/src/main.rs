@@ -4047,8 +4047,9 @@ fn compile_vl_located(
     emit_names: Names,
     link: LinkOpts,
 ) -> Result<(Vec<u8>, Option<(Store<()>, Instance)>)> {
+    FELL_BACK.with(|c| c.set(false));
     let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
-    let bytes = compile_vl_instance(
+    let compiled = compile_vl_instance(
         &mut store,
         &inst,
         source,
@@ -4056,8 +4057,92 @@ fn compile_vl_located(
         entry,
         emit_names,
         link,
-    )?;
+    );
+    // A claim whose build or lowering met a shared legacy helper's refusal declined, and legacy
+    // wrote that unit: legacy's refusal stands, or legacy's bytes ship with one line (rc 70 strict).
+    let soft = soft_refusals(&inst, &mut store);
+    let mut bytes = match compiled {
+        Err(refusal) => {
+            for (name, msg) in &soft {
+                eprintln!("{}", soft_note(name, msg));
+            }
+            return Err(refusal);
+        }
+        Ok(b) => b,
+    };
+    if let Some((name, msg)) = soft.first() {
+        if ir_strict() {
+            return Err(invalid_module_error(&soft_strict(name, msg)));
+        }
+        eprintln!("vl: {}", soft_fell_back(name, msg));
+        FELL_BACK.with(|c| c.set(true));
+    }
+    // A unit an IR claim lowered never ran legacy's lowering, so a refusal legacy would raise
+    // there never fired. A claimed module the engine refuses is rebuilt with claims off.
+    if claims_taken(&inst, &mut store) {
+        if let Some(f) = claimed_fault_injection()? {
+            inject_fault(f, &mut bytes)?;
+        }
+        if let Err(e) = by_module_size(bytes.len(), || Module::validate(engine, &bytes)) {
+            let rebuild = |c: &CompilerSource| {
+                let (mut s, i) = load_compiler(engine, c)?;
+                let b = compile_vl_instance(&mut s, &i, source, source_path, entry, emit_names, link)?;
+                Ok((b, (s, i)))
+            };
+            return claims_off_rebuild(engine, compiler, rebuild, Error::from(e), bytes, (store, inst), source_path);
+        }
+    }
     Ok((bytes, Some((store, inst))))
+}
+
+/// After a claimed module the engine refused (`err`, over `bad`): the unit compiled again with
+/// every IR claim off, so the answer is legacy's. Legacy refusing is that refusal (rc 1, with a
+/// note naming the claim). Legacy writing a valid module ships it with one stderr line, or under
+/// `$VL_IR_STRICT=1` is the invalid module, loud (rc 70). Both invalid is the invalid module.
+/// The fallback goes when legacy does (I8): then an invalid claimed module is always rc 70.
+fn claims_off_rebuild(
+    engine: &Engine,
+    compiler: &CompilerSource,
+    rebuild: impl Fn(&CompilerSource) -> Result<(Vec<u8>, (Store<()>, Instance))>,
+    err: Error,
+    bad: Vec<u8>,
+    session: (Store<()>, Instance),
+    source_path: &str,
+) -> Result<(Vec<u8>, Option<(Store<()>, Instance)>)> {
+    let headline = invalid_headline(&format!("{err:?}"), Some(session), source_path, Some(&bad));
+    CLAIMS_OFF.with(|c| c.set(true));
+    let legacy = rebuild(compiler);
+    CLAIMS_OFF.with(|c| c.set(false));
+    let (lb, ls) = match legacy {
+        Ok(r) => r,
+        Err(refusal) => {
+            eprintln!(
+                "vl: note: an IR claim wrote an invalid module ({headline}); legacy's emitter refuses the program"
+            );
+            return Err(refusal);
+        }
+    };
+    if by_module_size(lb.len(), || Module::validate(engine, &lb)).is_err() {
+        return Err(invalid_module_error(&headline));
+    }
+    if ir_strict() {
+        return Err(invalid_module_error(&format!(
+            "{headline}\nan IR claim produced an invalid module, and the legacy emitter builds the program \
+             ($VL_IR_STRICT=1 refuses that fallback)"
+        )));
+    }
+    eprintln!("vl: {headline}: IR claim produced an invalid module; used the legacy emitter");
+    FELL_BACK.with(|c| c.set(true));
+    Ok((lb, Some(ls)))
+}
+
+/// `$VL_FAULT_INJECT_CLAIMED`: a `$VL_FAULT_INJECT` fault applied to a claimed compile's
+/// module only, never to its claims-off rebuild, so the fallback has a control.
+fn claimed_fault_injection() -> Result<Option<Fault>> {
+    match std::env::var_os("VL_FAULT_INJECT_CLAIMED") {
+        None => Ok(None),
+        Some(v) => fault_from(v.to_str().unwrap_or("?"), "VL_FAULT_INJECT_CLAIMED"),
+    }
 }
 
 /// Is `text` the engine refusing a MODULE (rather than a program failing at run time)?
@@ -4120,7 +4205,7 @@ fn validator_sentence(text: &str) -> String {
 /// position - which is what every such failure printed before this row.
 fn locate_invalid_module(
     err: Error,
-    mut session: Option<(Store<()>, Instance)>,
+    session: Option<(Store<()>, Instance)>,
     entry: &str,
     bytes: Option<&[u8]>,
 ) -> Error {
@@ -4128,8 +4213,27 @@ fn locate_invalid_module(
     if !is_invalid_module(&text) {
         return err;
     }
+    invalid_module_error(&invalid_headline(&text, session, entry, bytes))
+}
+
+/// The invalid-module error over `headline`, marked a vl bug so the run exits 70.
+fn invalid_module_error(headline: &str) -> Error {
     INVALID_MODULE.store(true, Ordering::Relaxed);
-    let mut sentence = validator_sentence(&text);
+    Error::msg(format!(
+        "invalid module\n{headline}\nthis is a bug in vl, not in your program; \
+         please report it with this file"
+    ))
+}
+
+/// The engine's refusal `text` as one line naming the function and source line that emitted
+/// the offending bytes (`session` the compiler instance that wrote `bytes`), as D1578 reads it.
+fn invalid_headline(
+    text: &str,
+    mut session: Option<(Store<()>, Instance)>,
+    entry: &str,
+    bytes: Option<&[u8]>,
+) -> String {
+    let mut sentence = validator_sentence(text);
     if let Some(b) = bytes {
         let named = match session.as_mut() {
             Some((store, inst)) => name_heap_types(b, &sentence, store, inst),
@@ -4141,7 +4245,7 @@ fn locate_invalid_module(
     }
     let located = session.and_then(|(mut store, inst)| {
         let spans = EmitSpans::probe(&mut store, &inst)?;
-        let off = engine_fail_offset(&text)?;
+        let off = engine_fail_offset(text)?;
         spans.locate(&mut store, off, entry)
     });
     let headline = match &located {
@@ -4158,10 +4262,7 @@ fn locate_invalid_module(
         },
         None => format!("the emitted module failed to validate: {sentence}"),
     };
-    Error::msg(format!(
-        "invalid module\n{headline}\nthis is a bug in vl, not in your program; \
-         please report it with this file"
-    ))
+    headline
 }
 
 // ── the sampling guest profiler (`$VL_PROFILE_GUEST`) ────────────────────────
@@ -4546,6 +4647,13 @@ fn compile_vl_instance(
     }
     // `--test-emit-refusal`: refused on an old seed, since a test that pins a refusal would
     // otherwise build clean and measure nothing.
+    // `$VL_TEST_CLAIM_REFUSAL=1|2`: every claimed function or start refuses before or after its body
+    // lowers (tests only), the control for the soft-refusal fallback. A seed without the export ignores it.
+    if let Ok(k) = std::env::var("VL_TEST_CLAIM_REFUSAL") {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setTestClaimRefusal") {
+            set.call(&mut store, k.parse().unwrap_or(0))?;
+        }
+    }
     if link.test_emit_refusal {
         let set = inst
             .get_typed_func::<i32, i32>(&mut store, "setTestEmitRefusal")
@@ -4710,13 +4818,99 @@ fn ir_shadow_on() -> bool {
 }
 
 /// Under `$VL_IR_SHADOW`, arm the guest's IR shadow. A seed without `irShadowArm` ignores it.
+/// A claims-off rebuild (`claims_off_rebuild`) arms mode 1, under which no IR claim is taken
+/// and legacy writes every function.
 fn arm_ir_shadow(inst: &Instance, store: &mut Store<()>) {
-    if !ir_shadow_on() {
+    let mode = if CLAIMS_OFF.with(|c| c.get()) {
+        1
+    } else if ir_shadow_on() {
+        ir_shadow_mode()
+    } else {
         return;
-    }
+    };
     if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut *store, "irShadowArm") {
-        let _ = set.call(&mut *store, ir_shadow_mode());
+        let _ = set.call(&mut *store, mode);
     }
+}
+
+thread_local! {
+    /// Set while `claims_off_rebuild` compiles: `arm_ir_shadow` then turns every IR claim off.
+    static CLAIMS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set when this thread's last compile shipped legacy's bytes in place of an invalid
+    /// claimed module, so the compile cache does not store them.
+    static FELL_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the compile that just ran on `inst` took an IR claim: the guest counts a
+/// `claimed …` row per claimed unit even unarmed. A seed without the rows answers false.
+fn claims_taken(inst: &Instance, store: &mut Store<()>) -> bool {
+    let (Ok(count), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "irShadowRowCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "irShadowRowLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "irShadowRowAt"),
+    ) else {
+        return false;
+    };
+    let n = count.call(&mut *store, ()).unwrap_or(0);
+    (0..n).any(|i| {
+        len.call(&mut *store, i).unwrap_or(0) >= 7
+            && (0..7).all(|j| at.call(&mut *store, (i, j)).ok() == Some(b"claimed"[j as usize] as i32))
+    })
+}
+
+/// Each claimed unit whose build or lowering met a shared legacy helper's refusal, and so declined:
+/// `(name, message)` from the guest's `… a legacy helper refused in `name`: message` rows.
+fn soft_refusals(inst: &Instance, store: &mut Store<()>) -> Vec<(String, String)> {
+    let (Ok(count), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "irShadowRowCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "irShadowRowLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "irShadowRowAt"),
+    ) else {
+        return Vec::new();
+    };
+    const MARK: &str = "a legacy helper refused in `";
+    let mut out = Vec::new();
+    for i in 0..count.call(&mut *store, ()).unwrap_or(0) {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let row: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        let Some(k) = row.find(MARK) else { continue };
+        let rest = &row[k + MARK.len()..];
+        if let Some((name, msg)) = rest.split_once("`: ") {
+            out.push((name.to_string(), msg.lines().next().unwrap_or(msg).to_string()));
+        }
+    }
+    out
+}
+
+/// The note beside legacy's refusal when a claim declined on a helper's refusal (the TS hosts' text too).
+fn soft_note(name: &str, msg: &str) -> String {
+    format!("vl: note: an IR claim refused inside `{name}` ({msg}); legacy's emitter refuses the program")
+}
+
+/// The line beside legacy's bytes when such a claim declined and legacy built the unit.
+fn soft_fell_back(name: &str, msg: &str) -> String {
+    format!("inside `{name}`: {msg}: IR claim refused; used the legacy emitter")
+}
+
+/// The strict error for the same: rc 70, since an IR claim must not refuse what legacy builds.
+fn soft_strict(name: &str, msg: &str) -> String {
+    format!(
+        "inside `{name}`: {msg}\nan IR claim refused, and the legacy emitter builds the program \
+         ($VL_IR_STRICT=1 refuses that fallback)"
+    )
+}
+
+/// `$VL_IR_STRICT=1`: a claimed module that fails validation is a loud internal error even when
+/// legacy's emitter builds the program, as every gate and CI job runs it.
+fn ir_strict() -> bool {
+    std::env::var("VL_IR_STRICT").ok().as_deref() == Some("1")
+}
+
+/// Whether this thread's last compile fell back to legacy's bytes (`claims_off_rebuild`).
+fn fell_back() -> bool {
+    FELL_BACK.with(|c| c.get())
 }
 
 /// Under `$VL_IR_SHADOW`, print one `[ir] <path>: <n>\t<row>` line to stderr per row the
@@ -7570,6 +7764,11 @@ fn compile_and_run(
             )
         },
         |r: &(Vec<u8>, Option<(Store<()>, Instance)>)| {
+            // Legacy's bytes in place of an invalid claimed module are never stored: a strict
+            // run must meet the claim again.
+            if fell_back() {
+                return None;
+            }
             let m = user_module(run_engine, &r.0).ok()?;
             *compiled.borrow_mut() = Some(m);
             Some(r.0.clone())
@@ -9134,7 +9333,12 @@ fn fault_injection() -> Result<Option<Fault>> {
     let Some(raw) = std::env::var_os("VL_FAULT_INJECT") else {
         return Ok(None);
     };
-    match raw.to_str() {
+    fault_from(raw.to_str().unwrap_or(""), "VL_FAULT_INJECT")
+}
+
+/// The fault `raw` names, read from `$var`: "" is none, an unknown value an error.
+fn fault_from(raw: &str, var: &str) -> Result<Option<Fault>> {
+    match Some(raw) {
         None | Some("") => Ok(None),
         Some("corrupt-validate-bytes") => Ok(Some(Fault::CorruptValidateBytes)),
         Some("corrupt-start-fn-body") => Ok(Some(Fault::CorruptStartFnBody)),
@@ -9142,7 +9346,7 @@ fn fault_injection() -> Result<Option<Fault>> {
         Some(other) if other.starts_with("wrong-ref:") => {
             let bad = || {
                 Error::msg(format!(
-                    "vl: `$VL_FAULT_INJECT={other}` is not `wrong-ref:<type>[:<body>]` \
+                    "vl: `${var}={other}` is not `wrong-ref:<type>[:<body>]` \
                      with decimal indices"
                 ))
             };
@@ -9158,10 +9362,10 @@ fn fault_injection() -> Result<Option<Fault>> {
             Ok(Some(Fault::WrongRef { ty, body }))
         }
         Some(other) => bail!(
-            "vl: unrecognized $VL_FAULT_INJECT fault `{other}` — the values this binary \
+            "vl: unrecognized ${var} fault `{other}` — the values this binary \
              knows are `corrupt-validate-bytes`, `corrupt-start-fn-body`, \
              `huge-array-new-fixed` and `wrong-ref:<type>[:<body>]`. \
-             $VL_FAULT_INJECT is a TEST-ONLY hook for exercising the module-validation \
+             ${var} is a TEST-ONLY hook for exercising the module-validation \
              path; unset it."
         ),
     }
@@ -11812,8 +12016,8 @@ fn build_cmd(args: &[String]) -> Result<()> {
             )
         },
         |r: &(Vec<u8>, Option<(Store<()>, Instance)>)| {
-            by_module_size(r.0.len(), || Module::validate(&compile_engine, &r.0))
-                .is_ok()
+            // Never legacy's bytes in place of an invalid claimed module (`claims_off_rebuild`).
+            (!fell_back() && by_module_size(r.0.len(), || Module::validate(&compile_engine, &r.0)).is_ok())
                 .then(|| r.0.clone())
         },
         |b| (b, None),

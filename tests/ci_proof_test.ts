@@ -47,6 +47,10 @@ const LOCAL: Record<string, string> = {
   "ir shadow cases": "no ci.yml job runs the IR shadow over tests/cases",
   "ir claims":
     "no ci.yml job runs the shipped IR claim over the distilled corpus",
+  "ir claim refusals":
+    "no ci.yml job builds the programs legacy refuses at emit claimed and claimless (`ir-parity.vl --pop refusals`)",
+  "ir claim cross":
+    "no ci.yml job builds and runs the probes, pins and a cases sample claimed and claimless (`ir-parity.vl --cross`)",
 };
 
 // What ci.yml must run for each covered row: fragments of the same command, on the seed.
@@ -66,6 +70,9 @@ const CI_RUNS: Record<string, string[]> = {
   ],
   "late demands": [
     "vl run scripts/late-demands.vl --compiler build/vl-compiler.wasm -- --check --seed build/vl-compiler.wasm",
+  ],
+  "self ir misses": [
+    "vl run scripts/self-ir-misses.vl --compiler build/vl-compiler.wasm -- --check --seed build/vl-compiler.wasm",
   ],
   "phase state": [
     "vl run scripts/phase-state-census.vl --compiler build/vl-compiler.wasm -- --check",

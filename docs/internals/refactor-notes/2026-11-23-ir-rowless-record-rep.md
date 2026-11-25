@@ -1,0 +1,88 @@
+# IR: a record type no struct row records, at the row legacy stores it in, 2026-11-23
+
+Lane IR-N6, the follow-up the map family named (`map read default rep`). The coordinator scoped it
+as one general rule: a record type with no struct row reps as the row that stores it. Both halves
+call one predicate and neither restates it.
+
+## The rule
+
+`rowlessStoredTy(t, rep, rowTy)`: the storage row type `rowTy` where a value of record type `t` at
+rep `rep`, a type `structIndexOfTy` gives no row, is held at that row's rep; else -1. Each point
+names the row it stores the value in:
+
+1. **A built value** (`exprRepOf` -> `rowlessRecordRep`): the row `structIndexOfExpr` names.
+   A read of a place (an `Ident` or a `Member`) is excluded: it holds its place's rep.
+2. **A place** (`rowlessLetTy`): a `let`'s slot row (`irSlotRowTy`). Its reads are taken at that
+   row (`localReadStored`, `declRowReadTy`).
+
+A value whose rep the rule moved is typed at the row's recorded type wherever the IR mints its
+temp or out local: `outTyOf` (via `rowlessRecordTy`) at `irBLetTemp`, the coalesce and map-default
+outs, a valued `if` chain, a reference join, a valued switch and `objLit`.
+
+Also in the batch: legacy's `nullty` null-test arm (`emitDeadNullTest`) where the operand is a
+bare name, which legacy writes as a constant. An operand legacy reads and drops is refused by name
+(`null test nullty operand`); the IR has no read of a field at its storage row's rep for a
+`null`-typed node.
+
+## Refused shape: the rule at every node
+
+Applied to every node's rep, the rule lost tests/cases 71,771 -> 71,654 (`narrowed read` +109,
+`field read of a stored row` +22): a place's cell keeps its own type's rep, so a read of it
+disagreed with the cell. The place half is that decision made for the place itself.
+
+## What stays open
+
+- The 12 `map read default rep` cells: 9 now build, and the verifier refuses them ("a map read's
+  mv slot yields no value of its map"), since the map's rep keeps its value type's rowless record
+  while its mv slot stores the row. Next: the map's value rep takes `mvValStructIdxOf`'s row, a
+  third call of the same predicate. That row is `structRowOfRecordTy(nonNullTy(valueTy))`, a function
+  of the value type and the program's row table, not of the site. The same 9 also need the
+  `nullty` read of a field, so they stay unclaimed here (they fall back to legacy).
+- IR-M1's start rows (3 argument coercion and object field row rep, 7 open temp type) do not move.
+- The price: `tests/cases/generics/annotated-written-let-of-generic-read-as-itself.vl::a` (one
+  instance) now misses at `local slot shared across reps`. Its annotated record of a closure field,
+  `const r: {f: (t: T) => void}`, is a `let` the place half moves to its slot row, a slot another
+  instance holds at another rep. The next batch wins it back by giving that slot one rep.
+- The `nullty` arm's refusal, `null test nullty operand`: an operand that is not a bare name, which
+  legacy reads at its storage row and drops. Shadow row `rowless-nullty-operand-refused.vl` shows it.
+
+## Legacy tails the IR calls
+
+None new.
+
+## Readings (fixpoint seeds on both sides, master 88df143e)
+
+Functions with no blocker, `VL_IR_SHADOW=4`: tests/cases 78,599 -> 78,609; distilled corpus
+45,428 -> 45,428.
+
+| tests/cases program | gained | class it left |
+| --- | ---: | --- |
+| `maps/record-join-into-map-union-field.vl` | 3 | `ref if arm rep` |
+| `objects/join-binding-adopts-union-field-record.vl` | 1 | `ref if arm rep` |
+| `functions/field-completion-coercion.vl` | 1 | `object field count` |
+| `objects/empty-object-all-nullable-runs.vl` | 1 | `object field count` |
+| `structs/nul-distinct-scalar-list-field.vl` | 1 | `object field count` |
+| `objects/object-shape-unannotated-literal-rebuilt.vl` | 1 | `declaration coercion` |
+| `soundness/covariant-record-field-read-only-runs.vl` | 1 | `field read of a stored row` |
+| `soundness/fresh-list-element-built-at-wider-record-runs.vl` | 1 | `index element coercion` |
+| `structs/inline-record-nullable-field-twins.vl` | 1 | `return coercion` |
+| `generics/annotated-written-let-of-generic-read-as-itself.vl` | -1 | now `local slot shared across reps` |
+
+The one loss: a generic's annotated record of a closure field, `const r: {f: (t: T) => void}`,
+whose `let` the place half moves to its slot row in one instance while the slot is shared at
+another rep. It falls back to legacy; it is the rule's price.
+
+Armed tests/cases: covered 78,599 -> 78,609, matched 78,598 -> 78,608, with no failure beyond
+master's own. `--names` identical 9,037, differ 0; `--cases` identical 7,704, differ 0, witnesses
+same 61; `--claimless` identical 14,034, differ 0; mode 3 and armed self-compile identical; order
+rows 0. L2 self-compile fuel +0.19% on its base (the first cut asked `structIndexOfExpr` of every
+expression, +1.80%; `rowlessRecord` is asked first). `regress.vl`: no runs lost.
+
+IR-M1's `object field coercion` remainder, on the same pair: functions 9 -> 9, starts 15 -> 16,
+const cells 6 -> 4. The start that entered it, in
+`tests/cases/generics/hole-guarded-call-through-nullable-field.vl`, missed earlier at `global
+initializer coercion`; the two const cells that left it are in
+`tests/cases/generics/genalias-scalar-list-arg-control.vl`. The rule does not reach the remainder's
+`i32>closure` and `str>atom` shapes: those are field reps, not a rowless record's row.
+
+Legacy lines deleted: 0. Moved to `@ir`: 0.
