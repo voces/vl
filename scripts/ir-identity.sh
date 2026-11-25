@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Byte identity of what the IR claims, two ways.
+# What the IR claims against what legacy writes: behaviour parity, with bytes reported.
 #
 #     scripts/ir-identity.sh <seed-a> <seed-b> [--names]
 #     scripts/ir-identity.sh --cases <seed> [--shard i/n]
@@ -12,9 +12,12 @@
 # `self-compile identical` or `SELF-COMPILE DIFFERS`.
 # `--cases` builds a same-tree compiler with `CLAIMED` empty from <seed> (the shipped compiler
 # of this checkout), then builds every tests/cases program not marked `@error`, and every
-# scripts/capability-probes program, under both, comparing the wasm and the exit code, and for a
-# program that fails under both, its first diagnostic line: a claim that turns a legacy refusal
-# into a build, or into another refusal, reds. It prints `cases: identical N, fail under both N,
+# scripts/capability-probes program, under both, comparing the exit code, and for a program that
+# fails under both, its first diagnostic line: a claim that turns a legacy refusal into a build,
+# or into another refusal, reds. A program both build to other bytes is not a differ: it counts in
+# `bytes differ N (informational)` and goes to `ir-parity.vl --behaviour-only`, which runs both and
+# reds when the exit code, trap or output differs (coordinator ruling 2026-11-25, DECISIONS.md).
+# `$IR_IDENTITY_BYTES=1` restores the byte gate. It prints `cases: identical N, fail under both N,
 # differ N` and each that differs. It then builds every filed inventory witness whose outcome is
 # an emit reject (`scripts/inventory/witnesses.vl`) under both, comparing the exit code and the
 # first diagnostic line, and prints `witnesses: same N, differ N`.
@@ -53,6 +56,9 @@ fi
 export VL=${VL:-$PWD/scripts/vl-host/target/release/vl}
 # An invalid IR-claimed module is rc 70, never legacy's fallback bytes, so no differ hides behind it.
 export VL_IR_STRICT=1
+# A byte differ is informational and behaviour decides (coordinator ruling 2026-11-25); BYTES=1
+# ($IR_IDENTITY_BYTES) restores the byte gate, with listed divergences read through wasm-dis.
+BYTES=${IR_IDENTITY_BYTES:-0}
 T=$(mktemp -d)
 # The build logs of every file that was not identical (a differ or a timeout) outlive the run,
 # under $IR_IDENTITY_KEEP (default $TMPDIR/ir-identity-keep/<run>/), so a reading can be explained.
@@ -173,7 +179,8 @@ keep() { printf '%s\t%s\n%s\t%s\n' "$1" "$3" "$2" "$3" >> "$T/keep"; }
 # Compares the builds of the files listed in $1 under dirs $2 and $3; prints each that differs.
 # With $ERRCMP=1, a file that fails under both differs when its first diagnostic line does.
 compare_all() {
-  same=0; both=0; diff=0; tmo=0; expd=0; why=""
+  same=0; both=0; diff=0; tmo=0; expd=0; bytes=0; why=""
+  : > "$T/bdiff"
   while read -r f; do
     k=$(printf "%s" "$f" | tr "/" "_")
     why=""
@@ -183,11 +190,13 @@ compare_all() {
       && { [ "$ra" = 0 ] || [ "${ERRCMP:-0}" != 1 ] || cmp -s "$2/$k.err" "$3/$k.err"; } || keep "$2" "$3" "$k"
     if [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
       expd=$((expd + 1)); echo "expected divergence $f (legacy-wrong: claimless exit $rb)"
+      echo "$f" >> "$T/bdiff"
     elif [ "$ra" != "$rb" ]; then diff=$((diff + 1)); echo "DIFF $f (exit $ra vs $rb)"
     elif [ "$ra" != 0 ] && [ "${ERRCMP:-0}" = 1 ] && ! cmp -s "$2/$k.err" "$3/$k.err"; then
       diff=$((diff + 1)); echo "DIFF $f (first error: $(cat "$2/$k.err") vs $(cat "$3/$k.err"))"
     elif [ "$ra" != 0 ]; then both=$((both + 1))
     elif cmp -s "$2/$k.wasm" "$3/$k.wasm"; then same=$((same + 1))
+    elif [ "$BYTES" != 1 ]; then bytes=$((bytes + 1)); echo "$f" >> "$T/bdiff"
     elif need_dis "$f" && why=$(expected_divergence "$f" "$2/$k.wasm" "$3/$k.wasm"); then
       expd=$((expd + 1)); echo "expected divergence $f ($why)"
     else diff=$((diff + 1)); echo "DIFF $f${why:+ ($why)}"; fi
@@ -197,7 +206,7 @@ compare_all() {
 # Compares the refusals of the files listed in $1 under dirs $2 and $3: the exit code and the
 # first diagnostic line, or the wasm when both build; prints each that differs.
 compare_errors() {
-  esame=0; ediff=0; etmo=0; eexpd=0; why=""
+  esame=0; ediff=0; etmo=0; eexpd=0; ebytes=0; why=""
   while read -r f; do
     k=$(printf "%s" "$f" | tr "/" "_")
     why=""
@@ -208,6 +217,8 @@ compare_errors() {
     if [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
       eexpd=$((eexpd + 1)); echo "expected divergence $f (legacy-wrong: claimless exit $rb)"
     elif [ "$ra" != "$rb" ]; then ediff=$((ediff + 1)); echo "DIFF $f (exit $ra vs $rb)"
+    elif [ "$ra" = 0 ] && [ "$BYTES" != 1 ] && ! cmp -s "$2/$k.wasm" "$3/$k.wasm"; then
+      esame=$((esame + 1)); ebytes=$((ebytes + 1))
     elif [ "$ra" = 0 ] && ! cmp -s "$2/$k.wasm" "$3/$k.wasm" \
       && why=$(expected_divergence "$f" "$2/$k.wasm" "$3/$k.wasm"); then
       eexpd=$((eexpd + 1)); echo "expected divergence $f ($why)"
@@ -216,6 +227,26 @@ compare_errors() {
       ediff=$((ediff + 1)); echo "DIFF $f (first error: $(cat "$2/$k.err") vs $(cat "$3/$k.err"))"
     else esame=$((esame + 1)); fi
   done < "$1"
+}
+
+# Behaviour parity over the programs whose bytes differ (and the legacy-wrong ones the claims seed
+# alone builds): `ir-parity.vl --behaviour-only` builds both sides, runs them and compares exit
+# code, trap and output, or a legacy-wrong program's IR-on run against its expected output.
+# Sets $bdiff (behaviour differs) and $btmo (timeouts); a byte differ alone is never red.
+behaviour_check() {
+  bdiff=0; btmo=0
+  [ -s "$T/bdiff" ] || { echo "behaviour: no program's bytes differ"; return 0; }
+  local rc=0
+  "$VL" run scripts/ir-parity.vl --compiler "$1" -- --seed "$1" --claimless "$2" \
+    --from "$T/bdiff" --behaviour-only --out "$T/parity.tsv" > "$T/parity.log" 2>&1 || rc=$?
+  grep -E '^ir-parity: [0-9]+ programs' "$T/parity.log" | sed 's/^ir-parity/behaviour/'
+  grep -vP '^ir-parity: [0-9]+ programs|\tsame\t' "$T/parity.log" | sed 's/^/BEHAVIOUR /'
+  case "$rc" in
+    0) ;;
+    3) btmo=1 ;;
+    *) bdiff=$(awk -F '\t' '$2 == "differs" || $2 ~ /^build-fails\((on|off)\)$/' "$T/parity.tsv" | wc -l)
+       [ "$bdiff" -gt 0 ] || bdiff=1 ;;
+  esac
 }
 
 # The run's verdict: 1 on a differ, else 3 on a timeout (refused, never passed), else 0.
@@ -230,14 +261,14 @@ verdict() {
 
 if [ "${1:-}" = "--compare" ]; then
   ERRCMP=1 compare_all "${2:?usage: --compare <list> <dir-a> <dir-b>}" "${3:?}" "${4:?}"
-  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd"
+  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, bytes differ $bytes (informational)"
   verdict "$diff" "$tmo"
   exit
 fi
 
 if [ "${1:-}" = "--compare-errors" ]; then
   compare_errors "${2:?usage: --compare-errors <list> <dir-a> <dir-b>}" "${3:?}" "${4:?}"
-  echo "errors: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd"
+  echo "errors: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd, bytes differ $ebytes (informational)"
   verdict "$ediff" "$etmo"
   exit
 fi
@@ -282,8 +313,9 @@ if [ "${1:-}" = "--claimless" ]; then
   build_all "$T/list" "$SEED" "$T/a"
   build_all "$T/list" "$T/claimless.wasm" "$T/b"
   compare_all "$T/list" "$T/a" "$T/b"
-  echo "claimless: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd"
-  verdict "$diff" "$tmo"
+  echo "claimless: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, bytes differ $bytes (informational)"
+  behaviour_check "$SEED" "$T/claimless.wasm"
+  verdict $((diff + bdiff)) $((tmo + btmo))
   exit
 fi
 
@@ -298,15 +330,16 @@ if [ "${1:-}" = "--cases" ]; then
   build_all "$T/list" "$SEED" "$T/a"
   build_all "$T/list" "$T/claimless.wasm" "$T/b"
   compare_all "$T/list" "$T/a" "$T/b"
-  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd"
+  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, bytes differ $bytes (informational)"
+  behaviour_check "$SEED" "$T/claimless.wasm"
   "$VL" run scripts/inventory/witnesses.vl --compiler "$SEED" -- --outcome emit_reject --out "$T/w" > "$T/errs"
   shard_list "$T/errs"
   # A witness of the test-only refusal hook refuses only under the flag `check-filed-witnesses` passes.
   FLAGS=--test-emit-refusal build_all "$T/errs" "$SEED" "$T/ea"
   FLAGS=--test-emit-refusal build_all "$T/errs" "$T/claimless.wasm" "$T/eb"
   compare_errors "$T/errs" "$T/ea" "$T/eb"
-  echo "witnesses: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd"
-  verdict $((diff + ediff)) $((tmo + etmo))
+  echo "witnesses: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd, bytes differ $ebytes (informational)"
+  verdict $((diff + ediff + bdiff)) $((tmo + etmo + btmo))
   exit
 fi
 
@@ -314,6 +347,8 @@ A=${1:?usage: scripts/ir-identity.sh <seed-a> <seed-b> [--names] | --cases <seed
 B=${2:?usage: scripts/ir-identity.sh <seed-a> <seed-b> [--names] | --cases <seed> | --claimless <seed>}
 export FLAGS=${3:-}
 SEED_A=$A SEED_B=$B
+# Two seeds have no claimless relation to run against, so this mode stays a byte identity.
+BYTES=${IR_IDENTITY_BYTES:-1}
 D=scripts/silent-sweep/distilled
 ls "$D"/cells/*.vl "$D"/named/*.vl > "$T/list"
 shard_list "$T/list"
