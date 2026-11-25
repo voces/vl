@@ -13,6 +13,7 @@ import {
   CW_UP_ARG,
   CW_UP_ELEM,
   CW_UP_LETINIT,
+  CW_UP_OBJ,
   cwBindingOf,
   cwCalleeDeclOf,
   cwDeclFnWrites,
@@ -2816,6 +2817,25 @@ function fnPathSetOf(bd: i32, path: string[]): i32 {
       s = if s >= 0 { fnSetIntern(fnSetUnion(s, e)) } else { e }
     }
   }
+  // A `let` copying a field of `bd` (`let m = bd.v`) holds that field's record: its writes land at
+  // `path` past the field's own steps (D17360).
+  // So does each copy of such a `let`, at the same steps.
+  for c in fnLetFieldCopiesOf(bd) {
+    const fp = fnFieldCopyPrefix(c, bd)
+    if fp.length > 0 && fp.length < path.length && fnPathHasPrefix(path, fp) {
+      const rest = path.slice(fp.length, path.length)
+      const held: i32[] = [c]
+      for cc in fnLetCopiesOf(c) { held.push(cc) }
+      for h in held {
+        const cs = cwPathFnTargets(h, rest)
+        if cs.length > 0 && cs[0] < 0 { return -1 }
+        if cs.length > 0 {
+          const e = fnSetIntern(fnSetSorted(cs))
+          s = if s >= 0 { fnSetIntern(fnSetUnion(s, e)) } else { e }
+        }
+      }
+    }
+  }
   return s
 }
 
@@ -2839,6 +2859,71 @@ function fnLetCopiesOf(bd: i32): i32[] {
     i = i + 1
   }
   return out
+}
+
+// The un-annotated `let` bindings whose whole initialiser is a field read rooted at binding `bd`.
+function fnLetFieldCopiesOf(bd: i32): i32[] {
+  const out: i32[] = []
+  cwIxBuild()
+  const w = cwOccWalk(bd)
+  while cwOccNext(w) {
+    let u = if cwIxKind[w.row] == CW_OCC_USE { cwIxNode[w.row] } else { -1 }
+    let hops = 0
+    while u >= 0 && cwIxCovers(u) && cwIxUpKind[u] == CW_UP_OBJ && hops < 16 {
+      u = cwIxUp[u]
+      hops = hops + 1
+    }
+    const d = if hops > 0 && u >= 0 && cwIxCovers(u) && cwIxUpKind[u] == CW_UP_LETINIT { cwIxUp[u] } else { -1 }
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if dn is LetDecl && dn.letType < 0 && !i32ListHas(out, d) { out.push(d) }
+  }
+  return out
+}
+
+// The field steps, outermost first, of the read rooted at `bd` that initialises `let` `c`; [] when
+// its initialiser is no such read.
+function fnFieldCopyPrefix(c: i32, bd: i32): string[] {
+  const rev: string[] = []
+  const cn = nodeAt(c)
+  if !(cn is LetDecl) { return rev }
+  let x = parenPeelIx(cn.letInit)
+  while x >= 0 && x < P.nodes.length && rev.length < 16 {
+    const pr = fnMemberPropOf(x)
+    if pr == "" { break }
+    rev.push(pr)
+    x = parenPeelIx(fnMemberObjOf(x))
+  }
+  const out: string[] = []
+  if x < 0 || x >= P.nodes.length || identDeclOf(x) != bd { return out }
+  let i = rev.length - 1
+  while i >= 0 {
+    out.push(rev[i])
+    i = i - 1
+  }
+  return out
+}
+
+// The field name member read `x` reads; "" for any other node.
+function fnMemberPropOf(x: i32): string {
+  const n = nodeAt(x)
+  return if n is Member { n.memProp } else { "" }
+}
+
+// The object member read `x` reads; -1 for any other node.
+function fnMemberObjOf(x: i32): i32 {
+  const n = nodeAt(x)
+  return if n is Member { n.memObj } else { -1 }
+}
+
+// Whether `path` begins with the steps of `pre`.
+function fnPathHasPrefix(path: string[], pre: string[]): boolean {
+  if pre.length > path.length { return false }
+  let i = 0
+  while i < pre.length {
+    if path[i] != pre[i] { return false }
+    i = i + 1
+  }
+  return true
 }
 
 // The `let` whose whole initialiser is a hole identity call handing back read `u` (D17361); -1.
