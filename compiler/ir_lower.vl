@@ -11,7 +11,7 @@ import { printUnionPlan } from "./emit_fn_scans"
 import { armIdxSlot, sharedFieldRecvSlot } from "./emit_union_casts"
 import { mapRecvScalarBoxKindIn, mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
-import { slotRowTyOf } from "./emit_rep"
+import { repTyOf, slotRowTyOf } from "./emit_rep"
 import { luOvEnter, luOvLeave } from "./emit_elab"
 import {
   armIndexWriteArmsOf,
@@ -22,6 +22,7 @@ import {
   asgParkedFieldTail,
   asgParkedMapTail,
   asgWiderRowTail,
+  coalFieldPlanOfOpt,
   emitInitGuard,
   emitOptLeafHead,
   emitOptLeafTail,
@@ -114,6 +115,7 @@ import {
   optChainStagesRecv,
   sFieldFlatRow,
   sFieldTypeAt,
+  structIndexOfTy,
   variantFieldStorageKind,
   variantFieldTypeAt,
 } from "./emit_atom_kinds"
@@ -4902,13 +4904,6 @@ function opndAgain(o: Opnd, ix: i32): i32 {
   return 0
 }
 
-// Receiver `o` of member `lhsIx` read once more (`opndAgain`).
-function recvAgain(o: Opnd, lhsIx: i32): i32 {
-  const m = nodeAt(unwrapParen(lhsIx))
-  if !(m is Member) { return irLMiss("receiver read again") }
-  return opndAgain(o, m.memObj)
-}
-
 // Writes the global read the builder built at node `ix` once more, as legacy re-reads a name;
 // false where it built none.
 export function irLReadAgain(ix: i32): boolean {
@@ -6080,15 +6075,22 @@ function coalBoxStash(n: SCoalBox, _e: BinExpr, pending: i32[]): i32 {
 // writes it: the record variable, the field's null test opening the `if`, the default writing the
 // slotless out, the else, the record again and the field's box or its unboxed payload, the end.
 function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
-  const p = coalFieldPlanOf(e, unwrapParen(e.binLeft), n.cbAt, lw.irAt)
+  const lhsIx = unwrapParen(e.binLeft)
+  if lhsIx < 0 || lhsIx >= P.nodes.length {
+    return irLMiss("coalesce field node")
+  }
+  const m = nodeAt(lhsIx)
+  // A `p?.f` an instance holds over a non-null record takes that record's row (D17566).
+  const osi = if m is OptMember { structIndexOfTy(repTyOf(opRepOf(n.cbL))) } else { -1 }
+  const p = if osi >= 0 { coalFieldPlanOfOpt(e, lhsIx, osi, n.cbAt, lw.irAt) } else { coalFieldPlanOf(e, lhsIx, n.cbAt, lw.irAt) }
   const boxed = n.cbArm == "fieldBox"
   if p.cfArm != (if boxed { "boxed" } else { "unbox" }) {
     return irLMiss("coalesce field plan")
   }
   // A receiver legacy keeps in its stash is teed there and read back (`coalFieldRecvStash`).
-  const m = nodeAt(unwrapParen(e.binLeft))
-  if !(m is Member) { return irLMiss("coalesce field node") }
-  const st = coalFieldRecvStash(m.memObj, p)
+  const recvIx = if m is Member { m.memObj } else if m is OptMember && osi >= 0 { m.omObj } else { -1 }
+  if recvIx < 0 { return irLMiss("coalesce field node") }
+  const st = coalFieldRecvStash(recvIx, p)
   cond(n.cbL, pending)
   coalArmRecvCast(p.cfCast)
   if st >= 0 { fbLocalTee(st) }
@@ -6099,7 +6101,7 @@ function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if st >= 0 {
     fbLocalGet(st)
   } else {
-    if recvAgain(n.cbL, e.binLeft) < 0 { return -1 }
+    if opndAgain(n.cbL, recvIx) < 0 { return -1 }
     coalArmRecvCast(p.cfCast)
   }
   if boxed { coalFieldRead(p) }
