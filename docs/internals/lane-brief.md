@@ -102,6 +102,7 @@ not list reds that job. ready-check does not cover these:
 - A branch cut before land-check existed runs master's copy:
   `git show origin/master:scripts/land-check.sh | bash -s <pr>`. In a worktree with no host binary
   or seed, it takes the main checkout's.
+- On `LAND-RETRY`, run it again: the host or seed it copied was rebuilt while it checked.
 - On `LAND-NO: conflicts with master`, merge `origin/master` in (merge, not rebase), re-run
   `gate.sh --fast`, push, and run land-check again.
 - After a merge, start your next item. When your brief is done, send `DONE` with what landed, what
