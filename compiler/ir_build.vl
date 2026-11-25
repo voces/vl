@@ -389,6 +389,7 @@ import {
   holderCallRefPlainKey,
   holderCallSigs,
   holderPickOf,
+  holeBoxHeadAhead,
   holeBoxLeads,
   holeBoxTyAt,
   hostCallNamed,
@@ -2479,10 +2480,18 @@ function objLitAt(
       && repNodeAt(ks[k]) is RClosure
       && exprPrePathWhy(valIx, ibFnIx) == ""
       && recHeapNoted(rep)
+    // …and so is one at a field that holds such a closure or `null` (`cloNicheTakes`).
+    const nicheClo = !holed
+      && !clo
+      && own < 0
+      && !typed
+      && cloNicheTakes(v1, ks[k], valIx)
+      && recHeapNoted(rep)
     // A record or list the field holds as it stands, apart in no hole, is retagged too.
     const stands = vr != ks[k]
       && !holed
       && !clo
+      && !nicheClo
       && retagsAsStands(vr, ks[k], valIx)
     // A sub-word field (`repSubWord`) takes a plain i32, which the struct's field truncates.
     const packed = repSubWord(ks[k]) && repPrim(vr) == "i32"
@@ -2491,12 +2500,14 @@ function objLitAt(
       && !holed
       && !clo
       && !stands
+      && !nicheClo
       && !packed
       && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr)
     ) {
       return irBMiss("object field coercion")
     }
-    const v = if holed || clo || stands { repTemp(b, { rgV: v1 }, valIx, ks[k]) } else { v1 }
+    const v = if nicheClo { cloNicheRetag(b, v1, ks[k], valIx) } else if holed || clo || stands { repTemp(b, { rgV: v1 }, valIx, ks[k]) } else { v1 }
+    if ibMiss != "" { return v }
     if clo { irCloFieldRetagNote(ib, b[b.length - 1]) }
     layout[fi] = k
     if stashRow >= 0 { src.push(k) }
@@ -6280,6 +6291,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
     return strFromBytesRhs(b, c, ix)
   }
+  if d < 0 && trapCallNamed(c, ibFnIx) && tplStrHoleOf(c, ibFnIx) < 0 {
+    return trapCallRhs(b, c, ix)
+  }
   if d < 0 && numIntrCallReached(c, cf, ibFnIx) && tplStrHoleOf(c, ibFnIx) < 0 {
     if cf.identName == "fromCodePoint" || cf.identName == "fromCodePoints" {
       return fromCpRhs(b, c, cf, ix)
@@ -6614,8 +6628,11 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         && exprPrePathWhy(cargs[i], ibFnIx) == "") { repTempTy(b, { rgV: a }, cargs[i], pr, pt) } else if irBOpRep(a) != pr && recRetagNoted(irBOpRep(a), pr, cargs[i]) { repTempTy(b, { rgV: a }, cargs[i], pr, pt) } else { a }
       // A union parameter boxes the argument as legacy's `emitUnionBoxOwed` does (the floor); a
       // reference its parameter's valtype holds as it stands is passed as is (`repStoresAs`).
-      const fa = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, cargs[i], pr, -1, fu) } else { ra }
+      const fa0 = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, cargs[i], pr, -1, fu) } else { ra }
       if ibMiss != "" { return missRhs(ibMiss) }
+      // A closure handed to a parameter that holds a closure of its struct or `null` (the niche):
+      // retagged to that closure, then into its niche, as a field's (`objLitAt`).
+      const fa = if cloNicheTakes(fa0, pr, cargs[i]) { cloNicheRetag(b, fa0, pr, cargs[i]) } else { fa0 }
       if (
         irBOpRep(fa) != pr
         && !repNullRefFits(irBOpRep(fa), pr)
@@ -8362,6 +8379,23 @@ function trapStmt(b: i32[], c: Call, ix: i32) {
   return 0
 }
 
+// `__trap__(msg?)` read as a value: its message streamed, then legacy's `unreachable` for the
+// value, padded where the call ends a `never` (`emitCallCoreTrap`, `callEndsNever`).
+function trapCallRhs(b: i32[], c: Call, ix: i32): Rhs {
+  if c.callArgs.length > 1 { return missRhs("trap arguments") }
+  if c.callArgs.length == 1 {
+    if printArmOf(c.callArgs[0], ibFnIx) != "str" {
+      return missRhs("trap message")
+    }
+    const v = irBExpr(b, c.callArgs[0])
+    if ibMiss != "" { return missRhs("trap message") }
+    if repPrim(irBOpRep(v)) != "str" { return missRhs("trap message rep") }
+    irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+  }
+  const r: Rhs = { dnAt: ix, dnPad: callEndsNever(ix) }
+  return r
+}
+
 // Places the blocks a nullable print opens (`RPrintOpen`, arm `arm`) at index `at` of body `b`,
 // before the operand statements built from there.
 function printOpenAt(b: i32[], at: i32, arm: i32, ix: i32) {
@@ -9226,8 +9260,9 @@ function eqOperandRaw(b: i32[], ix: i32): Opnd {
   return deliver(b, ix, repNodeOfTy(ty), ty)
 }
 
-// A `==`/`!=` legacy writes on its numeric tail (`eqRouteOf`'s `numeric`) over a `boolean | null` niche and a bool or another
-// niche: each operand's i32 cell, then the plain compare.
+// A `==`/`!=` legacy writes on its numeric tail (`eqRouteOf`'s `numeric`) over a `boolean | null`
+// niche and a bool or another niche, or over two operands at one `i32` or `bool` cell (a function
+// set's ids): each operand's cell, then the plain compare.
 function nicheBoolEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const p = binPrimOp(n.binOp, false)
   if p == null { return irBMiss("operator " + n.binOp) }
@@ -9240,13 +9275,12 @@ function nicheBoolEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const rr = irBOpRep(r)
   const ln = repBoolNiche(lr)
   const rn = repBoolNiche(rr)
-  if (
-    !(ln || rn)
-    || !(ln || repPrim(lr) == "bool")
-    || !(rn || repPrim(rr) == "bool")
-  ) {
-    return irBMiss(OPERAND_TYPE)
-  }
+  const lp = repPrim(lr)
+  const cell = lr == rr && lp != null && (lp == "i32" || lp == "bool")
+  const niche = (ln || rn)
+    && (ln || repPrim(lr) == "bool")
+    && (rn || repPrim(rr) == "bool")
+  if !cell && !niche { return irBMiss(OPERAND_TYPE) }
   return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
 }
 
@@ -9988,8 +10022,8 @@ function tagSpanNote(b: i32[], b0: i32, ix: i32) {
 // (`stashIfBoxHead`), as legacy does.
 function boxOfJoinAt(b: i32[], at: i32): boolean {
   let ja = if ifCondLetAt(ib, b, at) { at + 1 } else { at }
-  // A coalesce that stages its operand's leads (`coalArmStagesLeads`) may follow that operand's
-  // own nodes, none of them a statement the lead would be written above.
+  // A coalesce may follow its operand's own nodes, none of them a statement the lead would be
+  // written above: the lowering writes the head ahead of the coalesce, which reads them there.
   let q = ja
   while (
     q < b.length
@@ -9999,14 +10033,7 @@ function boxOfJoinAt(b: i32[], at: i32): boolean {
     q = q + 1
   }
   const qn = if q < b.length { ib.irNodes[b[q]] } else { null }
-  if (
-    q > ja
-    && qn is SCoalBox
-    && coalArmStagesLeads(qn.cbArm)
-    && !ifBelowLeadHas(b, ja, q)
-  ) {
-    ja = q
-  }
+  if (q > ja && qn is SCoalBox && !ifBelowLeadHas(b, ja, q)) { ja = q }
   if b.length < ja + 2 { return false }
   const j = ib.irNodes[b[ja]]
   let out = if j is SIf { j.siOut } else if j is SCoalBox { j.cbOut } else { -1 }
@@ -10024,8 +10051,9 @@ function boxOfJoinAt(b: i32[], at: i32): boolean {
   if !(r is RToBox) { return false }
   const v = r.bxV
   if !(v is OVar) || v.ov != out { return false }
-  // Only a box whose head leads its value has its head written ahead of the join.
-  return holeBoxLeads(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
+  // Only a box whose head leads its value, or takes its slot ahead of it, has that head written
+  // ahead of the join.
+  return holeBoxHeadAhead(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
 }
 
 // Where the delivery built into `b` from `at` on ends in a box whose head leads and its value's own
@@ -10167,13 +10195,36 @@ function boxIntoOtherUnion(ix: i32, dst: i32, dstTy: i32): boolean {
   return dstTy < 0 || holeBoxPlanOf(ix, dstTy, ibFnIx).hbArm != "pass"
 }
 
-// The union legacy's field writer boxes literal row `row`'s field `fi` at.
 // Whether rep `dst` is the nullable of rep `r`, `r` a scalar.
 function nullableOver(dst: i32, r: i32): boolean {
   const n = repNodeAt(dst)
   return repIsScalar(r) && n is RNullable && n.rnInner == r
 }
 
+// Whether closure value `v` (node `ix`) is retagged into nullable closure rep `dst` by its niche:
+// `dst` holds a closure or `null`, `v` a closure of the one closure struct, delivered plainly.
+function cloNicheTakes(v: Opnd, dst: i32, ix: i32): boolean {
+  const vr = irBOpRep(v)
+  const dn = repNodeAt(dst)
+  return vr != dst
+    && dn is RNullable
+    && dn.rnDisc == 1
+    && repNodeAt(dn.rnInner) is RClosure
+    && repNodeAt(vr) is RClosure
+    && exprPrePathWhy(ix, ibFnIx) == ""
+}
+
+// Closure value `v` (node `ix`) retagged to nullable closure rep `dst`'s closure, then into its
+// niche (`cloNicheTakes`).
+function cloNicheRetag(b: i32[], v: Opnd, dst: i32, ix: i32): Opnd {
+  const dn = repNodeAt(dst)
+  if !(dn is RNullable) { return irBMiss("closure niche rep") }
+  const c = if irBOpRep(v) == dn.rnInner { v } else { repTemp(b, { rgV: v }, ix, dn.rnInner) }
+  if irBOpRep(v) != dn.rnInner { irCloFieldRetagNote(ib, b[b.length - 1]) }
+  return repTemp(b, { rgV: c }, ix, dst)
+}
+
+// The union legacy's field writer boxes literal row `row`'s field `fi` at.
 function fieldSiteTy(arm: ObjLitArm, row: i32, fi: i32): i32 {
   return if arm == "variant" { variantFieldBoxTy(row, fi) } else { structFieldBoxTy(row, fi) }
 }
