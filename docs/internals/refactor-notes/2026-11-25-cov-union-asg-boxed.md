@@ -14,6 +14,13 @@
   writes that cast through `asgWiderRowTail`, which `emitAsgValueOf`'s `widerRow` arm now calls
   too. Its operand is the name's record or the nullable record its cell holds.
 
+- **widerRow as an `if` arm.** Legacy's arm planner (`refIfArmOf`, through `ifArmIsValue`)
+  counts an assignment as an arm's value only where its target re-reads, so a `widerRow` write
+  is `noValue` and legacy refuses ("if-expression arm ends in a statement"). The IR's `refIfArm`
+  builds such an arm as a plain value (`ifArmWiderWrite`); the claimless build still refuses, so
+  `scripts/ir-divergence-baseline.txt` lists `ifArm` and `elseArm` of
+  `tests/cases/records/wider-record-write-as-if-arm-value.vl` as legacy-wrong (O3).
+
 ## Measurements
 
 - Class cut of the census (`CENSUS_CLASS`, 47 programs), against the tree after #10095 (this
