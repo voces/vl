@@ -36,4 +36,5 @@ into its stash, code 42 keyed by rep. It then runs the rungs, and every read of 
   sits in an `if` condition, a return, a `let` initializer, a call argument, a `&&` operand, an
   `if` arm value, a negation, a record field, a list element, an interpolation hole, a `while`
   condition and a lambda body. `gEv` proves each call ran once (27). Base: 3 `is staged`. Head:
-  71 matched, and 1 `is rung` (the float box's `floatLits` rung, which #10028 claims).
+  72 of 72 matched on master with #10028. `float-box-int-literal-is-positions.vl`'s two staged
+  functions (`once`, `staged`) now claim too: 68 of 68 matched.
