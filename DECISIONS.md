@@ -13122,3 +13122,7 @@ This extends the `??` hole precedent, D1589 (`fillCoalHoleNodes`), which re-asks
 **Where it fires.** Only where the read is not flow-narrowed. Inside a function, the checker already types a read before any write as `null`, so the local spelling's join is a correct `In | null` and runs. Emit now delivers such a read as the destination's null (D17203's emit half, D17204). The refusal is left to a function that reads a module binding a later top-level write fills.
 
 **Rejected alternative.** A new flow-sensitive "still definitely null" arm was rejected: it covers only the straight-line local case, which the existing narrowing already covers, and not the read across a function boundary.
+
+## A call refused for its argument count is typed by the callee's declared return (2026-11-25, coordinator ruling) — D17481
+
+**Ruled by the coordinator 2026-11-25**, on lane O2's D17481. Recovery after `wrong number of arguments` types the call by the callee's declared return, not `<error>`, as TypeScript does. What reads the result is checked against that type, so an independent true error still reports: `const s: string = mk(1, 2)` gives the arity error and `cannot assign A to 's'`, which is wrong at any arity. `<error>` would absorb such checks and hide them.
