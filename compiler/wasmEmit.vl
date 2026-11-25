@@ -47286,7 +47286,50 @@ export function coalFieldPlanOf(
   fnIx: i32,
 ): CoalFieldPlan {
   const lhs = nodeAt(lhsIx)
-  const none: CoalFieldPlan = {
+  if !(lhs is Member) { return coalFieldPlanNone() }
+  // A box receiver narrowed to one arm is unwrapped to that arm, asked ahead of the row as
+  // `emitMem` asks it: an index place is typed at the arm, so `structIndexOfExpr` answers
+  // for a ref it does not hold (D8145).
+  const mvi = coalNarrowedBoxArm(lhsIx, fnIx)
+  const msi = if mvi >= 0 { -1 } else { structIndexOfExpr(lhs.memObj, fnIx) }
+  return coalFieldPlanAt(
+    e,
+    lhsIx,
+    lhs.memObj,
+    lhs.memProp,
+    mvi,
+    msi,
+    exprIx,
+    fnIx,
+  )
+}
+
+// `coalFieldPlanOf` for `p?.f ?? d` whose receiver an instance holds as a non-null record of
+// struct row `si` (the template typed it a hole): the plan of that row's field `f`.
+export function coalFieldPlanOfOpt(
+  e: BinExpr,
+  lhsIx: i32,
+  si: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalFieldPlan {
+  const lhs = nodeAt(lhsIx)
+  if !(lhs is OptMember) || si < 0 { return coalFieldPlanNone() }
+  return coalFieldPlanAt(e, lhsIx, lhs.omObj, lhs.omProp, -1, si, exprIx, fnIx)
+}
+
+// Whether `p?.f` (node `lhsIx`) reads a receiver the template typed with a type variable, which
+// an instance may hold at a concrete record (`coalFieldPlanOfOpt`).
+export function optRecvHoleTyped(lhsIx: i32): boolean {
+  if lhsIx < 0 || lhsIx >= P.nodes.length { return false }
+  const m = nodeAt(lhsIx)
+  if !(m is OptMember) { return false }
+  const recv = unwrapParen(m.omObj)
+  return recv >= 0 && recv < P.nodes.length && tyHasTyVar(nodeTyIxOf(recv))
+}
+
+function coalFieldPlanNone(): CoalFieldPlan {
+  return {
     cfArm: "none",
     cfHeap: -1,
     cfFi: -1,
@@ -47296,35 +47339,46 @@ export function coalFieldPlanOf(
     cfRk: -1,
     cfMak: -1,
   }
-  if !(lhs is Member) { return none }
+}
+
+// The plan of `recv.prop ?? d` (node `lhsIx`) over a receiver narrowed to variant `mvi0`, else of
+// struct row `msi`, else of the receiver's own variant: the field's box heap and index, then
+// the arm its union and the result take.
+function coalFieldPlanAt(
+  e: BinExpr,
+  lhsIx: i32,
+  recv: i32,
+  prop: string,
+  mvi0: i32,
+  msi: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalFieldPlan {
+  const none = coalFieldPlanNone()
   // The receiver is a struct row or a union arm; an arm's field reads off its own heap
-  // type exactly as a row's does (D4667).
+  // type exactly as a row's does (D4667). A null-tested nullable arm is asserted non-null.
   let mHeap = -1
   let mfi = -1
   let mphys = ""
   let mphysTy = -1
   let mCast = -1
-  // A box receiver narrowed to one arm is unwrapped to that arm, asked ahead of the row as
-  // `emitMem` asks it: an index place is typed at the arm, so `structIndexOfExpr` answers
-  // for a ref it does not hold (D8145). A null-tested nullable arm is asserted non-null.
-  let mvi = coalNarrowedBoxArm(lhsIx, fnIx)
+  let mvi = mvi0
   if mvi >= 0 { mCast = variantHeap(mvi) }
-  const msi = if mvi >= 0 { -1 } else { structIndexOfExpr(lhs.memObj, fnIx) }
   if msi >= 0 {
-    mfi = sFieldIndex(msi, lhs.memProp)
+    mfi = sFieldIndex(msi, prop)
     if mfi >= 0 && sFieldIsUnionBox(msi, mfi) {
       mHeap = sHeapIdx[msi]
       mphys = sFieldElemNameAt(msi, mfi)
       mphysTy = sFieldElemTyIxAt(msi, mfi)
     }
   } else {
-    if mvi < 0 { mvi = exprVariantIndex(lhs.memObj, fnIx) }
+    if mvi < 0 { mvi = exprVariantIndex(recv, fnIx) }
     if mvi < 0 {
-      mvi = nulVariantIdxOfExpr(lhs.memObj, fnIx)
+      mvi = nulVariantIdxOfExpr(recv, fnIx)
       if mvi >= 0 { mCast = -2 }
     }
     if mvi >= 0 {
-      mfi = variantFieldIndex(mvi, lhs.memProp)
+      mfi = variantFieldIndex(mvi, prop)
       if mfi >= 0 && fieldRowIsUnionBox(uFieldStart[mvi] + mfi) {
         mHeap = variantHeap(mvi)
         mphys = variantFieldElemName(mvi, mfi)
