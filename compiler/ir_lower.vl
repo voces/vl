@@ -505,7 +505,10 @@ import {
   initBitOf,
   intSelTail,
   listBuildClose,
+  listGetIdxHook,
+  listGetIdxLegacy,
   listGetOrOpen,
+  listGetRecvHook,
   listOpRecvHeld,
   listOpStageBase,
   listReserveOpen,
@@ -2280,6 +2283,97 @@ function numIs(r: RNumIs): i32 {
     i = i + 1
   }
   return 1
+}
+
+// The `.get` index operands `listGetIdxHook` reads while legacy's `.get` head is written, innermost
+// last, and beside each the reads of it so far.
+const getIdxOs: Opnd[] = []
+const getIdxReads: i32[] = []
+
+// The `.get` receiver operands `listGetRecvHook` reads while `coalListGetOr` writes legacy's head,
+// innermost last; each read is the operand read again (`opndAgain`).
+const getRecvOs: Opnd[] = []
+
+// Whether receiver operand `o` of node `ix` can be read again at each use: a variable, or a temp
+// whose read the builder recorded (`irHoistRecv`'s tables).
+function recvReadAgainOk(o: Opnd, ix: i32): boolean {
+  if o is OImm { return true }
+  if !(o is OVar) { return false }
+  if !isTemp(o.ov) { return true }
+  return hoistedReadKnown(ix)
+}
+
+// Whether `irHoistRecv` finds a recorded read for node `ix`.
+function hoistedReadKnown(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if (lw.irReadVar[ix] ?? -1) >= 0 { return true }
+  if lw.irReadAgain.has(ix) || lw.irReadElem.has(ix) { return true }
+  if lw.irReadOpt.get(ix) != null { return true }
+  const m = nodeAt(ix)
+  return lw.irReadField.has(ix)
+    && m is Member
+    && hoistedReadKnown(unwrapParen(m.memObj))
+}
+
+// Hands legacy's `.get` head receiver operand `o` of node `ix` (`listGetRecvHook`) where it can be
+// read again (`recvReadAgainOk`). Returns whether it did; `irGetRecvEnd` then undoes it.
+function irGetRecvBegin(o: Opnd, ix: i32): boolean {
+  if !recvReadAgainOk(o, ix) { return false }
+  getRecvOs.push(o)
+  listGetRecvHook = irListGetRecvRead
+  return true
+}
+
+// Undoes the innermost `irGetRecvBegin`.
+function irGetRecvEnd() {
+  getRecvOs.pop()
+  if getRecvOs.length == 0 { listGetRecvHook = listGetIdxLegacy }
+  return 0
+}
+
+// `listGetRecvHook` under `coalListGetOr`: the innermost receiver operand read again.
+function irListGetRecvRead(objIx: i32, _fnIx: i32): i32 {
+  const at = getRecvOs.length - 1
+  if at < 0 {
+    irLMiss("get receiver unset")
+    return -1
+  }
+  if opndAgain(getRecvOs[at], objIx) < 0 { return -1 }
+  return 0
+}
+
+// Hands legacy's `.get` head index operand `o` (`listGetIdxHook`) where it is read at each use: an
+// immediate or a variable, never a temp. Returns whether it did; `irGetIdxEnd` then undoes it.
+export function irGetIdxBegin(o: Opnd): boolean {
+  if !(o is OImm || o is OVar && !isTemp(o.ov)) { return false }
+  getIdxOs.push(o)
+  getIdxReads.push(0)
+  listGetIdxHook = irListGetIdxRead
+  return true
+}
+
+// Undoes the innermost `irGetIdxBegin`.
+export function irGetIdxEnd() {
+  getIdxOs.pop()
+  getIdxReads.pop()
+  if getIdxOs.length == 0 { listGetIdxHook = listGetIdxLegacy }
+  return 0
+}
+
+// `listGetIdxHook` under `coalListGetOr`: the index operand the first time, then read again.
+function irListGetIdxRead(idxIx: i32, _fnIx: i32): i32 {
+  const at = getIdxOs.length - 1
+  if at < 0 || at >= getIdxReads.length {
+    irLMiss("get index unset")
+    return -1
+  }
+  const k = getIdxReads[at]
+  getIdxReads[at] = k + 1
+  if k == 0 {
+    irLOpnd(getIdxOs[at])
+    return 0
+  }
+  return opndAgain(getIdxOs[at], idxIx)
 }
 
 // The operands legacy fit writers' tails re-read through `fitRecvReadHook` while `irFitTail`
@@ -5973,15 +6067,24 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
 }
 
 // The fused `xs.get(i) ?? d`: legacy's shared head re-reads the receiver and the index the
-// builder found re-readable, so the receiver operand is skipped; then the default and the end.
+// builder found re-readable, so the receiver operand is skipped, and the index is the builder's
+// operand where it holds one (`listGetIdxHook`); then the default and the end.
 function coalListGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwSeq = []
   irLSkip(n.cbL)
   if lwMiss != "" { return -1 }
   irLSettle(pending)
-  if listGetOrOpen(unwrapParen(e.binLeft), lw.irAt) == null {
-    return irLMiss("listGetOr head")
-  }
+  const ci = n.cbIdx
+  const hooked = if ci != null { irGetIdxBegin(ci) } else { false }
+  // The receiver, skipped above, is read again at each of the head's reads where it can be.
+  const call = nodeAt(unwrapParen(e.binLeft))
+  const callee = if call is Call && call.callFn >= 0 { nodeAt(call.callFn) } else { null }
+  const recvIx = if callee is Member { unwrapParen(callee.memObj) } else { -1 }
+  const recvHooked = recvIx >= 0 && irGetRecvBegin(n.cbL, recvIx)
+  const ek = listGetOrOpen(unwrapParen(e.binLeft), lw.irAt)
+  if recvHooked { irGetRecvEnd() }
+  if hooked { irGetIdxEnd() }
+  if ek == null { return irLMiss("listGetOr head") }
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   lwFrames.pop()
