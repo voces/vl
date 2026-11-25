@@ -7805,7 +7805,7 @@ function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
 
 // `m.keys()` or `m.values()` as legacy's writer takes it: the map variable as itself, or a read
 // written again as the builder read it (`recvReadsAgain`), since that writer reads its receiver
-// once per step.
+// once per step; any other receiver is evaluated once (`miOnce`).
 function mapIterRhs(b: i32[], m: Member, ix: i32): Rhs {
   if mapShapeOfExpr(m.memObj, ibFnIx) == -3 {
     return missRhs("map iter value type")
@@ -7813,17 +7813,21 @@ function mapIterRhs(b: i32[], m: Member, ix: i32): Rhs {
   const at = b.length
   const v = irBExpr(b, m.memObj)
   if ibMiss != "" { return missRhs("method operand") }
-  const again = v is OVar
-    && v.ov >= 0
-    && ib.irVars[v.ov].vKind == "temp"
-    && recvReadsAgain(unwrapParen(m.memObj))
-  if (b.length != at && !again) || !(v is OVar) {
+  const temp = v is OVar && v.ov >= 0 && ib.irVars[v.ov].vKind == "temp"
+  const again = temp && recvReadsAgain(unwrapParen(m.memObj))
+  if !(v is OVar) || b.length != at && !temp {
     return missRhs("map iter receiver")
   }
   if !(repNodeAt(irBOpRep(v)) is RMap) {
     return missRhs("map iter receiver rep")
   }
-  const r: Rhs = { miV: v, miAt: ix, miVals: m.memProp == "values" }
+  const once = temp && !again
+  const r: Rhs = {
+    miV: v,
+    miAt: ix,
+    miVals: m.memProp == "values",
+    miOnce: once,
+  }
   return r
 }
 
@@ -9164,6 +9168,13 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   }
   // Else the storage read is that null, the local as it stands (`identReadArmOf` past the null).
   if nro == NULL_READ_STORED {
+    // A union destination whose box plan writes the null's own tag leaves the storage unread.
+    if (
+      heldAsBox(dst)
+      && holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx).hbArm == "null"
+    ) {
+      return boxTemp(b, { oiRep: ibNoValue, oiBits: 0 }, ix, dst)
+    }
     const sv = exprAt(b, ix, true)
     if ibMiss == "" && irBOpRep(sv) != dst {
       return irBMiss("null read storage rep")
@@ -12128,9 +12139,8 @@ function coalField(
   if recvIx < 0 { return irBMiss("coalesce field node") }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
-  // Its value stays on the stack from here, so no temp an operand before it built may wait.
-  if endsInTemp(b) { return irBMiss("coalesce field after an operand") }
-  // A box legacy unwraps itself is read at its storage, not narrowed.
+  // A box legacy unwraps itself is read at its storage, not narrowed. An operand built before it
+  // is written below the field's test (`coalArmStagesLeads`).
   const r = if p.cfCast >= 0 { storageReadOf(b, recvIx) } else { irBExpr(b, recvIx) }
   if ibMiss != "" { return r }
   // A receiver legacy re-emits is read again as the builder read it (`irHoistRecv`).
