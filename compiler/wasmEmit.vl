@@ -8092,6 +8092,20 @@ function emitOptChainIsNull(exprIx: i32, fnIx: i32) {
   return 0
 }
 
+// `?.` link `exprIx`'s value after its receiver's non-null value: the field, recovered non-null.
+// 0, or -1 for a link off no struct field.
+export function emitOptLinkValueTail(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return -1 }
+  const psi = optChainStructIdxOf(e.omObj, fnIx)
+  if psi < 0 || psi >= sHeapIdx.length { return -1 }
+  const pfi = sFieldIndex(psi, e.omProp)
+  if pfi < 0 { return emitFail("emitProgram: `?.` field is not on the struct") }
+  fbStructGet(sHeapIdx[psi], pfi)
+  fbRefAsNonNull()
+  return 0
+}
+
 // After `?.` link `exprIx`'s receiver null test: the `if` that answers true for a null receiver, else
 // tests the field. Whether the field's own null is tested, so the receiver's value comes next.
 export function emitOptLinkNullOpen(exprIx: i32, fnIx: i32): boolean {
@@ -8136,14 +8150,11 @@ function emitOptChainValue(exprIx: i32, fnIx: i32) {
     if psi < 0 {
       return emitFail("emitProgram: `?.` receiver is not a struct chain")
     }
-    const pfi = sFieldIndex(psi, e.omProp)
-    if pfi < 0 {
+    if sFieldIndex(psi, e.omProp) < 0 {
       return emitFail("emitProgram: `?.` field is not on the struct")
     }
     if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-    fbStructGet(sHeapIdx[psi], pfi)
-    fbRefAsNonNull()
-    return 0
+    return emitOptLinkValueTail(exprIx, fnIx)
   }
   // The cast off the stash already recovers a non-null ref; the in-place spelling recovers
   // its own niche.
@@ -22484,26 +22495,58 @@ export function nulStructEqGuardTail(
 ) {
   const lRoot = roots[0]
   const rRoot = roots[1]
-  fbBlock(127) // block i32 — $out
+  nulStructEqGuardOpen()
   if emitEqRootIsNull(lRoot, lIx, fnIx, rp.erL) < 0 { return -1 }
   if emitEqRootIsNull(rRoot, rIx, fnIx, rp.erR) < 0 { return -1 }
+  nulStructEqGuardMid()
+  if emitEqRootIsNull(lRoot, lIx, fnIx, rp.erL) < 0 { return -1 }
+  nulStructEqGuardBoth()
+  if nulStructEqFieldsAt(lRoot, rRoot, si, fnIx, rp) < 0 { return -1 }
+  nulStructEqGuardClose()
+  return 0
+}
+
+// `nulStructEqGuardTail`'s parts, in order: the `$out` block, then the two sides' null tests;
+// `Mid` answers 0 where they disagree; the left's test again; `Both` answers 1 where it is null;
+// the field-wise compare (`nulStructEqFieldsAt`); `Close` ends the block.
+export function nulStructEqGuardOpen() {
+  fbBlock(127) // block i32 — $out
+  return 0
+}
+
+export function nulStructEqGuardMid() {
   fbI32Bin(71) // 0x47 i32.ne — the two sides disagree on nullness
   fbIf(64)
   fbI32Const(0)
   fbBr(1) // → $out
   fbEnd()
-  if emitEqRootIsNull(lRoot, lIx, fnIx, rp.erL) < 0 { return -1 }
+  return 0
+}
+
+export function nulStructEqGuardBoth() {
   fbIf(64)
   fbI32Const(1) // both null ⇒ equal
   fbBr(1) // → $out
   fbEnd()
-  const pathSi: i32[] = []
-  const pathFi: i32[] = []
-  if (emitStructEqRec(lRoot, rRoot, si, pathSi, pathFi, fnIx, rp) < 0) {
-    return -1
-  }
+  return 0
+}
+
+export function nulStructEqGuardClose() {
   fbEnd()
   return 0
+}
+
+// The field-wise compare of a nullable-record compare at eq row `si`, from roots `lRoot`/`rRoot`.
+export function nulStructEqFieldsAt(
+  lRoot: i32,
+  rRoot: i32,
+  si: i32,
+  fnIx: i32,
+  rp: EqRootPlan,
+): i32 {
+  const pathSi: i32[] = []
+  const pathFi: i32[] = []
+  return emitStructEqRec(lRoot, rRoot, si, pathSi, pathFi, fnIx, rp)
 }
 
 // The stash slots `structEqEnter` saved, restored after a compare that is not `structEqTail`'s.
@@ -22747,7 +22790,12 @@ function structEqSlot(row: i32, side: i32): i32 {
 
 // `emitEqIsNull` over a compare root: a stashed operand is tested off its slot, and an `elem`
 // place's element (`eqElemNullTestOk`) is read through the place, its row banked.
-function emitEqRootIsNull(root: i32, ix: i32, fnIx: i32, place: EqRootPlace) {
+export function emitEqRootIsNull(
+  root: i32,
+  ix: i32,
+  fnIx: i32,
+  place: EqRootPlace,
+) {
   if root == -2 || root == -3 {
     fbLocalGet(if root == -2 { eqStashL } else { eqStashR })
     fbRefIsNull()
@@ -33503,6 +33551,7 @@ type MfSrcTys = {
   srcBack: i32,
   srcElemRef: boolean,
   srcSlot: i32,
+  srcNulUnit: boolean,
 }
 
 // The interned signature of `.map`/`.filter` callback `argIx`: the lifted function `cbFe`'s, or
@@ -33571,6 +33620,7 @@ function mfRefused(why: string): MfPlan {
     srcBack: -1,
     srcElemRef: false,
     srcSlot: -1,
+    srcNulUnit: false,
   }
   const dst: MfDstTys = { dstWrap: -1, dstBack: -1 }
   const p: MfPlan = {
@@ -33612,6 +33662,20 @@ export function mapFilterWhy(callIx: i32, fnIx: i32): string {
   }
   if cbn is Ident { return "" }
   return "map callback expression"
+}
+
+// Whether `.map`/`.filter` over receiver `recvIx` reads a `null[]` element, stored as the
+// `boolean | null` sentinel (D4671), for callback `argIx` whose element parameter is `nullref`:
+// the loop then hands the callback the bottom ref in its place (D17039).
+function mfNulUnitToRef(
+  recvIx: i32,
+  argIx: i32,
+  cbFe: i32,
+  fnIx: i32,
+): boolean {
+  if !arrElemIsNullUnitAt(recvIx, fnIx) { return false }
+  const key = if cbFe >= 0 { cloSigKeyExt(cbFe) } else { mfCallbackCloKey(argIx, fnIx) }
+  return key != "" && sigParamKindAt(key, 0) == "nulnone"
 }
 
 // The plan of `.map`/`.filter` call `callIx`, asked where legacy's arm asks it.
@@ -33660,6 +33724,7 @@ export function mapFilterPlanOf(callIx: i32, fnIx: i32): MfPlan {
   if !fnUses.mapFilter || p.mfSrcL < 0 || p.mfDstL < 0 {
     return mfRefused("emitProgram: .map/.filter scratch frame not reserved")
   }
+  p.mfSrc.srcNulUnit = mfNulUnitToRef(callee.memObj, c.callArgs[0], cbFe, fnIx)
   p.mfIsMap = callee.memProp == "map"
   p.mfRecv = callee.memObj
   p.mfCb = c.callArgs[0]
@@ -33719,6 +33784,7 @@ export function mfLoopTail(p: MfPlan, cL: i32) {
   const iL = mfScratchBase
   const nL = mfScratchBase + 1
   const jL = mfScratchBase + 2
+  mfNulUnit = p.mfSrc.srcNulUnit
   fbLocalSet(cL)
   // n = src.len
   fbLocalGet(srcL)
@@ -33776,6 +33842,7 @@ export function mfLoopTail(p: MfPlan, cL: i32) {
     fbStructGet(cloStructIdx, 0) // env
     fbLocalGet(eL)
     if srcElemRef { fbRefAsNonNull() }
+    mfNulUnitSwap()
     fbLocalGet(cL)
     fbStructGet(cloStructIdx, 1) // the callee's wasm function index
     fbCallIndirect(sig, gFnTableIdx)
@@ -35196,6 +35263,16 @@ function emitMfElem(
 // The ref-list slot `emitMfElem` reads from, for a read-side retag of its union boxes; -1 outside
 // a `.map`/`.filter` loop or where the source is not a ref list.
 let mfSrcSlot = -1
+// The current loop's `srcNulUnit`, set by `mfLoopTail`.
+let mfNulUnit = false
+
+// Replace the `null[]` element on the stack with the bottom ref its callback takes.
+function mfNulUnitSwap() {
+  if !mfNulUnit { return 0 }
+  fbDrop()
+  fbRefNullNone()
+  return 0
+}
 // The view destination `emitMfElem` reads each element through, as a callback's write to the
 // source must be seen by the next read (D3028); -1 where the source cannot be a view.
 let mfSvDst = -1
@@ -35261,6 +35338,7 @@ function emitMfInvoke(
   fbLocalGet(cL)
   fbStructGet(cloStructIdx, 0)     // env
   emitMfElem(srcL, iL, srcWrap, srcBack, srcElemRef)
+  mfNulUnitSwap()
   fbLocalGet(cL)
   fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
   fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
@@ -46061,6 +46139,17 @@ export function coalChainLinkOf(exprIx: i32, fnIx: i32): i32 {
   return -1
 }
 
+// Records outer link `ro` minted at lowering for chain `exprIx` in `fnIx`, so a later reader (the
+// armed shadow of a start body) finds it; one minted under a per-arm override stays its own.
+function coalChainNote(exprIx: i32, fnIx: i32, ro: i32) {
+  if luOvOn != 0 { return 0 }
+  const rs = coalChainPre.get(exprIx) ?? []
+  rs.push(fnIx)
+  rs.push(ro)
+  coalChainPre[exprIx] = rs
+  return 0
+}
+
 // Forgets the links minted for an earlier module's bodies.
 export function coalChainsReset() {
   coalChainPre = Map()
@@ -46073,6 +46162,13 @@ export function coalChainsReset() {
 export function coalChainsPrime(fx: i32) {
   const fd = nodeAt(fx)
   if fd is FuncDecl { coalChainsWalk(fd.fnBody, fx) }
+  return 0
+}
+
+// Mints the `??` chains' links in start nodes `order` (fnIx -1), in their order, ahead of the IR's
+// start claim; legacy's lowering reads a link minted here as it reads a function's.
+export function coalChainsPrimeStart(order: i32[]) {
+  for ix in order { coalChainsWalk(ix, -1) }
   return 0
 }
 
@@ -46124,6 +46220,7 @@ function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
     const pre = coalChainLinkOf(exprIx, fnIx)
     const reOuter = if pre >= 0 { pre } else { coalChainMint(e, exprIx, fnIx) }
     if reOuter < 0 { return -1 }
+    if pre < 0 { coalChainNote(exprIx, fnIx, reOuter) }
     return emitExpr(reOuter, fnIx)
   }
   // The operand is still evaluated and dropped for effect.
