@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims a closure call whose argument writes a statement:** `f(if c { 1 } else { 2 }, 3)`, `f(n ?? 9, 1)` or `f(x = mk(), 1)` through a closure value. The call's head (the callee, its stash and env, `RCallRefHead`) is staged ahead of the argument's statement, as legacy writes it before its arguments, and the arguments before it are staged too. Verifier rule 10 holds a head to one reader, its call; failing control `irShadowCorrupt(12)`. `short-circuit closure argument` falls from 19 rows to 0. Legacy's bytes are identical across `tests/cases`, distilled, the probes, the witnesses and the self-compile.

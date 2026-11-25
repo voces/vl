@@ -1254,10 +1254,10 @@ function claimStart(
   return true
 }
 
-// The shadow's failing controls: 0 none; the verifier must refuse 1 (a variable's rep swapped), 2
-// (a temp's definition deleted), 7 to 11 (`unrelatedMapControl`, `otherAgainControl`,
-// `nulEqNoNullableControl`, `nicheKindControl` both ways); the dual emit must report 3 (a byte
-// added to the lowering), 4 (a span row dropped) and 5 (its element-read rows); 6 the held coercion.
+// The shadow's failing controls: 0 none; the verifier refuses 1 (a rep swapped), 2 (a temp's
+// definition deleted), 7 to 12 (`unrelatedMapControl`, `otherAgainControl`, `nulEqNoNullableControl`,
+// `nicheKindControl` both ways, `headControl`); the dual emit reports 3 (a byte added), 4 (a span
+// row dropped) and 5 (its element-read rows); 6 is the held coercion.
 export function irShadowCorrupt(k: i32) {
   ibCorrupt = k
   return 0
@@ -6583,6 +6583,7 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     crVoid: isVoid,
     crDrop: !isVoid,
     crNever: callEndsNever(ix),
+    crHead: false,
   }
   return r
 }
@@ -6773,9 +6774,15 @@ function resultMemberCallRhs(b: i32[], c: Call, ix: i32, rx: i32): Rhs {
 // Closure call `ix` of `f` at plain key `key`: each argument at its parameter, then the call.
 function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
   const args: Opnd[] = []
+  // Where the callee ends, where each argument starts, and the call's head once one is staged.
+  const fEnd = b.length
+  const starts: i32[] = []
+  let head: Opnd = f
+  let staged = false
   let i = 0
   while i < c.callArgs.length {
     const at = b.length
+    starts.push(at)
     // A function handed as a bundle is the record of its closures, as `emitBundleReadArg` writes it.
     const bb = callRefBundleArgOf(c, ibFnIx, key, i)
     if bb.bbTy >= 0 {
@@ -6813,8 +6820,23 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
       && nodeAt(unwrapParen(c.callArgs[i])) is NullLit { closureParamRep(f, i) } else { -1 }
     const a = if wt >= 0 { deliver(b, c.callArgs[i], repNodeOfTy(wt), wt) } else if bx >= 0 && !asIs { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else if arm == "atomToStr" { closureArgAtomStr(b, c.callArgs[i], f, i) } else if nl >= 0 { deliver(b, c.callArgs[i], nl, -1) } else { irBExpr(b, c.callArgs[i]) }
     if ibMiss != "" { return missRhs("argument") }
-    if ifBelowLead(b, at, "short-circuit closure argument") {
-      return missRhs("short-circuit closure argument")
+    // An argument that writes a statement stages the call's head, and the arguments before it,
+    // ahead of that statement, as legacy writes them before it (`RCallRefHead`).
+    if ifBelowLeadHas(b, at, b.length) {
+      if !staged {
+        staged = true
+        head = closureHeadStage(b, fEnd, f, ix)
+        if ibMiss != "" { return missRhs("short-circuit closure argument") }
+        let k = 0
+        while k < starts.length {
+          starts[k] = starts[k] + 1
+          k = k + 1
+        }
+      }
+      const argIxs = c.callArgs.slice(0, args.length)
+      if !irBStageLeads(b, starts[args.length], starts, args, argIxs) {
+        return missRhs("short-circuit closure argument")
+      }
     }
     if wt >= 0 && irBOpRep(a) != repNodeOfTy(wt) {
       return missRhs("closure argument coercion")
@@ -6835,14 +6857,28 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
     i = i + 1
   }
   const r: Rhs = {
-    crFn: f,
+    crFn: head,
     crSig: cloSigTypeIdxAt(cloSigPosOfKey(key)),
     crArgs: args,
     crVoid: sigKeyRetIsVoid(key),
     crDrop: closureCallDrops(c, ix),
     crNever: callEndsNever(ix),
+    crHead: staged,
   }
   return r
+}
+
+// Closure `f`'s call head (`RCallRefHead`) at the callee's own type, inserted into `b` at `at`,
+// where the callee ends.
+function closureHeadStage(b: i32[], at: i32, f: Opnd, ix: i32): Opnd {
+  if !(f is OVar) || f.ov < 0 || f.ov >= ib.irVars.length {
+    return irBMiss("call_ref head callee")
+  }
+  const one: i32[] = []
+  const h = irBLetTempTy(one, { chFn: f }, ix, irBOpRep(f), ib.irVars[f.ov].vTy)
+  if ibMiss != "" || one.length != 1 { return irBMiss("call_ref head") }
+  insertAt(b, at, one[0])
+  return h
 }
 
 // Call statement `n`'s right-hand side as legacy's statement ladder writes it: a closure call
@@ -6858,6 +6894,7 @@ function stmtCallRefNever(rhs: Rhs, n: Call): Rhs {
     crVoid: rhs.crVoid,
     crDrop: rhs.crDrop,
     crNever: false,
+    crHead: rhs.crHead,
   }
   return r
 }
@@ -16557,12 +16594,23 @@ function repOfNulInner(r: i32): i32 {
   return if n is RNullable { n.rnInner } else { -1 }
 }
 
+// The call head's failing control (`irShadowCorrupt(12)`): a staged head read by its call as a plain
+// callee, which rule 10 must refuse.
+function headControl() {
+  for n in ib.irNodes {
+    const r = if n is SLet { n.lRhs } else if n is SEffect { n.efRhs } else { null }
+    if r is RCallRef && r.crHead { r.crHead = false }
+  }
+  return 0
+}
+
 // The failing control: breaks `ib` in the way `ibCorrupt` names.
 function corrupt() {
   if ibCorrupt == 7 { unrelatedMapControl() }
   if ibCorrupt == 8 { otherAgainControl() }
   if ibCorrupt == 9 { nulEqNoNullableControl() }
   if ibCorrupt == 10 || ibCorrupt == 11 { nicheKindControl(ibCorrupt == 11) }
+  if ibCorrupt == 12 { headControl() }
   if ibCorrupt == 1 && ib.irVars.length > 0 {
     const v = ib.irVars[0]
     const other = if repPrim(v.vRep) == "bool" { repNodeOfTy(TY_I32) } else { ibBool }
