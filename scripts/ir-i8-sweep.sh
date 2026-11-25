@@ -23,8 +23,11 @@
 # Every stub also records its name (`i8 hit <name>` rows), so a run sees every stub a program
 # reaches, not only the first. The baseline side runs the census probe (probe-patch.sh), so a
 # newly failing program with no function or start body the seed already leaves unclaimed is
-# UNEXPLAINED: a re-entry or a stubbed helper the claim path needs. --check exits 1 when that count
-# rises above scripts/ir-i8-census/sweep-baseline.txt; --write-baseline writes it.
+# UNEXPLAINED: a re-entry or a stubbed helper the claim path needs. Its causes (the first stub or
+# re-entry, and each fallback reason the seed lacks, `fallback: <reason>`) are the ratchet:
+# --check exits 1 on a cause scripts/ir-i8-census/sweep-baseline.txt does not list, and
+# --write-baseline only removes causes. Counts are printed, never graded, because coverage moves
+# programs from explained to unexplained (coordinator ruling, 2026-11-25).
 # --edges is the static half, in seconds and with no build: every call a kept function or an ir*.vl
 # file makes of a stubbed function (`<caller>\t<stub>`), the latent paths from the claim path into
 # stage B; the boundary writers scripts/ir-i8-census/boundary.txt names are marked. --check exits 1
@@ -42,7 +45,8 @@ set -euo pipefail
 KEEP=${1:?usage: scripts/ir-i8-sweep.sh <keep-list> [--grow] [--pops LIST] [--out DIR] [--max-iter N]}
 shift
 EDGES=0 GROW=0 POPS=self,distilled,cases,probes,witnesses OUT=build/ir-i8-sweep MAXIT=30 RATCHET=""
-BASELINE_FILE=scripts/ir-i8-census/sweep-baseline.txt
+BASELINE_FILE=${IR_I8_SWEEP_BASELINE:-scripts/ir-i8-census/sweep-baseline.txt}
+# Static edges, --edges: --write-baseline there rewrites edges-baseline.txt whole.
 while [ $# -gt 0 ]; do
   case "$1" in
     --grow) GROW=1; shift ;;
@@ -301,6 +305,8 @@ VL
   # The self-compile has no seed-unclaimed function, so its failure is unexplained too.
   awk -F'\t' '$1 == "self"' "$T/failing" >> "$OUT/unexplained.tsv"
   UNEXPLAINED=$(wc -l < "$OUT/unexplained.tsv")
+  # The causes the ratchet holds: each unexplained program's cause, and each new fallback reason.
+  { cut -f3 "$OUT/unexplained.tsv"; cut -f3 "$OUT/fell.tsv" | sed 's/^/fallback: /'; } | sort -u > "$OUT/causes.txt"
   sort -u "$T/needs" | awk -F'\t' '{ n[$3]++ } END { for (k in n) print k "\t" n[k] }' | sort -t$'\t' -k2,2nr > "$OUT/needs.tsv"
   {
     cat "$T/stage"
@@ -371,14 +377,24 @@ while :; do
 done
 cat "$OUT/report.txt"
 if [ "$RC" != 2 ] && [ -n "$RATCHET" ]; then
-  if [ "$RATCHET" = --write-baseline ]; then
-    printf '%s\n' "$UNEXPLAINED" > "$BASELINE_FILE"; echo "ir-i8-sweep: wrote $UNEXPLAINED to $BASELINE_FILE"; exit 0
+  # The cause list, one per line (`#` comments allowed); a missing baseline is written whole once.
+  [ -f "$BASELINE_FILE" ] || { cp "$OUT/causes.txt" "$BASELINE_FILE"; echo "ir-i8-sweep: started $BASELINE_FILE with $(wc -l < "$BASELINE_FILE") causes"; exit 0; }
+  grep -v '^#' "$BASELINE_FILE" | awk 'NF' | sort -u > "$T/base.causes"
+  new=$(comm -23 "$OUT/causes.txt" "$T/base.causes")
+  gone=$(comm -13 "$OUT/causes.txt" "$T/base.causes")
+  if [ -n "$new" ]; then
+    echo "ir-i8-sweep: NEW causes (a claim now reaches a legacy tail or stub; see $OUT/unexplained.tsv):"; sed 's/^/  /' <<< "$new"
+    [ "$RATCHET" = --write-baseline ] && echo "ir-i8-sweep: --write-baseline only removes causes; it refuses a new one"
+    exit 1
   fi
-  base=$(tr -dc '0-9' < "$BASELINE_FILE")
-  if [ "$UNEXPLAINED" -gt "$base" ]; then
-    echo "ir-i8-sweep: UNEXPLAINED rose: $UNEXPLAINED programs, baseline $base ($BASELINE_FILE); see $OUT/unexplained.tsv"; exit 1
+  if [ -n "$gone" ]; then
+    echo "ir-i8-sweep: causes gone:"; sed 's/^/  /' <<< "$gone"
+    if [ "$RATCHET" = --write-baseline ]; then
+      { grep '^#' "$BASELINE_FILE" || true; cat "$OUT/causes.txt"; } > "$T/nb"; mv "$T/nb" "$BASELINE_FILE"
+      echo "ir-i8-sweep: removed them from $BASELINE_FILE"; exit 0
+    fi
+    echo "ir-i8-sweep: run --write-baseline in this PR to drop them"
   fi
-  [ "$UNEXPLAINED" -lt "$base" ] && echo "ir-i8-sweep: unexplained fell: $UNEXPLAINED < $base; run --write-baseline in this PR"
-  echo "ir-i8-sweep: unexplained $UNEXPLAINED, baseline $base: ok"; exit 0
+  echo "ir-i8-sweep: $(wc -l < "$OUT/causes.txt") causes ($UNEXPLAINED unexplained programs, not graded), none new: ok"; exit 0
 fi
 exit "$RC"
