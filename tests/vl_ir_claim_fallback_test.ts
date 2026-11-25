@@ -8,8 +8,8 @@
 //   legacy builds, strict — `$VL_IR_STRICT=1`, as gates and CI run: the invalid module, rc 70.
 //
 // `tests/ir-claim-fallback/*-refused.vl` are programs a claim once escaped legacy's refusal on. The
-// two graded here stay refused after #9839, and the claim now raises the refusal itself
-// (`bundlePickRefused`), so the note names the claim's refusal; D17095's and D17096's witnesses
+// two graded here stay refused after #9839, and the IR now declines them (`bundlePickRefused`), so
+// the note names the decline; D17095's and D17096's witnesses
 // beside them are graded by `ir-parity.vl --pop refusals` instead, since a legacy rung lifts them. `claimed-and-valid.vl`
 // with `$VL_FAULT_INJECT_CLAIMED` (the claimed module corrupted, the rebuild not) is the control
 // for the two outcomes legacy builds. No assertion library, per CLAUDE.md.
@@ -24,7 +24,7 @@ if (ignore) console.warn("[ir-claim-fallback] skipped — needs the vl binary an
 const DIR = `${ROOT}/tests/ir-claim-fallback`;
 const STABLE = ["closure-stored-from-function-refused.vl", "other-bundle-stored-from-function-refused.vl"];
 const REFUSAL = "emitProgram: a function returning a parameter called at two signatures";
-const NOTE = "an IR claim refused inside";
+const NOTE = "the IR declined this statement (bundle result pick refused)";
 const FELL_BACK = "IR claim produced an invalid module; used the legacy emitter";
 
 /** `vl <cmd> <file>` against the seed, uncached, with `env` added; its exit code and streams. */
@@ -49,7 +49,7 @@ for (const strict of [false, true]) {
       fn: () => {
         const r = vl(["run", `${DIR}/${f}`], strict ? { VL_IR_STRICT: "1" } : {});
         if (r.code !== 1 || !r.err.includes(REFUSAL) || !r.err.includes(NOTE) || r.err.includes("invalid module\n")) {
-          throw new Error(`want rc 1 with legacy's refusal and the claim's note, got rc ${r.code}:\n${r.err.slice(0, 1500)}`);
+          throw new Error(`want rc 1 with legacy's refusal and the decline's note, got rc ${r.code}:\n${r.err.slice(0, 1500)}`);
         }
       },
     });

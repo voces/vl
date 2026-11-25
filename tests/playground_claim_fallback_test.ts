@@ -30,8 +30,8 @@ Deno.test({
   fn: async () => {
     const r = await runProgram(fixture("closure-stored-from-function-refused.vl"), createWasmChecker(fresh));
     const refusal = "a function returning a parameter called at two signatures";
-    const note = "an IR claim refused inside `@start` (";
-    if (r.compiled || !r.diagnostics.some((d) => d.message.includes(refusal)) || !r.diagnostics.some((d) => d.message.startsWith(note))) {
+    const note = "the IR declined this statement (bundle result pick refused)";
+    if (r.compiled || !r.diagnostics.some((d) => d.message.includes(refusal)) || !r.diagnostics.some((d) => d.message.includes(refusal) && d.message.includes(note))) {
       throw new Error(`want no run, legacy's refusal and the note, got compiled ${r.compiled}, ${messages(r)}`);
     }
   },

@@ -2,9 +2,9 @@
 // claimed module the engine refuses is compiled again with IR claims off, so legacy's refusal, or
 // legacy's bytes, is the answer. The native host's half is tests/vl_ir_claim_fallback_test.ts.
 //
-// The control below once compiled to an invalid module with claims on; the claim now raises legacy's
-// refusal itself (`bundlePickRefused`), and legacy refuses it with claims off too. The LSP's
-// `compile` (the playground's Run path) answers with that refusal and the claim's note. A module
+// The control below once compiled to an invalid module with claims on; the IR now declines it
+// (`bundlePickRefused`), legacy refuses it, and it refuses with claims off too. The LSP's
+// `compile` (the playground's Run path) answers with that refusal and the decline's note. A module
 // corrupted only while claims are on stands in for a claim legacy builds. No assertion library, per
 // CLAUDE.md.
 //
@@ -38,7 +38,7 @@ Deno.test({
     pushSrc(exp, CONTROL);
     const rc = exp.compileSrc();
     if (rc !== 3) {
-      throw new Error(`want the claim's emit refusal (rc 3) with claims on, got rc ${rc}`);
+      throw new Error(`want legacy's emit refusal (rc 3) with claims on, got rc ${rc}`);
     }
     pushSrc(exp, CONTROL);
     const legacy = withClaimsOff(exp, () => exp.compileSrc());
@@ -51,8 +51,8 @@ Deno.test({
   ignore,
   fn: async () => {
     const { bytes, diagnostics } = await createWasmChecker(fresh).compile(CONTROL, "main.vl", noSiblings);
-    const note = "an IR claim refused inside `@start` (emitProgram: a function returning a parameter called at two signatures";
-    if (bytes !== undefined || !diagnostics.some((d) => d.message.includes(REFUSAL)) || !diagnostics.some((d) => d.message.startsWith(note))) {
+    const note = "the IR declined this statement (bundle result pick refused)";
+    if (bytes !== undefined || !diagnostics.some((d) => d.message.includes(REFUSAL)) || !diagnostics.some((d) => d.message.includes(REFUSAL) && d.message.includes(note))) {
       throw new Error(`want no bytes and legacy's refusal, got ${bytes?.length} bytes and ${JSON.stringify(diagnostics.map((d) => d.message))}`);
     }
   },
