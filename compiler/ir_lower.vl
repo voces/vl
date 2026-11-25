@@ -946,6 +946,8 @@ let lwLive: i32[] = []
 let lwLiveEnd: i32[] = []
 let lwFloor = 0
 let lwFloors: i32[] = []
+// The boxes whose spans `boxLeadStage` raised the floor for, innermost last.
+let lwLeadBoxes: i32[] = []
 // The order-stash slots the function's `RStashSet`s opened: literal, layout position, slot.
 let lwStashAt: i32[] = []
 let lwStashFi: i32[] = []
@@ -1848,6 +1850,33 @@ function stashIfBoxHead(id: i32) {
   // A valued `if`'s box head follows the operands staged ahead of it (`valuedIfOpen`), as does a
   // `??`'s that stages them (`coalBox`).
   if n is SCoalBox && !coalArmStagesLeads(n.cbArm) { joinBoxHead(out, false) }
+  return 0
+}
+
+// Where node `id` opens a box-lead span, the temps earlier operands left pending, written first
+// as legacy writes those operands before the box's leading tag; each stays for its reader.
+function boxLeadStage(id: i32, pending: i32[]) {
+  if pending.length == 0 { return 0 }
+  let i = 0
+  while i < lw.irBoxLeadFirst.length && lw.irBoxLeadFirst[i] != id { i = i + 1 }
+  if i >= lw.irBoxLeadFirst.length { return 0 }
+  const roots = stageLeadOf([], pending)
+  if lwMiss != "" { return 0 }
+  // The span writes above the roots until its box is written (`boxLeadUnstage`).
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length
+  lwLeadBoxes.push(lw.irBoxLeadBox[i])
+  for r in roots { pending.push(r) }
+  return 0
+}
+
+// After box node `id` is written, the floor its span's staging raised is lowered again.
+function boxLeadUnstage(id: i32) {
+  if lwLeadBoxes.length == 0 || lwLeadBoxes[lwLeadBoxes.length - 1] != id {
+    return 0
+  }
+  lwLeadBoxes.pop()
+  lwFloor = lwFloors.pop() ?? 0
   return 0
 }
 
@@ -5066,11 +5095,13 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
       // A valueless `return` after a call in its tail form writes nothing.
       if !(i > 0 && callReturns(b, i - 1)) {
         const tl = ft[top] && i == b.length - 1 || callReturns(b, i)
+        boxLeadStage(id, pending)
         dispatchBoxHead(id)
         stashIfBoxHead(id)
         const k = ifOpen(id, pending, tl)
         if k == IF_NOT {
           node(id, pending, tl, if i == b.length - 1 { fo[top] } else { -1 })
+          boxLeadUnstage(id)
         }
         if k == IF_ELSE || k == IF_VALUED {
           const n = lw.irNodes[id]
@@ -6913,6 +6944,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwRootRun = 0
   lwRootRuns = []
   lwFloors = []
+  lwLeadBoxes = []
   lwStashAt = []
   lwBoxHeadAt = []
   lwIfHeadAt = Map()
@@ -6961,6 +6993,7 @@ type LwFrame = {
   lfLiveEnd: i32[],
   lfFloor: i32,
   lfFloors: i32[],
+  lfLeadBoxes: i32[],
   lfRootRun: i32,
   lfRootRuns: i32[],
   lfSeq: i32[],
@@ -6992,6 +7025,7 @@ function lwSave(): LwFrame {
     lfLiveEnd: lwLiveEnd,
     lfFloor: lwFloor,
     lfFloors: lwFloors,
+    lfLeadBoxes: lwLeadBoxes,
     lfRootRun: lwRootRun,
     lfRootRuns: lwRootRuns,
     lfSeq: lwSeq,
@@ -7024,6 +7058,7 @@ function lwRestore(f: LwFrame) {
   lwLiveEnd = f.lfLiveEnd
   lwFloor = f.lfFloor
   lwFloors = f.lfFloors
+  lwLeadBoxes = f.lfLeadBoxes
   lwRootRun = f.lfRootRun
   lwRootRuns = f.lfRootRuns
   lwSeq = f.lfSeq
