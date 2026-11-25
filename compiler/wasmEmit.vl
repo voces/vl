@@ -2165,7 +2165,10 @@ function emitStructFieldValue(si: i32, fi: i32, valIx: i32, fnIx: i32) {
     arm = structFieldArmOf(si, fi, valIx, fnIx, true)
   }
   const rc = match arm {
-    "mapClash" => emitFailAt(mapFieldClashMsg(), valIx)
+    "mapClash" => emitFailAt(
+      "emitProgram: a record field holds a fresh `Map()` whose values store functions at one rep while the record's row stores them at another, so the two map types differ; building it at one rep is not done yet",
+      valIx,
+    )
     "holder" => {
       return emitBundleMemberPick(
         valIx,
@@ -30986,8 +30989,17 @@ function emitCallRefAt(
     i = i + 1
   }
   callRefDepth = crDepth
-  const split = callRefSplitRefusal(callIx, c.callFn, fnIx)
-  if split != "" { return emitFail(split) }
+  const split = callRefSplitKind(callIx, c.callFn, fnIx)
+  if split == 1 {
+    return emitFail(
+      "emitProgram: this call runs functions that return different types, and one of them is also held where it cannot be stored as one of the functions this value may hold, so the call has no one signature",
+    )
+  }
+  if split == 2 {
+    return emitFail(
+      "emitProgram: this call runs a function value that may hold any of a set of functions returning different types, held where the instance keeps them at one signature; dispatching such a call per function is not built yet",
+    )
+  }
   // id = closure.id (field 1) — the callee's wasm function index, `call_indirect`'d at
   // the concrete `$fnsig` (the engine signature-checks the callee against it).
   let sig = -1
@@ -42139,7 +42151,11 @@ function emitIdentNonLocalRead(e: Ident, isid: i32, exprIx: i32, fnIx: i32) {
   if fe >= 0 {
     return match fnValueArmOf(fe, exprIx, stubWriteRhs) {
       "twin" => emitClosureValue(voidTwinForNode(exprIx, fe), fnIx)
-      "unfixed" => emitFailAt(genericValueUnfixedMsg(), exprIx)
+      "unfixed" => emitFailAt(
+        "emitProgram: a generic function taken as a value reaches no call that fixes its type "
+          + "— annotate the destination's function type",
+        exprIx,
+      )
       "inert" | "aliasCore" => emitClosureValueCore(fe, fnIx)
       "checked" => emitClosureValue(fe, fnIx)
     }
@@ -44133,48 +44149,28 @@ function emitAsgValueOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
       if emitAsgValue(exprIx, fnIx, -1) < 0 { return -1 }
       asgWiderRowTail(exprIx, fnIx)
     }
-    "none" => emitFail(asgNoValueMsg())
+    "none" => emitFail(
+      "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",
+    )
   }
 }
 
-// The refusal of closure call `callIx` (callee `calleeIx`) whose function set returns different
-// types and has no one signature, or "": legacy and the IR's claim raise the same sentence.
-export function callRefSplitRefusal(
-  callIx: i32,
-  calleeIx: i32,
-  fnIx: i32,
-): string {
+// Which refusal closure call `callIx` (callee `calleeIx`) meets because its function set returns
+// different types and has no one signature: 0 none, 1 the tag split left untagged, 2 the set kept
+// at one signature in the instance. Legacy and the IR's claim each raise the matching sentence.
+export function callRefSplitKind(callIx: i32, calleeIx: i32, fnIx: i32): i32 {
   // The judge let a call whose members return different types through for its set to be
   // tagged; left a closure set, the call would run each member at one signature (D15926).
   if fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx)) {
-    return "emitProgram: this call runs functions that return different types, and one of them is also held where it cannot be stored as one of the functions this value may hold, so the call has no one signature"
+    return 1
   }
   // A set of functions with different results, handed to an un-annotated parameter and left
   // closures, is typed in the instance at one member's signature: the call would run the others
   // at it (D16747).
   if closureCallSetSplits(nodeTyAt(calleeIx, fnIx), elabSrcDecl(fnIx)) {
-    return "emitProgram: this call runs a function value that may hold any of a set of functions returning different types, held where the instance keeps them at one signature; dispatching such a call per function is not built yet"
+    return 2
   }
-  return ""
-}
-
-// The refusal of a generic function read as a value that no call fixes the type of ("unfixed"),
-// raised by legacy and by the IR's claim alike.
-export function genericValueUnfixedMsg(): string {
-  return "emitProgram: a generic function taken as a value reaches no call that fixes its type "
-    + "— annotate the destination's function type"
-}
-
-// The refusal of a record field holding a fresh `Map()` at another rep than its row's (the
-// "mapClash" arm), raised by legacy and by the IR's claim alike.
-export function mapFieldClashMsg(): string {
-  return "emitProgram: a record field holds a fresh `Map()` whose values store functions at one rep while the record's row stores them at another, so the two map types differ; building it at one rep is not done yet"
-}
-
-// The refusal of an assignment used as a value whose plan has no arm ("none"): a contract, raised
-// by legacy and by the IR's claim alike.
-export function asgNoValueMsg(): string {
-  return "emitProgram: an assignment used as a value whose type is not its target's has no value lowering"
+  return 0
 }
 
 // Emit the assignment at `exprIx`, whose right side is built at the wide primitive `wp`
