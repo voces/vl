@@ -183,8 +183,8 @@ only when the start body is unclaimed. Nothing reaches legacy through the door.
 | I8 | one PR: empty the 14 entry points and B minus the keep set, then `dead-exports.vl`, a fixpoint and the full gate | coordinator |
 
 A port makes the tail take an IR-lowered operand in place of its `emitExpr` call. The rehearsal
-found two more re-entries in its last keep round, `refListReadAt` (4) and `emitNulIsNullTest` (2).
-They go to COV-IS, which owns nulls and is the nearest family. Per-family staging (§4) buys nothing:
+found two more re-entries in its last keep round: `refListReadAt` (4) goes to COV-CLOS, which owns
+lists, and `emitNulIsNullTest` (2) to COV-IS, which owns nulls. Per-family staging (§4) buys nothing:
 every failure the rehearsal found is a re-entry or missing coverage, not a family. I8 is ready when
 `ir-i8-sweep.sh` reports no newly failing program and the census reports no unclaimed function or
 start body.
