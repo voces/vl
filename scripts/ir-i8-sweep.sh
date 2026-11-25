@@ -25,13 +25,13 @@
 # newly failing program with no function or start body the seed already leaves unclaimed is
 # UNEXPLAINED: a re-entry or a stubbed helper the claim path needs. Its causes (the first stub or
 # re-entry, and each fallback reason the seed lacks, `fallback: <reason>`) are the ratchet:
-# --check exits 1 on a cause scripts/ir-i8-census/sweep-baseline.txt does not list, and
+# --check exits 1 on a cause no file in scripts/ir-i8-census/causes/ holds, and
 # --write-baseline only removes causes. Counts are printed, never graded, because coverage moves
 # programs from explained to unexplained (coordinator ruling, 2026-11-25).
 # --edges is the static half, in seconds and with no build: every call a kept function or an ir*.vl
 # file makes of a stubbed function (`<caller>\t<stub>`), the latent paths from the claim path into
 # stage B; the boundary writers scripts/ir-i8-census/boundary.txt names are marked. --check exits 1
-# on an edge scripts/ir-i8-census/edges-baseline.txt does not hold. An edge in
+# on an edge scripts/ir-i8-census/edges/ has no file for. An edge in
 # scripts/ir-i8-census/edges-proven.txt is proven unreachable from the IR (its line cites the proof)
 # and stays only because legacy still takes it; the target before I8 is 0 unproven edges, and the
 # I8 PR deletes the proven arms. Its guard is the sweep: --check exits 1 when any program reaches a
@@ -53,8 +53,11 @@ shift
 PROVEN_FILE=${IR_I8_PROVEN:-scripts/ir-i8-census/edges-proven.txt}
 proven_edges() { [ -f "$PROVEN_FILE" ] && awk -F'\t' '!/^#/ && NF { print $1 "\t" $2 }' "$PROVEN_FILE" | sort -u || true; }
 EDGES=0 GROW=0 POPS=self,distilled,cases,probes,witnesses OUT=build/ir-i8-sweep MAXIT=30 RATCHET=""
-BASELINE_FILE=${IR_I8_SWEEP_BASELINE:-scripts/ir-i8-census/sweep-baseline.txt}
-# Static edges, --edges: --write-baseline there rewrites edges-baseline.txt whole.
+# The lists are one entry per file, so concurrent PRs add or delete a file rather than edit a
+# shared line: keep/<fn> holds its reason, causes/<slug> its cause, edges/<caller>--<callee> nothing.
+CAUSES_DIR=${IR_I8_SWEEP_BASELINE:-scripts/ir-i8-census/causes}
+EDGES_DIR=scripts/ir-i8-census/edges
+# Static edges, --edges: --write-baseline there makes edges/ the current set, adding and deleting.
 while [ $# -gt 0 ]; do
   case "$1" in
     --grow) GROW=1; shift ;;
@@ -66,7 +69,7 @@ while [ $# -gt 0 ]; do
     *) echo "ir-i8-sweep: unknown argument $1" >&2; exit 2 ;;
   esac
 done
-[ -f "$KEEP" ] || { echo "ir-i8-sweep: no keep-list at $KEEP" >&2; exit 2; }
+[ -e "$KEEP" ] || { echo "ir-i8-sweep: no keep-list at $KEEP" >&2; exit 2; }
 VL=${VL:-$PWD/scripts/vl-host/target/release/vl}
 JOBS=${JOBS:-4}
 SEED=build/vl-compiler.wasm
@@ -74,6 +77,16 @@ SEED=build/vl-compiler.wasm
 ENTRY="emitBlockValueAs emitBlockValueAsGo emitExpr emitExprAsElem emitExprAsKind emitExprRaw emitFuncBody emitStmt emitStmtGo emitStmtIn emitStmtTail emitStmts emitStmtsTail emitWidened"
 T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
+# A list directory's entries, README.md aside.
+entries() { [ -d "$1" ] && find "$1" -maxdepth 1 -type f ! -name 'README*' -printf '%f\n' | sort || true; }
+# A keep directory becomes the `<name> <reason>` list the rest reads; keep_add writes to both.
+KEEP_DIR=""
+if [ -d "$KEEP" ]; then
+  KEEP_DIR=$KEEP KEEP=$T/keep.txt
+  for n in $(entries "$KEEP_DIR"); do echo "$n $(head -1 "$KEEP_DIR/$n")"; done > "$KEEP"
+fi
+keep_add() { echo "$1 $2" >> "$KEEP"; [ -z "$KEEP_DIR" ] || echo "$2" > "$KEEP_DIR/$1"; }
+cause_file() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'; }
 mkdir -p "$OUT"
 export VL_STD="${VL_STD:-$PWD/std}" VL_IR_STRICT=1 T
 
@@ -369,10 +382,15 @@ if [ "$EDGES" = 1 ]; then
   echo "static edges into stage B (a kept function or an ir*.vl file calling a stubbed one): $(wc -l < "$OUT/edges.txt")"
   awk -F'\t' 'FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF) w[$1] = 1; next } { print "  " $1 " -> " $2 (($2 in w) ? "   [boundary writer]" : "") }' "$B" "$OUT/edges.txt"
   [ -n "$RATCHET" ] || exit 0
-  EB=scripts/ir-i8-census/edges-baseline.txt
-  if [ "$RATCHET" = --write-baseline ]; then cp "$OUT/edges.txt" "$EB"; echo "ir-i8-sweep: wrote $(wc -l < "$EB") edges to $EB"; exit 0; fi
-  new=$(comm -23 "$OUT/edges.txt" <(sort -u "$EB"))
-  gone=$(comm -13 "$OUT/edges.txt" <(sort -u "$EB"))
+  entries "$EDGES_DIR" | sed 's/--/\t/' | sort -u > "$T/base.edges"
+  if [ "$RATCHET" = --write-baseline ]; then
+    mkdir -p "$EDGES_DIR"
+    comm -13 "$OUT/edges.txt" "$T/base.edges" | while IFS=$'\t' read -r a b; do rm -f "${EDGES_DIR:?}/${a:?}--${b:?}"; done
+    comm -23 "$OUT/edges.txt" "$T/base.edges" | while IFS=$'\t' read -r a b; do : > "$EDGES_DIR/$a--$b"; done
+    echo "ir-i8-sweep: $EDGES_DIR now holds $(entries "$EDGES_DIR" | grep -c .) edges"; exit 0
+  fi
+  new=$(comm -23 "$OUT/edges.txt" "$T/base.edges")
+  gone=$(comm -13 "$OUT/edges.txt" "$T/base.edges")
   [ -z "$gone" ] || { echo "ir-i8-sweep: edges gone (run --edges --write-baseline in this PR):"; sed 's/^/  /' <<< "$gone"; }
   if [ -n "$new" ]; then echo "ir-i8-sweep: NEW edges into stage B (a kept tail now calls a stubbed writer):"; sed 's/^/  /' <<< "$new"; exit 1; fi
   stale=$(comm -23 <(proven_edges) "$OUT/edges.txt")
@@ -393,8 +411,8 @@ while :; do
   sent=$(awk -F'\t' 'FILENAME == ARGV[1] { fell[$2] = 1; next } ($2 in fell) && $3 !~ /^reentry / { print $3 }' \
     "$OUT/fell.tsv" "$OUT/hits.tsv" | sort -u | grep -vxF -f <(kept) | grep -vxF -f <(printf '%s\n' $new) || true)
   [ -n "$new$sent" ] || break
-  for n in $new; do echo "$n ir-tail" >> "$KEEP"; done
-  for n in $sent; do echo "$n ir-sentinel" >> "$KEEP"; done
+  for n in $new; do keep_add "$n" ir-tail; done
+  for n in $sent; do keep_add "$n" ir-sentinel; done
   echo "== grew the keep-list by $(wc -w <<< "$new $sent"): $(tr '\n' ' ' <<< "$new $sent")" >&2
   it=$((it + 1)); [ $it -le "$MAXIT" ] || { echo "ir-i8-sweep: --max-iter $MAXIT reached" >&2; break; }
 done
@@ -407,9 +425,12 @@ if [ "$RC" != 2 ] && [ -n "$RATCHET" ]; then
     echo "ir-i8-sweep: PROVEN edges reached, so their proof is broken (fix the IR, or move the line out of $PROVEN_FILE):"; sed 's/^/  /' <<< "$reached"
     exit 1
   fi
-  # The cause list, one per line (`#` comments allowed); a missing baseline is written whole once.
-  [ -f "$BASELINE_FILE" ] || { cp "$OUT/causes.txt" "$BASELINE_FILE"; echo "ir-i8-sweep: started $BASELINE_FILE with $(wc -l < "$BASELINE_FILE") causes"; exit 0; }
-  grep -v '^#' "$BASELINE_FILE" | awk 'NF' | sort -u > "$T/base.causes"
+  # The cause list, one file per cause; a missing directory is written whole once.
+  if [ ! -d "$CAUSES_DIR" ]; then
+    mkdir -p "$CAUSES_DIR"; while IFS= read -r c; do echo "$c" > "$CAUSES_DIR/$(cause_file "$c")"; done < "$OUT/causes.txt"
+    echo "ir-i8-sweep: started $CAUSES_DIR with $(entries "$CAUSES_DIR" | grep -c .) causes"; exit 0
+  fi
+  for f in $(entries "$CAUSES_DIR"); do head -1 "$CAUSES_DIR/$f"; done | sort -u > "$T/base.causes"
   new=$(comm -23 "$OUT/causes.txt" "$T/base.causes")
   gone=$(comm -13 "$OUT/causes.txt" "$T/base.causes")
   if [ -n "$new" ]; then
@@ -420,8 +441,8 @@ if [ "$RC" != 2 ] && [ -n "$RATCHET" ]; then
   if [ -n "$gone" ]; then
     echo "ir-i8-sweep: causes gone:"; sed 's/^/  /' <<< "$gone"
     if [ "$RATCHET" = --write-baseline ]; then
-      { grep '^#' "$BASELINE_FILE" || true; cat "$OUT/causes.txt"; } > "$T/nb"; mv "$T/nb" "$BASELINE_FILE"
-      echo "ir-i8-sweep: removed them from $BASELINE_FILE"; exit 0
+      for f in $(entries "$CAUSES_DIR"); do grep -qxF -- "$(head -1 "$CAUSES_DIR/$f")" "$OUT/causes.txt" || rm "${CAUSES_DIR:?}/${f:?}"; done
+      echo "ir-i8-sweep: removed them from $CAUSES_DIR"; exit 0
     fi
     echo "ir-i8-sweep: run --write-baseline in this PR to drop them"
   fi
