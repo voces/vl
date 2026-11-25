@@ -128,6 +128,7 @@ import {
   RMapDelete,
   RMapGet,
   RNulNoneBox,
+  ROptRead,
   RRecover,
   RStashSet,
   RStrOp,
@@ -776,6 +777,7 @@ import {
   nicheReadKindAt,
   nicheReadRefOf,
   nulLitAtomTexts,
+  optChainStructIdxOf,
   readOwesNonNullRecover,
   readRepMemoAdvance,
   sFieldIsUnionBox,
@@ -11274,6 +11276,7 @@ export function recvReadsAgain(ix: i32): boolean {
     return true
   }
   const m = nodeAt(ix)
+  if ib.irReadOpt.has(ix) { return true }
   return ib.irReadField.has(ix)
     && m is Member
     && recvReadsAgain(unwrapParen(m.memObj))
@@ -13397,30 +13400,46 @@ function optFieldTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { orV: v, orAt: ix, orTag: tag }, ix, rep)
 }
 
-// A standalone `?.` over one link and an unstaged base (`ROptRead`), as `emitOptMemberValueGo`
-// writes it along `optLeafArmOf`: the base is a read the lowering writes again, owing no recover.
+// A standalone `?.` over an unstaged chain (`ROptRead`), as `emitOptMemberValueGo` writes it along
+// `optLeafArmOf`: the chain's root is a read the lowering writes again, owing no recover, and the
+// lowering walks its links (`emitOptChainIsNull`, `emitOptChainValue`).
 function optRead(b: i32[], n: OptMember, ix: i32, rep: i32): Opnd {
   if exprIsNulNone(ix, ibFnIx) { return irBMiss("optional read of null") }
   if optLeafArmOf(ix, ibFnIx) == "fail" { return irBMiss("optional read arm") }
-  const base = unwrapParen(n.omObj)
-  if base < 0 || base >= P.nodes.length || nodeAt(base) is OptMember {
+  const base = optChainRootOf(n.omObj)
+  if base < 0 || base >= P.nodes.length {
     return irBMiss("optional read chain")
   }
   if optChainStagesRecv(ix) { return irBMiss("optional read staged") }
-  if readOwesNonNullRecover(n.omObj, ibFnIx) {
+  if readOwesNonNullRecover(base, ibFnIx) {
     return irBMiss("optional read recover")
   }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   if rep != repNodeOfTy(ty) { return irBMiss("optional read rep") }
-  const r = irBExpr(b, n.omObj)
+  const r = irBExpr(b, base)
   if ibMiss != "" { return r }
   if !(r is OVar) || r.ov < 0 { return irBMiss("optional read base") }
-  // Legacy reads an unstaged base again after its null test, so a temp's read must re-read alike.
+  // Legacy reads an unstaged root again after each null test, so a temp's read must re-read alike.
   if ib.irVars[r.ov].vKind == "temp" && !recvReadsAgain(base) {
     return irBMiss("optional read base")
   }
-  return irBLetTempTy(b, { orV: r, orAt: ix, orTag: -1 }, ix, rep, ty)
+  const o: ROptRead = { orV: r, orAt: ix, orTag: -1 }
+  ib.irReadOpt[ix] = o
+  return irBLetTempTy(b, o, ix, rep, ty)
+}
+
+// The root of the `?.` chain whose receiver is `x`: the first node below its links, unparenthesized;
+// a link off no struct chain (`optChainStructIdxOf`) answers -1.
+function optChainRootOf(x: i32): i32 {
+  let u = unwrapParen(x)
+  while u >= 0 && u < P.nodes.length {
+    const m = nodeAt(u)
+    if !(m is OptMember) { return u }
+    if optChainStructIdxOf(m.omObj, ibFnIx) < 0 { return -1 }
+    u = unwrapParen(m.omObj)
+  }
+  return -1
 }
 
 // A string literal at the `str` rep, or delivered as its destination's interned atom.
