@@ -8078,6 +8078,20 @@ function emitOptChainIsNull(exprIx: i32, fnIx: i32) {
   return 0
 }
 
+// `?.` link `exprIx`'s value after its receiver's non-null value: the field, recovered non-null.
+// 0, or -1 for a link off no struct field.
+export function emitOptLinkValueTail(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return -1 }
+  const psi = optChainStructIdxOf(e.omObj, fnIx)
+  if psi < 0 || psi >= sHeapIdx.length { return -1 }
+  const pfi = sFieldIndex(psi, e.omProp)
+  if pfi < 0 { return emitFail("emitProgram: `?.` field is not on the struct") }
+  fbStructGet(sHeapIdx[psi], pfi)
+  fbRefAsNonNull()
+  return 0
+}
+
 // After `?.` link `exprIx`'s receiver null test: the `if` that answers true for a null receiver, else
 // tests the field. Whether the field's own null is tested, so the receiver's value comes next.
 export function emitOptLinkNullOpen(exprIx: i32, fnIx: i32): boolean {
@@ -8122,14 +8136,11 @@ function emitOptChainValue(exprIx: i32, fnIx: i32) {
     if psi < 0 {
       return emitFail("emitProgram: `?.` receiver is not a struct chain")
     }
-    const pfi = sFieldIndex(psi, e.omProp)
-    if pfi < 0 {
+    if sFieldIndex(psi, e.omProp) < 0 {
       return emitFail("emitProgram: `?.` field is not on the struct")
     }
     if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
-    fbStructGet(sHeapIdx[psi], pfi)
-    fbRefAsNonNull()
-    return 0
+    return emitOptLinkValueTail(exprIx, fnIx)
   }
   // The cast off the stash already recovers a non-null ref; the in-place spelling recovers
   // its own niche.
@@ -18117,12 +18128,84 @@ function arrLitLeafIsBool(ix: i32): boolean {
   return nodeAt(ix) is BoolLit
 }
 
-// Lower element `ix` the way the literal's own element loop does for `form`.
+// Lower element `ix` the way the literal's own element loop does for `form`: a constant leaf by
+// its literal alone (`arrLitConstLeafEmit`), anything else through the expression lowering.
 function arrLitDataElemEmit(ix: i32, fnIx: i32, form: i32): i32 {
+  if arrLitElemIsConst(ix) {
+    const rc = arrLitConstLeafEmit(ix, fnIx, form)
+    if rc != -2 { return rc }
+  }
+  // A tagged set's member is its id, as `emitExpr` writes it past a coercion.
+  const tl = fnTagLeafEmitted(ix, fnIx)
+  if (
+    form == ALD_I32
+    && tl >= 0
+    && !exprReadsDeadNever(ix, fnIx)
+    && coerceKindAt(ix, fnIx) == "none"
+  ) {
+    fbI32Const(tl)
+    return 0
+  }
+  return arrLitDataElemExpr(ix, fnIx, form)
+}
+
+// Element `ix` through the expression lowering, widened to the form's number kind.
+function arrLitDataElemExpr(ix: i32, fnIx: i32, form: i32): i32 {
   if form == ALD_I64 { return emitWidened(ix, 3, fnIx) }
   if form == ALD_F32 { return emitWidened(ix, 5, fnIx) }
   if form == ALD_F64 { return emitWidened(ix, 4, fnIx) }
   return emitExpr(ix, fnIx)
+}
+
+// A constant leaf `ix` (`arrLitElemIsConst`) written as `emitExpr` and `emitWidened` write it, read
+// off the literal alone (`arrLitLeafAsItself`): at the wider forms along the widening plan's
+// literal arms (`widenLitAt`) or its plain arm (`emitNumPlain`). -2 where they take another path.
+function arrLitConstLeafEmit(ix: i32, fnIx: i32, form: i32): i32 {
+  if form != ALD_I64 && form != ALD_F32 && form != ALD_F64 {
+    return arrLitLeafAsItself(ix, fnIx)
+  }
+  if arrLitLeafIsBool(unwrapParen(ix)) { return -2 }
+  const dst = if form == ALD_I64 { 3 } else if form == ALD_F64 { 4 } else { 5 }
+  const p = widenPlanOf(ix, dst, fnIx)
+  if p.wpArm == "instLit" || p.wpArm == "floatLit" {
+    return widenLitAt(ix, dst, fnIx)
+  }
+  if p.wpArm != "plain" { return -2 }
+  if boxDstShadowArmed() {
+    const why = numFloorWhy(p.wpSrc, dst, ix, fnIx)
+    boxDstShadowAs(if why == "" { "table" } else { why })
+    numPairShadowNote(p.wpSrc, dst, ix, fnIx)
+  }
+  const rc = arrLitLeafAsItself(ix, fnIx)
+  if rc != 0 { return rc }
+  return numWidenTail(p.wpSrc, dst, ix, fnIx)
+}
+
+// Constant leaf `ix` as `emitExpr` writes it, by its literal alone: a boolean's `i32.const`, a
+// number at its own width (`emitNumLitNode`), a negated one folded (`emitSignedNumLitAt`). -2 where
+// `emitExpr` takes a pre-path or a coercion, or a negation that does not fold.
+function arrLitLeafAsItself(ix: i32, fnIx: i32): i32 {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return -2 }
+  const e = nodeAt(x)
+  if exprPrePathWhy(x, fnIx) != "" || coerceKindAt(x, fnIx) != "none" {
+    return -2
+  }
+  if e is BoolLit {
+    fbI32Const(e.boolVal)
+    return 0
+  }
+  if e is NumLit { return emitNumLitNode(e, x, fnIx) }
+  if e is Unary {
+    const w = numLitTyWidth(x, fnIx)
+    if e.unOp != "-" || !arrLitLeafIsNum(unwrapParen(e.unArg)) || w == "" {
+      return -2
+    }
+    return emitSignedNumLitAt(x, w)
+  }
+  return emitFail(
+    "emitProgram: internal: a data literal's constant leaf is a number, a negated number or a boolean (`arrLitElemIsConst`)",
+  )
 }
 
 // Append the little-endian element bytes the lone constant instruction `ins` denotes to `out`,
@@ -46002,6 +46085,17 @@ export function coalChainLinkOf(exprIx: i32, fnIx: i32): i32 {
   return -1
 }
 
+// Records outer link `ro` minted at lowering for chain `exprIx` in `fnIx`, so a later reader (the
+// armed shadow of a start body) finds it; one minted under a per-arm override stays its own.
+function coalChainNote(exprIx: i32, fnIx: i32, ro: i32) {
+  if luOvOn != 0 { return 0 }
+  const rs = coalChainPre.get(exprIx) ?? []
+  rs.push(fnIx)
+  rs.push(ro)
+  coalChainPre[exprIx] = rs
+  return 0
+}
+
 // Forgets the links minted for an earlier module's bodies.
 export function coalChainsReset() {
   coalChainPre = Map()
@@ -46014,6 +46108,13 @@ export function coalChainsReset() {
 export function coalChainsPrime(fx: i32) {
   const fd = nodeAt(fx)
   if fd is FuncDecl { coalChainsWalk(fd.fnBody, fx) }
+  return 0
+}
+
+// Mints the `??` chains' links in start nodes `order` (fnIx -1), in their order, ahead of the IR's
+// start claim; legacy's lowering reads a link minted here as it reads a function's.
+export function coalChainsPrimeStart(order: i32[]) {
+  for ix in order { coalChainsWalk(ix, -1) }
   return 0
 }
 
@@ -46065,6 +46166,7 @@ function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
     const pre = coalChainLinkOf(exprIx, fnIx)
     const reOuter = if pre >= 0 { pre } else { coalChainMint(e, exprIx, fnIx) }
     if reOuter < 0 { return -1 }
+    if pre < 0 { coalChainNote(exprIx, fnIx, reOuter) }
     return emitExpr(reOuter, fnIx)
   }
   // The operand is still evaluated and dropped for effect.

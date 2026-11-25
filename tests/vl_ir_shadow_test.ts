@@ -626,15 +626,15 @@ Deno.test({
   fn: () => {
     // An `as!` over a type parameter pinned at no number, which legacy writes as the operand and a
     // trap inside the expression, is outside the set too.
-    const src = `function greet(c: boolean): i32 {
+    const src = `function greet(c: boolean, k: i32): i32 {
   const x = null
-  return (if c { x } else { x }) ?? 0
+  return k + ((if c { x } else { x }) ?? 0)
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function cv<T>(u: T): i32 {
   return u as! i32
 }
-print(greet(true))
+print(greet(true, 1))
 print(ap((x: i32) => x + 1))
 print(cv("s"))
 `;
@@ -1960,18 +1960,18 @@ Deno.test({
   ignore,
   fn: () => {
     const src = `function ok(x: i32): i32 { return x + 1 }
-function two(c: boolean): i32 {
+function two(c: boolean, k: i32): i32 {
   const xs = [1, 2]
   const x = null
-  const y = (if c { x } else { x }) ?? 0
+  const y = k + ((if c { x } else { x }) ?? 0)
   return xs[0] + y
 }
 print(ok(1))
-print(two(true))
+print(two(true, 3))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    const want = "blockers coalesce nulnone effect if";
+    const want = "blockers short-circuit right operand";
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }
