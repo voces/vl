@@ -1,11 +1,13 @@
 import { recFieldTyOf } from "./emit_rec_field_codes"
 import {
   asgFieldParks,
+  coalFieldPlanOfOpt,
   identityOperandUnboxes,
   listFitShadowPlanOf,
   listFitShadowReadsRow,
   listFitShadowSameTy,
   listFitShadowTyOf,
+  optRecvHoleTyped,
 } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import {
@@ -450,6 +452,7 @@ import {
   objLitVariantLayoutOf,
   objLitVariantStashAt,
   objLitVariantStashOf,
+  orderedDirectArgs,
   plainCoalesceAt,
   popAnyPlanOf,
   popOrPlanOf,
@@ -4804,7 +4807,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && rep == globalTyRep(scopeTyAt(d, -1))
       && cellRep == globalTyRep(letBindTy(d, -1))
     // An atom-assignment cell (`atomCellRep`) read at a string is its id, decoded as legacy's
-    // `emitAtomToStr` decodes it.
+    // `emitAtomToStr` decodes it; a delivery (`cell`) takes the id as it stands.
     if (
       cellRep != rep
       && repNodeAt(cellRep) is RAtom
@@ -4812,7 +4815,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && atomCellRep(d, rep) == cellRep
     ) {
       const id = globalStoredRead(b, g, ix, cellRep, repTyOf(cellRep))
-      if ibMiss != "" { return id }
+      if ibMiss != "" || cell { return id }
       return repTemp(b, { sxV: id, sxAt: ix }, ix, rep)
     }
     // A list cell the global section declares at the list its initializer built, an instance's
@@ -5963,10 +5966,11 @@ function tplHoleStr(b: i32[], c: Call): Opnd {
 
 // A direct call `ix` of a declared, capture-free function by name; its arguments by position.
 function callRhs(b: i32[], c: Call, ix: i32): Rhs {
-  if c.callFn < 0 || hasNamedArgs(c.callArgNames) {
-    return missRhs("named call")
-  }
+  if c.callFn < 0 { return missRhs("named call") }
   const cf = nodeAt(c.callFn)
+  // Named arguments reach only a declared function's direct call, which binds them to its
+  // parameters (`orderedDirectArgs`).
+  if hasNamedArgs(c.callArgNames) { return namedCallRhs(b, c, ix) }
   if cf is Member { return methodRhs(b, c, cf, ix) }
   // A call through any other closure expression is a plain closure call where legacy's is.
   if !(cf is Ident) {
@@ -6024,6 +6028,32 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if pos < 0 || pos >= fnStmts.length { return missRhs("call target") }
   if lf >= 0 && directCallInstanceArgMisfit(c.callArgs, lf, ibFnIx) >= 0 {
     return missRhs("binding call misfit")
+  }
+  return directCallAt(b, c, ix, pos)
+}
+
+// Call `c` with named arguments, as `emitCallCoreUserFn` sends it to `emitDirectCall`: a name
+// that resolves to a declared function no binding routes to a closure; every other is a miss.
+function namedCallRhs(b: i32[], c: Call, ix: i32): Rhs {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return missRhs("named call") }
+  const cf = nodeAt(c.callFn)
+  if !(cf is Ident) { return missRhs("named call") }
+  const d = identDeclOf(c.callFn)
+  if (
+    d < 0
+    || !(nodeAt(d) is FuncDecl)
+    || holderCallSigs(ix, ibFnIx).length > 0
+  ) {
+    return missRhs("named call")
+  }
+  if cloLiftCalleeOf(c.callFn, ibFnIx) >= 0 { return missRhs("named call") }
+  const pos = userFnCallTarget(c, cf, ibFnIx)
+  if (
+    pos < 0
+    || pos >= fnStmts.length
+    || userFnCallRoutesRef(c, cf, ibFnIx, pos)
+  ) {
+    return missRhs("named call")
   }
   return directCallAt(b, c, ix, pos)
 }
@@ -6170,6 +6200,12 @@ function bundleRecBuild(
 // arguments as `emitDirectCall` writes them, or a captured call's closure.
 function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   const inst = fnStmts[pos]
+  // The arguments in parameter order, as `emitDirectCall` binds a named call's.
+  const named = hasNamedArgs(c.callArgNames)
+  const cargs = if named { orderedDirectArgs(ix, pos) } else { c.callArgs }
+  for a in cargs {
+    if a < 0 { return missRhs("named call") }
+  }
   // A template hole this instance pins to a string or atom is written by legacy without the call.
   if tplStrHoleOf(c, ibFnIx) >= 0 { return missRhs("template hole pinned") }
   if !calleeSig(pos) { return missRhs("callee signature") }
@@ -6182,6 +6218,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   const wb = liftWriteBacks(pos, caps)
   if ibMiss != "" { return missRhs(ibMiss) }
   if env && !cloLifted(pos) && captureCountOf(pos) > 0 {
+    if named { return missRhs("named call") }
     return capturedCallRhs(b, c, ix, pos)
   }
   if envSlotShift(inst) > 1 + caps.length {
@@ -6191,18 +6228,18 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   const callee = nodeAt(inst)
   const args: Opnd[] = []
   if callee is FuncDecl {
-    if callee.fnParams.length != c.callArgs.length {
+    if callee.fnParams.length != cargs.length {
       return missRhs("argument count")
     }
     const starts: i32[] = []
     let i = 0
-    while i < c.callArgs.length {
+    while i < cargs.length {
       const at = b.length
       starts.push(at)
       // A bundle parameter takes a record of closures, on legacy's arm (`bundleArgArmOf`): a
       // lambda literal's built per signature, or a record read as it is.
       if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
-        const barm = bundleArgArmOf(callee.fnParams[i], c.callArgs[i], ibFnIx)
+        const barm = bundleArgArmOf(callee.fnParams[i], cargs[i], ibFnIx)
         if barm == "lambda" || barm == "fnRead" {
           const bt = bundleHeldTy(
             callee.fnParams[i],
@@ -6213,7 +6250,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
           }
           const ba = bundleArgRec(
             b,
-            c.callArgs[i],
+            cargs[i],
             callee.fnParams[i],
             barm == "fnRead",
           )
@@ -6223,7 +6260,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
           continue
         }
         if barm == "choice" {
-          const ba = bundleChoiceArg(b, c.callArgs[i], callee.fnParams[i])
+          const ba = bundleChoiceArg(b, cargs[i], callee.fnParams[i])
           if ibMiss != "" { return missRhs(ibMiss) }
           args.push(ba)
           i = i + 1
@@ -6240,16 +6277,16 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       if (
         repNodeAt(pr) is RClosure
         && (bundleAnyNoted() || elabHasHolderRecords())
-        && nodeAt(unwrapParen(c.callArgs[i])) is Ident
-        && bundleArgArmOf(callee.fnParams[i], c.callArgs[i], ibFnIx) == "member"
+        && nodeAt(unwrapParen(cargs[i])) is Ident
+        && bundleArgArmOf(callee.fnParams[i], cargs[i], ibFnIx) == "member"
       ) {
         if (
-          bundleHandMemberAt(ix, i, c.callArgs[i], ibFnIx) < 0
+          bundleHandMemberAt(ix, i, cargs[i], ibFnIx) < 0
           || !(repNodeAt(pr) is RClosure)
         ) {
           return missRhs("bundle argument member")
         }
-        const rec = exprAt(b, c.callArgs[i], false)
+        const rec = exprAt(b, cargs[i], false)
         if ibMiss != "" { return missRhs("argument") }
         if !(repNodeAt(irBOpRep(rec)) is RRecord) {
           return missRhs("bundle argument member")
@@ -6257,8 +6294,8 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         args.push(
           irBLetTempTy(
             b,
-            { hpV: rec, hpAt: ix, hpArg: c.callArgs[i], hpI: i },
-            c.callArgs[i],
+            { hpV: rec, hpAt: ix, hpArg: cargs[i], hpI: i },
+            cargs[i],
             pr,
             pt,
           ),
@@ -6268,21 +6305,21 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       }
       // An argument the checker records no box at is boxed at its parameter's union, legacy's
       // direct-call floor (`directArgUnionTyOf`).
-      const fl = if heldAsBox(pr) && !boxOwedAt(c.callArgs[i], ibFnIx) { directArgUnionTyOf(pos, i) } else { -1 }
+      const fl = if heldAsBox(pr) && !boxOwedAt(cargs[i], ibFnIx) { directArgUnionTyOf(pos, i) } else { -1 }
       const fu = if fl >= 0 && repNodeOfTy(fl) == pr { fl } else { -1 }
       // A struct literal legacy builds at a row of its parameter's row's heap (`paramStructIdxOf`)
       // is built at the parameter's rep; a `null` literal at the floor is its union's null box.
-      const lt = if repNodeAt(pr) is RRecord { objLitTwinTyAtRow(c.callArgs[i], pr, pt, paramStructIdxOf(callee.fnParams[i])) } else { -1 }
+      const lt = if repNodeAt(pr) is RRecord { objLitTwinTyAtRow(cargs[i], pr, pt, paramStructIdxOf(callee.fnParams[i])) } else { -1 }
       const a = if lt >= 0 { objLitAt(
         b,
-        unwrapParen(c.callArgs[i]),
+        unwrapParen(cargs[i]),
         pr,
         lt,
-        objLitLayoutRowOf(unwrapParen(c.callArgs[i]), ibFnIx),
+        objLitLayoutRowOf(unwrapParen(cargs[i]), ibFnIx),
         false,
-      ) } else if fu >= 0 && nodeAt(unwrapParen(c.callArgs[i])) is NullLit { boxTempIn(b, { oiRep: ibNoValue, oiBits: 0 }, c.callArgs[i], pr, -1, fu) } else { deliver(b, c.callArgs[i], pr, fu) }
+      ) } else if fu >= 0 && nodeAt(unwrapParen(cargs[i])) is NullLit { boxTempIn(b, { oiRep: ibNoValue, oiBits: 0 }, cargs[i], pr, -1, fu) } else { deliver(b, cargs[i], pr, fu) }
       if ibMiss != "" { return missRhs("argument") }
-      if i > 0 && !irBStageLeads(b, at, starts, args, c.callArgs) {
+      if i > 0 && !irBStageLeads(b, at, starts, args, cargs) {
         return missRhs("short-circuit argument after another")
       }
       // A list at its parameter's storage where no coercion is recorded (a twin, closures apart in
@@ -6294,10 +6331,10 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         || holeRetagNoted(irBOpRep(a), pr, true)
         || recRetag(irBOpRep(a), pr)
         || cloListUndeclaredTakes(irBOpRep(a), pr))
-        && exprPrePathWhy(c.callArgs[i], ibFnIx) == "") { repTempTy(b, { rgV: a }, c.callArgs[i], pr, pt) } else if irBOpRep(a) != pr && recRetagNoted(irBOpRep(a), pr, c.callArgs[i]) { repTempTy(b, { rgV: a }, c.callArgs[i], pr, pt) } else { a }
+        && exprPrePathWhy(cargs[i], ibFnIx) == "") { repTempTy(b, { rgV: a }, cargs[i], pr, pt) } else if irBOpRep(a) != pr && recRetagNoted(irBOpRep(a), pr, cargs[i]) { repTempTy(b, { rgV: a }, cargs[i], pr, pt) } else { a }
       // A union parameter boxes the argument as legacy's `emitUnionBoxOwed` does (the floor); a
       // reference its parameter's valtype holds as it stands is passed as is (`repStoresAs`).
-      const fa = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, c.callArgs[i], pr, -1, fu) } else { ra }
+      const fa = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, cargs[i], pr, -1, fu) } else { ra }
       if ibMiss != "" { return missRhs(ibMiss) }
       if (
         irBOpRep(fa) != pr
@@ -11713,13 +11750,18 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
     "boolPop" | "valNoKind" | "callNoKind" | "next" => false
   }
   const na = if arm == "next" { coalNextArmOf(n, lhsIx, ix, ibFnIx) } else { "nulRefs" }
-  if !built && na == "field" { return coalField(b, n, lhsIx, ix, rep) }
+  if !built && na == "field" { return coalField(b, n, lhsIx, ix, rep, -1) }
   // A call's (or an `if`'s) `boolean | null` is stashed once and tested against its sentinel, as
   // the niche cell's arm writes a stashed operand (`emitCoalesceCallNiche`, `coalNicheOpen`).
   if !built && na == "callBool" && coalLhsStashes(lhsIx) {
     return coalNicheCell(b, n, lhsIx, ix, rep, "nulBool")
   }
   // Past the optional chains legacy reaches the nullable-reference rungs (`coalOptPassesToNulRefs`).
+  // A `p?.f` whose hole receiver an instance holds as a non-null record is that row's field.
+  if !built && na == "opt" {
+    const osi = optRecvInstanceRow(lhsIx)
+    if osi >= 0 { return coalField(b, n, lhsIx, ix, rep, osi) }
+  }
   if !built && na == "opt" && coalOptPassesToNulRefs(lhsIx, ibFnIx) {
     return coalNulRef(b, n, lhsIx, ix, rep)
   }
@@ -11822,12 +11864,32 @@ function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return o
 }
 
+// The struct row of `p?.f`'s receiver where the template typed it a hole and this instance holds
+// it as a non-null record (D17566); -1 otherwise.
+function optRecvInstanceRow(lhsIx: i32): i32 {
+  if lhsIx < 0 || lhsIx >= P.nodes.length || !optRecvHoleTyped(lhsIx) {
+    return -1
+  }
+  const m = nodeAt(lhsIx)
+  if !(m is OptMember) { return -1 }
+  const r = exprRepOf(unwrapParen(m.omObj))
+  if !(repNodeAt(r) is RRecord) { return -1 }
+  return structIndexOfTy(repTyOf(r))
+}
+
 // `o.v ?? d` over a value-union record field past the boxed arms, along `coalFieldPlanOf` as
 // `emitCoalesceUnionField` writes it: the record, a variable it re-reads, then the shared null
 // test's `if`, the default built into its null arm. A receiver it unwraps (`cfCast`) is unwrapped
 // after each read.
-function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
-  const p = coalFieldPlanOf(n, lhsIx, ix, ibFnIx)
+function coalField(
+  b: i32[],
+  n: BinExpr,
+  lhsIx: i32,
+  ix: i32,
+  rep: i32,
+  optSi: i32,
+): Opnd {
+  const p = if optSi >= 0 { coalFieldPlanOfOpt(n, lhsIx, optSi, ix, ibFnIx) } else { coalFieldPlanOf(n, lhsIx, ix, ibFnIx) }
   if p.cfArm != "boxed" && p.cfArm != "unbox" {
     return irBMiss("coalesce field " + p.cfArm)
   }
@@ -11835,21 +11897,23 @@ function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   const repOk = if boxed { repNodeAt(rep) is RBox } else { repPrim(rep) != null }
   if !repOk { return irBMiss("coalesce field result rep") }
   const m = nodeAt(lhsIx)
-  if !(m is Member) { return irBMiss("coalesce field node") }
+  // A `p?.f` an instance holds over a non-null record (`optSi`) reads its receiver as `p.f`'s.
+  const recvIx = if m is Member { m.memObj } else if m is OptMember && optSi >= 0 { m.omObj } else { -1 }
+  if recvIx < 0 { return irBMiss("coalesce field node") }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   // Its value stays on the stack from here, so no temp an operand before it built may wait.
   if endsInTemp(b) { return irBMiss("coalesce field after an operand") }
   // A box legacy unwraps itself is read at its storage, not narrowed.
-  const r = if p.cfCast >= 0 { storageReadOf(b, m.memObj) } else { irBExpr(b, m.memObj) }
+  const r = if p.cfCast >= 0 { storageReadOf(b, recvIx) } else { irBExpr(b, recvIx) }
   if ibMiss != "" { return r }
   // A receiver legacy re-emits is read again as the builder read it (`irHoistRecv`).
   if !(r is OVar) || r.ov < 0 { return irBMiss("coalesce field place") }
   // One legacy keeps in its stash (`coalFieldRecvStash`, a call) is read back from there.
   if (
     ib.irVars[r.ov].vKind == "temp"
-    && !recvReadsAgain(unwrapParen(m.memObj))
-    && unionEqOperandOk(m.memObj)
+    && !recvReadsAgain(unwrapParen(recvIx))
+    && unionEqOperandOk(recvIx)
   ) {
     return irBMiss("coalesce field place")
   }
