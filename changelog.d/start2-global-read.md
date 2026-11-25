@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims more global reads, stores and every extern global:** a union global narrowed to a `T | null` niche reads its box through the niche tail; a struct global read at a record its cell's row holds reads at that row; a value assigned to a global that stands at the cell's rep (a wider record of a declared subtype, a list twin, a closure apart in a hole) is retagged there, as a `let` initializer is; and an `extern let`/`extern const` binding's import index counts as minted, so its reads and writes no longer refuse as `global index`. On the classes' own programs `global index` falls 6 → 0, `global store coercion` 6 → 1 and `global read coercion` 8 → 4, and tests/cases start bodies claimed rise 1 → 8 of 42.
