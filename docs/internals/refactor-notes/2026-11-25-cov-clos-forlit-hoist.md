@@ -25,7 +25,7 @@ lowering gave.
 * For the probe, `arrLitDataElemExpr` was instrumented to `emitFail("DBG arrLitDataElemExpr")`, and
   the 4 programs were built at `VL_IR_SHADOW=5`. On the base tree each program fired 3 times (the
   control). On this tree each fired 0 times.
-* I8 sweep: `reentry arrLitDataElemExpr` is gone, and it is removed from `sweep-baseline.txt`.
+* I8 sweep: `reentry arrLitDataElemExpr` is gone, and its `causes/` entry is deleted.
 
 ## Parked: a box over a valued `if` (a lowering prerequisite)
 
