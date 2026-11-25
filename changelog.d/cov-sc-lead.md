@@ -1,3 +1,3 @@
-## Compiler internals (Track C)
+## Codegen, memory & runtime (Track B)
 
 - **IR coverage: a variable read before a later operand that holds a `??` is staged, not refused:** a binary operator's left operand, a list `.slice` receiver and earlier bounds, and a string method's receiver and earlier arguments are staged below a later operand holding a `??` that stages its leads, a store or a stash, as call arguments already were (`irBStageLeads`). `gradeParts` (ci-distilled's grader) and the scripts' slice and method sites are claimed; `short-circuit right operand` on tests/cases falls from 11 functions to 2, and the scripts' three short-circuit classes from 10 functions to 0. Byte-identical to legacy.
