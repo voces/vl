@@ -25,8 +25,8 @@ reads it once.
 
 ## Measurement
 
-`scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep.txt` (all populations), master
-against this change:
+`scripts/ir-i8-sweep.sh` over the keep list (then `keep.txt`, since replaced by `keep/`), all
+populations, master against this change:
 
 | | before | after |
 |---|---:|---:|
@@ -36,4 +36,4 @@ against this change:
 
 The 310 programs claim the same functions and start bodies before and after (census probes of
 master and of this change: 492 functions, 200 start bodies, no miss). Each is claimless-identical
-with no armed mismatch under `VL_IR_SHADOW=6`. `sweep-baseline.txt` drops the cause.
+with no armed mismatch under `VL_IR_SHADOW=6`. The cause's file, `causes/reentry_rcReadSource`, is deleted.
