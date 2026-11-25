@@ -11,6 +11,7 @@ import { printUnionPlan } from "./emit_fn_scans"
 import {
   armIdxSlot,
   irOnceRefSlot,
+  irOnceSlot,
   sharedFieldRecvSlot,
 } from "./emit_union_casts"
 import { mapRecvScalarBoxKindIn, mapRecvTyIn } from "./emit_ty_canon"
@@ -38,7 +39,7 @@ import {
   luOvLocalLeave,
   optLeafArmOf,
 } from "./wasmEmit"
-import { pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
+import { atomPayloadTail, pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
 import {
   armSiteRecv,
   capCellTargetOf,
@@ -314,6 +315,7 @@ import {
   repPrim,
 } from "./ir"
 import {
+  VT_ANYREF,
   fbArrayCopy,
   fbArrayFill,
   fbArrayGet,
@@ -744,6 +746,7 @@ import {
   voidTailCallee,
 } from "./wasmEmit"
 import {
+  HoleBox,
   arrLitVariantSlot,
   atomEqPlanOf,
   holeBoxPlanOf,
@@ -1887,7 +1890,14 @@ function dispatchBoxHeadOf(boxId: i32) {
 function joinBoxHead(out: i32, staged: boolean) {
   if !lwIfHeadBuilt { stashIfHeadsNote() }
   const bx = lwIfBoxAt.get(out) ?? -1
-  if bx < 0 || i32ListHas(lwBoxHeadAt, unwrapParen(bx)) { return 0 }
+  // A late box (`irBoxLate`) writes its own head after its value.
+  if (
+    bx < 0
+    || i32ListHas(lwBoxHeadAt, unwrapParen(bx))
+    || i32ListHas(lw.irBoxLate, unwrapParen(bx))
+  ) {
+    return 0
+  }
   const p = holeBoxPlanOf(bx, lwIfBoxTy.get(out) ?? -1, lw.irAt)
   if holeBoxLeads(p.hbArm) {
     if staged { lwPushing = true } else { leaf() }
@@ -4787,6 +4797,7 @@ function boxOp(r: RToBox) {
   const fnIx = lw.irAt
   const p = holeBoxPlanOf(r.bxAt, r.bxTy, fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
+  if i32ListHas(lw.irBoxLate, unwrapParen(r.bxAt)) { return boxLate(r, p) }
   // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
   if !i32ListHas(lwBoxHeadAt, unwrapParen(r.bxAt)) {
     if p.hbArm != "pass" && p.hbArm != "memberBox" && p.hbArm != "retag" {
@@ -4819,6 +4830,32 @@ function boxOp(r: RToBox) {
   if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
   if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
   return holeBoxTail(p, r.bxAt, fnIx)
+}
+
+// A late box (`irBoxLate`): its value and payload conversion, held in an `anyref` local
+// (`irOnceSlot`), then the plan's tag, the payload again and the box. Only a plan whose head is
+// its tag alone takes this; any other refuses.
+function boxLate(r: RToBox, p: HoleBox) {
+  const fnIx = lw.irAt
+  const tagOnly = p.hbArm == "atom"
+    || p.hbArm == "atomAsStr"
+    || p.hbArm == "atomList"
+    || p.hbArm == "rec"
+    || p.hbArm == "obj"
+    || p.hbArm == "refList"
+  if !tagOnly { return irLMiss("box of a valued if at plan " + p.hbArm) }
+  irLOpnd(r.bxV)
+  if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
+  if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
+  if p.hbArm == "atom" || p.hbArm == "atomList" { atomPayloadTail(p.hbKind) }
+  const any: u8[] = [VT_ANYREF]
+  const s = irOnceSlot(any)
+  fbLocalSet(s)
+  holeBoxHead(p, r.bxAt, fnIx)
+  lwBoxHeadAt.push(unwrapParen(r.bxAt))
+  fbLocalGet(s)
+  fbStructNew(uBoxIdx)
+  return 0
 }
 
 // Opens legacy's header hoists for the loop over `condIx` and `bodyIx`, its rows and header
