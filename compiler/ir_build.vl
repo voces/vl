@@ -770,6 +770,7 @@ import {
   holderRecordTy,
   identIsEnvCapture,
   identNameIsUserBound,
+  instanceReadTyOf,
   letArmCellRow,
   letAtomCellTy,
   letBindIsAtom,
@@ -917,6 +918,7 @@ import {
 } from "./emit_atom_kinds"
 import { recordHeapOfTy, structRowHeap } from "./emit_shape_intern"
 import {
+  NICHE_NUL_LIT,
   NICHE_NUL_MAP,
   RC_MAP,
   RC_REF_LIST,
@@ -7665,14 +7667,13 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   }
   const want = printArmRep(arm)
   if want == "" { return skip("print " + arm) }
-  // A `K | null` read out of a wider box converts to the niche first, which the IR does not build.
-  if arm == "nulAtom" && narrowedNulLitPinBoxKey(c.callArgs[0], ibFnIx) != "" {
-    return skip("print nulAtom from a box")
-  }
+  // A `K | null` read out of a wider box converts to the niche first (`emitPrintNulLitUnion`).
+  const fromBox = want == "nulAtom"
+    && narrowedNulLitPinBoxKey(c.callArgs[0], ibFnIx) != ""
   const unionIf = arm == "union" && nodeAt(unwrapParen(c.callArgs[0])) is IfStmt
   const from = b.length
   // An atom arm, or its `K | null`, streams the id its operand is held at (`emitStashAtomId`).
-  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else if want == "atom" || want == "nulAtom" { exprAt(b, c.callArgs[0], true) } else { irBExpr(b, c.callArgs[0]) }
+  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else if fromBox { nulLitNicheRead(b, c.callArgs[0]) } else if want == "atom" || want == "nulAtom" { exprAt(b, c.callArgs[0], true) } else { irBExpr(b, c.callArgs[0]) }
   if ibMiss != "" { return 0 }
   // Legacy opens a nullable string's or boolean's print blocks before its operand, so where the
   // operand wrote a valued `if` (or a stash) the blocks open before it (`RPrintOpen`).
@@ -7699,6 +7700,18 @@ function printStmt(b: i32[], c: Call, ix: i32) {
     ix,
   )
   return 0
+}
+
+// Place `ix`, narrowed to `K | null` out of a wider box, as that niche: read at its storage, the
+// box, then converted (`RNicheRead`), as `emitNarrowedNicheRead` writes it.
+function nulLitNicheRead(b: i32[], ix: i32): Opnd {
+  const rep = repNodeOfTy(heldTy(instanceReadTyOf(ix, ibFnIx)))
+  if !atomNullable(rep) { return irBMiss("nullable literal niche rep") }
+  const mark = storageReadEnter(ix)
+  const o = irBExpr(b, ix)
+  storageReadLeave(mark)
+  if ibMiss != "" { return o }
+  return irBLetTemp(b, { nrV: o, nrAt: ix, nrKind: NICHE_NUL_LIT }, ix, rep)
 }
 
 // A `print`'s `if` argument at the union arm, as legacy's `emitPrintValueUnion` writes it: at a
@@ -7760,9 +7773,9 @@ function printArmRep(arm: PrintArm): string {
     "nulStr" => "nulStr"
     "nulBool" => "nulBool"
     "atom" => "atom"
-    "nulAtom" => "nulAtom"
+    "nulAtom" | "nulLitPin" => "nulAtom"
     "union" => "union"
-    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "unrenderable" => ""
+    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "unrenderable" => ""
   }
 }
 
@@ -12844,6 +12857,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   if pre == "pre-path tag leaf" { return tagLeaf(ix) }
   if pre == "pre-path tag dispatch" { return tagDispatch(b, ix) }
   if pre == "pre-path null unit read" { return nulUnitPlaceRead(b, ix, cell) }
+  if pre == "pre-path nul atom niche" { return nulLitNicheRead(b, ix) }
   if pre != "" { return irBMiss(pre) }
   const n = nodeAt(ix)
   if n is Paren { return exprAt(b, n.parInner, cell) }
@@ -16128,7 +16142,14 @@ function nicheKindControl(back: boolean) {
   for n in ib.irNodes {
     if !(n is SLet) { continue }
     const r = n.lRhs
-    if !(r is RNicheRead) || r.nrKind == 1 || r.nrKind == 2 { continue }
+    if (
+      !(r is RNicheRead)
+      || r.nrKind == 1
+      || r.nrKind == 2
+      || r.nrKind == NICHE_NUL_LIT
+    ) {
+      continue
+    }
     const isMap = r.nrKind == NICHE_NUL_MAP
     const isFn = r.nrKind == 11
     if back {
