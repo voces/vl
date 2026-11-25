@@ -13428,28 +13428,97 @@ function emitSharedFieldAssign(memIx: i32, valIx: i32, fnIx: i32) {
     fbLocalSet(vslot)
     let i = 0
     while i < vis.length {
-      const last = i == vis.length - 1
-      if !last {
-        if emitSharedFieldRecv(m.memObj, fnIx, rslot) < 0 { return -1 }
-        fbStructGet(uBoxIdx, 0) // field 0: tag
-        fbI32Rel(RS_TAG, uTags[vis[i]])
-        fbI32Bin(70)            // 0x46 i32.eq
-        fbIf(64)                // 0x40 void
-      }
-      if emitSharedFieldRecv(m.memObj, fnIx, rslot) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-      fbRefCast(variantHeap(vis[i]))
+      if sharedFieldArmOpen(m.memObj, fnIx, rslot, vis, i) < 0 { return -1 }
       fbLocalGet(vslot)
-      fbStructSet(variantHeap(vis[i]), fis[i])
-      if !last { fbElse() }
+      sharedFieldArmClose(vis, fis, i)
       i = i + 1
     }
-    let e = 0
-    while e < vis.length - 1 {
-      fbEnd()
-      e = e + 1
-    }
+    sharedFieldArmsEnd(vis)
     return 1
+  }
+  return 0
+}
+
+// The shared field write's plan for field store `memIx` (`sharedFieldAssignPlanOf`), its members'
+// variant rows into `vis` and field indices into `fis`: 0 none, 1 a value per arm, 2 one value.
+export function sharedFieldStorePlan(
+  memIx: i32,
+  fnIx: i32,
+  vis: i32[],
+  fis: i32[],
+): i32 {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return 0 }
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, vis, fis)
+  return sharedFieldAssignPlanOf(code, vis, fis)
+}
+
+// The one-value plan's staging slot for field store `memIx` (`sharedFieldStorePlan` 2), which its
+// arms read the value from.
+export function sharedFieldValSlot(
+  memIx: i32,
+  fnIx: i32,
+  vis: i32[],
+  fis: i32[],
+): i32 {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return -1 }
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, [], [])
+  return objOrderStashSlot(
+    variantFieldStorageKind(vis[0], fis[0]),
+    code,
+    uFieldStorageSlot(vis[0], fis[0]),
+  )
+}
+
+// Arm `i` of a shared field write over receiver `recvIx` (staged in `rslot`, or -1 to re-read it):
+// all but the last test the box's tag, then each casts the payload to its variant. The arm's value
+// and `sharedFieldArmClose` follow.
+function sharedFieldArmOpen(
+  recvIx: i32,
+  fnIx: i32,
+  rslot: i32,
+  vis: i32[],
+  i: i32,
+): i32 {
+  if i < vis.length - 1 {
+    if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
+    sharedFieldArmTest(vis, i)
+  }
+  if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
+  return sharedFieldArmCast(vis, i)
+}
+
+// After a shared field write's receiver box: the test of arm `i`'s tag, opening its `if`. Legacy
+// and the IR share it, as they share `sharedFieldArmCast` and `sharedFieldArmClose`.
+export function sharedFieldArmTest(vis: i32[], i: i32) {
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Rel(RS_TAG, uTags[vis[i]])
+  fbI32Bin(70)            // 0x46 i32.eq
+  fbIf(64)                // 0x40 void
+  return 0
+}
+
+// After a shared field write's receiver box: its payload cast to arm `i`'s variant.
+export function sharedFieldArmCast(vis: i32[], i: i32) {
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(variantHeap(vis[i]))
+  return 0
+}
+
+// After arm `i`'s value: its store, and the `else` to the next arm.
+export function sharedFieldArmClose(vis: i32[], fis: i32[], i: i32) {
+  fbStructSet(variantHeap(vis[i]), fis[i])
+  if i < vis.length - 1 { fbElse() }
+  return 0
+}
+
+// After the last arm: the `end` of each tag test.
+export function sharedFieldArmsEnd(vis: i32[]) {
+  let e = 0
+  while e < vis.length - 1 {
+    fbEnd()
+    e = e + 1
   }
   return 0
 }
@@ -13469,27 +13538,12 @@ function emitSharedFieldAssignPerArm(
   fbLocalSet(rslot)
   let i = 0
   while i < vis.length {
-    const last = i == vis.length - 1
-    if !last {
-      if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 0) // field 0: tag
-      fbI32Rel(RS_TAG, uTags[vis[i]])
-      fbI32Bin(70)            // 0x46 i32.eq
-      fbIf(64)                // 0x40 void
-    }
-    if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(variantHeap(vis[i]))
+    if sharedFieldArmOpen(recvIx, fnIx, rslot, vis, i) < 0 { return -1 }
     if emitVariantFieldValue(vis[i], fis[i], valIx, fnIx) < 0 { return -1 }
-    fbStructSet(variantHeap(vis[i]), fis[i])
-    if !last { fbElse() }
+    sharedFieldArmClose(vis, fis, i)
     i = i + 1
   }
-  let e = 0
-  while e < vis.length - 1 {
-    fbEnd()
-    e = e + 1
-  }
+  sharedFieldArmsEnd(vis)
   return 1
 }
 
