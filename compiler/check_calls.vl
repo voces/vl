@@ -446,7 +446,6 @@ import {
   judgeHoleCallOps,
   setMemberRetAt,
   substTyDeep,
-  substTyDeepNeverDropped,
   substTyDeepOf,
   tErr,
   tErrUnsupported,
@@ -547,6 +546,7 @@ import {
   mkNullableTy,
   mkObjTy,
   nestParentOf,
+  nomNameOfTy,
   objFieldType,
   tvSlotBound,
   tyArrayElemIx,
@@ -566,6 +566,7 @@ import {
   tyMentionsTyVarNamed,
   tyPinElem,
   tyPrintsAsRef,
+  tyReachesEmptyHole,
   tyRefusesArrayWrite,
   tySame,
   tyToStr,
@@ -1805,7 +1806,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
         const pN: string[] = []
         const pT: i32[] = []
         unboundCallPinsOf(n, sd, nNames, pN, pT)
-        if pN.length > 0 { retTy = substTyDeepNeverDropped(retTy, pN, pT) }
+        if pN.length > 0 { retTy = nullForNeverArm(substTyDeep(retTy, pN, pT)) }
       }
     }
   }
@@ -2980,10 +2981,42 @@ function openParamArgsFixed(f: FuncDecl, n: Call, tp: string): boolean {
       if at < 0 || at >= T.tys.length || tyHasHole(at) || tyHasTyVar(at) {
         return false
       }
+      if tyReachesEmptyHole(at) { return false }
     }
     i = i + 1
   }
   return true
+}
+
+// `ty` with each `X | null` whose `X` is `never` read as `null`, through lists, maps and records:
+// a call's result holds no value of the `never` arm. An instance keeps the arm (D3178).
+function nullForNeverArm(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const t = tyAt(ty)
+  if t is TyNullable { return if t.nInner == TY_NEVER { TY_NULL } else { ty } }
+  if t is TyArray {
+    const e = nullForNeverArm(tyElemOf(t))
+    if e == tyElemOf(t) { return ty }
+    return if t.aRead == 1 { mkArrayViewTy(e) } else { mkArrayTy(e) }
+  }
+  if t is TyMap {
+    const v = nullForNeverArm(tyValOf(t))
+    return if v == tyValOf(t) { ty } else { mkMapTy(tyKeyOf(t), v, t.mSet) }
+  }
+  if t is TyObj && nomNameOfTy(ty) == "" {
+    const out: i32[] = []
+    let changed = false
+    for f in t.objFieldTypes {
+      const f2 = nullForNeverArm(f)
+      if f2 != f { changed = true }
+      out.push(f2)
+    }
+    if !changed { return ty }
+    const nn: string[] = []
+    for n in t.objFieldNames { nn.push(n) }
+    return mkObjTy(nn, out)
+  }
+  return ty
 }
 
 // A call of a generic that binds none of its type parameters is the instance at their default
