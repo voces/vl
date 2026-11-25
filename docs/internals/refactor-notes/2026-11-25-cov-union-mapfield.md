@@ -55,5 +55,10 @@ body, and the present arm. The verifier checks an atom-niche operand and a box o
 - Class cut (`scripts/ir-i8-census/classes/coalesce-nulref-atomjoinstash.txt`, 3 programs),
   master tree before and this tree after: `coalesce nulRef atomJoinStash` 4 → 0 (one function
   and three start bodies); every function and start body of the three programs is claimed (3 → 7).
-- The positions sweep is the class's own `tests/cases/null/coalesce-call-litunion-niche-boxed-positions.vl`
-  (its `f` and start body both missed before and both are claimed now).
+- The class's own `tests/cases/null/coalesce-call-litunion-niche-boxed-positions.vl`: its `f` and
+  start body both missed before and both are claimed now.
+- Q58 sweep `tests/cases/null/coalesce-call-litunion-niche-boxed-in-each-position.vl` (a call's
+  argument, a return, a record field, a list element, an `if` arm, a loop, a nested function):
+  before, 6 functions and the start missed `coalesce nulRef atomJoinStash`; after, all are claimed
+  but `list`, which moves to `short-circuit array element after another` (its second element
+  follows the first's pending value).
