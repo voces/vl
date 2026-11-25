@@ -32,6 +32,7 @@ import {
   RCall,
   RCallHost,
   RCallRef,
+  RCallRefHead,
   RCast,
   RCellGet,
   RCellNew,
@@ -231,6 +232,9 @@ let vfDefLog: i32[] = []
 // The `push` temps not yet consumed, in push order, and which temps are such pushes.
 let vfPushed: i32[] = []
 let vfPushes: {[i32]: boolean} = Map()
+// The `RCallRefHead` temps, which only their `RCallRef` reads, and those it has read.
+let vfHeads: {[i32]: boolean} = Map()
+let vfHeadsRead: {[i32]: boolean} = Map()
 // The `RStashSet`s not yet read by their record: its literal, the kid set, the value's rep.
 let vfSetAt: i32[] = []
 let vfSetK: i32[] = []
@@ -330,6 +334,21 @@ function mapRecvOk(sym: i32, loc: Opnd, at: i32): boolean {
   return repNodeAt(opRep(loc)) is RMap
 }
 
+// A `crHead` call's callee: an `RCallRefHead` temp no call has read yet, released for this read.
+function headRead(o: Opnd, at: i32): boolean {
+  if !(o is OVar) || !(vfHeads[o.ov] ?? false) {
+    fail(10, at, "a call_ref's head is no call_ref head")
+    return false
+  }
+  if vfHeadsRead[o.ov] ?? false {
+    fail(10, at, "a call_ref head read twice")
+    return false
+  }
+  vfHeads[o.ov] = false
+  vfHeadsRead[o.ov] = true
+  return true
+}
+
 // Rule 4 at a use: a temp is read only once its one definition is in scope.
 function use(o: Opnd, at: i32) {
   match o {
@@ -339,6 +358,13 @@ function use(o: Opnd, at: i32) {
           10,
           at,
           "a push read anywhere but as its store's leading operand",
+        )
+      }
+      if vfHeads[o.ov] ?? false {
+        return fail(
+          10,
+          at,
+          "a call_ref head read anywhere but as its call's callee",
         )
       }
       if o.ov < 0 || o.ov >= vf.irVars.length {
@@ -618,10 +644,21 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       callSig(r.caCallee, r.caArgs, dst, at, r.caNever)
     }
     RCallRef => {
+      if r.crHead && !headRead(r.crFn, at) { return 0 }
       use(r.crFn, at)
       uses(r.crArgs, at)
       if !(repNodeAt(opRep(r.crFn)) is RClosure) {
         return fail(2, at, "call_ref of a non-closure")
+      }
+      0
+    }
+    RCallRefHead => {
+      use(r.chFn, at)
+      if !(repNodeAt(opRep(r.chFn)) is RClosure) {
+        return fail(2, at, "call_ref head of a non-closure")
+      }
+      if dst != opRep(r.chFn) {
+        return fail(2, at, "a call_ref head is at its closure's rep")
       }
       0
     }
@@ -2705,6 +2742,7 @@ function stmt(id: i32, prev: i32) {
         vfPushed.push(d)
         vfPushes[d] = true
       }
+      if r is RCallRefHead { vfHeads[d] = true }
       if vf.irVars[d].vKind == "temp" {
         if vfDefined[d] {
           return fail(4, id, "defines temp v" + i32ToStr(d) + " twice")
@@ -3272,6 +3310,7 @@ function rhsReadsList(r: Rhs): boolean {
       RCall |
       RCallHost |
       RCallRef |
+      RCallRefHead |
       RCast |
       RCellGet |
       RCellNew |
@@ -3561,6 +3600,8 @@ export function irVerify(f: IrFn): IrVerdict {
   vfDefLog = []
   vfPushed = []
   vfPushes = Map()
+  vfHeads = Map()
+  vfHeadsRead = Map()
   vfStaged = false
   vfSetAt = []
   vfSetK = []
