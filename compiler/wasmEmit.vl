@@ -1751,7 +1751,7 @@ import {
   localNulStrRecovers,
   nulBoxScalarValtype,
   nulCollWrapHeap,
-  nulNoneEqSides,
+  nulNoneEqRoute,
   nulStrReadRecovers,
   nulTestArmOf,
   nullOwnAt,
@@ -33069,25 +33069,39 @@ function emitListGetOr(getIx: i32, defIx: i32, fnIx: i32) {
 
 // The fused `xs.get(i) ?? d` arm itself, with the call's operands already marked.
 function emitListGetOrGo(getIx: i32, defIx: i32, fnIx: i32) {
+  const ek = listGetOrOpen(getIx, fnIx)
+  if ek == null { return -1 }
+  if emitScalarValue(defIx, fnIx, ek) < 0 { return -1 }
+  fbEnd() // 0x0b end
+  return 0
+}
+
+// The head of a fused `xs.get(i) ?? d` over a scalar list: one unsigned bounds compare opens an
+// `if` at the element's rep whose arm reads the element, then the `else` the default fills. The
+// element kind, or null after a named failure for no `.get` on a collected scalar list.
+export function listGetOrOpen(getIx: i32, fnIx: i32): VKind | null {
   const c = nodeAt(getIx)
   if c is Call {
-    if c.callFn < 0 { return -1 }
+    if c.callFn < 0 { return null }
     const callee = nodeAt(c.callFn)
     if callee is Member {
       if c.callArgs.length != 1 {
-        return emitFail(
+        emitFail(
           "emitProgram: internal: .get reached with the wrong argument count — the checker's arity rule refuses it",
         )
+        return null
       }
       // The scalar element kind (i32 / f64) selects the list types + read rep. The caller
       // gates on `exprF64Array || exprArray`, so a string list, whose element may be null,
       // takes the generic nullable read instead (D2276).
       const ek = scalarListElemKind(callee.memObj, fnIx)
       if ek == null {
-        return emitFail("emitProgram: .get receiver is not a scalar list")
+        emitFail("emitProgram: .get receiver is not a scalar list")
+        return null
       }
       if !scalarListUsed(ek) {
-        return emitFail("emitProgram: .get but list type not collected")
+        emitFail("emitProgram: .get but list type not collected")
+        return null
       }
       const lTy = scalarListWrap(ek, exprPackedRow(callee.memObj, fnIx))
       const aTy = scalarListBack(ek, exprPackedRow(callee.memObj, fnIx))
@@ -33096,22 +33110,21 @@ function emitListGetOrGo(getIx: i32, defIx: i32, fnIx: i32) {
       listGetStageMark(getIx)
       // cond: len u> idx  (one unsigned compare covers negative + past-len). The receiver
       // is evaluated before the index, as every other `.get` spelling does (D3756).
-      if emitListGetRecv(callee.memObj, fnIx, lTy) < 0 { return -1 }
+      if emitListGetRecv(callee.memObj, fnIx, lTy) < 0 { return null }
       fbStructGet(lTy, 1)       // field 1: len
-      if emitListGetIdx(c.callArgs[0], fnIx) < 0 { return -1 }
+      if emitListGetIdx(c.callArgs[0], fnIx) < 0 { return null }
       fbI32Bin(75)              // 0x4b i32.gt_u
       fbIfForScalarListElem(ek) // 0x04 if, the element's own result rep
-      if emitListGetRecv(callee.memObj, fnIx, lTy) < 0 { return -1 }
+      if emitListGetRecv(callee.memObj, fnIx, lTy) < 0 { return null }
       fbStructGet(lTy, 0)       // field 0: backing
-      if emitListGetIdx(c.callArgs[0], fnIx) < 0 { return -1 }
+      if emitListGetIdx(c.callArgs[0], fnIx) < 0 { return null }
       fbArrayGet(aTy)           // 0xfb 0x0b array.get — the element
       fbElse()                  // 0x05 else
-      if emitScalarValue(defIx, fnIx, ek) < 0 { return -1 }
-      fbEnd()                   // 0x0b end
-      return 0
+      return ek
     }
   }
-  return emitFail("emitProgram: expected a list .get call")
+  emitFail("emitProgram: expected a list .get call")
+  return null
 }
 
 // The list a fused `xs.pop() ?? d` reads: its element kind, wrapper and backing heap types, and
@@ -41864,8 +41877,8 @@ function emitNullReadAtDst(exprIx: i32, fnIx: i32): boolean {
   return true
 }
 
-// The null (`NULL_OWN_*`) the destination of `null`-typed read `exprIx` holds where its rep's kind
-// is not the read's storage's, else -1: the storage read is that null.
+// The null (`NULL_OWN_*`) the destination of `null`-typed read `exprIx` holds where its rep's kind,
+// or its struct row, is not the read's storage's, else -1: the storage read is that null.
 export function nullReadDstOwnOf(exprIx: i32, fnIx: i32): i32 {
   const at = parenPeelIx(exprIx)
   let dst = ctxTyAt(at, fnIx)
@@ -41874,7 +41887,8 @@ export function nullReadDstOwnOf(exprIx: i32, fnIx: i32): i32 {
   const st = readNarrowedStoreAt(exprIx, fnIx)
   if dst < 0 || st < 0 { return -1 }
   const dk = repOfTy(dst).rdKind
-  if dk == repOfTy(st).rdKind { return -1 }
+  const sk = repOfTy(st).rdKind
+  if dk == sk && repSlotOfKind(dk, dst) == repSlotOfKind(sk, st) { return -1 }
   // An open `_ | null` destination (an un-annotated binding of the read) is built at the read's
   // storage, so the storage read is its null.
   const dt = tyAt(dst)
@@ -43635,7 +43649,7 @@ export function eqRouteOf(e: BinExpr, exprIx: i32, fnIx: i32): EqRoute {
   }
   const aq = atomEqRouteOf(atomEqPlanOf(e, fnIx).aqArm)
   if aq != null { return aq }
-  if nulNoneEqSides(l, r, fnIx) { return "nulNone" }
+  if nulNoneEqRoute(l, r, fnIx) { return "nulNone" }
   if binEqHasNoLowering(exprIx) { return "noLowering" }
   const xrep = xrepEmitPair(e, fnIx)
   if !xrep && binEqGRepUnresolved(exprIx, fnIx) { return "gRepUnresolved" }
@@ -43767,7 +43781,7 @@ function emitAtomEqByPlan(e: BinExpr, fnIx: i32): i32 {
 }
 
 // D1576 — `x == null` where `x` is the `null` type is statically true (`!=` false): the
-// non-literal side evaluates for its effect (`nulNoneEqSides`).
+// non-literal side evaluates for its effect (`nulNoneEqRoute`).
 function emitNulNoneEq(e: BinExpr, fnIx: i32): i32 {
   if emitNulNoneForEffect(e.binLeft, fnIx) < 0 { return -1 }
   if emitNulNoneForEffect(e.binRight, fnIx) < 0 { return -1 }
