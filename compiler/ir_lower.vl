@@ -39,7 +39,12 @@ import {
   luOvLocalLeave,
   optLeafArmOf,
 } from "./wasmEmit"
-import { atomPayloadTail, pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
+import {
+  atomPayloadTail,
+  boxTagOnly,
+  pushRecvCastOn,
+  pushRecvCastSet,
+} from "./wasmEmit"
 import {
   armSiteRecv,
   capCellTargetOf,
@@ -545,6 +550,8 @@ import {
   listBuildClose,
   listGetIdxHook,
   listGetIdxLegacy,
+  listGetIdxRelease,
+  listGetIdxUnstage,
   listGetOrOpen,
   listGetRecvHook,
   listOpRecvHeld,
@@ -783,6 +790,7 @@ import {
   narrowedVariantRepIs,
   nulVariantFieldPlain,
   numIsPlanOf,
+  structFieldAt,
   structFieldPlain,
   tagIsArmOf,
   variantFieldPlain,
@@ -2435,6 +2443,7 @@ function numIs(r: RNumIs): i32 {
 // last, and beside each the reads of it so far.
 const getIdxOs: Opnd[] = []
 const getIdxReads: i32[] = []
+let getIdxSlots: i32[] = []
 
 // The `.get` receiver operands `listGetRecvHook` reads while `coalListGetOr` writes legacy's head,
 // innermost last; each read is the operand read again (`opndAgain`).
@@ -2491,9 +2500,19 @@ function irListGetRecvRead(objIx: i32, _fnIx: i32): i32 {
 // Hands legacy's `.get` head index operand `o` (`listGetIdxHook`) where it is read at each use: an
 // immediate or a variable, never a temp. Returns whether it did; `irGetIdxEnd` then undoes it.
 export function irGetIdxBegin(o: Opnd): boolean {
-  if !(o is OImm || o is OVar && !isTemp(o.ov)) { return false }
+  // A temp (a call, say) is written once to a fresh i32 local and read from it at each use.
+  const once = o is OVar && isTemp(o.ov) && repPrim(opRepOf(o)) == "i32"
+  if !(o is OImm || o is OVar && !isTemp(o.ov) || once) { return false }
+  const slot = if once { irOnceSlot([127]) } else { -1 }
+  // Legacy's staging of the index is dropped: the tail reads this local through the hook.
+  if slot >= 0 {
+    irLOpnd(o)
+    fbLocalSet(slot)
+    listGetIdxUnstage()
+  }
   getIdxOs.push(o)
   getIdxReads.push(0)
+  getIdxSlots.push(slot)
   listGetIdxHook = irListGetIdxRead
   return true
 }
@@ -2502,6 +2521,7 @@ export function irGetIdxBegin(o: Opnd): boolean {
 export function irGetIdxEnd() {
   getIdxOs.pop()
   getIdxReads.pop()
+  if (getIdxSlots.pop() ?? -1) >= 0 { listGetIdxRelease() }
   if getIdxOs.length == 0 { listGetIdxHook = listGetIdxLegacy }
   return 0
 }
@@ -2515,6 +2535,8 @@ function irListGetIdxRead(idxIx: i32, _fnIx: i32): i32 {
   }
   const k = getIdxReads[at]
   getIdxReads[at] = k + 1
+  const slot = getIdxSlots[at] ?? -1
+  if slot >= 0 { return fbLocalGet(slot) }
   if k == 0 {
     irLOpnd(getIdxOs[at])
     return 0
@@ -2881,15 +2903,21 @@ function fieldIdxAt(at: i32, m: Member): i32 {
   if exprVariantIndex(m.memObj, fnIx) >= 0 {
     return variantFieldPlain(at, fnIx)
   }
-  const sf = structFieldPlain(at, fnIx)
+  const sf = structFieldPlainOrAt(at, fnIx)
   return if sf >= 0 { sf } else { nulVariantFieldPlain(at, fnIx) }
+}
+
+// `structFieldPlain`, or the stored field a read that records no kind takes (`structFieldAt`).
+function structFieldPlainOrAt(at: i32, fnIx: i32): i32 {
+  const sf = structFieldPlain(at, fnIx)
+  return if sf >= 0 { sf } else { structFieldAt(at, fnIx) }
 }
 
 // After a plain field read's object: the field, and the read's recovery.
 function fieldTail(at: i32, m: Member) {
   const fnIx = lw.irAt
   const vi = exprVariantIndex(m.memObj, fnIx)
-  const sf = if vi < 0 { structFieldPlain(at, fnIx) } else { -1 }
+  const sf = if vi < 0 { structFieldPlainOrAt(at, fnIx) } else { -1 }
   const idx = if vi >= 0 { variantFieldPlain(at, fnIx) } else if sf >= 0 { sf } else { nulVariantFieldPlain(at, fnIx) }
   if idx < 0 { return irLMiss("field shape") }
   // A narrowed `V | null` receiver, read non-null as `emitMemNulVariantRead` reads it.
@@ -5028,13 +5056,9 @@ function boxOp(r: RToBox) {
 // its tag alone takes this; any other refuses.
 function boxLate(r: RToBox, p: HoleBox) {
   const fnIx = lw.irAt
-  const tagOnly = p.hbArm == "atom"
-    || p.hbArm == "atomAsStr"
-    || p.hbArm == "atomList"
-    || p.hbArm == "rec"
-    || p.hbArm == "obj"
-    || p.hbArm == "refList"
-  if !tagOnly { return irLMiss("box of a valued if at plan " + p.hbArm) }
+  if !boxTagOnly(p.hbArm) {
+    return irLMiss("box of a valued if at plan " + p.hbArm)
+  }
   irLOpnd(r.bxV)
   if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
   if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
@@ -6627,9 +6651,12 @@ function coalListGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwSeq = []
   irLSkip(n.cbL)
   if lwMiss != "" { return -1 }
-  irLSettle(pending)
+  // An index temp is consumed into its local ahead of the head, before the pending temps settle.
   const ci = n.cbIdx
-  const hooked = if ci != null { irGetIdxBegin(ci) } else { false }
+  const tempIdx = ci != null && ci is OVar && isTemp(ci.ov)
+  const early = if tempIdx && ci != null { irGetIdxBegin(ci) } else { false }
+  irLSettle(pending)
+  const hooked = if early { true } else if ci != null { irGetIdxBegin(ci) } else { false }
   // The receiver, skipped above, is read again at each of the head's reads where it can be.
   const call = nodeAt(unwrapParen(e.binLeft))
   const callee = if call is Call && call.callFn >= 0 { nodeAt(call.callFn) } else { null }
@@ -7236,6 +7263,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwFloors = []
   lwLeadBoxes = []
   lwStashAt = []
+  getIdxSlots = []
   lwBoxHeadAt = []
   lwIfHeadAt = Map()
   lwIfHeadBuilt = false

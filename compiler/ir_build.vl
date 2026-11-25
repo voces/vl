@@ -1,6 +1,7 @@
 import { nullableRecordTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import {
   asgFieldParks,
+  catWidenTakes,
   coalFieldPlanOfOpt,
   identityOperandUnboxes,
   listFitShadowPlanOf,
@@ -327,6 +328,7 @@ import {
   atomicValPrim,
   binNumWidth,
   blockValueWidenKind,
+  boxTagOnly,
   bundleArgArmOf,
   bundleCallRefPlainKey,
   bundleChoiceTyOf,
@@ -794,6 +796,7 @@ import {
   captureNamesOf,
   captureValKind,
   captureValStructIdx,
+  catWidenSideOfBin,
   cbIdentNamesFn,
   cloSigKeyExt,
   coalesceDefaultNullable,
@@ -3593,6 +3596,15 @@ function bundleCallOf(n: Call, ix: i32, t: i32): boolean {
   // Where legacy picks a member after the call, the value is that member, at the call's type.
   const pk = bundleResultPickOf(ix, pos, ibFnIx)
   return pk.bpField < 0 && pk.bpHeap != -2
+}
+
+// Whether direct call `ix` of `callee` returns its bundle parameter's record where its value is
+// used at none of the members (`bpHeap` -2); the builder declines it, so the program counts as a
+// capability the IR cannot yet lower.
+function bundlePickRefused(ix: i32, callee: i32): boolean {
+  if !elabHasRetRecords() && !bundleAnyNoted() { return false }
+  if bundleResultPickOf(ix, callee, ibFnIx).bpHeap != -2 { return false }
+  return true
 }
 
 function noPick(): BundlePick {
@@ -8790,7 +8802,7 @@ function popValueRhs(b: i32[], m: Member, ix: i32): Rhs {
 // index, which legacy writes from the call twice, so only an index it re-reads in place is taken.
 function getValueRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if popAnyPlanOf(ix, ibFnIx) == null { return missRhs("method get") }
-  if !listGetIdxReReadable(c.callArgs[0]) { return missRhs("get index staged") }
+  const reRead = listGetIdxReReadable(c.callArgs[0])
   const v = irBExpr(b, m.memObj)
   if ibMiss != "" { return missRhs("method operand") }
   if !(repNodeAt(irBOpRep(v)) is RList) {
@@ -8799,11 +8811,21 @@ function getValueRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const at = b.length
   const i = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return missRhs("method operand") }
-  if b.length != at || irBOpRep(i) != repNodeOfTy(TY_I32) {
+  if irBOpRep(i) != repNodeOfTy(TY_I32) { return missRhs("get index operand") }
+  // An index legacy cannot re-read is one temp, written once to a local at its first use
+  // (`irGetIdxBegin`); one re-read in place builds no statement.
+  if reRead && b.length != at || !reRead && !oneTempAt(b, at, i) {
     return missRhs("get index operand")
   }
   const r: Rhs = { lqV: v, lqIx: [i], lqAt: ix }
   return r
+}
+
+// Whether body `b` gained exactly one node from `at` on, the `let` defining temp `o`.
+function oneTempAt(b: i32[], at: i32, o: Opnd): boolean {
+  if b.length != at + 1 || !(o is OVar) || o.ov < 0 { return false }
+  const n = ib.irNodes[b[at]]
+  return n is SLet && n.lDst == o.ov && ib.irVars[o.ov].vKind == "temp"
 }
 
 // Whether map store value `val` into receiver `recv`'s mv slot `sh` is an object literal legacy
@@ -9918,8 +9940,8 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   if (
     ibMiss == ""
     && boxLeadsAt(b, at)
+    && !boxTagLateAt(b, at)
     && !boxOfJoinAt(b, at)
-    && !boxLeadSpanAt(b, at)
   ) {
     boxLateAt(b, at)
   }
@@ -10303,6 +10325,24 @@ function boxOfJoinAt(b: i32[], at: i32): boolean {
   return holeBoxHeadAhead(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
 }
 
+// Whether the delivery built into `b` from `at` on ends in a box whose plan's head is its tag alone
+// (`boxTagOnly`) over a value holding a statement, which goes late (`boxLateAt`) ahead of the
+// head-first arms: those stay for a head that is more than a tag.
+function boxTagLateAt(b: i32[], at: i32): boolean {
+  if !ifBelowLeadHas(b, at, leadFirstAt(b)) { return false }
+  const n = ib.irNodes[b[b.length - 1]]
+  if !(n is SLet) { return false }
+  const r = n.lRhs
+  if (
+    !(r is RToBox)
+    || !boxTagOnly(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
+  ) {
+    return false
+  }
+  ib.irBoxLate.push(unwrapParen(r.bxAt))
+  return true
+}
+
 // Where the delivery built into `b` from `at` on ends in a box whose head leads and its value's
 // own nodes hold a statement (a valued `if` or `??`), notes the box late (`irBoxLate`): its head
 // follows the value, which the lowering holds in a local.
@@ -10316,41 +10356,6 @@ function boxLateAt(b: i32[], at: i32) {
   }
   ib.irBoxLate.push(unwrapParen(r.bxAt))
   return 0
-}
-
-// Where the delivery built into `b` from `at` on ends in a box whose head leads and its value's own
-// nodes write no statement but valued `if`s and `??`s that stage their leads, notes them as the
-// span the lowering writes that head ahead of (`irBoxLeadFirst`), as legacy writes the whole value
-// under it, and answers true.
-function boxLeadSpanAt(b: i32[], at: i32): boolean {
-  const bx = b.length - 1
-  if bx <= at { return false }
-  const n = ib.irNodes[b[bx]]
-  if !(n is SLet) { return false }
-  const r = n.lRhs
-  if (
-    !(r is RToBox)
-    || !holeBoxLeads(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
-  ) {
-    return false
-  }
-  for x in ib.irBoxLeadBox {
-    if x == b[bx] { return false }
-  }
-  // Only a span that holds a join under the head, which would otherwise refuse.
-  if !ifBelowLeadHas(b, at, bx) { return false }
-  let i = at
-  while i < bx {
-    const m = ib.irNodes[b[i]]
-    const join = m is SIf && m.siOut >= 0
-      || m is SCoalBox && coalArmStagesLeads(m.cbArm)
-    if !join && ifBelowLeadHas(b, i, i + 1) { return false }
-    i = i + 1
-  }
-  ib.irBoxLeadFirst.push(b[at])
-  ib.irBoxLeadBox.push(b[bx])
-  ib.irBoxLeadN.push(bx - at)
-  return true
 }
 
 // Whether the delivery built into `b` from `at` on ends in a box whose plan writes its tag ahead of
@@ -10595,10 +10600,14 @@ function listCat(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const r = irBExpr(b, n.binRight)
   if ibMiss != "" { return r }
   if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
-  if irBOpRep(l) != rep || irBOpRep(r) != rep || !(repNodeAt(rep) is RList) {
+  // A widening concat's narrower side is a list at its own rep, widened by its tail (`catWidenTail`).
+  const ws = if catWidenTakes(ix, ibFnIx) { catWidenSideOfBin(ix, ibFnIx) } else { 0 }
+  const lok = irBOpRep(l) == rep || ws == 1 && repNodeAt(irBOpRep(l)) is RList
+  const rok = irBOpRep(r) == rep || ws == 2 && repNodeAt(irBOpRep(r)) is RList
+  if !lok || !rok || !(repNodeAt(rep) is RList) {
     return irBMiss("list concat operand rep")
   }
-  return irBLetTemp(b, { ljL: l, ljR: r, ljAt: ix }, ix, rep)
+  return irBLetTemp(b, { ljL: l, ljR: r, ljAt: ix, ljWiden: ws }, ix, rep)
 }
 
 // Two union boxes, each built at its own box rep, compared by legacy's staged compare.
@@ -12328,9 +12337,10 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   }
   const m = nodeAt(c.callFn)
   if !(m is Member) { return irBMiss("coalesce listGetOr call") }
-  if !optRecvReReadable(m.memObj) || !listGetIdxReReadable(c.callArgs[0]) {
+  if !optRecvReReadable(m.memObj) {
     return irBMiss("coalesce listGetOr staged operand")
   }
+  const idxReRead = listGetIdxReReadable(c.callArgs[0])
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   // Its value stays on the stack from here, so no temp an operand before it built may wait.
@@ -12344,15 +12354,20 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const at = b.length
   const i = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return i }
-  if b.length != at || irBOpRep(i) != repNodeOfTy(TY_I32) {
+  if irBOpRep(i) != repNodeOfTy(TY_I32) {
     return irBMiss("coalesce listGetOr index operand")
   }
-  // Legacy's head reads the index at each use, so an immediate or a variable is handed to it.
+  // An index legacy cannot re-read is one temp, held once in a local (`irGetIdxBegin`).
+  if idxReRead && b.length != at || !idxReRead && !oneTempAt(b, at, i) {
+    return irBMiss("coalesce listGetOr index operand")
+  }
+  // Legacy's head reads the index at each use, so an immediate, a variable or that temp is handed
+  // to it.
   const reread = i is OImm
     || i is OVar
     && i.ov >= 0
     && i.ov < ib.irVars.length
-    && ib.irVars[i.ov].vKind != "temp"
+    && (ib.irVars[i.ov].vKind != "temp" || !idxReRead)
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
   if !coalNeverDefault(nb, n.binRight, rep, t) {
@@ -14669,7 +14684,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
         return listEq(b, n, ix, rep)
       }
       const cat = irListCatHook(ix, ibFnIx)
-      if cat == "plain" { return listCat(b, n, ix, rep) }
+      if cat == "plain" || cat == "widen" && catWidenTakes(ix, ibFnIx) {
+        return listCat(b, n, ix, rep)
+      }
       if cat != "none" { return irBMiss("list concat " + cat) }
       if eqRouteOf(n, ix, ibFnIx) == "numeric" {
         return nicheBoolEq(b, n, ix, rep)
@@ -14808,6 +14825,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return irBMiss("call") }
+    if rhs is RCall && bundlePickRefused(ix, rhs.caCallee) {
+      return irBMiss("bundle result pick refused")
+    }
     if rhs is RCall && rhs.caNever { return irBLetTemp(b, rhs, ix, rep) }
     if rhs is RCall && nulNoneCallee(rhs.caCallee) {
       const sentinel = nullOwnAt(ix, ibFnIx)
