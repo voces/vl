@@ -1003,8 +1003,9 @@ export function irLOpnd(o: Opnd) {
       // A range loop copy's variable reads as legacy's copy reads it (`urLocalRead`).
       if !urLocalRead(s) { fbLocalGet(s) }
       // An arm-site payload standing for an element read banks that read's row (`emitIndexBanked`).
-      if v == lwPayloadVar && lwPayloadRow >= 0 {
-        irLIndexRow(lwPayloadRow, rf)
+      const pk = lwPayloadVars.length - 1
+      if pk >= 0 && v == lwPayloadVars[pk] && lwPayloadRows[pk] >= 0 {
+        irLIndexRow(lwPayloadRows[pk], rf)
       }
       // A `shadow` arm's list is the frame's nullable list scratch, read non-null.
       if listFitShadowHolds(s) { fbRefAsNonNull() }
@@ -2649,9 +2650,9 @@ function armSiteStmt(n: SArmSite, pending: i32[]) {
   irLSettle(pending)
   const sp = emitFnSpanNode.length
   const sh = shIdxNode.length
-  const mute = lwIdxRowMute
-  lwIdxRowMute = n.saAt
+  lwIdxRowMutes.push(n.saAt)
   const recv = armSiteRecv(n.saAt)
+  const recvRow = if recv >= 0 && recv < P.nodes.length && nodeAt(recv) is Index { recv } else { -1 }
   let k = 0
   while k < arms.length && lwMiss == "" {
     const loc = armSiteArmOpen(n.saAt, bl, arms[k], lw.irAt)
@@ -2662,13 +2663,11 @@ function armSiteStmt(n: SArmSite, pending: i32[]) {
     lw.irVars[n.saVars[k]].vSlot = loc
     lwFrames.push(-1)
     armSiteArmEnter(n.saAt, arms[k], loc, lw.irAt)
-    const pv = lwPayloadVar
-    const pr = lwPayloadRow
-    lwPayloadVar = n.saVars[k]
-    lwPayloadRow = if nodeAt(recv) is Index { recv } else { -1 }
+    lwPayloadVars.push(n.saVars[k])
+    lwPayloadRows.push(recvRow)
     body(n.saArms[k], false, t, false)
-    lwPayloadVar = pv
-    lwPayloadRow = pr
+    lwPayloadVars.pop()
+    lwPayloadRows.pop()
     armSiteArmLeave()
     fbElse()
     k = k + 1
@@ -2679,7 +2678,7 @@ function armSiteStmt(n: SArmSite, pending: i32[]) {
     fbEnd()
     k = k - 1
   }
-  lwIdxRowMute = mute
+  lwIdxRowMutes.pop()
   adoptBankedRows(sp, sh)
   // Only an element read banks a row of its own (`emitIndexBanked`).
   if nodeAt(n.saAt) is Index { irLIndexRow(n.saAt, from) }
@@ -5935,16 +5934,19 @@ export function irLIndexFrom(ix: i32, from: i32): i32 {
   return lwRowOpenAt[id] ?? from
 }
 
-// The arm-site read whose arms are lowering, which banks one row over its whole chain; -1 for none.
-let lwIdxRowMute = -1
-// The payload variable of the arm lowering and the element read its receiver is, -1 for none.
-let lwPayloadVar = -1
-let lwPayloadRow = -1
+// The arm-site reads whose arms are lowering, each banking one row over its whole chain.
+const lwIdxRowMutes: i32[] = []
+// The payload variable of each arm lowering, innermost last, and the element read its receiver is
+// (-1 for none).
+const lwPayloadVars: i32[] = []
+const lwPayloadRows: i32[] = []
 
 // Banks the element-read row of `Index` node `ix` written from `from` on, as legacy's
 // `emitIndexBanked` does: only where names and the source map are emitted, and only over bytes.
 export function irLIndexRow(ix: i32, from: i32) {
-  if !idxRowsOn() || lwBuf.length <= from || ix == lwIdxRowMute { return 0 }
+  if !idxRowsOn() || lwBuf.length <= from || i32ListHas(lwIdxRowMutes, ix) {
+    return 0
+  }
   lwRowAst.push(ix)
   lwRowFrom.push(from)
   lwRowTo.push(lwBuf.length)
