@@ -245,11 +245,13 @@ I8 draft retires the instruments that compare against legacy: the IR shadow, box
 shadow, claims-off fallback and door-guard tests, `self-ir-misses`, and the full-gate shadow and
 parity rows.
 
-`ci-ir-identity` compares the I8 compiler against master's fetched seed for the I8 PR only. In that
-PR or the one right after it, the job becomes behaviour parity: each program's run output against
-its `@log`/Want (`ir-parity --behaviour-only`), with the byte comparison dropped (merge-queue §Q57),
-because a byte check against the previous seed would red every later codegen change (coordinator
-ruling, 2026-11-25).
+`ci-ir-identity` is behaviour parity now, not at I8 (coordinator ruling, 2026-11-25; DECISIONS.md).
+A differing exit code or refusal reds; a program both sides build to other bytes is counted as
+informational and run on both (`ir-parity.vl --behaviour-only`), which reds when its exit, trap or
+output differs, or when a `legacy-wrong:` program's IR-on run misses its `@log`/Want. At I8 the
+claimless side is master's fetched seed for that PR only; afterwards there is no claimless side,
+and each program's run is graded against its `@log`/Want alone. A program that prints nothing is
+graded by exit code and validity: 316 of the 26,238 programs the job covers.
 
 ## 8. The I8 PR's checklist (a plan; nothing is deleted before the I8 PR)
 
@@ -295,7 +297,7 @@ I8 (testing-strategy.md's kill-matrix rule). A check with no survivor is convert
 
 | check | where it runs | what it compares | at I8 | the survivor that catches its breakage |
 |---|---|---|---|---|
-| `ci-ir-identity` (`ir-identity.sh --cases` / `--claimless`, `ir-identity-annotate.sh`) | ci.yml, 4 shards; the queue | claims-on bytes against the same tree's claimless build | **convert**: against master's fetched seed for the I8 PR only, then behaviour parity (`ir-parity --behaviour-only`, run output against `@log`/Want; §7) | itself, converted |
+| `ci-ir-identity` (`ir-identity.sh --cases` / `--claimless`, `ir-identity-annotate.sh`) | ci.yml, 4 shards; the queue | claims-on behaviour against the same tree's claimless build; bytes informational (done 2026-11-25) | **convert** the claimless side: master's fetched seed for the I8 PR only, then each program's run against its `@log`/Want alone (§7) | itself, converted |
 | `ir-parity.vl --cross` (`ir claim cross`), `tests/vl_ir_identity_compare_test.ts`, `vl_ir_parity_legacy_wrong_test.ts` | gate.sh full; ci-native | claimed against claimless runs; the comparators' controls | **convert** to `--behaviour-only` over the same populations; the tests keep their controls on the behaviour grading | themselves, converted |
 | the claims-off fallback tests (`vl_ir_claim_fallback_test`, `vl_claim_fallback_wasm_test`, `playground_claim_fallback_test`) | ci-native; the ci.yml editor step | an invalid claimed module falls back to legacy (rc 70 under strict) | **convert** to one test per host that an invalid module (the `$VL_FAULT_INJECT` seam) is rc 70 with the validator's message | themselves, converted |
 | `scripts/ir-divergence-baseline.txt` (17 rows) | read by `ir-identity.sh`, `ir-parity.vl`, `ir-shadow.vl` | the listed byte differences between claimed and claimless builds | **retire** | behaviour parity: a `legacy-wrong:` row's program keeps its `@log`/Want, and parity grades it |

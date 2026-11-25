@@ -13218,3 +13218,24 @@ body using it as a number (`v.d + 1`, D17047's pin) would no longer check, a run
 which every reader of the instance's types inherits. The alternative, emitting a `?.` read at its
 stored row as a `.` read is (#10001), would have to be repeated in each emitter, and legacy's is
 frozen.
+
+## Byte identity with legacy stops being a gate; ci-ir-identity grades behaviour (2026-11-25, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-25, after consulting the owner**, ahead of I8 rather than at it.
+`ci-ir-identity` no longer reds on a program both sides build to other bytes. It reds when a
+program's exit code or refusal differs between the claims-on and the claimless compiler, or when a
+program both build runs otherwise (`ir-parity.vl --behaviour-only`: exit code, trap and output, or
+a `legacy-wrong:` program's IR-on run against its `@log`/Want). The byte differs are still counted
+(`bytes differ N (informational)`); `$IR_IDENTITY_BYTES=1` restores the byte gate for a lane that
+wants it. The fixpoint, the fuel, seed-size and plumb-shape gates, the Q58 sweeps and the strict
+witnesses stay.
+
+**Why.** The lanes were spending most of their effort matching legacy's layout quirks, not
+behaviour: the operand-order stash stack, box placement in a desugared `?.`, the order dependence
+of row adoption, and legacy reservation changes made only to keep bytes equal. A byte gate against
+an emitter that I8 deletes protects nothing a user can observe.
+
+**The blind spot.** A program that prints nothing is graded by its exit code and module validity
+alone: 316 of the 26,238 programs these modes cover (299 `tests/cases` programs, 1 capability
+probe, 1 distilled cell, 15 `runs` witnesses), counted as no `print(`, `printErr(` or `@trap` in
+the source.
