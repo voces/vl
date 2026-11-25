@@ -16,4 +16,4 @@ Looked at and left open, with reasons:
   handed to an open scrutinee's instance is typed at a union box; building it at `str` only moves
   the start to `box ladder` (COV-IS), so it is left as is.
 - `global initializer rep` (D6120): `const x = if c { [] } else { null }` has an open element type.
-- `expression as` (`maps/scalar-read-as-opt.vl`) is claimed on master 9a5c4e05 already.
+- `expression as` (`maps/scalar-read-as-opt.vl`) is claimed on master 91452f48 already.
