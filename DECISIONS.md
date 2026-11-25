@@ -13123,6 +13123,10 @@ This extends the `??` hole precedent, D1589 (`fillCoalHoleNodes`), which re-asks
 
 **Rejected alternative.** A new flow-sensitive "still definitely null" arm was rejected: it covers only the straight-line local case, which the existing narrowing already covers, and not the read across a function boundary.
 
+## A call refused for its argument count is typed by the callee's declared return (2026-11-25, coordinator ruling) — D17481
+
+**Ruled by the coordinator 2026-11-25**, on lane O2's D17481. Recovery after `wrong number of arguments` types the call by the callee's declared return, not `<error>`, as TypeScript does. What reads the result is checked against that type, so an independent true error still reports: `const s: string = mk(1, 2)` gives the arity error and `cannot assign A to 's'`, which is wrong at any arity. `<error>` would absorb such checks and hide them.
+
 ## A narrowed module `let` pays one program-wide writer analysis; a `const` pays none (2026-11-23) — D17063
 
 **Decided by the checker-fix lane that closed D17063 (2026-11-23), for the coordinator to confirm
