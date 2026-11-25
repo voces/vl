@@ -2938,9 +2938,38 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
     if ibMiss != "" { return gv }
     return irBLetTemp(b, { teV: gv, teTag: tag }, ix, rep)
   }
+  const cb = if v < 0 { capturedBoxRaw(b, r) } else { null }
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  if cb != null { return irBLetTemp(b, { teV: cb, teTag: tag }, ix, rep) }
   if v < 0 { return irBMiss("is box not a local") }
   const o: Opnd = { ov: v }
   return irBLetTemp(b, { teV: o, teTag: tag }, ix, rep)
+}
+
+// A captured union box `r` read raw past its narrowing: a lifted function's own parameter, or its
+// environment's field at the box's rep; null where `r` is no captured box.
+function capturedBoxRaw(b: i32[], r: i32): Opnd | null {
+  const n = nodeAt(r)
+  if !(n is Ident) || ibFnIx < 0 || captureSlotOf(n.identName, ibFnIx) < 0 {
+    return null
+  }
+  const fe = fnStmtsPosOf(ibFnIx)
+  const cr = capRepFor(fe, n.identName, -1)
+  const ty = capTyOf(fe, n.identName)
+  if !heldAsBox(cr) || ty < 0 || repNodeOfTy(ty) != cr { return null }
+  if cloLifted(fe) {
+    const lv = liftCapVar(fe, n.identName, -1)
+    if lv < 0 || ib.irVars[lv].vRep != cr { return null }
+    const o: Opnd = { ov: lv }
+    return o
+  }
+  return irBLetTempTy(
+    b,
+    { evSlot: captureSlotOf(n.identName, ibFnIx), evAt: r },
+    r,
+    cr,
+    ty,
+  )
 }
 
 // A member receiver's test at its storage: the field read as the storage read, its declared box.
@@ -3043,7 +3072,13 @@ function boxTestTagOf(
     return 0
   }
   const r = unwrapParen(n.isObj)
-  if localIndexOf(ibFnIx, r) < 0 && globalBoxSymOf(identDeclOf(r), r) < 0 {
+  const rn = if r >= 0 && r < P.nodes.length { nodeAt(r) } else { null }
+  const cap = rn is Ident && captureSlotOf(rn.identName, ibFnIx) >= 0
+  if (
+    localIndexOf(ibFnIx, r) < 0
+    && globalBoxSymOf(identDeclOf(r), r) < 0
+    && !cap
+  ) {
     irBMiss("is box not a local")
     return 0
   }
@@ -3734,6 +3769,12 @@ export function irBLetTempTy(
 export function irBBoxLocal(b: i32[], ix: i32): Opnd {
   const d = identDeclOf(ix)
   const w = localIndexOf(ibFnIx, ix)
+  // A capture's box is its lifted parameter or its environment field (`capturedBoxRaw`).
+  if w < 0 {
+    const cb = capturedBoxRaw(b, ix)
+    if ibMiss != "" { return irBMiss(ibMiss) }
+    if cb != null { return cb }
+  }
   if d >= 0 && w < 0 { return globalBoxRead(b, d, ix) }
   if d < 0 || w < 0 { return irBMiss("box receiver") }
   const dn = nodeAt(d)
