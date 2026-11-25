@@ -137,6 +137,7 @@ import {
   RToBox,
   Rhs,
   SArmSite,
+  SArmWrite,
   SAssign,
   SBlock,
   SBoundsCheck,
@@ -12279,6 +12280,7 @@ function nodeAssigns(ni: i32, v: i32): boolean {
     SIf => bodyAssigns(n.siThen, v) || bodyAssigns(n.siElse, v)
     SCoalBox => coalBoxAssigns(n, v)
     SArmSite => n.saOut == v
+    SArmWrite => armsAssign(n.awArms, v)
     SBlock => bodyAssigns(n.bkBody, v)
     SLoop => bodyAssigns(n.lpBody, v)
     SForIn => n.xfVar == v || n.xfVar2 == v || bodyAssigns(n.xfBody, v)
@@ -12309,6 +12311,14 @@ function nodeAssigns(ni: i32, v: i32): boolean {
 // per-level `nodeAssigns` frame stays as small as its other arms need.
 function coalBoxAssigns(n: SCoalBox, v: i32): boolean {
   return bodyAssigns(n.cbNull, v) || bodyAssigns(n.cbLB, v)
+}
+
+// Whether any arm body in `arms` assigns `v`.
+function armsAssign(arms: i32[][], v: i32): boolean {
+  for a in arms {
+    if bodyAssigns(a, v) { return true }
+  }
+  return false
 }
 
 function bodyAssigns(body: i32[], v: i32): boolean {
@@ -14029,10 +14039,57 @@ function storeValue(b: i32[], x: i32, rep: i32, at: i32): Opnd {
 // `xs[i] = v` that legacy writes as the plain store (`idxStoreOtherWhy`): receiver, index and
 // value in source order, then the store, whose guard runs after the value. A union list's value that
 // owes no box is boxed at the site's union (`idxStoreSiteBoxes`), as legacy's `emitUnionBoxArg`.
+// A store through a box of list arms inside `is K[]` (`SArmWrite`): per arm, the store built over
+// the arm's payload variable, the receiver read as it (`ibArmRecvVar`) and typed at the arm.
+function elemArmWrite(b: i32[], n: BinExpr, t: Index, ix: i32) {
+  if ibArmRecvVar >= 0 { return skip("store arm write nested") }
+  const recv = unwrapParen(t.idxArr)
+  if !(nodeAt(recv) is Ident) { return skip("store arm write receiver") }
+  const v = irBExpr(b, recv)
+  if ibMiss != "" { return 0 }
+  // Legacy reads the box again by its name at each arm: a variable's local, or a global the
+  // lowering reads again (`irHoistRecv`).
+  if (
+    !(v is OVar)
+    || v.ov < 0
+    || ib.irVars[v.ov].vKind == "temp" && !recvReadsAgain(recv)
+  ) {
+    return skip("store arm write receiver")
+  }
+  const bodies: i32[][] = []
+  const vars: i32[] = []
+  for m in armIndexWriteArmsOf(t, ibFnIx) {
+    const pr = repNodeOfTy(m)
+    if pr < 0 { return skip("store arm write arm") }
+    const pv = irVarNew(ib, pr, m, "local", -1)
+    const ab: i32[] = []
+    const mark = luOvEnter(recv, m)
+    readRepMemoAdvance()
+    ibArmRecvIx = recv
+    ibArmRecvVar = pv
+    elemStore(ab, n, t, ix)
+    ibArmRecvIx = -1
+    ibArmRecvVar = -1
+    luOvLeave(mark)
+    readRepMemoAdvance()
+    if ibMiss != "" { return 0 }
+    bodies.push(ab)
+    vars.push(pv)
+  }
+  irBNode(
+    b,
+    { awV: v, awAt: ix, awArms: bodies, awVars: vars },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  return 0
+}
+
 function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   // Legacy writes a store through a box of list arms per arm before any other plan.
   if armIndexWriteArmsOf(t, ibFnIx).length > 0 {
-    return skip("store arm write")
+    return elemArmWrite(b, n, t, ix)
   }
   // Legacy takes a map store before it plans an element store.
   if exprMap(t.idxArr, ibFnIx) {
