@@ -1,5 +1,6 @@
 import { recFieldTyOf } from "./emit_rec_field_codes"
 import {
+  asgFieldParks,
   identityOperandUnboxes,
   listFitShadowPlanOf,
   listFitShadowReadsRow,
@@ -127,6 +128,7 @@ import {
   RMakeRec,
   RMapDelete,
   RMapGet,
+  RMapSet,
   RNulNoneBox,
   ROptRead,
   RRecover,
@@ -7849,6 +7851,7 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
     msKey: leads[1],
     msVal: v,
     msAdd: val < 0,
+    msPark: false,
   }
   irBNode(b, { efRhs: r }, -1, ibNoValue, ix)
   return 0
@@ -13765,6 +13768,7 @@ function assignValueGo(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const arm = asgValueArmOf(ix, ibFnIx)
   if arm == "lit" { return assignValueLit(b, n, ix, rep) }
   if arm == "nullLit" { return assignValueNullLit(b, n, ix, rep) }
+  if arm == "parked" { return assignValueParked(b, n, ix, rep) }
   if arm != "reRead" { return irBMiss("assignment value " + arm) }
   // The store between an operand already built and the box's re-read would put that operand out of
   // stack order, as `assignValueLit`'s would.
@@ -13802,10 +13806,56 @@ function assignValueGo(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const nulLocal = t is Ident && !globalTarget(n.binLeft) && atomNullable(r0)
   const dec = atomAtStr(r0, rep) || nulLocal && repPrim(rep) == "str"
   const w = if ibMiss == "" && dec { widenTo(b, o, ix, rep, -1) } else { o }
+  // A closure re-read where the assignment's type leaves a closure part open, or fills one, is
+  // the same closure struct, retagged, as a closure cell's read is.
+  if (
+    ibMiss == ""
+    && irBOpRep(w) != rep
+    && repNodeAt(irBOpRep(w)) is RClosure
+    && holeRetagNoted(irBOpRep(w), rep, true)
+  ) {
+    return irBLetTemp(b, { rgV: w }, ix, rep)
+  }
   if ibMiss == "" && irBOpRep(w) != rep {
     return irBMiss("assignment value re-read rep")
   }
   return w
+}
+
+// An assignment as a value its element store, struct field store or map set parks
+// (`asgValueArmOf` "parked"): the store (a field's or a map's marked to park), then the slot read
+// back (`RAsgParked`). A field of a kind no scratch local holds is a named miss.
+function assignValueParked(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const t = nodeAt(n.binLeft)
+  if t is Member && !asgFieldParks(ix, ibFnIx) {
+    return irBMiss("assignment value parked field")
+  }
+  if !(t is Index) && !(t is Member) {
+    return irBMiss("assignment value parked target")
+  }
+  const at = b.length
+  assignTo(b, n, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  const last = if b.length > at { ib.irNodes[b[b.length - 1]] } else { null }
+  const ms = if last is SEffect { last.efRhs } else { null }
+  if !(last is SListSet) && !(last is SSetField) && !(ms is RMapSet) {
+    return irBMiss("assignment value parked store")
+  }
+  if last is SSetField { last.sfPark = true }
+  if ms is RMapSet { ms.msPark = true }
+  const src = if last is SListSet { irBOpRep(last.lsSrc) } else if last is SSetField { irBOpRep(last.sfSrc) } else if ms is RMapSet { irBOpRep(ms.msVal) } else { -1 }
+  const sn = repNodeAt(src)
+  // A value narrower than its slot is narrowed back by the one opcode legacy writes after it.
+  const uw = asgReadUnwidenOp(ix, ibFnIx)
+  if uw >= 0 {
+    if sn is RNullable { return irBMiss("assignment value parked unwiden") }
+    const p = irBLetTemp(b, { apAt: ix }, ix, src)
+    return irBLetTemp(b, { uwV: p, uwOp: uw, uwAt: ix }, ix, rep)
+  }
+  if src != rep && !(sn is RNullable && sn.rnInner == rep) {
+    return irBMiss("assignment value parked rep")
+  }
+  return irBLetTemp(b, { apAt: ix }, ix, rep)
 }
 
 // An assignment of `null` the checker types `null` (`asgValueArmOf` "nullLit"): the store, then
@@ -14076,7 +14126,7 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   if irBOpRep(v) != r || irBOpRep(x) != repNodeKids(r)[k] {
     return skip("field store coercion")
   }
-  irBNode(b, { sfV: v, sfIx: k, sfSrc: x }, -1, ibNoValue, ix)
+  irBNode(b, { sfV: v, sfIx: k, sfSrc: x, sfPark: false }, -1, ibNoValue, ix)
   return 0
 }
 

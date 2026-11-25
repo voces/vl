@@ -298,6 +298,9 @@ export type ROptRead = { orV: Opnd, orAt: i32, orTag: i32 }
 // one opcode `uwOp` legacy's `asgReadUnwidenOp` names: an integer wrap or truncation, an `f32`
 // demotion, or `ref.as_non_null` of a reference held in its own nullable niche.
 export type RAsgUnwiden = { uwV: Opnd, uwOp: i32, uwAt: i32 }
+// An assignment `apAt` as a value its store parked (`asgValueArmOf` "parked"): the element store's,
+// field store's or map set's parked slot read back and recovered, as `emitAsgValueOf` reads it.
+export type RAsgParked = { apAt: i32 }
 // A numeric `as` at cast node `ncAt` over operand `ncV`, built at the kind `numCastKindOf`
 // names; legacy's `numCastTail` writes the conversion, and an `as!`'s test and trap.
 // A numeric `as` at node `ncAt` over `ncV`; a bare exact `as`'s miss returns `ncMiss`, the
@@ -446,7 +449,7 @@ export type RMapOp = { mpOp: MapOp, mpArgs: Opnd[], mpAt: i32 }
 export type RMapNew = { mnAt: i32 }
 // A set of `msVal` at key `msKey` into map global `msSym` (receiver node `msRecv`, recovered for
 // `msNonNull`), or, with `msSym` -1, into receiver operand `msLoc`; a Set's `add` (`msAdd`) stores the
-// constant `true`.
+// constant `true`. `msPark`: the set keeps its value for its assignment's value (`RAsgParked`).
 export type RMapSet = {
   msSym: i32,
   msNonNull: boolean,
@@ -455,6 +458,7 @@ export type RMapSet = {
   msKey: Opnd,
   msVal: Opnd,
   msAdd: boolean,
+  msPark: boolean,
 }
 // `czL ?? czD` at `??` node `czAt` over a `string | null`: legacy's block, in which `czD`, a
 // string literal written by legacy's literal writer, runs only when `czL` is null.
@@ -671,6 +675,7 @@ export type Rhs = RAfterEffects
   | RArmUnbox
   | RAsTail
   | RAsUnion
+  | RAsgParked
   | RAsgUnwiden
   | RAtomEq
   | RAtomSole
@@ -795,7 +800,8 @@ export type SwitchArm = { swArm: i32, swWhy: string, swBody: i32[] }
 // none) is written by an `SAssign` that ends each arm, or by each `SBr` to the block's label.
 export type SLet = { lDst: i32, lRhs: Rhs }
 export type SAssign = { asDst: i32, asSrc: Opnd }
-export type SSetField = { sfV: Opnd, sfIx: i32, sfSrc: Opnd }
+// `sfPark`: the store parks its value for its assignment's value to read back (`RAsgParked`).
+export type SSetField = { sfV: Opnd, sfIx: i32, sfSrc: Opnd, sfPark: boolean }
 export type SListSet = { lsV: Opnd, lsIx: Opnd, lsSrc: Opnd }
 export type SCellSet = { csCell: Opnd, csSrc: Opnd }
 export type SGlobalSet = { gsSym: i32, gsSrc: Opnd }
@@ -1426,6 +1432,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RArmUnbox |
       RAsTail |
       RAsUnion |
+      RAsgParked |
       RAsgUnwiden |
       RAtomEq |
       RAtomSole |
@@ -1853,6 +1860,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RNumWiden => [r.nwV]
     ROptRead => [r.orV]
     RNumCast => if r.ncMiss is OVar && r.ncMiss.ov < 0 { [r.ncV] } else { [r.ncV, r.ncMiss] }
+    RAsgParked => []
     RAsgUnwiden => [r.uwV]
     RNumIntr => r.nxArgs
     RNumUnionBin => r.nbArgs
@@ -1990,6 +1998,7 @@ function rhsText(r: Rhs): string {
       + opndText(r.orV)
       + (if r.orTag >= 0 { " is tag " + i32ToStr(r.orTag) } else { "" })
     RNumCast => "cast " + opndText(r.ncV)
+    RAsgParked => "asg parked"
     RAsgUnwiden => "unwiden " + opndText(r.uwV)
     RToBox => "box " + opndText(r.bxV)
     RHoleOptBox => "hole opt box " + opndText(r.hxV)
@@ -2374,6 +2383,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
   return match r {
     RAfterEffects |
       RAsTail |
+      RAsgParked |
       RAsgUnwiden |
       RAtomEq |
       RAtomSole |
