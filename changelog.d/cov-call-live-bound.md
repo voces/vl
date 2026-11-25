@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims a call of a name that a local binding shadows a module function with:** whether a call of `w` reaches a parameter, local or capture `w` or the module function `w` is now decided by one static predicate, `identNameIsBoundAt`. It reads the binder's resolution and the binding's scope, where before legacy read its emit-time scope stack and the IR builder guessed. Legacy's bytes are identical across `tests/cases`, distilled, the capability probes, the witnesses and the self-compile. `call of a non-declaration: not routed to a closure` falls from 5 functions and 4 start bodies to 2 functions (the null-typed callee, a separate mechanism).

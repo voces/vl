@@ -34,7 +34,7 @@ scratch tree (nothing under `build/`). The plan it led to is that note's §7.
 
 The last rounds add about one name each: the record copy and union coercion chains are deep.
 Seeding the set from the static IR→stub edges would save rebuilds. The 19 names beyond the 90 in
-`scripts/ir-i8-census/keep.txt`: emitChainRootElem emitCoerceAtomPayload emitEqIsNull
+`scripts/ir-i8-census/keep.txt` (since replaced by `keep/`, one file per function): emitChainRootElem emitCoerceAtomPayload emitEqIsNull
 emitEqRootIsNull emitListGetRecv emitMapGetScalarBox emitMapPrep emitMapPrepFor emitMapRecvKey
 emitNulIsNullTest emitUnionCoerceAtomBox emitUnionCoerceValueAtom emitUnionListLitViaRefArm
 eqHelpFnBody listGetOrOpen nulStructEqGuardTail pushMapRecvRef refListReadAt structEqStage.

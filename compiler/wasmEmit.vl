@@ -1479,7 +1479,6 @@ import {
   forInStringSrc,
   forInU8Src,
   globalNulListCellRead,
-  identNameIsLiveBound,
   listFitShadowRow,
   litAtomWidenTexts,
   mapReadScalarBoxKind,
@@ -4646,6 +4645,23 @@ export function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
   const recv = nd.isObj
+  if unionEqOperandOk(recv) { return emitRecordFitPlaced(isIx, -1, fnIx) }
+  if recordFitPlanOf(isIx, fnIx) == 0 { return 0 }
+  // A receiver that is not a re-readable place (a call) is evaluated once into the `?.` stash.
+  if !fnUses.optRecv {
+    return emitFailAt("emitProgram: `is` receiver stash not reserved", recv)
+  }
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbLocalSet(optRecvSlot)
+  return emitRecordFitPlaced(isIx, optRecvSlot, fnIx)
+}
+
+// `emitRecordFitIs` past its receiver: read from local `src`, or read again where `src` is -1,
+// the only form the IR hands it (`recordFitPlanOf` 1). 0 when the test is not that shape.
+export function emitRecordFitPlaced(isIx: i32, src: i32, fnIx: i32): i32 {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) { return 0 }
+  const recv = nd.isObj
   const objTy = nodeTyAt(recv, fnIx)
   const names: string[] = []
   const sets: i32[] = []
@@ -4656,11 +4672,6 @@ export function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
       "emitProgram: `is` over a record reached its field test with no field narrowed",
     )
   }
-  // A receiver that is not a re-readable place (a call) is evaluated once into the `?.` stash.
-  const staged = !unionEqOperandOk(recv)
-  if staged && !fnUses.optRecv {
-    return emitFailAt("emitProgram: `is` receiver stash not reserved", recv)
-  }
   const si = structIndexOfExpr(recv, fnIx)
   const vi = if si >= 0 { -1 } else { exprVariantIndex(recv, fnIx) }
   // The instance's type decides: a generic receiver handed `A | null` is nullable there.
@@ -4670,11 +4681,6 @@ export function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
       "emitProgram: `is` over a nullable record that is not a nullable reference",
     )
   }
-  if staged {
-    if emitExpr(recv, fnIx) < 0 { return -1 }
-    fbLocalSet(optRecvSlot)
-  }
-  const src = if staged { optRecvSlot } else { -1 }
   return emitRecordFitCore(recv, src, si, vi, nullable, names, sets, fnIx)
 }
 
@@ -4920,13 +4926,21 @@ function listNeedsDiscrim(vis: i32[]): boolean {
 function emitListFitIs(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
-  return emitListFitAt(nd.isObj, isVarTyIxOf(isIx), isIx, -1, fnIx)
+  return emitListFitAt(nd.isObj, isVarTyIxOf(isIx), isIx, fnIx)
 }
 
-// The fit test of list `recv` against `chk`, leaving 1 or 0, with `recv` read from scratch
-// slot `stash` when it is one, else emitted. 0 when the test is not that shape, 1 when
-// emitted, -1 when refused at `anchor`.
-function emitListFitAt(
+// The fit test of list `recv` against `chk`, leaving 1 or 0, with `recv` emitted. 0 when the
+// test is not that shape, 1 when emitted, -1 when refused at `anchor`.
+function emitListFitAt(recv: i32, chk: i32, anchor: i32, fnIx: i32): i32 {
+  const p = listFitPlanOf(recv, chk, fnIx)
+  if p.lftOk == 0 { return 0 }
+  if p.lftOk < 0 { return emitFailAt(p.lftWhy, anchor) }
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  return listFitTail(p, fnIx)
+}
+
+// `emitListFitAt` with `recv` read from scratch slot `stash`.
+function emitListFitStashed(
   recv: i32,
   chk: i32,
   anchor: i32,
@@ -4936,8 +4950,7 @@ function emitListFitAt(
   const p = listFitPlanOf(recv, chk, fnIx)
   if p.lftOk == 0 { return 0 }
   if p.lftOk < 0 { return emitFailAt(p.lftWhy, anchor) }
-  if stash >= 0 { fbLocalGet(stash) }
-  else if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbLocalGet(stash)
   return listFitTail(p, fnIx)
 }
 
@@ -9142,24 +9155,53 @@ function emitNulMapArmBox(
   defIx: i32,
   fnIx: i32,
 ): i32 {
+  nulMapArmBoxHead(tag)
+  if emitExpr(exprIx, fnIx) < 0 { return -1 }
+  nulMapArmBoxPresent()
+  if defIx >= 0 {
+    if emitUnionBoxOwed(unionName, unionTy, defIx, fnIx) < 0 { return -1 }
+  } else {
+    nulMapArmBoxNull()
+  }
+  fbEnd()
+  return 1
+}
+
+// Ahead of a `M | null` value boxed under map arm tag `tag`: the box's block, and the tag's, which
+// the value's null branch carries out (`emitNulMapArmBox`).
+function nulMapArmBoxHead(tag: i32): i32 {
+  if tag < 0 {
+    return emitFail("emitProgram: a nullable map's union names no map arm tag")
+  }
   fbBlockRefNul(uBoxIdx, false) // (ref $uBox) blocktype
   fbBlock(127) // i32: the tag, carried out when the value is null
   fbI32Rel(RS_TAG, tag)
-  if emitExpr(exprIx, fnIx) < 0 { return -1 }
+  return 0
+}
+
+// After the value: on a map, its arm's box out of the outer block; on null, the tag dropped.
+function nulMapArmBoxPresent() {
   fbBrOnNull(0)
   fbStructNew(uBoxIdx) // { tag, map struct ref }
   fbBr(1)
   fbEnd()
   fbDrop()
-  if defIx >= 0 {
-    if emitUnionBoxOwed(unionName, unionTy, defIx, fnIx) < 0 { return -1 }
-  } else {
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbRefNullNone()
-    fbStructNew(uBoxIdx) // { null tag, unread }
-  }
+  return 0
+}
+
+function nulMapArmBoxNull() {
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbRefNullNone()
+  fbStructNew(uBoxIdx) // { null tag, unread }
+  return 0
+}
+
+// `emitNulMapArmBox`'s tail past its value, the null path the null box.
+function nulMapArmBoxTail(): i32 {
+  nulMapArmBoxPresent()
+  nulMapArmBoxNull()
   fbEnd()
-  return 1
+  return 0
 }
 
 // `l ?? d` of `coalMapJoinWhen`'s shape: the left's arm box, else `d` boxed. 1 handled, -1 failed.
@@ -10003,7 +10045,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 // value built before the box sits above that tag. `null` and `lit` write no value after theirs.
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
-    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "clo" => true
+    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "nulMap" | "clo" => true
     "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
   }
 }
@@ -10020,6 +10062,9 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
     "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
+    "nulMap" => nulMapArmBoxHead(
+      mapBoxTagOf(mapShapeOfExpr(exprIx, fnIx), p.hbKind, exprIx, fnIx),
+    )
     "clo" => cloArmBoxHead(p.hbKind, exprIx, fnIx)
     "lit" => {
       fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
@@ -10043,6 +10088,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "nulBool" => nulBoolBoxTail()
     "retag" => boxRetagTail(p.hbKind, exprIx, fnIx)
     "mapBox" => mapBoxTail(p.hbKind, exprIx, fnIx)
+    "nulMap" => nulMapArmBoxTail()
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
   }
 }
@@ -10078,6 +10124,7 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     || p.hbArm == "rec"
     || p.hbArm == "refList"
     || p.hbArm == "map"
+    || p.hbArm == "nulMap"
     || p.hbArm == "clo"
     || p.hbArm == "retag"
   ) {
@@ -13412,7 +13459,7 @@ function emitSharedFieldRecv(recvIx: i32, fnIx: i32, slot: i32) {
 
 // How a fit writer re-reads a receiver it holds in no slot: the IR lowering's read of its own
 // operand while it writes that writer's tail (`irFitTail`, which restores the default), else
-// `emitExpr`. The default reads nothing, so the cell needs no init-order guard.
+// `emitExpr`. The default reads no module state at init, so the cell needs no init-order guard.
 export let fitRecvReadHook: (recvIx: i32, fnIx: i32) => i32 = fitRecvLegacy
 
 const FIT_RECV_LEGACY = -2
@@ -26574,7 +26621,7 @@ function emitAsOneListTail(
     fbRefIsNull()
     fbI32Eqz()
   } else {
-    fit = emitListFitAt(obj, tty, exprIx, st, fnIx)
+    fit = emitListFitStashed(obj, tty, exprIx, st, fnIx)
   }
   if fit < 0 { return -1 }
   if fit == 0 {
@@ -30014,7 +30061,7 @@ export function numIntrCallReached(c: Call, callee: Ident, fnIx: i32): boolean {
     return false
   }
   if unknownCallRoutesRef(c, callee, fnIx) { return false }
-  return !identNameIsLiveBound(callee.identName, fnIx)
+  return !identNameIsBoundAt(callee.identName, fnIx, c.callFn)
 }
 
 // The name a call's callee resolves by: a dispatch arm the check built ahead of the lift that names
@@ -30048,7 +30095,7 @@ export function userFnCallRoutesRef(
 ): boolean {
   if target < 0 { return unknownCallRoutesRef(c, callee, fnIx) }
   if (
-    identNameIsLiveBound(callee.identName, fnIx)
+    identNameIsBoundAt(callee.identName, fnIx, c.callFn)
     && identIsBoundClosure(c.callFn, fnIx)
   ) {
     return true
@@ -30065,7 +30112,7 @@ function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
     return emitCallRef(callIx, fnIx)
   }
   if target < 0 {
-    if !identNameIsLiveBound(callee.identName, fnIx) {
+    if !identNameIsBoundAt(callee.identName, fnIx, c.callFn) {
       const niRc = emitNumIntr(callIx, fnIx, callee.identName)
       if niRc != NUM_INTR_NONE { return niRc }
     }
