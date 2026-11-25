@@ -26,4 +26,6 @@ For a `StrLit` that is no atom (`exprIsLitAtom`) and that no pre-path arm takes
   `is` returned, as a condition, as an argument and in a lambda; a record arm told by its literal
   field; `as!` and `as?` to a literal arm; and module scope. Master's swept compiler refuses it on
   `reentry emitStrValue`, and this change's builds and runs it.
-- **Byte identity:** the counts are in the PR body.
+- **Byte identity** against the merge-base seed (default build, equal exit codes): `tests/cases` 0
+  of 9,422 differ, distilled + capability probes + witnesses 0 of 18,150, and the self-compile is
+  identical.
