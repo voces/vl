@@ -223,15 +223,23 @@ posts the red list there; this table is the latest, by owner.
 
 | as of | what fails | count | owner |
 |---|---|---:|---|
-| master ad8ae0a3 | self-compile (`ir-i8-self-list.sh`) | 0 units | done |
-| master ad8ae0a3 | programs reaching an unclaimed function (`emitFuncBody`) | 568 | the COV lanes, by census class |
-| master ad8ae0a3 | programs reaching an unclaimed start body or global initializer (`emitStartGlobalInitValue` 310, `emitStmt` 99, `emitStartGlobalInit` 6, `emitVariantCoerce` 4) | 419 | COV-START, CENSUS |
-| master ad8ae0a3 | `reentry emitDelivered` | 47 | COV-IS |
-| master ad8ae0a3 | `reentry emitStrValue` | 37 | COV-CALL |
-| master ad8ae0a3 | tools that are programs (`scripts/lib/census-grade.vl` and others) | ≥1 | CENSUS |
-| master ad8ae0a3 | instruments that compare against legacy (`ci-ir-identity`, the shadow and claim-fallback tests, `self-ir-misses`) | 6 suites | INFRA (retire or rewrite in the I8 PR) |
-| master ad8ae0a3 | ratchets with no reading (unused-state, render-parse, self-ir-misses, plumb-shape-cost) | 4 | INFRA |
-| master ad8ae0a3 | stubs still called after `--apply` | 14 | INFRA |
+| master 7ddd7d14 | self-compile (`ir-i8-self-list.sh`) | 0 units | done |
+| master 7ddd7d14 | re-entry causes (`ir-i8-sweep.sh`: newly failing with nothing the seed leaves unclaimed) | 0 | done |
+| master 7ddd7d14 | programs reaching an unclaimed function (`emitFuncBody`) | 545 | the COV lanes, by census class |
+| master 7ddd7d14 | programs reaching an unclaimed start body or global initializer (`emitStartGlobalInitValue` 279, `emitStmt` 101, `emitStartGlobalInit` 6, `emitVariantCoerce` 4) | 390 | COV-START, CENSUS |
+| master 7ddd7d14 | `reentry emitDelivered` (each program also has an unclaimed unit) | 44 | COV-IS |
+| master 7ddd7d14 | tools that are programs: `scripts/plumb-shape-cost.vl` (`runTimed`) | 1 | COV-CLOS |
+| master 7ddd7d14 | ratchets with no reading: plumb-shape-cost | 1 | follows the tool above |
+| master 7ddd7d14 | stubs still called after `--apply` | 14 | INFRA |
+| regeneration 4 | witnesses that were silent invalid wasm and now refuse loudly | 14 | a soundness gain, kept |
 
-The program counts are `ir-i8-sweep.sh` on master: 1,071 of 27,539 programs newly fail (cases 723,
-witnesses 289, distilled 44, probes 15), and 35 of them with nothing the seed leaves unclaimed.
+The program counts are `ir-i8-sweep.sh` on master 7ddd7d14: 979 of 27,569 programs newly fail (cases
+668, witnesses 253, distilled 44, probes 14), every one on a unit the seed leaves unclaimed. The I8
+draft retires the instruments that compare against legacy: the IR shadow, box-destination shadow,
+claims-off fallback and door-guard tests, and `self-ir-misses`.
+
+`ci-ir-identity` compares the I8 compiler against master's fetched seed for the I8 PR only. In that
+PR or the one right after it, the job becomes behaviour parity: each program's run output against
+its `@log`/Want (`ir-parity --behaviour-only`), with the byte comparison dropped (merge-queue §Q57),
+because a byte check against the previous seed would red every later codegen change (coordinator
+ruling, 2026-11-25).
