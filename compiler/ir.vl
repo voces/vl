@@ -158,10 +158,6 @@ export function armUnboxRoute(r: RArmUnbox): ArmUnboxRoute {
   if r.uaAsg { return "asg" }
   return if r.uaDst >= 0 { "recordArms" } else { "arm" }
 }
-// A read `asAt` through a box of lists or maps (an element, `.length`, `.has` or `.get`),
-// written by legacy's tag chain (`armSiteWrite`) per arm: `asOps` the box, then its index or key,
-// none for a `.length`; `asStash` the box is held in legacy's receiver stash, not re-read by name.
-export type RArmSite = { asOps: Opnd[], asAt: i32, asStash: boolean }
 // A box local read at its storage as the niche (`nicheReadKindAt`, kind `nrKind`) its narrowing
 // names, `nrAt` the read: the null tag is the niche's null, any other arm its payload.
 export type RNicheRead = { nrV: Opnd, nrAt: i32, nrKind: i32 }
@@ -289,7 +285,8 @@ export type RListGet = {
 // `llAt`: the `.length` `Member` node, which legacy's hoist and view decisions key on.
 export type RListLen = { llV: Opnd, llAt: i32 }
 // `nwV`, of number kind `nwSrc`, widened to kind `nwDst` at delivery node `nwAt` (kinds as
-// `widenPlanOf` names them: 1 i32, 3 i64, 4 f64, 5 f32); 3 to 1 is a shift-mask fold's wrap.
+// `widenPlanOf` names them: 1 i32, 3 i64, 4 f64, 5 f32). A narrowing is exact: a shift-mask fold's
+// wrap, or a literal set's member read out of a wider list arm (`numNarrowTail`).
 export type RNumWiden = { nwV: Opnd, nwSrc: i32, nwDst: i32, nwAt: i32 }
 // A standalone `?.` at node `orAt` over the chain base `orV`, read twice: its null test and leaf
 // head, then the base as non-null and the leaf's tail, as `emitOptMemberValueGo` writes them.
@@ -670,7 +667,6 @@ export type RRel = { rlSp: i32, rlSub: i32, rlVal: i32 }
 // read at a narrower union's box rep, the same box.
 export type RStage = { sgV: Opnd }
 export type Rhs = RAfterEffects
-  | RArmSite
   | RArmUnbox
   | RAsTail
   | RAsUnion
@@ -883,7 +879,7 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 export function coalArmStagesLeads(a: CoalValArm): boolean {
   return match a {
     "litUnion" | "nulBool" | "nulRef" | "nulStr" | "asProp" | "nulBoolJoin" | "valBox" | "valScalar" => true
-    "boolPop" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "listGetOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "boxStash" | "boxFieldScalar" => false
+    "boolPop" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "listGetOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "optBoxLeaf" | "optRecLeaf" | "boxStash" | "boxFieldScalar" => false
   }
 }
 // An integer `match` chain written as one `br_table` (`IntSwitchPlan`): operand `isOn` less
@@ -944,7 +940,21 @@ export type RawEff = "struct.set"
   | "sink.null"
   | "sink.close"
 export type SRawOp = { srOp: RawEff, srHeap: i32, srArgs: Opnd[], srImm: i32 }
-export type IrNode = SAssign
+// A read `saAt` through a box of lists or maps (an element, `.length`, `.has` or `.get`) on
+// legacy's tag chain: `saOps` the box, then its index or key (none for a `.length`); per arm
+// `saArms[k]` reads payload variable `saVars[k]` and writes out `saOut`; the index is read as
+// `saIdx` when set. `saStash`: the box is held in legacy's receiver stash, not re-read by name.
+export type SArmSite = {
+  saOps: Opnd[],
+  saAt: i32,
+  saStash: boolean,
+  saArms: i32[][],
+  saVars: i32[],
+  saIdx: i32,
+  saOut: i32,
+}
+export type IrNode = SArmSite
+  | SAssign
   | SBlock
   | SBoundsCheck
   | SBr
@@ -1078,6 +1088,9 @@ export type IrFn = {
   // The plain field reads the builder built, by the read's node: its object read again, then the
   // field. With `irReadVar` and `irReadAgain`, how the loop prologue reads its receivers.
   irReadField: {[i32]: i32},
+  // The standalone `?.` reads the builder built over a chain root it reads again, by the read's
+  // node: the whole read written again, as legacy re-emits a `?.` receiver.
+  irReadOpt: {[i32]: ROptRead},
   // The declaration-time address-fold rows the builder derived, in legacy's order: each qualifying
   // `const`'s node, the wasm local holding its bounded part, and its folded constant.
   irMaDecl: i32[],
@@ -1178,6 +1191,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irReadElem: Map(),
     irLitReads: 0,
     irReadField: Map(),
+    irReadOpt: Map(),
     irMaDecl: [],
     irMaSlot: [],
     irMaK: [],
@@ -1375,7 +1389,8 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
         }
         cur = n.isElse
       }
-      SAssign |
+      SArmSite |
+        SAssign |
         SBlock |
         SBoundsCheck |
         SCellSet |
@@ -1407,7 +1422,6 @@ export function irNodeEndsPath(n: IrNode): boolean {
     RCallHost => r.chNever
     RCallRef => r.crNever
     RAfterEffects |
-      RArmSite |
       RArmUnbox |
       RAsTail |
       RAsUnion |
@@ -1690,6 +1704,14 @@ export function irPushBodies(f: IrFn, id: i32, bodies: i32[][], pos: i32[]) {
       bodies.push(n.cbLB)
       pos.push(0)
     }
+    SArmSite => {
+      let k = n.saArms.length - 1
+      while k >= 0 {
+        bodies.push(n.saArms[k])
+        pos.push(0)
+        k = k - 1
+      }
+    }
     SSwitch => {
       let k = n.swArms.length - 1
       while k >= 0 {
@@ -1859,7 +1881,6 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     }
     RAsTail => [r.akV]
     RArmUnbox => [r.uaV]
-    RArmSite => r.asOps
     RTagStash => [r.tgsV]
     RStashSet => [r.ssV]
     RTagIs => []
@@ -1990,7 +2011,6 @@ function rhsText(r: Rhs): string {
     RAsUnion => "as.union " + opndText(r.auV)
     RAfterEffects => "after " + i32ToStr(r.aeEff.length) + " effects " + opndText(r.aeV)
     RAsTail => "as.tail " + opndText(r.akV)
-    RArmSite => "arm_site @" + i32ToStr(r.asAt) + (if r.asStash { " stash" } else { "" })
     RArmUnbox => "arm_unbox "
       + opndText(r.uaV)
       + " @"
@@ -2224,6 +2244,25 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
       s
     }
     SCoalBox => coalBoxText(f, n, p, d)
+    SArmSite => {
+      let s = p
+        + "arm_site @"
+        + i32ToStr(n.saAt)
+        + (if n.saStash { " stash" } else { "" })
+      for o in n.saOps { s = s + " " + opndText(o) }
+      s = s + outText(n.saOut) + "\n"
+      let k = 0
+      while k < n.saArms.length {
+        s = s
+          + p
+          + "arm v"
+          + i32ToStr(n.saVars[k])
+          + "\n"
+          + bodyText(f, n.saArms[k], d + 1)
+        k = k + 1
+      }
+      s
+    }
     SSwitch => {
       let s = p + "switch v" + i32ToStr(n.swOn) + outText(n.swOut) + "\n"
       for a in n.swArms {
@@ -2313,11 +2352,12 @@ export function irNodeFamily(n: IrNode): IrFamily {
       SRangeLoop |
       SReturn |
       STrap => "control"
+    SArmSite => "box"
     SCoalBox => match n.cbArm {
       "popOr" | "listGetOr" => "list"
       "nulRef" | "boxStash" => "box"
       "litUnion" | "nulBool" | "boxFieldScalar" | "nulStr" | "asProp" | "nulBoolJoin" => "box"
-      "fieldBox" | "fieldVal" | "optLeaf" => "record"
+      "fieldBox" | "fieldVal" | "optLeaf" | "optBoxLeaf" | "optRecLeaf" => "record"
       "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
     }
@@ -2410,8 +2450,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RMapNew |
       RMapOp |
       RMapSet => "map"
-    RArmSite |
-      RArmUnbox |
+    RArmUnbox |
       RAsUnion |
       RBoxField |
       RBoxNarrow |

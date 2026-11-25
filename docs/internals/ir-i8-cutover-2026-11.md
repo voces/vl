@@ -172,15 +172,36 @@ only when the start body is unclaimed. Nothing reaches legacy through the door.
 
 | step | what | owner |
 |---|---|---|
-| keep | the 109 shared tails stay (`scripts/ir-i8-census/keep.txt`); a later no-behaviour PR may move them to their own module | INFRA (the list), CENSUS (its growth) |
+| keep | the 113 shared tails stay (`scripts/ir-i8-census/keep.txt`: the rehearsal's 109 plus 4 that COV-UNION's #10051 drew in); a later no-behaviour PR may move them to their own module | INFRA (the list), CENSUS (its growth) |
 | port | `emitStrValue` (47 programs, blocks the self-compile; first), `emitChainRead` (50), `rcReadSource` (309) | COV-CALL |
-| port | `arrLitDataElemEmit` (150), `emitListGetIdx` (58), `emitListGetRecv` (17), `pushMapRecvRef` (2) | COV-CLOS |
+| port | `arrLitDataElemEmit` (150), `emitListGetIdx` (58), `emitListGetRecv` (17), `pushMapRecvRef` (2), `emitIdxIndex` (1) | COV-CLOS |
 | port | `emitArmSiteAt` (22), `emitDelivered` (7), `emitCoerceAtomPayload` (3) | COV-IS |
 | const | `emitConstCellInit`'s remaining `emitExpr` arm (8 programs) | COV-START |
 | latent | the 16 stubbed writers a kept tail calls that no population reaches: a probe or a static check each | INFRA |
-| gate | `scripts/ir-i8-sweep.sh` in CI, ratcheting "newly failing and not unclaimed" (681) down | INFRA |
+| gate | `scripts/ir-i8-sweep.sh` in CI (`ci-i8-sweep`): no new cause of "newly failing and not unclaimed", and no new static edge into stage B | INFRA |
 | coverage | the census tail to zero unclaimed functions and start bodies | the COV lanes |
 | I8 | one PR: empty the 14 entry points and B minus the keep set, then `dead-exports.vl`, a fixpoint and the full gate | coordinator |
+
+The gate ratchets the set of causes, not the count: coverage moves a program from explained to
+unexplained when it claims the last unclaimed function beside a re-entry (coordinator ruling, 2026-11-25).
+
+**The static edges go to zero by hook** (coordinator ruling, 2026-11-25). Every edge from a kept
+function into stage B lies under one IR hook: the call where the claim path enters a legacy tail
+that takes an expression index. Porting the hook leaves its whole kept subtree unreached, so
+`dead-exports.vl` takes it and the keep list shrinks; the edge baseline only falls.
+
+| IR hook | edges under it (the causes among them) | owner |
+|---|---|---|
+| `armSite` → `emitArmSiteAt` → `emitUnionCoerce` | the union-coercion tree (`emitArmSiteAt`, `emitCoerceAtomPayload`, `pushMapRecvRef`) | COV-IS |
+| `structEq` → `nulStructEqGuardTail` | `emitChainRead`, `refListReadAt`, `emitIdxIndex`, `emitNulIsNullTest` | COV-UNION |
+| `lowerList` → `coerceTail` → `emitRecCopyInto` | `rcReadSource`, `emitRecCopyFields` | COV-CALL |
+| `hoistInRangeCopy` → `arrLitHoistGlobal` | `arrLitDataElemExpr`, `emitStrValue` | COV-CLOS, COV-CALL |
+| `coalListGetOr` → `listGetOrOpen` | `emitListGetIdx`, `emitListGetRecv` | COV-CLOS |
+| `emitConstCellInit` → `emitUnionBoxOwed` | `emitDelivered`, `emitUnionBoxArg` | COV-START |
+| `numCastTail` → `numExactCastTail` → `emitReturnValue` | none: unreachable, cut | INFRA |
+| `irFitTail` | `emitRecordFitIs`, `fitRecvRead` | INFRA |
+| `rhs` → `emitAsUnionTagged` → `emitAsOneListTail` | `emitListFitAt` | INFRA |
+| none (`structEqStage`, kept with no IR root) | its `emitExpr` call | INFRA (off the keep list) |
 
 A port makes the tail take an IR-lowered operand in place of its `emitExpr` call. The rehearsal
 found two more re-entries in its last keep round: `refListReadAt` (4) goes to COV-CLOS, which owns
