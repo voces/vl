@@ -13129,8 +13129,8 @@ This extends the `??` hole precedent, D1589 (`fillCoalHoleNodes`), which re-asks
 
 ## A narrowed module `let` pays one program-wide writer analysis; a `const` pays none (2026-11-23) — D17063
 
-**Decided by the checker-fix lane that closed D17063 (2026-11-23), for the coordinator to confirm
-or overrule**, on the checker cost cliff IR-N1 found. A module `let`'s initializer narrows it
+**Decided by the checker-fix lane that closed D17063 (2026-11-23); confirmed by the coordinator
+2026-11-25**, on the checker cost cliff IR-N1 found. A module `let`'s initializer narrows it
 (`let g: U = { a: 0 }; print(g.a)` checks), so each later call must ask whether it may write the
 cell, and that needs the writer analysis of the whole module. A `const` holding a list is never
 narrowed and never asks. The analysis is linear and stays; the quadratic
