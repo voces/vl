@@ -24,3 +24,7 @@ that is not a call. On master `bc95de5c4` it is the first miss of 17 functions a
   new): a `null`-typed name delivered as an argument, a return, a `let`, a record field, a list
   element, an assignment's value and an `if` arm. On master 7 of its 8 functions are this miss;
   here all 8 match and it prints its 8 lines.
+- **D17201 closed**: a `null`-typed name in a value `if` arm boxed into `A | B | null`. The claimless
+  build refuses it at emit ("ref valtype with no interned shape"); the claimed build now runs and
+  prints its `Want:`. The parity gate's refusals population showed it as `build-fails(off)` until
+  the row was closed, and it then leaves that population (112 → 111 programs).
