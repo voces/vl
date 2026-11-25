@@ -25,13 +25,13 @@ const messages = (r: PlaygroundResult) => JSON.stringify(r.diagnostics.map((d) =
 const bytesOf = (exp: Exports) => Uint8Array.from({ length: exp.rbyteLen() }, (_, i) => exp.rbyteAt(i));
 
 Deno.test({
-  name: "playground claim fallback: an invalid claimed module legacy refuses runs nothing, with legacy's refusal and the note",
+  name: "playground claim fallback: a claim's refusal legacy shares runs nothing, with the refusal and the note",
   ignore,
   fn: async () => {
     const r = await runProgram(fixture("closure-stored-from-function-refused.vl"), createWasmChecker(fresh));
     const refusal = "a function returning a parameter called at two signatures";
-    const note = "an IR claim wrote an invalid module (";
-    if (r.compiled || !r.diagnostics.some((d) => d.message.includes(refusal)) || !r.diagnostics.some((d) => d.message.startsWith(note))) {
+    const note = "the IR declined this statement (bundle result pick refused)";
+    if (r.compiled || !r.diagnostics.some((d) => d.message.includes(refusal)) || !r.diagnostics.some((d) => d.message.includes(refusal) && d.message.includes(note))) {
       throw new Error(`want no run, legacy's refusal and the note, got compiled ${r.compiled}, ${messages(r)}`);
     }
   },
