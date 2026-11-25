@@ -65,14 +65,14 @@ if [ -z "${CENSUS_CLASS:-}" ] || grep -q '^self'$'\t' "$CENSUS_CLASS"; then
 VL_IR_SHADOW=5 "$VL" build compiler/entry.vl -o "$T/self.wasm" --compiler "$T/probe.wasm" 2>&1 > /dev/null \
   | awk -F'\t' '/^\[ir\] / { n = $1; sub(/.*: /, "", n); if ($2 ~ /^(fnc |fnu |claimed start|start uncovered |claim fell back)/) print "self\t" n "\t" $2 }' \
   > "$OUT/self.rows"
+  echo 1 > "$OUT/self.programs"
 else
-  rm -f "$OUT/self.rows"
+  rm -f "$OUT/self.rows" "$OUT/self.programs"
 fi
 for pop in distilled cases probes witnesses; do
-  xargs -n 100 -P "$JOBS" env VL="$VL" PROBE="$T/probe.wasm" sh "$T/one.sh" < "$T/$pop" > "$OUT/$pop.rows" || true
+  xargs -r -n 100 -P "$JOBS" env VL="$VL" PROBE="$T/probe.wasm" sh "$T/one.sh" < "$T/$pop" > "$OUT/$pop.rows" || true
   wc -l < "$T/$pop" > "$OUT/$pop.programs"
 done
-echo 1 > "$OUT/self.programs"
 cat "$T/distilled" "$T/cases" "$T/probes" "$T/witnesses" > "$OUT/programs.txt"
 
 scripts/ir-i8-census/summary.sh "$OUT" | tee "$OUT/summary.txt"
