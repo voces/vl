@@ -696,6 +696,7 @@ import {
   mapReadScalarBoxKindIn,
   mapRecvScalarBoxKindIn,
   mapRecvTyIn,
+  mapTyScalarBoxKind,
   nodeTyInOf,
   readContainerTyAt,
 } from "./emit_ty_canon"
@@ -1672,9 +1673,7 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   // narrowed read is its storage's declared box (`storedMemberBoxTest`).
   const st = if stored { readNarrowedStoreAt(n.isObj, ibFnIx) } else { -1 }
   if (
-    stored
-      && !(repNodeAt(irBOpRep(v)) is RBox)
-      && !storedNullableOfValue(irBOpRep(v))
+    stored && !heldAsBox(irBOpRep(v))
     || st >= 0 && irBOpRep(v) != repNodeOfTy(st)
   ) {
     return irBMiss("is member storage rep")
@@ -3133,13 +3132,6 @@ function boolNullable(r: i32): boolean {
 export function boxedNullable(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RNullable && n.rnDisc == 4
-}
-
-// Whether `r` is a boxed nullable over a plain value, which an `is` on its field tests at its
-// storage. One over a union box narrows its other arm to a box legacy reads apart.
-function storedNullableOfValue(r: i32): boolean {
-  const n = repNodeAt(r)
-  return n is RNullable && n.rnDisc == 4 && !(repNodeAt(n.rnInner) is RBox)
 }
 
 // Whether rep `r` is held as a union box: a box, or a boxed nullable.
@@ -7481,13 +7473,10 @@ export function irBStageLeads(
   args: Opnd[],
   argIxs: i32[],
 ): boolean {
-  // A receiver stage, and a `??` along an arm that stages nothing, is written in place, below
-  // which the lowering stages nothing. A literal's order stash sets its fields below them.
-  // So is a void `if` (a `null`-typed one run for its effect), below which the lowering writes no
-  // staged temp.
-  if listStageFrom(b, at) || coalBoxFrom(b, at, false) || voidIfFrom(b, at) {
-    return false
-  }
+  // A receiver stage is written in place, below which the lowering stages nothing. A literal's
+  // order stash sets its fields below them. So is a void `if` (a `null`-typed one run for its
+  // effect), below which the lowering writes no staged temp.
+  if listStageFrom(b, at) || voidIfFrom(b, at) { return false }
   // A box over a tag dispatch or a join span has its head written ahead of that span
   // (`dispatchBoxHead`), above any operand staged before it, where legacy writes that operand
   // first (D17564).
@@ -7495,7 +7484,7 @@ export function irBStageLeads(
   // A store the operand makes (an assignment as its value) is a statement: an earlier operand
   // read at its use would see the stored value, so it is staged below the store, as below an `if`.
   const store = storeFrom(b, at)
-  const coal = coalBoxFrom(b, at, true)
+  const coal = coalBoxFrom(b, at, true) || coalBoxFrom(b, at, false)
   const stash = stashSetFrom(b, at) || tagStashFrom(b, at)
   if (
     !valuedIfFrom(b, at) && !coal && !stash && !store && !lead
@@ -8908,10 +8897,13 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if pp == null { return missRhs("push plan") }
   const why = pushPlainWhy(pp, ibFnIx)
   // A late receiver held in its own local is read by index after the value either way.
-  const late = why == "push late receiver" && pushRecvHeldAtRest(pp.ppRecv)
+  const late = why == "push late receiver"
+  const held = pushRecvHeldAtRest(pp.ppRecv)
   // A nullable element slot's push is legacy's plain build of the value (`pushNestSlot`).
   const nest = why == "push nested list element"
   if why != "" && !late && !nest { return missRhs(why) }
+  // Any other late receiver is built after the value, as legacy stages it (D1280).
+  if late && !held { return pushLateRhs(b, c, m, ix) }
   const clear = !endsInTemp(b)
   const at = b.length
   const v = pushRecvExpr(b, m.memObj)
@@ -8950,6 +8942,27 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     return missRhs("push short-circuit operand")
   }
   const r: Rhs = { lpV: recv, lpX: x, lpAt: ix }
+  return r
+}
+
+// A `.push` `ix` whose value stages a list receiver of its own: the value at the receiver's element
+// rep, then the receiver, so the value's list op cannot overwrite this push's staged receiver.
+function pushLateRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  const ln = repNodeAt(exprRepOf(m.memObj))
+  if !(ln is RList) { return missRhs("push operand coercion") }
+  const er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
+  const x = deliver(b, c.callArgs[0], er, -1)
+  if ibMiss != "" { return missRhs("method operand") }
+  if irBOpRep(x) != er { return missRhs("push operand coercion") }
+  const at = b.length
+  const v = pushRecvExpr(b, m.memObj)
+  if ibMiss != "" || irBOpRep(v) != exprRepOf(m.memObj) {
+    return missRhs("push operand coercion")
+  }
+  if ifBelowLead(b, at, "push short-circuit operand") {
+    return missRhs("push short-circuit operand")
+  }
+  const r: Rhs = { lpV: v, lpX: x, lpAt: ix }
   return r
 }
 
@@ -9799,7 +9812,7 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     && !boxOfJoinAt(b, at)
     && !boxLeadSpanAt(b, at)
   ) {
-    ifBelowLeadIn(b, at, leadFirstAt(b), "box of a valued if")
+    boxLateAt(b, at)
   }
   // A `null`-typed value is the bottom ref, which a nullable reference holds as it stands (D1567).
   if (
@@ -10169,6 +10182,21 @@ function boxOfJoinAt(b: i32[], at: i32): boolean {
   return holeBoxHeadAhead(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
 }
 
+// Where the delivery built into `b` from `at` on ends in a box whose head leads and its value's
+// own nodes hold a statement (a valued `if` or `??`), notes the box late (`irBoxLate`): its head
+// follows the value, which the lowering holds in a local.
+function boxLateAt(b: i32[], at: i32) {
+  if !ifBelowLeadHas(b, at, leadFirstAt(b)) { return 0 }
+  const n = ib.irNodes[b[b.length - 1]]
+  if !(n is SLet) { return irBMiss("box of a valued if") }
+  const r = n.lRhs
+  if !(r is RToBox) {
+    return irBMiss("box of a valued if over a null-typed call")
+  }
+  ib.irBoxLate.push(unwrapParen(r.bxAt))
+  return 0
+}
+
 // Where the delivery built into `b` from `at` on ends in a box whose head leads and its value's own
 // nodes write no statement but valued `if`s and `??`s that stage their leads, notes them as the
 // span the lowering writes that head ahead of (`irBoxLeadFirst`), as legacy writes the whole value
@@ -10233,7 +10261,8 @@ function boxPlanWhy(p: HoleBox, v: Opnd, ix: i32): string {
     "nulBool" => repBoolNiche(r)
     "rec" | "obj" => repNodeAt(r) is RRecord
     "refList" | "atomList" => repNodeAt(r) is RList
-    "mapScalar" => false
+    // A scalar map read is built as the probe's own box (`mapGetAt`), which this plan writes as is.
+    "mapScalar" => boxedNullable(r)
     // A union-valued map read is built as its box, a miss the null-tagged box (`mapGetAt`).
     "mapBox" => tempIsWholeMapRead(v, ix)
     "map" => repNodeAt(r) is RMap
@@ -13360,10 +13389,17 @@ function mapGetAt(
     }
     if box >= 0 || !repOk { return irBMiss("map get union box rep") }
   }
+  // A scalar read typed at a boxed nullable its map's value rep is not (one arm of a union of
+  // maps) is the probe's own box at that value's kind, as the box plan's `mapScalar` writes it.
+  const sk = if box < 0
+    && arm != "unionBox"
+    && boxedNullable(rep)
+    && !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) { mapTyScalarBoxKind(repTyOf(mr)) } else { -1 }
+  const bk = if sk >= 0 { sk } else { box }
   // A read the instance types without the null its map's value holds is the helper's value at
   // that niche, as legacy reads it: a miss and a stored null are both its sentinel.
   const plain = arm == "unionBox"
-    || box >= 0
+    || bk >= 0
     || mapGetRepOk(sh, m.rmVal, rep, rd.idxArr)
   const nt = if plain { -1 } else { mapReadNicheTy(sh, m.rmVal, rep, rd.idxArr) }
   const twTy = if plain || nt >= 0 { -1 } else { mapGetTwinTy(sh, m.rmVal, rep, rd.idxArr) }
@@ -13374,7 +13410,7 @@ function mapGetAt(
     mtLoc: rk.mkLoc,
     mtKey: rk.mkKey,
     mtAt: ix,
-    mtBox: box,
+    mtBox: bk,
     mtRow: row,
     mtTrap: trap,
     mtPrint: -1,
@@ -13387,11 +13423,13 @@ function mapGetAt(
     if ibMiss != "" { return v }
     return repTemp(b, { rgV: v }, ix, rep)
   }
-  if box < 0 && tempTy >= 0 { return irBLetTempTy(b, r, ix, rep, tempTy) }
-  if box < 0 { return irBLetTemp(b, r, ix, rep) }
+  if bk < 0 && tempTy >= 0 { return irBLetTempTy(b, r, ix, rep, tempTy) }
+  if bk < 0 { return irBLetTemp(b, r, ix, rep) }
   // The box is the union's own, typed at it where a narrowed re-read's node is the member's.
-  const bt = if tempTy >= 0 { tempTy } else { holeBoxTyAt(ix, ibFnIx) }
-  if bt < 0 || repNodeOfTy(bt) != rep { return irBMiss("map get box type") }
+  const bt = if tempTy >= 0 { tempTy } else if sk >= 0 { nodeTyAt(ix, ibFnIx) } else { holeBoxTyAt(ix, ibFnIx) }
+  if bt < 0 || repNodeOfTy(heldTy(bt)) != rep {
+    return irBMiss("map get box type")
+  }
   return irBLetTempTy(b, r, ix, rep, heldTy(bt))
 }
 
