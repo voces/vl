@@ -188,6 +188,7 @@ jobs:
       seed_key: ${{ steps.keys.outputs.seed }}
       bin_key: ${{ steps.keys.outputs.bin }}
       rustc: ${{ steps.keys.outputs.rustc }}
+      ir_identity: ${{ steps.ir.outputs.identity }}
     steps:
       # The seed's compiled forms live in a private cache outside the checkout (DECISIONS.md,
       # "The seed sidecar lives only in the user's private cache"); the seed cache steps save it.
@@ -231,6 +232,18 @@ jobs:
       # master push of the squash can ask whether it would re-test the same tree with the same
       # keys (scripts/ci-verdict.sh) without parsing logs. Equal trees give equal hashFiles
       # parts of both keys; rustc is the one input the tree does not fix.
+      # Whether ci-ir-identity has anything to prove: a pull request that changes none of the
+      # programs it builds, the compiler that builds them or the baseline that reads them skips
+      # its steps (still green). Every other event runs it.
+      - name: Does this change reach the IR identity proof
+        id: ir
+        run: |
+          if [ "${{ github.event_name }}" != pull_request ]; then echo "identity=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          re='^(compiler/|std/|tests/cases/|scripts/capability-probes/|scripts/silent-sweep/distilled/(cells|named)/|scripts/vl-host/|docs/internals/inventory(-2)?/|scripts/ir-identity\.sh$|scripts/ir-divergence-baseline\.txt$|scripts/inventory/witnesses\.vl$|scripts/ir-i8-census/witnesses\.vl$|\.github/workflows/ci\.yml$)'
+          hit=$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" | grep -E -m1 "$re" || true)
+          if [ -n "$hit" ]; then echo "identity=true" >> "$GITHUB_OUTPUT"; echo "ir identity: runs ($hit)"
+          else echo "identity=false" >> "$GITHUB_OUTPUT"; echo "ir identity: no compiler, std, program or baseline change"; fi
+
       - name: Record the tested tree
         if: github.event_name == 'pull_request'
         run: |
@@ -1140,6 +1153,109 @@ jobs:
           JOBS: "4"
 
   # ---------------------------------------------------------------------------
+  # ci-ir-identity — what the IR claims, byte for byte against the same tree's compiler with
+  # `CLAIMED` empty (scripts/ir-identity.sh): `--cases` over tests/cases, the capability probes
+  # and the emit-reject witnesses, and `--claimless` over the distilled corpus and the `runs`
+  # witnesses, each dealt across the shards by `--shard i/N`. A differ the divergence baseline
+  # does not list reds the job and names the program in an error annotation. A pull request
+  # that touches none of its inputs (seed's `ir_identity`) runs no step and stays green.
+  # ---------------------------------------------------------------------------
+  ci-ir-identity:
+    needs: seed
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      RUN: ${{ needs.seed.outputs.ir_identity }}
+    steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        if: env.RUN == 'true'
+
+      # A listed divergence is read through wasm-dis; this job has no node_modules.
+      - name: Cache native binaryen
+        if: env.RUN == 'true'
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/vl/binaryen-*
+          key: binaryen-${{ runner.os }}-${{ hashFiles('scripts/fetch-binaryen.sh') }}
+
+      - name: Native binaryen
+        if: env.RUN == 'true'
+        run: |
+          d=$(bash scripts/fetch-binaryen.sh)
+          echo "WASM_DIS=$d/bin/wasm-dis" >> "$GITHUB_ENV"
+
+      - name: Restore vl-host binary
+        if: env.RUN == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        if: env.RUN == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            ${{ runner.temp }}/vl-seed-cache
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      - name: Warm the seed's sidecars
+        if: env.RUN == 'true'
+        run: bash scripts/warm-seed.sh
+
+      # One claimless compiler serves both modes.
+      - name: Build the claimless compiler
+        if: env.RUN == 'true'
+        run: |
+          bash scripts/ir-identity.sh --build-claimless build/vl-compiler.wasm "$RUNNER_TEMP/claimless.wasm"
+          echo "IR_IDENTITY_CLAIMLESS=$RUNNER_TEMP/claimless.wasm" >> "$GITHUB_ENV"
+
+      - name: IR identity, tests/cases and probes (--cases)
+        if: env.RUN == 'true'
+        run: |
+          set -o pipefail
+          rc=0
+          bash scripts/ir-identity.sh --cases build/vl-compiler.wasm --shard ${{ matrix.shard }}/4 | tee "$RUNNER_TEMP/cases.log" || rc=$?
+          grep -E '^(DIFF|TIMEOUT) ' "$RUNNER_TEMP/cases.log" | sed 's/^/::error title=ir-identity --cases::/' || true
+          exit "$rc"
+        env:
+          JOBS: "4"
+          IR_IDENTITY_KEEP: ${{ runner.temp }}/ir-identity-keep/cases
+
+      - name: IR identity, distilled corpus and runs witnesses (--claimless)
+        if: env.RUN == 'true' && !cancelled()
+        run: |
+          set -o pipefail
+          rc=0
+          bash scripts/ir-identity.sh --claimless build/vl-compiler.wasm --shard ${{ matrix.shard }}/4 | tee "$RUNNER_TEMP/claimless.log" || rc=$?
+          grep -E '^(DIFF|TIMEOUT) ' "$RUNNER_TEMP/claimless.log" | sed 's/^/::error title=ir-identity --claimless::/' || true
+          exit "$rc"
+        env:
+          JOBS: "4"
+          IR_IDENTITY_KEEP: ${{ runner.temp }}/ir-identity-keep/claimless
+
+      - name: Upload the logs of every non-identical program
+        if: failure() && env.RUN == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: ir-identity-keep-${{ matrix.shard }}
+          path: ${{ runner.temp }}/ir-identity-keep
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # ci-embed-seed — the release DISTRIBUTION build (roadmap H-M2), gated on every
   # push instead of only at release time.
   #
@@ -1330,7 +1446,7 @@ jobs:
   # tests/ci_proof_test.ts holds `needs` to every other job in this file.
   # ---------------------------------------------------------------------------
   ci-proof:
-    needs: [ci, seed, ci-native, checks, checks-suites, ci-release-shape, ci-cost, ci-distilled, ci-witnesses, ci-embed-seed]
+    needs: [ci, seed, ci-native, checks, checks-suites, ci-release-shape, ci-cost, ci-distilled, ci-witnesses, ci-ir-identity, ci-embed-seed]
     if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/vl-queue/')
     runs-on: ubuntu-latest
     steps:
