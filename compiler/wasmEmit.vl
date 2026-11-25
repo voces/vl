@@ -14135,7 +14135,7 @@ const SPREAD_ORDINAL_CAP = 524000
 
 // Spread literal `arrIx`'s frame slot for item group `g`: keyed by its recorded ordinal, else,
 // for a literal no collect walk met, by the emission sequence `seq`.
-function spreadGroupSlotAt(
+export function spreadGroupSlotAt(
   arrIx: i32,
   g: i32,
   kk: ListKind,
@@ -14300,25 +14300,55 @@ function emitArrSpreadBoxed(arrIx: i32, row: i32, fnIx: i32) {
   return spreadJoinGroups(arrIx, slots, groupRows, wrap, back, kk, row, seq)
 }
 
-// One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`. A list
-// literal source linked to the literal it is spread into is built there, as a run is (D16701).
+// One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`: the group
+// as `emitSpreadGroup` builds it, then `spreadBoxedGroupTail`.
 function emitSpreadGroupBoxed(
   grp: i32,
   isSrc: boolean,
   row: i32,
   fnIx: i32,
 ): i32 {
-  const lit = unwrapParen(grp)
-  if (
-    !isSrc
-    || lit >= 0 && nodeAt(lit) is ArrayLit && elabSpreadRunHolderOf(lit) >= 0
-  ) {
+  if spreadBoxedGroupIsRun(grp, isSrc) {
     return emitSpreadGroup(grp, fnIx, LBK_UNION, row)
   }
   const k = mfRecvKindOf(grp, fnIx)
   if k == "reflist" {
     const s = refListSlotOfExpr(grp, fnIx)
     if emitSpreadGroup(grp, fnIx, LBK_REF, s) < 0 { return -1 }
+    return spreadBoxedGroupTail(grp, isSrc, row, fnIx)
+  }
+  // Unreachable past `spreadSrcBoxes`, which admits only a scalar source whose element is a
+  // member or widens to one.
+  if k == null || k == "u8list" || spreadSrcBoxAtom(grp, row, fnIx) < 0 {
+    return emitFailAt(
+      "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
+      grp,
+    )
+  }
+  if emitSpreadGroup(grp, fnIx, pendingKindOfList(k, 0), 0) < 0 { return -1 }
+  return spreadBoxedGroupTail(grp, isSrc, row, fnIx)
+}
+
+// Whether group `grp` of a boxing spread is built at its union-box row itself: a run, or a list
+// literal source linked to the literal it is spread into (D16701).
+export function spreadBoxedGroupIsRun(grp: i32, isSrc: boolean): boolean {
+  if !isSrc { return true }
+  const lit = unwrapParen(grp)
+  return lit >= 0 && nodeAt(lit) is ArrayLit && elabSpreadRunHolderOf(lit) >= 0
+}
+
+// Brings boxing spread group `grp`, on the stack as built, to union-box row `row`: a ref list
+// retagged or widened, a scalar list boxed per element. Returns 0, or -1 once failed.
+export function spreadBoxedGroupTail(
+  grp: i32,
+  isSrc: boolean,
+  row: i32,
+  fnIx: i32,
+): i32 {
+  if spreadBoxedGroupIsRun(grp, isSrc) { return 0 }
+  const k = mfRecvKindOf(grp, fnIx)
+  if k == "reflist" {
+    const s = refListSlotOfExpr(grp, fnIx)
     if s == row || rlUnionRowCovers(s, row) { return 0 }
     if rlUnionRowRetags(s, row) { return emitUnionListRetagTop(s, row, grp) }
     if rlWidenTagOf(s, row) < 0 {
@@ -14330,15 +14360,12 @@ function emitSpreadGroupBoxed(
     return emitRefListWidenTop(s, row)
   }
   const ak = spreadSrcBoxAtom(grp, row, fnIx)
-  // Unreachable past `spreadSrcBoxes`, which admits only a scalar source whose element is a
-  // member or widens to one.
   if k == null || k == "u8list" || ak < 0 {
     return emitFailAt(
       "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
       grp,
     )
   }
-  if emitSpreadGroup(grp, fnIx, pendingKindOfList(k, 0), 0) < 0 { return -1 }
   return emitScalarListBoxTop(
     listKindElemKind(k),
     ak,
@@ -30073,54 +30100,50 @@ function emitCallCoreTrap(c: Call, fnIx: i32) {
   return 0
 }
 
-// The direct call node a UFCS `self`-method call `o.f(args)` rewrites to, `f(o, args)` with
-// named arguments shifted past the receiver, or -1 when `f` takes no leading `self`.
-function emitCallCoreUfcsNode(callIx: i32, c: Call, um: Member) {
-  // a UFCS member-call normally lowers to a direct `Ident` call before emission;
-  // this fallback re-derives the same direct call should it reach emit unrewritten.
-  // D1120 — at the site, the same node the merge walk keys on.
+// The function a UFCS `self`-method call `o.f(args)` names, or "" when `f` takes no leading
+// `self` (D1120: asked at the site, the node the merge walk keys on).
+export function ufcsCallName(callIx: i32, c: Call, um: Member): string {
   let uName = ufcsAliasAtSite(callIx, um.memProp)
   const ud = memberDeclOf(callIx)
   if ud >= 0 {
-    if memberMethodOf(callIx) != ud { return -1 }
+    if memberMethodOf(callIx) != ud { return "" }
     uName = binderNameAt(ud)
   }
   const uTarget = fnIndexOf(uName)
-  if uTarget >= 0 {
-    const uFn = nodeAt(fnStmts[uTarget])
-    if uFn is FuncDecl {
-      const uParams = uFn.fnParams
-      if uParams.length == c.callArgs.length + 1 {
-        const uP0 = nodeAt(uParams[0])
-        if uP0 is Param {
-          if uP0.parName == "self" {
-            const uArgs: i32[] = []
-            uArgs.push(um.memObj)
-            let ua = 0
-            while ua < c.callArgs.length {
-              uArgs.push(c.callArgs[ua])
-              ua = ua + 1
-            }
-            // The injected receiver is an UNNAMED slot-0 positional; any
-            // named args shift right with it ("" rides slot 0) so the
-            // rebuilt direct call reorders them around the receiver
-            // exactly as the host does.
-            const uNames: string[] = []
-            if hasNamedArgs(c.callArgNames) {
-              uNames.push("")
-              let un = 0
-              while un < c.callArgNames.length {
-                uNames.push(c.callArgNames[un])
-                un = un + 1
-              }
-            }
-            return mkCallN(mkIdent(uName, -1), uArgs, uNames, -1)
-          }
-        }
-      }
+  if uTarget < 0 { return "" }
+  const uFn = nodeAt(fnStmts[uTarget])
+  if !(uFn is FuncDecl) || uFn.fnParams.length != c.callArgs.length + 1 {
+    return ""
+  }
+  const uP0 = nodeAt(uFn.fnParams[0])
+  return if uP0 is Param && uP0.parName == "self" { uName } else { "" }
+}
+
+// The direct call node a UFCS `self`-method call `o.f(args)` rewrites to, `f(o, args)` with
+// named arguments shifted past the receiver, or -1 when `f` takes no leading `self`. A UFCS call
+// normally lowers to a direct `Ident` call before emission; this re-derives it should it not.
+function emitCallCoreUfcsNode(callIx: i32, c: Call, um: Member) {
+  const uName = ufcsCallName(callIx, c, um)
+  if uName == "" { return -1 }
+  const uArgs: i32[] = []
+  uArgs.push(um.memObj)
+  let ua = 0
+  while ua < c.callArgs.length {
+    uArgs.push(c.callArgs[ua])
+    ua = ua + 1
+  }
+  // The injected receiver is an unnamed slot-0 positional; any named args shift right with it
+  // ("" rides slot 0) so the rebuilt direct call reorders them around the receiver as the host does.
+  const uNames: string[] = []
+  if hasNamedArgs(c.callArgNames) {
+    uNames.push("")
+    let un = 0
+    while un < c.callArgNames.length {
+      uNames.push(c.callArgNames[un])
+      un = un + 1
     }
   }
-  return -1
+  return mkCallN(mkIdent(uName, -1), uArgs, uNames, -1)
 }
 
 // Whether a call of `callee`, a name no function in scope owns, is a closure-valued callee
@@ -30279,6 +30302,37 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   }
 }
 
+// Whether call `c`'s callee, or the receiver of its field, is typed `null` or `never` in this
+// instance, so no function is reached: a guard leaves it dead (D3197, D16841), or an instance binds
+// a type parameter to `never` (D3178).
+export function calleeTypedDead(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return false }
+  const t = nodeTyAt(c.callFn, fnIx)
+  if t == TY_NULL || t == TY_NEVER { return true }
+  const um = nodeAt(c.callFn)
+  if !(um is Member) { return false }
+  const ot = nodeTyAt(um.memObj, fnIx)
+  return ot == TY_NEVER || ot == TY_NULL
+}
+
+// Whether `emitCallCore` writes call `callIx` of non-name callee `c` as `emitNullCalleeCall`: no
+// closure, place record, result member or UFCS rung takes it, and `calleeTypedDead`.
+export function callCalleeDead(callIx: i32, c: Call, fnIx: i32): boolean {
+  if (
+    c.callFn < 0
+    || nodeAt(c.callFn) is Ident
+    || exprIsClosure(c.callFn, fnIx)
+  ) {
+    return false
+  }
+  if placeRecordSigs(callIx, fnIx).length > 0 { return false }
+  if callResultMemberTy(unwrapParen(c.callFn), fnIx) >= 0 { return false }
+  const um = nodeAt(c.callFn)
+  if um is OptMember { return false }
+  if um is Member && ufcsCallName(callIx, c, um) != "" { return false }
+  return calleeTypedDead(c, fnIx)
+}
+
 // A call through a value this instance types `null` itself, which a guard leaves dead: the
 // stack-polymorphic `unreachable` stands in for its result (D3197).
 function emitNullCalleeCall(): i32 {
@@ -30323,16 +30377,7 @@ function emitCallCore(callIx: i32, fnIx: i32) {
         callIx,
       )
     }
-    if nodeTyAt(c.callFn, fnIx) == TY_NULL { return emitNullCalleeCall() }
-    // An instance binding a type parameter to `never` reaches no call through it (D3178).
-    if nodeTyAt(c.callFn, fnIx) == TY_NEVER { return emitNullCalleeCall() }
-    if um is Member && nodeTyAt(um.memObj, fnIx) == TY_NEVER {
-      return emitNullCalleeCall()
-    }
-    // A `?.` guard's arm over a receiver this instance types `null` is dead (D16841).
-    if um is Member && nodeTyAt(um.memObj, fnIx) == TY_NULL {
-      return emitNullCalleeCall()
-    }
+    if calleeTypedDead(c, fnIx) { return emitNullCalleeCall() }
     return emitFail("emitProgram: callee is not a function name")
   }
   return emitFail("emitProgram: expected a call expression")
@@ -42680,7 +42725,7 @@ let luOvLocNodes: i32[] = []
 let luOvLocSlots: i32[] = []
 
 // Overrides read `ix` to local `slot`; returns the mark `luOvLocalLeave` restores to.
-function luOvLocalEnter(ix: i32, slot: i32): i32 {
+export function luOvLocalEnter(ix: i32, slot: i32): i32 {
   const mark = luOvLocNodes.length
   luOvLocNodes.push(ix)
   luOvLocSlots.push(slot)
@@ -42688,7 +42733,7 @@ function luOvLocalEnter(ix: i32, slot: i32): i32 {
 }
 
 // Drops every local override pushed since `mark`.
-function luOvLocalLeave(mark: i32) {
+export function luOvLocalLeave(mark: i32) {
   while luOvLocNodes.length > mark {
     luOvLocNodes.pop()
     luOvLocSlots.pop()
@@ -42842,6 +42887,47 @@ function emitArmIndexWrite(fnIx: i32, a: BinExpr, target: Index): i32 {
   return 1
 }
 
+// Arm `m`'s head in the `is K[]` store chain (`emitArmIndexWriteAt`), its receiver box on the
+// stack: the box's tag tested against the arm's, opening the arm's `if`.
+export function armIndexWriteTest(m: i32): i32 {
+  const t = listIsArmTag(m)
+  if t < 0 { return armIndexWriteNoWrapper() }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, t)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)
+  return 0
+}
+
+// Arm `m`'s payload, its receiver box on the stack again: cast to the arm's list into the arm's
+// wrapper local, which it returns; -1 where the arm has none.
+export function armIndexWritePayload(m: i32): i32 {
+  const heap = armHeapOf(m)
+  const loc = armWrapLocal(m)
+  if heap < 0 || loc < 0 { return armIndexWriteNoWrapper() }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbLocalSet(loc)
+  return loc
+}
+
+// An arm's store, a statement in the chain, parks its value slot (`idxStoreTail`): read and dropped.
+export function armIndexWriteDrop(target: Index, fnIx: i32): i32 {
+  const st = idxStorePlanOf(target, fnIx)
+  if st == null {
+    return emitFail("emitProgram: an arm's store has no store plan")
+  }
+  fbLocalGet(listIdxValSlot(st.mfKind, st.slot))
+  fbDrop()
+  return 0
+}
+
+function armIndexWriteNoWrapper() {
+  return emitFail(
+    "emitProgram: a union-of-lists arm has no wrapper to store through",
+  )
+}
+
 function emitArmIndexWriteAt(
   fnIx: i32,
   a: BinExpr,
@@ -42855,23 +42941,11 @@ function emitArmIndexWriteAt(
     return 0
   }
   const m = arms[i]
-  const t = listIsArmTag(m)
-  const heap = armHeapOf(m)
-  const loc = armWrapLocal(m)
-  if t < 0 || heap < 0 || loc < 0 {
-    return emitFail(
-      "emitProgram: a union-of-lists arm has no wrapper to store through",
-    )
-  }
   if emitExpr(recv, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, t)
-  fbI32Bin(70) // 0x46 i32.eq
-  fbIf(64)
+  if armIndexWriteTest(m) < 0 { return -1 }
   if emitExpr(recv, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1)
-  fbRefCast(heap)
-  fbLocalSet(loc)
+  const loc = armIndexWritePayload(m)
+  if loc < 0 { return -1 }
   const mark = luOvEnter(recv, m)
   const lmark = luOvLocalEnter(recv, loc)
   const r = emitAssignIndex(fnIx, a, target)

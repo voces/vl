@@ -12,7 +12,12 @@ import { armIdxSlot, sharedFieldRecvSlot } from "./emit_union_casts"
 import { mapRecvScalarBoxKindIn, mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
+import { luOvEnter, luOvLeave } from "./emit_elab"
 import {
+  armIndexWriteArmsOf,
+  armIndexWriteDrop,
+  armIndexWritePayload,
+  armIndexWriteTest,
   asgParkedElemTail,
   asgParkedFieldTail,
   asgParkedMapTail,
@@ -23,6 +28,8 @@ import {
   emitOptLinkNullOpen,
   emitOptLinkValueTail,
   fieldStoreParkTail,
+  luOvLocalEnter,
+  luOvLocalLeave,
   optLeafArmOf,
 } from "./wasmEmit"
 import { pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
@@ -92,6 +99,7 @@ import {
   i32ToStr,
   nodeAt,
   nodeChildren,
+  spreadArgOf,
 } from "./ast"
 import {
   isRecvStagedIx,
@@ -257,6 +265,7 @@ import {
   RVariantDiscrim,
   Rhs,
   SArmSite,
+  SArmWrite,
   SAssign,
   SBlock,
   SBoundsCheck,
@@ -646,6 +655,8 @@ import {
   simdMemTail,
   simdRowIsMem,
   simdTail,
+  spreadBoxedGroupTail,
+  spreadGroupSlotAt,
   spreadGroupStash,
   spreadJoinGroups,
   stageListRecvTail,
@@ -852,6 +863,7 @@ import {
   forInPairSlotOf,
 } from "./emit_plan_list"
 import {
+  ListKind,
   bankSpanRow,
   bankedRowsDrop,
   callRefDepth,
@@ -891,6 +903,7 @@ import { ListBuild } from "./emit_ref_list_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { globalIndexOfSid } from "./emit_fn_ret_kinds"
 import { i32ListHas } from "./listutil"
+import { memberCallYieldsValue } from "./emit_nullable_rets"
 
 // The function being lowered.
 export function irLFn(): IrFn { return lw }
@@ -1250,10 +1263,7 @@ function rhs(r: Rhs, tail: boolean) {
   match r {
     RPrimOp => primOp(r)
     RCall => call(r, tail)
-    RGlobalGet => {
-      globalRead(r.ggSym, r.ggNonNull)
-      if r.ggNn > 0 { fbRefAsNonNull() }
-    }
+    RGlobalGet => globalGetRhs(r)
     RMapGetOr => mapGetOr(r)
     RMapGet => {
       const from = irLAt()
@@ -1358,6 +1368,7 @@ function rhs(r: Rhs, tail: boolean) {
       // Legacy's `emitExpr` writes `unreachable` for the value, and its consumer goes on.
       leaf()
       fbUnreachable()
+      if r.dnPad { fbUnreachable() }
     }
     RHoleOptBox => {
       // Legacy writes the box's tag, then the operand's plain cast, then the two boxes.
@@ -2739,6 +2750,66 @@ function nicheRead(r: RNicheRead) {
   return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
 }
 
+// `SArmWrite` as legacy's `is K[]` store chain (`emitArmIndexWriteAt`) writes it: per arm the box
+// from its name's local, its tag test, the box again and its payload cast into the arm's wrapper
+// local, the arm's store under the arm's overrides, its parked value dropped; `unreachable` last.
+function armWriteStmt(n: SArmWrite, pending: i32[]) {
+  const a = nodeAt(n.awAt)
+  if !(a is BinExpr) { return irLMiss("arm write node") }
+  const t = nodeAt(unwrapParen(a.binLeft))
+  if !(t is Index) { return irLMiss("arm write target") }
+  const recv = unwrapParen(t.idxArr)
+  const arms = armIndexWriteArmsOf(t, lw.irAt)
+  if arms.length == 0 || arms.length != n.awArms.length {
+    return irLMiss("arm write arms")
+  }
+  // A variable's box is its local; a global's is read again at each use (`irHoistRecv`).
+  const bl = plainVarLocal(n.awV)
+  if bl < 0 && !irReadsAgain(recv) { return irLMiss("arm write receiver") }
+  if bl < 0 { irLSkip(n.awV) }
+  irLSettle(pending)
+  let k = 0
+  while k < arms.length && lwMiss == "" {
+    if armWriteRecv(bl, recv) < 0 { break }
+    if armIndexWriteTest(arms[k]) < 0 {
+      irLMiss("arm write arm")
+      break
+    }
+    if armWriteRecv(bl, recv) < 0 { break }
+    const loc = armIndexWritePayload(arms[k])
+    if loc < 0 {
+      irLMiss("arm write arm")
+      break
+    }
+    lw.irVars[n.awVars[k]].vSlot = loc
+    const mark = luOvEnter(recv, arms[k])
+    const lmark = luOvLocalEnter(recv, loc)
+    lwFrames.push(-1)
+    body(n.awArms[k], false, -1, false)
+    armIndexWriteDrop(t, lw.irAt)
+    luOvLocalLeave(lmark)
+    luOvLeave(mark)
+    fbElse()
+    k = k + 1
+  }
+  fbUnreachable()
+  while k > 0 {
+    lwFrames.pop()
+    fbEnd()
+    k = k - 1
+  }
+  return 0
+}
+
+// An arm write's box: local `bl`, or node `recv` read again where it has none.
+function armWriteRecv(bl: i32, recv: i32): i32 {
+  if bl >= 0 {
+    fbLocalGet(bl)
+    return 0
+  }
+  return irHoistRecv(recv)
+}
+
 // `SArmSite` as legacy's tag chain (`emitArmSiteAt`) writes it: an index set once into its stash
 // (`armIdxSlot`), the box set into the receiver stash or read by its name's local, then per arm
 // its tag test and payload cast (`armSiteArmOpen`) and the arm's body, `unreachable` past the last.
@@ -3178,7 +3249,7 @@ function irForLitHoist(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
   if !(a is ArrayLit) || a.arrElems.length != r.mlElems.length { return -1 }
   let i = 0
   while i < r.mlElems.length {
-    if !forLitElemWrites(r.mlElems[i], a.arrElems[i], t) {
+    if !forLitElemWrites(r.mlElems[i], t) {
       const g = hoistInRangeCopy(r, fnIx, arm)
       if g >= 0 {
         irLMiss("for iterable element")
@@ -3189,17 +3260,12 @@ function irForLitHoist(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
     i = i + 1
   }
   if t.fhBack < 0 || !forLitHoistable(r.mlAt, a.arrElems) { return -1 }
-  // A global's read of a `const` string that is not pooled is no one constant: no hoist.
+  // A global's read of a `const` string literal that is not pooled is no one constant: no hoist.
   i = 0
   while i < r.mlElems.length {
     const e = r.mlElems[i]
-    if (
-      e is OVar
-      && isTemp(e.ov)
-      && !forLitStrPooled(forLitConstStrOf(a.arrElems[i], fnIx))
-    ) {
-      return -1
-    }
+    const sx = if e is OVar && isTemp(e.ov) { forLitConstStrOf(a.arrElems[i], fnIx) } else { -1 }
+    if sx >= 0 && !forLitStrPooled(sx) { return -1 }
     i = i + 1
   }
   const init: u8[] = []
@@ -3223,24 +3289,37 @@ function irForLitHoist(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
   return forLitHoistClose(init, r.mlElems.length, t)
 }
 
-// Whether `for` iterable element `e` (node `x`) is one `forLitElemAt` writes as legacy's hoist
-// does: an immediate, a variable's read, or a global's read of a module `const` string literal.
-function forLitElemWrites(e: Opnd, x: i32, t: ForLitHoistTys): boolean {
+// Whether `for` iterable element `e` is one `forLitElemAt` writes as legacy's hoist
+// does: an immediate, a variable's read, or a string global's read.
+function forLitElemWrites(e: Opnd, t: ForLitHoistTys): boolean {
   if !(e is OVar) || !isTemp(e.ov) { return true }
   return tempRhs(e.ov) is RGlobalGet
     && t.fhBack >= 0
     && t.fhForm == forLitStrForm()
-    && forLitConstStrOf(x, lw.irAt) >= 0
 }
 
 // Writes `for` iterable element `e` (node `x`) alone: a module `const`'s string literal for a
-// global's read of one (the read itself pure, skipped where the list hoists), else the operand.
+// global's read of one, any other global's read as itself (each pure, skipped where the list
+// hoists), else the operand.
 function forLitElemAt(e: Opnd, x: i32, fnIx: i32) {
   if e is OVar && isTemp(e.ov) {
-    leaf()
-    return emitStrLitAt(forLitConstStrOf(x, fnIx), fnIx)
+    const sx = forLitConstStrOf(x, fnIx)
+    if sx >= 0 {
+      leaf()
+      return emitStrLitAt(sx, fnIx)
+    }
+    const r = tempRhs(e.ov)
+    if !(r is RGlobalGet) { return irLMiss("for iterable element") }
+    return globalGetRhs(r)
   }
   return irLOpnd(e)
+}
+
+// `RGlobalGet`: the global's read, then the recover its consumer owes.
+function globalGetRhs(r: RGlobalGet) {
+  globalRead(r.ggSym, r.ggNonNull)
+  if r.ggNn > 0 { fbRefAsNonNull() }
+  return 0
 }
 
 // Legacy's hoist of `for` iterable `r` (`arrLitHoistGlobal`), asked with each range variable its
@@ -3302,6 +3381,7 @@ function spreadList(r: RSpread) {
   const fnIx = lw.irAt
   const lb: ListBuild = { lbKind: r.spKind, lbSlot: r.spSlot }
   arrLitPrologue(r.spAt)
+  if r.spBoxRow >= 0 { return spreadBoxedList(r, fnIx) }
   const p = spreadPlanOf(r.spAt, fnIx, lb)
   if p.spWhy != "" || p.spSrcs.length != r.spSrcs.length {
     return irLMiss("spread plan")
@@ -3331,6 +3411,39 @@ function spreadList(r: RSpread) {
     p.spRow,
     seq,
   )
+}
+
+// `RSpread` along legacy's boxing arm: each group's list brought to the union-box row by
+// `spreadBoxedGroupTail` and stashed, then the join, as `emitArrSpreadBoxed` writes them.
+function spreadBoxedList(r: RSpread, fnIx: i32): i32 {
+  const row = r.spBoxRow
+  const kk: ListKind = "reflist"
+  const wrap = spreadWrapIdx(kk, row)
+  const back = spreadBackIdx(kk, row)
+  if wrap < 0 || back < 0 { return irLMiss("spread pair") }
+  if r.spAt < 0 || r.spAt >= P.nodes.length { return irLMiss("spread node") }
+  const a = nodeAt(r.spAt)
+  if !(a is ArrayLit) { return irLMiss("spread node") }
+  const seq = liKinds.length
+  const slots: i32[] = []
+  const rows: i32[] = []
+  let g = 0
+  while g < r.spSrcs.length {
+    irLOpnd(r.spSrcs[g])
+    const grp = r.spGroups[g]
+    let isSrc = false
+    for e in a.arrElems {
+      if spreadArgOf(e) == grp { isSrc = true }
+    }
+    if spreadBoxedGroupTail(grp, isSrc, row, fnIx) < 0 { return -1 }
+    const gs = spreadGroupSlotAt(r.spAt, g, kk, row, seq)
+    if gs < 0 { return -1 }
+    fbLocalSet(gs)
+    slots.push(gs)
+    rows.push(row)
+    g = g + 1
+  }
+  return spreadJoinGroups(r.spAt, slots, rows, wrap, back, kk, row, seq)
 }
 
 // The module global map walk receiver `recvIx` names, or -1: a bare name with no local in `fnIx`
@@ -5041,6 +5154,7 @@ function storeLeadOpnds(n: IrNode, armOut: i32): Opnd[] {
     SSetField => [n.sfV, n.sfSrc]
     SListSet => [n.lsV, n.lsIx, n.lsSrc]
     SArmSite |
+      SArmWrite |
       SBlock |
       SBoundsCheck |
       SBr |
@@ -5219,6 +5333,19 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       if r is RTagStash { return tagStashEffect(r, pending) }
       if r is RStashSet { return stashSetEffect(r, pending) }
       if r is RUnionStage { return unionStageEffect(r, pending) }
+      // A dead call through a field: `unreachable`, then the drop `emitCallStmt` writes where the
+      // member call yields a value.
+      if r is RDeadNever {
+        const dc = if r.dnAt >= 0 { nodeAt(r.dnAt) } else { null }
+        if !(dc is Call) || dc.callFn < 0 || !(nodeAt(dc.callFn) is Member) {
+          return irLMiss("dead never effect")
+        }
+        fbUnreachable()
+        if r.dnPad { fbUnreachable() }
+        irLSettle(pending)
+        if memberCallYieldsValue(r.dnAt) { fbDrop() }
+        return 0
+      }
       // A void import leaves nothing; any other host call's discarded value is dropped.
       if r is RCallHost {
         hostCall(r)
@@ -5230,6 +5357,7 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     }
     SCoalBox => coalBox(n, pending)
     SArmSite => armSiteStmt(n, pending)
+    SArmWrite => armWriteStmt(n, pending)
     SBlock => {
       if n.bkOut >= 0 && varSlot(n.bkOut) >= 0 {
         return loopValueBlock(n, pending, id)
@@ -6425,6 +6553,11 @@ function siteArmMintAt(id: i32) {
 function spreadPairMintAt(id: i32) {
   const nt = lw.irSpreadPair[id]
   if nt == null { return 0 }
+  if nt.sqBoxRow >= 0 {
+    spreadWrapIdx("reflist", nt.sqBoxRow)
+    spreadBackIdx("reflist", nt.sqBoxRow)
+    return 0
+  }
   const lb: ListBuild = { lbKind: nt.sqKind, lbSlot: nt.sqSlot }
   elabSpreadNote(nt.sqAt)
   const p = spreadPlanOf(nt.sqAt, lw.irAt, lb)
@@ -6511,13 +6644,19 @@ function numNarrows(src: i32, dst: i32): boolean {
   return dst == 1 && src != 1 || dst == 3 && (src == 4 || src == 5)
 }
 
-// The payload and index variables of the function's arm-site reads (`SArmSite`).
+// The payload and index variables of the function's arm-site reads (`SArmSite`) and arm writes
+// (`SArmWrite`).
 function armSitePayloads(): {[i32]: boolean} {
   const r: {[i32]: boolean} = Map()
   for n in lw.irNodes {
     if n is SArmSite {
       for v in n.saVars { r[v] = true }
       if n.saIdx >= 0 { r[n.saIdx] = true }
+    }
+  }
+  for w in lw.irNodes {
+    if w is SArmWrite {
+      for v in w.awVars { r[v] = true }
     }
   }
   return r

@@ -234,6 +234,8 @@ export type RSpread = {
   spKind: i32,
   spSlot: i32,
   spAt: i32,
+  // The union-box row legacy's boxing arm builds at (`emitArrSpreadBoxed`), else -1.
+  spBoxRow: i32,
 }
 // `__array_new__(lnLen, lnFill)` at call node `lnAt`, written by legacy's stash and tail.
 export type RListNew = { lnLen: Opnd, lnFill: Opnd, lnAt: i32 }
@@ -314,9 +316,10 @@ export type RToBox = { bxV: Opnd, bxAt: i32, bxTy: i32, bxFree: boolean }
 // `u as? N` over a type parameter boxing scalar `hxV` at cast node `hxAt` (`holeOptShapeOf`'s
 // "box"), whose tag legacy writes ahead of the operand (`holeOptBoxHead`, `holeOptBoxTail`).
 export type RHoleOptBox = { hxV: Opnd, hxAt: i32 }
-// The value of node `dnAt`, which a dead arm's `never` read feeds (`exprReadsDeadNever`): no value
-// reaches it, so legacy writes `unreachable` in its place and its consumer's code goes on (D16006).
-export type RDeadNever = { dnAt: i32 }
+// The value of node `dnAt`, which a dead arm's `never` read feeds (`exprReadsDeadNever`) or a call
+// reaching no function (`callCalleeDead`): legacy writes `unreachable` in its place, a second where
+// `dnPad` (a call typed `never`, `callEndsNever`), and its consumer's code goes on (D16006).
+export type RDeadNever = { dnAt: i32, dnPad: boolean }
 // Atom `rgV` as the `K | null` (discipline 3) that holds it: the same i32, so no bytes.
 export type RRetag = { rgV: Opnd }
 // Atom `sxV`, or its `K | null`, as the string, or `string | null`, legacy's atom decode writes
@@ -963,7 +966,12 @@ export type SArmSite = {
   saIdx: i32,
   saOut: i32,
 }
+// A store `awAt` through a box of list arms, inside `is K[]` (`emitArmIndexWriteAt`): per arm
+// `awArms[k]`, the box `awV` read by name, its tag tested, its payload cast into variable
+// `awVars[k]`, and the arm's store over it; `unreachable` past the last arm.
+export type SArmWrite = { awV: Opnd, awAt: i32, awArms: i32[][], awVars: i32[] }
 export type IrNode = SArmSite
+  | SArmWrite
   | SAssign
   | SBlock
   | SBoundsCheck
@@ -993,8 +1001,13 @@ export type IrVar = { vRep: i32, vTy: i32, vKind: VarKind, vSlot: i32 }
 // One function: the node arena with each node's type, rep and source node, the variables, the
 // top-level body, the parameters and result, and the signatures of the functions and the reps of
 // the globals it uses, and the source statement that built each run of nodes (`irSpan*`).
-// A spread literal `sqAt` and its build's kind and slot (`irSpreadPair`).
-export type SpreadPairNote = { sqAt: i32, sqKind: i32, sqSlot: i32 }
+// A spread literal `sqAt`, its build's kind and slot, and its boxing row or -1 (`irSpreadPair`).
+export type SpreadPairNote = {
+  sqAt: i32,
+  sqKind: i32,
+  sqSlot: i32,
+  sqBoxRow: i32,
+}
 
 export type IrFn = {
   irNodes: IrNode[],
@@ -1400,6 +1413,7 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
         cur = n.isElse
       }
       SArmSite |
+        SArmWrite |
         SAssign |
         SBlock |
         SBoundsCheck |
@@ -1719,6 +1733,14 @@ export function irPushBodies(f: IrFn, id: i32, bodies: i32[][], pos: i32[]) {
       let k = n.saArms.length - 1
       while k >= 0 {
         bodies.push(n.saArms[k])
+        pos.push(0)
+        k = k - 1
+      }
+    }
+    SArmWrite => {
+      let k = n.awArms.length - 1
+      while k >= 0 {
+        bodies.push(n.awArms[k])
         pos.push(0)
         k = k - 1
       }
@@ -2276,6 +2298,25 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
       }
       s
     }
+    SArmWrite => {
+      let s = p
+        + "arm_write @"
+        + i32ToStr(n.awAt)
+        + " "
+        + opndText(n.awV)
+        + "\n"
+      let k = 0
+      while k < n.awArms.length {
+        s = s
+          + p
+          + "arm v"
+          + i32ToStr(n.awVars[k])
+          + "\n"
+          + bodyText(f, n.awArms[k], d + 1)
+        k = k + 1
+      }
+      s
+    }
     SSwitch => {
       let s = p + "switch v" + i32ToStr(n.swOn) + outText(n.swOut) + "\n"
       for a in n.swArms {
@@ -2365,7 +2406,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
       SRangeLoop |
       SReturn |
       STrap => "control"
-    SArmSite => "box"
+    SArmSite | SArmWrite => "box"
     SCoalBox => match n.cbArm {
       "popOr" | "listGetOr" => "list"
       "nulRef" | "boxStash" => "box"
