@@ -12,5 +12,6 @@ Found on master, not fixed here (checker soundness, to be filed as a clause-1 ro
 `r` in `function ret(a) { return a.h }; const r = ret(u)`, `u: K | J` with `h: i32` / `h: string`,
 has an unconstrained type (`const c: boolean = r` is check-clean). Every copy of it builds an
 invalid module: `function back() { return r }`, `const c = r; print(c)` (top level or in a
-function). Mono and the object literal refuse loudly at `show(wrap(r))` and `{ f: r }`. The sweep
-keeps the positions that run.
+function). Mono and the object literal refuse loudly at `show(wrap(r))` and `{ f: r }`. SOUND owns
+the row and the checker fix (a union-of-records base resolves to its members' field join), under
+which `r` is `i32 | string`; the sweep prints `r` in each position, which runs on both sides.
