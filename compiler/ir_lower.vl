@@ -18,6 +18,7 @@ import {
   emitOptLeafTail,
   emitOptLinkNullClose,
   emitOptLinkNullOpen,
+  emitOptLinkValueTail,
   optLeafArmOf,
 } from "./wasmEmit"
 import { pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
@@ -355,6 +356,7 @@ import {
   MapGetOrArm,
   MapUnionPlan,
   MemAddrPlan,
+  OptLeafArm,
   armSiteWrite,
   arrCopyBacking,
   arrCopyPlanOf,
@@ -4254,6 +4256,8 @@ function irHoistRecv(ix: i32): i32 {
     if irHoistRecv(unwrapParen(m.memObj)) < 0 { return -1 }
     return fieldTail(ix, m)
   }
+  const o = lw.irReadOpt.get(ix)
+  if o != null { return optReadGo(o, true) }
   irLMiss("hoisted receiver read")
   return -1
 }
@@ -4873,34 +4877,77 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
 // and the leaf's head, then the base as non-null (its niche recovered) and the leaf's tail.
 function optRead(r: ROptRead) {
   if r.orTag >= 0 { return optFieldIs(r) }
+  return optReadGo(r, false)
+}
+
+// `optRead`'s untagged read, written `again` (its root read again from the first, `irHoistRecv`).
+function optReadGo(r: ROptRead, again: boolean): i32 {
   const arm = optLeafArmOf(r.orAt, lw.irAt)
   if arm == "fail" { return irLMiss("optional read arm") }
+  const m = nodeAt(r.orAt)
+  if !(m is OptMember) { return irLMiss("optional read node") }
+  const was = lwOptRootRead
+  lwOptRootRead = again
+  const rc = optReadLinks(r, m, arm)
+  lwOptRootRead = was
+  return rc
+}
+
+// `optReadGo`'s chain test, leaf head, value and tail.
+function optReadLinks(r: ROptRead, m: OptMember, arm: OptLeafArm): i32 {
   if arm != "nonNull" {
-    irLOpnd(r.orV)
-    fbRefIsNull()
-    if emitOptLinkNullOpen(r.orAt, lw.irAt) { optReadBase(r, true) }
-    emitOptLinkNullClose(r.orAt, lw.irAt)
+    if optChainIsNullAt(r, r.orAt) < 0 { return -1 }
     emitOptLeafHead(r.orAt, lw.irAt)
-    optReadBase(r, true)
-  } else {
-    optReadBase(r, false)
   }
+  if optChainValueAt(r, m.omObj) < 0 { return -1 }
   emitOptLeafTail(r.orAt, lw.irAt)
   return 0
 }
 
-// The optional read's base as `emitOptChainValue` pushes an unstaged one, `again` once the null
-// test has read it (a temp's read written again, `opndAgain`): its niche recovered.
-function optReadBase(r: ROptRead, again: boolean) {
-  const m = nodeAt(r.orAt)
-  if !(m is OptMember) { return irLMiss("optional read node") }
-  if again {
-    if opndAgain(r.orV, m.omObj) < 0 { return -1 }
-  } else {
-    irLOpnd(r.orV)
+// Whether the optional read being written has read its chain's root (`optChainRoot`) once.
+let lwOptRootRead = false
+
+// `emitOptChainIsNull` over read `r`'s chain at `x`: each link's receiver test, then its own field
+// test where the field has a null; the root's null test at the bottom.
+function optChainIsNullAt(r: ROptRead, x: i32): i32 {
+  const m = nodeAt(unwrapParen(x))
+  if !(m is OptMember) {
+    if optChainRoot(r, x) < 0 { return -1 }
+    fbRefIsNull()
+    return 0
   }
-  if exprNullableRefNiche(m.omObj, lw.irAt) { fbRefAsNonNull() }
+  if optChainIsNullAt(r, m.omObj) < 0 { return -1 }
+  if emitOptLinkNullOpen(x, lw.irAt) && optChainValueAt(r, m.omObj) < 0 {
+    return -1
+  }
+  emitOptLinkNullClose(x, lw.irAt)
   return 0
+}
+
+// `emitOptChainValue` over read `r`'s chain at `x`: the root, its niche recovered, then each link's
+// field, recovered non-null.
+function optChainValueAt(r: ROptRead, x: i32): i32 {
+  const m = nodeAt(unwrapParen(x))
+  if !(m is OptMember) {
+    if optChainRoot(r, x) < 0 { return -1 }
+    if exprNullableRefNiche(x, lw.irAt) { fbRefAsNonNull() }
+    return 0
+  }
+  if optChainValueAt(r, m.omObj) < 0 { return -1 }
+  if emitOptLinkValueTail(x, lw.irAt) < 0 {
+    return irLMiss("optional link field")
+  }
+  return 0
+}
+
+// Read `r`'s chain root `x`: its operand the first time, then read again (`opndAgain`).
+function optChainRoot(r: ROptRead, x: i32): i32 {
+  if !lwOptRootRead {
+    lwOptRootRead = true
+    irLOpnd(r.orV)
+    return 0
+  }
+  return opndAgain(r.orV, x)
 }
 
 // A tagged `ROptRead` as legacy's `optField` arm writes it over an unstaged base: its null test,
