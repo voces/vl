@@ -350,8 +350,13 @@ const fmtDiags = (diags: WasmDiag[]): string =>
   JSON.stringify(diags.map((d) => `${d.line}:${d.col} ${d.message}`));
 
 /** Substring matching with case and quote style (backtick vs apostrophe)
- * folded — wording parity is not pinned across the two compilers. */
-const fold = (s: string): string => s.toLowerCase().replace(/`/g, "'");
+ * folded — wording parity is not pinned across the two compilers. A refusal's
+ * `note: the IR declined …` line is context, not the refusal: no expectation
+ * matches it. */
+const fold = (s: string): string =>
+  s.split("\n")
+    .filter((l) => !l.trimStart().startsWith("note: the IR declined"))
+    .join("\n").toLowerCase().replace(/`/g, "'");
 const matches = (message: string, want: string): boolean =>
   fold(message).includes(fold(want));
 
