@@ -278,6 +278,9 @@ VL
   : > "$T/failing" ; : > "$T/needs" ; : > "$T/fell" ; : > "$T/unexplained" ; : > "$T/hits"
   grep -E '(claim fell back|IR claim refused).*i8 stub [A-Za-z0-9_]+' "$T/self.log" \
     | grep -oE 'i8 stub [A-Za-z0-9_]+' | sed 's/^i8 stub /self\tcompiler\/entry.vl\t/' >> "$T/needs" || true
+  # The self-compile's hits are every stub or re-entry its log names; it runs no probe to drain them.
+  grep -oE 'i8 (stub|reentry) [A-Za-z0-9_]+' "$T/self.log" | sed -E 's/^i8 (stub )?//' | sort -u \
+    | sed 's/^/self\tcompiler\/entry.vl\t/' >> "$T/hits" || true
   [ "$fix" != "${fix#self-compile fails}" ] && printf 'self\tcompiler/entry.vl\t%s\n' "$(grep -m1 -oE 'i8 (stub|reentry) [A-Za-z0-9_]+' "$T/self.log" | sed -E 's/i8 (stub )?//' || echo other)" >> "$T/failing"
   for pop in ${POPS//,/ }; do
     [ "$pop" = self ] && continue
