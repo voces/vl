@@ -107,6 +107,7 @@ import {
   RPrintOpen,
   RRawOp,
   RRecCopyPure,
+  RRecDown,
   RRecordFitIs,
   RRecover,
   RRel,
@@ -210,6 +211,7 @@ import {
   repIsNoValue,
   repIsScalar,
   repPrim,
+  repSubWord,
   repWhat,
   repsLowerAlike,
 } from "./ir"
@@ -867,11 +869,11 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       let i = 0
       while i < ks.length {
-        // A packed `u8` field takes a plain i32, which `struct.new` truncates.
+        // A sub-word field (`repSubWord`) takes a plain i32, which `struct.new` truncates.
         if (
           opRep(r.mrFields[i]) != ks[i]
           && !vfOpenTakes(recKidSiteTy(r, i, at), ks[i], opRep(r.mrFields[i]))
-          && !(repPrim(ks[i]) == "u8" && opRep(r.mrFields[i]) == vfI32)
+          && !(repSubWord(ks[i]) && opRep(r.mrFields[i]) == vfI32)
         ) {
           return fail(2, at, "field " + i32ToStr(i) + "'s rep differs")
         }
@@ -921,7 +923,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       // A nullable field the checker narrowed past its null reads at its inner rep.
       const kn = repNodeAt(k)
       const narrowed = kn is RNullable && kn.rnInner == dst
-      if dst >= 0 && k != dst && !unboxed && !narrowed {
+      // A sub-word field (`repSubWord`) reads into an i32.
+      const subWord = repSubWord(k) && dst == vfI32
+      if dst >= 0 && k != dst && !unboxed && !narrowed && !subWord {
         return fail(2, at, "a field's rep is not its destination's")
       }
       // A shared template member's read is at its kid's own rep: it has no type to unbox to.
@@ -962,8 +966,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if !(repNodeAt(dst) is RList) {
         return fail(2, at, "a spread literal of a non-list rep")
       }
-      // A boxing spread's group is any list, which the lowering boxes or retags to the row.
+      // A boxing spread's group is any list, which the lowering boxes or retags to the row; the
+      // literal itself is a list of boxes.
       if r.spBoxRow >= 0 {
+        const dl = repNodeAt(dst)
+        const de = if dl is RList { repNodeAt(dl.rlsElem) } else { null }
+        if !(de is RBox) && !(de is RNullable && de.rnDisc == 4) {
+          return fail(2, at, "a boxing spread is not a list of boxes")
+        }
         for s in r.spSrcs {
           if !(repNodeAt(opRep(s)) is RList) {
             return fail(2, at, "a boxing spread's source is not a list")
@@ -1051,8 +1061,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if l == vfStr && dst >= 0 && dst != vfI32 {
         return fail(2, at, "a string's element is an i32")
       }
-      // A packed byte reads unsigned into an i32.
-      const packed = repPrim(kidAt(l, 0)) == "u8" && dst == vfI32
+      // A sub-word element (`repSubWord`) reads into an i32.
+      const packed = repSubWord(kidAt(l, 0)) && dst == vfI32
       // A nullable element may read recovered at its inner rep.
       const en = repNodeAt(kidAt(l, 0))
       const recovered = en is RNullable && en.rnInner == dst
@@ -1078,6 +1088,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         && !boxListRetag(opRep(r.rgV), dst)
         && !boxMapRetag(opRep(r.rgV), dst)
         && !listRetagHole(vf, opRep(r.rgV), dst)
+        && !vfCloListUndeclared(opRep(r.rgV), dst)
         && !cloHoleRetagAlike(opRep(r.rgV), dst)
         && !recRetag(opRep(r.rgV), dst)
         && !cloFieldRetag(r.rgV, dst, at)
@@ -1348,6 +1359,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     // The parked slot is the store's own value, built at this rep (`assignValueParked`).
     RAsgParked => 0
+    RRecDown => {
+      use(r.rdV, at)
+      // The name's re-read is its record, or the nullable one its cell holds; the cast's non-null.
+      const sn = repNodeAt(opRep(r.rdV))
+      const rec = sn is RRecord
+        || sn is RNullable && repNodeAt(sn.rnInner) is RRecord
+      if (!rec || dst >= 0 && !(repNodeAt(dst) is RRecord)) {
+        return fail(2, at, "a wider-row cast is of a record to a record")
+      }
+      0
+    }
     RAsgUnwiden => {
       use(r.uwV, at)
       if !unwidenAgrees(r.uwOp, opRep(r.uwV), dst) {
@@ -2772,7 +2794,12 @@ function stmt(id: i32, prev: i32) {
       use(n.sfV, id)
       use(n.sfSrc, id)
       const r = opRep(n.sfV)
-      if !(repNodeAt(r) is RRecord) || kidAt(r, n.sfIx) != opRep(n.sfSrc) {
+      if !(repNodeAt(r) is RRecord) {
+        return fail(2, id, "a field write's rep is not the field's")
+      }
+      // A sub-word field (`repSubWord`) takes a plain i32, which `struct.set` truncates.
+      const k = kidAt(r, n.sfIx)
+      if k != opRep(n.sfSrc) && !(repSubWord(k) && opRep(n.sfSrc) == vfI32) {
         return fail(2, id, "a field write's rep is not the field's")
       }
       0
@@ -3384,6 +3411,7 @@ function rhsReadsList(r: Rhs): boolean {
       RPrintOpen |
       RRawOp |
       RRecCopyPure |
+      RRecDown |
       RRecordFitIs |
       RRecover |
       RRel |
@@ -3559,6 +3587,20 @@ function vfNicheTakes(r: i32, v: i32): boolean {
 function vfStoresAs(dst: i32, src: i32): boolean {
   const a = vf.irRepValtype[dst] ?? []
   return a.length > 0 && u8sSame(a, vf.irRepValtype[src] ?? [])
+}
+
+// Whether a closure list at rep `src` that writes no valtype is the closure list at `dst` that
+// writes one, as the builder noted them (`cloListUndeclaredTakes`).
+function vfCloListUndeclared(src: i32, dst: i32): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  return a is RList
+    && d is RList
+    && repNodeAt(a.rlsElem) is RClosure
+    && repNodeAt(d.rlsElem) is RClosure
+    && vf.irRepValtype.has(src)
+    && (vf.irRepValtype[src] ?? []).length == 0
+    && (vf.irRepValtype[dst] ?? []).length > 0
 }
 
 // Whether record `r` is built at a variant's row, as `makeRec` lowers it.
