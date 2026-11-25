@@ -97,6 +97,7 @@ import {
 } from "./emit_base"
 import {
   fieldRowStorageKind,
+  optChainStagesRecv,
   sFieldFlatRow,
   sFieldTypeAt,
   variantFieldStorageKind,
@@ -806,6 +807,9 @@ import {
   optRecLeafTestClose,
   optRecLeafTestOpen,
   optRecvStagedAt,
+  optRecvStashCast,
+  optRecvStashGet,
+  optRecvStashTee,
   recordFitPlanOf,
   strMemberEqTail,
   unionLitIsPlanOf,
@@ -4403,6 +4407,7 @@ function boxOp(r: RToBox) {
     || p.hbArm == "obj"
     || p.hbArm == "refList"
     || p.hbArm == "map"
+    || p.hbArm == "nulMap"
     || p.hbArm == "clo"
     || p.hbArm == "atomAsStr"
     || p.hbArm == "retag"
@@ -5122,7 +5127,7 @@ function optReadLinks(
 function optChainIsNullAt(r: ROptRead, x: i32, read: boolean[]): i32 {
   const m = nodeAt(unwrapParen(x))
   if !(m is OptMember) {
-    if optChainRoot(r, x, read) < 0 { return -1 }
+    if optChainRoot(r, x, read, false) < 0 { return -1 }
     fbRefIsNull()
     return 0
   }
@@ -5139,8 +5144,11 @@ function optChainIsNullAt(r: ROptRead, x: i32, read: boolean[]): i32 {
 function optChainValueAt(r: ROptRead, x: i32, read: boolean[]): i32 {
   const m = nodeAt(unwrapParen(x))
   if !(m is OptMember) {
-    if optChainRoot(r, x, read) < 0 { return -1 }
-    if exprNullableRefNiche(x, lw.irAt) { fbRefAsNonNull() }
+    if optChainRoot(r, x, read, true) < 0 { return -1 }
+    // A staged root's stash read is cast to its record, which recovers it.
+    if !optChainStagesRecv(r.orAt) && exprNullableRefNiche(x, lw.irAt) {
+      fbRefAsNonNull()
+    }
     return 0
   }
   if optChainValueAt(r, m.omObj, read) < 0 { return -1 }
@@ -5150,13 +5158,25 @@ function optChainValueAt(r: ROptRead, x: i32, read: boolean[]): i32 {
   return 0
 }
 
-// Read `r`'s chain root `x`: its operand the first time, then read again (`opndAgain`).
-function optChainRoot(r: ROptRead, x: i32, read: boolean[]): i32 {
+// Read `r`'s chain root `x`: its operand the first time, then read again (`opndAgain`). A root
+// legacy stages (`optChainStagesRecv`) is teed into its stash first and read back from it after,
+// cast to its record where it is read as one (`asRef`), as `emitOptRecvBase` writes it.
+function optChainRoot(
+  r: ROptRead,
+  x: i32,
+  read: boolean[],
+  asRef: boolean,
+): i32 {
+  const staged = optChainStagesRecv(r.orAt)
+  if staged && !fnUses.optRecv { return irLMiss("optional read stash") }
   if !read[0] {
     read[0] = true
     irLOpnd(r.orV)
-    return 0
+    if !staged { return 0 }
+    optRecvStashTee()
+    return if asRef { optRecvStashCast(x, lw.irAt) } else { 0 }
   }
+  if staged { return optRecvStashGet(x, lw.irAt, asRef) }
   return opndAgain(r.orV, x)
 }
 
@@ -5661,17 +5681,23 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   ) {
     return irLMiss("coalesce optional field plan")
   }
-  if optRecvStagedAt(m.omObj) {
-    return irLMiss("coalesce optional field staged receiver")
-  }
   const lp = coalOptLeafPlanOf(m, structIndexOfExpr(m.omObj, lw.irAt))
   if lp.olLeaf == null { return irLMiss("coalesce optional field plan") }
+  // A staged receiver (`optChainStagesRecv`) is teed into its stash, then read back from it cast to
+  // its record, as `emitOptRecvBase` writes it.
+  const staged = optChainStagesRecv(unwrapParen(e.binLeft))
+  if staged && !fnUses.optRecv { return irLMiss("coalesce optional stash") }
   cond(n.cbL, pending)
+  if staged { optRecvStashTee() }
   coalOptLeafOpen(lp)
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   fbElse()
-  if opndAgain(n.cbL, m.omObj) < 0 { return -1 }
+  if staged {
+    if optRecvStashGet(m.omObj, lw.irAt, true) < 0 { return -1 }
+  } else if opndAgain(n.cbL, m.omObj) < 0 {
+    return -1
+  }
   lwFrames.pop()
   return coalOptLeafRead(lp)
 }
