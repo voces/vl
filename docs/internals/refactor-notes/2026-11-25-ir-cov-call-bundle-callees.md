@@ -1,6 +1,6 @@
 # IR: calls through a bundle record's place or straight off its call, 2026-11-25
 
-Lane COV-CALL, PR C. Base: master 7eddff27. The class is `indirect call`: a callee that is neither a
+Lane COV-CALL, PR C. Base: master 7eddff27, merged with master after #10038. The class is `indirect call`: a callee that is neither a
 name nor a field, which `callRefPlainKey`'s expression head refused.
 
 ## Change
@@ -44,3 +44,5 @@ unclaimed on `open local type`.
   unclaimed before. One function stays unclaimed in another class (`coalesce mapScalarJoin
   default computes`); it runs and is claimless-identical. It builds under `VL_IR_SHADOW=6` with no
   mismatch and is claimless-identical.
+- `scripts/ready-check.sh`: `gate.sh --fast: exit 0 (FAST TIER PASSED)`, `ready-check: passed`.
+  `ir-identity.sh` runs in CI (ci-ir-identity).
