@@ -823,6 +823,7 @@ import {
   letBindRep,
   letBindRepClaims,
   letBindTy,
+  letRefListSlot,
   letCellKind,
   letCellSlot,
   letIsNulNone,
@@ -3767,7 +3768,9 @@ export function irBDeclVar(d: i32): i32 {
   const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else { heldTy(scopeTyAt(d, ibFnIx)) }
   // A map local is held as legacy stores it, its mv slot off its initializer (`mapSlotHeldTy`).
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  const ty = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
+  const ty1 = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
+  // A record list local is held at the ref-list row legacy lays it out on (`listRowHeldTy`).
+  const ty = if dn is LetDecl { listRowHeldTy(ty1, d) } else { ty1 }
   const rep = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(rep, ty) {
     irBMiss("local rep " + repWhat(rep))
@@ -3803,6 +3806,31 @@ export function irBDeclVar(d: i32): i32 {
   if rl >= 0 { return declVarAt(d, repNodeOfTy(rl), rl) }
   if letLitUndeclaredRow(d) { ibDeclRowSeen = true }
   return declVarAt(d, rep, ty)
+}
+
+// List type `ty` of `let` `d` as legacy lays its local out: where its record element type is not
+// the element of the ref-list row legacy declares the local at (a kept maker's records, built at
+// the row they are adopted at), the list of that row's element; else `ty`.
+function listRowHeldTy(ty: i32, d: i32): i32 {
+  const lt = letListRowTy(ty, d, ibFnIx)
+  return if lt >= 0 { lt } else { ty }
+}
+
+// The list type of the ref-list row legacy lays binding `d` out on (`letRefListSlot`, in frame
+// `fnIx`, -1 a global), where `ty` is a record list whose element rep is not that row's record
+// element; else -1.
+function letListRowTy(ty: i32, d: i32, fnIx: i32): i32 {
+  const l = repNodeAt(repNodeOfTy(ty))
+  if !(l is RList) || !(repNodeAt(l.rlsElem) is RRecord) { return -1 }
+  const slot = letRefListSlot(d, fnIx)
+  const et = if slot >= 0 { rlElemTyIxAt(slot) } else { -1 }
+  if et < 0 || irTyOpen(et) { return -1 }
+  const lt = listTyOfElem(et)
+  const rl = repNodeAt(repNodeOfTy(lt))
+  if !(rl is RList) || rl.rlsElem == l.rlsElem || !(repNodeAt(rl.rlsElem) is RRecord) {
+    return -1
+  }
+  return lt
 }
 
 // The record type of the struct row legacy declares `let` `d`'s local at, where that row is not
@@ -6015,8 +6043,11 @@ function atomCellRep(d: i32, r: i32): i32 {
 }
 
 // A record global whose checked rep `r` has no struct heap is held at its storage row's rep
-// (`letBindTy`) where that has one, as its initializer stores it (D17087); else `r`.
+// (`letBindTy`) where that has one, as its initializer stores it (D17087), and a record list global
+// at its storage row's list where that row's record element is another (`listAtStorageRow`);
+// else `r`.
 function cellAtStorageRow(d: i32, r: i32): i32 {
+  if repNodeAt(r) is RList { return listAtStorageRow(d, r) }
   if !(repNodeAt(r) is RRecord) { return r }
   const key = "g" + i32ToStr(d) + ":" + i32ToStr(r) + ":" + i32ToStr(repTyOf(r))
   const memo = cellHeapMemo[key] ?? -2
@@ -6029,6 +6060,14 @@ function cellAtStorageRow(d: i32, r: i32): i32 {
     || recHeapOf(sr) < 0) { r } else { sr }
   cellHeapMemo[key] = at
   return at
+}
+
+// Record list global `d` at checked rep `r` held at its storage row's list (`letBindTy`), where that
+// row lays out another record element (a kept maker's records, built at the row they are adopted
+// at); else `r`.
+function listAtStorageRow(d: i32, r: i32): i32 {
+  const lt = letListRowTy(repTyOf(r), d, -1)
+  return if lt >= 0 { globalTyRep(lt) } else { r }
 }
 
 // The type global `d`'s cell holds: the record a holding binding holds whole, or the one member
