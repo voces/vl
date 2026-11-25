@@ -243,3 +243,58 @@ PR or the one right after it, the job becomes behaviour parity: each program's r
 its `@log`/Want (`ir-parity --behaviour-only`), with the byte comparison dropped (merge-queue §Q57),
 because a byte check against the previous seed would red every later codegen change (coordinator
 ruling, 2026-11-25).
+
+## 8. The I8 PR's checklist (a plan; nothing is deleted before the I8 PR)
+
+The coordinator ruled on 2026-11-25 that this checklist be kept as a plan. The I8 PR carries it out
+in one pass, in this order. Each step is one commit, and each commit is one mechanism.
+
+1. **Preconditions.** The newest regeneration of the dress rehearsal shows each of these at zero:
+   - newly failing programs (§7's red list);
+   - unclaimed units in the self-compile (`ir-i8-self-list.sh`);
+   - unproven edges (`edges/` minus `edges-proven.txt`);
+   - tools that are themselves programs and miss.
+2. **The sweep.** Run `ir-i8-sweep.sh scripts/ir-i8-census/keep --apply`. It empties the 14 entry
+   points and stage B minus the keep set, and deletes what `dead-exports.vl` lists.
+3. **The driver arms.** In `emit_sections.vl`, the arms that call `emitFuncBody`, `emitStmt` and the
+   start-body writers become `emitUnclaimed`. Each then refuses with a sentence that names the unit.
+4. **Stubs and proven edges.** Delete the 14 stubs still called after `--apply`, each with its caller
+   arm. Delete the arms that `edges-proven.txt` names, and the file with them.
+5. **The legacy-comparing checks** (the table below): retire each one or convert it.
+6. **The host and the playground.** Remove the claims-off fallback:
+   - `main.rs`: the "used the legacy emitter" path and `$VL_FAULT_INJECT_CLAIMED`;
+   - `lsp/src/claimFallback.ts`.
+   An invalid module is then rc 70 with no second build, so `VL_IR_STRICT` has nothing left to
+   choose. The `$VL_IR_SHADOW` modes the host passes through go with the compiler's shadow, along
+   with `agent-setup.sh`'s mode-6 and fallback probes. The shared host binary is rebuilt as a
+   coordinator step after the merge.
+7. **The rebaseline.** Run `scripts/ir-i8-rebaseline.sh` from a fixpoint seed, then add the fuel ledger
+   line.
+8. **The rules and the docs.** Update every rule that names a retired check:
+   - CLAUDE.md: `gate.sh --fast` runs the IR shadow test; "Each proof runs once" names
+     `ir-identity.sh --cases`;
+   - merge-queue.md: Q8, Q14, Q45 and R3, plus the `--claimless` run in the queue procedure;
+   - testing-strategy.md and the kill matrix.
+   Each retired check's intent is folded into the check that survives it.
+9. **The full gate.** Then READY.
+
+**What compares against legacy, and what becomes of it at I8.** Each check below has the claims-off
+or claimless compiler, or a legacy lowering, on one side. Once legacy is deleted, that side is the
+same compiler as the other, an older seed, or nothing.
+
+| check | where it runs | what it compares | at I8 |
+|---|---|---|---|
+| `ci-ir-identity` (`ir-identity.sh --cases` / `--claimless`, `ir-identity-annotate.sh`) | ci.yml, 4 shards; the queue | claims-on bytes against the same tree's claimless build | **convert**: against master's fetched seed for the I8 PR only, then behaviour parity (`ir-parity --behaviour-only`, run output against `@log`/Want; §7) |
+| `scripts/ir-divergence-baseline.txt` (17 rows) | read by `ir-identity.sh`, `ir-parity.vl`, `ir-shadow.vl` | the listed byte differences between claimed and claimless builds | **retire**: behaviour parity lists no byte differences; a `legacy-wrong:` row's program keeps its `@log`/Want |
+| `ir-parity.vl --pop refusals` (`ir claim refusals`) and `--cross` (`ir claim cross`) | gate.sh full | refusals and runs, claimed against claimless | **convert** `--cross` to `--behaviour-only` over the same populations; **retire** `--pop refusals`, since with one emitter a claim cannot skip a refusal |
+| `ir-shadow.vl` (`ir shadow`, `ir shadow cases`, `ir claims`), its two baselines, `heavy-programs.txt` | gate.sh full | each claimed function's bytes against legacy's; any fallback | **retire**: no legacy bytes remain, and the native fixpoint plus behaviour parity carry the claim check; `vl_heavy_programs_test` goes with them |
+| `tests/vl_ir_prepost_test.ts` (`ir shadow suite`) | gate.sh `--fast` | `$VL_IR_SHADOW=6`, the build before legacy against the build after | **retire**: with no legacy run, there is no "before" |
+| `tests/vl_ir_shadow_test.ts`, `vl_box_dst_shadow_test`, `vl_ir_claim_fallback_test`, `vl_claim_fallback_wasm_test`, `playground_claim_fallback_test`, `vl_ir_door_guard_test` | ci-native; the ci.yml editor step | the shadow, the box-destination shadow, the claims-off fallback, the door guard | **retire** (as the draft does), with `compiler/box_dst_shadow.vl` and `tests/ir-claim-fallback/` |
+| `tests/vl_ir_identity_compare_test.ts`, `vl_ir_parity_legacy_wrong_test.ts` | ci-native | the comparators of the two scripts above | **convert** with their scripts: the `legacy-wrong:` grading is behaviour parity's whole rule |
+| `self-ir-misses.vl` and its baseline; kill-matrix mutant `selfirmiss` | gate.sh, ci.yml | IR misses in the self-compile | **retire** the ratchet (a miss becomes an `emitUnclaimed` refusal, and the fixpoint fails); **re-aim** the mutant at `native fixpoint` |
+| `claim-refusal-survey.sh` (sweep.yml `claim-refusal`) | sweep label | a refused claim against the claimless build | **retire** |
+| `ir-driver-census.sh`, `ir-only-census.vl`, `ir-i8-census/` (`census.sh`, `probe-patch.sh`, `stub-reach.sh`) | by hand | where legacy is still reached | **retire** with the I8 tools; `ir-i8-sweep.sh` and `ir-i8-self-list.sh` go one PR later, once nothing reads them |
+| `ci-verdict.sh` `TREE_SKIPS`, `ci_verdict_test`, `ci_proof_test`'s local rows | ci.yml | job and row names | **follow** the renames and retirements above |
+
+Behaviour parity is the conversion target for every row marked convert. It holds the
+`ir-identity` paths filter in ci.yml, and it is the only check that still needs the shards.
