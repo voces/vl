@@ -128,6 +128,27 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: an instanced call nested in an instanced call keeps each call's type arguments",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The inner call's type arguments must not take the place of the outer's: the outer read
+    // their end offsets after parsing its arguments, and printed the inner call twice (D17560).
+    const src = "function a<T>(x: T): T { return x }\n" +
+      "function b<T>(x: T): T { return x }\n" +
+      "print(a<i32>( b<i32>(3)))\n" +
+      "print(a<string>(b<string>(a<string>(\"s\"))))\n";
+    const want = "function a<T>(x: T): T { return x }\n" +
+      "function b<T>(x: T): T { return x }\n" +
+      "print(a<i32>(b<i32>(3)))\n" +
+      "print(a<string>(b<string>(a<string>(\"s\"))))\n";
+    const r = await run([], src);
+    if (r.code !== 0 || r.out !== want) {
+      throw new Error(`want:\n${want}\ngot (code ${r.code}):\n${r.out}${r.err}`);
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: every compound assignment reprints its own operator, and a fused generic close re-spaces",
   ignore: !ENABLED,
   fn: async () => {
