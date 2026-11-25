@@ -1175,10 +1175,42 @@ function softRefused(what: string): boolean {
   return true
 }
 
+// The last claim's decline: its unit, what it declined, and the node that names. Set once a
+// claim's build is done, cleared when the claim succeeds, and read by a refusal of the same unit.
+// A unit no claim declined reads "".
+let declUnit = -1
+let declWhat = ""
+let declAt = -1
+
+// What the claim for `unit` (a function, or the top-level code's first statement) declined, such
+// as "this statement (is guard)", or "" when it did not decline.
+export function irDeclinedFor(unit: i32): string {
+  if unit < 0 || unit != declUnit { return "" }
+  return declWhat
+}
+
+// The node the last decline names: the statement holding a builder miss, else the unit.
+export function irDeclineAt(): i32 { return declAt }
+
+// Records, once the build is done, that the claim for `unit` declines with what the build missed
+// (or `whole`) unless a later step clears it: a claim that succeeds sets `declUnit` to -1.
+function declinePending(unit: i32, built: string, whole: string) {
+  declUnit = unit
+  declWhat = if built != "" { "this statement (" + built + ")" } else { whole }
+  declAt = if built != "" { missAtOr(unit) } else { unit }
+}
+
+// The node a builder miss names: the statement holding it, else the unit.
+function missAtOr(unit: i32): i32 {
+  if ibMissAt >= 0 { return ibMissAt }
+  return unit
+}
+
 // The claim seam, before legacy lowers the function at `fnIx` (`fnStmts` slot `fnPos`): when the
 // builder covers it and every node is claimed, the lowering writes its code entry onto `out` and
 // this answers true, so legacy does not run. Armed, legacy always runs and the shadow checks it.
 export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
+  declUnit = -1
   // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
   const s = claimScopeBegin()
@@ -1194,6 +1226,7 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   const built = build(fnIx, fnPos)
   ibClaimBuild = false
   if softRefused("") { return false }
+  declinePending(fnIx, built, "this function")
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
@@ -1203,9 +1236,12 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   }
   const why = irLowerClaim(ib, globalCtxOf(fnPos), fnPos, out)
   if why != "" {
+    // A legacy helper's refusal inside the lowering is legacy's own message: no note repeats it.
+    declWhat = if why.indexOf("a legacy helper refused in ") == 0 { "" } else { "this function (" + why + ")" }
     count("claim fell back: " + why)
     return false
   }
+  declUnit = -1
   count("claimed")
   return true
 }
@@ -1233,6 +1269,7 @@ export function irClaimStart(
   poolFill: boolean,
   out: u8[],
 ): boolean {
+  declUnit = -1
   if !irStartClaimOn() { return false }
   const s = claimScopeBegin()
   const ok = claimStart(order, orderGi, poolFill, out)
@@ -1252,6 +1289,11 @@ function claimStart(
   const built = buildStart(order, orderGi, poolFill)
   ibClaimBuild = false
   if softRefused("start ") { return false }
+  declinePending(
+    if order.length > 0 { order[0] } else { -1 },
+    built,
+    "this top-level code",
+  )
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
@@ -1261,9 +1303,12 @@ function claimStart(
   }
   const why = irLowerClaim(ib, ibGlobalCtx(), -1, out)
   if why != "" {
+    // A legacy helper's refusal inside the lowering is legacy's own message: no note repeats it.
+    declWhat = if why.indexOf("a legacy helper refused in ") == 0 { "" } else { "this top-level code (" + why + ")" }
     count("claim fell back: " + why)
     return false
   }
+  declUnit = -1
   count("claimed start")
   return true
 }
@@ -1322,6 +1367,8 @@ let ibFnPos = -1
 // its row, so the return's miss names that case; -1 when none.
 let ibRetNestedTwin = -1
 let ibMiss = ""
+// The innermost statement whose build set `ibMiss`, or -1.
+let ibMissAt = -1
 let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
@@ -7128,9 +7175,10 @@ export function irBStageLeads(
   if listStageFrom(b, at) || coalBoxFrom(b, at, false) || voidIfFrom(b, at) {
     return false
   }
-  // A box over a tag dispatch has its head written ahead of the dispatch (`dispatchBoxHead`),
-  // above any operand staged before it, where legacy writes that operand first (D17564).
-  if dispatchBoxFrom(b, at) { return false }
+  // A box over a tag dispatch or a join span has its head written ahead of that span
+  // (`dispatchBoxHead`), above any operand staged before it, where legacy writes that operand
+  // first (D17564).
+  if dispatchBoxFrom(b, at) || boxLeadSpanFrom(b, at) { return false }
   // A store the operand makes (an assignment as its value) is a statement: an earlier operand
   // read at its use would see the stored value, so it is staged below the store, as below an `if`.
   const store = storeFrom(b, at)
@@ -7251,6 +7299,18 @@ function tagStashFrom(b: i32[], at: i32): boolean {
 // lowering leads (`irBoxLeadBox`).
 function dispatchBoxFrom(b: i32[], at: i32): boolean {
   if !tagStashFrom(b, at) { return false }
+  let i = at
+  while i < b.length {
+    for x in ib.irBoxLeadBox {
+      if x == b[i] { return true }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether operands built into `b` from `at` on end a box-lead span (`irBoxLeadBox`).
+function boxLeadSpanFrom(b: i32[], at: i32): boolean {
   let i = at
   while i < b.length {
     for x in ib.irBoxLeadBox {
@@ -9352,7 +9412,12 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   }
   const v = widenTo(b, exprAt(b, ix, true), ix, dst, dstTy)
   ib.irUnbankedRead = outer
-  if ibMiss == "" && boxLeadsAt(b, at) && !boxOfJoinAt(b, at) {
+  if (
+    ibMiss == ""
+    && boxLeadsAt(b, at)
+    && !boxOfJoinAt(b, at)
+    && !boxLeadSpanAt(b, at)
+  ) {
     ifBelowLeadIn(b, at, leadFirstAt(b), "box of a valued if")
   }
   // A `null`-typed value is the bottom ref, which a nullable reference holds as it stands (D1567).
@@ -9730,6 +9795,41 @@ function boxOfJoinAt(b: i32[], at: i32): boolean {
   if !(v is OVar) || v.ov != out { return false }
   // Only a box whose head leads its value has its head written ahead of the join.
   return holeBoxLeads(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
+}
+
+// Where the delivery built into `b` from `at` on ends in a box whose head leads and its value's own
+// nodes write no statement but valued `if`s and `??`s that stage their leads, notes them as the
+// span the lowering writes that head ahead of (`irBoxLeadFirst`), as legacy writes the whole value
+// under it, and answers true.
+function boxLeadSpanAt(b: i32[], at: i32): boolean {
+  const bx = b.length - 1
+  if bx <= at { return false }
+  const n = ib.irNodes[b[bx]]
+  if !(n is SLet) { return false }
+  const r = n.lRhs
+  if (
+    !(r is RToBox)
+    || !holeBoxLeads(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
+  ) {
+    return false
+  }
+  for x in ib.irBoxLeadBox {
+    if x == b[bx] { return false }
+  }
+  // Only a span that holds a join under the head, which would otherwise refuse.
+  if !ifBelowLeadHas(b, at, bx) { return false }
+  let i = at
+  while i < bx {
+    const m = ib.irNodes[b[i]]
+    const join = m is SIf && m.siOut >= 0
+      || m is SCoalBox && coalArmStagesLeads(m.cbArm)
+    if !join && ifBelowLeadHas(b, i, i + 1) { return false }
+    i = i + 1
+  }
+  ib.irBoxLeadFirst.push(b[at])
+  ib.irBoxLeadBox.push(b[bx])
+  ib.irBoxLeadN.push(bx - at)
+  return true
 }
 
 // Whether the delivery built into `b` from `at` on ends in a box whose plan writes its tag ahead of
@@ -15757,7 +15857,11 @@ function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
   const cut = stmtNode(b, ix, sibs, pos) == IF_CUTS_BLOCK
     && nodeAt(ix) is IfStmt
-  if ibMiss != "" && censusGoesOn(ibMiss) { ibMiss = "" }
+  if ibMiss != "" && ibMissAt < 0 { ibMissAt = ix }
+  if ibMiss != "" && censusGoesOn(ibMiss) {
+    ibMiss = ""
+    ibMissAt = -1
+  }
   // Legacy writes back a region's length after its last statement, inside that statement's
   // span (`emitStmtIn`).
   if reserveEnds(ix) {
@@ -16535,6 +16639,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibCalleeParamAt = Map()
   ibCalleeParamFn = Map()
   ibMiss = ""
+  ibMissAt = -1
   ibMisses = []
   ibReserveEnd = []
   ibReservePushes = []
@@ -17305,6 +17410,7 @@ function buildThunk(fe: i32): string {
   ibFnPos = -1
   ibRetNestedTwin = -1
   ibMiss = ""
+  ibMissAt = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if fe < 0 || fe >= fnStmts.length { return "thunk target" }
   const d = fnStmts[fe]
@@ -17435,6 +17541,7 @@ function buildEqHelp(si: i32): string {
   ibFnPos = -1
   ibRetNestedTwin = -1
   ibMiss = ""
+  ibMissAt = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if si < 0 || si >= sHeapIdx.length { return "compare helper row" }
   ib.irName = "@eq " + i32ToStr(si)
@@ -17538,6 +17645,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibFnPos = -1
   ibRetNestedTwin = -1
   ibMiss = ""
+  ibMissAt = -1
   ibMisses = []
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
