@@ -2,7 +2,7 @@
 # The I8 cutover as one re-runnable command (ir-i8-cutover-2026-11.md §5), in a throwaway tree:
 #
 #     scripts/ir-i8-sweep.sh <keep-list> [--grow] [--pops self,distilled,cases,probes,witnesses]
-#                            [--out <dir>] [--max-iter N]
+#                            [--out <dir>] [--max-iter N] [--check | --write-baseline]
 #
 # (a) stub-reach.sh's stage B, minus <keep-list>: the 14 entry points and every emitter function
 #     that calls an emptied one are emptied, each to `emitFail("i8 stub <name>")`
@@ -18,6 +18,11 @@
 # A claim that falls back for a reason the seed's run of that program does not show is reported
 # too, since a stubbed helper that returns a sentinel makes the IR decline with its own reason,
 # beside the stubbed functions the IR files call by name (the static IR-to-stub edges).
+# Every stub also records its name (`i8 hit <name>` rows), so a run sees every stub a program
+# reaches, not only the first. The baseline side runs the census probe (probe-patch.sh), so a
+# newly failing program with no function or start body the seed already leaves unclaimed is
+# UNEXPLAINED: a re-entry or a stubbed helper the claim path needs. --check exits 1 when that count
+# rises above scripts/ir-i8-census/sweep-baseline.txt; --write-baseline writes it.
 # --grow appends each IR need that is a stub, not an entry point or a re-entry, to <keep-list>
 # (reason `ir-tail`) and runs again, until a run finds none or --max-iter (default 30) have passed.
 # Writes <out>/report.txt (the summary and the stub table), <out>/failing.tsv (pop, program, stub),
@@ -30,13 +35,15 @@
 set -euo pipefail
 KEEP=${1:?usage: scripts/ir-i8-sweep.sh <keep-list> [--grow] [--pops LIST] [--out DIR] [--max-iter N]}
 shift
-GROW=0 POPS=self,distilled,cases,probes,witnesses OUT=build/ir-i8-sweep MAXIT=30
+GROW=0 POPS=self,distilled,cases,probes,witnesses OUT=build/ir-i8-sweep MAXIT=30 RATCHET=""
+BASELINE_FILE=scripts/ir-i8-census/sweep-baseline.txt
 while [ $# -gt 0 ]; do
   case "$1" in
     --grow) GROW=1; shift ;;
     --pops) POPS=${2:?}; shift 2 ;;
     --out) OUT=${2:?}; shift 2 ;;
     --max-iter) MAXIT=${2:?}; shift 2 ;;
+    --check|--write-baseline) RATCHET=$1; shift ;;
     *) echo "ir-i8-sweep: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -57,6 +64,10 @@ lists() {
   find tests/cases -name '*.vl' | sort > "$T/cases"
   ls scripts/capability-probes/*.vl > "$T/probes"
   "$VL" run scripts/ir-i8-census/witnesses.vl -- "$T/wit" docs/internals/inventory docs/internals/inventory-2 > "$T/witnesses"
+  # The baseline compiler: the census probe of this checkout, which also names what it leaves unclaimed.
+  cp -r compiler "$T/probe"
+  bash scripts/ir-i8-census/probe-patch.sh "$T/probe"
+  "$VL" build "$T/probe/entry.vl" -o "$T/probe.wasm" --compiler "$SEED" > /dev/null
 }
 
 # `<file>\t<message>` for every error `vl check --codegen` under compiler $1 prints for the
@@ -72,6 +83,8 @@ VL_IR_SHADOW=5 "$VL" check --codegen --compiler "$C" "$@" 2>&1 > /dev/null | awk
     match($0, /i8 (stub|reentry) [A-Za-z0-9_]+/); w = substr($0, RSTART + 3, RLENGTH - 3)
     sub(/^stub /, "", w); print h "\tNEED " w; fflush(); next
   }
+  /^\[ir\] / && /\t(fnu |start uncovered )/ { h = $0; sub(/^\[ir\] /, "", h); sub(/: [0-9]+\t.*/, "", h); print h "\tUNC"; fflush(); next }
+  /^\[ir\] / && /\ti8 hit / { h = $0; sub(/^\[ir\] /, "", h); sub(/: [0-9]+\t.*/, "", h); r = $0; sub(/.*\ti8 hit /, "", r); print h "\tHIT " r; fflush(); next }
   /^\[ir\] / && /\tclaim fell back: / {
     h = $0; sub(/^\[ir\] /, "", h); sub(/: [0-9]+\t.*/, "", h)
     r = $0; sub(/.*\tclaim fell back: /, "", r); print h "\tFELL " r; fflush()
@@ -126,6 +139,40 @@ VL
     mv "$T/f.new" "$T/tree/compiler/$b"
   done
   rm -f "$T"/uses.*
+  # Stub hits: each stub records its name before it fails, and the IR shadow's next row drains them.
+  cat >> "$T/tree/compiler/emit_bytes.vl" <<'VL'
+
+// The sweep's stub hits, drained into the IR shadow's rows as `i8 hit <name>`.
+let i8HitList: string[] = []
+let i8HitAt = 0
+export function i8Hit(n: string) {
+  i8HitList.push(n)
+  return 0
+}
+export function i8HitReset() {
+  i8HitList = []
+  i8HitAt = 0
+  return 0
+}
+export function i8HitTake(): string {
+  if i8HitAt >= i8HitList.length { return "" }
+  const h = i8HitList[i8HitAt]
+  i8HitAt = i8HitAt + 1
+  return h
+}
+VL
+  for f in "$T"/tree/compiler/*.vl; do
+    grep -qE '^  (return )?emitFail\("i8 stub ' "$f" || continue
+    sed -i -E 's/^  (return )?emitFail\("i8 stub ([A-Za-z0-9_]+)"\)/  i8Hit("\2")\n&/' "$f"
+    if [ "${f##*/}" != emit_bytes.vl ]; then { echo 'import { i8Hit } from "./emit_bytes"'; cat "$f"; } > "$T/f.new"; mv "$T/f.new" "$f"; fi
+  done
+  sed -i 's/^  emitFail("i8 reentry " + caller)$/  i8Hit("reentry " + caller)\n&/' "$T/tree/compiler/wasmEmit.vl"
+  awk '/^export function irShadowBegin\(\) \{$/ { print; print "  i8HitReset()"; b = 1; next }
+    /^function count\(key: string\) \{$/ { print; print "  let h = i8HitTake()"; print "  while h != \"\" {"; print "    count(\"i8 hit \" + h)"; print "    h = i8HitTake()"; print "  }"; c = 1; next }
+    { print }
+    END { if (!b || !c) { print "ir-i8-sweep: an i8 hit anchor in ir_build.vl was not found" > "/dev/stderr"; exit 1 } }' \
+    "$T/tree/compiler/ir_build.vl" > "$T/f.new"
+  { echo 'import { i8HitReset, i8HitTake } from "./emit_bytes"'; cat "$T/f.new"; } > "$T/tree/compiler/ir_build.vl"
   # The static IR-to-stub edges: stubbed functions an ir*.vl file calls by name.
   grep -ohE 'emitFail\("i8 stub [A-Za-z0-9_]+"\)' "$T"/tree/compiler/*.vl | sed -E 's/.*i8 stub ([A-Za-z0-9_]+).*/\1/' | sort -u > "$T/stubs"
   grep -ohE '[A-Za-z_][A-Za-z0-9_]*\(' "$T"/tree/compiler/ir*.vl | tr -d '(' | sort -u | comm -12 - "$T/stubs" > "$OUT/ir-stub-edges.txt"
@@ -216,25 +263,33 @@ VL
   done
   cp "$c" "$OUT/compiler.wasm"
   # The populations: the self-compile's own result, then each list under both compilers.
-  : > "$T/failing" ; : > "$T/needs" ; : > "$T/fell"
+  : > "$T/failing" ; : > "$T/needs" ; : > "$T/fell" ; : > "$T/unexplained" ; : > "$T/hits"
   grep -E '(claim fell back|IR claim refused).*i8 stub [A-Za-z0-9_]+' "$T/self.log" \
     | grep -oE 'i8 stub [A-Za-z0-9_]+' | sed 's/^i8 stub /self\tcompiler\/entry.vl\t/' >> "$T/needs" || true
   [ "$fix" != "${fix#self-compile fails}" ] && printf 'self\tcompiler/entry.vl\t%s\n' "$(grep -m1 -oE 'i8 (stub|reentry) [A-Za-z0-9_]+' "$T/self.log" | sed -E 's/i8 (stub )?//' || echo other)" >> "$T/failing"
   for pop in ${POPS//,/ }; do
     [ "$pop" = self ] && continue
-    [ -s "$T/base.$pop" ] || scan "$SEED" "$T/$pop" > "$T/base.$pop"
+    [ -s "$T/base.$pop" ] || scan "$T/probe.wasm" "$T/$pop" > "$T/base.$pop"
     scan "$c" "$T/$pop" > "$T/sweep.$pop"
     grep $'\tNEED ' "$T/sweep.$pop" | awk -F'\t' -v p="$pop" '{ sub(/^NEED /, "", $2); print p "\t" $1 "\t" $2 }' >> "$T/needs" || true
-    awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 !~ /^(NEED|FELL) /) bad[$1] = 1; next }
-      $2 ~ /^(NEED|FELL) / || ($1 in bad) || ($1 in seen) { next }
+    awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 !~ /^(NEED|FELL|HIT) / && $2 != "UNC") bad[$1] = 1; next }
+      $2 ~ /^(NEED|FELL|HIT) / || $2 == "UNC" || ($1 in bad) || ($1 in seen) { next }
       { seen[$1] = 1; s = "other"; if (match($2, /i8 (stub|reentry) [A-Za-z0-9_]+/)) { s = substr($2, RSTART + 3, RLENGTH - 3); sub(/^stub /, "", s) }; print p "\t" $1 "\t" s }' \
       "$T/base.$pop" "$T/sweep.$pop" >> "$T/failing"
+    # Unexplained: newly failing with nothing the seed leaves unclaimed. And every stub each program reaches.
+    awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 == "UNC") unc[$1] = 1; next }
+      $1 == p && !($2 in unc) { print p "\t" $2 "\t" $3 }' "$T/base.$pop" "$T/failing" >> "$T/unexplained"
+    grep $'\tHIT ' "$T/sweep.$pop" | awk -F'\t' -v p="$pop" '{ sub(/^HIT /, "", $2); print p "\t" $1 "\t" $2 }' >> "$T/hits" || true
     # A fallback reason the seed's run of the same program does not show.
     awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 ~ /^FELL /) had[$1 "\t" $2] = 1; next }
       $2 ~ /^FELL / && !(($1 "\t" $2) in had) && $2 !~ /i8 (stub|reentry)/ { sub(/^FELL /, "", $2); print p "\t" $1 "\t" $2 }' \
       "$T/base.$pop" "$T/sweep.$pop" >> "$T/fell"
   done
   cp "$T/failing" "$OUT/failing.tsv"; sort -u "$T/fell" > "$OUT/fell.tsv"
+  sort -u "$T/unexplained" > "$OUT/unexplained.tsv"; sort -u "$T/hits" > "$OUT/hits.tsv"
+  # The self-compile has no seed-unclaimed function, so its failure is unexplained too.
+  awk -F'\t' '$1 == "self"' "$T/failing" >> "$OUT/unexplained.tsv"
+  UNEXPLAINED=$(wc -l < "$OUT/unexplained.tsv")
   sort -u "$T/needs" | awk -F'\t' '{ n[$3]++ } END { for (k in n) print k "\t" n[k] }' | sort -t$'\t' -k2,2nr > "$OUT/needs.tsv"
   {
     cat "$T/stage"
@@ -244,12 +299,16 @@ VL
       [ "$pop" = self ] && continue
       echo "$pop: $(wc -l < "$T/$pop") programs, $(awk -F'\t' -v p="$pop" '$1 == p' "$T/failing" | wc -l) newly failing"
     done
+    echo "unexplained (newly failing, nothing the seed leaves unclaimed): $UNEXPLAINED programs"
+    cut -f3 "$OUT/unexplained.tsv" | sort | uniq -c | sort -rn | awk '{ n = $1; $1 = ""; printf "  %6d %s\n", n, $0 }'
     echo "newly failing, by the first stub hit (programs):"
     cut -f3 "$T/failing" | sort | uniq -c | sort -rn | awk '{ n = $1; $1 = ""; printf "  %6d %s\n", n, $0 }'
     echo "IR needs (claims that fell back on or refused inside a stub or a re-entry; programs):"
     awk -F'\t' '{ printf "  %6d  %s\n", $2, $1 }' "$OUT/needs.tsv"
     echo "IR fallbacks the seed does not show, by reason (programs; trace each to a stub below):"
     sort -u "$T/fell" | cut -f3 | sort | uniq -c | sort -rn | awk '{ n = $1; $1 = ""; printf "  %6d %s\n", n, $0 }'
+    echo "every stub reached (programs reaching it, all populations):"
+    cut -f2,3 "$OUT/hits.tsv" | sort -u | cut -f2 | sort | uniq -c | sort -rn | head -40 | awk '{ n = $1; $1 = ""; printf "  %6d %s\n", n, $0 }'
     echo "static IR-to-stub edges (stubbed functions an ir*.vl file calls by name): $(wc -l < "$OUT/ir-stub-edges.txt")"
     sed 's/^/  /' "$OUT/ir-stub-edges.txt"
   } > "$OUT/report.txt"
@@ -269,4 +328,15 @@ while :; do
   it=$((it + 1)); [ $it -le "$MAXIT" ] || { echo "ir-i8-sweep: --max-iter $MAXIT reached" >&2; break; }
 done
 cat "$OUT/report.txt"
+if [ "$RC" != 2 ] && [ -n "$RATCHET" ]; then
+  if [ "$RATCHET" = --write-baseline ]; then
+    printf '%s\n' "$UNEXPLAINED" > "$BASELINE_FILE"; echo "ir-i8-sweep: wrote $UNEXPLAINED to $BASELINE_FILE"; exit 0
+  fi
+  base=$(tr -dc '0-9' < "$BASELINE_FILE")
+  if [ "$UNEXPLAINED" -gt "$base" ]; then
+    echo "ir-i8-sweep: UNEXPLAINED rose: $UNEXPLAINED programs, baseline $base ($BASELINE_FILE); see $OUT/unexplained.tsv"; exit 1
+  fi
+  [ "$UNEXPLAINED" -lt "$base" ] && echo "ir-i8-sweep: unexplained fell: $UNEXPLAINED < $base; run --write-baseline in this PR"
+  echo "ir-i8-sweep: unexplained $UNEXPLAINED, baseline $base: ok"; exit 0
+fi
 exit "$RC"
