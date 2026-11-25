@@ -176,23 +176,35 @@ function wat(root: string, n: number): string {
 
 /** `--compare` of `t/ok.vl` built to two modules whose `$f@1` differs, under `baseline`. */
 function diverged(baseline: string, dis: string = DIS) {
+  return divergedAt(baseline, () => "t/ok.vl", dis);
+}
+
+/** `diverged` for the program `file(root)` names; `$IR_IDENTITY_WIT` is `<root>/wit`. */
+function divergedAt(baseline: string, file: (root: string) => string, dis: string = DIS) {
   const root = Deno.makeTempDirSync();
   try {
     const b = `${root}/baseline.txt`;
     Deno.writeTextFileSync(b, baseline);
     const one = wat(root, 1), two = wat(root, 2);
     const list = `${root}/list`;
-    Deno.writeTextFileSync(list, "t/ok.vl\n");
+    const f = file(root);
+    Deno.writeTextFileSync(list, `${f}\n`);
+    const k = f.replaceAll("/", "_");
     const a = `${root}/a`, c = `${root}/b`;
     for (const [d, w] of [[a, one], [c, two]]) {
       Deno.mkdirSync(d);
-      Deno.writeTextFileSync(`${d}/t_ok.vl.rc`, "0\n");
-      Deno.writeTextFileSync(`${d}/t_ok.vl.err`, "");
-      Deno.writeFileSync(`${d}/t_ok.vl.wasm`, Uint8Array.from(w, (ch) => ch.charCodeAt(0)));
+      Deno.writeTextFileSync(`${d}/${k}.rc`, "0\n");
+      Deno.writeTextFileSync(`${d}/${k}.err`, "");
+      Deno.writeFileSync(`${d}/${k}.wasm`, Uint8Array.from(w, (ch) => ch.charCodeAt(0)));
     }
     const out = new Deno.Command("bash", {
       args: [SCRIPT, "--compare", list, a, c],
-      env: { IR_IDENTITY_KEEP: `${root}/keep`, IR_DIVERGENCE_BASELINE: b, WASM_DIS: dis },
+      env: {
+        IR_IDENTITY_KEEP: `${root}/keep`,
+        IR_DIVERGENCE_BASELINE: b,
+        WASM_DIS: dis,
+        IR_IDENTITY_WIT: `${root}/wit`,
+      },
       stdout: "piped",
       stderr: "piped",
     }).outputSync();
@@ -221,6 +233,22 @@ Deno.test({ name: "ir-identity --compare: a differ in a program the baseline doe
   const r = diverged("t/other.vl\tf@1\ttest mechanism\t#0\n");
   if (r.code !== 1 || !r.text.includes("DIFF t/ok.vl\n")) {
     throw new Error(`want t/ok.vl to red, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+// An inventory witness, extracted under `$IR_IDENTITY_WIT/inv<k>/<id>/` afresh each run, is listed by
+// its row's file: `inv1` is docs/internals/inventory, `inv2` docs/internals/inventory-2.
+Deno.test({ name: "ir-identity --compare: an inventory witness is listed by its row's file", ignore: noBinaryen }, () => {
+  const r = divergedAt("docs/internals/inventory/D1.md\tf@1\ttest mechanism\t#0\n", (root) => `${root}/wit/inv1/D1/w.vl`);
+  if (r.code !== 0 || !r.text.includes("expected divergence") || !r.text.includes("(f@1)")) {
+    throw new Error(`want an expected divergence naming f@1, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+Deno.test({ name: "ir-identity --compare: an inventory witness whose row the baseline does not list reds", ignore: noBinaryen }, () => {
+  const r = divergedAt("docs/internals/inventory-2/D1.md\tf@1\ttest mechanism\t#0\n", (root) => `${root}/wit/inv1/D1/w.vl`);
+  if (r.code !== 1 || !r.text.includes("DIFF ")) {
+    throw new Error(`want the witness to red, got exit ${r.code}:\n${r.text}`);
   }
 });
 
