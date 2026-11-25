@@ -5,6 +5,12 @@ holds the rules ("Gates", "Agent concurrency"); this page holds the steps. Who p
 CLAUDE.md's "Each proof runs once" bullet: the lane proves its change once, the queue proves the
 merged tree, and the reviewer reruns only a reading it disputes.
 
+> **Superseded in part, 2026-11-25 (coordinator ruling).** CI is the queue: trains, verifier lanes,
+> PRE-REVIEW and lane-claim broadcasts retire. A lane follows [`lane-brief.md`](lane-brief.md), and
+> the rulings O1 to O6 are in [`orchestration-reset-2026-11-25.md`](orchestration-reset-2026-11-25.md).
+> Below, R1 to R12 and Q1 to Q71 are kept as history and as the reasons behind each check. Where
+> they conflict with O1 to O6, O1 to O6 win.
+
 ## READY
 
 A lane that wants its PR merged sends one line:
