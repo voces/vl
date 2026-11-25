@@ -109,6 +109,7 @@ import {
   IrFn,
   IrNode,
   MapProbe,
+  NumIntrSel,
   OImm,
   OStr,
   OVar,
@@ -257,6 +258,7 @@ import {
   MapSetValArm,
   MemAddrPlan,
   NUL_STRUCT_EQ_NO_ROW,
+  NumIntrArm,
   ObjLitArm,
   PrintArm,
   StructFieldArm,
@@ -412,6 +414,7 @@ import {
   numCastKindOf,
   numCastKindTy,
   numIntrCallReached,
+  numIntrOperandTy,
   numIntrPlanOf,
   numLitAsApplies,
   numLitLexAt,
@@ -747,6 +750,7 @@ import {
   holderMemberTy,
   holderRecordTy,
   identIsEnvCapture,
+  identNameIsUserBound,
   letArmCellRow,
   letAtomCellTy,
   letBindIsAtom,
@@ -810,6 +814,7 @@ import {
   gConstExprEmit,
   gInitProgAfter,
   gInitProgIdx,
+  gMemLogIdx,
   gPromoInStart,
   globalStmtOrd,
   liFrameRestore,
@@ -5681,6 +5686,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if simdCallNamed(c, ibFnIx) { return simdRhs(b, c, ix) }
   if atomicCallNamed(c, ibFnIx) { return atomicRhs(b, c, ix) }
   if truncSatCallNamed(c, ibFnIx) { return truncSatRhs(b, c, ix) }
+  if cf.identName == "__log__" && !identNameIsUserBound(c.callFn, ibFnIx) {
+    return logCallRhs(b, c, ix)
+  }
   if hostCallNamed(c, ibFnIx) { return hostCallRhs(b, c, ix) }
   if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
     return strFromBytesRhs(b, c, ix)
@@ -7017,6 +7025,29 @@ function hostCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   return r
 }
 
+// `__log__(offset, length)` as `emitCallCoreLog` writes it: both operands as they stand, then a
+// call of the reserved `__log__` import.
+function logCallRhs(b: i32[], c: Call, ix: i32): Rhs {
+  if c.callArgs.length != 2 { return missRhs("log arguments") }
+  const at = b.length
+  const args: Opnd[] = []
+  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  if ibMiss != "" { return missRhs("log operand") }
+  if ifBelowLead(b, at, "log short-circuit operand") {
+    return missRhs("log short-circuit operand")
+  }
+  for a in args {
+    if repPrim(irBOpRep(a)) != "i32" { return missRhs("log operand rep") }
+  }
+  const r: Rhs = {
+    chImport: gMemLogIdx,
+    chArgs: args,
+    chVoid: true,
+    chNever: callEndsNever(ix),
+  }
+  return r
+}
+
 // `__str_from_bytes__(src, at, count)` as legacy's arm writes it: the three operands as they stand
 // (a byte list, then two i32s), then the helper call (`strFromBytesTail`).
 function strFromBytesRhs(b: i32[], c: Call, ix: i32): Rhs {
@@ -7042,23 +7073,30 @@ function strFromBytesRhs(b: i32[], c: Call, ix: i32): Rhs {
   return r
 }
 
-// A numeric intrinsic legacy writes as one instruction (`numIntrPlanOf`), each operand already
-// at the operation's kind. An integer `abs`/`min`/`max` select is a named miss.
+// A numeric intrinsic as legacy writes it (`numIntrPlanOf`): each operand at the operation's kind,
+// widened where `emitExprAsKind` widens it, then its one instruction, or an integer
+// `abs`/`min`/`max`'s select (`intSelTail`).
 function numIntrRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
   const pl = numIntrPlanOf(ix, ibFnIx, f.identName)
-  if pl.niArm != "bitcast" && pl.niArm != "float" && pl.niArm != "int" {
-    return missRhs("intrinsic " + pl.niArm)
-  }
-  if c.callArgs.length == 0 || pl.niArm == "bitcast" && c.callArgs.length != 1 {
+  const sel = numIntrSelOf(pl.niArm, f.identName)
+  if sel == null { return missRhs("intrinsic " + pl.niArm) }
+  if (
+    c.callArgs.length == 0
+    || pl.niArm == "bitcast" && c.callArgs.length != 1
+    || pl.niArm == "intAbs" && c.callArgs.length != 1
+    || pl.niArm == "intMinMax" && c.callArgs.length != 2
+  ) {
     return missRhs("intrinsic argument count")
   }
   const want = numKindPrim(pl.niKind)
+  const wt = numIntrOperandTy(pl)
+  const dst = if wt >= 0 { repNodeOfTy(wt) } else { -1 }
   const args: Opnd[] = []
   const starts: i32[] = []
   for a in c.callArgs {
     const at = b.length
     starts.push(at)
-    const v = irBExpr(b, a)
+    const v = if dst >= 0 { deliver(b, a, dst, -1) } else { irBExpr(b, a) }
     if ibMiss != "" { return missRhs("argument") }
     if args.length > 0 && !irBStageLeads(b, at, starts, args, c.callArgs) {
       return missRhs("short-circuit argument after another")
@@ -7067,8 +7105,25 @@ function numIntrRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
     if p == null || p != want { return missRhs("intrinsic operand coercion") }
     args.push(v)
   }
-  const r: Rhs = { nxArgs: args, nxOp: pl.niOp, nxAt: ix }
+  const r: Rhs = {
+    nxArgs: args,
+    nxOp: pl.niOp,
+    nxSel: sel,
+    nxWide: pl.niKind == 3,
+    nxAt: ix,
+  }
   return r
+}
+
+// How intrinsic arm `arm` of call name `name` lowers: "op" for one instruction, the integer
+// select it is, or null for an arm that is no intrinsic (`none`) or one legacy cannot read (`bad`).
+function numIntrSelOf(arm: NumIntrArm, name: string): NumIntrSel | null {
+  return match arm {
+    "bitcast" | "float" | "int" => "op"
+    "intAbs" => "abs"
+    "intMinMax" => if name == "max" { "max" } else { "min" }
+    "none" | "bad" => null
+  }
 }
 
 // The prim rep of number kind `k` as the numeric plans name kinds (0 i32, 3 i64, 4 f64,
