@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims a list `.get(i)` whose index is a call:** legacy stashes an index it cannot re-read in place and reads the stash at each use. The IR now takes that index as one temp and holds it in a fresh local (`irOnceSlot`) ahead of the head, which reads it through `listGetIdxHook`. Legacy's own staging of it is dropped while the IR holds it (`listGetIdxUnstage` / `listGetIdxRelease`), so the call runs once, alone and under `??`. `get index staged` falls from 7 rows to 0. An index of more than one temp, and a staged receiver under `??`, stay named misses.
