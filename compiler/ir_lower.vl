@@ -485,6 +485,8 @@ import {
   initBitOf,
   intSelTail,
   listBuildClose,
+  listGetIdxHook,
+  listGetIdxLegacy,
   listGetOrOpen,
   listOpRecvHeld,
   listOpStageBase,
@@ -2225,6 +2227,47 @@ function numIs(r: RNumIs): i32 {
     i = i + 1
   }
   return 1
+}
+
+// The `.get` index operands `listGetIdxHook` reads while legacy's `.get` head is written, innermost
+// last, and the reads of each so far.
+const getIdxOs: Opnd[] = []
+const getIdxReadsAt: i32[] = []
+let getIdxReads = 0
+
+// Hands legacy's `.get` head index operand `o` (`listGetIdxHook`) where it is read at each use: an
+// immediate or a variable, never a temp. Returns whether it did; `irGetIdxEnd` then undoes it.
+export function irGetIdxBegin(o: Opnd): boolean {
+  if !(o is OImm || o is OVar && !isTemp(o.ov)) { return false }
+  getIdxOs.push(o)
+  getIdxReadsAt.push(getIdxReads)
+  getIdxReads = 0
+  listGetIdxHook = irListGetIdxRead
+  return true
+}
+
+// Undoes the innermost `irGetIdxBegin`.
+export function irGetIdxEnd() {
+  getIdxOs.pop()
+  getIdxReads = getIdxReadsAt.pop() ?? 0
+  if getIdxOs.length == 0 { listGetIdxHook = listGetIdxLegacy }
+  return 0
+}
+
+// `listGetIdxHook` under `coalListGetOr`: the index operand the first time, then read again.
+function irListGetIdxRead(idxIx: i32, _fnIx: i32): i32 {
+  const at = getIdxOs.length - 1
+  if at < 0 {
+    irLMiss("get index unset")
+    return -1
+  }
+  const k = getIdxReads
+  getIdxReads = k + 1
+  if k == 0 {
+    irLOpnd(getIdxOs[at])
+    return 0
+  }
+  return opndAgain(getIdxOs[at], idxIx)
 }
 
 // The operands legacy fit writers' tails re-read through `fitRecvReadHook` while `irFitTail`
@@ -5469,15 +5512,18 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
 }
 
 // The fused `xs.get(i) ?? d`: legacy's shared head re-reads the receiver and the index the
-// builder found re-readable, so the receiver operand is skipped; then the default and the end.
+// builder found re-readable, so the receiver operand is skipped, and the index is the builder's
+// operand where it holds one (`listGetIdxHook`); then the default and the end.
 function coalListGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwSeq = []
   irLSkip(n.cbL)
   if lwMiss != "" { return -1 }
   irLSettle(pending)
-  if listGetOrOpen(unwrapParen(e.binLeft), lw.irAt) == null {
-    return irLMiss("listGetOr head")
-  }
+  const ci = n.cbIdx
+  const hooked = if ci != null { irGetIdxBegin(ci) } else { false }
+  const ek = listGetOrOpen(unwrapParen(e.binLeft), lw.irAt)
+  if hooked { irGetIdxEnd() }
+  if ek == null { return irLMiss("listGetOr head") }
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   lwFrames.pop()
