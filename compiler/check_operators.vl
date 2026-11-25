@@ -210,7 +210,7 @@ import {
   inStrFix,
   strParseCastHint,
 } from "./check_diag_text"
-import { seedExpected } from "./check_expected"
+import { joinWantAt, seedExpected } from "./check_expected"
 import {
   checkIdentityBinNode,
   fnEqRefused,
@@ -402,6 +402,7 @@ import {
   constrainEmpty,
   eqKeepsWideLit,
   eqNonNullMutual,
+  joinArmFits,
   joinArmLit,
   joinTys,
   keepListStorage,
@@ -534,6 +535,7 @@ import {
   sameNumeric,
   tyAdmitsNull,
   tyExcludesNull,
+  tyHasNullMember,
   tyHasTyVar,
   tyIsUnionShaped,
   tyIsV128Brand,
@@ -1215,6 +1217,25 @@ function coalHitStamp(x: i32): i32 {
 function coalHitTy(x: i32): i32 {
   const hvt = coalMapValTyAt(x, true)
   return nonNullTy(if hvt >= 0 { hvt } else { elabLiveTyOf(x) })
+}
+
+// The destination banked for `??` `n` at `ix` (`joinWantAt`) its join `ct` takes instead, or -1:
+// when the left holds no value of its own type, only ever `null` or a hole with no non-null part
+// yet, so the result is the default's, checked against the destination as a valued `if`'s arm is.
+function coalLitJoinOf(n: BinExpr, ix: i32, lt: i32, rt: i32, ct: i32): i32 {
+  const jw = joinWantAt.get(ix) ?? -1
+  if (
+    jw < 0
+    || ct < 0
+    || tyHasTyVar(jw)
+    || tyHasNullMember(jw)
+    || assignable(ct, jw)
+  ) {
+    return -1
+  }
+  const lo = tyAt(lt)
+  if !isNullTy(lt) && !(lo is TyNullable && lo.nInner < 0) { return -1 }
+  return if joinArmFits(n.binRight, rt, jw) { jw } else { -1 }
 }
 
 function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
@@ -2480,7 +2501,10 @@ function binTyOfSides(n: BinExpr, ix: i32, lt0: i32, rt0: i32, ltOut: i32[]) {
   // here, below both the `=` arm's own pin and the operand peek, rather than trapping (D1462).
   if lt < 0 { return TY_ERR }
   if op == "??" {
-    const ct = checkCoalesceBinNode(n, ix, lt, rt)
+    const ct0 = checkCoalesceBinNode(n, ix, lt, rt)
+    // A `??` checks its default against its destination, as a valued `if` checks its arms (D17565).
+    const cw = coalLitJoinOf(n, ix, lt, rt, ct0)
+    const ct = if cw >= 0 { cw } else { ct0 }
     // A generic `??` is the `if` it spells, so a pin that joins its sides apart re-asks it (D2846).
     const clt = tyAt(lt)
     if clt is TyNullable && clt.nInner >= 0 {
