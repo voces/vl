@@ -292,8 +292,12 @@ VL
         print p "\t" $1 "\t" s }' \
       "$T/base.$pop" "$T/sweep.$pop" "$T/sweep.$pop" >> "$T/failing"
     # Unexplained: newly failing with nothing the seed leaves unclaimed. And every stub each program reaches.
-    awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 == "UNC") unc[$1] = 1; next }
-      $1 == p && !($2 in unc) { print p "\t" $2 "\t" $3 }' "$T/base.$pop" "$T/failing" >> "$T/unexplained"
+    # Explained: the seed leaves a function or start unclaimed, or a claim falls back under the seed
+    # too; a module case's rows print under whichever of its files the batch built, so they explain
+    # every file of its directory. An error located in std names no program.
+    awk -F'\t' -v p="$pop" 'function dir(f) { if (f !~ /^tests\/cases\/modules\//) return ""; sub(/\/[^\/]*$/, "", f); return f }
+      FILENAME == ARGV[1] { if ($2 == "UNC" || $2 ~ /^FELL /) { unc[$1] = 1; d = dir($1); if (d != "") udir[d] = 1 }; next }
+      $1 == p && $2 !~ /^std:/ && !($2 in unc) && !(dir($2) != "" && (dir($2) in udir)) { print p "\t" $2 "\t" $3 }' "$T/base.$pop" "$T/failing" >> "$T/unexplained"
     grep $'\tHIT ' "$T/sweep.$pop" | awk -F'\t' -v p="$pop" '{ sub(/^HIT /, "", $2); print p "\t" $1 "\t" $2 }' >> "$T/hits" || true
     # A fallback reason the seed's run of the same program does not show.
     awk -F'\t' -v p="$pop" 'FILENAME == ARGV[1] { if ($2 ~ /^FELL /) had[$1 "\t" $2] = 1; next }
