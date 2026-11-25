@@ -12,6 +12,8 @@
 # Writes <out-dir>/<pop>.rows (file, count, row), <out-dir>/summary.txt (summary.sh), the witnesses
 # under <out-dir>/wit, and <out-dir>/programs.txt, every program, for `CENSUS_PROGRAMS=` of
 # ir-driver-census.sh. Run from the checkout root; $VL names the host, $JOBS the fan-out (default 4).
+# $CENSUS_CLASS names a class-programs.sh list: each population is cut to the programs it lists,
+# and the self-compile runs only when the list names it.
 set -euo pipefail
 SEED=${1:?usage: scripts/ir-i8-census/census.sh <seed> <out-dir>}
 OUT=${2:?usage: scripts/ir-i8-census/census.sh <seed> <out-dir>}
@@ -35,6 +37,13 @@ awk '
   END { if (!a || !b || !c) { print "ir-i8-census: a probe anchor in ir_build.vl was not found" > "/dev/stderr"; exit 1 } }
 ' "$T/probe/ir_build.vl" > "$T/ir_build.vl"
 mv "$T/ir_build.vl" "$T/probe/ir_build.vl"
+# Two classes split for the census alone: `is rung` names its rung, and a miss at a node with no
+# rep (`repMissAt`) names the node's kind. The shipped compiler's classes stay unsplit.
+grep -q '^  if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }$' "$T/probe/ir_build.vl" \
+  && grep -q '^  return irBMiss(miss)$' "$T/probe/ir_build.vl" \
+  || { echo "ir-i8-census: a split anchor in ir_build.vl was not found" >&2; exit 1; }
+sed -i -e 's|^  if arm != "variant" \&\& arm != "armTag" { return irBMiss("is rung") }$|  if arm != "variant" \&\& arm != "armTag" { return irBMiss("is rung " + arm) }|' \
+  -e 's|^  return irBMiss(miss)$|  return irBMiss(miss + " of " + irAstKind(ix))|' "$T/probe/ir_build.vl"
 "$VL" build "$T/probe/entry.vl" -o "$T/probe.wasm" --compiler "$SEED" > /dev/null
 
 rm -rf "$OUT/wit"
@@ -42,6 +51,13 @@ rm -rf "$OUT/wit"
 ls scripts/silent-sweep/distilled/cells/*.vl scripts/silent-sweep/distilled/named/*.vl > "$T/distilled"
 find tests/cases -name '*.vl' | sort > "$T/cases"
 ls scripts/capability-probes/*.vl > "$T/probes"
+if [ -n "${CENSUS_CLASS:-}" ]; then
+  for pop in distilled cases probes witnesses; do
+    awk -F'\t' -v pop="$pop" -v out="$OUT" '$1 == pop { sub(/^wit\//, out "/wit/", $2); print $2 }' "$CENSUS_CLASS" \
+      | grep -Fxf - "$T/$pop" > "$T/$pop.cut" || true
+    mv "$T/$pop.cut" "$T/$pop"
+  done
+fi
 
 # One chunk's rows: `<file>\t<count>\t<row>` for every function row and start row, each
 # flushed alone, since the parallel chunks share one file and a buffered block splits a row.
@@ -52,14 +68,18 @@ VL_IR_SHADOW=5 "$VL" check --codegen --compiler "$PROBE" "$@" 2>&1 > /dev/null |
     if ($2 ~ /^(fnc |fnu |claimed start|start uncovered |claim fell back)/) { print h "\t" n "\t" $2; fflush() }
   }'
 ONE
+if [ -z "${CENSUS_CLASS:-}" ] || grep -q '^self'$'\t' "$CENSUS_CLASS"; then
 VL_IR_SHADOW=5 "$VL" build compiler/entry.vl -o "$T/self.wasm" --compiler "$T/probe.wasm" 2>&1 > /dev/null \
   | awk -F'\t' '/^\[ir\] / { n = $1; sub(/.*: /, "", n); if ($2 ~ /^(fnc |fnu |claimed start|start uncovered |claim fell back)/) print "self\t" n "\t" $2 }' \
   > "$OUT/self.rows"
+  echo 1 > "$OUT/self.programs"
+else
+  rm -f "$OUT/self.rows" "$OUT/self.programs"
+fi
 for pop in distilled cases probes witnesses; do
-  xargs -n 100 -P "$JOBS" env VL="$VL" PROBE="$T/probe.wasm" sh "$T/one.sh" < "$T/$pop" > "$OUT/$pop.rows" || true
+  xargs -r -n 100 -P "$JOBS" env VL="$VL" PROBE="$T/probe.wasm" sh "$T/one.sh" < "$T/$pop" > "$OUT/$pop.rows" || true
   wc -l < "$T/$pop" > "$OUT/$pop.programs"
 done
-echo 1 > "$OUT/self.programs"
 cat "$T/distilled" "$T/cases" "$T/probes" "$T/witnesses" > "$OUT/programs.txt"
 
 scripts/ir-i8-census/summary.sh "$OUT" | tee "$OUT/summary.txt"

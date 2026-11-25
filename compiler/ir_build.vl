@@ -7,7 +7,11 @@ import {
   listFitShadowTyOf,
 } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
-import { nulAtomWidenTexts } from "./emit_lit_atoms"
+import {
+  litAtomMark,
+  litAtomRollback,
+  nulAtomWidenTexts,
+} from "./emit_lit_atoms"
 import {
   objLitBuildVariantRow,
   popRecvIsList,
@@ -752,6 +756,7 @@ import {
   nicheReadKindAt,
   nulLitAtomTexts,
   readOwesNonNullRecover,
+  readRepMemoAdvance,
   sFieldIsUnionBox,
   sFieldStoreKind,
   spreadBoxingSource,
@@ -1048,22 +1053,43 @@ function claimable(): boolean {
   return true
 }
 
-// The soft-refusal scope one claim seam opens: the enclosing scope, restored when it closes, so a
-// seam nested in another (a const cell inside a claimed body) never hardens its caller's.
-type Soft = { sfWas: boolean, sfMsg: string }
+// The scope one claim seam opens: the soft-refusal state it replaces, restored when it closes, and
+// the atom table's mark, so a claim that falls back leaves what legacy then writes as legacy alone
+// would. Seams never nest: an inner claim that wrote inside an outer one that fell back would keep
+// bytes naming atoms the outer rollback forgets, so a second open scope is a compiler bug.
+type ClaimScope = { sfWas: boolean, sfMsg: string, csAtoms: i32 }
 
-function softBegin(): Soft {
-  const s: Soft = { sfWas: emitSoftFail, sfMsg: emitSoftMsg }
+let claimScopeOpen = false
+
+function claimScopeBegin(): ClaimScope {
+  // Hard, not the open scope's soft refusal: the nesting is the compiler's bug, not the claim's.
+  if claimScopeOpen {
+    emitSoftFail = false
+    emitFail("emitProgram: a claim seam opened inside another claim's scope")
+  }
+  claimScopeOpen = true
+  const s: ClaimScope = {
+    sfWas: emitSoftFail,
+    sfMsg: emitSoftMsg,
+    csAtoms: litAtomMark(),
+  }
   emitSoftFail = true
   emitSoftMsg = ""
   return s
 }
 
-// Closes scope `s`, answering the refusal a shared legacy helper raised inside it, or "".
-function softEnd(s: Soft): string {
+// Closes scope `s` for a claim that wrote (`ok`) or fell back: a fallback forgets the atoms it
+// interned and the read reps it remembered (D17241, D17243). Answers the refusal a shared legacy
+// helper raised inside it, or "".
+function claimScopeEnd(s: ClaimScope, ok: boolean): string {
+  claimScopeOpen = false
   const m = emitSoftMsg
   emitSoftFail = s.sfWas
   emitSoftMsg = s.sfMsg
+  if !ok {
+    litAtomRollback(s.csAtoms)
+    readRepMemoAdvance()
+  }
   return m
 }
 
@@ -1087,9 +1113,9 @@ function softRefused(what: string): boolean {
 export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
-  const s = softBegin()
+  const s = claimScopeBegin()
   const ok = claimFn(fnIx, fnPos, out)
-  softEnd(s)
+  claimScopeEnd(s, ok)
   return ok
 }
 
@@ -1140,9 +1166,9 @@ export function irClaimStart(
   out: u8[],
 ): boolean {
   if !irStartClaimOn() { return false }
-  const s = softBegin()
+  const s = claimScopeBegin()
   const ok = claimStart(order, orderGi, poolFill, out)
-  softEnd(s)
+  claimScopeEnd(s, ok)
   return ok
 }
 
@@ -1189,6 +1215,7 @@ export function irShadowArmed(): boolean { return ibArmed }
 export function irShadowBegin() {
   ibRowKey = []
   ibRowN = []
+  claimScopeOpen = false
   cellHeapMemo = Map()
   return 0
 }
@@ -1425,6 +1452,8 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
     return irBLetTemp(b, { lsV: v, lsAt: ix }, ix, rep)
   }
   if arm == "litMember" { return isLitMember(b, n, ix, rep) }
+  // A float box tested against integer literals is each member's box test or-ed, `numBox`'s.
+  if arm == "floatLits" { return isLitArmsTest(b, n, ix, rep, "numBox") }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   // Each rung's own answer, asked once: the arm tag's `tagIsArmOf`, the variant's plain row.
   const ta: TagIsArm = if arm == "armTag" { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
@@ -9978,8 +10007,16 @@ function arrayLit(
     if elems.length > 0 && !irBStageLeads(b, at, starts, elems, n.arrElems) {
       return irBMiss("short-circuit array element after another")
     }
-    if irBOpRep(v) != er { return irBMiss("array element coercion") }
-    elems.push(v)
+    // A closure whose rep leaves a part open, or fills one, is the element's closure struct,
+    // retagged, as a record field's is. A record or list element is not: its retag is no closure's.
+    const holed = irBOpRep(v) != er
+      && repNodeAt(irBOpRep(v)) is RClosure
+      && repNodeAt(er) is RClosure
+      && holeRetagNoted(irBOpRep(v), er, true)
+      && exprPrePathWhy(e, ibFnIx) == ""
+    const ve = if holed { repTemp(b, { rgV: v }, e, er) } else { v }
+    if irBOpRep(ve) != er { return irBMiss("array element coercion") }
+    elems.push(ve)
   }
   const r: Rhs = {
     mlElems: elems,
@@ -12067,6 +12104,11 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       oiBits: if n.boolVal != 0 { 1 } else { 0 },
     }
     return t
+  }
+  // A `match` arm's string pattern over an open scrutinee is untyped, and a string where it does
+  // not take its member's atom, as legacy's `emitStr` writes any untyped literal.
+  if n is StrLit && nodeTyAt(ix, ibFnIx) < 0 && !strLitTakesAtom(ix, ibFnIx) {
+    return strLit(ix, repNodeOfTy(TY_STR))
   }
   const own = exprRepOf(ix)
   // A `never` call, operator or field read is legacy's i32: its consumer widens it as any i32.
@@ -14932,9 +14974,9 @@ export function irLowerConstCell(gi: i32, gst: i32, probe: boolean): string {
 // the IR writes it and this answers true, so legacy does not; armed, legacy always runs.
 export function irClaimConstCell(gi: i32, gst: i32): boolean {
   if ibArmed { return false }
-  const s = softBegin()
+  const s = claimScopeBegin()
   const why = irLowerConstCell(gi, gst, false)
-  softEnd(s)
+  claimScopeEnd(s, why == "")
   if why != "" {
     if why.indexOf("a legacy helper refused in ") == 0 {
       count("claim fell back: const cell " + why)
@@ -15416,9 +15458,9 @@ function thunkRetTy(ty: i32, r: i32): i32 {
 // in a claimed family, the lowering writes its code entry onto `out` and this answers true.
 export function irClaimThunk(fe: i32, out: u8[]): boolean {
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
-  const s = softBegin()
+  const s = claimScopeBegin()
   const ok = claimThunk(fe, out)
-  softEnd(s)
+  claimScopeEnd(s, ok)
   return ok
 }
 
@@ -15504,9 +15546,9 @@ function buildEqHelp(si: i32): string {
 // it: when it builds and every node is in a claimed family, its code entry goes onto `out`.
 export function irClaimEqHelp(si: i32, out: u8[]): boolean {
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
-  const s = softBegin()
+  const s = claimScopeBegin()
   const ok = claimEqHelp(si, out)
-  softEnd(s)
+  claimScopeEnd(s, ok)
   return ok
 }
 

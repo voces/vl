@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Summarises an I8 census directory (census.sh): per population, functions claimed of total per
-# file and per distinct function, start bodies (`@start`, `@init`) claimed of total, the first
+# file and per distinct function, start bodies (`@start`, `@init`) claimed of total, the headline
+# (unclaimed distinct functions plus start bodies; programs with no unclaimed row), the first
 # misses ranked by the distinct functions they keep, and every `claim fell back` row. `read of
 # <name>` is one arm (`identRead`: a name neither local, global nor a function), so it is one class.
 #
@@ -16,13 +17,14 @@ for pop in self distilled cases probes witnesses; do
     $3 ~ /^fnc @/ { sc++; next }
     $3 ~ /^fnc / { fc++; k = key($1, substr($3, 5)); if (!(k in st)) st[k] = "c"; next }
     $3 ~ /^fnu / {
+      bad[$1] = 1
       r = substr($3, 5); i = index(r, " | "); nm = substr(r, 1, i - 1); why = substr(r, i + 3)
       sub(/^read of [A-Za-z0-9_$]+$/, "read of <name>", why)
       if (nm ~ /^@/) { su++; sm[why]++; next }
       fu++; mf[why]++; k = key($1, nm); st[k] = "u"; dw[k] = why; next
     }
     $3 == "claimed start" { sc += $2; next }
-    $3 ~ /^claim fell back/ { fb[$1 ": " $3] += $2; next }
+    $3 ~ /^claim fell back/ { bad[$1] = 1; fb[$1 ": " $3] += $2; next }
     END {
       for (k in st) { d++; if (st[k] == "c") dc++; else dm[dw[k]]++ }
       nf = 0; for (f in files) nf++
@@ -30,6 +32,9 @@ for pop in self distilled cases probes witnesses; do
       printf "functions per file: %d claimed of %d (%.1f%%)\n", fc, fc + fu, (fc + fu) ? 100 * fc / (fc + fu) : 0
       printf "distinct functions: %d claimed of %d (%.1f%%)\n", dc, d, d ? 100 * dc / d : 0
       printf "start bodies: %d claimed of %d\n", sc, sc + su
+      nb = 0; for (f in bad) nb++
+      printf "unclaimed: %d distinct functions + %d start bodies = %d\n", d - dc, su, d - dc + su
+      printf "programs fully claimed: %d of %d with rows\n", nf - nb, nf
       cmd = "sort -rn | head -" top
       print "first misses (distinct functions kept, per-file count):"
       for (w in dm) printf "  %6d %6d  %s\n", dm[w], mf[w], w | cmd
