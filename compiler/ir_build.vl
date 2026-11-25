@@ -127,6 +127,7 @@ import {
   RMakeRec,
   RMapDelete,
   RMapGet,
+  RNulNoneBox,
   RRecover,
   RStashSet,
   RStrOp,
@@ -280,6 +281,7 @@ import {
   asLitAtomWhy,
   asNicheCastWhy,
   asNumLitScalarWhy,
+  asPropNicheHeapOf,
   asUnionTagWhy,
   asWrapArmOf,
   asgValueArmOf,
@@ -601,6 +603,7 @@ import {
 import {
   EmptyFitPlan,
   NarrowedMapReadArm,
+  arrElemNulSent,
   arrLitIsForIter,
   coalBoxFieldScalarPlanOf,
   coalDeadJoinIfOf,
@@ -2218,7 +2221,11 @@ function objLitAt(
     starts.push(mark)
     const own = fieldExplicitNullOwn(arm, row, fi, valIx)
     const typed = own < 0 && fieldExplicitNullTyped(arm, row, fi, valIx)
-    const v0 = if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own, nuRead: [] }, valIx, ks[k]) } else if typed { fieldNullTemp(b, row, fi, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
+    // A variant's omitted sentinel field is its field's own null, as legacy's `emitVariantStruct`
+    // writes the minted `null` at the field.
+    const omitOwn = if given < 0 && own < 0 && arm == "variant" { nullOwnOfRep(ks[k]) } else { -1 }
+    const omitNul = omitOwn >= 0 && nullOwnRepFits(omitOwn, ks[k])
+    const v0 = if omitNul { repTemp(b, { nuAt: valIx, nuOwn: omitOwn, nuRead: [] }, valIx, ks[k]) } else if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own, nuRead: [] }, valIx, ks[k]) } else if typed { fieldNullTemp(b, row, fi, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
     if ibMiss != "" { return v0 }
     const vr = irBOpRep(v0)
     // A closure value at a field whose closure rep leaves a part open, or fills one, is the same
@@ -2241,11 +2248,14 @@ function objLitAt(
       && !holed
       && !clo
       && retagsAsStands(vr, ks[k], valIx)
+    // A packed `u8` field takes a plain i32, which the struct's packed field truncates.
+    const packed = repPrim(ks[k]) == "u8" && repPrim(vr) == "i32"
     if (
       vr != ks[k]
       && !holed
       && !clo
       && !stands
+      && !packed
       && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr)
     ) {
       return irBMiss("object field coercion")
@@ -2588,6 +2598,14 @@ function nullReadOwnAt(ix: i32): i32 {
   if exprPrePathWhy(ix, ibFnIx) != "" { return -1 }
   const own = nullReadDstOwnOf(sl, ibFnIx)
   return if own >= 0 { own } else { NULL_READ_STORED }
+}
+
+// The null a sentinel nullable rep `dst` holds, a boolean's or an atom's (`nullOwnRepFits`); -1 for
+// any other rep, whose null the field's delivery writes.
+function nullOwnOfRep(dst: i32): i32 {
+  if boolNullable(dst) { return NULL_OWN_BOOL }
+  if atomNullable(dst) { return NULL_OWN_ATOM }
+  return -1
 }
 
 // Whether rep `dst` holds the null `own` (`NULL_OWN_*`) names, as the verifier's `RNullOf` rule
@@ -3624,6 +3642,9 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
     const p = intSwitchPlanOf(ix0, ibFnIx)
     if p != null && p.ispElse >= 0 { return valuedSwitch(b, ix0, p, rep0) }
   }
+  if ty0 < 0 && ifExprPlainWhy(ix0, ibFnIx) == "null join" {
+    return nullJoinIf(b, n0, ix0, rep0)
+  }
   const rj = ifRefJoinOf(ix0, ibFnIx)
   const rk = rj.rjKind
   if ty0 < 0 && rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
@@ -3792,14 +3813,70 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) {
     return irBMiss("ref if drops null atom")
   }
-  const ty = rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)
-  if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
+  // A record join legacy writes at a row of another record (`ifTypedStructRow`, its destination's)
+  // is built at that row's record, each arm delivered there.
+  const sr = if kind == "struct" && rj.rjSlot >= 0 && rj.rjSlot < sTyIx.length { repNodeOfTy(sTyIx[rj.rjSlot]) } else { -1 }
+  const atRow = sr >= 0
+    && sr != rep
+    && repNodeAt(sr) is RRecord
+    && repNodeAt(rep) is RRecord
+    && !irTyOpen(sTyIx[rj.rjSlot])
+  const jr = if atRow { sr } else { rep }
+  const ty = if atRow { sTyIx[rj.rjSlot] } else { rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep) }
+  if irTyHeldOpen(ty, jr) { return irBMiss("open temp type") }
   // A union-typed join legacy writes at its destination's row names no row of its own: its out
   // would declare a local of no interned shape (D4645's module-scope spelling).
   if rj.rjSlot < 0 && exprUnion(ix, ibFnIx) {
     return irBMiss("union if record join row")
   }
-  return refIfLink(b, n, ix, rep, ty, kind, rj.rjSlot, false)
+  return refIfLink(b, n, ix, jr, ty, kind, rj.rjSlot, false)
+}
+
+// A `null`-typed value `if`, as legacy's `emitAllNullIf` writes it: the `if` for its effects alone,
+// then the destination's null (`emitNullAt`).
+function nullJoinIf(b: i32[], n: IfStmt, ix: i32, rep: i32): Opnd {
+  ifForEffect(b, n, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  const own = nullOwnAt(ix, ibFnIx)
+  if own < 0 || !nullOwnRepFits(own, rep) {
+    return irBMiss("null unit read rep")
+  }
+  return repTemp(b, { nuAt: ix, nuOwn: own, nuRead: [] }, ix, rep)
+}
+
+// `emitIfForEffect`: the conditions as a void `if` chain, each arm's prelude and its `null`-typed
+// value for effect (`nulNoneEffect`), an `else if` its next link.
+function ifForEffect(b: i32[], n: IfStmt, ix: i32) {
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+  const thenB = effectArm(n.ifThen)
+  if ibMiss != "" { return 0 }
+  const elseB: i32[] = []
+  if n.ifElse >= 0 {
+    const en = nodeAt(n.ifElse)
+    if en is IfStmt {
+      ifForEffect(elseB, en, n.ifElse)
+    } else {
+      for k in effectArm(n.ifElse) { elseB.push(k) }
+    }
+    if ibMiss != "" { return 0 }
+  }
+  irBNode(b, sIf(c, thenB, elseB, -1, n.ifElse >= 0), -1, ibNoValue, ix)
+  return 0
+}
+
+// One arm of `ifForEffect`: its prelude, then its value for effect.
+function effectArm(blockIx: i32): i32[] {
+  const body: i32[] = []
+  armPrelude(body, blockIx)
+  if ibMiss != "" { return body }
+  const tv = ifArmValueExpr(blockIx)
+  if tv < 0 {
+    irBMiss("null join arm value")
+    return body
+  }
+  nulNoneEffect(body, tv, blockIx, null)
+  return body
 }
 
 // A value `if` on the union join's rung, as legacy's `emitUnionIfValue` writes it: a chain of `if`s
@@ -4098,14 +4175,29 @@ function refIfArm(
   }
   // An atom arm in a `string` join decodes to its member string (`emitAtomToStr`), from the atom
   // as its cell holds it.
-  const built = exprAt(body, tv, arm == "atomStr")
+  // A struct literal whose row is on the join's record heap is built as that record, as a binding's
+  // or an argument's is (`objLitTwinTyAtRow`).
+  const lt = if arm == "plain" && tv >= 0 { objLitTwinTyAtRow(tv, rep, -1, -1) } else { -1 }
+  const built = if lt >= 0 { objLitAt(
+    body,
+    unwrapParen(tv),
+    rep,
+    lt,
+    objLitLayoutRowOf(unwrapParen(tv), ibFnIx),
+    false,
+  ) } else { exprAt(body, tv, arm == "atomStr") }
   // An arm built at a closure rep the join's leaves open, or fills, is the same closure retagged.
   const holed = arm == "plain"
     && ibMiss == ""
     && irBOpRep(built) != rep
     && holeRetagNoted(irBOpRep(built), rep, true)
     && exprPrePathWhy(tv, ibFnIx) == ""
-  const v = if arm == "atomStr" && ibMiss == "" { atomToStr(body, built, tv, rep) } else if ibMiss == "" && (holed || refIfArmNiches(built, tv, rep)) { repTemp(body, { rgV: built }, tv, rep) } else { built }
+  // A `null`-typed arm is the bottom ref, which a nullable reference join holds as it stands.
+  const bottom = arm == "plain"
+    && ibMiss == ""
+    && irBOpRep(built) != rep
+    && repNullRefFits(irBOpRep(built), rep)
+  const v = if arm == "atomStr" && ibMiss == "" { atomToStr(body, built, tv, rep) } else if ibMiss == "" && (holed || bottom || refIfArmNiches(built, tv, rep)) { repTemp(body, { rgV: built }, tv, rep) } else { built }
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("ref if arm rep") }
   if ibMiss == "" {
     irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
@@ -6904,13 +6996,14 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
 }
 
 // Whether the operands built into `b` from `at` up to `to` write a statement legacy would write
-// below a lead opened before them: a valued `if`, a boxed `??` or a stash.
+// below a lead opened before them: an `if` (valued, or a `null` join's for effect), a boxed `??`
+// or a stash.
 function ifBelowLeadHas(b: i32[], at: i32, to: i32): boolean {
   let i = at
   while i < to {
     const n = ib.irNodes[b[i]]
     if (
-      n is SIf && n.siOut >= 0
+      n is SIf
       || n is SCoalBox
       || n is SEffect && n.efRhs is RStashSet
       || storeAt(n)
@@ -9081,6 +9174,8 @@ function boxLeadsAt(b: i32[], at: i32): boolean {
   const n = ib.irNodes[b[b.length - 1]]
   if !(n is SLet) { return false }
   const r = n.lRhs
+  // A `null`-typed call's box writes its tag ahead of the call (`emitNulNoneBoxPayload`).
+  if r is RNulNoneBox { return r.nnPay }
   if !(r is RToBox) { return false }
   const arm = holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm
   return arm != "pass" && arm != "memberBox"
@@ -10334,7 +10429,9 @@ function arrayLit(
   if sw == "long" && !strChunk && !dataConst {
     return irBMiss("array long " + route)
   }
-  if sw != "" && sw != "long" { return irBMiss("array " + sw) }
+  // A `null[]` element seeding an i32 list is the sentinel 2 (`emitArrI32`).
+  const nulSent = sw == "null sentinel"
+  if sw != "" && sw != "long" && !nulSent { return irBMiss("array " + sw) }
   // Typed at the type legacy's build decision takes (`arrLitBuiltTyOf`): an instance's `[1.5]` at
   // `T[]` is an f32 list where its stamp says f64. Its own-shape route keeps the stamp. `bt` is the
   // type behind `lb`, the build the literal's delivery threaded.
@@ -10350,8 +10447,9 @@ function arrayLit(
   ) {
     return irBMiss("array union element rep")
   }
-  // A packed list's elements are built as plain i32s, which its backing truncates.
-  const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
+  // A packed list's elements are built as plain i32s, which its backing truncates; a `null[]`'s
+  // too, its i32 storage holding each `null` as the sentinel.
+  const er = if arm == "u8" || repPrim(ln.rlsElem) == "null" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
   const starts: i32[] = []
   // A `for` iterable's signed number literal at a number element is one immediate, as legacy's
@@ -10369,7 +10467,7 @@ function arrayLit(
       er,
       -1,
       arrRefUnionElemTy(ix, uslot, ibFnIx),
-    ) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else { deliver(b, e, er, -1) }
+    ) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else if nulSent && arrElemNulSent(e, ibFnIx) { nulSentinelElem(b, e, er) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
     // An element written before a valued `if` is staged below it, as a call's argument is.
     if elems.length > 0 && !irBStageLeads(b, at, starts, elems, n.arrElems) {
@@ -10480,8 +10578,12 @@ function spreadLit(
   const srcs: Opnd[] = []
   let g = 0
   while g < grps.length {
-    const v = spreadSrcBuild(b, p, g, grps[g], ix, rep)
-    if ibMiss != "" { return v }
+    const v0 = spreadSrcBuild(b, p, g, grps[g], ix, rep)
+    if ibMiss != "" { return v0 }
+    // A source list whose rep is the literal's twin, or apart only in a hole, is the same list
+    // retagged: the plan copies its elements raw, at one kind.
+    const v = if irBOpRep(v0) != rep
+      && (listRetag(irBOpRep(v0), rep) || holeRetagNoted(irBOpRep(v0), rep, true)) { repTemp(b, { rgV: v0 }, grps[g], rep) } else { v0 }
     if irBOpRep(v) != rep { return irBMiss("array spread source rep") }
     srcs.push(v)
     g = g + 1
@@ -12904,13 +13006,15 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   return irBMiss("expression " + irAstKind(ix))
 }
 
-// A cast over a union box by legacy's tag test (`asUnionTagWhy` names the other lowerings): the
-// box, then the test and tail at the cast's own rep. `as?`'s valued `if` takes its value from the
+// A cast over a union box by legacy's tag test, or its element test across list reps
+// (`asUnionTagWhy` names the other lowerings): the box, then the test and tail at the cast's rep. `as?`'s valued `if` takes its value from the
 // stack, so no temp an operand before it built may wait there.
 function asUnion(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
   const why = asUnionTagWhy(ix, ibFnIx)
   if why == "niche" { return asNiche(b, n, ix, rep) }
-  if why != "" { return irBMiss("union cast " + why) }
+  if why != "" && why != "list across reps" && why != "literal union" {
+    return irBMiss("union cast " + why)
+  }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   if rep != repNodeOfTy(ty) { return irBMiss("union cast result rep") }
@@ -13039,9 +13143,11 @@ function asLit(b: i32[], n: AsExpr, ix: i32, rep: i32, arm: string): Opnd {
 }
 
 // A cast over a niche-repped `T | null` operand, as `emitAsNulNiche` writes it: `as?` is the
-// operand at its own rep, and `as!` its `ref.as_non_null` (`RCast`).
+// operand at its own rep, `as!` its `ref.as_non_null` (`RCast`), and the propagating `as` a block.
 function asNiche(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
   const why = asNicheCastWhy(ix, ibFnIx)
+  if why == "propagate" { return asNicheProp(b, n, ix, rep) }
+  if why == "one list" { return asOneList(b, n, ix, rep) }
   if why != "" { return irBMiss("union cast niche " + why) }
   const v = irBExpr(b, n.asObj)
   if ibMiss != "" { return v }
@@ -13059,6 +13165,65 @@ function asNiche(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("union cast niche rep")
   }
   return irBLetTemp(b, { ctV: v, ctTarget: rep, ctOnFail: "trap" }, ix, rep)
+}
+
+// A cast over a union of lists stored as its one list (`asNicheCastWhy`'s "one list"), as
+// `emitAsOneListCast` writes it: the list, then legacy's fit and miss at the cast's own rep.
+function asOneList(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  if rep != repNodeOfTy(ty) { return irBMiss("union cast one list result rep") }
+  if n.asMode == "null" && endsInTemp(b) {
+    return irBMiss("union cast after an operand")
+  }
+  const v = irBExpr(b, n.asObj)
+  if ibMiss != "" { return v }
+  const vn = repNodeAt(irBOpRep(v))
+  const inner = if vn is RNullable { repNodeAt(vn.rnInner) } else { vn }
+  if !(inner is RList) { return irBMiss("union cast one list operand rep") }
+  return irBLetTemp(b, { auV: v, auAt: ix }, ix, rep)
+}
+
+// The propagating `as` over a niche-repped `T | null` operand: the operand built inside the block,
+// whose null path returns the function's null (`RRetNull`) and leaves legacy's `unreachable`.
+function asNicheProp(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  if asPropNicheHeapOf(n.asObj, ibFnIx) < 0 {
+    return irBMiss("union cast niche propagate heap")
+  }
+  if nullRetPlanOf(ibFnIx) == null {
+    return irBMiss("union cast niche propagate null plan")
+  }
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const lb: i32[] = []
+  const l = irBExpr(lb, n.asObj)
+  if ibMiss != "" { return l }
+  if !(l is OVar) || l.ov < 0 { return irBMiss("union cast niche operand") }
+  const vr = irBOpRep(l)
+  const vn = repNodeAt(vr)
+  if (
+    !(vn is RNullable)
+    || vn.rnInner != rep
+    || !refNullable(vr) && !strNullable(vr)
+  ) {
+    return irBMiss("union cast niche rep")
+  }
+  const nb: i32[] = []
+  const r: Rhs = { rnrAt: ix }
+  const rt = irBLetTempTy(nb, r, ix, ib.irRetRep, ib.irRetTy)
+  irBNode(nb, { rtHas: true, rtV: rt }, -1, ibNoValue, ix)
+  irBNode(nb, { tpWhy: 0 }, -1, ibNoValue, ix)
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const arm: CoalValArm = "asProp"
+  irBNode(
+    b,
+    { cbL: l, cbLB: lb, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // An `as` at a `v128` rep over a `v128` operand re-brands the same bits, which legacy writes as
@@ -13501,9 +13666,7 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   const st = idxStorePlanOf(t, ibFnIx)
   if st == null { return skip("store plan") }
   // Legacy writes an unstamped unit into a `null[]` as its sentinel, apart from the value's emit.
-  if idxStoreNullUnitUnstamped(t.idxArr, n.binRight, ibFnIx) {
-    return skip("store null unit sentinel")
-  }
+  const nulStore = idxStoreNullUnitUnstamped(t.idxArr, n.binRight, ibFnIx)
   const why = idxStoreOtherWhy(st, n.binRight, ibFnIx)
   if why != "" { return skip(why) }
   const site = idxStoreSiteBoxes(st, n.binRight, ibFnIx)
@@ -13518,10 +13681,15 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   const i = irBExpr(b, t.idxIndex)
   const ln = repNodeAt(irBOpRep(v))
   if !(ln is RList) { return skip("store operand coercion") }
-  // A packed list's element is stored as a plain i32, which its backing truncates.
-  const er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
+  // A packed list's element is stored as a plain i32, which its backing truncates; a `null[]`'s
+  // as its i32 storage's sentinel.
+  const er = if repPrim(ln.rlsElem) == "u8" || repPrim(ln.rlsElem) == "null" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const xat = b.length
-  const x = if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
+  // Its sentinel is an i32 only where the list's own rep holds `null[]`'s i32 storage.
+  if nulStore && repPrim(ln.rlsElem) != "null" {
+    return skip("store null unit sentinel rep")
+  }
+  const x = if nulStore { nulSentinelStore(b, n.binRight, er) } else if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
   if ibMiss != "" { return 0 }
   if ifBelowLeadIn(b, at, xat, "store short-circuit operand") { return 0 }
   if repPrim(irBOpRep(i)) != "i32" || irBOpRep(x) != er {
@@ -16319,7 +16487,25 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   const noted = irGlobalRepOf(ib, gi)
   const rep = if noted >= 0 { noted } else { globalTyRep(globalHeldTy(gst)) }
   if rep < 0 { return irBMiss("global initializer rep") }
-  const d = deliver(b, init, rep, -1)
+  // A constant list literal whose binding's storage row (`letBindTy`, D14434) is another list, a
+  // wider record's, is built at that row, which the cell then stores.
+  const bindRep = if noted < 0 && gConstExprEmit { globalTyRep(letBindTy(gst, -1)) } else { -1 }
+  const iu = unwrapParen(init)
+  const atBind = bindRep >= 0
+    && bindRep != rep
+    && repNodeAt(bindRep) is RList
+    && iu >= 0
+    && iu < P.nodes.length
+    && nodeAt(iu) is ArrayLit
+  const iv = if atBind { nodeAt(iu) } else { null }
+  const d = if iv is ArrayLit { arrayLit(
+    b,
+    iv,
+    iu,
+    bindRep,
+    arrLitListBuild(iu, ibFnIx),
+    heldTy(letBindTy(gst, -1)),
+  ) } else { deliver(b, init, rep, -1) }
   if ibMiss != "" { return d }
   // A record on the cell's own struct heap, or a declared subtype's, is stored retagged; so is a
   // list or closure the body lanes' retags take, unless legacy already stores it as it stands.
@@ -16695,6 +16881,29 @@ function noteRecHeaps(r: i32) {
 }
 
 // Whether each element is a string literal, an immediate at its use.
+// An element of an i32 list seeded with the `null` sentinel that is the list's `null`, as legacy
+// writes it: the sentinel 2, after any value other than a `null` literal written for its effect
+// and dropped.
+function nulSentinelElem(b: i32[], e: i32, er: i32): Opnd {
+  if repPrim(er) != "i32" { return irBMiss("array null sentinel rep") }
+  const two: Opnd = { oiRep: er, oiBits: 2 }
+  if nodeAt(unwrapParen(e)) is NullLit { return two }
+  const v = irBExpr(b, e)
+  if ibMiss != "" { return v }
+  return irBLetTempTy(b, { aeEff: [v], aeV: two, aeAt: e }, e, er, TY_I32)
+}
+
+// An unstamped `null` stored into a `null[]`, as `emitIdxStoreValue` writes it: the value for its
+// effect (`emitNulNoneForEffect`, nothing for a `null` or a name read), then the sentinel 2.
+function nulSentinelStore(b: i32[], x: i32, er: i32): Opnd {
+  const two: Opnd = { oiRep: er, oiBits: 2 }
+  const effs: Opnd[] = []
+  const e = nulNoneEffect(b, x, x, effs)
+  if ibMiss != "" { return e }
+  if effs.length == 0 { return two }
+  return irBLetTempTy(b, { aeEff: effs, aeV: two, aeAt: x }, x, er, TY_I32)
+}
+
 function allStrLits(es: i32[]): boolean {
   for e in es {
     const u = unwrapParen(e)

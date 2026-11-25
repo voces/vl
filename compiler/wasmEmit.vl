@@ -14784,9 +14784,7 @@ function emitArrI32(arrIx: i32, elems: i32[], fnIx: i32, lbKind: i32) {
         )
       }
     }
-    const eNul = isNullTy(nodeTyAt(elems[i], fnIx))
-      || asgYieldsNulHole(unwrapParen(elems[i]), fnIx)
-    if nulUnit && eNul {
+    if nulUnit && arrElemNulSent(elems[i], fnIx) {
       if !(nodeAt(unwrapParen(elems[i])) is NullLit) {
         if emitExpr(elems[i], fnIx) < 0 { return -1 }
         fbDrop()
@@ -14806,6 +14804,12 @@ function emitArrI32(arrIx: i32, elems: i32[], fnIx: i32, lbKind: i32) {
     return arrLitLenCap(elems.length, lTy())
   }
   return arrLitShortTail("i32", elems.length)
+}
+
+// Whether element `e` of an i32 list seeded with the `null` sentinel is that list's `null`, written
+// as the sentinel 2: typed `null`, or an assignment of `null` into a never-filled binding.
+export function arrElemNulSent(e: i32, fnIx: i32): boolean {
+  return isNullTy(nodeTyAt(e, fnIx)) || asgYieldsNulHole(unwrapParen(e), fnIx)
 }
 
 // `emitArr`'s body: it applies each arm's element context and leaves it for the wrapper's
@@ -25875,8 +25879,8 @@ function emitAsNulNiche(e: AsExpr, fnIx: i32) {
   // The propagating `as`: a present value leaves the block at its own non-null heap type, and a
   // null returns the function's own null, as an explicit `if x == null { return null }` does.
   // Read once, into no scratch slot (D1812, D16066).
-  const heap = nulNicheHeapOf(obj, payload, fnIx)
-  if heap >= 0 && fnRetNullBearing(fnIx) {
+  const heap = asPropNicheHeapOf(obj, fnIx)
+  if heap >= 0 {
     fbBlockRefNul(heap, false)
     if emitExpr(obj, fnIx) < 0 { return -1 }
     fbBrOnNonNull(0)
@@ -25893,6 +25897,14 @@ function emitAsNulNiche(e: AsExpr, fnIx: i32) {
       + e.asTy
       + " | null` propagates the null to the caller, and only the trapping and coalescing forms are lowered for that operand — write `as!`, `as?`, or the explicit `if x == null { return null }`",
   )
+}
+
+// The heap a propagating `as` over nullable-ref niche operand `obj` leaves its block at, or -1
+// where it has none or the function's result bears no null to return.
+export function asPropNicheHeapOf(obj: i32, fnIx: i32): i32 {
+  const payload = nulRefNichePayloadTy(nodeTyAt(obj, fnIx))
+  if payload < 0 || !fnRetNullBearing(fnIx) { return -1 }
+  return nulNicheHeapOf(obj, payload, fnIx)
 }
 
 // The heap type of the nullable-ref niche operand `obj` whose payload is `payload`, the cell
@@ -26051,17 +26063,28 @@ function emitAsUnionOpt(
   return 0
 }
 
+// The member texts a box-to-literal-union cast to `tty` tests: its numeric literals, else its
+// string literals.
+function asBoxToLitUnionTexts(tty: i32): string[] {
+  const nums = tyNumLitMemberTexts(tty)
+  return if nums.length > 0 { nums } else { tyLitMemberTexts(tty) }
+}
+
+// The box kind whose payload a box-to-literal-union cast to `tty` tests: its numeric base's, else
+// the string kind (2).
+function asBoxToLitUnionKind(tty: i32): i32 {
+  if tyNumLitMemberTexts(tty).length > 0 {
+    return boxTagOfTy(numLitUnionBaseTy(tty))
+  }
+  return 2
+}
+
 // The cast of a union box to literal-union target `tty` (node `exprIx`): a hit is the base's tag
 // with a payload equal to a member. The result is the base scalar, the atom id or the member
 // string, as the node reps; a miss traps, returns the box, or is `null`, by mode. Returns 0 or -1.
 function emitAsBoxToLitUnion(e: AsExpr, exprIx: i32, tty: i32, fnIx: i32) {
-  let texts = tyNumLitMemberTexts(tty)
-  let k = 2
-  if texts.length > 0 {
-    k = boxTagOfTy(numLitUnionBaseTy(tty))
-  } else {
-    texts = tyLitMemberTexts(tty)
-  }
+  const texts = asBoxToLitUnionTexts(tty)
+  const k = asBoxToLitUnionKind(tty)
   if texts.length == 0 || k < 0 {
     return emitFail(
       "emitProgram: `as "
@@ -26069,8 +26092,20 @@ function emitAsBoxToLitUnion(e: AsExpr, exprIx: i32, tty: i32, fnIx: i32) {
         + "` names a literal union with no members",
     )
   }
-  const st = unionAsBoxSlot()
   if emitExprRaw(e.asObj, fnIx) < 0 { return -1 }
+  return emitAsBoxToLitUnionTail(e, exprIx, texts, k, fnIx)
+}
+
+// `emitAsBoxToLitUnion` after its operand box: the box into the cast's slot, the base tag and
+// each member's test, then `as?`'s value or the miss and the unbox (or the atom chain).
+function emitAsBoxToLitUnionTail(
+  e: AsExpr,
+  exprIx: i32,
+  texts: string[],
+  k: i32,
+  fnIx: i32,
+) {
+  const st = unionAsBoxSlot()
   fbLocalSet(st)
   fbLocalGet(st)
   fbStructGet(uBoxIdx, 0) // field 0: the tag
@@ -26235,6 +26270,26 @@ function emitAsUnionTagTail(e: AsExpr, p: AsUnionTag) {
 export function emitAsUnionTagged(exprIx: i32, fnIx: i32) {
   const e = nodeAt(exprIx)
   if !(e is AsExpr) { return -1 }
+  if !exprUnion(e.asObj, fnIx) {
+    const ol = asOneListOf(e, exprIx, fnIx)
+    if ol == null { return -1 }
+    return if emitAsOneListTail(e, exprIx, ol, fnIx) < 0 { -1 } else { 0 }
+  }
+  if asUnionTagWhy(exprIx, fnIx) == "literal union" {
+    const lt = asUnionArmTyOf(exprIx)
+    const texts = asBoxToLitUnionTexts(lt)
+    const k = asBoxToLitUnionKind(lt)
+    if texts.length == 0 || k < 0 { return -1 }
+    return emitAsBoxToLitUnionTail(e, exprIx, texts, k, fnIx)
+  }
+  if asUnionTagWhy(exprIx, fnIx) == "list across reps" {
+    const tty = asUnionArmTyOf(exprIx)
+    const tags: i32[] = []
+    const fits: i32[] = []
+    const slotsAt: i32[][] = []
+    const heap = asListAcrossRepsOf(e, tty, fnIx, tags, fits, slotsAt)
+    return emitAsListAcrossTail(e, tty, heap, tags, fits, slotsAt, fnIx)
+  }
   const p = asUnionTagPlanOf(e, asUnionArmTyOf(exprIx), fnIx)
   if p == null { return -1 }
   return emitAsUnionTagTail(e, p)
@@ -26325,15 +26380,26 @@ export function asNicheCastWhy(exprIx: i32, fnIx: i32): string {
 // has no tag: the whole list always fits, and a narrower target fits when every element does,
 // by `is`'s own element test. 0 when the cast is not that shape, 1 when emitted, -1 on failure.
 function emitAsOneListCast(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
-  const obj = e.asObj
   const ol = asOneListOf(e, exprIx, fnIx)
   if ol == null { return 0 }
+  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
+  return emitAsOneListTail(e, exprIx, ol, fnIx)
+}
+
+// `emitAsOneListCast` after its operand list, along its shape `ol`: nothing for the whole list,
+// else the list into a scratch slot, its fit, then `as?`'s value or the miss. 1, or -1 on failure.
+function emitAsOneListTail(
+  e: AsExpr,
+  exprIx: i32,
+  ol: AsOneList,
+  fnIx: i32,
+): i32 {
+  const obj = e.asObj
   const nullable = ol.olNullable
   const oty = ol.olOty
   const tty = ol.olTty
   const heap = ol.olHeap
   const rep = ol.olRep
-  if emitExpr(obj, fnIx) < 0 { return -1 }
   if isWholeOfOneListUnion(oty, tty) && !nullable { return 1 }
   const key = if rep == "reflist" { refListSlotOfExpr(obj, fnIx) } else { 0 }
   const lk: ListKind = if rep == "list" { "list" } else if rep == "i64list" { "i64list" } else if rep == "strlist" { "strlist" } else { "reflist" }
@@ -26422,6 +26488,22 @@ function emitAsListAcrossReps(e: AsExpr, tty: i32, fnIx: i32): i32 {
   const heap = asListAcrossRepsOf(e, tty, fnIx, tags, fits, slotsAt)
   if heap < 0 { return 0 }
   if emitExpr(e.asObj, fnIx) < 0 { return -1 }
+  const r = emitAsListAcrossTail(e, tty, heap, tags, fits, slotsAt, fnIx)
+  return if r < 0 { -1 } else { 1 }
+}
+
+// `emitAsListAcrossReps` after its operand box, along its plan (`asListAcrossRepsOf`): the box
+// into the cast's slot, the element test across the arms, then the unbox at wrapper `heap`.
+function emitAsListAcrossTail(
+  e: AsExpr,
+  tty: i32,
+  heap: i32,
+  tags: i32[],
+  fits: i32[],
+  slotsAt: i32[][],
+  fnIx: i32,
+): i32 {
+  if heap < 0 { return -1 }
   fbLocalSet(unionAsBoxSlot())
   const r = emitListIsAcrossRepsAt(
     unionAsBoxSlot(),
@@ -26432,8 +26514,7 @@ function emitAsListAcrossReps(e: AsExpr, tty: i32, fnIx: i32): i32 {
     fnIx,
   )
   if r < 0 { return -1 }
-  if emitAsUnionTail(e, false, -1, -1, heap) < 0 { return -1 }
-  return 1
+  return emitAsUnionTail(e, false, -1, -1, heap)
 }
 
 // The heap of list type `ty`'s wrapper in a union box, or -1 when it has none.
