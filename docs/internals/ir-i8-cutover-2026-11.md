@@ -138,3 +138,53 @@ builders. They are reached, just not by these programs.
 - §7's later rows, I9 and I10, were sized the same way and are not re-measured here.
 - Whether `emitConstCellInit`'s constant writer belongs to the start-function stage or is its own
   step is a ruling for the coordinator. It shares no code with the start body.
+
+## 7. The rehearsal and the plan (2026-11-25)
+
+A rehearsal of §5 ran on master 7eddff27. It emptied the 14 entry points, grew stage B, then built
+and ran every program of the five populations with both the seed and the stubbed compiler. The
+method and every reading are in `refactor-notes/2026-11-25-ir-i8-rehearsal.md`; the programs behind each re-entry are
+`scripts/ir-i8-census/failing.tsv`.
+
+**Stage B as `stub-reach.sh` grows it breaks the IR.** Its name-level fixpoint also empties shared
+tails that the claim path calls, so claims fall back and the self-compile fails. A keep set, grown
+to a fixpoint over 29 rebuilds, holds those tails out of B:
+
+| stage | functions emptied | lines deleted |
+|---|---:|---:|
+| B as `stub-reach.sh` grows it | 539 | 19,968 |
+| B minus the keep set (109 functions, 3,533 lines) | 375 | 12,972 |
+
+**What still reaches legacy.** Of 27,421 programs, 20,490 give identical output (no output differs)
+and 4,867 fail under both compilers. These 2,064 fail only under B:
+
+| cause | tests/cases | witnesses | distilled | probes |
+|---|---:|---:|---:|---:|
+| an unclaimed function or start body | 875 | 402 | 84 | 22 |
+| a re-entry: a kept tail calls `emitExpr` or `emitWidened` | 328 | 172 | 125 | 16 |
+| a record compare falls back (33, cut to 4 by the last keep round) | 30 | 2 | 0 | 0 |
+| `emitConstCellInit` calls `emitExpr` | 1 | 4 | 2 | 1 |
+
+The self-compile fails on one re-entry: `emitStrValue`. The global initializer path reaches legacy
+only when the start body is unclaimed. Nothing reaches legacy through the door.
+
+**The plan is a keep list plus a port list, and one sweep** (coordinator ruling, 2026-11-25):
+
+| step | what | owner |
+|---|---|---|
+| keep | the 109 shared tails stay (`scripts/ir-i8-census/keep.txt`); a later no-behaviour PR may move them to their own module | INFRA (the list), CENSUS (its growth) |
+| port | `emitStrValue` (47 programs, blocks the self-compile; first), `emitChainRead` (50), `rcReadSource` (309) | COV-CALL |
+| port | `arrLitDataElemEmit` (150), `emitListGetIdx` (58), `emitListGetRecv` (17), `pushMapRecvRef` (2) | COV-CLOS |
+| port | `emitArmSiteAt` (22), `emitDelivered` (7), `emitCoerceAtomPayload` (3) | COV-IS |
+| const | `emitConstCellInit`'s remaining `emitExpr` arm (8 programs) | COV-START |
+| latent | the 16 stubbed writers a kept tail calls that no population reaches: a probe or a static check each | INFRA |
+| gate | `scripts/ir-i8-sweep.sh` in CI, ratcheting "newly failing and not unclaimed" (681) down | INFRA |
+| coverage | the census tail to zero unclaimed functions and start bodies | the COV lanes |
+| I8 | one PR: empty the 14 entry points and B minus the keep set, then `dead-exports.vl`, a fixpoint and the full gate | coordinator |
+
+A port makes the tail take an IR-lowered operand in place of its `emitExpr` call. The rehearsal
+found two more re-entries in its last keep round: `refListReadAt` (4) goes to COV-CLOS, which owns
+lists, and `emitNulIsNullTest` (2) to COV-IS, which owns nulls. Per-family staging (§4) buys nothing:
+every failure the rehearsal found is a re-entry or missing coverage, not a family. I8 is ready when
+`ir-i8-sweep.sh` reports no newly failing program and the census reports no unclaimed function or
+start body.
