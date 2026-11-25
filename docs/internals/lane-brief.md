@@ -57,6 +57,8 @@ not list reds that job. ready-check does not cover these:
 3. A PR that touches `std/*.vl` exports: the `std-api-reviewer` agent's verdict (ready-check names
    the need).
 4. For a measurement, one refactor note. Never edit `CHANGELOG.md` or architecture-target's Status.
+5. Grade the inventory rows you file or close with `VL_IR_STRICT=1`, as CI does:
+   `VL_IR_STRICT=1 vl run scripts/check-filed-witnesses.vl -- --strict <dirs>` (coordinator, 2026-11-25).
 
 ## Landing
 
