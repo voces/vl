@@ -718,6 +718,7 @@ import {
   asgYieldsNullLit,
   boxedFieldUnionTyOf,
   callIsArrSlice,
+  callResultMemberTy,
   capCellName,
   capCellTargetOf,
   captureCountOf,
@@ -729,6 +730,7 @@ import {
   coalesceDefaultNullable,
   declaredIndexAt,
   envSlotShift,
+  exprIsClosure,
   exprIsLitAtom,
   exprIsNulNone,
   exprIsStrMethod,
@@ -5673,7 +5675,14 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if cf is Member { return methodRhs(b, c, cf, ix) }
   // A call through any other closure expression is a plain closure call where legacy's is.
   if !(cf is Ident) {
+    // A place holding a returned record whole is called at its member, as `emitHolderCall` reads it.
+    if holderCallSigs(ix, ibFnIx).length > 0 { return holderCallRhs(b, c, ix) }
     if callRefPlainKey(ix, ibFnIx) == "" { return missRhs("indirect call") }
+    // A call straight off a returned record's member, as `emitCallCore` sends it to `emitCallRef`.
+    const rx = unwrapParen(c.callFn)
+    if !exprIsClosure(c.callFn, ibFnIx) && callResultMemberTy(rx, ibFnIx) >= 0 {
+      return resultMemberCallRhs(b, c, ix, rx)
+    }
     return closureCallRhs(b, c, ix)
   }
   const d = identDeclOf(c.callFn)
@@ -6457,6 +6466,40 @@ function holderCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const crep = repNodeOfTy(pk.bpTy)
   if !(repNodeAt(crep) is RClosure) { return missRhs("holder member rep") }
   const f = irBLetTempTy(b, { bpV: v, bpAt: ix }, c.callFn, crep, pk.bpTy)
+  if ibMiss != "" { return missRhs(ibMiss) }
+  return closureCallAt(b, c, ix, key, f)
+}
+
+// Call `ix` of the member closure that direct call `rx` picks from the bundle record it returns
+// (`bundleResultPickOf`, legacy's `emitBundleResultPick`), at plain key `callRefPlainKey`.
+function resultMemberCallRhs(b: i32[], c: Call, ix: i32, rx: i32): Rhs {
+  const key = callRefPlainKey(ix, ibFnIx)
+  if !legacyPlainAgrees(ix, key) {
+    return missRhs("closure call plan disagrees")
+  }
+  const ic = nodeAt(rx)
+  if !(ic is Call) { return missRhs("result member callee") }
+  const rhs = callRhs(b, ic, rx)
+  if ibMiss != "" { return missRhs("result member callee") }
+  if !(rhs is RCall) { return missRhs("result member callee") }
+  const si = irSigOf(ib, rhs.caCallee)
+  const sr = if si >= 0 { ib.irSigRet[si] } else { -1 }
+  if sr < 0 || !(repNodeAt(sr) is RRecord) {
+    return missRhs("result member record")
+  }
+  const pk = bundleResultPickOf(rx, rhs.caCallee, ibFnIx)
+  const crep = if pk.bpField >= 0 && pk.bpTy >= 0 { repNodeOfTy(pk.bpTy) } else { -1 }
+  if crep < 0 || !(repNodeAt(crep) is RClosure) {
+    return missRhs("result member pick")
+  }
+  const rec = irBLetTempTy(b, rhs, rx, sr, repTyOf(sr))
+  const f = irBLetTempTy(
+    b,
+    { rkV: rec, rkAt: rx, rkFe: rhs.caCallee },
+    rx,
+    crep,
+    pk.bpTy,
+  )
   if ibMiss != "" { return missRhs(ibMiss) }
   return closureCallAt(b, c, ix, key, f)
 }
