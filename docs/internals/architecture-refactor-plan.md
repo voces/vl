@@ -195,7 +195,7 @@ order, subject to the one-writer rule.
 | T3 | Dogfood the Python scripts in VL. **Done.** No tracked `.py` file is left, and the `no-python` row (`scripts/no-python.vl`, in `gate.sh` and CI) refuses a new one or a `python` invocation in a script. See [T3 log](#t3-log). | T1 |
 | T4 | L10: the `-O` optimizer. **Done:** R1–R8 run in the compiler, and R9 serves the same requests from the JS hosts. See [T4 log](#t4-log). | owner decision 3 below |
 | T5 | L12: the remaining LSP features. **Done:** every seed-backed feature lives in `lsp/src/features.ts`; `server.ts` is transport. See [T5 log](#t5-log). | A7 |
-| T6 | Check CPU: a CI run proves gate rows. **In progress.** Last: `scripts/ci-proof.sh` and `GATE_CI_PROOF`. The queue audit skips the rows that a `vl-queue/` push run proved on the same tree, seed, deno and rustc. Next: the queue pushes its candidate (the vl-tools proposal in the PR), then the audit reuses CI's proven seed. See [T6 log](#t6-log). | none |
+| T6 | Check CPU: a CI run proves gate rows. **Retired 2026-11-25 with the merge queue (O2):** CI is the queue, `GATE_CI_PROOF`, `ci-proof.sh verify` and the `ci-proof` job are deleted, and `ci-proof.sh rows` stays as the list of gate rows a PR's CI runs. Before that: `scripts/ci-proof.sh` and `GATE_CI_PROOF`. The queue audit skips the rows that a `vl-queue/` push run proved on the same tree, seed, deno and rustc. Next: the queue pushes its candidate (the vl-tools proposal in the PR), then the audit reuses CI's proven seed. See [T6 log](#t6-log). | none |
 
 ## Concurrency
 
