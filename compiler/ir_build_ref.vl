@@ -166,6 +166,7 @@ import {
 import {
   narrowedFieldPlain,
   nulVariantFieldPlain,
+  structFieldAt,
   structFieldPlain,
   unionEqNameless,
   unionUnionEqStagedOf,
@@ -405,6 +406,44 @@ function listElemHeapOf(arr: i32, fnIx: i32): i32 {
   return if si >= 0 && si < sHeapIdx.length { sHeapIdx[si] } else { -1 }
 }
 
+// Plain field `n` of a nullable record receiver at rep `r` over record `inner`, read at the field's
+// own rep `rep`: the receiver, recovered to its record with no `ref.as_non_null` (`RRecover`), then
+// the field.
+function nullRecvField(
+  b: i32[],
+  n: Member,
+  ix: i32,
+  rep: i32,
+  r: i32,
+  inner: i32,
+): Opnd {
+  const fnIx = irBFnIx()
+  if structFieldPlain(ix, fnIx) < 0 { return irBMiss("member nullable") }
+  const it = repTyOf(inner)
+  const k = if it >= 0 { repRecordKidOf(inner, it, n.memProp) } else { -1 }
+  if k < 0 || repNodeKids(inner)[k] != rep { return irBMiss("member nullable") }
+  const rv = irBExpr(b, n.memObj)
+  if missed(rv) { return rv }
+  if irBOpRep(rv) != r { return irBMiss("member nullable receiver rep") }
+  const rc = irBLetTempTy(
+    b,
+    { rcV: rv, rcAt: n.memObj, rcNn: 0 },
+    n.memObj,
+    inner,
+    it,
+  )
+  if missed(rc) { return rc }
+  const gf: Rhs = {
+    gfV: rc,
+    gfIx: k,
+    gfAt: ix,
+    gfStored: isStorageRead(ix),
+    gfStr: false,
+    gfShared: false,
+  }
+  return irBLetTemp(b, gf, ix, rep)
+}
+
 // Read `ix` through a box of lists or maps (`armSiteRecv`: an element, `.length`, `.has` or
 // `.get`) on legacy's tag chain (`SArmSite`): the box, and an index or key each arm reads again, so
 // a variable, an immediate, the key's literal, or a value set once; per arm, the read built over
@@ -635,6 +674,12 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   const r0 = repNodeOfTy(ot)
   const hr = if repNodeAt(r0) is RUnsup { holeRecvBox(irBOpenLocalReadRep(n.memObj)) } else { -1 }
   const r = if hr >= 0 { hr } else { r0 }
+  // A plain field read off a nullable record (a guarded compare's field read, `recEqTyped`) reads
+  // the record inside: `struct.get` takes the nullable reference, whose null the guard rules out.
+  const rn = repNodeAt(r)
+  if rn is RNullable && repNodeAt(rn.rnInner) is RRecord {
+    return nullRecvField(b, n, ix, rep, r, rn.rnInner)
+  }
   if repNodeAt(r) is RList {
     if n.memProp != "length" { return irBMiss("list member") }
     if !refRepOk(r, -1) { return irBMiss("list length rep") }
@@ -670,9 +715,12 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   }
   // A plain field read off a struct or a bare variant.
   const fnIx = irBFnIx()
+  // A read whose recorded kind is not its field's (`structFieldAt`) is read at the field as stored.
+  const unrec = structFieldAt(ix, fnIx) >= 0 && structFieldPlain(ix, fnIx) < 0
   const plain = variantFieldPlain(ix, fnIx) >= 0
     || structFieldPlain(ix, fnIx) >= 0
     || nulVariantFieldPlain(ix, fnIx) >= 0
+    || structFieldAt(ix, fnIx) >= 0
   if repNodeAt(r) is RRecord && plain {
     const k = repRecordKidOf(r, ot, n.memProp)
     if k < 0 { return irBMiss("field kid") }
@@ -680,6 +728,10 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     const own = memFieldUnionBox(ix, fnIx)
       && rep == repNodeOfTy(nodeTyAt(ix, fnIx))
     const kr = repNodeKids(r)[k]
+    const krn = repNodeAt(kr)
+    if unrec && kr != rep && !(krn is RNullable && krn.rnInner == rep) {
+      return irBMiss("unrecorded field read at another rep")
+    }
     // A hole function's field reads at the closure rep the built record holds (`holeCloTy`).
     if holeCloTy(nodeTyAt(ix, fnIx)) && repNodeAt(kr) is RClosure {
       return holeCloFieldRead(b, n, ix, k)

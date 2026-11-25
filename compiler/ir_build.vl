@@ -328,6 +328,7 @@ import {
   atomicValPrim,
   binNumWidth,
   blockValueWidenKind,
+  boxTagOnly,
   bundleArgArmOf,
   bundleCallRefPlainKey,
   bundleChoiceTyOf,
@@ -351,6 +352,7 @@ import {
   cloCellReaches,
   cloLiftCalleeOf,
   closureValueCoreWhy,
+  closureValueIsGeneric,
   closureValueWhy,
   coalChainLinkOf,
   coalClosedWidensAtom,
@@ -415,6 +417,7 @@ import {
   keptDeclStoresNothing,
   legacyContextLiveWhy,
   letIfInitPerArmRep,
+  letStoresGenericAliasCore,
   listFitIsPlanOf,
   listOpRecvHeldPlan,
   lowMemFoldsCallee,
@@ -1443,6 +1446,9 @@ let ibMissAt = -1
 // The right side of the name write (`x = v`, or a capture-box write `let`) last built, as legacy's
 // `stubWriteRhs`: a generic function read there is the stub cell's own value, not unfixed.
 let ibStubRhs = -1
+// The initializer of the binding being built when legacy stores it as a generic function's core
+// closure (`letStoresGenericAliasCore`): legacy never refuses that read, so neither does the claim.
+let ibAliasRhs = -1
 let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
@@ -3597,6 +3603,15 @@ function bundleCallOf(n: Call, ix: i32, t: i32): boolean {
   return pk.bpField < 0 && pk.bpHeap != -2
 }
 
+// Whether direct call `ix` of `callee` returns its bundle parameter's record where its value is
+// used at none of the members (`bpHeap` -2); the builder declines it, so the program counts as a
+// capability the IR cannot yet lower.
+function bundlePickRefused(ix: i32, callee: i32): boolean {
+  if !elabHasRetRecords() && !bundleAnyNoted() { return false }
+  if bundleResultPickOf(ix, callee, ibFnIx).bpHeap != -2 { return false }
+  return true
+}
+
 function noPick(): BundlePick {
   const none: BundlePick = { bpHeap: -1, bpField: -1, bpTy: -1, bpKey: "" }
   return none
@@ -5701,6 +5716,16 @@ function cloValue(b: i32[], ix: i32, rep: i32, ty: i32): Opnd {
     return irBMiss(cloValueWhy(ix))
   }
   const why = if cloValueIsCore(ix, fe) { closureValueCoreWhy(fe) } else { closureValueWhy(fe) }
+  // A generic function taken as a value is legacy's contract, raised before the claim declines.
+  if (
+    why != ""
+    && emitSoftFail
+    && ix != ibAliasRhs
+    && !cloValueIsCore(ix, fe)
+    && closureValueIsGeneric(fe)
+  ) {
+    emitFailAt(why, ix)
+  }
   if why != "" { return irBMiss("closure value refused") }
   const env: Opnd[] = if fnEnvIdxOf(fe) >= 0 { cloEnvOf(b, fe, ix) } else { [] }
   if ibMiss != "" { return irBMiss(ibMiss) }
@@ -9930,8 +9955,8 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   if (
     ibMiss == ""
     && boxLeadsAt(b, at)
+    && !boxTagLateAt(b, at)
     && !boxOfJoinAt(b, at)
-    && !boxLeadSpanAt(b, at)
   ) {
     boxLateAt(b, at)
   }
@@ -10315,6 +10340,24 @@ function boxOfJoinAt(b: i32[], at: i32): boolean {
   return holeBoxHeadAhead(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
 }
 
+// Whether the delivery built into `b` from `at` on ends in a box whose plan's head is its tag alone
+// (`boxTagOnly`) over a value holding a statement, which goes late (`boxLateAt`) ahead of the
+// head-first arms: those stay for a head that is more than a tag.
+function boxTagLateAt(b: i32[], at: i32): boolean {
+  if !ifBelowLeadHas(b, at, leadFirstAt(b)) { return false }
+  const n = ib.irNodes[b[b.length - 1]]
+  if !(n is SLet) { return false }
+  const r = n.lRhs
+  if (
+    !(r is RToBox)
+    || !boxTagOnly(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
+  ) {
+    return false
+  }
+  ib.irBoxLate.push(unwrapParen(r.bxAt))
+  return true
+}
+
 // Where the delivery built into `b` from `at` on ends in a box whose head leads and its value's
 // own nodes hold a statement (a valued `if` or `??`), notes the box late (`irBoxLate`): its head
 // follows the value, which the lowering holds in a local.
@@ -10328,41 +10371,6 @@ function boxLateAt(b: i32[], at: i32) {
   }
   ib.irBoxLate.push(unwrapParen(r.bxAt))
   return 0
-}
-
-// Where the delivery built into `b` from `at` on ends in a box whose head leads and its value's own
-// nodes write no statement but valued `if`s and `??`s that stage their leads, notes them as the
-// span the lowering writes that head ahead of (`irBoxLeadFirst`), as legacy writes the whole value
-// under it, and answers true.
-function boxLeadSpanAt(b: i32[], at: i32): boolean {
-  const bx = b.length - 1
-  if bx <= at { return false }
-  const n = ib.irNodes[b[bx]]
-  if !(n is SLet) { return false }
-  const r = n.lRhs
-  if (
-    !(r is RToBox)
-    || !holeBoxLeads(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
-  ) {
-    return false
-  }
-  for x in ib.irBoxLeadBox {
-    if x == b[bx] { return false }
-  }
-  // Only a span that holds a join under the head, which would otherwise refuse.
-  if !ifBelowLeadHas(b, at, bx) { return false }
-  let i = at
-  while i < bx {
-    const m = ib.irNodes[b[i]]
-    const join = m is SIf && m.siOut >= 0
-      || m is SCoalBox && coalArmStagesLeads(m.cbArm)
-    if !join && ifBelowLeadHas(b, i, i + 1) { return false }
-    i = i + 1
-  }
-  ib.irBoxLeadFirst.push(b[at])
-  ib.irBoxLeadBox.push(b[bx])
-  ib.irBoxLeadN.push(bx - at)
-  return true
 }
 
 // Whether the delivery built into `b` from `at` on ends in a box whose plan writes its tag ahead of
@@ -10578,6 +10586,28 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32, dstTy: i32): Opnd {
     dst,
     ix,
   )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// The temp of a call that never returns, `v`, read at i32 and widened to `to` at node `ix`; a
+// never operand of another shape is a miss.
+function neverWidened(b: i32[], v: Opnd, ix: i32, to: i32): Opnd {
+  if ibMiss != "" { return v }
+  if (
+    !(v is OVar)
+    || v.ov < 0
+    || v.ov >= ib.irVars.length
+    || !repIsNoValue(irBOpRep(v))
+  ) {
+    return irBMiss("never operand not a call")
+  }
+  const i32r = repNodeOfTy(TY_I32)
+  ib.irVars[v.ov].vRep = i32r
+  const dk = numKindOf(to)
+  const t = irVarNew(ib, to, repTyOf(to), "temp", -1)
+  const w: Rhs = { nwV: v, nwSrc: numKindOf(i32r), nwDst: dk, nwAt: ix }
+  irBNode(b, { lDst: t, lRhs: w }, repTyOf(to), to, ix)
   const o: Opnd = { ov: t }
   return o
 }
@@ -13213,7 +13243,11 @@ function coalNicheCell(
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
   if !coalNeverDefault(nb, n.binRight, rep, t) {
-    const d = irBExpr(nb, n.binRight)
+    // A default the atom hook writes (a `const` bound to a member literal) is delivered at the
+    // niche's atom, as `const d: K = Z` delivers it.
+    const hook = atom
+      && exprPrePathWhy(n.binRight, ibFnIx) == "pre-path atom hook"
+    const d = if hook { deliver(nb, n.binRight, rep, ty) } else { irBExpr(nb, n.binRight) }
     if ibMiss != "" { return d }
     if irBOpRep(d) != rep { return irBMiss("coalesce niche default rep") }
     irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
@@ -14757,12 +14791,14 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if rw != "" { return irBMiss(rw) }
     const never = nl || nr
     const sib = if nl { n.binRight } else { n.binLeft }
-    // Legacy writes the op at i32, an operand of another width converted or not (D17064).
+    // Legacy writes the op at i32 beside an i32 operand; beside a wider one, at that operand's
+    // width (D17064): the `never` side diverges first, so no value of it is ever read.
     const i32r = repNodeOfTy(TY_I32)
-    if never && exprRepOf(sib) != i32r {
+    const sr = exprRepOf(sib)
+    if never && sr != i32r && !nl {
       return irBMiss("never operator over a non-i32 operand")
     }
-    const orep = if !never { rep } else if binIsCompare(n.binOp) { ibBool } else { i32r }
+    const orep = if !never { rep } else if binIsCompare(n.binOp) { ibBool } else if sr == i32r { i32r } else { sr }
     // Mixed numeric widths meet at the operator's width, each operand widened before the next
     // is built, as legacy builds them (`emitBinOperandAs`); a literal there is legacy's to write.
     const dst = binWidthRep(n)
@@ -14781,7 +14817,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       return irBMiss("widen literal")
     }
     const ls = b.length
-    const l = widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1)
+    // A left `never` beside a wider operand is read at i32, its consumer's rep, and widened to
+    // that operand's width, as legacy writes it; no value of it is ever read.
+    const wideNever = never && nl && sr != i32r
+    const l = if wideNever { neverWidened(b, irBExpr(b, n.binLeft), n.binLeft, sr) } else { widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1) }
     const at = b.length
     const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1)
     if ibMiss != "" { return l }
@@ -14832,6 +14871,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return irBMiss("call") }
+    if rhs is RCall && bundlePickRefused(ix, rhs.caCallee) {
+      return irBMiss("bundle result pick refused")
+    }
     if rhs is RCall && rhs.caNever { return irBLetTemp(b, rhs, ix, rep) }
     if rhs is RCall && nulNoneCallee(rhs.caCallee) {
       const sentinel = nullOwnAt(ix, ibFnIx)
@@ -15104,6 +15146,8 @@ function wrapLit(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 // cast's own rep. A cast legacy refuses (`asLitAtomWhy`, `asNumLitScalarWhy`) is left to it.
 function asLit(b: i32[], n: AsExpr, ix: i32, rep: i32, arm: string): Opnd {
   const why = if arm == "litAtom" { asLitAtomWhy(ix, ibFnIx) } else { asNumLitScalarWhy(ix, ibFnIx) }
+  // Each of these refusals is a contract on the cast as written, raised before the claim declines.
+  if why != "" && emitSoftFail { emitFailAt(why, ix) }
   if why != "" { return irBMiss("literal cast refused") }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
@@ -16753,6 +16797,9 @@ function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if sn is LetDecl && sn.letInit >= 0 && cboxIsWriteLet(ix) {
     ibStubRhs = unwrapParen(sn.letInit)
   }
+  if sn is LetDecl && letStoresGenericAliasCore(sn, ibFnIx) {
+    ibAliasRhs = unwrapParen(sn.letInit)
+  }
   const cut = stmtNode(b, ix, sibs, pos) == IF_CUTS_BLOCK
     && nodeAt(ix) is IfStmt
   if ibMiss != "" && ibMissAt < 0 { ibMissAt = ix }
@@ -17546,6 +17593,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
+  ibAliasRhs = -1
   ibMisses = []
   ibReserveEnd = []
   ibReservePushes = []
@@ -18318,6 +18366,7 @@ function buildThunk(fe: i32): string {
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
+  ibAliasRhs = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if fe < 0 || fe >= fnStmts.length { return "thunk target" }
   const d = fnStmts[fe]
@@ -18450,6 +18499,7 @@ function buildEqHelp(si: i32): string {
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
+  ibAliasRhs = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if si < 0 || si >= sHeapIdx.length { return "compare helper row" }
   ib.irName = "@eq " + i32ToStr(si)
@@ -18555,6 +18605,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
+  ibAliasRhs = -1
   ibMisses = []
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
