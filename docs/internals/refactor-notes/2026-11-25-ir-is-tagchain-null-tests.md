@@ -48,5 +48,5 @@ Base rows from master 7eddff27; head on this branch.
 
 - `tests/cases/unions/is-union-alias-arm-positions.vl` (new): a parameter, a local, a field and a
   global, across 11 positions. Base: 3 `is variant tagChain`. Head: 4 of 4 matched.
-- The `tests/cases/functions/module-holder-of-bundles-*.vl` cases (8 programs) already sweep the
+- The `tests/cases/closures/module-holder-of-bundles-*.vl` cases (8 programs) already sweep the
   holder's positions. Every function in them now claims and matches.
