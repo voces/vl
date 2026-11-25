@@ -8,11 +8,19 @@ the member's.
 
 ## Fix
 
-When that member is a record, map or ref list (`boxNarrowCon` is not -2), the read takes the
-value's box whole (`mtWhole`) at the map's value rep, then narrows it with `RBoxNarrow` to the
-member. `boxNarrowAt` in `ir_lower.vl` finds the variant by rep (`variantOfRep`) when the narrowing
-at that site has no plain variant of that rep. This is the IR's general box-narrow lowering. It adds
-no legacy-helper call.
+When that member is a record, the read takes the value's box whole (`mtWhole`) at the map's value
+rep, then narrows it with `RBoxNarrow` to the record. `boxNarrowAt` in `ir_lower.vl` finds the
+variant by rep (`variantOfRep`) when the narrowing at that site has no plain variant of that rep.
+This is the IR's general box-narrow lowering, and it adds no legacy-helper call. An `as!` read is
+left out, because its lowering ignores `mtWhole`.
+
+Legacy writes this read through `emitExpr`, which banks the read's element-read row over the probe
+alone. The narrowing cast is not inside it. So the whole read banks the row even where its caller
+passed none: the binding arm passes none because it expects the box (`letNulMapReadUnionBox`).
+Without that row, `ir shadow cases` reds on `spans: count 8 vs 7` in `fromMapRead`.
+
+A map or ref-list member is not taken. Its narrow is `boxContainerRead`, which needs an identifier
+node. Taking it made D1866's witness fall back (`box container read node`).
 
 ## Census: base (master) → head, all 11,500 census files
 
