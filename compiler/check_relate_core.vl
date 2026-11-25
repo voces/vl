@@ -187,6 +187,7 @@ import {
   chPendGiven,
   chPendNodes,
   chPendTys,
+  ihPendFn,
   ihPendGiven,
   ihPendHoles,
   ihPendNodes,
@@ -607,6 +608,7 @@ import {
 } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
 import {
+  CW_UP_CALLEE,
   covarRootName,
   cwBindingOf,
   cwBindingWrittenValues,
@@ -621,10 +623,14 @@ import {
   cwGetRecv,
   cwHeldFnOf,
   cwIxCovers,
+  cwIxNode,
   cwIxUp,
+  cwIxUpKind,
   cwIxWant,
   cwKeyOfDecl,
   cwKeyOfRoot,
+  cwOccNext,
+  cwOccWalk,
   cwParamArgs,
   cwPeel,
   cwSliceRecv,
@@ -773,16 +779,21 @@ function fillIfHoleNodes(h: i32) {
       ) {
         if ix < nodeTyIx.length { nodeTySet(ix, res) }
       } else if fitsWant || assignable(res, given) {
-        tErr(
-          "this `if` joins "
-            + tyToStr(h)
-            + " and "
-            + tyToStr(ihPendOthers[i])
-            + " once the assignment below fills the binding; the join is type-valid but cannot build "
-            + "after the fill yet — annotate the binding as "
-            + tyToStr(h),
-          ix,
-        )
+        const rf = fillRetFnOf(ix, ihPendFn[i])
+        if rf >= 0 && !fnCalledYet(rf) {
+          // The `if` is the function's one returned value and no call has read its return yet,
+          // so the return follows the re-banked join, as it would had the fill come first.
+          for ft in [declTyOf(rf), nodeTyIxOf(rf)] {
+            const bt = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+            if bt is TyFunc {
+              bt.fnRet = res
+              tyMutBump(ft, -1)
+            }
+          }
+          if ix < nodeTyIx.length { nodeTySet(ix, res) }
+        } else {
+          tErr(fillJoinOrderMsg(h, ihPendOthers[i], rf), ix)
+        }
       } else {
         tErr(
           "this `if` was typed "
@@ -799,6 +810,69 @@ function fillIfHoleNodes(h: i32) {
     i = i + 1
   }
   return 0
+}
+
+// The un-annotated function `fd` whose one returned value is the `if` at `ix`; -1 when the `if`
+// is not that function's sole result.
+function fillRetFnOf(ix: i32, fd: i32): i32 {
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnName == "" || f.fnBody < 0 {
+    return -1
+  }
+  const ft = declTyOf(fd)
+  if ft < 0 || ft >= T.tys.length || !(tyAt(ft) is TyFunc) { return -1 }
+  let rets = 0
+  const stack: i32[] = [f.fnBody]
+  while stack.length > 0 {
+    const u = stack.pop() ?? -1
+    if u >= 0 && u < P.nodes.length {
+      const n = nodeAt(u)
+      if n is RetStmt {
+        if parenPeelIx(n.retArg) != ix { return -1 }
+        rets = rets + 1
+      }
+      if !(n is FuncDecl) {
+        for k in nodeChildren(u) { stack.push(k) }
+      }
+    }
+  }
+  return if rets > 0 { fd } else { -1 }
+}
+
+// Whether a checked call of function `fd` has typed its result by the return as it stands.
+function fnCalledYet(fd: i32): boolean {
+  const ow = cwOccWalk(fd)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    if u >= 0 && cwIxCovers(u) && cwIxUpKind[u] == CW_UP_CALLEE {
+      const c = cwIxUp[u]
+      if c >= 0 && nodeTyIxOf(c) >= 0 { return true }
+    }
+  }
+  return false
+}
+
+// The refusal for a re-banked join the `if`'s settled delivery has read: for function `rf`'s
+// returned value, the order that lets it run; for any other delivery, the gap it is.
+function fillJoinOrderMsg(h: i32, o: i32, rf: i32): string {
+  const fd = if rf >= 0 && rf < P.nodes.length { nodeAt(rf) } else { null }
+  const head = "this `if` joins "
+    + tyToStr(h)
+    + " and "
+    + tyToStr(o)
+    + " once the assignment below fills the binding"
+  if fd is FuncDecl {
+    return head
+      + ", and a call of `"
+      + fd.fnName
+      + "` reads that join before the fill; call `"
+      + fd.fnName
+      + "` after the assignment, or annotate the binding as "
+      + tyToStr(h)
+  }
+  return head
+    + "; the join is type-valid but cannot build after the fill yet — annotate the binding as "
+    + tyToStr(h)
 }
 
 // Whether join `res` holds a record `at`, the one record the `if` is delivered at, does not: an
@@ -828,6 +902,7 @@ export function noteIfHoleJoin(ix: i32, a: i32, b: i32, given: i32, want: i32) {
   ihPendOthers.push(if ha { b } else { a })
   ihPendGiven.push(given)
   ihPendWant.push(want)
+  ihPendFn.push(curFnDeclIx)
   return 0
 }
 
