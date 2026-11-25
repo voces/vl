@@ -104,6 +104,7 @@ import {
   WhileStmt,
   addNode,
   condLitTrue,
+  externGlobalLinkOfNode,
   i32ToStr,
   nodeAt,
   nodeChildren,
@@ -522,6 +523,7 @@ import {
   hoistRowMark,
   hoistRowReads,
   holeBoxHead,
+  holeBoxHeadAhead,
   holeBoxLeads,
   holeBoxTail,
   holeOptBoxHead,
@@ -786,6 +788,7 @@ import {
   nulTestArmOf,
 } from "./emit_plan_null"
 import {
+  arrLitRefLongSlot,
   arrLitRefShortSlot,
   objLitBuildVariantRow,
   spreadBackIdx,
@@ -906,6 +909,7 @@ import {
   gHelpF64Rem,
   gImports,
   gTestClaimRefusal,
+  globalStmts,
   liKinds,
   listIdxScratchBase,
   localIsRef,
@@ -1230,9 +1234,12 @@ function floatRem(a: Opnd[], atF32: boolean) {
   return f64RemCallTail(atF32)
 }
 
-// Whether global `g` has the cell a pre-pass assigns before any body is emitted.
+// Whether global `g` has the cell a pre-pass assigns before any body is emitted, or is an
+// `extern` binding whose import index the parse fixed (`userGlobalIdx`).
 function globalMinted(g: i32): boolean {
-  return g >= 0 && g < gCellIdx.length && gCellIdx[g] >= 0
+  if g < 0 || g >= gCellIdx.length { return false }
+  if gCellIdx[g] >= 0 { return true }
+  return g < globalStmts.length && externGlobalLinkOfNode(globalStmts[g]) >= 0
 }
 
 function opRepOf(o: Opnd): i32 {
@@ -1924,7 +1931,7 @@ function joinBoxHead(out: i32, staged: boolean) {
   const bx = lwIfBoxAt.get(out) ?? -1
   if bx < 0 || i32ListHas(lwBoxHeadAt, unwrapParen(bx)) { return 0 }
   const p = holeBoxPlanOf(bx, lwIfBoxTy.get(out) ?? -1, lw.irAt)
-  if holeBoxLeads(p.hbArm) {
+  if holeBoxHeadAhead(p.hbArm) {
     if staged { lwPushing = true } else { leaf() }
     holeBoxHead(p, bx, lw.irAt)
     lwPushing = false
@@ -3357,7 +3364,8 @@ function makeList(r: RMakeList) {
   }
   // A literal past its arm's chunk size builds in chunks, as the arm's legacy writer does
   // (`arrLitChunkPlanOf`): opened before its elements, each element then the chunk's flush.
-  const cp = if arm != "ref" { arrLitChunkPlanOf(arm, lb.lbSlot) } else { null }
+  const rs = if arm == "ref" { refLitSlot(r, fnIx, lb) } else { -1 }
+  const cp = if arm != "ref" { arrLitChunkPlanOf(arm, lb.lbSlot) } else if rs >= 0 { arrLitChunkPlanOf(arm, rs) } else { null }
   if cp != null && r.mlElems.length > cp.acMax {
     const dst = arrLitChunkOpen(cp, arm, r.mlElems.length)
     let coff = 0
@@ -3371,16 +3379,24 @@ function makeList(r: RMakeList) {
   }
   for e in r.mlElems { irLOpnd(e) }
   if arm == "ref" {
-    const sl = arrLitRefShortSlot(r.mlAt, fnIx, lb)
-    const vs = if sl >= 0 { sl } else { arrLitVariantSlot(r.mlAt, fnIx, lb) }
-    const vl = if vs >= 0 { vs } else { arrLitVariantLongSlot(r.mlAt, fnIx, lb) }
-    const a = nodeAt(r.mlAt)
-    const ul = if vl < 0 && a is ArrayLit { arrLitUnionLongSlot(r.mlAt, a.arrElems, fnIx, lb) } else { -1 }
-    if vl < 0 && ul < 0 { return irLMiss("ref list slot") }
-    return arrLitRefShortTail(if vl >= 0 { vl } else { ul }, r.mlElems.length)
+    if rs < 0 { return irLMiss("ref list slot") }
+    return arrLitRefShortTail(rs, r.mlElems.length)
   }
   if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
+}
+
+// The slot ref-list literal `r` builds at: a short arm's or its chunked twin's, else a variant or
+// union-box slot's per-element build; -1 for none.
+function refLitSlot(r: RMakeList, fnIx: i32, lb: ListBuild): i32 {
+  const sl = arrLitRefShortSlot(r.mlAt, fnIx, lb)
+  const vs = if sl >= 0 { sl } else { arrLitVariantSlot(r.mlAt, fnIx, lb) }
+  const ll = if vs >= 0 { vs } else { arrLitRefLongSlot(r.mlAt, fnIx, lb) }
+  const vl = if ll >= 0 { ll } else { arrLitVariantLongSlot(r.mlAt, fnIx, lb) }
+  if vl >= 0 { return vl }
+  if r.mlAt < 0 || r.mlAt >= P.nodes.length { return -1 }
+  const a = nodeAt(r.mlAt)
+  return if a is ArrayLit { arrLitUnionLongSlot(r.mlAt, a.arrElems, fnIx, lb) } else { -1 }
 }
 
 // `for` iterable `r`'s module list at arm `arm`, as legacy's hoist (`arrLitHoistGlobal`) builds
@@ -6643,6 +6659,13 @@ function ret(n: SReturn, pending: i32[]) {
     return fbReturnOp()
   }
   if retAfterEffectsTail(n.rtV, pending) { return 0 }
+  // A returned `__trap__` is its `unreachable`, which legacy writes with no `return` after it.
+  const tv = n.rtV
+  if tv is OVar && isTemp(tv.ov) && retIsTrap(tempRhs(tv.ov)) {
+    irLOpnd(tv)
+    irLSettle(pending)
+    return 0
+  }
   // A call retagged into its `K | null` is the same i32, so legacy tail-calls it too.
   const outer = retagOf(n.rtV)
   const inner = if outer >= 0 { retagOperand(outer) } else { n.rtV }
@@ -6664,6 +6687,17 @@ function ret(n: SReturn, pending: i32[]) {
   }
   cond(n.rtV, pending)
   return sinkExit()
+}
+
+// Whether `r` is a `__trap__` call read as a value (`trapCallRhs`), not a dead read's `unreachable`.
+function retIsTrap(r: Rhs): boolean {
+  if !(r is RDeadNever) || r.dnAt < 0 || r.dnAt >= P.nodes.length {
+    return false
+  }
+  const c = nodeAt(r.dnAt)
+  if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length { return false }
+  const f = nodeAt(c.callFn)
+  return f is Ident && f.identName == "__trap__"
 }
 
 // Whether returned `v` is a call after effects (`RAfterEffects`), now written as legacy writes it:
