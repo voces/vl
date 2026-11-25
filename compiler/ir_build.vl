@@ -3457,7 +3457,16 @@ export function irBLetTempTy(
   ty0: i32,
 ): Opnd {
   // A byte value's temp holds the i32 it is built at (`byteHeld`).
-  const ty = if repPrim(rep) == "i32" { byteHeld(ty0) } else { ty0 }
+  const ty1 = if repPrim(rep) == "i32" { byteHeld(ty0) } else { ty0 }
+  // A scalar value typed at a still-open variable holds the scalar its rep names whatever instance
+  // closes it, so it is typed at that rep's own type.
+  const p = repPrim(rep)
+  const scalar = p == "i32"
+    || p == "i64"
+    || p == "f32"
+    || p == "f64"
+    || p == "bool"
+  const ty = if scalar && irTyHeldOpen(ty1, rep) && repTyOf(rep) >= 0 { repTyOf(rep) } else { ty1 }
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
   // the verifier can close, so its function stays legacy's.
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
@@ -4754,6 +4763,18 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !narrowed
       && rep == globalTyRep(scopeTyAt(d, -1))
       && cellRep == globalTyRep(letBindTy(d, -1))
+    // An atom-assignment cell (`atomCellRep`) read at a string is its id, decoded as legacy's
+    // `emitAtomToStr` decodes it.
+    if (
+      cellRep != rep
+      && repNodeAt(cellRep) is RAtom
+      && repPrim(rep) == "str"
+      && atomCellRep(d, rep) == cellRep
+    ) {
+      const id = globalStoredRead(b, g, ix, cellRep, repTyOf(cellRep))
+      if ibMiss != "" { return id }
+      return repTemp(b, { sxV: id, sxAt: ix }, ix, rep)
+    }
     // A list cell the global section declares at the list its initializer built, an instance's
     // (`cellDeclStores`), is read as it is, at that list.
     const declStored = cellRep != rep
@@ -5671,12 +5692,24 @@ function globalRep(g: i32, d: i32): i32 {
   if noted >= 0 { return noted }
   const ht = globalHolderTy(d)
   const r0 = globalTyRep(if ht >= 0 { ht } else { scopeTyAt(d, -1) })
-  const r = if ht < 0 { cellAtStorageRow(d, r0) } else { r0 }
+  const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, r0)) } else { r0 }
   if r >= 0 {
     globalNoteAt(g, d, r)
     if ht >= 0 { ib.irGlobalHeld[g] = true }
   }
   return r
+}
+
+// Global `d`'s cell where the global section declares an i32 cell for a string binding whose
+// initializer is an assignment to an atom cell: that atom, the id the assignment yields; else `r`.
+function atomCellRep(d: i32, r: i32): i32 {
+  if repPrim(r) != "str" || globalCellKind(d) != "i32" { return r }
+  const g = nodeAt(d)
+  if !(g is LetDecl) || g.letInit < 0 { return r }
+  const ai = nodeAt(unwrapParen(g.letInit))
+  if !(ai is BinExpr) || ai.binOp != "=" { return r }
+  const ar = repNodeOfTy(heldTy(exprTyOf(ai.binLeft)))
+  return if repNodeAt(ar) is RAtom { ar } else { r }
 }
 
 // A record global whose checked rep `r` has no struct heap is held at its storage row's rep
@@ -5733,6 +5766,14 @@ function globalNoteAt(g: i32, d: i32, rep: i32) {
 function globalStoreTy(d: i32, rep: i32): i32 {
   const st = letBindTy(d, -1)
   const ht = heldTy(st)
+  // An atom-assignment cell is stored at its atom (`atomCellRep`).
+  if (
+    repNodeAt(rep) is RAtom
+    && atomCellRep(d, repNodeOfTy(ht)) == rep
+    && repTyOf(rep) >= 0
+  ) {
+    return repTyOf(rep)
+  }
   // A list cell declared at the instance list its initializer built is stored at that list.
   if (
     repNodeAt(rep) is RList
@@ -17216,7 +17257,22 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     && ai.binOp == "="
     && repNodeAt(repNodeOfTy(heldTy(exprTyOf(ai.binLeft)))) is RAtom
   ) {
-    return irBMiss("global initializer atom assignment")
+    // Where the global section declares the cell an i32, the atom's own, the assignment's value is
+    // stored as the id it yields.
+    const ar = repNodeOfTy(heldTy(exprTyOf(ai.binLeft)))
+    if globalCellKind(gst) != "i32" || irGlobalRepOf(ib, gi) >= 0 {
+      return irBMiss("global initializer atom assignment")
+    }
+    // The store, then its target read again at the atom: the value legacy's `local.get` yields.
+    assign(b, ai, unwrapParen(init))
+    if ibMiss != "" { return irBMiss(ibMiss) }
+    const av = irBExpr(b, ai.binLeft)
+    if ibMiss != "" { return av }
+    if irBOpRep(av) != ar {
+      return irBMiss("global initializer atom assignment")
+    }
+    globalNoteAt(gi, gst, ar)
+    return av
   }
   const noted = irGlobalRepOf(ib, gi)
   const rep = if noted >= 0 { noted } else { globalTyRep(globalHeldTy(gst)) }
