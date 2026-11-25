@@ -1254,10 +1254,10 @@ function claimStart(
   return true
 }
 
-// The shadow's failing controls: 0 none; the verifier must refuse 1 (a variable's rep swapped), 2
-// (a temp's definition deleted), 7 to 11 (`unrelatedMapControl`, `otherAgainControl`,
-// `nulEqNoNullableControl`, `nicheKindControl` both ways); the dual emit must report 3 (a byte
-// added to the lowering), 4 (a span row dropped) and 5 (its element-read rows); 6 the held coercion.
+// The shadow's failing controls: 0 none; the verifier refuses 1 (a rep swapped), 2 (a temp's
+// definition deleted), 7 to 12 (`unrelatedMapControl`, `otherAgainControl`, `nulEqNoNullableControl`,
+// `nicheKindControl` both ways, `headControl`); the dual emit reports 3 (a byte added), 4 (a span
+// row dropped) and 5 (its element-read rows); 6 is the held coercion.
 export function irShadowCorrupt(k: i32) {
   ibCorrupt = k
   return 0
@@ -2121,7 +2121,19 @@ function outTyOf(ix: i32, rep: i32): i32 {
     const ct = openCoalMapTy(ix)
     if ct >= 0 && repNodeOfTy(ct) == rep { return ct }
   }
+  const ft = nullFoldedTy(t, rep)
+  if ft >= 0 { return ft }
   return rowlessRecordTy(ix, t, rep)
+}
+
+// Where type `t` is `T | null` over a `T` that already admits `null` (a recursive alias the checker
+// does not fold) and the value is held at `T`'s rep `rep`, the type holding it there; else -1.
+function nullFoldedTy(t: i32, rep: i32): i32 {
+  if t < 0 || !(repNodeAt(rep) is RNullable) { return -1 }
+  const n = repNodeAt(repNodeOfTy(t))
+  if !(n is RNullable) || n.rnInner != rep { return -1 }
+  const rt = repTyOf(rep)
+  return if rt >= 0 && repNodeOfTy(rt) == rep { rt } else { -1 }
 }
 
 // Type `t` of `ix`, or where `rowlessRecordRep` moved its rep `rep` to a storage row, that row's
@@ -3460,7 +3472,16 @@ export function irBLetTempTy(
   ty0: i32,
 ): Opnd {
   // A byte value's temp holds the i32 it is built at (`byteHeld`).
-  const ty = if repPrim(rep) == "i32" { byteHeld(ty0) } else { ty0 }
+  const ty1 = if repPrim(rep) == "i32" { byteHeld(ty0) } else { ty0 }
+  // A scalar value typed at a still-open variable holds the scalar its rep names whatever instance
+  // closes it, so it is typed at that rep's own type.
+  const p = repPrim(rep)
+  const scalar = p == "i32"
+    || p == "i64"
+    || p == "f32"
+    || p == "f64"
+    || p == "bool"
+  const ty = if scalar && irTyHeldOpen(ty1, rep) && repTyOf(rep) >= 0 { repTyOf(rep) } else { ty1 }
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
   // the verifier can close, so its function stays legacy's.
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
@@ -4757,6 +4778,18 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !narrowed
       && rep == globalTyRep(scopeTyAt(d, -1))
       && cellRep == globalTyRep(letBindTy(d, -1))
+    // An atom-assignment cell (`atomCellRep`) read at a string is its id, decoded as legacy's
+    // `emitAtomToStr` decodes it.
+    if (
+      cellRep != rep
+      && repNodeAt(cellRep) is RAtom
+      && repPrim(rep) == "str"
+      && atomCellRep(d, rep) == cellRep
+    ) {
+      const id = globalStoredRead(b, g, ix, cellRep, repTyOf(cellRep))
+      if ibMiss != "" { return id }
+      return repTemp(b, { sxV: id, sxAt: ix }, ix, rep)
+    }
     // A list cell the global section declares at the list its initializer built, an instance's
     // (`cellDeclStores`), is read as it is, at that list.
     const declStored = cellRep != rep
@@ -5674,12 +5707,24 @@ function globalRep(g: i32, d: i32): i32 {
   if noted >= 0 { return noted }
   const ht = globalHolderTy(d)
   const r0 = globalTyRep(if ht >= 0 { ht } else { scopeTyAt(d, -1) })
-  const r = if ht < 0 { cellAtStorageRow(d, r0) } else { r0 }
+  const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, r0)) } else { r0 }
   if r >= 0 {
     globalNoteAt(g, d, r)
     if ht >= 0 { ib.irGlobalHeld[g] = true }
   }
   return r
+}
+
+// Global `d`'s cell where the global section declares an i32 cell for a string binding whose
+// initializer is an assignment to an atom cell: that atom, the id the assignment yields; else `r`.
+function atomCellRep(d: i32, r: i32): i32 {
+  if repPrim(r) != "str" || globalCellKind(d) != "i32" { return r }
+  const g = nodeAt(d)
+  if !(g is LetDecl) || g.letInit < 0 { return r }
+  const ai = nodeAt(unwrapParen(g.letInit))
+  if !(ai is BinExpr) || ai.binOp != "=" { return r }
+  const ar = repNodeOfTy(heldTy(exprTyOf(ai.binLeft)))
+  return if repNodeAt(ar) is RAtom { ar } else { r }
 }
 
 // A record global whose checked rep `r` has no struct heap is held at its storage row's rep
@@ -5736,6 +5781,14 @@ function globalNoteAt(g: i32, d: i32, rep: i32) {
 function globalStoreTy(d: i32, rep: i32): i32 {
   const st = letBindTy(d, -1)
   const ht = heldTy(st)
+  // An atom-assignment cell is stored at its atom (`atomCellRep`).
+  if (
+    repNodeAt(rep) is RAtom
+    && atomCellRep(d, repNodeOfTy(ht)) == rep
+    && repTyOf(rep) >= 0
+  ) {
+    return repTyOf(rep)
+  }
   // A list cell declared at the instance list its initializer built is stored at that list.
   if (
     repNodeAt(rep) is RList
@@ -6545,6 +6598,7 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     crVoid: isVoid,
     crDrop: !isVoid,
     crNever: callEndsNever(ix),
+    crHead: false,
   }
   return r
 }
@@ -6735,9 +6789,15 @@ function resultMemberCallRhs(b: i32[], c: Call, ix: i32, rx: i32): Rhs {
 // Closure call `ix` of `f` at plain key `key`: each argument at its parameter, then the call.
 function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
   const args: Opnd[] = []
+  // Where the callee ends, where each argument starts, and the call's head once one is staged.
+  const fEnd = b.length
+  const starts: i32[] = []
+  let head: Opnd = f
+  let staged = false
   let i = 0
   while i < c.callArgs.length {
     const at = b.length
+    starts.push(at)
     // A function handed as a bundle is the record of its closures, as `emitBundleReadArg` writes it.
     const bb = callRefBundleArgOf(c, ibFnIx, key, i)
     if bb.bbTy >= 0 {
@@ -6775,8 +6835,23 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
       && nodeAt(unwrapParen(c.callArgs[i])) is NullLit { closureParamRep(f, i) } else { -1 }
     const a = if wt >= 0 { deliver(b, c.callArgs[i], repNodeOfTy(wt), wt) } else if bx >= 0 && !asIs { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else if arm == "atomToStr" { closureArgAtomStr(b, c.callArgs[i], f, i) } else if nl >= 0 { deliver(b, c.callArgs[i], nl, -1) } else { irBExpr(b, c.callArgs[i]) }
     if ibMiss != "" { return missRhs("argument") }
-    if ifBelowLead(b, at, "short-circuit closure argument") {
-      return missRhs("short-circuit closure argument")
+    // An argument that writes a statement stages the call's head, and the arguments before it,
+    // ahead of that statement, as legacy writes them before it (`RCallRefHead`).
+    if ifBelowLeadHas(b, at, b.length) {
+      if !staged {
+        staged = true
+        head = closureHeadStage(b, fEnd, f, ix)
+        if ibMiss != "" { return missRhs("short-circuit closure argument") }
+        let k = 0
+        while k < starts.length {
+          starts[k] = starts[k] + 1
+          k = k + 1
+        }
+      }
+      const argIxs = c.callArgs.slice(0, args.length)
+      if !irBStageLeads(b, starts[args.length], starts, args, argIxs) {
+        return missRhs("short-circuit closure argument")
+      }
     }
     if wt >= 0 && irBOpRep(a) != repNodeOfTy(wt) {
       return missRhs("closure argument coercion")
@@ -6797,14 +6872,28 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
     i = i + 1
   }
   const r: Rhs = {
-    crFn: f,
+    crFn: head,
     crSig: cloSigTypeIdxAt(cloSigPosOfKey(key)),
     crArgs: args,
     crVoid: sigKeyRetIsVoid(key),
     crDrop: closureCallDrops(c, ix),
     crNever: callEndsNever(ix),
+    crHead: staged,
   }
   return r
+}
+
+// Closure `f`'s call head (`RCallRefHead`) at the callee's own type, inserted into `b` at `at`,
+// where the callee ends.
+function closureHeadStage(b: i32[], at: i32, f: Opnd, ix: i32): Opnd {
+  if !(f is OVar) || f.ov < 0 || f.ov >= ib.irVars.length {
+    return irBMiss("call_ref head callee")
+  }
+  const one: i32[] = []
+  const h = irBLetTempTy(one, { chFn: f }, ix, irBOpRep(f), ib.irVars[f.ov].vTy)
+  if ibMiss != "" || one.length != 1 { return irBMiss("call_ref head") }
+  insertAt(b, at, one[0])
+  return h
 }
 
 // Call statement `n`'s right-hand side as legacy's statement ladder writes it: a closure call
@@ -6820,6 +6909,7 @@ function stmtCallRefNever(rhs: Rhs, n: Call): Rhs {
     crVoid: rhs.crVoid,
     crDrop: rhs.crDrop,
     crNever: false,
+    crHead: rhs.crHead,
   }
   return r
 }
@@ -16519,12 +16609,23 @@ function repOfNulInner(r: i32): i32 {
   return if n is RNullable { n.rnInner } else { -1 }
 }
 
+// The call head's failing control (`irShadowCorrupt(12)`): a staged head read by its call as a plain
+// callee, which rule 10 must refuse.
+function headControl() {
+  for n in ib.irNodes {
+    const r = if n is SLet { n.lRhs } else if n is SEffect { n.efRhs } else { null }
+    if r is RCallRef && r.crHead { r.crHead = false }
+  }
+  return 0
+}
+
 // The failing control: breaks `ib` in the way `ibCorrupt` names.
 function corrupt() {
   if ibCorrupt == 7 { unrelatedMapControl() }
   if ibCorrupt == 8 { otherAgainControl() }
   if ibCorrupt == 9 { nulEqNoNullableControl() }
   if ibCorrupt == 10 || ibCorrupt == 11 { nicheKindControl(ibCorrupt == 11) }
+  if ibCorrupt == 12 { headControl() }
   if ibCorrupt == 1 && ib.irVars.length > 0 {
     const v = ib.irVars[0]
     const other = if repPrim(v.vRep) == "bool" { repNodeOfTy(TY_I32) } else { ibBool }
@@ -17219,7 +17320,22 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     && ai.binOp == "="
     && repNodeAt(repNodeOfTy(heldTy(exprTyOf(ai.binLeft)))) is RAtom
   ) {
-    return irBMiss("global initializer atom assignment")
+    // Where the global section declares the cell an i32, the atom's own, the assignment's value is
+    // stored as the id it yields.
+    const ar = repNodeOfTy(heldTy(exprTyOf(ai.binLeft)))
+    if globalCellKind(gst) != "i32" || irGlobalRepOf(ib, gi) >= 0 {
+      return irBMiss("global initializer atom assignment")
+    }
+    // The store, then its target read again at the atom: the value legacy's `local.get` yields.
+    assign(b, ai, unwrapParen(init))
+    if ibMiss != "" { return irBMiss(ibMiss) }
+    const av = irBExpr(b, ai.binLeft)
+    if ibMiss != "" { return av }
+    if irBOpRep(av) != ar {
+      return irBMiss("global initializer atom assignment")
+    }
+    globalNoteAt(gi, gst, ar)
+    return av
   }
   const noted = irGlobalRepOf(ib, gi)
   const rep = if noted >= 0 { noted } else { globalTyRep(globalHeldTy(gst)) }
