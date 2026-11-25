@@ -46825,30 +46825,20 @@ function emitCoalesceOptNulRecord(
   // not one: a record slot is `(ref null $S)` at both declarations (D1180), and `o?.f ??
   // d` must yield `d` when the field is null too — receiver-null or field-null, short-circuited through one i32 `if` so `struct.get` never runs on a null receiver.
   if eqKindIsRecord(nfKind) {
-    const ntg = sFieldTgtStructIdx(nsi, nfi)
-    if ntg < 0 {
+    const rp = optRecLeafPlanOf(e, nsi, nfi, fnIx)
+    if rp.orTgtHeap < 0 {
       return emitFail(
         "emitProgram: `?.` over a nested-struct field names no struct row",
       )
     }
-    const nDefNul = coalesceDefaultNullable(e.binRight, fnIx)
     if emitOptRecvBase(lhs.omObj, fnIx, false) < 0 { return -1 }
-    fbRefIsNull() // the receiver
-    fbIf(127)
-    fbI32Const(1)
-    fbElse()
+    optRecLeafTestOpen()
     if emitOptRecvBase(lhs.omObj, fnIx, true) < 0 { return -1 }
-    fbStructGet(nHeap, nfi)
-    fbRefIsNull() // the field slot
-    fbEnd()
-    fbIfRefNul(sHeapIdx[ntg], nDefNul)
+    optRecLeafTestClose(rp)
     if emitExpr(e.binRight, fnIx) < 0 { return -1 }
     fbElse()
     if emitOptRecvBase(lhs.omObj, fnIx, true) < 0 { return -1 }
-    fbStructGet(nHeap, nfi)
-    if !nDefNul { fbRefAsNonNull() }
-    fbEnd()
-    return 0
+    return optRecLeafRead(rp)
   }
   if nfKind == "union" {
     return emitOptCoalesceBoxLeaf(e, lhs, nHeap, nfi, exprIx, fnIx)
@@ -46875,6 +46865,80 @@ function emitCoalesceOptNulRecord(
 // `nsi`: its heap, field and `if` kind (`optLeafKindOf`), or a null `olLeaf` for any other field
 // (a record, a box, a closure or a map, each its own core, or a field with no `if` blocktype).
 export type CoalOptLeafPlan = { olHeap: i32, olFi: i32, olLeaf: VKind | null }
+
+// How `emitCoalesceOptNulRecord` writes `p?.f ?? d` over a record field `orFi` of struct heap
+// `orHeap`: the field's own row's heap `orTgtHeap` (-1 for none) blocks the `if`, nullable when the
+// default is (`orDefNul`), else the field is recovered non-null.
+export type OptRecLeafPlan = {
+  orHeap: i32,
+  orFi: i32,
+  orTgtHeap: i32,
+  orDefNul: boolean,
+}
+
+export function optRecLeafPlanOf(
+  e: BinExpr,
+  nsi: i32,
+  nfi: i32,
+  fnIx: i32,
+): OptRecLeafPlan {
+  const ntg = sFieldTgtStructIdx(nsi, nfi)
+  const p: OptRecLeafPlan = {
+    orHeap: sHeapIdx[nsi],
+    orFi: nfi,
+    orTgtHeap: if ntg >= 0 && ntg < sHeapIdx.length { sHeapIdx[ntg] } else { -1 },
+    orDefNul: coalesceDefaultNullable(e.binRight, fnIx),
+  }
+  return p
+}
+
+// The record-field plan over nullable struct row `nsi`, or one whose `orTgtHeap` is -1 where the
+// field is no record.
+export function coalOptRecLeafPlanAt(
+  e: BinExpr,
+  lhs: OptMember,
+  nsi: i32,
+  fnIx: i32,
+): OptRecLeafPlan {
+  const nfi = if nsi >= 0 && nsi < sHeapIdx.length { sFieldIndex(nsi, lhs.omProp) } else { -1 }
+  if nfi < 0 || !eqKindIsRecord(fieldRowKind(sFieldFlatRow(nsi, nfi))) {
+    const no: OptRecLeafPlan = {
+      orHeap: -1,
+      orFi: -1,
+      orTgtHeap: -1,
+      orDefNul: false,
+    }
+    return no
+  }
+  return optRecLeafPlanOf(e, nsi, nfi, fnIx)
+}
+
+// After the receiver: its null test, answering true for a null receiver, else (the receiver next)
+// testing the field slot, which a record leaves nullable at every declaration (D1180).
+export function optRecLeafTestOpen() {
+  fbRefIsNull() // the receiver
+  fbIf(127)
+  fbI32Const(1)
+  fbElse()
+  return 0
+}
+
+// After the receiver again: the field slot's null test, then the `if` both arms of `p` yield.
+export function optRecLeafTestClose(p: OptRecLeafPlan) {
+  fbStructGet(p.orHeap, p.orFi)
+  fbRefIsNull() // the field slot
+  fbEnd()
+  return fbIfRefNul(p.orTgtHeap, p.orDefNul)
+}
+
+// After the receiver a third time, in the present arm: the field, recovered non-null unless the
+// default is nullable, and the `if`'s end.
+export function optRecLeafRead(p: OptRecLeafPlan): i32 {
+  fbStructGet(p.orHeap, p.orFi)
+  if !p.orDefNul { fbRefAsNonNull() }
+  fbEnd()
+  return 0
+}
 
 // The box-field plan `emitCoalesceOptNulRecord` writes `p?.f ?? d` at (`e`, node `exprIx`) over
 // nullable struct row `nsi`, or one whose `obFail` names why the field is no union box.
