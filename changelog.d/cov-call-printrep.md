@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR reads a union's tag field at the rep legacy stores it at:** a lone literal tag every arm of an un-narrowed union stores as an atom (`{kind: KC} | {kind: KC}`, `KC = "circle"`), and an alias field a row stores as a string beside its base's arm (`{kind: K1} | {kind: string}`, D1461). The IR read the first at the joined literal's string rep and the second at the alias's atom rep, so `print` (and on master a claimed `return s.kind`, which then failed validation and fell back) disagreed with the bytes legacy reads. `exprTyOf` now takes the arms' atom set (`sharedFieldAtomTy`) or the string, and the shared and narrowed field reads accept that rep. `print operand rep` loses D17072's and D1461's rows.
