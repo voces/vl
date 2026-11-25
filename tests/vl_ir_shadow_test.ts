@@ -3173,27 +3173,21 @@ Deno.test({
   },
 });
 
-// A stored literal boxed into a union stays legacy's (the box writes its tag ahead of the store,
-// which the builder writes as a statement first); one after a call operand builds and matches,
-// the call's value staged below the store as legacy writes it first.
+// A stored literal boxed into a union builds with the box's tag written ahead of the store, as
+// legacy writes it; one after a call operand builds and matches, the call's value staged below the
+// store as legacy writes it first.
 const ASG_VALUE_LIT_MISSES =
   `function boxed(c: boolean) {\n  let x: i32 | null = null\n  return if c { x = 5 }\n}\nfunction k() { return 3 }\nfunction h(p: i32, q: i32) { return p + q }\nlet f: f32 = 0.5\nfunction lead() { return h(k(), f = 4) }\nprint(boxed(true) ?? 0)\nprint(lead())\n`;
 Deno.test({
-  name: "ir shadow: a boxed stored literal stays a named miss; one after a call operand matches",
+  name: "ir shadow: a boxed stored literal and one after a call operand build and match",
   ignore,
   fn: () => {
     const { rc, rows } = run(ASG_VALUE_LIT_MISSES, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if (
-      (rows.get("uncovered box of an assignment") ?? 0) !== 1 ||
-      (rows.get("covered") ?? 0) !== 3 ||
-      (rows.get("matched") ?? 0) !== 3
-    ) {
-      throw new Error(
-        `want boxed uncovered by name, lead, k and h matched, got ${JSON.stringify([...rows])}`,
-      );
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want boxed, lead, k and h covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
