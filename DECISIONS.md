@@ -13143,3 +13143,7 @@ its elements stored as the `null[]` sentinel.
   So the literal is recorded as a candidate and judged in `flushNullOnlyLits`, where a hole a write
   filled is that write's `T | null` and its list is not refused.
 - The refusal names a contract: annotating the list or the binding runs.
+
+## A call refused for its argument count is typed by the callee's declared return (2026-11-25, coordinator ruling) — D17481
+
+**Ruled by the coordinator 2026-11-25**, on lane O2's D17481. Recovery after `wrong number of arguments` types the call by the callee's declared return, not `<error>`, as TypeScript does. What reads the result is checked against that type, so an independent true error still reports: `const s: string = mk(1, 2)` gives the arity error and `cannot assign A to 's'`, which is wrong at any arity. `<error>` would absorb such checks and hide them.
