@@ -42,7 +42,7 @@ through legacy's `armSiteWrite` → `emitArmSiteAt`, whose per-arm read is `emit
   - `armSiteWrite`'s operand state (`armIdxNode`/`Local`/`Imm`, `emitArmIdx`, `ARM_IDX_*`) existed
     only for the IR, so it is removed, and `armSiteWrite` is private again. `emitIdxIndex` stays a
     function, since the I8 sweep names it as a cause.
-  - `armSiteWrite` and `emitArmSiteAt` leave `scripts/ir-i8-census/keep.txt`: nothing in an
+  - `armSiteWrite` and `emitArmSiteAt` leave `scripts/ir-i8-census/keep.txt` (since replaced by `keep/`): nothing in an
     `ir*.vl` file reaches them now.
 
 ## How it was measured
