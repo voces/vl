@@ -927,7 +927,7 @@ import {
   parseI32,
   parseI64Pair,
 } from "./emit_bignum"
-import { isVoidTy, tyMapValOf } from "./tyquery"
+import { isVoidTy, nullableInnerOrNone, tyHasNullMember, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
   listGetIdxReReadable,
@@ -951,6 +951,7 @@ import {
   TY_NEVER,
   TY_NUL_STR,
   TY_STR,
+  mkNullableTyOf,
   tyIsRecord,
   tyScalarBasePrim,
 } from "./check_types"
@@ -3349,6 +3350,13 @@ function capturedClosureTy(ix: i32): i32 {
   return if ty >= 0 && repNodeAt(repNodeOfTy(ty)) is RClosure { ty } else { -1 }
 }
 
+// The type local binding `d` holds a returned record whole at in `frame` (`holderRecordTy`): that
+// record, or `| null` beside it where the binding's type holds null, as a map read's miss; else -1.
+function holderHeldRecordTy(d: i32, frame: i32): i32 {
+  const ht = holderRecordTy(d, frame)
+  return if ht >= 0 && tyHasNullMember(scopeTyAt(d, frame)) { mkNullableTyOf(ht) } else { ht }
+}
+
 // The record type read `ix` of a holding binding is (`holderRecordTy`), where this frame's
 // variable for it, or the module cell of a global one, holds that record; -1 otherwise.
 function holderReadTy(ix: i32): i32 {
@@ -3364,7 +3372,12 @@ function holderReadTy(ix: i32): i32 {
   const ht = holderRecordTy(d, ibFnIx)
   if ht < 0 { return -1 }
   const v = boundVarOf(ix)
-  if v >= 0 { return if ib.irVars[v].vTy == ht { ht } else { -1 } }
+  // A local holding it beside `null` (`holderHeldRecordTy`) is read as it is until narrowed.
+  const vt = if v >= 0 { ib.irVars[v].vTy } else { -1 }
+  if vt >= 0 && nullableInnerOrNone(vt) == ht {
+    return if tyHasNullMember(nodeTyAt(ix, ibFnIx)) { vt } else { ht }
+  }
+  if v >= 0 { return if vt == ht { ht } else { -1 } }
   // A module holder's read is of the record its cell holds (`globalRep`).
   const g = globalIndexOfSid(sidOfNode(ix))
   if g < 0 { return -1 }
@@ -3556,9 +3569,10 @@ function cellTakesClosure(d: i32, v: i32, src: Opnd): boolean {
 export function irBDeclVar(d: i32): i32 {
   const known = ibDeclVar[d] ?? -1
   if known >= 0 { return known }
-  // Legacy holds a binding of a returned record whole as that record (`letCellKind`), and one
-  // holding a single member of it as that member's closure (`holderMemberTy`).
-  const ht = holderRecordTy(d, ibFnIx)
+  // Legacy holds a binding of a returned record whole as that record (`letCellKind`), `| null`
+  // beside it where its type holds null (`holderHeldRecordTy`), and one holding a single member
+  // of it as that member's closure (`holderMemberTy`).
+  const ht = holderHeldRecordTy(d, ibFnIx)
   const hm = if ht < 0 && (elabHasRetRecords() || bundleAnyNoted()) { holderMemberTy(d, ibFnIx) } else { -1 }
   const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else { heldTy(scopeTyAt(d, ibFnIx)) }
   // A map local is held as legacy stores it, its mv slot off its initializer (`mapSlotHeldTy`).
@@ -4891,9 +4905,11 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     const gm = irGlobalReadMiss(g, ibGlobalCtx())
     if gm != "" { return irBMiss(gm) }
     const sid = sidOfNode(ix)
+    // A holder's cell beside `null` is read as it is; legacy's recover would trap on the miss.
+    const nulHeld = cellRep == rep && holderCellNullable(g, d)
     const gr: Rhs = {
       ggSym: g,
-      ggNonNull: globalReadRecovers(sid, ix, ibFnIx),
+      ggNonNull: globalReadRecovers(sid, ix, ibFnIx) && !nulHeld,
       ggNn: if boxCore { 0 } else if narrowed { if readOwesNonNullRecover(ix, ibFnIx) { 1 } else { 0 } } else { -1 },
     }
     ib.irReadAgain[ix] = gr
@@ -5017,9 +5033,11 @@ function globalStoredRead(
 ): Opnd {
   const gm = irGlobalReadMiss(g, ibGlobalCtx())
   if gm != "" { return irBMiss(gm) }
+  // A holder's cell beside `null` is read as it is (`holderCellNullable`).
+  const nulHeld = nodeAt(ix) is Ident && holderCellNullable(g, identDeclOf(ix))
   const gr: Rhs = {
     ggSym: g,
-    ggNonNull: globalReadRecovers(sidOfNode(ix), ix, ibFnIx),
+    ggNonNull: globalReadRecovers(sidOfNode(ix), ix, ibFnIx) && !nulHeld,
     ggNn: -1,
   }
   ib.irReadAgain[ix] = gr
@@ -5472,6 +5490,14 @@ function narrowedLocalRead(
       ix,
       rep,
     )
+  }
+  // A local holding a returned record beside `null` (`holderHeldRecordTy`), read narrowed past it,
+  // recovers the record.
+  const vn = repNodeAt(ib.irVars[v].vRep)
+  if arm == "local" && vn is RNullable && vn.rnInner == rep && holderReadTy(ix) == repTyOf(rep) {
+    const hr: Rhs = { rcV: o, rcAt: ix, rcNn: 1 }
+    ib.irReadAgain[ix] = hr
+    return irBLetTempTy(b, hr, ix, rep, holderReadTy(ix))
   }
   // A list read's overrides (`identListOverrideOf`) are asked at the lowering, which holds them.
   const na = if arm == "local" { nullNarrowArmOf(ix, ib.irVars[v].vRep, rep) } else { "none" }
@@ -17724,6 +17750,14 @@ function cellDeclStores(gst: i32, rep: i32, vr: i32): boolean {
   fbValtype(k, letCellSlot(gst, -1, k))
   wTarget(prev)
   return u8sSame(vt, refRepValtype(vr))
+}
+
+// Whether global `g`, declared at `d`, is a holder of a returned record whole (`globalHolderTy`)
+// whose cell this build noted beside `null` (`holderCellTakesNull`), as a map read's miss stores.
+function holderCellNullable(g: i32, d: i32): boolean {
+  const ht = globalHolderTy(d)
+  const cn = repNodeAt(irGlobalRepOf(ib, g))
+  return ht >= 0 && cn is RNullable && cn.rnInner == repNodeOfTy(ht)
 }
 
 // Whether global `gst`, a holder legacy keeps a returned record in whole (`globalHolderTy`, cell
