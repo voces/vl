@@ -20,9 +20,10 @@
 - **The class**: `lists/annotated-callback-over-built-list.vl`, `lists/map-identity-callback-over-built-list.vl`
   (2 functions), `unions/null-member-of-a-stored-box-field-prints.vl`, and the start bodies of
   `named/d15207_loop_over.vl` and `named/d16132_for_in_unann.vl` now match under `VL_IR_SHADOW=2`.
-- **Legacy identity and the shadow**: see the PR body for the A/B over
+- **Legacy identity and the shadow**: against the compiler of #10135, the 16,054 programs under
   `tests/cases/{lists,records,generics,closures,objects,unions,types,structs}` and `distilled/named`
-  against the compiler of #10135.
+  build byte-identical. Their `VL_IR_SHADOW=2` tallies move in 18 programs, none losing a match or
+  gaining a fail or mismatch; a few move on to another class (`box ladder`, `object field coercion`).
 - **Q58 position sweep** (`tests/cases/records/rowless-record-param-read-at-its-row-positions.vl`,
   new): the callback parameter handed to a call, bound by a `let` first, a second callback's, and a
   module loop's element read. The miss is shape-sensitive (a module `for` over the source list
