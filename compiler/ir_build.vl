@@ -10575,6 +10575,28 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32, dstTy: i32): Opnd {
   return o
 }
 
+// The temp of a call that never returns, `v`, read at i32 and widened to `to` at node `ix`; a
+// never operand of another shape is a miss.
+function neverWidened(b: i32[], v: Opnd, ix: i32, to: i32): Opnd {
+  if ibMiss != "" { return v }
+  if (
+    !(v is OVar)
+    || v.ov < 0
+    || v.ov >= ib.irVars.length
+    || !repIsNoValue(irBOpRep(v))
+  ) {
+    return irBMiss("never operand not a call")
+  }
+  const i32r = repNodeOfTy(TY_I32)
+  ib.irVars[v.ov].vRep = i32r
+  const dk = numKindOf(to)
+  const t = irVarNew(ib, to, repTyOf(to), "temp", -1)
+  const w: Rhs = { nwV: v, nwSrc: numKindOf(i32r), nwDst: dk, nwAt: ix }
+  irBNode(b, { lDst: t, lRhs: w }, repTyOf(to), to, ix)
+  const o: Opnd = { ov: t }
+  return o
+}
+
 // Two lists, each built at its own list rep, compared by legacy's list compare.
 function listEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const l = irBExpr(b, n.binLeft)
@@ -14750,12 +14772,14 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if rw != "" { return irBMiss(rw) }
     const never = nl || nr
     const sib = if nl { n.binRight } else { n.binLeft }
-    // Legacy writes the op at i32, an operand of another width converted or not (D17064).
+    // Legacy writes the op at i32 beside an i32 operand; beside a wider one, at that operand's
+    // width (D17064): the `never` side diverges first, so no value of it is ever read.
     const i32r = repNodeOfTy(TY_I32)
-    if never && exprRepOf(sib) != i32r {
+    const sr = exprRepOf(sib)
+    if never && sr != i32r && !nl {
       return irBMiss("never operator over a non-i32 operand")
     }
-    const orep = if !never { rep } else if binIsCompare(n.binOp) { ibBool } else { i32r }
+    const orep = if !never { rep } else if binIsCompare(n.binOp) { ibBool } else if sr == i32r { i32r } else { sr }
     // Mixed numeric widths meet at the operator's width, each operand widened before the next
     // is built, as legacy builds them (`emitBinOperandAs`); a literal there is legacy's to write.
     const dst = binWidthRep(n)
@@ -14774,7 +14798,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       return irBMiss("widen literal")
     }
     const ls = b.length
-    const l = widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1)
+    // A left `never` beside a wider operand is read at i32, its consumer's rep, and widened to
+    // that operand's width, as legacy writes it; no value of it is ever read.
+    const wideNever = never && nl && sr != i32r
+    const l = if wideNever { neverWidened(b, irBExpr(b, n.binLeft), n.binLeft, sr) } else { widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1) }
     const at = b.length
     const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1)
     if ibMiss != "" { return l }
