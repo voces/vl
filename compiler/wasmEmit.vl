@@ -18051,18 +18051,50 @@ export function arrLitDataTry(
 // whatever its length (D3417). Returns 1 when the backing is on the stack, 0 when some element
 // is not one constant instruction (nothing emitted), -1 when an element fails to lower.
 function arrLitDataBuild(elems: i32[], fnIx: i32, form: i32, backTy: i32): i32 {
+  const computed = arrLitDataComputed(elems, fnIx, form)
+  if computed == null { return 0 }
+  const d = arrLitDataSegWrite(elems, fnIx, form, backTy, computed)
+  if d <= 0 || computed.length == 0 { return d }
+  // The computed elements are stored after the segment builds the backing, in source order,
+  // so a literal of any length with some computed elements stays a few bytes per such element.
+  const dst = arrLitDataHold(form)
+  for at in computed {
+    arrLitDataStoreAt(dst, at)
+    if arrLitDataElemEmit(elems[at], fnIx, form) < 0 { return -1 }
+    fbArraySet(backTy)
+  }
+  fbLocalGet(dst)
+  fbRefAsNonNull()
+  return 1
+}
+
+// The indices of long literal `elems`' computed elements at data form `form`, in source order;
+// null where one neither is a constant nor stores after the segment (`arrLitDataStores`).
+function arrLitDataComputed(elems: i32[], fnIx: i32, form: i32): i32[] | null {
   const computed: i32[] = []
   let i = 0
   while i < elems.length {
     if !arrLitElemIsConst(elems[i]) {
-      if !arrLitDataStores(elems[i], fnIx, form) { return 0 }
+      if !arrLitDataStores(elems[i], fnIx, form) { return null }
       computed.push(i)
     }
     i = i + 1
   }
+  return computed
+}
+
+// The backing of `elems` at `form` from one data segment, each `computed` element's slot zero:
+// 1 on the stack, 0 where some constant is not one instruction (nothing written), -1 on failure.
+function arrLitDataSegWrite(
+  elems: i32[],
+  fnIx: i32,
+  form: i32,
+  backTy: i32,
+  computed: i32[],
+): i32 {
   const parts: { b: u8[] }[] = [{ b: [] }]
   let n = 0
-  i = 0
+  let i = 0
   let ci = 0
   while i < elems.length {
     if parts[parts.length - 1].b.length >= LIT_PART { parts.push({ b: [] }) }
@@ -18086,23 +18118,66 @@ function arrLitDataBuild(elems: i32[], fnIx: i32, form: i32, backTy: i32): i32 {
   fbI32Const(0)            // segment offset
   fbI32Const(elems.length) // element count
   fbArrayNewData(backTy, seg)
-  if computed.length == 0 { return 1 }
-  // The computed elements are stored after the segment builds the backing, in source order,
-  // so a literal of any length with some computed elements stays a few bytes per such element.
+  return 1
+}
+
+// The segment-built backing on the stack, held in a fresh scratch slot of form `form`'s list kind,
+// which it returns.
+function arrLitDataHold(form: i32): i32 {
   liKinds.push(arrLitDataKind(form))
   liSlots.push(0)
   liBack.push(1)
   const dst = listIdxScratchBase + liKinds.length
   fbLocalSet(dst)
-  for at in computed {
-    fbLocalGet(dst)
-    fbI32Const(at)
-    if arrLitDataElemEmit(elems[at], fnIx, form) < 0 { return -1 }
-    fbArraySet(backTy)
+  return dst
+}
+
+// A long literal with computed elements (route `dataComputed`) built as `arrLitDataTry` builds
+// it, its elements the caller's: `arrLitDataOpen` writes the segment and holds it, then each
+// computed element is stored (`arrLitDataStoreAt`, the element at the arm's width,
+// `arrLitDataStoreEnd`), then `arrLitDataClose`. The open's slot, or -1 where it writes nothing.
+export function arrLitDataOpen(
+  elems: i32[],
+  fnIx: i32,
+  arm: ArrLitArm,
+  row: i32,
+): i32 {
+  const form = arrLitDataFormOf(arm, row)
+  if form < 0 { return -1 }
+  const computed = arrLitDataComputed(elems, fnIx, form)
+  if computed == null || computed.length == 0 { return -1 }
+  if (
+    arrLitDataSegWrite(elems, fnIx, form, arrLitDataBackOf(arm, row), computed)
+    <= 0
+  ) {
+    return -1
   }
+  return arrLitDataHold(form)
+}
+
+// The head of the store of element `at` into the held backing `dst`; the element follows.
+export function arrLitDataStoreAt(dst: i32, at: i32): i32 {
+  fbLocalGet(dst)
+  fbI32Const(at)
+  return 0
+}
+
+// The store of an element at arm `arm` (row `row`) into its held backing.
+export function arrLitDataStoreEnd(arm: ArrLitArm, row: i32): i32 {
+  fbArraySet(arrLitDataBackOf(arm, row))
+  return 0
+}
+
+// The held backing `dst` of `n` elements, wrapped at arm `arm` (row `row`).
+export function arrLitDataClose(
+  dst: i32,
+  n: i32,
+  arm: ArrLitArm,
+  row: i32,
+): i32 {
   fbLocalGet(dst)
   fbRefAsNonNull()
-  return 1
+  return arrLitWrap(n, arrLitDataWrapOf(arm, row))
 }
 
 // The data segment holding the `n` bytes of `parts`: the one a literal of the same bytes already
@@ -18366,7 +18441,7 @@ function arrLitWrap(n: i32, wrapTy: i32): i32 {
 }
 
 // Whether element `ix` is a number literal, a negated one, or a boolean literal, in parens or not.
-function arrLitElemIsConst(ix: i32): boolean {
+export function arrLitElemIsConst(ix: i32): boolean {
   const x = unwrapParen(ix)
   if x < 0 || x >= P.nodes.length { return false }
   const e = nodeAt(x)
