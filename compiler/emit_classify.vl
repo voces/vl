@@ -1818,12 +1818,31 @@ export function readOwesNonNullRecover(exprIx: i32, fnIx: i32): boolean {
   if ck == null { return false }
   const tw = vkNonNullRefTwin(ck)
   if tw == null { return false }
+  // A holder of a returned record beside `null` (`letCellKind`'s `nulstruct`), read narrowed past
+  // it, is that record whatever function type the read is typed at.
+  if ck == "nulstruct" && holderReadPastNull(exprIx, fnIx) { return true }
   const d = repOfNode(exprIx, fnIx)
   if d.rdKind == tw { return true }
   // A record's two niches are one heap once a declared struct is also an arm (D3593), so a
   // nullable record cell read at the other record rep recovers too.
   return (ck == "nulvariant" || ck == "nulstruct")
     && (d.rdKind == "struct" || d.rdKind == "variant")
+}
+
+// Whether binding `d`, holding a returned record whole in `fnIx`, holds `null` beside it (a map
+// read's miss).
+export function holderHoldsNull(d: i32, fnIx: i32): boolean {
+  return holderRecordSigs(d, fnIx).length > 0
+    && tyHasNullMember(scopeTyAt(d, fnIx))
+}
+
+// Whether read `exprIx` in `fnIx` is of a binding holding a returned record whole
+// (`holderRecordSigs`), narrowed past `null`.
+export function holderReadPastNull(exprIx: i32, fnIx: i32): boolean {
+  if !(nodeAt(exprIx) is Ident) { return false }
+  if holderRecordSigs(identDeclOf(exprIx), fnIx).length == 0 { return false }
+  const t = nodeTyAt(exprIx, fnIx)
+  return t >= 0 && !tyHasNullMember(t)
 }
 
 // Can the cell the read at `exprIx` names hold null, whatever the read narrows to? A
@@ -3118,10 +3137,13 @@ function lckReset() {
   return 0
 }
 
-// `letCellKind`'s answer: a returned bundle's holder is that record (D15144), then the rep
-// the binding's type claims, the annotation's kind, else the rep kind of the type it holds.
+// `letCellKind`'s answer: a returned bundle's holder is that record (D15144), nullable where its
+// type holds null (a map read), then the rep the binding's type claims, the annotation's kind,
+// else the rep kind of the type it holds.
 function letCellKindGo(letIx: i32, fnIx: i32): VKind {
-  if holderRecordSigs(letIx, fnIx).length > 0 { return "struct" }
+  if holderRecordSigs(letIx, fnIx).length > 0 {
+    return if holderHoldsNull(letIx, fnIx) { "nulstruct" } else { "struct" }
+  }
   if letBindRepClaims(letIx, fnIx) {
     const ck = letBindRep(letIx, fnIx).rdKind
     if ck != null { return ck }
@@ -4633,6 +4655,19 @@ export function optChainStructIdxOf(exprIx: i32, fnIx: i32) {
     return sFieldTgtStructIdx(psi, pfi)
   }
   return structIndexOfExpr(exprIx, fnIx)
+}
+
+// True when `?.` leaf `exprIx` reps as an atom (`K | null`'s niche) but reads a field its layout
+// family stores as the string, so the leaf decodes the string to the atom.
+export function optLeafDecodesStr(exprIx: i32, fnIx: i32): boolean {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is OptMember) { return false }
+  const si = optChainStructIdxOf(e.omObj, fnIx)
+  if si < 0 || si >= sFieldStart.length { return false }
+  const fi = sFieldIndex(si, e.omProp)
+  if fi < 0 || fieldRowKind(sFieldStart[si] + fi) != "str" { return false }
+  const rd = repOfNode(exprIx, fnIx)
+  return rd.rdKind == "i32" && rd.rdNul == 3
 }
 
 // The fifth receiver shape of the member field-code ladder: a receiver typed `Arm | null`
@@ -6705,7 +6740,9 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     OptMember => {
       const olr = optChainLeafFieldRow(exprIx, fnIx)
       if olr < 0 { return false }
-      if fieldRowIsNulAtom(olr) { return true }
+      if fieldRowIsNulAtom(olr) || optLeafDecodesStr(exprIx, fnIx) {
+        return true
+      }
       return fieldRowIsPlainI32(olr) && nodeRepIsNulAtom(exprIx, fnIx)
     }
     // No other expression reads a literal-union niche.

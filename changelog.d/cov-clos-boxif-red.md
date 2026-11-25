@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- IR box of a valued if (lane COV-CLOS, I8 red list): a `??` boxed under a head written ahead of its value is claimed in two more shapes. In the first, a coalesce arm that does not stage its operand's leads (an element, a map read, an optional leaf) goes under an atom box's tag (`boxOfJoinAt`). In the second, a nested `??` goes into a nullable record join's niche box, whose stash slot is now taken ahead of the join, as legacy's rung takes it (`holeBoxHeadAhead`). On this class's programs, `box of a valued if` falls from 14 functions to 6. 4 of the 8 now claim, and 4 move on to `string operand after another`.

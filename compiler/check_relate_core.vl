@@ -187,6 +187,7 @@ import {
   chPendGiven,
   chPendNodes,
   chPendTys,
+  ihPendFn,
   ihPendGiven,
   ihPendHoles,
   ihPendNodes,
@@ -607,6 +608,7 @@ import {
 } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
 import {
+  CW_UP_CALLEE,
   covarRootName,
   cwBindingOf,
   cwBindingWrittenValues,
@@ -621,10 +623,14 @@ import {
   cwGetRecv,
   cwHeldFnOf,
   cwIxCovers,
+  cwIxNode,
   cwIxUp,
+  cwIxUpKind,
   cwIxWant,
   cwKeyOfDecl,
   cwKeyOfRoot,
+  cwOccNext,
+  cwOccWalk,
   cwParamArgs,
   cwPeel,
   cwSliceRecv,
@@ -766,8 +772,28 @@ function fillIfHoleNodes(h: i32) {
       // A nullable destination seeds its inner as the want; the join already reached it nullable.
       let want = ihPendWant[i]
       if want >= 0 && tyAdmitsNull(given) { want = joinTys(want, TY_NULL) }
-      if (want >= 0 && assignable(res, want)) || assignable(res, given) {
+      const fitsWant = want >= 0 && assignable(res, want)
+      if (
+        (fitsWant || assignable(res, given))
+        && !fillJoinHoldsOtherRec(res, if fitsWant { want } else { given })
+      ) {
         if ix < nodeTyIx.length { nodeTySet(ix, res) }
+      } else if fitsWant || assignable(res, given) {
+        const rf = fillRetFnOf(ix, ihPendFn[i])
+        if rf >= 0 && !fnCalledYet(rf) {
+          // The `if` is the function's one returned value and no call has read its return yet,
+          // so the return follows the re-banked join, as it would had the fill come first.
+          for ft in [declTyOf(rf), nodeTyIxOf(rf)] {
+            const bt = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+            if bt is TyFunc {
+              bt.fnRet = res
+              tyMutBump(ft, -1)
+            }
+          }
+          if ix < nodeTyIx.length { nodeTySet(ix, res) }
+        } else {
+          tErr(fillJoinOrderMsg(h, ihPendOthers[i], rf), ix)
+        }
       } else {
         tErr(
           "this `if` was typed "
@@ -786,6 +812,86 @@ function fillIfHoleNodes(h: i32) {
   return 0
 }
 
+// The un-annotated function `fd` whose one returned value is the `if` at `ix`; -1 when the `if`
+// is not that function's sole result.
+function fillRetFnOf(ix: i32, fd: i32): i32 {
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnName == "" || f.fnBody < 0 {
+    return -1
+  }
+  const ft = declTyOf(fd)
+  if ft < 0 || ft >= T.tys.length || !(tyAt(ft) is TyFunc) { return -1 }
+  let rets = 0
+  const stack: i32[] = [f.fnBody]
+  while stack.length > 0 {
+    const u = stack.pop() ?? -1
+    if u >= 0 && u < P.nodes.length {
+      const n = nodeAt(u)
+      if n is RetStmt {
+        if parenPeelIx(n.retArg) != ix { return -1 }
+        rets = rets + 1
+      }
+      if !(n is FuncDecl) {
+        for k in nodeChildren(u) { stack.push(k) }
+      }
+    }
+  }
+  return if rets > 0 { fd } else { -1 }
+}
+
+// Whether a checked call of function `fd` has typed its result by the return as it stands.
+function fnCalledYet(fd: i32): boolean {
+  const ow = cwOccWalk(fd)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    if u >= 0 && cwIxCovers(u) && cwIxUpKind[u] == CW_UP_CALLEE {
+      const c = cwIxUp[u]
+      if c >= 0 && nodeTyIxOf(c) >= 0 { return true }
+    }
+  }
+  return false
+}
+
+// The refusal for a re-banked join the `if`'s settled delivery has read: for function `rf`'s
+// returned value, the order that lets it run; for any other delivery, the gap it is.
+function fillJoinOrderMsg(h: i32, o: i32, rf: i32): string {
+  const fd = if rf >= 0 && rf < P.nodes.length { nodeAt(rf) } else { null }
+  const head = "this `if` joins "
+    + tyToStr(h)
+    + " and "
+    + tyToStr(o)
+    + " once the assignment below fills the binding"
+  if fd is FuncDecl {
+    return head
+      + ", and a call of `"
+      + fd.fnName
+      + "` reads that join before the fill; call `"
+      + fd.fnName
+      + "` after the assignment, or annotate the binding as "
+      + tyToStr(h)
+  }
+  return head
+    + "; the join is type-valid but cannot build after the fill yet — annotate the binding as "
+    + tyToStr(h)
+}
+
+// Whether join `res` holds a record `at`, the one record the `if` is delivered at, does not: an
+// arm of that record would reach `at`'s block unconverted.
+function fillJoinHoldsOtherRec(res: i32, at: i32): boolean {
+  const g = nonNullTy(at)
+  if g < 0 || g >= T.tys.length || !(tyAt(g) is TyObj) { return false }
+  const r = nonNullTy(res)
+  if r < 0 || r >= T.tys.length { return false }
+  const rt = tyAt(r)
+  const ms: i32[] = if rt is TyUnion { rt.uMembers } else { [r] }
+  for m in ms {
+    if m >= 0 && m < T.tys.length && tyAt(m) is TyObj && !tyEq(m, g) {
+      return true
+    }
+  }
+  return false
+}
+
 // Notes the value `if` at `ix` whose arm types `a` and `b` are one open hole and one settled type,
 // typed `given` and delivered to `want` (-1 for none), for `fillIfHoleNodes` to re-ask at the fill.
 export function noteIfHoleJoin(ix: i32, a: i32, b: i32, given: i32, want: i32) {
@@ -796,6 +902,7 @@ export function noteIfHoleJoin(ix: i32, a: i32, b: i32, given: i32, want: i32) {
   ihPendOthers.push(if ha { b } else { a })
   ihPendGiven.push(given)
   ihPendWant.push(want)
+  ihPendFn.push(curFnDeclIx)
   return 0
 }
 
@@ -10596,9 +10703,51 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
       const f = objFieldType(it2, hdField[row])
       if f >= 0 { return f }
     }
+    // A union of records reads a field every member has at the join of theirs, as a read off a
+    // receiver written at that union does.
+    if it2 is TyUnion {
+      const f = sharedUnionFieldTy(it2, hdField[row])
+      if f >= 0 { return f }
+    }
     return rebaseHoleUnder(row, inner2, bNames, bTys)
   }
   return -1
+}
+
+// Shared-field access over a struct union: a field present on every member is readable on the
+// union directly and its type is the join of the per-member field types. -1 when a member lacks
+// the field or is not a struct. The join is what admits a discriminated union, whose arms carry
+// the tag at mutually unassignable literal types; whether the read lowers is `sharedUnionFieldPlan`'s.
+export function sharedUnionFieldTy(u: TyUnion, prop: string) {
+  const members = u.uMembers
+  if members.length < 1 { return -1 }
+  let shared = -1
+  const acc = joinAccNew()
+  let i = 0
+  while i < members.length {
+    const mIx = members[i]
+    if mIx < 0 { return -1 }
+    const m = tyAt(mIx)
+    if m is TyObj {
+      const ft = objFieldType(m, prop)
+      if ft < 0 { return -1 }
+      if shared < 0 {
+        shared = ft
+      } else {
+        // Runtime field values of different numeric types join apart, as an `if` over the
+        // members' reads would.
+        njApartSet(true)
+        // Each member's field is a record that already exists, so the join keeps it a member
+        // rather than widening it in place, as a `??` over two existing records does (D15314).
+        njFixSet(true, true)
+        shared = joinTysInto(acc, shared, ft)
+      }
+    } else {
+      return -1
+    }
+    i = i + 1
+  }
+  return shared
 }
 
 // Whether `bindGenWalk` also binds through unions and generic-application arguments, for

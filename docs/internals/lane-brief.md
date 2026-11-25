@@ -99,6 +99,10 @@ not list reds that job. ready-check does not cover these:
   watches master and reverts a red master push at once; the lane then re-lands.
 - Do not self-merge a PR that changes a shared plan's output across many programs, a gate baseline
   or a ratchet: send READY with the proof lines and the coordinator merges.
+- A branch cut before land-check existed runs master's copy:
+  `git show origin/master:scripts/land-check.sh | bash -s <pr>`. In a worktree with no host binary
+  or seed, it takes the main checkout's.
+- On `LAND-RETRY`, run it again: the host or seed it copied was rebuilt while it checked.
 - On `LAND-NO: conflicts with master`, merge `origin/master` in (merge, not rebase), re-run
   `gate.sh --fast`, push, and run land-check again.
 - After a merge, start your next item. When your brief is done, send `DONE` with what landed, what
