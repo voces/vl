@@ -254,6 +254,7 @@ import {
   RResultPick,
   RRetNull,
   RRetag,
+  RSharedFieldSet,
   RSharedRead,
   RSimd,
   RSpread,
@@ -673,6 +674,12 @@ import {
   sharedArmModeReads,
   sharedArmTail,
   sharedArmTestTail,
+  sharedFieldArmCast,
+  sharedFieldArmClose,
+  sharedFieldArmTest,
+  sharedFieldArmsEnd,
+  sharedFieldStorePlan,
+  sharedFieldValSlot,
   sharedReadPlainOf,
   sharedReadPlanOf,
   sharedReadStashes,
@@ -1526,6 +1533,7 @@ function rhs(r: Rhs, tail: boolean) {
     RVariantDiscrim => variantDiscrim(r)
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
+    RSharedFieldSet => irLMiss("shared field store value")
     RBoxNarrow => boxNarrow(r)
     RNicheRead => nicheRead(r)
     RArmUnbox => armUnbox(r)
@@ -2717,6 +2725,56 @@ function sharedRead(r: RSharedRead) {
   if sharedReadTail(code, vis, fis, r.srAt, fnIx) < 0 { return -1 }
   if readOwesNonNullRecover(r.srAt, fnIx) { fbRefAsNonNull() }
   return 0
+}
+
+// `RSharedFieldSet`: legacy's shared field write. The receiver is staged once or pushed again per
+// arm, and the value staged once or written in its arm. Each arm but the last tests its tag; each
+// casts the payload to its variant and stores the value at its field.
+function sharedFieldSet(r: RSharedFieldSet) {
+  const fnIx = lw.irAt
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const plan = sharedFieldStorePlan(lhsOfAssign(r.shAt), fnIx, vis, fis)
+  if plan == 0 || r.shVs.length != (if plan == 1 { vis.length } else { 1 }) {
+    return irLMiss("shared field store plan")
+  }
+  const slot = if r.shStash { sharedFieldRecvSlot() } else { -1 }
+  if r.shStash {
+    irLOpnd(r.shR)
+    fbLocalSet(slot)
+  }
+  const vslot = if plan == 2 { sharedFieldValSlot(lhsOfAssign(r.shAt), fnIx, vis, fis) } else { -1 }
+  if plan == 2 {
+    irLOpnd(r.shVs[0])
+    fbLocalSet(vslot)
+  }
+  let i = 0
+  while i < vis.length {
+    if i < vis.length - 1 {
+      sharedFieldSetRecv(r, slot)
+      sharedFieldArmTest(vis, i)
+    }
+    sharedFieldSetRecv(r, slot)
+    sharedFieldArmCast(vis, i)
+    if plan == 2 { fbLocalGet(vslot) } else { irLOpnd(r.shVs[i]) }
+    sharedFieldArmClose(vis, fis, i)
+    i = i + 1
+  }
+  return sharedFieldArmsEnd(vis)
+}
+
+// One receiver push of shared field write `r`: its stash slot's box, its global's, else its box
+// local.
+function sharedFieldSetRecv(r: RSharedFieldSet, slot: i32) {
+  if r.shStash { return sharedRecvSlotGet(slot) }
+  if r.shGlobal >= 0 { return globalRead(r.shGlobal, r.shGlobalNonNull) }
+  return irLOpnd(r.shR)
+}
+
+// The target of assignment node `at`, or -1.
+function lhsOfAssign(at: i32): i32 {
+  const a = nodeAt(at)
+  return if a is BinExpr { unwrapParen(a.binLeft) } else { -1 }
 }
 
 // One member's arm of shared read `r`, in its form (`sharedArmModeOf`) as legacy writes it: the
@@ -5509,6 +5567,11 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       }
       if r is RMapClear {
         mapClear(r)
+        irLSettle(pending)
+        return 0
+      }
+      if r is RSharedFieldSet {
+        sharedFieldSet(r)
         irLSettle(pending)
         return 0
       }
