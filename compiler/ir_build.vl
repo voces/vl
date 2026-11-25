@@ -57,6 +57,7 @@ import {
 import { irTyF64, irTyI64 } from "./ir_helper"
 import { fnSigIdxOfFn } from "./emit_closure_sites"
 import { numUnionMinted } from "./check_union_mint"
+import { strListHas } from "./listutil"
 import {
   ArrayLit,
   AsExpr,
@@ -711,6 +712,7 @@ import {
   asgYieldsNullLit,
   boxedFieldUnionTyOf,
   callIsArrSlice,
+  capCellName,
   capCellTargetOf,
   captureCountOf,
   captureNamesOf,
@@ -728,6 +730,7 @@ import {
   exprNulLitUnion,
   exprNullableMap,
   exprNullableRefNiche,
+  exprTypedTagId,
   exprUnion,
   fnBundleRetSigs,
   fnIndexOfNode,
@@ -836,7 +839,7 @@ import {
   fnCheckedRetTy,
   globalIndexOfSid,
 } from "./emit_fn_ret_kinds"
-import { declOrigOf, identDeclOf, sidOfNode } from "./symbols"
+import { declOrigOf, identDeclOf, nodeSrc, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
 import {
   charLitCp,
@@ -6033,12 +6036,27 @@ function liftCapDecl(pos: i32, name: string): i32 {
   if known != -2 { return known }
   let found = -1
   const todo: i32[] = [fnStmts[pos]]
+  // A capture the body does not read is carried for a nested function it names that captures it;
+  // that function's body is walked too, once, unless the lifted function reads it through its cell.
+  const seen: {[i32]: boolean} = Map()
   while todo.length > 0 && found < 0 {
     const i = todo.pop() ?? -1
     const n = if i >= 0 && i < P.nodes.length { nodeAt(i) } else { null }
-    if n is Ident && n.identName == name {
+    if n is Ident {
       const d = identDeclOf(i)
-      if d >= 0 && d < P.nodes.length && nodeAt(d) is LetDecl { found = d }
+      const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+      if n.identName == name && dn is LetDecl { found = d }
+      if dn is FuncDecl && !(seen[d] ?? false) {
+        seen[d] = true
+        const fp = fnStmtsPosOf(d)
+        if (
+          fp >= 0
+          && strListHas(captureNamesOf(fp), name)
+          && !strListHas(captureNamesOf(pos), capCellName(fp))
+        ) {
+          todo.push(d)
+        }
+      }
     }
     if i >= 0 && i < P.nodes.length { nodeChildrenPush(i, todo) }
   }
@@ -8401,6 +8419,17 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     // another instance may have set, is not it.
     const hole = holeCloTy(nodeTyAt(unwrapParen(ix), ibFnIx))
     const ty = if dstTy >= 0 && !(hole && repNodeOfTy(dstTy) != dst) { dstTy } else { repTyOf(dst) }
+    return cloValue(b, unwrapParen(ix), dst, ty)
+  }
+  // A function name typed as a tagged set's id, read where the set marks no leaf, is the closure
+  // its destination holds: legacy's `emitIdentNode` writes `emitClosureValue` whatever the type.
+  if (
+    ibMiss == ""
+    && dst >= 0
+    && repNodeAt(dst) is RClosure
+    && taggedNameCloValue(ix)
+  ) {
+    const ty = if dstTy >= 0 && repNodeOfTy(dstTy) == dst { dstTy } else { repTyOf(dst) }
     return cloValue(b, unwrapParen(ix), dst, ty)
   }
   // A box local narrowed to a record arm at a record destination: the box, then the table's
@@ -13536,6 +13565,9 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
   if irBOpRep(a) != ri { return skip("for range bound rep") }
   const v = irVarNew(ib, ri, TY_I32, "local", vw)
   ibDeclVar[ix] = v
+  // An instance's loop is a clone whose body reads still name the source's declaration.
+  const src = nodeSrc[ix] ?? -1
+  if src >= 0 { ibDeclVar[src] = v }
   irBNode(b, { asDst: v, asSrc: a }, -1, ibNoValue, ix)
   let bound: Opnd = { oiRep: ri, oiBits: 0 }
   if rangeConstIs(n.frTo, ibFnIx) {
@@ -13735,11 +13767,13 @@ function rangeBodyOf(n: ForRange): i32[] {
   return fb
 }
 
-// The innermost unrolled copy of range loop `d` being built, or -1.
+// The innermost unrolled copy of range loop `d`, or of an instance's clone of it, or -1.
 function rangeImmAt(d: i32): i32 {
   let k = ibRangeImmAt.length - 1
   while k >= 0 {
-    if ibRangeImmAt[k] == d { return k }
+    if ibRangeImmAt[k] == d || (nodeSrc[ibRangeImmAt[k]] ?? -1) == d {
+      return k
+    }
     k = k - 1
   }
   return -1
@@ -16261,6 +16295,20 @@ function untypedCloValue(ix: i32): boolean {
   const t = nodeTyAt(u, ibFnIx)
   if t >= 0 && !holeCloTy(t) { return false }
   if exprPrePathWhy(u, ibFnIx) != "" { return false }
+  return cloValueFeOf(u) >= 0
+}
+
+// Whether `ix` is a function name whose type is a tagged set's id (`fnTagTyIsTagged`) at a read the
+// set does not write as a member's id (`fnTagLeafEmitted`), and no coercion converts.
+function taggedNameCloValue(ix: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is Ident) { return false }
+  if !exprTypedTagId(u, ibFnIx) || fnTagLeafEmitted(u, ibFnIx) >= 0 {
+    return false
+  }
+  if coerceKindAt(u, ibFnIx) != "none" || exprPrePathWhy(u, ibFnIx) != "" {
+    return false
+  }
   return cloValueFeOf(u) >= 0
 }
 
