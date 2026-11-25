@@ -605,6 +605,15 @@ export type RMapHas = {
   mhKey: Opnd,
   mhAt: i32,
 }
+// `m.clear()` at call `mcAt` on map global `mcSym` (receiver node `mcRecv`, recovered for
+// `mcNonNull`), or with `mcSym` -1 receiver operand `mcLoc`: legacy's reset of the map in place.
+export type RMapClear = {
+  mcSym: i32,
+  mcNonNull: boolean,
+  mcLoc: Opnd,
+  mcRecv: i32,
+  mcAt: i32,
+}
 // `m.delete(k)` at call `mdAt` on map global `mdSym` (receiver node `mdRecv`, recovered for
 // `mdNonNull`), or with `mdSym` -1 receiver operand `mdLoc`, key `mdKey`: legacy's probe, the
 // entry's tombstone and an i32 0 or 1.
@@ -751,6 +760,7 @@ export type Rhs = RAfterEffects
   | RMakeClo
   | RMakeList
   | RMakeRec
+  | RMapClear
   | RMapDelete
   | RMapEq
   | RMapFilter
@@ -1154,6 +1164,9 @@ export type IrFn = {
   irBoxLeadFirst: i32[],
   irBoxLeadBox: i32[],
   irBoxLeadN: i32[],
+  // The boxes, by their value's node, whose value is built with a statement under it (a valued
+  // `if` or `??`): the lowering holds that value in a local and writes the head after it.
+  irBoxLate: i32[],
 }
 
 // Whether effect node `id` is one `irNoTailEff` names.
@@ -1231,6 +1244,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irBoxLeadFirst: [],
     irBoxLeadBox: [],
     irBoxLeadN: [],
+    irBoxLate: [],
     irReadAgain: Map(),
     irReadBoxed: Map(),
     irSkipBase: Map(),
@@ -1528,6 +1542,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RMakeClo |
       RMakeList |
       RMakeRec |
+      RMapClear |
       RMapDelete |
       RMapEq |
       RMapFilter |
@@ -1907,6 +1922,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMapGetOr => [r.mgLoc, r.mgKey, r.mgDef]
     RMapGet => [r.mtLoc, r.mtKey]
     RMapHas => [r.mhLoc, r.mhKey]
+    RMapClear => [r.mcLoc]
     RMapDelete => [r.mdLoc, r.mdKey]
     RMapEq => [r.mqLoc, r.mqKey, r.mqOther]
     RMapIter => [r.miV]
@@ -2144,6 +2160,7 @@ function rhsText(r: Rhs): string {
     RMapGetOr => "map.get_or " + mapRecvText(r.mgSym, r.mgLoc) + "[" + opndText(r.mgKey) + "]"
     RMapGet => "map.get " + mapRecvText(r.mtSym, r.mtLoc) + "[" + opndText(r.mtKey) + "]"
     RMapHas => "map.has " + mapRecvText(r.mhSym, r.mhLoc) + "[" + opndText(r.mhKey) + "]"
+    RMapClear => "map.clear " + mapRecvText(r.mcSym, r.mcLoc)
     RMapDelete => "map.delete " + mapRecvText(r.mdSym, r.mdLoc) + "[" + opndText(r.mdKey) + "]"
     RMapEq => "map.eq "
       + mapRecvText(r.mqSym, r.mqLoc)
@@ -2534,7 +2551,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RMapFilter |
       RSpread |
       RStrOp => "list"
-    RMapDelete |
+    RMapClear |
+      RMapDelete |
       RMapEq |
       RMapGet |
       RMapGetOr |
@@ -2921,6 +2939,24 @@ export function recRowRetag(src: i32, dst: i32, hs: {[i32]: i32}): boolean {
   return repsLowerAlike(src, dst, hs) || recFieldsWiden(src, dst, hs)
 }
 
+// Whether plain record rep `src`, with no heap of its own, held on heap `h` (a list's element storage
+// legacy lays out) stands at plain record rep `dst` on `h` as `recRowRetag` admits; where it does,
+// `src` is noted at `h` in `hs`, so the retag's check reads the same heap.
+export function recRowRetagOn(
+  src: i32,
+  dst: i32,
+  h: i32,
+  hs: {[i32]: i32},
+): boolean {
+  if h < 0 || heapNotedOr(hs, src) >= 0 || heapNotedOr(hs, dst) != h {
+    return false
+  }
+  hs[src] = h
+  if recRowRetag(src, dst, hs) { return true }
+  hs[src] = -1
+  return false
+}
+
 // Whether record temp `v` at plain record rep `src`, built at a struct heap (`irVarHeapOf`) its rep
 // notes none of, stands at plain record rep `dst` on that heap: fields lower alike by name over the
 // heaps noted in `f`. The note is the temp's own, so it says nothing of another value of `src`.
@@ -3206,21 +3242,31 @@ export function recHeapOf(r: i32): i32 {
   return askRecordHeap(ty)
 }
 
-// The record, list or map rep of list element `e`, under a `| null`, or -1.
+// The rep list element `e` is stored at with or without a `| null`, or -1: a record, list, map or
+// string its nullable ref backing holds alike, or a boolean or atom its i32 backing holds with the
+// null as the niche's sentinel.
 function recElemCore(e: i32): i32 {
   const n = repNodeAt(e)
   if n == null { return -1 }
   return match n {
-    RRecord | RList | RMap => e
+    RAtom |
+      RList |
+      RMap |
+      RRecord => e
+    RPrim => if (n.rpK == "str" || n.rpK == "bool") && n.rpPacked == 0 { e } else { -1 }
     RNullable => {
       const i = repNodeAt(n.rnInner)
-      if i is RRecord || i is RList || i is RMap { n.rnInner } else { -1 }
+      const ref = i is RRecord
+        || i is RList
+        || i is RMap
+        || n.rnDisc == 1 && repPrim(n.rnInner) == "str"
+      const niche = n.rnDisc == 2 && repPrim(n.rnInner) == "bool"
+        || n.rnDisc == 3 && i is RAtom
+      if ref || niche { n.rnInner } else { -1 }
     }
-    RAtom |
-      RBox |
+    RBox |
       RClosure |
       RNoValue |
-      RPrim |
       RRaw |
       RUnsup => -1
   }
