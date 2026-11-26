@@ -47,7 +47,9 @@ change sentence and still miss:
 - soundness/covariant-record-field-read-only-runs `@init`: `convert list -> list` → `field read of
   a stored row`.
 
-Two 100-file batches exit 70 on both probes alike, from the same programs.
+On both probes alike, two 100-file batches exit non-zero: one names D17671's Q58 test, which this
+merge-base does not yet hold, and one holds D17671's `mk`, invalid on this merge-base. Their other
+files are graded.
 
 **Not covered.** The two tests' `@start` still misses `global initializer coercion` at
 `const m = Map()`, on master too; that's regen-11's class, next in the series.
