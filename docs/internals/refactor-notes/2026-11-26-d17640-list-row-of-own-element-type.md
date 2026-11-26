@@ -24,4 +24,8 @@ element type keys, before its inner-rows fallback.
   a returned list, two elements, and a walk. It prints the same output on legacy and under
   `$VL_IR_STRICT=1`. The IR still declines its elements (`array element coercion`), which the
   element retag change addresses separately.
-- `distilled/regress.vl`: see the PR.
+- `distilled/regress.vl`: no runs lost. Its movement list is identical to master's seed.
+- The fix is in a shared layout plan, not the legacy emitter alone. `arrLitRowSlotIn` feeds
+  `letRefListSlot` and `letCellSlot`, the global cell's slot, which the shared global section writes
+  and the IR builder reads (`fbValtype(k, letCellSlot(...))`). On master the witness fails under
+  `$VL_IR_STRICT=1` with the same message.
