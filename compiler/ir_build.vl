@@ -3012,6 +3012,10 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   if r >= 0 && r < P.nodes.length && nodeAt(r) is Member {
     return storedMemberBoxTest(b, n, ix, rep, tag)
   }
+  // An element's or map cell's box is its read at the storage, tested by tag as a local's is.
+  if tag >= 0 && r >= 0 && r < P.nodes.length && nodeAt(r) is Index {
+    return storedValueTagTest(b, n, ix, rep, ta, tag)
+  }
   const v = rawBoxVar(r)
   // A module global's box is its cell read raw, as legacy's storage read pushes it.
   if v < 0 && globalBoxSymOf(identDeclOf(r), r) >= 0 {
@@ -10044,6 +10048,31 @@ export function deliverStr(b: i32[], ix: i32): Opnd {
   return deliver(b, ix, repNodeOfTy(TY_STR), TY_STR)
 }
 
+// String operand `p` as legacy's `emitStrValue` writes it: a literal-union part decodes to its
+// member string and a dead `never` read is `unreachable` at the string (`deliverStr`), a call
+// that never returns and builds no string is that call and then the dead string, any other part
+// is built as it stands.
+export function strPartAt(b: i32[], p: i32): Opnd {
+  if exprIsLitAtom(p, ibFnIx) || exprReadsDeadNever(p, ibFnIx) {
+    return deliverStr(b, p)
+  }
+  const u = unwrapParen(p)
+  const c = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if !(c is Call) || !callEndsNever(u) || repPrim(exprRepOf(u)) == "str" {
+    return irBExpr(b, p)
+  }
+  const r = callRhs(b, c, u)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  irBNode(b, { efRhs: r }, -1, ibNoValue, u)
+  return irBLetTempTy(
+    b,
+    { dnAt: u, dnPad: false },
+    u,
+    repNodeOfTy(TY_STR),
+    TY_NEVER,
+  )
+}
+
 // Value `e` a union list's element is built from for its box (a literal's element, a store's value):
 // a `null` literal has no value of its own, so the box writer writes the null tag alone.
 function unionElemValue(b: i32[], e: i32): Opnd {
@@ -10695,7 +10724,7 @@ function boxTempIn(
 ): Opnd {
   if ibMiss != "" { return v }
   // A value with no recorded box union is boxed into its destination rep's own union.
-  const uTy = if uTy0 < 0 { repTyOf(dst) } else { uTy0 }
+  let uTy = if uTy0 < 0 { repTyOf(dst) } else { uTy0 }
   // A `null`-typed call is the box ladder's first rung (`emitNulNoneBoxPayload`), the call its
   // payload; any other `null`-typed value stays legacy's.
   if exprIsNulNone(ix, ibFnIx) && heldAsBox(dst) {
@@ -10747,6 +10776,16 @@ function boxTempIn(
       ix,
       dst,
     )
+  }
+  // A value the recorded union leaves to the ladder is planned at the union `dst` holds, which
+  // legacy's box writes (its null box tag is the program's, whatever the record names).
+  const dTy = repTyOf(dst)
+  if p.hbArm == "ladder" && dTy >= 0 && dTy != uTy {
+    const rp = holeBoxPlanOf(ix, dTy, ibFnIx)
+    if rp.hbArm != "ladder" {
+      p = rp
+      uTy = dTy
+    }
   }
   // An assignment the ladder would box is boxed as its target's value after its store, on the
   // target's own plan (an `asgLit`, say: the stored literal's box at the target's kind).
@@ -14364,8 +14403,10 @@ function mapGetAt(
   row: boolean,
   tempTy: i32,
   trap: boolean,
-  whole: boolean,
+  whole0: boolean,
 ): Opnd {
+  // A read at its storage is the value's box past its narrowing, as a `whole` read is.
+  const whole = whole0 || isStorageRead(ix)
   const rd = nodeAt(ix)
   if !(rd is Index) { return irBMiss("map get") }
   const arm = mapGetArmOf(ix, ibFnIx)
@@ -16307,7 +16348,7 @@ function accAppend(b: i32[], n: BinExpr, ix: i32) {
   let i = 1
   while i < parts.length {
     const from = b.length
-    const a = irBExpr(b, parts[i])
+    const a = strPartAt(b, parts[i])
     if ibMiss != "" { return 0 }
     if args.length > 0 && !irBStageLeads(b, from, starts, args, ixs) {
       return skip("string operand after another")
@@ -17910,11 +17951,14 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     }
     // Legacy may build a `[]` its pushes follow at its final size, through locals (D3623).
     const lr = if pos >= 0 { listReserveScan(n, sibs, pos, ibFnIx) } else { null }
-    // The lowering opens a reserve over a function's body only (`reserveOpen`).
+    // The lowering opens a reserve over a function's body or the start body's program
+    // (`reserveOpen`), not another helper's.
     const inFn = ibFnIx >= 0
       && ibFnIx < P.nodes.length
       && nodeAt(ibFnIx) is FuncDecl
-    if lr != null && !inFn { return skip("list reserve outside a function") }
+    if lr != null && !inFn && !irFnBuiltOnce(ib) {
+      return skip("list reserve outside a function")
+    }
     // An annotated binding of a bundle holder's read takes the member its type names, as legacy's
     // `emitTypedHolderInit` picks it ahead of every other initializer.
     if typedHolderMember(ix, ibFnIx) >= 0 { return holderPickLet(b, n, ix, v) }
