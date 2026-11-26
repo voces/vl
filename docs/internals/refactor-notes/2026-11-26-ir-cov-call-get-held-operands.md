@@ -25,11 +25,18 @@ receiver's temp was still pending when the index built.
 
 ## Proof
 
+- **`coalNiche`'s string-literal default** writes its operand in place inside legacy's block. It
+  now refuses an operand that built an inner `??` (`coalesce string operand holds a ??`), as it
+  already refused a valued `if`: that out stays on the stack beneath the reads after it. Once the
+  rest of such a start body built, its lowering fell back on `stack value read out of order`, and
+  the shadow's unlowered row rose. The shape fails the same way on a current-master seed, where an
+  earlier statement's miss hid it.
+
+## Proof
+
 - **Census**, CENSUS's nested programs plus `closures/record-list-fn-field-two-results-opt-call`:
-  every start body is claimed except `list-get-nested-stash-string`'s. Its lines 7 and 8, a
-  string-list `.get ?? d` whose receiver's argument holds a fused read, fall back on
-  `stack value read out of order`, as line 7 already does on a current-master seed. That is a
-  separate mechanism.
+  every start body is claimed except `list-get-nested-stash-string`'s, which now misses by name on
+  the string `??` above.
 - **Armed sweep:** every `@run` program under `tests/cases/lists/` (258) prints the same with
   `VL_IR_SHADOW=6 VL_IR_STRICT=1` as without.
 - **Q58:** `tests/cases/lists/get-held-operand-positions.vl` puts a plain `.get` with a fused-`??`
