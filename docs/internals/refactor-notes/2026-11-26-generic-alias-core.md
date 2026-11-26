@@ -9,4 +9,14 @@ the binding missed `closure value refused`. `cloValue` now takes the core arm fo
 
 ## Measurements
 
-MEASUREMENTS_PLACEHOLDER
+I8 census over the `tests/cases` programs, the new position test among them (base and head at
+master `e71640fbf`): `closure value refused` 7 → 0 unclaimed functions (`aliasNum` of
+`nested-hole-fn-namesakes.vl`, and the position test's six). Claimed functions 97,691 → 97,698,
+claimed starts 8,409 → 8,409; 0 claimed functions or starts lost, no other class moved.
+
+Claims-off ripple (`VL_IR_SHADOW=1`, every `tests/cases` program): 0 of 8,198 built programs
+differ in bytes; 1,447 fail to build on both seeds (expected-error cases).
+
+Q58 position sweep (`tests/cases/functions/generic-alias-core-positions.vl`: called once, twice,
+over a capture, two defaulted parameters, in a loop, inside a lambda): base 6 functions miss,
+head 0; output identical claims-off and on.
