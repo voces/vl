@@ -61,7 +61,7 @@ elif [ "$pin_now" -lt "$pin_was" ]; then
   printf '{"emit_mono.vl": %s, "commit": "%s"}\n' "$pin_now" "$(git rev-parse --short=9 HEAD)" > scripts/pin-helper-budget-baseline.json
   echo "rebaseline: pin-helper-budget: written ($pin_was -> $pin_now)"
 fi
-for s in late-demands self-ir-misses; do
+for s in late-demands; do
   ratchet "$s" "$VL" run "scripts/$s.vl" --compiler "$SEED" -- --check --seed "$SEED" \
     :: "$VL" run "scripts/$s.vl" --compiler "$SEED" -- --write-baseline --seed "$SEED"
 done

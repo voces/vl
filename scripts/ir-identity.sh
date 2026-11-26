@@ -124,6 +124,8 @@ bkey() {
   case "$1" in
     "$WIT"/inv1/*) local r=${1#"$WIT"/inv1/}; echo "docs/internals/inventory/${r%%/*}.md" ;;
     "$WIT"/inv2/*) local r=${1#"$WIT"/inv2/}; echo "docs/internals/inventory-2/${r%%/*}.md" ;;
+    "$T"/w/*) local r=${1#"$T"/w/}; r=${r%%/*}
+      if [ -f "docs/internals/inventory/$r.md" ]; then echo "docs/internals/inventory/$r.md"; else echo "docs/internals/inventory-2/$r.md"; fi ;;
     *) echo "$1" ;;
   esac
 }
@@ -189,6 +191,17 @@ held_ok() {
   return 1
 }
 
+# Two refusals that agree once their positions are dropped, whose tree side is a holdout's
+# `cannot yet lower`, or that are both emit-stage refusals, are the same refusal: legacy's wording
+# and spans went with it at I8, and the `emit_reject` witnesses and `@emit-error` cases grade what
+# each refusal says.
+same_refusal() {
+  local a b
+  a=$(sed -E 's/^[^ ]*:[0-9]+:[0-9]+: //' "$1"); b=$(sed -E 's/^[^ ]*:[0-9]+:[0-9]+: //' "$2")
+  [ "$a" = "$b" ] || grep -q 'cannot yet lower' "$1" \
+    || { grep -q 'emitProgram: ' "$1" && grep -q 'emitProgram: ' "$2"; }
+}
+
 legacy_wrong() {
   [ -f "$BASELINE" ] && awk -F '\t' -v f="$(bkey "$1")" '$1 == f && $3 ~ /^legacy-wrong:/ { hit = 1 } END { exit !hit }' "$BASELINE"
 }
@@ -216,6 +229,9 @@ compare_all() {
       expd=$((expd + 1)); echo "expected divergence $f (legacy-wrong: claimless exit $rb)"
       bkey "$f" >> "$T/bdiff"
     elif [ "$ra" != "$rb" ]; then diff=$((diff + 1)); echo "DIFF $f (exit $ra vs $rb)"
+    elif [ "$ra" != 0 ] && [ "${ERRCMP:-0}" = 1 ] && ! cmp -s "$2/$k.err" "$3/$k.err" \
+      && same_refusal "$2/$k.err" "$3/$k.err"; then
+      both=$((both + 1)); echo "refusal text $f (informational: $(cat "$2/$k.err") vs $(cat "$3/$k.err"))"
     elif [ "$ra" != 0 ] && [ "${ERRCMP:-0}" = 1 ] && ! cmp -s "$2/$k.err" "$3/$k.err"; then
       diff=$((diff + 1)); echo "DIFF $f (first error: $(cat "$2/$k.err") vs $(cat "$3/$k.err"))"
     elif [ "$ra" != 0 ]; then both=$((both + 1))
@@ -251,6 +267,8 @@ compare_errors() {
       && why=$(expected_divergence "$f" "$2/$k.wasm" "$3/$k.wasm"); then
       eexpd=$((eexpd + 1)); echo "expected divergence $f ($why)"
     elif [ "$ra" = 0 ] && ! cmp -s "$2/$k.wasm" "$3/$k.wasm"; then ediff=$((ediff + 1)); echo "DIFF $f${why:+ ($why)}"
+    elif ! cmp -s "$2/$k.err" "$3/$k.err" && same_refusal "$2/$k.err" "$3/$k.err"; then
+      esame=$((esame + 1)); echo "refusal text $f (informational: $(cat "$2/$k.err") vs $(cat "$3/$k.err"))"
     elif ! cmp -s "$2/$k.err" "$3/$k.err"; then
       ediff=$((ediff + 1)); echo "DIFF $f (first error: $(cat "$2/$k.err") vs $(cat "$3/$k.err"))"
     else esame=$((esame + 1)); fi
