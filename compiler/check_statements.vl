@@ -6,7 +6,7 @@ import { checkTailArmsAgainst } from "./check_fn_decl"
 import { noteOpenUnionRows } from "./check_hole_links"
 import { openMemberRows } from "./check_leaf_steps"
 import { HD_ITER1, HD_ITER2, gnotRecordBase } from "./check_hole_pins"
-import { strListHas, strListIndexOf } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import { exprIsCollCtorCall } from "./check_list_origin"
 import {
   nodeTyIx,
@@ -367,8 +367,12 @@ import {
   TyArray,
   TyErr,
   TyFunc,
+  TyLit,
   TyMap,
+  TyNeg,
+  TyNullable,
   TyObj,
+  TyPrim,
   TyUnion,
   TyVar,
   mkArrayTy,
@@ -389,6 +393,7 @@ import {
   tyPinVal,
   tySame,
   tyToStr,
+  tyValOf,
   tyValOpen,
 } from "./check_types"
 import { breakValueAt, joinLeavesOf } from "./check_unconsumed"
@@ -678,6 +683,7 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     }
   }
   const keptJoin = if annot < 0 { letKeptJoinAtPin(n.letInit) } else { -1 }
+  const initD0 = T.diags.length
   if n.letInit >= 0 {
     if tpEnvNames.length > 0 { tpIfMarkOk(n.letInit) }
     initTy = checkNodeHook(n.letInit)
@@ -686,7 +692,7 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   if annot < 0 && T.frames.length == 1 && (moduleGlobals[n.letName] ?? false) {
     initTy = letHoistedOpenCtn(ix, n.letInit, initTy)
   }
-  initTy = letDeclInitVerdicts(n, ix, annot, initTy, seedMark)
+  initTy = letDeclInitVerdicts(n, ix, annot, initTy, seedMark, initD0)
   let bound = TY_ERR
   if annot >= 0 {
     bound = annot
@@ -881,6 +887,7 @@ function letDeclInitVerdicts(
   annot: i32,
   initTy0: i32,
   seedMark: i32,
+  initD0: i32,
 ): i32 {
   let initTy = initTy0
   // A `void` initializer has no value to bind — reject with a source-located message,
@@ -943,6 +950,27 @@ function letDeclInitVerdicts(
         + n.letName
         + "` would hold a `never` value, and none exists: its initializer never returns — call it as a statement, or declare the binding's type",
       ix,
+    )
+    initTy = TY_ERR
+  }
+  // A generic call whose type parameter no argument bound leaves its result a type variable no
+  // enclosing body declares; an un-annotated binding would hold a value of no type (D17575). An
+  // initializer that already raised a diagnostic has said why, so this one would only repeat it.
+  const quiet = T.diags.length == initD0
+  const unbName = if quiet && n.letInit >= 0 && annot < 0 { tyUnscopedVarName(initTy, []) } else { "" }
+  if unbName != "" {
+    const call = nodeAt(n.letInit)
+    const cf = if call is Call && call.callFn >= 0 { nodeAt(call.callFn) } else { null }
+    const who = if cf is Ident { "`" + cf.identName + "`" } else { "the call" }
+    tErr(
+      "cannot infer the type parameter `"
+        + unbName
+        + "` of "
+        + who
+        + ": no argument fixes it; annotate `"
+        + n.letName
+        + "` or pass the type parameter explicitly",
+      n.letInit,
     )
     initTy = TY_ERR
   }
@@ -2671,4 +2699,37 @@ function forInHoleUnion(t: i32): boolean {
     }
   }
   return true
+}
+
+// The name of the first type variable in `ty` that is no inference hole and that no enclosing body
+// declares, through lists, nullables, maps, records and unions; "" for none. A function type's own
+// type variables are its generics', so it is not entered.
+function tyUnscopedVarName(ty: i32, seen: i32[]): string {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return "" }
+  seen.push(ty)
+  const t = tyAt(ty)
+  return match t {
+    TyVar => {
+      const hole = t.tvName.length > 0 && t.tvName.slice(0, 1) == "?"
+      if hole || strListHas(tpEnvNames, t.tvName) { "" } else { t.tvName }
+    }
+    TyArray => tyUnscopedVarName(tyElemOf(t), seen)
+    TyNullable => tyUnscopedVarName(t.nInner, seen)
+    TyMap => {
+      const k = tyUnscopedVarName(tyKeyOf(t), seen)
+      if k != "" { k } else { tyUnscopedVarName(tyValOf(t), seen) }
+    }
+    TyObj => tyUnscopedFirst(t.objFieldTypes, seen)
+    TyUnion => tyUnscopedFirst(t.uMembers, seen)
+    TyFunc | TyPrim | TyErr | TyLit | TyNeg => ""
+  }
+}
+
+// `tyUnscopedVarName` over each of `tys`, the first name found; "" for none.
+function tyUnscopedFirst(tys: i32[], seen: i32[]): string {
+  for m in tys {
+    const n = tyUnscopedVarName(m, seen)
+    if n != "" { return n }
+  }
+  return ""
 }
