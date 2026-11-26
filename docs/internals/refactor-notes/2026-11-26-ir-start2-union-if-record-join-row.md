@@ -18,8 +18,15 @@ coordinator folded two neighbouring findings into the same branch.
    The lowering (`ifJoinField`) reads the field at the row of the operand's rep, as `sharedField`
    reads a field at a row it names.
 
+3. **Printing that read.** `print` takes its arm from `printArmOf`, and the string-op scratch frame
+   from `exprHasStrOp`; both ask `exprString`, whose read rep names no struct either, so a string
+   field printed as `i32`. `exprString` now answers a field read off a value `if` from its checked
+   rep, so the arm and the frame agree. This closes D17108, whose grading case gains the position.
+
+Legacy still refuses a direct read, so those programs (D17108's witness and the two cases holding
+one) are listed `legacy-wrong` in `ir-divergence-baseline.txt`, graded on the IR-on run alone.
+
 Graded under `VL_IR_REQUIRE_CLAIM=1` (isolated host) against a control compiler without the change,
 which refuses every one. D4645's grading list passes: its repro, the three ablation spellings, and
-D2907's un-annotated and direct spellings. `ir-parity --behaviour-only`: byte-identical wherever
-legacy builds the program. A program with a direct read is one legacy refuses, so it has no
-claimless twin.
+D2907's un-annotated and direct spellings, and so does D17108's. `ir-parity --behaviour-only`:
+byte-identical wherever legacy builds the program.
