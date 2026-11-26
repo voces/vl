@@ -35,6 +35,10 @@ The seed of layout stage 2b's head against this tree's.
 - **Positions file:** `tests/cases/lists/record-of-two-unannotated-functions-in-list-positions.vl`.
   It calls `r` off the element, off the element bound first, and inside a function the list is
   handed to. The head prints `7 8 3` and is claimed; the control exits 1.
+- **Legacy-wrong bookkeeping:** legacy still writes the invalid module, so an armed-shadow
+  `vl check --codegen` of the positions file exits 70 and fails its chunk. Like the two programs
+  already there, it is listed in `claims-off-skip.txt` and as an expected divergence in
+  `scripts/ir-divergence-baseline.txt` (`__start__@1`, legacy-wrong).
 - **Positions left out:**
   - calling `s` alone also runs on the head (prints `12`);
   - calling both fields in one program, or in a loop, makes legacy store the ids, and it already
