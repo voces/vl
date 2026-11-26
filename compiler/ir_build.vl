@@ -6848,30 +6848,17 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       if i > 0 && !irBStageLeads(b, at, starts, args, cargs) {
         return missRhs("short-circuit argument after another")
       }
-      // A list at its parameter's storage where no coercion is recorded (a twin, closures apart in
-      // a hole, a hole's closure list keyed at the parameter's: `cloListUndeclaredTakes`), or a
-      // record on the parameter's struct heap or a declared subtype's (`recRetagAt`), goes in as
-      // it stands, retagged.
-      const ra = if (irBOpRep(a) != pr
-        && (listRetag(irBOpRep(a), pr)
-        || holeRetagNoted(irBOpRep(a), pr, true)
-        || recRetag(irBOpRep(a), pr)
-        || cloListUndeclaredTakes(irBOpRep(a), pr))
-        && exprPrePathWhy(cargs[i], ibFnIx) == "") { repTempTy(b, { rgV: a }, cargs[i], pr, pt) } else if irBOpRep(a) != pr && recRetagNoted(irBOpRep(a), pr, cargs[i]) { repTempTy(b, { rgV: a }, cargs[i], pr, pt) } else { a }
+      // A value its parameter takes as it stands or retagged is converted first (`irConvert`).
+      const ra = if convertKindOf(a, pr, pt, cargs[i]) >= 0 { irConvert(b, a, pr, pt, cargs[i]) } else { a }
       // A union parameter boxes the argument as legacy's `emitUnionBoxOwed` does (the floor); a
       // reference its parameter's valtype holds as it stands is passed as is (`repStoresAs`).
       const fa0 = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, cargs[i], pr, -1, fu) } else { ra }
       if ibMiss != "" { return missRhs(ibMiss) }
       // A closure handed to a parameter that holds a closure of its struct or `null` (the niche):
       // retagged to that closure, then into its niche, as a field's (`objLitAt`).
-      const fa = if cloNicheTakes(fa0, pr, cargs[i]) { cloNicheRetag(b, fa0, pr, cargs[i]) } else { fa0 }
-      if (
-        irBOpRep(fa) != pr
-        && !repNullRefFits(irBOpRep(fa), pr)
-        && !repStoresAs(pr, irBOpRep(fa))
-      ) {
-        return missRhs("argument coercion")
-      }
+      const fn0 = if cloNicheTakes(fa0, pr, cargs[i]) { cloNicheRetag(b, fa0, pr, cargs[i]) } else { fa0 }
+      const fa = irConvert(b, fn0, pr, pt, cargs[i])
+      if ibMiss != "" { return missRhs(ibMiss) }
       args.push(fa)
       i = i + 1
     }
@@ -16207,9 +16194,10 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
     ) {
       return skip("store of an assignment of null into a null local")
     }
-    const src = storeValue(b, n.binRight, ib.irVars[v].vRep, ix)
+    const sv = storeValue(b, n.binRight, ib.irVars[v].vRep, ix)
     if ibMiss != "" { return 0 }
-    if irBOpRep(src) != ib.irVars[v].vRep { return skip("assignment coercion") }
+    const src = irConvertStored(b, sv, ib.irVars[v].vRep, ib.irVars[v].vTy, n.binRight)
+    if ibMiss != "" { return 0 }
     irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
     return 0
   }
@@ -16217,30 +16205,12 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
   if g < 0 || d < 0 { return skip("assignment target") }
   const val = storeValue(b, n.binRight, globalRep(g, d), ix)
   if ibMiss != "" { return 0 }
-  const src = storedAsStands(b, val, globalRep(g, d), n.binRight)
-  if globalRep(g, d) != irBOpRep(src) { return skip("global store coercion") }
+  const src = irConvertStored(b, val, globalRep(g, d), repTyOf(globalRep(g, d)), n.binRight)
+  if ibMiss != "" { return 0 }
   const gm = irGlobalWriteMiss(g, ibGlobalCtx())
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
   return 0
-}
-
-// Value `v` of `x` retagged to cell rep `rep` where it stands there with no coercion legacy
-// records at `x`, as a `let`'s initializer is: a list twin, a union-box list or map, a record on the
-// cell's heap or a declared subtype's, or a closure apart only in a hole; else `v`.
-function storedAsStands(b: i32[], v: Opnd, rep: i32, x: i32): Opnd {
-  const r = irBOpRep(v)
-  if r == rep || exprPrePathWhy(x, ibFnIx) != "" { return v }
-  if (
-    listRetag(r, rep)
-    || boxListRetag(r, rep)
-    || boxMapRetag(r, rep)
-    || recRetagAt(r, rep, x)
-    || holeRetagNoted(r, rep, true)
-  ) {
-    return repTemp(b, { rgV: v }, x, rep)
-  }
-  return v
 }
 
 // Assignment `at`'s value `x` at its cell's rep `rep`: delivered, or into a `null` cell, run for its
@@ -17528,26 +17498,14 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if ibMiss != "" { return 0 }
     // A ref list bound at its record-or-null twin, or a union-box list or map at another union's,
     // is the same value; legacy writes no convert where no coercion is recorded at the initializer.
-    const pre = exprPrePathWhy(n.letInit, ibFnIx) == ""
-    const src0 = if (irBOpRep(built) != ib.irVars[v].vRep
-      && (listRetag(irBOpRep(built), ib.irVars[v].vRep)
-      || boxListRetag(irBOpRep(built), ib.irVars[v].vRep)
-      || boxMapRetag(irBOpRep(built), ib.irVars[v].vRep)
-      || recRetagAt(irBOpRep(built), ib.irVars[v].vRep, n.letInit))
-      && pre) { repTemp(b, { rgV: built }, n.letInit, ib.irVars[v].vRep) } else { built }
     // A fresh local stored at the value's own rep takes it (`localStoredAt`), as a closure cell
-    // takes its closure (`cellTakesClosure`); else a value apart from its cell only in closure
-    // openness is the cell's value as it stands.
-    const stored = irBOpRep(src0) != ib.irVars[v].vRep
-      && (fresh && localStoredAt(v, ix, irBOpRep(src0))
-      || cellTakesClosure(ix, v, src0))
-    const src = if (!stored
-      && irBOpRep(src0) != ib.irVars[v].vRep
-      && holeRetagNoted(irBOpRep(src0), ib.irVars[v].vRep, true)
-      && pre) { repTemp(b, { rgV: src0 }, n.letInit, ib.irVars[v].vRep) } else { src0 }
-    if (irBOpRep(src) != ib.irVars[v].vRep && !stored) {
-      return skip("declaration coercion")
-    }
+    // takes its closure (`cellTakesClosure`); else the value is converted to the cell's rep.
+    const stored = irBOpRep(built) != ib.irVars[v].vRep
+      && convertKindOf(built, ib.irVars[v].vRep, ib.irVars[v].vTy, n.letInit) != CONVERT_RETAG
+      && (fresh && localStoredAt(v, ix, irBOpRep(built))
+      || cellTakesClosure(ix, v, built))
+    const src = if stored { built } else { irConvertStored(b, built, ib.irVars[v].vRep, ib.irVars[v].vTy, n.letInit) }
+    if ibMiss != "" { return 0 }
     irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
     if lr != null {
       irBNode(
@@ -19764,6 +19722,16 @@ export function irConvert(
   return irBMiss("convert " + repWhat(irBOpRep(v)) + " -> " + repWhat(dst))
 }
 
+// `irConvert` into a cell, which stores one rep: a value taken as it stands at another rep is a
+// miss, since no retag or store writes it.
+function irConvertStored(b: i32[], v: Opnd, dst: i32, dstTy: i32, at: i32): Opnd {
+  if ibMiss != "" { return v }
+  if irBOpRep(v) != dst && convertKindOf(v, dst, dstTy, at) == CONVERT_AS_IS {
+    return irBMiss("convert " + repWhat(irBOpRep(v)) + " -> " + repWhat(dst))
+  }
+  return irConvert(b, v, dst, dstTy, at)
+}
+
 // How `irConvert` takes value `v` to rep `dst`: as it stands, by a retag, or -1 for no case yet.
 const CONVERT_AS_IS = 0
 const CONVERT_RETAG = 1
@@ -19800,6 +19768,9 @@ function convertRetag(
   clo: boolean,
 ): boolean {
   const ok = listRetag(src, dst)
+    || boxListRetag(src, dst)
+    || boxMapRetag(src, dst)
+    || cloListUndeclaredTakes(src, dst)
     || holeRetagNoted(src, dst, clo && !(repNodeAt(src) is RRecord))
     || recRetag(src, dst)
     || recRetagNoted(src, dst, at)
