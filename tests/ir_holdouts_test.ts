@@ -39,21 +39,20 @@ Deno.test("holdouts: rows are <program> <unit> <class> <owner>, sorted, unique, 
 
 Deno.test("holdouts: no row the base branch's list lacks", async () => {
   const base = Deno.env.get("HOLDOUTS_BASE") ?? "origin/master";
-  const r = await new Deno.Command("git", {
-    args: ["show", `${base}:${HOLDOUTS_PATH}`],
-    cwd: ROOT,
-    stdout: "piped",
-    stderr: "null",
-  }).output();
-  if (!r.success) {
-    console.warn(
-      `[ir-holdouts] ${base} has no ${HOLDOUTS_PATH}; nothing to compare`,
-    );
+  const git = async (...args: string[]): Promise<{ ok: boolean; out: string }> => {
+    const r = await new Deno.Command("git", { args, cwd: ROOT, stdout: "piped", stderr: "null" })
+      .output();
+    return { ok: r.success, out: new TextDecoder().decode(r.stdout) };
+  };
+  // Probed with commands that exit 0 or 1, never git's 128, which a harness reads as a death.
+  const has = (await git("rev-parse", "--verify", "--quiet", `${base}^{commit}`)).ok &&
+    (await git("ls-tree", "--name-only", base, "--", HOLDOUTS_PATH)).out.trim() !== "";
+  if (!has) {
+    console.warn(`[ir-holdouts] ${base} has no ${HOLDOUTS_PATH}; nothing to compare`);
     return;
   }
-  const was = new Set(
-    rowsOf(new TextDecoder().decode(r.stdout)).map((l) => l.split("\t")[0]),
-  );
+  const baseText = (await git("show", `${base}:${HOLDOUTS_PATH}`)).out;
+  const was = new Set(rowsOf(baseText).map((l) => l.split("\t")[0]));
   if (was.size === 0) return;
   const added = here.map((l) => l.split("\t")[0]).filter((p) => !was.has(p));
   if (added.length) {
