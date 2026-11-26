@@ -128,6 +128,7 @@ import {
   condLitTrue,
   hasNamedArgs,
   i32ToStr,
+  isBareBlockIf,
   nodeAt,
   nodeChildrenPush,
   spreadArgOf,
@@ -675,6 +676,7 @@ import {
   boxOwedAt,
   boxTyNameAt,
   coerceKindAt,
+  exprRecordArmsTy,
   fnCloCoerceAtNode,
   instTyOrSelf,
   listCopyAtNode,
@@ -894,6 +896,7 @@ import {
   structIndexOfExpr,
   structIndexOfObjCtx,
   topLambdaRecordFe,
+  unionBoxStoreTyOf,
 } from "./emit_classify"
 import {
   declaredSlotOf,
@@ -2950,14 +2953,6 @@ function fieldPlainWhy(
     return nulNoneFieldWhy("object field nulnone", valIx, dst)
   }
   if !fieldArmDelivers(fa) { return "object field " + fa }
-  // A union of records stored at the field's record heap is cast there by `deliver` (D16321).
-  if (
-    fa == "armDelivery"
-    && narrowedArmNeedsUnbox(valIx, ibFnIx)
-    && !recordArmsUnboxOwed(valIx, dst)
-  ) {
-    return "object field arm unbox"
-  }
   if !fieldArmRepFits(fa, dst) { return "object field row rep" }
   // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
   if (
@@ -4737,12 +4732,13 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
     return irBMiss("ref if drops null atom")
   }
   // A record join legacy writes at a row of another record (`ifTypedStructRow`, its destination's)
-  // is built at that row's record, each arm delivered there.
+  // is built at that row's record, each arm delivered there; so is a union of records (D15719).
   const sr = if kind == "struct" && rj.rjSlot >= 0 && rj.rjSlot < sTyIx.length { repNodeOfTy(rowStoredTy(rj.rjSlot)) } else { -1 }
   const atRow = sr >= 0
     && sr != rep
     && repNodeAt(sr) is RRecord
-    && repNodeAt(rep) is RRecord
+    && (repNodeAt(rep) is RRecord
+    || heldAsBox(rep) && exprRecordArmsTy(ix, ibFnIx) >= 0)
     && !irTyOpen(rowStoredTy(rj.rjSlot))
   const jr = if atRow { sr } else { rep }
   const ty = if atRow { rowStoredTy(rj.rjSlot) } else { rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep) }
@@ -6285,7 +6281,27 @@ function capTyOf(fe: i32, name: string): i32 {
   // One holding a single closed member of it is held as that member's closure, as `irBDeclVar`
   // holds the local (`holderMemberTy`).
   const hm = if nodeAt(d) is LetDecl && (elabHasRetRecords() || bundleAnyNoted()) { holderMemberTy(d, frame) } else { -1 }
-  return if hm >= 0 && !irTyOpen(hm) { hm } else { ty }
+  if hm >= 0 && !irTyOpen(hm) { return hm }
+  // An instance's parameter carries its key's annotation; its source's tells a hole parameter.
+  const sd = nodeSrc[d] ?? d
+  const pd = if sd >= 0 && sd < P.nodes.length { nodeAt(sd) } else { null }
+  return if pd is Param && pd.parType < 0 { capSlotRowTy(fe, name, ty) } else { ty }
+}
+
+// Unannotated record parameter capture `name` of `fe`, typed `ty`, at the row its capture slot is
+// declared at (`captureValStructIdx`, `declRowTy`) where that row is another record's; else `ty`.
+function capSlotRowTy(fe: i32, name: string, ty: i32): i32 {
+  if ty < 0 || !(repNodeAt(repNodeOfTy(ty)) is RRecord) { return ty }
+  const si = captureValStructIdx(fe, name)
+  const dt = if si >= 0 { declRowTy(si) } else { -1 }
+  if (
+    dt < 0
+    || repNodeOfTy(dt) == repNodeOfTy(ty)
+    || !(repNodeAt(repNodeOfTy(dt)) is RRecord)
+  ) {
+    return ty
+  }
+  return dt
 }
 
 // The type of captured loop variable `name` of `fe` with no read to type it: a `for-in`'s element
@@ -12068,6 +12084,19 @@ function unionEqSide(b: i32[], ix: i32): Opnd {
       return o
     }
   }
+  // A read narrowed out of a union's storage is compared at that storage (`unionEqOperandTy`).
+  const r = unwrapParen(ix)
+  if (
+    r >= 0
+    && r < P.nodes.length
+    && nodeAt(r) is Ident
+    && unionBoxStoreTyOf(r, ibFnIx) >= 0
+  ) {
+    const m = storageReadEnter(r)
+    const o = irBExpr(b, ix)
+    storageReadLeave(m)
+    return o
+  }
   return irBExpr(b, ix)
 }
 
@@ -17802,14 +17831,25 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   // A value at another rep goes into the element's slot through the one converter.
   const x = if irBOpRep(x0) != er { irConvertStored(b, x0, er, repTyOf(er), n.binRight) } else { x0 }
   if ibMiss != "" { return 0 }
-  if ifBelowLeadIn(b, at, xat, "store short-circuit operand") { return 0 }
+  // An index holding a statement (a valued `if`, a `match`) stages the receiver below it, as a
+  // later argument's earlier ones are.
+  const rv = [v]
+  const n0 = b.length
+  if (
+    ifBelowLeadHas(b, at, xat)
+    && !irBStageLeads(b, at, [vat], rv, [t.idxArr])
+  ) {
+    if ibMiss == "" { irBMiss("store short-circuit operand") }
+    return 0
+  }
+  const sh = b.length - n0
   if repPrim(irBOpRep(i)) != "i32" || irBOpRep(x) != er {
     return skip("store operand coercion")
   }
   // A valued `if` is written in place after the receiver and index, which are staged below it;
   // the store's tail is their one consumer (a hoisted receiver's skip misses at the lowering).
-  const lead = [v, i]
-  if !irBStageLeads(b, xat, [vat, at], lead, [t.idxArr, t.idxIndex]) {
+  const lead = [rv[0], i]
+  if !irBStageLeads(b, xat + sh, [vat, at + sh], lead, [t.idxArr, t.idxIndex]) {
     return skip("if into an element store")
   }
   irBNode(b, { bcV: lead[0], bcIx: lead[1] }, -1, ibNoValue, ix)
@@ -19470,6 +19510,7 @@ function tailIf(b: i32[], ix: i32) {
   }
   if ibMiss != "" { return 0 }
   irBNode(b, sIf(c, thenB, elseB, -1, hasElse), -1, ibNoValue, ix)
+  ib.irTailLinks.push(b[b.length - 1])
   return 0
 }
 
@@ -19515,25 +19556,40 @@ function tailArm(blockIx: i32): i32[] {
   }
   const last = stmts[stmts.length - 1]
   const ln = nodeAt(last)
-  // An else-less `if` ending an arm is a `T | null` value: legacy's `emitStmtTail` writes it as a
-  // tail link with no `else`, and the body's pad returns what falls through.
+  // An else-less `if` ending an arm, a `T | null` value or a bare block, is a tail link with no
+  // `else` (legacy's `emitStmtTail`), and the body's pad returns what falls through.
   if (
     ln is IfStmt
-    && (lastStmtIsValueIf(last, ibFnIx) || elseLessNullableTail(last, ibFnIx))
+    && (lastStmtIsValueIf(last, ibFnIx)
+      || elseLessNullableTail(last, ibFnIx)
+      || isBareBlockIf(last))
   ) {
     tailIf(body, last)
     return body
   }
   if ln is RetStmt || ln is IfStmt || ifArmValueExpr(blockIx) != last {
     stmt(body, last, stmts, stmts.length - 1)
-    if ibMiss == "" && !irBodyLeaves(ib, body) { skip("tail arm") }
+    if (
+      ibMiss == ""
+      && !irBodyLeaves(ib, body)
+      && !callIsNever(unwrapParen(last))
+    ) {
+      skip("tail arm")
+    }
     return body
   }
   // An arm value legacy writes as a statement (`tailArmStmtIsValue`), such as a call that never
-  // returns, goes through `emitStmt`, which banks no row of its own.
+  // returns, goes through `emitStmt`, which banks no row of its own. A never call's lowering ends
+  // in `unreachable` (`callEndsNever`), so the arm leaves though its last node is the call.
   if !tailArmStmtIsValue(last, ibFnIx) {
     stmtNode(body, last, stmts, stmts.length - 1)
-    if ibMiss == "" && !irBodyLeaves(ib, body) { skip("tail arm") }
+    if (
+      ibMiss == ""
+      && !irBodyLeaves(ib, body)
+      && !callIsNever(unwrapParen(last))
+    ) {
+      skip("tail arm")
+    }
     return body
   }
   if retRefusedWhy(last, ibFnIx) != "" {
