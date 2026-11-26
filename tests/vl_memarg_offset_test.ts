@@ -11,6 +11,7 @@
 //
 // @test-timing opt
 
+import { holdoutTest } from "./support/holdouts.ts";
 import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen, wasmDis } from "./support/tree.ts";
 
 const WASM_OPT = binaryen("wasm-opt");
@@ -164,7 +165,7 @@ const bodies = (wat: string): string =>
 Deno.test({
   name: "memarg offset: --low-memory-unused[=<bytes>] folds `p + C` below the promised size",
   ignore: !ENABLED,
-  fn: async () => {
+  fn: holdoutTest("tests/vl_memarg_offset_test.ts#memarg offset: --low-memory-unused[=<bytes>] folds `p + C` below the promised size", async () => {
     const dir = Deno.makeTempDirSync({ prefix: "vl-memarg-lmu-sized-" });
     try {
       const put = (name: string, src: string) => Deno.writeTextFileSync(`${dir}/${name}.vl`, src + "\n");
@@ -207,7 +208,7 @@ Deno.test({
     } finally {
       Deno.removeSync(dir, { recursive: true });
     }
-  },
+  }),
 });
 
 // Folding changes no value a program that keeps the promise can print: every scalar width at
@@ -217,7 +218,7 @@ Deno.test({
 Deno.test({
   name: "memarg offset: --low-memory-unused keeps every value of a program that keeps the promise",
   ignore: !ENABLED,
-  fn: async () => {
+  fn: holdoutTest("tests/vl_memarg_offset_test.ts#memarg offset: --low-memory-unused keeps every value of a program that keeps the promise", async () => {
     const dir = Deno.makeTempDirSync({ prefix: "vl-memarg-lmu-eq-" });
     try {
       const widths: [string, string, string][] = [
@@ -272,7 +273,7 @@ Deno.test({
     } finally {
       Deno.removeSync(dir, { recursive: true });
     }
-  },
+  }),
 });
 
 // The sized promise is parsed strictly, and a heap window that starts inside it contradicts it.
@@ -334,7 +335,7 @@ const RT_IMPORT = 'import { M32, ld8, ld16, ld32, ld64, st8, st16, st32, st64 } 
 Deno.test({
   name: "memarg offset: --low-memory-unused folds a trivial accessor's address like the offset form",
   ignore: !ENABLED,
-  fn: async () => {
+  fn: holdoutTest("tests/vl_memarg_offset_test.ts#memarg offset: --low-memory-unused folds a trivial accessor's address like the offset form", async () => {
     const dir = Deno.makeTempDirSync({ prefix: "vl-memarg-lmu-acc-" });
     try {
       Deno.writeTextFileSync(`${dir}/rt.vl`, RT + "\n");
@@ -387,7 +388,7 @@ Deno.test({
     } finally {
       Deno.removeSync(dir, { recursive: true });
     }
-  },
+  }),
 });
 
 // Only a TRIVIAL accessor is inlined: a parameter read twice, a second statement, a computed
@@ -443,7 +444,7 @@ Deno.test({
 Deno.test({
   name: "memarg offset: --low-memory-unused keeps every value an inlined accessor reads or writes",
   ignore: !ENABLED,
-  fn: async () => {
+  fn: holdoutTest("tests/vl_memarg_offset_test.ts#memarg offset: --low-memory-unused keeps every value an inlined accessor reads or writes", async () => {
     const dir = Deno.makeTempDirSync({ prefix: "vl-memarg-lmu-acc-eq-" });
     try {
       Deno.writeTextFileSync(`${dir}/rt.vl`, RT + "\n");
@@ -510,7 +511,7 @@ Deno.test({
     } finally {
       Deno.removeSync(dir, { recursive: true });
     }
-  },
+  }),
 });
 
 // The refusals name a base the user can pass: a multiple of 8, and never a `--heap-base=` the

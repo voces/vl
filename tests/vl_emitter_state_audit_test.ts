@@ -38,9 +38,9 @@ const EMIT_SECTIONS = `${ROOT}/compiler/emit_sections.vl`;
 const CONTROL_RESET = "classifyStateReset";
 const CONTROL_NAMES = ["capFrame", "gckDepth", "irkDepth", "bcDepth"];
 
-/** The index rule's control: the reset whose line D11770 added, and the register it clears. */
+/** The index rule's control: a per-program reset and a register only it clears. */
 const INDEX_CONTROL_RESET = "wasmEmitStateReset";
-const INDEX_CONTROL_NAME = "ssArmRhs";
+const INDEX_CONTROL_NAME = "asgParkedSlot";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);

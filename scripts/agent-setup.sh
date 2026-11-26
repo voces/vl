@@ -19,8 +19,9 @@ fi
 VL=scripts/vl-host/target/release/vl
 
 # Whether the host serves this tree's guest protocol: the newest `$VL_IR_SHADOW` mode (6, the
-# order check) must print `[ir]` rows, and the claims-off fallback must answer. A host built before a
-# mode landed maps it to off, and every gate row that asks for it reads "no `[ir]` rows".
+# order check) must print `[ir]` rows, and an invalid module must be refused with no legacy rebuild.
+# A host built before a mode landed maps it to off, and every gate row that asks for it reads "no
+# `[ir]` rows"; one built before the fallback's removal still answers the claimed fault seam.
 host_ok() {
   [ -x "$VL" ] && [ -f build/vl-compiler.wasm ] || return 1
   local d
@@ -29,15 +30,12 @@ host_ok() {
   VL_STD="$PWD/std" VL_IR_SHADOW=6 VL_COMPILER_WASM=build/vl-compiler.wasm \
     "$VL" build "$d/t.vl" -o "$d/t.wasm" 2>&1 | grep -q '^\[ir\]'
   local rc=$?
-  # The claims-off fallback (c0cbdab7): a claimed module the fault seam corrupts runs on legacy's
-  # bytes with the fallback line, and is rc 70 strict. An older host ignores the seam.
   if [ $rc -eq 0 ]; then
     local out
-    out="$(VL_STD="$PWD/std" VL_NO_CACHE=1 VL_IR_STRICT=0 VL_FAULT_INJECT_CLAIMED=corrupt-validate-bytes \
+    out="$(VL_STD="$PWD/std" VL_NO_CACHE=1 VL_FAULT_INJECT_CLAIMED=corrupt-validate-bytes \
       VL_COMPILER_WASM=build/vl-compiler.wasm "$VL" run "$d/t.vl" 2>&1)"
-    case "$out" in *"used the legacy emitter"*) ;; *) rc=1 ;; esac
-    [ "$(printf '%s\n' "$out" | tail -n 1)" = 3 ] || rc=1
-    VL_STD="$PWD/std" VL_NO_CACHE=1 VL_IR_STRICT=1 VL_FAULT_INJECT_CLAIMED=corrupt-validate-bytes \
+    case "$out" in *"used the legacy emitter"*) rc=1 ;; esac
+    VL_STD="$PWD/std" VL_NO_CACHE=1 VL_FAULT_INJECT=corrupt-validate-bytes \
       VL_COMPILER_WASM=build/vl-compiler.wasm "$VL" run "$d/t.vl" > /dev/null 2>&1
     [ $? -eq 70 ] || rc=1
   fi
@@ -56,16 +54,16 @@ host_check() {
     return 1
   fi
   if host_ok; then
-    echo "agent-setup: host ok (\`VL_IR_SHADOW=6\` prints \`[ir]\` rows, and the claims-off fallback answers)"
+    echo "agent-setup: host ok (\`VL_IR_SHADOW=6\` prints \`[ir]\` rows, and an invalid module is refused)"
     return 0
   fi
   if [ ! -L scripts/vl-host/target ]; then
-    echo "agent-setup: the host at $VL predates this tree's \`\$VL_IR_SHADOW\` modes or its claims-off fallback." >&2
+    echo "agent-setup: the host at $VL predates this tree's \`\$VL_IR_SHADOW\` modes, or still has the claims-off fallback." >&2
     echo "  This target is not a worktree's symlink, so it is not rebuilt here: force-rebuild it" >&2
     echo "  (rm $VL && touch scripts/vl-host/src/main.rs && cargo build --release)." >&2
     return 1
   fi
-  echo "agent-setup: the shared host predates this tree's \`\$VL_IR_SHADOW\` modes or its claims-off fallback; building an isolated one"
+  echo "agent-setup: the shared host predates this tree's \`\$VL_IR_SHADOW\` modes, or still has the claims-off fallback; building an isolated one"
   HOST_TGT="$(mktemp -d "${TMPDIR:-/tmp}/vl-host-target.XXXXXX")"
   trap 'rm -rf "$HOST_TGT"' EXIT
   (cd scripts/vl-host && cargo build --release -j "${JOBS:-6}" --target-dir "$HOST_TGT")
@@ -74,7 +72,7 @@ host_check() {
   cp "$HOST_TGT/release/vl" "$VL"
   rm -rf "$HOST_TGT"
   trap - EXIT
-  host_ok || { echo "agent-setup: the rebuilt host still fails the \`[ir]\` rows or the claims-off fallback probe" >&2; return 1; }
+  host_ok || { echo "agent-setup: the rebuilt host still fails the \`[ir]\` rows or the invalid-module probe" >&2; return 1; }
   echo "agent-setup: host rebuilt into this worktree's own target (remove the worktree to drop it)"
 }
 
