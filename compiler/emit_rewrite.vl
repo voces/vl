@@ -275,6 +275,7 @@ import {
   IDENT_DROP_CBOX_READ,
   IDENT_DROP_LOOP_MOVE,
   declMovedOf,
+  declOrigOf,
   fnParamsOfDecl,
   identAuditDrop,
   identDeclOf,
@@ -4526,15 +4527,46 @@ function cboxSeedLet(name: string, decl: i32, annot: i32, ty: i32) {
   return lx
 }
 
+// The parameter among `ps` whose cell seed (`cboxSeedLet`) is `lx`, or -1.
+function cboxSeedParam(lx: i32, ps: i32[]): i32 {
+  for p in ps {
+    if (cboxCellDecl[p] ?? -1) == lx { return p }
+  }
+  return -1
+}
+
+// Whether `let` `ix` is the shadow respelling's seed of a parameter among `boxed`.
+function cboxParamSeed(ix: i32, boxed: i32[]): boolean {
+  const o = declOrigOf(ix)
+  return o >= 0
+    && o < P.nodes.length
+    && nodeAt(o) is Param
+    && i32ListHas(boxed, o)
+}
+
+// The shadow respelling's seed of parameter `p` among block `blk`'s statements, or -1.
+function cboxRespellSeedOf(blk: i32, p: i32): i32 {
+  const b = nodeAt(blk)
+  if p < 0 || !(b is Block) { return -1 }
+  for st in b.blkStmts {
+    if nodeAt(st) is LetDecl && declOrigOf(st) == p { return st }
+  }
+  return -1
+}
+
 // Block `blk` with `first` put before its statements.
-function cboxPrepend(blk: i32, first: i32) {
+function cboxPrepend(blk: i32, first: i32) { return cboxInsert(blk, -1, first) }
+
+// Block `blk` with `stmt` put right after its statement `after`, or first where `after` is -1.
+function cboxInsert(blk: i32, after: i32, stmt: i32) {
   const b = nodeAt(blk)
   if b is Block {
     const out: i32[] = []
-    out.push(first)
+    if after < 0 { out.push(stmt) }
     let i = 0
     while i < b.blkStmts.length {
       out.push(b.blkStmts[i])
+      if b.blkStmts[i] == after { out.push(stmt) }
       i = i + 1
     }
     b.blkStmts = out
@@ -4672,7 +4704,8 @@ function cboxWalk(ix: i32, boxed: i32[]) {
     }
     LetDecl => {
       cboxRenameJoins(ix, boxed)
-      n.letInit = cboxWalk(n.letInit, boxed)
+      // A boxed parameter's respelling seed reads the argument, ahead of the cell (D17674).
+      if !cboxParamSeed(ix, boxed) { n.letInit = cboxWalk(n.letInit, boxed) }
       if i32ListHas(boxed, ix) { cboxBoxLet(ix, ix) }
       return ix
     }
@@ -5162,7 +5195,11 @@ export function captureBoxRewrite(_stmts: i32[]) {
         fn.fnBody = cboxWalk(fn.fnBody, boxed)
         let si = seeds.length - 1
         while si >= 0 {
-          cboxPrepend(fn.fnBody, seeds[si])
+          // A parameter the shadow respelling copied into a seed (D3025) is boxed after that
+          // seed, which `cboxWalk` leaves reading the argument: the cell reads the seed (D17674).
+          const sp = cboxSeedParam(seeds[si], ps)
+          const rs = cboxRespellSeedOf(fn.fnBody, sp)
+          cboxInsert(fn.fnBody, rs, seeds[si])
           si = si - 1
         }
       }
