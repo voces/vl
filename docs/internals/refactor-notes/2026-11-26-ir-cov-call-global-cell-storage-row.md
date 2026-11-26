@@ -31,26 +31,41 @@ withdrawn row copy), so the result follows the storage instead.
 as a map default (bound and stored into a record field), a binding, a field, an argument, a
 returned value and a call through it, a list element, and a record field.
 
+**START-2's part, folded in.** START-2 had built the same mechanism for `global read coercion`
+(D17385) before the coordinator's ruling reached it. The coordinator ruled that this lane owns the
+mechanism, and START-2's commits are merged here unchanged. A record cell that a call built at a
+declared twin's row is stored at that row (`globalStoreTy`), and the holed read takes the noted
+storage row (`irGlobalStoreTyOf`). Verifier rule 2 is unchanged.
+
 **Census.** The whole-corpus per-function census covers tests/cases, the distilled cells and
-named sets, the capability probes and the runs-witnesses of both inventories. The merge-base probe
-is compared against this branch's probe:
+named sets, the capability probes and the runs-witnesses of both inventories (29,571 files). The
+master probe (`c9b20b30e`) is compared against this branch's probe, master merged in:
 
 | | fnc | fnu | fail |
 | --- | --- | --- | --- |
-| merge-base | 167,533 | 265 | 0 |
-| branch | 167,535 | 262 | 0 |
+| master | 168,681 | 249 | 0 |
+| branch | 168,687 | 240 | 0 |
 
-There are none newly missed. The newly claimed are `put` in each of the two tests, and D2939's
-`@start` (`convert record -> record` before, `claimed start` now; it prints `7 8` armed). Two misses
-change sentence and still miss:
+There are none newly missed.
+
+Newly claimed:
+- `put` in both tests.
+- The Q58 test's `asDefault`, `asListElem`, `asRecField` and `put`.
+- Three `@start`s now claimed (`claimed start`), each of which missed before:
+  - D2939: `convert record -> record`.
+  - D17385: `global read coercion`.
+  - functions/return-literal-twin-nested: `global read coercion`.
+
+Two misses change sentence and still miss:
 - D14870's `@start`: `object variant field box` → `object rep`.
-- soundness/covariant-record-field-read-only-runs `@init`: `convert list -> list` → `field read of
-  a stored row`.
+- soundness/covariant-record-field-read-only-runs `@init`: `convert list -> list` → `field read of a
+  stored row`.
 
-On both probes alike, two 100-file batches exit non-zero. One names D17671's Q58 test, which this
-merge-base does not yet hold. Re-run without it, its other 99 files give 1,040 rows on each probe,
-all claimed and identical; those rows are not in the table above. The other batch holds D17671's
-`mk`, which is invalid on this merge-base, and its rows are graded.
+On master, one 100-file batch exits 70: it holds the Q58 test, whose `asReturn` is legacy's invalid
+module there (D17680). The batch's other files are graded.
+
+**Armed sweep.** Of the 7,799 `@run` programs under tests/cases, only the seven already listed
+in `scripts/ir-divergence-baseline.txt` print differently armed.
 
 **Not covered.** The two tests' `@start` still misses `global initializer coercion` at
 `const m = Map()`, on master too; that's regen-11's class, next in the series.
