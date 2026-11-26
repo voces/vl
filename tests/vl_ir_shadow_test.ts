@@ -106,64 +106,24 @@ const fileRows: FileRow[] = [...(() => {
 
 // A divergence Q57 lets a lane choose: `scripts/ir-divergence-baseline.txt` lists it as
 // `program\tfunction\tmechanism\tPR`, the function as a `--names` build spells it (`f@1`).
-const DIVERGENCE_FILE = `${ROOT}/scripts/ir-divergence-baseline.txt`;
-
-/** A `--names` function name as a detail row spells it: no `@<module>` suffix, the start `@start`. */
-const shadowName = (fn: string) => {
-  const n = fn.replace(/@\d+$/, "");
-  return n === "__start__" ? "@start" : n;
-};
-
-/** Each listed program's functions, as detail rows spell them. */
-const parseDivergences = (text: string) => {
-  const out = new Map<string, Set<string>>();
-  for (const line of text.split("\n")) {
-    if (line === "" || line.startsWith("#")) continue;
-    const f = line.split("\t");
-    if (f.length !== 4) throw new Error(`${DIVERGENCE_FILE}: not four tab-separated fields: ${line}`);
-    out.set(f[0], (out.get(f[0]) ?? new Set()).add(shadowName(f[1])));
-  }
-  return out;
-};
-
-const DIVERGENCES = parseDivergences(exists(DIVERGENCE_FILE) ? Deno.readTextFileSync(DIVERGENCE_FILE) : "");
-
-/** A row a chosen divergence accounts for: a byte mismatch, or the claim rule's fail for one. */
+/** A byte mismatch, or the claim rule's fail for one: informational, since behaviour parity is the
+ * gate (ci-ir-identity; ready-check builds and runs the corpus). A spans or other mismatch still reds. */
 const bytesRow = (k: string) =>
   k.includes("bytes") && (k.startsWith("mismatch ") || k.startsWith("fail a claimable function did not match: "));
 
-/**
- * A listed program's rows without its byte mismatches, and how many functions those were, when
- * the detail compile (`irShadowArm(2)`) names every one and each is listed for it; else it throws
- * naming the function, or the mismatches it could not name. Other programs' rows pass unchanged.
- */
-const subtractDivergence = (row: FileRow, rows: Map<string, number>, listed: Set<string> | undefined, corrupt: number) => {
-  const bytes = [...rows.keys()].filter(bytesRow);
-  if (listed === undefined || bytes.length === 0) return { rows, expected: 0 };
-  const want = bytes.filter((k) => k.startsWith("mismatch ")).reduce((n, k) => n + rows.get(k)!, 0);
-  const named = new Map<string, number>();
-  for (const [k, n] of run(row.src, 2, corrupt).rows) {
-    const head = k.split("\n")[0];
-    const at = head.lastIndexOf(" in ");
-    if (!head.startsWith("detail ") || !head.slice(7, at).includes("bytes")) continue;
-    const fn = head.slice(at + 4);
-    named.set(fn, (named.get(fn) ?? 0) + n);
-  }
-  const unlisted = [...named.keys()].filter((fn) => !listed.has(fn));
-  if (unlisted.length > 0) {
-    throw new Error(`${row.file}: a byte mismatch in a function the divergence baseline does not list: ${unlisted.join(", ")}`);
-  }
-  const got = [...named.values()].reduce((a, b) => a + b, 0);
-  if (got !== want) throw new Error(`${row.file}: ${want} byte mismatches, the detail compile names ${got} (at most 3 a class)`);
-  const fns = bytes.filter((k) => k.startsWith("mismatch ") && !k.startsWith("mismatch start ")).reduce((n, k) => n + rows.get(k)!, 0);
+/** The rows without byte mismatches, and how many covered functions those were. */
+const dropBytes = (rows: Map<string, number>) => {
+  const fns = [...rows.keys()]
+    .filter((k) => bytesRow(k) && k.startsWith("mismatch ") && !k.startsWith("mismatch start "))
+    .reduce((n, k) => n + rows.get(k)!, 0);
   return { rows: new Map([...rows].filter(([k]) => !bytesRow(k))), expected: fns };
 };
 
 /** Grades one file row's armed compile against its expectations and the standing three. */
-const gradeRow = (row: FileRow, listing = DIVERGENCES, corrupt = 0) => {
+const gradeRow = (row: FileRow, corrupt = 0) => {
   const armed = run(row.src, true, corrupt);
   const { rc } = armed;
-  const { rows, expected } = subtractDivergence(row, armed.rows, listing.get(row.file), corrupt);
+  const { rows, expected } = dropBytes(armed.rows);
   const got = JSON.stringify([...rows]);
   if (rc !== 0) throw new Error(`${row.file}: want compileSrc rc 0, got ${rc}`);
   const fails = failures(rows);
@@ -183,9 +143,8 @@ const gradeRow = (row: FileRow, listing = DIVERGENCES, corrupt = 0) => {
 
 for (const row of fileRows) Deno.test({ name: row.name, ignore, fn: () => gradeRow(row) });
 
-// The divergence subtraction's controls. `irShadowCorrupt(3)` adds a byte to every lowering, so
-// each covered function (and the start body) is a byte mismatch: listed, the row passes. Unlisted,
-// or with one function left out, it reds. A spans mismatch (control 4) reds even when listed.
+// The byte-divergence control. `irShadowCorrupt(3)` adds a byte to every lowering, so each covered
+// function (and the start body) is a byte mismatch, which passes; a spans mismatch (control 4) reds.
 const DIVERGED: FileRow = {
   file: "tests/ir-shadow-rows/divergence-control.vl",
   name: "ir shadow: divergence control",
@@ -194,8 +153,6 @@ const DIVERGED: FileRow = {
   src: "function f(x: i32): i32 { return x + 1 }\nfunction g(x: i32): i32 { return x * 2 }\n" +
     "function h(x: i32): i32 { return x - 3 }\nprint(f(2))\nprint(g(3))\nprint(h(4))\n",
 };
-const listing = (...fns: string[]) =>
-  parseDivergences(fns.map((fn) => `${DIVERGED.file}\t${fn}\tcontrol\t#0\n`).join(""));
 const reds = (f: () => void, want: string) => {
   try {
     f();
@@ -207,13 +164,11 @@ const reds = (f: () => void, want: string) => {
 };
 
 Deno.test({
-  name: "ir shadow: a listed divergence passes, and an unlisted one reds",
+  name: "ir shadow: a byte divergence is informational, and a spans divergence reds",
   ignore,
   fn: () => {
-    gradeRow(DIVERGED, listing("f@1", "g@1", "h@1", "__start__@1"), 3);
-    reds(() => gradeRow(DIVERGED, listing(), 3), "did not match: bytes");
-    reds(() => gradeRow(DIVERGED, listing("f@1", "g@1", "__start__@1"), 3), "does not list: h");
-    reds(() => gradeRow(DIVERGED, listing("f@1", "g@1", "h@1", "__start__@1"), 4), "did not match: spans");
+    gradeRow(DIVERGED, 3);
+    reds(() => gradeRow(DIVERGED, 4), "did not match: spans");
   },
 });
 
@@ -279,7 +234,7 @@ Deno.test({
     const row = fileRows.find((r) => r.file.endsWith("/nullable-record-compare-element-side.vl"));
     if (row === undefined) throw new Error("want the nullable-record-compare-element-side row, got none");
     gradeRow(row);
-    reds(() => gradeRow(row, DIVERGENCES, 5), "spans");
+    reds(() => gradeRow(row, 5), "spans");
   },
 });
 
@@ -315,7 +270,7 @@ Deno.test({
     const row = fileRows.find((r) => r.file.endsWith("/record-compare-element-place.vl"));
     if (row === undefined) throw new Error("want the record-compare-element-place row, got none");
     gradeRow(row);
-    reds(() => gradeRow(row, DIVERGENCES, 5), "spans");
+    reds(() => gradeRow(row, 5), "spans");
   },
 });
 
@@ -3364,17 +3319,17 @@ Deno.test({
   ignore,
   fn: () => {
     const src = Deno.readTextFileSync(
-      new URL("./cases/closures/captured-hole-fn-handed-on-two-generics.vl", import.meta.url),
+      new URL("./cases/closures/hole-fn-list-named-callback.vl", import.meta.url),
     );
     const one = run(src, 1);
     const detail = run(src, 2);
     const plain = run(src, 0);
     const rows1 = [...one.rows.keys()];
-    if (rows1.some((k) => k.startsWith("detail ")) || one.rows.get("uncovered rep unsup") !== 1) {
-      throw new Error(`want mode 1's one \`uncovered rep unsup\` and no detail row, got ${JSON.stringify([...one.rows])}`);
+    if (rows1.some((k) => k.startsWith("detail ")) || one.rows.get("start uncovered rep unsup") !== 1) {
+      throw new Error(`want mode 1's one \`start uncovered rep unsup\` and no detail row, got ${JSON.stringify([...one.rows])}`);
     }
-    if (detail.rows.get("detail rep unsup of call in viaReturn$1") !== 1) {
-      throw new Error(`want the detail row naming the call node in viaReturn$1, got ${JSON.stringify([...detail.rows])}`);
+    if (detail.rows.get("detail rep unsup of index in @start") !== 1) {
+      throw new Error(`want the detail row naming the index node in @start, got ${JSON.stringify([...detail.rows])}`);
     }
     if (one.out.length !== plain.out.length || one.out.some((b, i) => b !== plain.out[i])) {
       throw new Error("want the armed shadow's module byte-identical to the unarmed one");

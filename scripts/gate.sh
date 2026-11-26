@@ -405,8 +405,9 @@ run "ir shadow cases"          "$VL" run scripts/silent-sweep/distilled/ir-shado
 run "ir claims"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --claims
 # A claim never skips a refusal legacy raises: every program legacy refuses at emit (`@emit-error`
 # cases, tests/ir-claim-fallback, the emit_reject witnesses) is refused alike with claims on and
-# off, strict, held at 0 differs (coordinator ruling 2026-11-24). About 57 CPU-s.
-run "ir claim refusals"        "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop refusals --out "$LOGS/ir-claim-refusals.tsv"
+# off, strict, held at 0 differs (coordinator ruling 2026-11-24); bytes are not graded (ruling
+# 2026-11-26). About 57 CPU-s.
+run "ir claim refusals"        "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop refusals --behaviour-only --out "$LOGS/ir-claim-refusals.tsv"
 # The invariant G3 exists for: a shipped build is never invalid, refused or running otherwise where
 # the claimless build builds and runs clean (coordinator ruling 2026-11-24). Every capability probe
 # and IR pin, and a fixed 1-in-12 of tests/cases. About 135 CPU-s in the gate.
