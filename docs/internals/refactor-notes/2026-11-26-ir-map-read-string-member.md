@@ -19,8 +19,10 @@ narrowed past `null`) at the nullable niche while the map's value is the box (`n
 legacy converts at the print (`emitPrintNulLitUnion`).
 
 **Found behind it.** `if m[k] is K` stashes the map read's box in a local whose boxed-nullable rep
-writes no local valtype (`repLocalValtype`), so the lowering refuses it (`unmapped slot`), in a
-function body and at top level alike. It was masked by this miss; it needs its own lowering.
+writes no local valtype (`repLocalValtype`), so the lowering refuses it, in a function body and at
+top level alike. It was masked by this miss. The decline now names itself (`slotless local at a rep
+with no valtype`, a `claim fell back` reason the registry routes to COV-START) and needs its own
+lowering.
 
 New case `tests/cases/literal-unions/map-read-narrowed-string-member-positions.vl`: the guarded and
 bare else of `is i32`, the `i32` arm, and a parameter map in a function body; every unit claimed and
