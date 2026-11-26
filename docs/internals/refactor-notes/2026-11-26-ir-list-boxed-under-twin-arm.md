@@ -17,10 +17,14 @@ Lane COV-IS, 2026-11-26. Regen-10 row `box ladder` on
 
 - `nested-numlit-list-twin-row-box.vl` and the D16894 witness: claimed whole, `@log` lines under
   `VL_IR_REQUIRE_CLAIM=1`.
-- Sweep `tests/cases/unions/list-boxed-under-twin-arm-positions.vl`: argument, binding, return,
-  assignment, record field and list element, the union spelled inline (a `type` alias keys the
-  rows so the IR already took them); master misses 2 functions at `box ladder`, this branch none;
-  output equals the `VL_IR=0` run.
+- Sweep `tests/cases/unions/list-boxed-under-twin-arm-positions.vl`: argument, return, record
+  field and list element, the union spelled inline (a `type` alias keys the rows so the IR already
+  took them); master misses 2 functions at `box ladder`, this branch none; output equals the
+  `VL_IR=0` run.
+- A typed binding (`const b: K[][] | i32[][] | string = five`) and an assignment of the same value
+  in a function were check-clean invalid wasm on master (legacy stores the bare list where the box
+  is due) and are claimed and valid here; legacy alone still writes them invalid (the box shadow's
+  legacy build), so they stay out of `tests/cases`.
 - `tests/vl_ir_shadow_test.ts`'s "construct outside the set" case took this shape as its
   `box ladder` witness; it now takes the one function-level `box ladder` left in `tests/cases`
   (a hole parameter bound to two numeric-union instances, from
