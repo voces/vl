@@ -33,17 +33,7 @@ import type { ModuleReader } from "../../compiler/coreTypes.ts";
 // the test that keeps them agreeing; the two TS ones used to be hand-maintained
 // twins and had silently lost the `export { … } from "…"` arm.
 import { needsModules } from "../../compiler/moduleGate.ts";
-import {
-  engineRefusal,
-  fellBackLine,
-  invalidHeadline,
-  needsClaimsOff,
-  refusedNote,
-  softFellBack,
-  softNote,
-  softRefusals,
-  withClaimsOff,
-} from "./claimFallback.ts";
+import { engineRefusal, invalidClaimedModule, invalidHeadline, softNote, softRefusals } from "./claimFallback.ts";
 import { columnMap } from "./utf16Columns.ts";
 
 /**
@@ -2295,8 +2285,7 @@ export const createWasmChecker = (
     const status = exp.compileSrc(); // 0 ok; 1 lex/parse; 2 type; 3 emit
     staging.checked = false; // the emit path leaves no symbol tables behind
     const diagnostics = readDiags(exp, source);
-    // A claim that met a shared legacy helper's refusal declined, and legacy wrote that unit: its
-    // refusal stands with a note, or its bytes ship with a warning (`claimFallback.ts`).
+    // A claim that recorded a refusal declined, so the compile refused: the note names the claim.
     const soft = softRefusals(exp);
     const top = { line: 0, character: 0 };
     const notice = (message: string, severity: VLDiagnostic["severity"]): VLDiagnostic =>
@@ -2306,29 +2295,21 @@ export const createWasmChecker = (
       return { bytes: undefined, diagnostics: [...diagnostics, ...notes] };
     }
     const bytes = moduleBytes(exp);
+    // A recorded refusal beside a module, or a module the engine refuses, is the compiler's bug.
     if (soft.length > 0) {
       const [name, msg] = soft[0];
-      return { bytes, diagnostics: [...diagnostics, notice(softFellBack(name, msg), "warning")] };
+      const bug = `inside \`${name}\`: ${msg}: an IR claim refused, yet the compile wrote a module (a bug in vl)`;
+      return { bytes: undefined, diagnostics: [...diagnostics, notice(bug, "error")] };
     }
-    if (!needsClaimsOff(exp, bytes)) return { bytes, diagnostics };
-    // A claimed module the engine refuses: compiled again with claims off, legacy's answer is
-    // the result — its refusal with a note, or its bytes with a warning (`claimFallback.ts`).
-    // Located first: the rebuild replaces the spans the claimed compile recorded.
+    if (!invalidClaimedModule(exp, bytes)) return { bytes, diagnostics };
     const where = invalidHeadline(exp, engineRefusal(bytes), entryKey);
     const at = where.line !== undefined && where.file === entryKey
       ? { line: where.line - 1, character: where.col ?? 0 }
       : { line: 0, character: 0 };
     const said = (message: string, severity: VLDiagnostic["severity"]): VLDiagnostic =>
       ({ message, severity, range: { start: at, end: at }, source: "vital" });
-    staged = undefined;
-    await ensureStaged(exp, source, entryKey, read);
-    const legacy = withClaimsOff(exp, () => exp.compileSrc());
-    staged = undefined;
-    const legacyDiags = readDiags(exp, source);
-    if (legacy !== 0) {
-      return { bytes: undefined, diagnostics: [...legacyDiags, said(refusedNote(where.headline), "info")] };
-    }
-    return { bytes: moduleBytes(exp), diagnostics: [...legacyDiags, said(fellBackLine(where.headline), "warning")] };
+    const bug = `invalid module: ${where.headline} (a bug in vl, not in your program)`;
+    return { bytes: undefined, diagnostics: [...diagnostics, said(bug, "error")] };
   };
 
   const moduleBytes = (exp: Exports): Uint8Array => {

@@ -59,6 +59,7 @@
 // @test-timing sweep n=2328 name~"native-align setup"
 
 import { filePath } from "./support/filePath.ts";
+import { HOLDOUTS, holdoutVerdict } from "./support/holdouts.ts";
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
 const CASES = new URL("./cases/", import.meta.url);
@@ -270,6 +271,8 @@ const TIERS: Record<Tier, string[]> = {
   accept: [],
   "emit-reject": [],
 };
+/** The I8 holdouts (tests/support/holdouts.ts): graded by their emit refusal alone. */
+const HELD: string[] = [];
 /** Excluded cases, paired with the tier they WOULD be asserted in. */
 const EXCLUDED: { rel: string; tier: Tier }[] = [];
 /** Files whose directives claim more than one tier — a corpus bug, never valid. */
@@ -282,6 +285,7 @@ for (const rel of [...walkVl(CASES)].sort()) {
   if (tiers.length > 1) AMBIGUOUS.push({ rel, tiers });
   else if (tiers.length === 0) UNCLASSIFIED.push(rel);
   else if (rel in EXCLUSIONS) EXCLUDED.push({ rel, tier: tiers[0] });
+  else if (HOLDOUTS.has(`tests/cases/${rel}`)) HELD.push(rel);
   else TIERS[tiers[0]].push(rel);
 }
 
@@ -552,6 +556,7 @@ const CHECK_LEG = (tier: Tier): "check" | "codegen" =>
 const CHECK_LEGS: Record<"check" | "codegen", string[]> = { check: [], codegen: [] };
 const CHECKED_TIERS: Tier[] = ["accept", "reject", "emit-reject"];
 for (const tier of CHECKED_TIERS) CHECK_LEGS[CHECK_LEG(tier)].push(...TIERS[tier]);
+CHECK_LEGS.codegen.push(...HELD);
 // The exclusion tripwires re-run the same assertion over their case, so the batch has
 // to carry them too. A RUN- or TRAP-tier exclusion has no `vl check` leg at all.
 for (const { rel, tier } of EXCLUDED) {
@@ -832,6 +837,18 @@ for (const rel of TIERS["emit-reject"]) {
 }
 
 // ── Tripwires: the exclusions and the discovery itself must stay honest ───────
+for (const rel of HELD) {
+  Deno.test({
+    name: `native-align holdout: ${rel} — refused with \`cannot yet lower\``,
+    ignore: !ENABLED,
+    fn: async () => {
+      const c = await checkRun(rel, true);
+      const why = holdoutVerdict(`tests/cases/${rel}`, c.code !== 0 && c.stage === "emit", c.text);
+      if (why !== "") throw new Error(why);
+    },
+  });
+}
+
 for (const { rel, tier } of EXCLUDED) {
   Deno.test({
     name: `native-align exclusion: ${rel} — still diverges (${tier} tier)`,
@@ -858,7 +875,9 @@ Deno.test({
           `(moved, renamed, or deleted): ${stale.join(", ")}`,
       );
     }
-    const staleNamed = Object.keys(HOST_NAMED).filter((rel) => !DISCOVERED_TIERED.has(rel));
+    const staleNamed = Object.keys(HOST_NAMED).filter((rel) =>
+      !DISCOVERED_TIERED.has(rel) && !HELD.includes(rel)
+    );
     if (staleNamed.length) {
       throw new Error(
         `HOST_NAMED names ${staleNamed.length} case(s) discovery does not place in a tier ` +
