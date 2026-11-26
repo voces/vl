@@ -6197,7 +6197,11 @@ function atomCellRep(d: i32, r: i32): i32 {
   const ai = nodeAt(unwrapParen(g.letInit))
   if !(ai is BinExpr) || ai.binOp != "=" { return r }
   const ar = repNodeOfTy(heldTy(exprTyOf(ai.binLeft)))
-  return if repNodeAt(ar) is RAtom { ar } else { r }
+  const an = repNodeAt(ar)
+  if an is RAtom { return ar }
+  // A `K | null` place's assignment value is the member written, the atom inside its niche.
+  if an is RNullable && repNodeAt(an.rnInner) is RAtom { return an.rnInner }
+  return r
 }
 
 // A record global whose checked rep `r` has no struct heap is held at its storage row's rep
@@ -8450,7 +8454,8 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   const unionIf = arm == "union" && nodeAt(unwrapParen(c.callArgs[0])) is IfStmt
   const from = b.length
   // An atom arm, or its `K | null`, streams the id its operand is held at (`emitStashAtomId`).
-  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else if fromBox { nulLitNicheRead(b, c.callArgs[0]) } else if want == "atom" || want == "nulAtom" { exprAt(b, c.callArgs[0], true) } else { irBExpr(b, c.callArgs[0]) }
+  const asgAtom = if want == "atom" { asgAtomRep(c.callArgs[0]) } else { -1 }
+  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else if fromBox { nulLitNicheRead(b, c.callArgs[0]) } else if asgAtom >= 0 { deliver(b, c.callArgs[0], asgAtom, -1) } else if want == "atom" || want == "nulAtom" { exprAt(b, c.callArgs[0], true) } else { irBExpr(b, c.callArgs[0]) }
   if ibMiss != "" { return 0 }
   // Legacy opens a nullable string's or boolean's print blocks before its operand, so where the
   // operand wrote a valued `if` (or a stash) the blocks open before it (`RPrintOpen`).
@@ -8496,6 +8501,20 @@ function printBoxNull(b: i32[], arg: i32, ix: i32) {
   }
   irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
   return 0
+}
+
+// The atom an assignment `ix` used as a value writes to its place (a `K` place, or the member
+// inside a `K | null` niche), which legacy delivers as the id it is; -1 otherwise.
+function asgAtomRep(ix: i32): i32 {
+  const a = unwrapParen(ix)
+  if a < 0 || a >= P.nodes.length { return -1 }
+  const n = nodeAt(a)
+  if !(n is BinExpr) || n.binOp != "=" { return -1 }
+  const pr = repNodeOfTy(heldTy(exprTyOf(n.binLeft)))
+  const pn = repNodeAt(pr)
+  if pn is RAtom { return pr }
+  if pn is RNullable && repNodeAt(pn.rnInner) is RAtom { return pn.rnInner }
+  return -1
 }
 
 // Place `ix`, narrowed to `K | null` out of a wider box, as that niche: read at its storage, the
@@ -9661,6 +9680,10 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // legacy writes it at the kind its consumer asks.
   const du = unwrapParen(ix)
   const dn = if du >= 0 && du < P.nodes.length { nodeAt(du) } else { null }
+  // An assignment delivered at its place's atom is that atom's id, not the string its type reps.
+  if ibMiss == "" && dst >= 0 && dn is BinExpr && asgAtomRep(du) == dst {
+    return assignValue(b, dn, du, dst)
+  }
   if (
     ibMiss == ""
     && dst >= 0
