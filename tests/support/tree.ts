@@ -16,9 +16,13 @@ export const ROOT = filePath(new URL("../../", import.meta.url)).replace(
   /[\\/]$/,
   "",
 );
-export const VL = `${ROOT}/scripts/vl-host/target/release/vl${
-  Deno.build.os === "windows" ? ".exe" : ""
-}`;
+/** The vl CLI every native test spawns: `$VL_HARNESS_BIN` when set (the I8 census's recording
+ * wrapper, scripts/ir-i8-census/harness-pop.sh, which runs the real binary unchanged), else the
+ * checkout's release build. */
+export const VL = Deno.env.get("VL_HARNESS_BIN") ||
+  `${ROOT}/scripts/vl-host/target/release/vl${
+    Deno.build.os === "windows" ? ".exe" : ""
+  }`;
 export const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 
 /** A binaryen CLI tool: from `$VL_BINARYEN` (a directory of the native release
