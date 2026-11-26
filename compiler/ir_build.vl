@@ -46,7 +46,7 @@ import {
 } from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
-import { sigKeyRetIsVoid } from "./emit_sig_tokens"
+import { sigKeyRetIsVoid, sigKeyRetKind } from "./emit_sig_tokens"
 import {
   litAliasTyOrSelf,
   monoBundleFe,
@@ -3540,6 +3540,11 @@ function openCallValue(b: i32[], n: Call, ix: i32): Opnd {
   }
   const rhs = callRhs(b, n, ix)
   if ibMiss != "" { return irBMiss("call") }
+  // A closure call is at the scalar its key's result names, as legacy's `call_ref` leaves it.
+  if rhs is RCallRef && !rhs.crNever && !rhs.crVoid {
+    const kr = keyScalarRep(sigKeyRetKind(callRefPlainKey(ix, ibFnIx)))
+    if kr >= 0 { return irBLetTempTy(b, rhs, ix, kr, repTyOf(kr)) }
+  }
   if !(rhs is RCall) || rhs.caNever { return repMissAt(ix, miss) }
   const si = irSigOf(ib, rhs.caCallee)
   const r = if si >= 0 { ib.irSigRet[si] } else { -1 }
@@ -7776,7 +7781,12 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
     if wt >= 0 && irBOpRep(a) != repNodeOfTy(wt) {
       return missRhs("closure argument coercion")
     }
-    if bx >= 0 && irBOpRep(a) != bx && !nulListTakes(bx, irBOpRep(a), arm) {
+    if (
+      bx >= 0
+      && irBOpRep(a) != bx
+      && !nulListTakes(bx, irBOpRep(a), arm)
+      && !holeSlotTakes(bx, irBOpRep(a), sigParamKindAt(key, i))
+    ) {
       return missRhs("closure argument box")
     }
     // A `null` literal built at the parameter's rep is that parameter's value.
@@ -7801,6 +7811,14 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
     crHead: staged,
   }
   return r
+}
+
+// Whether a hole callee's parameter (its closure rep leaves it `unsup`) takes value rep `v` as it
+// stands at the key's slot kind `k`: an atom's `i32` id at an `i32` slot, a box at a union's.
+function holeSlotTakes(p: i32, v: i32, k: VKind | null): boolean {
+  if !(repNodeAt(p) is RUnsup) { return false }
+  const n = repNodeAt(v)
+  return k == "i32" && n is RAtom || k == "union" && n is RBox
 }
 
 // Closure `f`'s call head (`RCallRefHead`) at the callee's own type, inserted into `b` at `at`,
@@ -8512,7 +8530,9 @@ function mapHasRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
   const sh = mapRecvShapeOf(recvIx, ibFnIx)
   if sh == -3 { return missRhs("map has value type") }
   const ka = mapKeyArmOf(recvIx, keyIx, ibFnIx, sh)
-  if ka != "plain" && ka != "i64" { return missRhs("map key " + ka) }
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return missRhs("map key " + ka)
+  }
   const rk = mapRecvKeyOf(b, recvIx, keyIx, "map has receiver", ka == "i64")
   if rk == null { return missRhs(ibMiss) }
   const r: Rhs = {
@@ -8531,7 +8551,9 @@ function mapDeleteRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
   const sh = mapRecvShapeOf(recvIx, ibFnIx)
   if sh == -3 { return missRhs("map delete value type") }
   const ka = mapKeyArmOf(recvIx, keyIx, ibFnIx, sh)
-  if ka != "plain" && ka != "i64" { return missRhs("map key " + ka) }
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return missRhs("map key " + ka)
+  }
   const rk = mapRecvKeyOf(b, recvIx, keyIx, "map delete receiver", ka == "i64")
   if rk == null { return missRhs(ibMiss) }
   const r: Rhs = {
@@ -9080,7 +9102,9 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
   const sh = mapRecvShapeOf(recv, ibFnIx)
   if sh == -3 { return skip("map store value type") }
   const ka = mapKeyArmOf(recv, key, ibFnIx, sh)
-  if ka != "plain" && ka != "i64" { return skip("map key " + ka) }
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return skip("map key " + ka)
+  }
   let valArm: MapSetValArm = "plain"
   if val >= 0 {
     if mapSetRefIntoMono(recv, val, ibFnIx) {
@@ -10855,11 +10879,12 @@ function boxTempIn(
   }
   // A `null` the builder delivers for a node that is no `null` literal (a binding's absent
   // initializer, an assignment of `null` used as a value) is the destination's null box, as legacy
-  // writes a bare `null`; a `null`-unit read that reads nothing is dropped (`nulReadDropped`).
+  // writes a bare `null`; a `null`-unit read that reads nothing is dropped (`nulReadDropped`),
+  // also where the plan's `null` arm finds that read in place of a `null` literal's immediate.
   if (
-    p.hbArm == "ladder"
+    (p.hbArm == "ladder" || p.hbArm == "null")
     && nullOwnRepFits(NULL_OWN_BOX, dst)
-    && (v is OImm && irBOpRep(v) == ibNoValue
+    && (v is OImm && irBOpRep(v) == ibNoValue && p.hbArm == "ladder"
       || repPrim(irBOpRep(v)) == "null" && nulReadDropped(b, v))
   ) {
     return repTemp(
@@ -11334,23 +11359,22 @@ function radixWideRead(b: i32[], v: Opnd): Opnd {
   return r.uwV
 }
 
-// The temp of a call that never returns, `v`, read at i32 and widened to `to` at node `ix`; a
-// never operand of another shape is a miss.
+// The temp of a call that never returns, `v`, read at i32 and widened to `to` at node `ix`; its
+// temp holds no value or the i32 legacy's never value takes. A never operand an inner operator
+// already widened goes on from its own width; one of another shape is a miss.
 function neverWidened(b: i32[], v: Opnd, ix: i32, to: i32): Opnd {
-  if ibMiss != "" { return v }
-  if (
-    !(v is OVar)
-    || v.ov < 0
-    || v.ov >= ib.irVars.length
-    || !repIsNoValue(irBOpRep(v))
-  ) {
+  if ibMiss != "" || irBOpRep(v) == to { return v }
+  if !(v is OVar) || v.ov < 0 || v.ov >= ib.irVars.length {
     return irBMiss("never operand not a call")
   }
   const i32r = repNodeOfTy(TY_I32)
-  ib.irVars[v.ov].vRep = i32r
+  const own = irBOpRep(v)
+  const src = if repIsNoValue(own) { i32r } else { own }
+  if numKindOf(src) < 0 { return irBMiss("never operand not a call") }
+  ib.irVars[v.ov].vRep = src
   const dk = numKindOf(to)
   const t = irVarNew(ib, to, repTyOf(to), "temp", -1)
-  const w: Rhs = { nwV: v, nwSrc: numKindOf(i32r), nwDst: dk, nwAt: ix }
+  const w: Rhs = { nwV: v, nwSrc: numKindOf(src), nwDst: dk, nwAt: ix }
   irBNode(b, { lDst: t, lRhs: w }, repTyOf(to), to, ix)
   const o: Opnd = { ov: t }
   return o
@@ -14390,7 +14414,9 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
     ibFnIx,
     mapRecvShapeOf(rd.idxArr, ibFnIx),
   )
-  if ka != "plain" && ka != "i64" { return irBMiss("map key " + ka) }
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return irBMiss("map key " + ka)
+  }
   const rp = repPrim(rep)
   const uk = if uq != null { uq.muWide } else { -1 }
   const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32"
@@ -14504,7 +14530,9 @@ function mapGetAt(
   const arm = mapGetArmOf(ix, ibFnIx)
   const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
   const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
-  if ka != "plain" && ka != "i64" { return irBMiss("map key " + ka) }
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return irBMiss("map key " + ka)
+  }
   const rk = mapRecvKeyOf(
     b,
     rd.idxArr,
@@ -14746,13 +14774,20 @@ function mapRecvKeyOf(
 
 // Map key `keyIx` of receiver `recvIx` as legacy writes it: at the `i64` an `i64`-keyed map holds
 // where `wide` (`emitScalarValue`), a key the atom hook converts at the receiver's atom key rep by
-// the hook's arm, else as itself.
+// the hook's arm, an atom key of a string-keyed map as its member text, else as itself.
 function mapKeyAt(b: i32[], recvIx: i32, keyIx: i32, wide: boolean): Opnd {
   if wide { return deliver(b, keyIx, repNodeOfTy(TY_I64), TY_I64) }
   if exprPrePathWhy(keyIx, ibFnIx) == "pre-path atom hook" {
     const kt = nodeMapKeyTyOf(unwrapParen(recvIx))
     const r = if kt >= 0 { repNodeOfTy(kt) } else { -1 }
     if r >= 0 && repNodeAt(r) is RAtom { return deliver(b, keyIx, r, kt) }
+  }
+  // An atom key of a string-keyed map is decoded to its member text (`mapKeyArmOf`'s `atom`).
+  if (
+    mapKeyArmOf(recvIx, keyIx, ibFnIx, mapRecvShapeOf(recvIx, ibFnIx))
+    == "atom"
+  ) {
+    return deliver(b, keyIx, repNodeOfTy(TY_STR), TY_STR)
   }
   return irBExpr(b, keyIx)
 }
@@ -17023,8 +17058,12 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   const k0 = repRecordKidOf(r0, rt, t.memProp)
   if k0 < 0 { return skip("field kid") }
   // A receiver instanced at a stored row (D15827) is built at that row, whose field legacy's store
-  // writes, where its type reads the field at another rep.
-  const r = if fieldStoreRepFits(va, repNodeKids(r0)[k0]) { r0 } else { irBOpRep(v0) }
+  // writes, where its type reads the field at another rep; so is a receiver built at a record row
+  // other than its type's that holds the field at a rep the value fits.
+  const vRep = irBOpRep(v0)
+  const kv = if vRep != r0 && repNodeAt(vRep) is RRecord { repRecordKidOf(vRep, rt, t.memProp) } else { -1 }
+  const own = kv >= 0 && fieldStoreRepFits(va, repNodeKids(vRep)[kv])
+  const r = if own { vRep } else if fieldStoreRepFits(va, repNodeKids(r0)[k0]) { r0 } else { vRep }
   const k = if r == r0 { k0 } else if repNodeAt(r) is RRecord { repRecordKidOf(r, rt, t.memProp) } else { -1 }
   if k < 0 { return skip("field store row rep") }
   const dst = repNodeKids(r)[k]
@@ -17309,10 +17348,13 @@ function forInListUnion(b: i32[], n: ForIn, ix: i32) {
 function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
   const arm = forRangeArm(n, ix, ibFnIx)
   const why = forRangeRolledBlock(n, ix, ibFnIx)
-  // A partial loop, and a rolled one's wrap exit, are written by legacy's helpers (`SRangeLoop`).
-  const helpers = arm == "partial" || arm == "rolled" && why == "wrap exit"
+  // A partial loop, and a rolled one's wrap exit or dynamic step, are written by legacy's helpers
+  // (`SRangeLoop`), whose test picks a dynamic step's direction.
+  const dyn = why == "dynamic step"
+  const helpers = arm == "partial"
+    || arm == "rolled" && (why == "wrap exit" || dyn)
   const opened = why == "hoisted" || why == "proven"
-  if why != "" && !opened && !(helpers && why == "wrap exit") {
+  if why != "" && !opened && !(helpers && (why == "wrap exit" || dyn)) {
     return skip("for range " + why)
   }
   const k = forRangeStaticStep(n)
@@ -17351,6 +17393,16 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
     irBNode(b, { asDst: bv, asSrc: t }, -1, ibNoValue, ix)
     const o: Opnd = { ov: bv }
     bound = o
+  }
+  // A dynamic step is evaluated once, after the bounds, into the loop's third slot.
+  if dyn {
+    const sw = declaredIndexAt(ibFnIx, s + 2)
+    if sw < 0 || !again && localVarAt(sw) >= 0 { return skip("for range slot") }
+    const st = irBExpr(b, n.frStep)
+    if ibMiss != "" { return 0 }
+    if irBOpRep(st) != ri { return skip("for range step rep") }
+    const sv = if again && localVarAt(sw) >= 0 { localVarAt(sw) } else { irVarNew(ib, ri, TY_I32, "local", sw) }
+    irBNode(b, { asDst: sv, asSrc: st }, -1, ibNoValue, ix)
   }
   if arm == "unrolled" { return forRangeUnrolled(b, n, ix, v) }
   if helpers { return forRangeHelperLoop(b, n, ix, v, arm == "partial") }
