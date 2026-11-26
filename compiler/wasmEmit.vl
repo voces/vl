@@ -10226,7 +10226,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 // value built before the box sits above that tag. `null` and `lit` write no value after theirs.
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
-    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "recCopy" | "refList" | "map" | "nulMap" | "clo" => true
+    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "recCopy" | "narrowBox" | "refList" | "map" | "nulMap" | "clo" => true
     "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "numRebox" | "ladder" => false
   }
 }
@@ -10242,7 +10242,7 @@ export function holeBoxHeadAhead(a: HoleBoxArm): boolean {
 export function boxTagOnly(a: HoleBoxArm): boolean {
   return match a {
     "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" => true
-    "recCopy" | "numRebox" | "map" | "nulMap" | "clo" | "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
+    "recCopy" | "numRebox" | "narrowBox" | "map" | "nulMap" | "clo" | "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
   }
 }
 
@@ -10255,7 +10255,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     }
     "atom" | "atomAsStr" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
     "atomList" => fbI32Rel(RS_TAG, atomListArmTag())
-    "rec" | "obj" | "recCopy" => fbI32Rel(RS_TAG, uTags[p.hbKind])
+    "rec" | "obj" | "recCopy" | "narrowBox" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
     "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
     "nulMap" => nulMapArmBoxHead(
@@ -10278,6 +10278,10 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
     "null" | "rec" | "obj" | "recCopy" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
+    "narrowBox" => {
+      fbStructGet(uBoxIdx, 1)
+      fbStructNew(uBoxIdx)
+    }
     "atom" | "atomList" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
@@ -10401,6 +10405,7 @@ function unionBoxArgLadders(
   return hp.hbArm == "ladder"
     || hp.hbArm == "recCopy"
     || hp.hbArm == "numRebox"
+    || hp.hbArm == "narrowBox"
     || hp.hbArm == "mapBox"
     || hp.hbArm == "nulNiche" && nulNicheBoxTagOf(unionTy, exprIx, fnIx) < 0
 }
@@ -40063,7 +40068,6 @@ export function forInLoopClose(s: ForIn, lp: ForInLoop, fiSeq: i32): i32 {
 function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   if !luForUnionIter(s.fiIter, fnIx) { return 0 }
   const arms = luMembersAt(nodeTyAt(s.fiIter, fnIx))
-  const u = luElemTy(arms)
   // The element union's rep: a box, or the string a literal union joined with `string` is.
   // Inside `is K[]` each element converts to `K`'s rep (D17002).
   const kt = luForKTy(s, fnIx)
@@ -40072,24 +40076,126 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   if k != "union" {
     return emitListUnionForFlat(s, stmtIx, fnIx, arms, k, kt >= 0)
   }
+  const lp = luForBoxPlanOf(arms)
+  if lp.lbWhy != "" { return emitFail(lp.lbWhy) }
+  return emitListUnionForLoop(s, stmtIx, fnIx, lp.lbPlan)
+}
+
+// The walk plan of `for` statement `s` over a union of lists' box (`emitListUnionFor`): its box arm,
+// or its flat arm where each element converts to a scalar or a string; `lbWhy` names a refusal,
+// "not a union walk" where `s` is none.
+export function luForWalkPlanOf(s: ForIn, fnIx: i32): LuForBoxPlan {
+  if !luForUnionIter(s.fiIter, fnIx) {
+    return {
+      lbWhy: "not a union walk",
+      lbPlan: luForFlatPlanOf([], "union", false).lbPlan,
+    }
+  }
+  const arms = luMembersAt(nodeTyAt(s.fiIter, fnIx))
+  const kt = luForKTy(s, fnIx)
+  const k: VKind = (if kt >= 0 { repSigKindOfTy(kt) } else { luForElemKind(s.fiIter, fnIx) })
+    ?? "union"
+  if k != "union" { return luForFlatPlanOf(arms, k, kt >= 0) }
+  return luForBoxPlanOf(arms)
+}
+
+// The type a union-of-lists walk `s` binds its variable at: `K` under `is K[]`, else the element
+// union of its arms.
+export function luForWalkElemTy(s: ForIn, fnIx: i32): i32 {
+  const kt = luForKTy(s, fnIx)
+  if kt >= 0 { return kt }
+  return luElemTy(luMembersAt(nodeTyAt(s.fiIter, fnIx)))
+}
+
+// From arm `i` on, the length of the list a union-of-lists box in local `box` holds: a tag test
+// per arm, the last arm untested (a checked walk's box holds one of them).
+export function luForLenChain(box: i32, plan: LuForPlan, i: i32) {
+  const last = i + 1 >= plan.tags.length
+  if !last {
+    luForArmTest(box, plan.tags[i])
+    fbIf(127) // 0x7f: (result i32)
+  }
+  fbLocalGet(box)
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(plan.heaps[i])
+  fbStructGet(plan.heaps[i], 1) // field 1: len
+  if last { return 0 }
+  fbElse()
+  luForLenChain(box, plan, i + 1)
+  fbEnd()
+  return 0
+}
+
+// From arm `i` on, element `cur` of the list a union-of-lists box in local `box` holds, boxed into
+// the element union or converted to the flat kind (`emitListUnionForElem`), under the same tag
+// chain as `luForLenChain`.
+export function luForElemChain(
+  box: i32,
+  cur: i32,
+  plan: LuForPlan,
+  i: i32,
+): i32 {
+  const last = i + 1 >= plan.tags.length
+  if last { return emitListUnionForElem(box, cur, plan, i) }
+  luForArmTest(box, plan.tags[i])
+  if plan.destKind == "union" {
+    fbIfRef(uBoxIdx)
+  } else {
+    fbOpenIf()
+    fbValtype(plan.destKind, -1)
+  }
+  if emitListUnionForElem(box, cur, plan, i) < 0 { return -1 }
+  fbElse()
+  if luForElemChain(box, cur, plan, i + 1) < 0 { return -1 }
+  fbEnd()
+  return 0
+}
+
+// Whether the box in local `box` carries tag `tag`.
+function luForArmTest(box: i32, tag: i32) {
+  fbLocalGet(box)
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, tag)
+  fbI32Bin(70) // 0x46 i32.eq
+  return 0
+}
+
+// A union-of-lists walk whose element union is a box: per arm, its tag, wrapper heap and element
+// row (`LuForPlan`), or the refusal (`lbWhy`) its emit raises.
+export type LuForBoxPlan = { lbWhy: string, lbPlan: LuForPlan }
+
+// The box walk plan of union-of-lists arms `arms` (`emitListUnionFor`'s union arm).
+export function luForBoxPlanOf(arms: i32[]): LuForBoxPlan {
   const tags: i32[] = []
   const heaps: i32[] = []
   const eTags: i32[] = []
   const eBoxes: i32[] = []
   const eNul: boolean[] = []
+  const none: LuForPlan = {
+    tags: [],
+    heaps: [],
+    eTags: [],
+    eBoxes: [],
+    eNul: [],
+    eTexts: [],
+    eFrom: [],
+    destKind: "union",
+  }
   for m in arms {
     const t = listIsArmTag(m)
     const h = listArmHeapOf(m)
     const row = armElemRowOf(tyArrayElemIx(m))
     if t < 0 || h < 0 || listBackOfWrap(h) < 0 || row.et == -1 {
-      return emitFail(
-        "emitProgram: a union-of-lists `for` arm has no tag, wrapper or element box",
-      )
+      return {
+        lbWhy: "emitProgram: a union-of-lists `for` arm has no tag, wrapper or element box",
+        lbPlan: none,
+      }
     }
     if unMemIsRefElemArray(m) && rvMayView(unMemRefArrArmSlot(m)) {
-      return emitFail(
-        "emitProgram: a union-of-lists arm may hold a list view, which its read does not unwrap",
-      )
+      return {
+        lbWhy: "emitProgram: a union-of-lists arm may hold a list view, which its read does not unwrap",
+        lbPlan: none,
+      }
     }
     tags.push(t)
     heaps.push(h)
@@ -40097,8 +40203,11 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
     eBoxes.push(row.ebox)
     eNul.push(row.nul)
   }
-  if u < 0 {
-    return emitFail("emitProgram: a union-of-lists `for` has no element union")
+  if luElemTy(arms) < 0 {
+    return {
+      lbWhy: "emitProgram: a union-of-lists `for` has no element union",
+      lbPlan: none,
+    }
   }
   const plan: LuForPlan = {
     tags: tags,
@@ -40108,9 +40217,9 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
     eNul: eNul,
     eTexts: [],
     eFrom: [],
-    destKind: k,
+    destKind: "union",
   }
-  return emitListUnionForLoop(s, stmtIx, fnIx, plan)
+  return { lbWhy: "", lbPlan: plan }
 }
 
 // How an arm's element (or map value) `e` enters the element union: its box tag (`et`, -2 for an
@@ -40276,7 +40385,7 @@ let forInPairBox: ArmElemRow | null = null
 // A per-arm `for` walk's arms: each list arm's tag and wrapper heap, then how its element enters
 // the element union (`eTags`: a box tag, -2 a stored box, -3 an atom widened by `eTexts`, -4 as
 // read), at the element union's rep `destKind`.
-type LuForPlan = {
+export type LuForPlan = {
   tags: i32[],
   heaps: i32[],
   eTags: i32[],
@@ -40297,6 +40406,18 @@ function emitListUnionForFlat(
   k: VKind,
   toK: boolean,
 ): i32 {
+  const lp = luForFlatPlanOf(arms, k, toK)
+  if lp.lbWhy != "" { return emitFail(lp.lbWhy) }
+  return emitListUnionForLoop(s, stmtIx, fnIx, lp.lbPlan)
+}
+
+// The flat walk plan of union-of-lists arms `arms` into element kind `k` (`emitListUnionForFlat`):
+// each element as stored, an atom widened to its string, or (`toK`) converted to `K`'s rep.
+export function luForFlatPlanOf(
+  arms: i32[],
+  k: VKind,
+  toK: boolean,
+): LuForBoxPlan {
   const plan: LuForPlan = {
     tags: [],
     heaps: [],
@@ -40318,9 +40439,10 @@ function emitListUnionForFlat(
       || listBackOfWrap(h) < 0
       || (k != "str" && k != "i32" && !toK)
     ) {
-      return emitFail(
-        "emitProgram: a union-of-lists `for` arm has no tag or wrapper, or its element union no rep the walk delivers",
-      )
+      return {
+        lbWhy: "emitProgram: a union-of-lists `for` arm has no tag or wrapper, or its element union no rep the walk delivers",
+        lbPlan: plan,
+      }
     }
     const atom = tyIsLitUnionOrLit(e)
     plan.tags.push(t)
@@ -40331,7 +40453,7 @@ function emitListUnionForFlat(
     plan.eNul.push(false)
     plan.eTexts.push(if atom { tyLitMemberTexts(e) } else { [] })
   }
-  return emitListUnionForLoop(s, stmtIx, fnIx, plan)
+  return { lbWhy: "", lbPlan: plan }
 }
 
 // The loop of `emitListUnionFor`: the box held in `#l`, one tag test, then per arm its own walk
@@ -40456,7 +40578,7 @@ function emitListUnionForArm(
 // Arm `i`'s element read over the box in local `box` at cursor `cur`, at the element union's
 // rep: a boxed element as stored, a scalar wrapped in its value box, a `null` off a nullable
 // element under the null tag, an atom widened to its string.
-function emitListUnionForElem(
+export function emitListUnionForElem(
   box: i32,
   cur: i32,
   plan: LuForPlan,
