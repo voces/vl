@@ -5,11 +5,11 @@ Repo-wide RULES only. The measurements and incidents behind each rule are in
 same headings. Subsystem detail lives in `docs/internals/`; `ROADMAP.md` owns the forward plan,
 `CHANGELOG.md` the shipped work, `DECISIONS.md` the non-obvious rationale.
 
-A refactor measurement goes in a new dated file under `docs/internals/refactor-notes/`, never into
-`architecture-target-2026-10.md`. **A PR adds only its own refactor note; the orchestrator folds
-notes into architecture-target's Status and the notes index.** That way lanes never conflict on a shared line.
-Likewise **a PR never edits `CHANGELOG.md`: it adds one `changelog.d/<branch>.md`** (`changelog.d/README.md`);
-the orchestrator folds them with `scripts/changelog-fold.vl`.
+A refactor note and a `changelog.d/<branch>.md` entry are **optional** (DECISIONS.md, "Docs and
+comments are not part of the job"). A refactor note, when written, is a new dated file under
+`docs/internals/refactor-notes/`, never `architecture-target-2026-10.md`. **A PR never edits
+`CHANGELOG.md`**; the orchestrator folds whatever `changelog.d/` entries and notes exist
+(`scripts/changelog-fold.vl`), so lanes never conflict on a shared line.
 
 ## Rulings — nothing waits on the owner
 

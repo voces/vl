@@ -13373,3 +13373,19 @@ is reused.
 bundle parameter returned whole. Only the producer was missing: the signature list from the
 callers' side, the lambda instanced at each signature under the maker's frame, and the `return`
 building the record.
+
+## Docs and comments are not part of the job (2026-11-26, coordinator ruling under the owner's delegation)
+
+The owner said docs and comments do not matter to them and left the policy to the coordinator.
+The coordinator ruled:
+
+1. **No PR has to write prose.** A refactor note, a `changelog.d/` entry, an inventory row (except
+   below) and a docs-only PR are all optional, and none is checked. `ready-check.sh` no longer
+   requires `changelog.d/<branch>.md`.
+2. **A PR body is at most 10 lines:** what changed, the units before and after, and the proof.
+3. **No time goes into comments,** to write them or to trim them. The comment ratchets
+   (`comment-budget`, `std-comment-audience`) stay, because they only fail when a count rises, so a
+   PR that writes no comment passes them.
+4. **What stays:** an inventory row for a clause-1 defect the finder does not fix in the same PR;
+   the `std-api-reviewer` pass on a std export change, which reviews the API and not its prose; and
+   CLAUDE.md's rules. A stale doc is deleted when it misleads a lane, not maintained.

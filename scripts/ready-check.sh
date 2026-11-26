@@ -69,8 +69,9 @@ fi
 if grep -q '^std/.*\.vl$' <<< "$CHANGED" && git diff "$BASE" HEAD -- 'std/*.vl' | grep -qE '^[-+]\s*export '; then
   LINES+=("std exports changed: attach the std-api-reviewer agent's verdict")
 fi
+# A changelog entry is optional (DECISIONS.md, "Docs and comments are not part of the job").
 if grep -qx "changelog.d/$BRANCH.md" <<< "$CHANGED"; then LINES+=("changelog.d/$BRANCH.md: present")
-else fail=1; LINES+=("changelog.d/$BRANCH.md: MISSING"); fi
+else LINES+=("changelog.d/$BRANCH.md: none (optional)"); fi
 
 echo
 echo "== paste into the READY message =="
