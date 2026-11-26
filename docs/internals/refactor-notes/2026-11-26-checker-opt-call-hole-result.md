@@ -1,6 +1,6 @@
 # Checker: a `?.` call through a hole parameter reads `| null` at every instance (2026-11-26, COV-CALL)
 
-**Defect.** D17662 (unfiled: D17662, filed on COV-CLOS's branch) is clause 1, check-clean invalid wasm. It was filed by COV-CLOS's
+**Defect.** D17662 is clause 1, check-clean invalid wasm. It was filed by COV-CLOS's
 `shared member callee nullable receiver` sweep.
 
 **Mechanism.** On a hole parameter, `a?.f(5)` is typed as a derived hole: the callee is the
