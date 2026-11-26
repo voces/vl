@@ -9135,30 +9135,36 @@ function elabMakerSigAdd(lam: i32, t: i32, sigs: i32[], mine: i32[]): boolean {
 }
 
 // The slot arm of the destination walk: call `c` of maker `d` stored as field `f` of a `const`
-// record literal, or an element of a `const` list literal, every value the slot is written a call
-// of `d`. Adds the signatures of each call through the slot's reads and the `const` places holding
+// record literal, an element of a `const` list literal, or a value of a fresh map, every value the
+// slot is written a call of `d`. Adds the signatures of each call through the slot's reads and the `const` places holding
 // one; 1, 0 where a read is anything else, -1 where `c` is stored in no such slot.
 function elabMakerSlotSigs(lam: i32, d: i32, c: i32, sigs: i32[]): i32 {
   cwIxBuild()
   if c < 0 || !cwIxCovers(c) { return -1 }
   const uk0 = cwIxUpKind[c]
   let f = ""
+  // A map's value is stored by `m[k] = c` or `m.set(k, c)` into a fresh `Map()`.
+  const md = if uk0 == CW_UP_ASG_RHS || uk0 == CW_UP_ARG { elabMapStoreDecl(c) } else { -1 }
+  const isMap = md >= 0
   if uk0 == CW_UP_FIELD {
     const fx = cwIxUpAux[c]
     const fiv = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
     if !(fiv is FieldInit) { return -1 }
     f = fiv.fiName
-  } else if uk0 == CW_UP_ELEM {
+  } else if uk0 == CW_UP_ELEM || isMap {
     f = "[]"
   } else {
     return -1
   }
-  const lit = cwIxUp[c]
-  if lit < 0 || !cwIxCovers(lit) || cwIxUpKind[lit] != CW_UP_LETINIT { return 0 }
-  const s = cwIxUp[lit]
+  const lit = if isMap { -1 } else { cwIxUp[c] }
+  if !isMap && (lit < 0 || !cwIxCovers(lit) || cwIxUpKind[lit] != CW_UP_LETINIT) {
+    return 0
+  }
+  const s = if isMap { md } else { cwIxUp[lit] }
   const sn = if s >= 0 && s < P.nodes.length { nodeAt(s) } else { null }
-  if !(sn is LetDecl) || sn.letKw != "const" || sn.letType >= 0 { return 0 }
-  const isList = f == "[]"
+  if !(sn is LetDecl) || sn.letType >= 0 { return 0 }
+  if !isMap && sn.letKw != "const" { return 0 }
+  const isList = f == "[]" && !isMap
   const vals: i32[] = []
   const ats: i32[] = []
   if cwSlotWrittenValues(s, [f], vals, ats) < 0 || vals.length == 0 { return 0 }
@@ -9177,19 +9183,36 @@ function elabMakerSlotSigs(lam: i32, d: i32, c: i32, sigs: i32[]): i32 {
       }
       const m = cwIxUp[u]
       const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
-      const own = if isList { mn is Index } else { mn is Member && mn.memProp == f }
+      // The slot's own place: the field, any element, or a map's value read by index or `get`.
+      let place = m
+      let own = false
+      if isMap {
+        if mn is Index {
+          own = true
+        } else if mn is Member && (mn.memProp == "get" || mn.memProp == "set" || mn.memProp == "has" || mn.memProp == "keys") {
+          // `set` is a write the slot's values hold; `has` and `keys` read no value.
+          const mk = if cwIxCovers(m) { cwIxUpKind[m] } else { -1 }
+          if mk != CW_UP_CALLEE && mn.memProp != "has" { return 0 }
+          own = mn.memProp == "get"
+          place = if own { cwIxUp[m] } else { m }
+        } else {
+          return 0
+        }
+      } else {
+        own = if isList { mn is Index } else { mn is Member && mn.memProp == f }
+      }
       if !own {
-        // A list's length, or another field of the record, reads no value of the slot.
-        const other = if isList { mn is Member && mn.memProp == "length" } else { mn is Member }
+        // A map's other members, a list's length, or another field of the record, read no value.
+        const other = isMap || (if isList { mn is Member && mn.memProp == "length" } else { mn is Member })
         if !other { return 0 }
         continue
       }
-      const uk = if cwIxCovers(m) { cwIxUpKind[m] } else { -1 }
+      const uk = if cwIxCovers(place) { cwIxUpKind[place] } else { -1 }
       if uk == CW_UP_CALLEE {
-        if !elabMakerSigAdd(lam, cwIxUp[m], sigs, mine) { return 0 }
+        if !elabMakerSigAdd(lam, cwIxUp[place], sigs, mine) { return 0 }
       } else if uk == CW_UP_LETINIT {
-        if !elabMakerPlaceSigs(lam, cwIxUp[m], sigs, mine) { return 0 }
-      } else {
+        if !elabMakerPlaceSigs(lam, cwIxUp[place], sigs, mine) { return 0 }
+      } else if !(isMap && (uk == CW_UP_ASG_LHS || uk == CW_UP_CMP)) {
         return 0
       }
     } else if k != CW_OCC_BIND && k != CW_OCC_ASG {
@@ -9199,8 +9222,8 @@ function elabMakerSlotSigs(lam: i32, d: i32, c: i32, sigs: i32[]): i32 {
   return 1
 }
 
-// Adds the signatures of each call through `const` place `h`, initialised with a slot's read; false
-// where `h` is read another way.
+// Adds the signatures of each call through `const` place `h`, initialised with a slot's read, and
+// through its `const` copies; a null test reads no value. False where `h` is read another way.
 function elabMakerPlaceSigs(lam: i32, h: i32, sigs: i32[], mine: i32[]): boolean {
   const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
   if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return false }
@@ -9211,10 +9234,16 @@ function elabMakerPlaceSigs(lam: i32, h: i32, sigs: i32[], mine: i32[]): boolean
     if k == CW_OCC_CALL {
       if !elabMakerSigAdd(lam, u, sigs, mine) { return false }
     } else if k == CW_OCC_USE {
-      if cwUseInOtherFrame(u) || !cwIxCovers(u) || cwIxUpKind[u] != CW_UP_CALLEE {
+      if cwUseInOtherFrame(u) || !cwIxCovers(u) { return false }
+      const uk = cwIxUpKind[u]
+      // A null test reads no value; a `const` copy is a place of its own.
+      if uk == CW_UP_CALLEE {
+        if !elabMakerSigAdd(lam, cwIxUp[u], sigs, mine) { return false }
+      } else if uk == CW_UP_LETINIT {
+        if !elabMakerPlaceSigs(lam, cwIxUp[u], sigs, mine) { return false }
+      } else if uk != CW_UP_CMP {
         return false
       }
-      if !elabMakerSigAdd(lam, cwIxUp[u], sigs, mine) { return false }
     } else if k != CW_OCC_BIND {
       return false
     }
