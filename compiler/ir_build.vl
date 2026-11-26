@@ -151,6 +151,7 @@ import {
   RListStage,
   RMakeRec,
   RMapDelete,
+  RMapFilterHead,
   RMapGet,
   RMapSet,
   RNulNoneBox,
@@ -832,7 +833,6 @@ import {
   fnBundleRetSigs,
   fnIndexOfNode,
   fnRetHeldAsBundle,
-  fnValuePlain,
   forInElemTyOf,
   forInMapRecv,
   globalCellHeap,
@@ -7528,17 +7528,17 @@ function bundleCaptureRead(b: i32[], fx: i32): Opnd {
 // between instances that dispatch it differently, D1063): legacy reads the field at its storage
 // (`emitMemStructRead`), so the IR reads the receiver's record kid at its own type.
 function sharedFieldCallee(b: i32[], m: Member, at: i32): Opnd {
-  const ot = nodeTyAt(m.memObj, ibFnIx)
-  const r = if ot >= 0 { repNodeOfTy(ot) } else { -1 }
+  const ot0 = nodeTyAt(m.memObj, ibFnIx)
+  const r = if ot0 >= 0 { repNodeOfTy(ot0) } else { -1 }
   const si = structIndexOfExpr(m.memObj, ibFnIx)
   const fi = if si >= 0 { sFieldIndex(si, m.memProp) } else { -1 }
   // A nullable record receiver (a `?.` on an un-annotated parameter) is read by legacy off the
-  // nullable reference the chain tested; the verifier admits no field read of a nullable.
+  // nullable reference the chain tested: its field is the inner record's.
   const rn = repNodeAt(r)
-  if rn is RNullable && repNodeAt(rn.rnInner) is RRecord {
-    return irBMiss("shared member callee nullable receiver")
-  }
-  if !(repNodeAt(r) is RRecord) || fi < 0 {
+  const nul = rn is RNullable && repNodeAt(rn.rnInner) is RRecord
+  const rr = if rn is RNullable && nul { rn.rnInner } else { r }
+  const ot = if nul { repTyOf(rr) } else { ot0 }
+  if !(repNodeAt(rr) is RRecord) || fi < 0 {
     return irBMiss("shared member callee row")
   }
   // Legacy's narrowed and union-box tails read the node's own type, which it has none of.
@@ -7546,12 +7546,12 @@ function sharedFieldCallee(b: i32[], m: Member, at: i32): Opnd {
     return irBMiss("shared member callee tail")
   }
   // The field is read at its kid's own type, which its record rep carries.
-  const k = repRecordKidOf(r, ot, m.memProp)
-  const ft = if k >= 0 { repTyOf(repNodeKids(r)[k]) } else { -1 }
+  const k = repRecordKidOf(rr, ot, m.memProp)
+  const ft = if k >= 0 { repTyOf(repNodeKids(rr)[k]) } else { -1 }
   if (
     ft < 0
-    || ibTyOpen(ft, repNodeKids(r)[k])
-    || repNodeKids(r)[k] != repNodeOfTy(ft)
+    || ibTyOpen(ft, repNodeKids(rr)[k])
+    || repNodeKids(rr)[k] != repNodeOfTy(ft)
   ) {
     return irBMiss("shared member callee kid")
   }
@@ -7566,7 +7566,7 @@ function sharedFieldCallee(b: i32[], m: Member, at: i32): Opnd {
     gfStr: false,
     gfShared: true,
   }
-  return irBLetTempTy(b, g, at, repNodeKids(r)[k], ft)
+  return irBLetTempTy(b, g, at, repNodeKids(rr)[k], ft)
 }
 
 // Armed, legacy has written call `ix` already, and must have taken the plain path at `key`.
@@ -8098,7 +8098,19 @@ function stashRhs(r: Rhs): boolean { return r is RStashSet }
 
 function tagStashRhs(r: Rhs): boolean { return r is RTagStash }
 
-function listStageRhs(r: Rhs): boolean { return r is RListStage }
+// Whether a node built into `b` from `at` on is a statement, not a temp written at its use.
+function stmtWrittenFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    if stmtClassOf(ib.irNodes[b[i]]) != "temp" { return true }
+    i = i + 1
+  }
+  return false
+}
+
+function listStageRhs(r: Rhs): boolean {
+  return r is RListStage || r is RMapFilterHead
+}
 
 // Whether a statement of class `c` among an operand's later siblings has the operands before it
 // written below it, as `ifBelowLeadHas` reads it: a valued or void `if`, a `??` box, a store or a
@@ -8497,12 +8509,10 @@ function mapDeleteRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
 // the callback's value, or the `null` immediate for a capture-free function the lowering builds.
 function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const why = mapFilterWhy(ix, ibFnIx)
-  // A call yielding the callback is written as legacy writes a plain function value (`fnValuePlain`).
+  // Any other callback expression is its closure value, written after the list's store.
   const callCb = why == "map callback expression"
-    && nodeAt(unwrapParen(c.callArgs[0])) is Call
-    && fnValuePlain(c.callArgs[0], 0)
   if why != "" && why != "map callback env" && !callCb { return missRhs(why) }
-  const v = irBExpr(b, m.memObj)
+  let v = irBExpr(b, m.memObj)
   if ibMiss != "" { return missRhs("method operand") }
   if !(repNodeAt(irBOpRep(v)) is RList) { return missRhs("map receiver rep") }
   const at = b.length
@@ -8512,8 +8522,17 @@ function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if !(nodeAt(cb) is FuncDecl || cbIdentNamesFn(c.callArgs[0], ibFnIx)) {
     f = irBExpr(b, cb)
     if ibMiss != "" { return missRhs("method operand") }
-    if ifBelowLead(b, at, "map short-circuit operand") {
-      return missRhs("map short-circuit operand")
+    if !(repNodeAt(irBOpRep(f)) is RClosure) {
+      return missRhs("map callback rep")
+    }
+    // Legacy stores the list into the call's source local before the callback: where the callback
+    // writes a statement, that store is a head statement ahead of it (`RMapFilterHead`).
+    if stmtWrittenFrom(b, at) {
+      const one: i32[] = []
+      irBNode(one, { efRhs: { mhV: v, mhAt: ix } }, -1, ibNoValue, ix)
+      if ibMiss != "" || one.length != 1 { return missRhs("map head") }
+      insertAt(b, at, one[0])
+      v = { oiRep: ibNoValue, oiBits: 0 }
     }
   }
   // A capturing function literal: its captures, each read where legacy's closure writer reads it.
@@ -9469,17 +9488,9 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const xAt = b.length
   const x0 = deliver(b, c.callArgs[0], er, -1)
   if ibMiss != "" { return missRhs("method operand") }
-  // A closure whose rep leaves a part open, or fills one, is the element's closure struct,
-  // retagged, as a list literal's element is.
-  const holed = irBOpRep(x0) != er
-    && repNodeAt(irBOpRep(x0)) is RClosure
-    && repNodeAt(er) is RClosure
-    && holeRetagNoted(irBOpRep(x0), er, true)
-    && exprPrePathWhy(c.callArgs[0], ibFnIx) == ""
-  // So is a value that stands at the element's rep (`retagsAsStands`).
-  const stands = irBOpRep(x0) != er
-    && retagsAsStands(irBOpRep(x0), er, c.callArgs[0])
-  const x = if holed || stands { repTemp(b, { rgV: x0 }, c.callArgs[0], er) } else { x0 }
+  // A value at another rep goes into the element's slot through the one converter.
+  const x = if irBOpRep(x0) != er { irConvertStored(b, x0, er, repTyOf(er), c.callArgs[0]) } else { x0 }
+  if ibMiss != "" { return missRhs(ibMiss) }
   if irBOpRep(x) != er { return missRhs("push operand coercion") }
   if nest && !pushNullableElemPlain(c.callArgs[0], er) {
     return missRhs("push nullable element coercion")
@@ -9509,8 +9520,10 @@ function pushLateRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const ln = repNodeAt(exprRepOf(m.memObj))
   if !(ln is RList) { return missRhs("push operand coercion") }
   const er = if repSubWord(ln.rlsElem) { repNodeOfTy(TY_I32) } else { ln.rlsElem }
-  const x = deliver(b, c.callArgs[0], er, -1)
+  const x0 = deliver(b, c.callArgs[0], er, -1)
   if ibMiss != "" { return missRhs("method operand") }
+  const x = if irBOpRep(x0) != er { irConvertStored(b, x0, er, repTyOf(er), c.callArgs[0]) } else { x0 }
+  if ibMiss != "" { return missRhs(ibMiss) }
   if irBOpRep(x) != er { return missRhs("push operand coercion") }
   const at = b.length
   const v = pushRecvExpr(b, m.memObj)
@@ -10064,6 +10077,31 @@ function atomToStr(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
 // The value of `ix` delivered at a plain string: an atom decodes to its member string.
 export function deliverStr(b: i32[], ix: i32): Opnd {
   return deliver(b, ix, repNodeOfTy(TY_STR), TY_STR)
+}
+
+// String operand `p` as legacy's `emitStrValue` writes it: a literal-union part decodes to its
+// member string and a dead `never` read is `unreachable` at the string (`deliverStr`), a call
+// that never returns and builds no string is that call and then the dead string, any other part
+// is built as it stands.
+export function strPartAt(b: i32[], p: i32): Opnd {
+  if exprIsLitAtom(p, ibFnIx) || exprReadsDeadNever(p, ibFnIx) {
+    return deliverStr(b, p)
+  }
+  const u = unwrapParen(p)
+  const c = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if !(c is Call) || !callEndsNever(u) || repPrim(exprRepOf(u)) == "str" {
+    return irBExpr(b, p)
+  }
+  const r = callRhs(b, c, u)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  irBNode(b, { efRhs: r }, -1, ibNoValue, u)
+  return irBLetTempTy(
+    b,
+    { dnAt: u, dnPad: false },
+    u,
+    repNodeOfTy(TY_STR),
+    TY_NEVER,
+  )
 }
 
 // Value `e` a union list's element is built from for its box (a literal's element, a store's value):
@@ -16358,7 +16396,7 @@ function accAppend(b: i32[], n: BinExpr, ix: i32) {
   let i = 1
   while i < parts.length {
     const from = b.length
-    const a = irBExpr(b, parts[i])
+    const a = strPartAt(b, parts[i])
     if ibMiss != "" { return 0 }
     if args.length > 0 && !irBStageLeads(b, from, starts, args, ixs) {
       return skip("string operand after another")
@@ -16823,8 +16861,9 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   }
   const x0 = if nulStore { nulSentinelStore(b, n.binRight, er) } else if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
   if ibMiss != "" { return 0 }
-  // A value that stands at the element's rep (`retagsAsStands`) is stored retagged.
-  const x = if irBOpRep(x0) != er && retagsAsStands(irBOpRep(x0), er, n.binRight) { repTemp(b, { rgV: x0 }, n.binRight, er) } else { x0 }
+  // A value at another rep goes into the element's slot through the one converter.
+  const x = if irBOpRep(x0) != er { irConvertStored(b, x0, er, repTyOf(er), n.binRight) } else { x0 }
+  if ibMiss != "" { return 0 }
   if ifBelowLeadIn(b, at, xat, "store short-circuit operand") { return 0 }
   if repPrim(irBOpRep(i)) != "i32" || irBOpRep(x) != er {
     return skip("store operand coercion")
