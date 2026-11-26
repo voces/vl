@@ -4,7 +4,7 @@
 legacy's plain arm does. It had no case for an argument that never returns (`f(__trap__())`).
 That argument is legacy's general arm with no scalar width, so `callRefPlainKey` was empty and
 the call missed `call of a non-declaration`. Such an argument stops before the call, so it is
-written as itself at any scalar parameter (`keyScalarRep`).
+written as itself at any scalar parameter (`keyScalarRep`), read by `callIsNever`.
 
 Legacy reads `callRefArgPlain` only to note which arguments the IR writes as it does; its own
 bytes do not move.
