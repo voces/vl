@@ -5483,15 +5483,20 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     && heldAsBox(cr)
     && heldAsBox(rep)
     && readNarrowedTyAt(ix, ibFnIx) >= 0
+  // A capture held at a record row its read's type does not record is read as it is held, as a
+  // local's read is (`rowlessReadTyOfVar`); its fields read at that row (`declRowReadTy`).
+  const rowTy = if cr != rep && !narrowed && !holed && !boxed { capRowlessTy(fe, name, ix, cr) } else { -1 }
   if (
     cr != rep
     && !narrowed
     && !holed
     && !boxed
+    && rowTy < 0
     && !capCellListSame(fe, name, cr, rep)
   ) {
     return irBMiss("capture binding")
   }
+  if rowTy >= 0 { return capturedAsHeld(b, fe, name, ix, cr, rowTy) }
   // The capture is held at its binding's type, or a walk variable's (`capLoopTyOf`), whose rep
   // must be the one it is read at first.
   const atOwn = narrowed || holed || boxed
@@ -5530,6 +5535,37 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if boxed { return irBLetTemp(b, { sgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
+}
+
+// The type capture `name` of `fe`, held at rep `cr`, is held at where its read `ix` names a record
+// row that type does not record (`rowlessReadTyAt`); -1 for none.
+function capRowlessTy(fe: i32, name: string, ix: i32, cr: i32): i32 {
+  const ct = capTyOf(fe, name)
+  if ct < 0 || repNodeOfTy(ct) != cr { return -1 }
+  const rt = rowlessReadTyAt(nodeTyAt(ix, ibFnIx), ct)
+  return if rt == ct { ct } else { -1 }
+}
+
+// Read `ix` of capture `name` of `fe` at its own rep `cr` and type `ct`: the environment's field,
+// or the lifted function's parameter.
+function capturedAsHeld(
+  b: i32[],
+  fe: i32,
+  name: string,
+  ix: i32,
+  cr: i32,
+  ct: i32,
+): Opnd {
+  if !cloLifted(fe) {
+    const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
+    ib.irReadAgain[ix] = ev
+    return irBLetTempTy(b, ev, ix, cr, ct)
+  }
+  const v = liftCapVar(fe, name, cr)
+  if v < 0 || ib.irVars[v].vRep != cr { return irBMiss("capture binding") }
+  ib.irReadVar[ix] = v
+  const o: Opnd = { ov: v }
+  return o
 }
 
 // The atom rep capture `name` of `fe` is held at where its read `ix` at plain string `rep` reads
@@ -18228,6 +18264,12 @@ export function declRowReadTy(ix: i32): i32 {
   }
   const d = identDeclOf(u)
   const lv = if d >= 0 { ibDeclVar[d] ?? -1 } else { -1 }
+  // A capture's fields read at the row it is held at, as `capturedAsHeld` reads it.
+  if lv < 0 && identReadArmOf(un, u, ibFnIx, false) == "capture" {
+    const fe = fnStmtsPosOf(ibFnIx)
+    const cr = capRepOf(fe, un.identName)
+    if cr >= 0 && cr != exprRepOf(u) { return capRowlessTy(fe, un.identName, u, cr) }
+  }
   if lv < 0 { return boundRowlessReadTy(u) }
   const t = heldTy(scopeTyAt(d, ibFnIx))
   // Only a local the place half moved holds a rep its type does not give.
@@ -18246,9 +18288,13 @@ function boundRowlessReadTy(u: i32): i32 {
 // `boundRowlessReadTy` for read `u` of variable `v`, which any local read names, a loop's own.
 function rowlessReadTyOfVar(u: i32, v: i32): i32 {
   if v < 0 { return -1 }
-  const t = nodeTyAt(u, ibFnIx)
+  return rowlessReadTyAt(nodeTyAt(u, ibFnIx), ib.irVars[v].vTy)
+}
+
+// The type `vt` a place is held at where a read of it typed `t` names a record row `vt` does not
+// record, or none (`rowlessStoredTy`); -1 when the two agree.
+function rowlessReadTyAt(t: i32, vt: i32): i32 {
   const r = repNodeOfTy(t)
-  const vt = ib.irVars[v].vTy
   const rl = rowlessStoredTy(t, r, vt)
   if rl >= 0 { return rl }
   if t < 0 || vt < 0 || t == vt || !(repNodeAt(r) is RRecord) { return -1 }
