@@ -796,6 +796,7 @@ import {
   elabInstTyAt,
   elabMakerLamOf,
   elabSpreadNote,
+  elabStoreMemberOf,
   isStorageRead,
   luOvEnter,
   luOvLeave,
@@ -2603,7 +2604,9 @@ function objLitAt(
     // A nested struct literal laid out at another row than the one this field targets is built at
     // the field's rep, by the targeted row's layout (D17666).
     const tgtRow = if arm == "struct" && own < 0 && !typed && !idAsClo { nestedLitTargetRow(valIx, ks[k], row, fi) } else { -1 }
-    const v0 = if idAsClo { cloValue(b, unwrapParen(valIx), ks[k], fieldSiteTy(arm, row, fi)) } else if tgtRow >= 0 { objLitAt(
+    const hold = arm == "struct"
+      && structFieldArmOf(row, fi, valIx, ibFnIx, false) == "holder"
+    const v0 = if hold { fieldHolderPick(b, valIx, ks[k]) } else if idAsClo { cloValue(b, unwrapParen(valIx), ks[k], fieldSiteTy(arm, row, fi)) } else if tgtRow >= 0 { objLitAt(
       b,
       unwrapParen(valIx),
       ks[k],
@@ -2954,6 +2957,9 @@ function fieldPlainWhy(
   if fa == "nulnone" {
     return nulNoneFieldWhy("object field nulnone", valIx, dst)
   }
+  // A bundle holder's read is the member the field's closure takes (`fieldHolderPick`).
+  if fa == "holder" && repNodeAt(dst) is RClosure { return "" }
+  if fa == "nulStrAtom" && strNullable(dst) { return "" }
   if !fieldArmDelivers(fa) { return "object field " + fa }
   if !fieldArmRepFits(fa, dst) { return "object field row rep" }
   // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
@@ -18963,6 +18969,18 @@ function holderRecordOf(b: i32[], f: i32): Opnd {
   return irBExpr(b, f)
 }
 
+// A record field's bundle holder read `valIx`: the holder's record, then the member the field
+// takes (`elabStoreMemberOf`), as legacy's `emitStructFieldValue` picks it.
+function fieldHolderPick(b: i32[], valIx: i32, dst: i32): Opnd {
+  const rec = holderRecordOf(b, valIx)
+  if ibMiss != "" { return rec }
+  if !(repNodeAt(irBOpRep(rec)) is RRecord) {
+    return irBMiss("holder pick record")
+  }
+  const m = elabStoreMemberOf(nodeSrc[valIx] ?? valIx)
+  return repTemp(b, { hkV: rec, hkM: m, hkArg: valIx }, valIx, dst)
+}
+
 // `let` `ix` (variable `v`) initialised with a bundle holder's read: the holder's record, then the
 // member the binding's type names (`RHolderPick`), at the binding's rep and type.
 function holderPickLet(b: i32[], n: LetDecl, ix: i32, v: i32): i32 {
@@ -18976,7 +18994,7 @@ function holderPickLet(b: i32[], n: LetDecl, ix: i32, v: i32): i32 {
   }
   const t = irBLetTempTy(
     b,
-    { hkV: rec, hkAt: ix, hkArg: n.letInit },
+    { hkV: rec, hkM: typedHolderMember(ix, ibFnIx), hkArg: n.letInit },
     n.letInit,
     ib.irVars[v].vRep,
     ib.irVars[v].vTy,
@@ -21045,7 +21063,12 @@ function globalHolderPick(b: i32[], gst: i32, init: i32, rep: i32): Opnd {
   if !(repNodeAt(irBOpRep(rec)) is RRecord) {
     return irBMiss("holder pick record")
   }
-  return repTemp(b, { hkV: rec, hkAt: gst, hkArg: init }, init, rep)
+  return repTemp(
+    b,
+    { hkV: rec, hkM: typedHolderMember(gst, ibFnIx), hkArg: init },
+    init,
+    rep,
+  )
 }
 
 // Global `gi`'s initializer `init` at its bare-arm cell, delivered at the cell's type so a
