@@ -16,4 +16,16 @@ parameters or globals keeps legacy's fill.
 
 ## Measurements
 
-MEASUREMENTS_PLACEHOLDER
+I8 census over the `tests/cases` programs, the new position test among them (base and head at
+master `f550c5892`): `closure env capture` 5 → 1 unclaimed functions (`looped` of
+`capturing-nested-function-read-from-another-frame-equality.vl` and the position test's three).
+Claimed functions 97,756 → 97,760, claimed starts 8,419 → 8,419, claims fallen back 11 → 11; 0
+claimed functions or starts lost, no other class moved. The one left (`counted` of
+`maker-delivered-at-two-function-types.vl`) is a hole lambda's capture at a maker instance, another
+mechanism.
+
+Q58 position sweep (`tests/cases/closures/cell-filled-closure-over-frame-local-positions.vl`: a
+while-loop local pushed, a for-in variable, an if-block local bound and called, a body local passed
+as an argument, a local record returned): base 3 functions miss, head 0; output identical
+claims-off and on. A partial claims-off ripple (2,719 built `tests/cases` programs) found 0 byte
+differences; the merge queue's identity check is the full measurement.
