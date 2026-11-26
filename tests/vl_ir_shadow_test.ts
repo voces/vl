@@ -613,21 +613,20 @@ function greet(a: boolean, xs: i32[]): i32 {
   return [...xs, if a { 1 } else { 2 }].length
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-type K = 0 | 1
-function own(x: K[][] | string | null) {
-  if x is K[][] { print(x[0][0]) } else { print(9) }
+function use(r) {
+  if r != null { print(r + 1) }
 }
-own([[1]])
-function twin(x: K[][] | i32[][] | string) {
-  if x is K[][] { print(x[0][0]) } else { print(9) }
+function fi(k: i32, a: f64, b: i32) {
+  const j = if k == 0 { a } else if k == 1 { b } else { null }
+  use(j)
 }
-function go() {
-  const five: i32[][] = [[5]]
-  twin(five)
+function ii(k: i32, a: i32, b: f64) {
+  use(if k == 0 { a } else if k == 1 { b } else { null })
 }
 print(greet(true, [1]))
 print(ap((x: i32) => x + 1))
-go()
+fi(0, 2.5, 7)
+ii(1, 7, 2.5)
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
