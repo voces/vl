@@ -6402,6 +6402,35 @@ function calleeSig(pos: i32): boolean {
   return true
 }
 
+// The first of arguments `args` typed `never`, or -1.
+function neverArgOf(args: i32[]): i32 {
+  let k = 0
+  while k < args.length {
+    if heldTy(exprTyOf(args[k])) == TY_NEVER { return k }
+    k = k + 1
+  }
+  return -1
+}
+
+// Call `ix` whose argument `nv` of `args` never returns, as legacy writes it: the arguments before
+// it (effect-free here, so none is written), that argument's call as a statement, then the call's
+// `unreachable` (`RDeadNever`).
+function deadCallAfter(b: i32[], args: i32[], nv: i32, ix: i32): Rhs {
+  let k = 0
+  while k < nv {
+    if !exprEffectFree(args[k]) { return missRhs("dead call argument before") }
+    k = k + 1
+  }
+  const ai = unwrapParen(args[nv])
+  const an = if ai >= 0 && ai < P.nodes.length { nodeAt(ai) } else { null }
+  if !(an is Call) { return missRhs("dead call argument") }
+  const r = callRhs(b, an, ai)
+  if ibMiss != "" { return missRhs(ibMiss) }
+  irBNode(b, { efRhs: r }, -1, ibNoValue, ai)
+  const d: Rhs = { dnAt: ix, dnPad: callEndsNever(ix) }
+  return d
+}
+
 // Whether slot `pos` holds declaration `d`, or the instance the monomorphizer minted from generic
 // `d`: a first instance takes the template's own slot (`monoOrigNode` keeps the original), a later
 // one a slot of its own (`monoInstFe`, from the template's slot `monoInstOrig`).
@@ -6700,7 +6729,12 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   }
   // A template hole this instance pins to a string or atom is written by legacy without the call.
   if tplStrHoleOf(c, ibFnIx) >= 0 { return missRhs("template hole pinned") }
-  if !calleeSig(pos) { return missRhs("callee signature") }
+  if !calleeSig(pos) {
+    // An argument that never returns ends the call: a never-typed parameter has no rep to sign.
+    const nv = neverArgOf(cargs)
+    if nv >= 0 { return deadCallAfter(b, cargs, nv, ix) }
+    return missRhs("callee signature")
+  }
   // A callee with a hidden environment parameter takes a null one before its arguments, and a
   // lifted one its captures next; one that captures through its environment stays legacy's.
   const env = envSlotShift(inst) > 0
