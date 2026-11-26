@@ -40,12 +40,15 @@ if ! cmp -s "$vl" "$d/host/vl" || ! cmp -s "$seed" "$d/host/seed.wasm"; then
   echo "LAND-RETRY: $seed or $vl changed during the check; re-run"
   exit 2
 fi
+# The lines of log `$2` matching `$1`, or its tail when none does (a step that died before its rows).
+excerpt() { { grep -E "$1" "$2" || tail -n 10 "$2"; } | head -10 | sed 's/^/  /'; }
 if printf '%s\n' "$out" | grep -q "Found 0 errors"; then
   # Two PRs green against an older master can still meet in the merged compiler. Where master's
   # compiler/ moved after the PR's merge base, the merged tree's compiler is built with this seed
   # and graded on the cheap IR rows: the shadow over tests/cases and the shadow suite.
   base=$(git merge-base origin/master "$sha")
   if ! git diff --quiet "$base" origin/master -- compiler/; then
+    command -v deno > /dev/null || { echo "LAND-NO: deno not found (needed for the IR shadow suite)"; exit 1; }
     # A worktree, since the shadow lists its programs with `git ls-files`; removed on exit.
     t="$d/tree"
     git worktree add -q --detach "$t" "$(git commit-tree "$tree" -p origin/master -m land-check)"
@@ -62,12 +65,12 @@ if printf '%s\n' "$out" | grep -q "Found 0 errors"; then
         scripts/silent-sweep/distilled/ir-shadow.vl --compiler build/vl-compiler.wasm -- \
         --seed build/vl-compiler.wasm --cases --prepost > "$d/shadow.log" 2>&1); then
       echo "LAND-NO: the merged tree's IR shadow over tests/cases reds:"
-      grep -E 'rose|fail rule|above' "$d/shadow.log" | head -10 | sed 's/^/  /'
+      excerpt 'rose|fail rule|above' "$d/shadow.log"
       exit 1
     fi
     if ! (cd "$t" && timeout 600 deno test -A --no-check tests/vl_ir_shadow_test.ts > "$d/suite.log" 2>&1); then
       echo "LAND-NO: the merged tree's IR shadow suite reds:"
-      grep -E 'FAILED|error: ' "$d/suite.log" | head -10 | sed 's/^/  /'
+      excerpt 'FAILED|error: ' "$d/suite.log"
       exit 1
     fi
   fi

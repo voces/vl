@@ -633,6 +633,7 @@ import {
   rlElemStructRow,
   rlElemVariantRow,
   structRowFieldStoresAtom,
+  structRowFnSlotLayout,
   structRowOfRecordTy,
 } from "./emit_shape_rows"
 import { mvValTyIxAt } from "./emit_map_value_slots"
@@ -712,6 +713,7 @@ import {
   unionLitIsPlanOf,
 } from "./wasmEmit"
 import {
+  fnInPinnedInstance,
   mapReadScalarBoxKindIn,
   mapRecvScalarBoxKindIn,
   mapRecvTyIn,
@@ -2403,7 +2405,7 @@ function rowTyBuildsAtGo(rt: i32, row: i32, seen: i32[]): boolean {
   seen.push(row)
   for name in repRecordFieldNames(rr) {
     const ft = recFieldTyOf(rt, name)
-    if irTyOpen(ft) && !openFieldStoredAsIds(ft, row, name, seen) {
+    if irTyOpen(ft) && !openFieldStoredAsRow(ft, row, name, seen) {
       return false
     }
   }
@@ -2413,15 +2415,18 @@ function rowTyBuildsAtGo(rt: i32, row: i32, seen: i32[]): boolean {
 // Whether open field `name` of type `ft` in struct row `row` is stored closed: a tagged set, which
 // the rep tree reps as its i32 id, stored as plain i32, or a nested record whose own row stores
 // its open parts so.
-function openFieldStoredAsIds(
+function openFieldStoredAsRow(
   ft: i32,
   row: i32,
   name: string,
   seen: i32[],
 ): boolean {
   if tyDenotesFunc(ft) {
-    return repPrim(repNodeOfTy(ft)) == "i32"
-      && structRowFieldStoresAtom(row, name) == 1
+    // A tagged set held as its id where the row stores the id, or a closure where it stores a
+    // non-null one; a nullable closure slot is no such row.
+    const fr = repNodeOfTy(ft)
+    return repPrim(fr) == "i32" && structRowFieldStoresAtom(row, name) == 1
+      || repNodeAt(fr) is RClosure && structRowFnSlotLayout(row, name) == 1
   }
   if !(repNodeAt(repNodeOfTy(ft)) is RRecord) { return false }
   const fi = sFieldIndex(row, name)
@@ -3069,11 +3074,11 @@ function storedMemberBoxTest(
   const v = irBExpr(b, n.isObj)
   storageReadLeave(mark)
   if ibMiss != "" { return v }
-  // The read is its storage's declared box, as legacy's storage read is.
+  // The read is its storage's declared box (a `U | null` box too), as legacy's storage read is.
   const st = readNarrowedStoreAt(n.isObj, ibFnIx)
   if (
     st < 0
-    || !(repNodeAt(irBOpRep(v)) is RBox)
+    || !(repNodeAt(irBOpRep(v)) is RBox) && !boxedNullable(irBOpRep(v))
     || irBOpRep(v) != repNodeOfTy(st)
   ) {
     return irBMiss("is member storage rep")
@@ -3452,6 +3457,36 @@ function strRowField(ix: i32): boolean {
 
 // The atom type `let` `d` holds when its initializer is a shared union field read every arm
 // stores as an atom (`sharedFieldAtomTy`), else -1.
+// The atom type binding `d` holds where its initializer is an assignment (`const v = k = "a"`):
+// the member written, held as the place's declared type less `null`; else -1.
+function letAsgAtomTy(d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const l = nodeAt(d)
+  if !(l is LetDecl) || l.letInit < 0 { return -1 }
+  const iv = unwrapParen(l.letInit)
+  if iv < 0 || iv >= P.nodes.length { return -1 }
+  const a = nodeAt(iv)
+  if !(a is BinExpr) || a.binOp != "=" || a.binCompound != "" { return -1 }
+  return atomLessNull(asgPlaceDeclTy(a.binLeft))
+}
+
+// Type `t` less `null` where that is an atom (the `K | null` niche's own atom), else -1.
+function atomLessNull(t: i32): i32 {
+  if t < 0 { return -1 }
+  const r = repNodeOfTy(t)
+  const n = repNodeAt(r)
+  if n is RAtom { return t }
+  return if atomNullable(r) && n is RNullable { repTyOf(n.rnInner) } else { -1 }
+}
+
+// The declared type of assignment target `ix` where it names a binding or parameter, else -1.
+function asgPlaceDeclTy(ix: i32): i32 {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is Ident) { return -1 }
+  const d = identDeclOf(u)
+  return if d >= 0 && d < P.nodes.length { heldTy(scopeTyAt(d, ibFnIx)) } else { -1 }
+}
+
 function letSharedFieldAtomTy(d: i32): i32 {
   const l = nodeAt(d)
   if !(l is LetDecl) || l.letInit < 0 { return -1 }
@@ -4022,7 +4057,8 @@ export function irBDeclVar(d: i32): i32 {
     const at0 = letAtomCellTy(d, ibFnIx)
     const r0 = if at0 >= 0 { repNodeOfTy(heldTy(at0)) } else { -1 }
     const atom0 = r0 >= 0 && (repNodeAt(r0) is RAtom || atomNullable(r0))
-    const at = if atom0 { at0 } else { letSharedFieldAtomTy(d) }
+    const sf = if atom0 { -1 } else { letSharedFieldAtomTy(d) }
+    const at = if atom0 { at0 } else if sf >= 0 { sf } else { letAsgAtomTy(d) }
     const ar = if at >= 0 { repNodeOfTy(heldTy(at)) } else { -1 }
     if ar >= 0 && (repNodeAt(ar) is RAtom || atomNullable(ar)) {
       return declVarAt(d, ar, heldTy(at))
@@ -4980,6 +5016,23 @@ function endsInTemp(b: i32[]): boolean {
   const n = ib.irNodes[id]
   if !(n is SLet) || n.lDst < 0 || n.lDst >= ib.irVars.length { return false }
   return ib.irVars[n.lDst].vKind == "temp"
+}
+
+// The list rep `dst` (or its nullable's inner) holds where list literal `ix`, in a pinned
+// instance, is built at a list of a narrower number than that list's element; else -1.
+function widerNumListAt(ix: i32, dst: i32): i32 {
+  if !fnInPinnedInstance(ibFnIx) { return -1 }
+  const dn = repNodeAt(dst)
+  const lr = if dn is RList { dst } else if dn is RNullable && repNodeAt(dn.rnInner) is RList { dn.rnInner } else { -1 }
+  if lr < 0 { return -1 }
+  const own = repNodeAt(exprRepOf(ix))
+  const want = repNodeAt(lr)
+  if !(own is RList) || !(want is RList) || own.rlsElem == want.rlsElem {
+    return -1
+  }
+  const sk = numKindOf(own.rlsElem)
+  const dk = numKindOf(want.rlsElem)
+  return if sk >= 0 && dk >= 3 && sk != dk { lr } else { -1 }
 }
 
 // The body of value-`if` arm `blockIx`: its one value, delivered at `rep`, written to out `t`. A
@@ -7925,8 +7978,12 @@ export function irBStageLeads(
 function stageTyOf(a: Opnd, ix: i32): i32 {
   const own = heldTy(exprTyOf(ix))
   if repNodeOfTy(own) == irBOpRep(a) { return own }
-  // An immediate at a rep its type does not name (a function set's id) has no staged type.
-  if a is OImm { return -1 }
+  // An immediate at a rep its type does not name (a function set's id) is staged at the rep's own
+  // type, which names it.
+  if a is OImm {
+    const rt = repTyOf(irBOpRep(a))
+    return if rt >= 0 && repNodeOfTy(rt) == irBOpRep(a) { rt } else { -1 }
+  }
   if !(a is OStr) { return own }
   const ctx = heldTy(ctxTyAt(ix, ibFnIx))
   return if repNodeOfTy(ctx) == irBOpRep(a) { ctx } else { -1 }
@@ -10150,6 +10207,23 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // destination's rep, each arm delivered there.
   if ibMiss == "" && dst >= 0 && dn is IfStmt && exprRepOf(du) < 0 {
     return ifExprAt(b, dn, du, dst, repTyOf(dst))
+  }
+  // A list literal delivered to a wider number's list, or that list's nullable, in a pinned
+  // instance is built at that list, each element widened there, as legacy writes it.
+  if ibMiss == "" && dst >= 0 && dn is ArrayLit {
+    const lr = widerNumListAt(du, dst)
+    if lr >= 0 {
+      const lv = arrayLit(
+        b,
+        dn,
+        du,
+        lr,
+        arrLitListBuild(du, ibFnIx),
+        repTyOf(lr),
+      )
+      if ibMiss != "" || lr == dst { return lv }
+      return widenTo(b, lv, ix, dst, dstTy)
+    }
   }
   // A read the checker narrowed to `null` is the destination's null where legacy's `nullread` arm
   // writes one (`nullReadDstOwnOf`), not its storage's.
