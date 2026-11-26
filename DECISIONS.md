@@ -13330,6 +13330,25 @@ rule, stated as an outcome, not a pin per upstream fact. Making the elaboration'
 every call, instance bodies included, is [D17574](docs/internals/inventory/D17574.md), next in SOUND's queue, a clause-1 row in its grading list riding on it. Inside an instance body an
 annotation naming the type parameter still reads the check's binding, so that rule cannot land alone.
 
+## A record value names its struct row through `irVarRow`, and its rep is that row's (2026-11-26, coordinator ruling) — D17666
+
+**Ruled by the coordinator 2026-11-26.** A rep can be shared by types laid out at different struct
+rows, so a rep alone does not name a heap. A record value the builder produces at a known row
+(built at it, read off a field that targets it, an element of a list laid out at it) is noted on
+the function with that row (`irVarRowNote`), and one accessor answers it (`irVarRow`, `irOpRow`).
+The value's rep is the row's own, `rowRep(si)`: the rep of the type the row stores, its targeted
+record fields at their rows' stored types (`rowStoredTy`), and a nullable value takes the row of its
+inner record. The verifier holds the invariant (rule 3, `varRowsWhy`): the rep is the row's or its
+nullable, and a value also noted as built on a heap is on the row's. Where `rowRep` and the
+checker type's rep disagree, `rowRep` wins. Every builder read of a row's type goes through
+`rowStoredTy`.
+
+**Why.** Before it, the lowering found a field read's struct by the rep's canonical type, which
+names the wrong heap for a nested record laid out at another row (D17666's
+`[{ r: { f: inc0 }, s: { f: dbl } }]`). Producers (this accessor) and consumers (a place holding
+the value, COV-CALL's list, map and record places) are split so the place side builds on one
+answer; D17666 closes when both are in.
+
 ## A maker's returned hole lambda held at two signatures is a record of its holders' signatures (2026-11-26, coordinator rulings)
 
 **Ruled by the coordinator 2026-11-26** (family C, `docs/internals/maker-bundle-record-2026-11.md`).

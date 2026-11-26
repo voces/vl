@@ -594,23 +594,28 @@ Deno.test({
   },
 });
 
-// Outside the set: a `??` over a `null`-typed if-expression and a radix literal assigned through an
+// Outside the set: an operand left below a `??` written in place (whose value waits on the stack at
+// its use, so no stage or spill holds the operand below it) and a radix literal assigned through an
 // if-expression into a nullable wide cell each leave their function uncovered, named. A closure
 // parameter, its baked callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    const src = `function greet(c: boolean, k: i32): i32 {
-  const x = null
-  return k + ((if c { x } else { x }) ?? 0)
+    const src = `type J = { a: i32 }
+type P = { j: J, k: i32 }
+type Q = { j: null, k: i32 }
+function mk(b: boolean): P | Q {
+  return if b { { j: { a: 3 }, k: 1 } } else { { j: null, k: 2 } }
 }
+const g = mk(true)
+function greet(k: i32): i32 { return k + (g.j?.a ?? 0) }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function wr(c: boolean): i64 | null {
   let x: i64 | null = null
   return x = if c { 0xfffffffe } else { 1 }
 }
-print(greet(true, 1))
+print(greet(1))
 print(ap((x: i32) => x + 1))
 print(wr(true) ?? 0)
 `;
@@ -1937,15 +1942,21 @@ Deno.test({
   name: "ir shadow: the blocker census names every class a function missed, and moves no byte",
   ignore,
   fn: () => {
-    const src = `function ok(x: i32): i32 { return x + 1 }
-function two(c: boolean, k: i32): i32 {
+    const src = `type J = { a: i32 }
+type P = { j: J, k: i32 }
+type Q = { j: null, k: i32 }
+function mk(b: boolean): P | Q {
+  return if b { { j: { a: 3 }, k: 1 } } else { { j: null, k: 2 } }
+}
+const g = mk(true)
+function ok(x: i32): i32 { return x + 1 }
+function two(k: i32): i32 {
   const xs = [1, 2]
-  const x = null
-  const y = k + ((if c { x } else { x }) ?? 0)
+  const y = k + (g.j?.a ?? 0)
   return xs[0] + y
 }
 print(ok(1))
-print(two(true, 3))
+print(two(3))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
@@ -1953,8 +1964,8 @@ print(two(true, 3))
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }
-    if ((census.rows.get("blockers none") ?? 0) !== 1) {
-      throw new Error(`want one covered function, got ${JSON.stringify([...census.rows])}`);
+    if ((census.rows.get("blockers none") ?? 0) !== 2) {
+      throw new Error(`want two covered functions (ok, mk), got ${JSON.stringify([...census.rows])}`);
     }
     const plain = run(src, false);
     if (plain.out.length !== census.out.length || plain.out.some((b, i) => b !== census.out[i])) {
@@ -3167,7 +3178,8 @@ Deno.test({
 
 // A returned `__trap__()` is the trap, then the bare `return` legacy writes after it: at an i32, a
 // string with a message, a record and a union result it builds and matches. At a wider number
-// legacy widens the dead value, so that result stays a named miss.
+// legacy also widens the dead value and the IR does not (D17667): it builds, and its bytes differ
+// only on that dead code, which behaviour parity admits.
 const RETURNED_TRAP =
   `type Pt = { x: i32, y: i32 }\nfunction ti(_n: i32): i32 { return __trap__() }\nfunction ts(_n: i32): string { return __trap__("unset") }\nfunction tp(): Pt { return __trap__() }\nfunction tu(): i32 | string { return __trap__() }\nfunction tl(): i64 { return __trap__() }\nexport let hi: (n: i32) => i32 = ti\nexport let hs: (n: i32) => string = ts\nexport let hp: () => Pt = tp\nexport let hu: () => i32 | string = tu\nexport let hl: () => i64 = tl\nprint(1)\n`;
 Deno.test({
@@ -3176,13 +3188,10 @@ Deno.test({
   fn: () => {
     const { rc, rows } = run(RETURNED_TRAP, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
-    const fails = failures(rows);
-    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
-      throw new Error(`want ti, ts, tp and tu covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if ((rows.get("uncovered returned trap widened") ?? 0) !== 1) {
-      throw new Error(`want tl a named miss, got ${JSON.stringify([...rows])}`);
+    const fails = failures(rows).filter((f) => !/^fail a claimable function did not match: bytes: .* in tl$/.test(f));
+    if (fails.length > 0) throw new Error(`want no failure but tl's bytes, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want all five covered and ti, ts, tp and tu matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

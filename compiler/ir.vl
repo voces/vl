@@ -1090,6 +1090,8 @@ export type IrFn = {
   // A thunk whose result type is its rep's own (`repTyOf`), its target's being open: the verifier
   // then checks the thunk forwards faithfully, since that type round-trips to its rep by origin.
   irRetFromRep: boolean,
+  // A function no instance re-builds at other reps (`fnBuiltOnce`): its open parts hold as built.
+  irBuiltOnce: boolean,
   // A lifted function's assigned captures, the parameter variables every exit hands back after
   // its result (D3664), in legacy's order (`fbSeedRetExtra`).
   irRetExtra: i32[],
@@ -1101,8 +1103,14 @@ export type IrFn = {
   irGlobalAt: {[i32]: i32},
   // The heap the builder noted for each record rep a hole retag compares (`irRecHeapNote`).
   irRecHeap: {[i32]: i32},
-  // The struct heap a struct literal's record temp is built at (`irVarHeapNote`).
+  // The struct row a struct literal's record temp is built at (`irVarHeapNote`); `sHeapIdx` names
+  // its heap.
   irVarHeap: {[i32]: i32},
+  // The struct row each record variable is laid out at (`irVarRowNote`): its rep is that row's
+  // rep (`rowRep`), or its nullable, and its wasm type the row's heap.
+  irVarRow: {[i32]: i32},
+  // The rep each struct row a variable is noted at is laid out at (`irVarRowNote`).
+  irRowRep: {[i32]: i32},
   // The retag nodes the builder noted as a closure stored at a record field legacy writes plainly,
   // whose closure kid another row on the same heap typed (`irCloFieldRetagNote`).
   irCloFieldRetag: {[i32]: boolean},
@@ -1215,9 +1223,10 @@ export function irNoTailHas(f: IrFn, v: i32): boolean {
   return false
 }
 
-// Whether `f` is a start body, built once: no instance re-builds it at other reps.
+// Whether `f` is built once, so no instance re-builds it at other reps: a start body, or a function
+// the builder found has one instance (`irBuiltOnce`).
 export function irFnBuiltOnce(f: IrFn): boolean {
-  return f.irName == "@start" || f.irName == "@init"
+  return f.irName == "@start" || f.irName == "@init" || f.irBuiltOnce
 }
 
 export function irFnNew(at: i32, name: string): IrFn {
@@ -1238,6 +1247,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irFragment: false,
     irThunk: false,
     irRetFromRep: false,
+    irBuiltOnce: false,
     irRetExtra: [],
     irSigFn: [],
     irSigParams: [],
@@ -1247,6 +1257,8 @@ export function irFnNew(at: i32, name: string): IrFn {
     irGlobalAt: Map(),
     irRecHeap: Map(),
     irVarHeap: Map(),
+    irVarRow: Map(),
+    irRowRep: Map(),
     irCloFieldRetag: Map(),
     irPushRecv: Map(),
     irGlobalStoreTy: Map(),
@@ -1392,14 +1404,36 @@ export function irCloFieldRetagNote(f: IrFn, id: i32) {
   return 0
 }
 
-// The struct heap record temp `v` is built at (`irVarHeapNote`), or -1 for none.
+// The struct row record temp `v` is built at (`irVarHeapNote`), or -1 for none.
 export function irVarHeapOf(f: IrFn, v: i32): i32 {
   return f.irVarHeap[v] ?? -1
 }
 
-// Notes record temp `v` as built at struct heap `h`, whatever heap its rep notes.
-export function irVarHeapNote(f: IrFn, v: i32, h: i32) {
-  if h >= 0 { f.irVarHeap[v] = h }
+// The struct row record variable `v` is laid out at (`irVarRowNote`), or -1 for none.
+export function irVarRow(f: IrFn, v: i32): i32 { return f.irVarRow[v] ?? -1 }
+
+// The struct row operand `o` is laid out at: its variable's (`irVarRow`), or -1 for an immediate.
+export function irOpRow(f: IrFn, o: Opnd): i32 {
+  return if o is OVar && o.ov >= 0 { irVarRow(f, o.ov) } else { -1 }
+}
+
+// Notes record variable `v` as laid out at struct row `row`, whose rep is `rr`, once.
+export function irVarRowNote(f: IrFn, v: i32, row: i32, rr: i32) {
+  if row >= 0 && (f.irVarRow[v] ?? -1) == -1 {
+    f.irVarRow[v] = row
+    f.irRowRep[row] = rr
+  }
+  return 0
+}
+
+// The rep struct row `row` is laid out at (`irVarRowNote`), or -1 where no variable is noted there.
+export function irRowRepOf(f: IrFn, row: i32): i32 {
+  return f.irRowRep[row] ?? -1
+}
+
+// Notes record temp `v` as built at struct row `row`, whatever heap its rep notes.
+export function irVarHeapNote(f: IrFn, v: i32, row: i32) {
+  if row >= 0 { f.irVarHeap[v] = row }
   return 0
 }
 
