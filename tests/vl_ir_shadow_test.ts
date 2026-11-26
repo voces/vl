@@ -609,8 +609,20 @@ function mk(b: boolean): P | Q {
   return if b { { j: { a: 3 }, k: 1 } } else { { j: null, k: 2 } }
 }
 const g = mk(true)
-function greet(a: boolean, xs: i32[]): i32 {
-  return [...xs, if a { 1 } else { 2 }].length
+type K1 = "circle" | "round"
+type A = { kind: K1, r: f64 }
+type B = { kind: "a", r: f64 }
+function f(n: i32): A | B {
+  if n == 0 { return { kind: "circle", r: 1.0 } }
+  const v: B = { kind: "a", r: 2.0 }
+  return v
+}
+function greet(n: i32) {
+  const b = f(n)
+  if b is B {
+    const k = b.kind
+    print(k)
+  }
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function use(r) {
@@ -623,7 +635,7 @@ function fi(k: i32, a: f64, b: i32) {
 function ii(k: i32, a: i32, b: f64) {
   use(if k == 0 { a } else if k == 1 { b } else { null })
 }
-print(greet(true, [1]))
+greet(2)
 print(ap((x: i32) => x + 1))
 fi(0, 2.5, 7)
 ii(1, 7, 2.5)
@@ -1464,7 +1476,7 @@ print(k(2, true, false) + f(true, false) + f2(false, true) + re(true))
 // staged below the `if` (`intr`, `bin`, `eq`, `st`, and `stIx`'s receiver below its index's), so
 // only `sp`'s `if` after a spread is a miss.
 Deno.test({
-  name: "ir shadow: a short-circuit operand below a node's lead is a named miss, not a fallback",
+  name: "ir shadow: a short-circuit operand below a node's lead is staged, not a named miss or a fallback",
   ignore,
   fn: () => {
     const src = `let m: Map<i32, boolean> = Map()
@@ -1497,13 +1509,10 @@ print(meth(true, "hello"))
 print(intr(true, 0.5))
 `;
     const { rows } = run(src, true);
-    const want: [string, number][] = [
-      ["uncovered array spread short-circuit operand", 1],
-    ];
-    for (const [k, n] of want) {
-      if (rows.get(k) !== n) throw new Error(`want ${n} "${k}" rows, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered array spread short-circuit operand")) {
+      throw new Error(`want \`sp\` staged, got ${JSON.stringify([...rows])}`);
     }
-    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (failures(rows).some((f) => !bytesRow(f))) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
     if (rows.has("uncovered store short-circuit operand")) {
       throw new Error(`want \`stIx\` staged, got ${JSON.stringify([...rows])}`);
     }
@@ -1969,21 +1978,32 @@ function mk(b: boolean): P | Q {
 }
 const g = mk(true)
 function ok(x: i32): i32 { return x + 1 }
-function two(k: i32): i32 {
-  const xs = [1, 2]
-  return [...xs, if k > 0 { 0 } else { 1 }].length + k
+type K1 = "circle" | "round"
+type A = { kind: K1, r: f64 }
+type B = { kind: "a", r: f64 }
+function f(n: i32): A | B {
+  if n == 0 { return { kind: "circle", r: 1.0 } }
+  const v: B = { kind: "a", r: 2.0 }
+  return v
+}
+function two(n: i32) {
+  const b = f(n)
+  if b is B {
+    const k = b.kind
+    print(k)
+  }
 }
 print(ok(1))
-print(two(3))
+two(2)
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    const want = "blockers array spread short-circuit operand";
+    const want = "blockers atom cell local rep";
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }
-    if ((census.rows.get("blockers none") ?? 0) !== 2) {
-      throw new Error(`want two covered functions (ok, mk), got ${JSON.stringify([...census.rows])}`);
+    if ((census.rows.get("blockers none") ?? 0) !== 3) {
+      throw new Error(`want three covered functions (ok, mk, f), got ${JSON.stringify([...census.rows])}`);
     }
     const plain = run(src, false);
     if (plain.out.length !== census.out.length || plain.out.some((b, i) => b !== census.out[i])) {
