@@ -629,6 +629,7 @@ import {
   annTyOf,
   mapTyWithVal,
   mvValVariantOf,
+  rlElemStructRow,
   rlElemVariantRow,
   structRowFieldStoresAtom,
   structRowOfRecordTy,
@@ -2338,6 +2339,24 @@ function listRowElemIs(arr: i32, e: i32): boolean {
   return et >= 0 && !irTyOpen(et) && repNodeOfTy(et) == e
 }
 
+// Whether list `arr` is held at a list of element rep `e`.
+function listRepElemIs(arr: i32, e: i32): boolean {
+  const ln = repNodeAt(exprRepOf(arr))
+  return ln is RList && ln.rlsElem == e
+}
+
+// The record rep the ref-list row of list `arr` lays its elements out at (`elemRowTy`), or -1. Its
+// own element type's rep counts only where `own` asks: a read whose type no struct row records.
+function listElemRowRep(arr: i32, own: boolean): i32 {
+  const slot = refListSlotOfExpr(unwrapParen(arr), ibFnIx)
+  const et = if slot >= 0 { rlElemTyIxAt(slot) } else { -1 }
+  if et < 0 || irTyOpen(et) { return -1 }
+  const eu = elemRowTy(et, slot)
+  if eu == et && !own { return -1 }
+  const er = repNodeOfTy(eu)
+  return if repNodeAt(er) is RRecord { er } else { -1 }
+}
+
 // Whether a value of type `t` (any type at all) is held at record rep `rep`: the rep alone decides.
 function builtRecord(t: i32, rep: i32): boolean {
   return t >= 0 && repNodeAt(rep) is RRecord
@@ -2993,6 +3012,10 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   if r >= 0 && r < P.nodes.length && nodeAt(r) is Member {
     return storedMemberBoxTest(b, n, ix, rep, tag)
   }
+  // An element's or map cell's box is its read at the storage, tested by tag as a local's is.
+  if tag >= 0 && r >= 0 && r < P.nodes.length && nodeAt(r) is Index {
+    return storedValueTagTest(b, n, ix, rep, ta, tag)
+  }
   const v = rawBoxVar(r)
   // A module global's box is its cell read raw, as legacy's storage read pushes it.
   if v < 0 && globalBoxSymOf(identDeclOf(r), r) >= 0 {
@@ -3323,7 +3346,7 @@ function listRowTyOf(ix: i32, r: i32): i32 {
   const slot = refListSlotOfExpr(unwrapParen(ix), ibFnIx)
   const et = if slot >= 0 { rlElemTyIxAt(slot) } else { -1 }
   if et < 0 || irTyOpen(et) { return -1 }
-  const lt = listTyOfElem(et)
+  const lt = listTyOfElem(elemRowTy(et, slot))
   const ln = repNodeAt(repNodeOfTy(lt))
   if (
     !(ln is RList)
@@ -3335,6 +3358,22 @@ function listRowTyOf(ix: i32, r: i32): i32 {
   return lt
 }
 
+// Element type `et` of ref-list row `slot`, or the declared type of the struct row legacy lays
+// its elements out at (`rlElemStructRow`) where that row's rep is another record, no twin of
+// `et`'s (`recTwinRep`), which keeps its own.
+function elemRowTy(et: i32, slot: i32): i32 {
+  const si = rlElemStructRow(slot)
+  const dt = if si >= 0 { declRowTy(si) } else { -1 }
+  if dt < 0 || repNodeOfTy(dt) == repNodeOfTy(et) { return et }
+  if (
+    !(repNodeAt(repNodeOfTy(dt)) is RRecord)
+    || recTwinRep(repNodeOfTy(et), repNodeOfTy(dt))
+  ) {
+    return et
+  }
+  return dt
+}
+
 // Rep `r` of built value `ix` at record type `t`, or the rep of the row legacy stores it in
 // (`structIndexOfExpr`): a value's rep follows its storage. A place keeps its own.
 function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
@@ -3342,6 +3381,11 @@ function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
   // A read of a place holds the place's rep, which the place decides (`rowlessLetTy`).
   const nd = nodeAt(unwrapParen(ix))
   if nd is Ident || nd is Member { return r }
+  // An element read off a list laid out at another record's row (`elemRowTy`) is that row's; a
+  // read whose type no struct row records is the element its list's row lays out.
+  const la = if nd is Index { nd.idxArr } else { -1 }
+  const lr = if la >= 0 { listElemRowRep(la, structIndexOfTy(t) < 0) } else { -1 }
+  if lr >= 0 && lr != r && listRepElemIs(la, lr) { return lr }
   const rt = builtStoredTy(t, r, storeRowOf(ix))
   if rt < 0 { return r }
   // An element read moves only off a list laid out at that row (`listRowRep`).
@@ -10655,7 +10699,7 @@ function boxTempIn(
 ): Opnd {
   if ibMiss != "" { return v }
   // A value with no recorded box union is boxed into its destination rep's own union.
-  const uTy = if uTy0 < 0 { repTyOf(dst) } else { uTy0 }
+  let uTy = if uTy0 < 0 { repTyOf(dst) } else { uTy0 }
   // A `null`-typed call is the box ladder's first rung (`emitNulNoneBoxPayload`), the call its
   // payload; any other `null`-typed value stays legacy's.
   if exprIsNulNone(ix, ibFnIx) && heldAsBox(dst) {
@@ -10707,6 +10751,16 @@ function boxTempIn(
       ix,
       dst,
     )
+  }
+  // A value the recorded union leaves to the ladder is planned at the union `dst` holds, which
+  // legacy's box writes (its null box tag is the program's, whatever the record names).
+  const dTy = repTyOf(dst)
+  if p.hbArm == "ladder" && dTy >= 0 && dTy != uTy {
+    const rp = holeBoxPlanOf(ix, dTy, ibFnIx)
+    if rp.hbArm != "ladder" {
+      p = rp
+      uTy = dTy
+    }
   }
   // An assignment the ladder would box is boxed as its target's value after its store, on the
   // target's own plan (an `asgLit`, say: the stored literal's box at the target's kind).
@@ -14324,8 +14378,10 @@ function mapGetAt(
   row: boolean,
   tempTy: i32,
   trap: boolean,
-  whole: boolean,
+  whole0: boolean,
 ): Opnd {
+  // A read at its storage is the value's box past its narrowing, as a `whole` read is.
+  const whole = whole0 || isStorageRead(ix)
   const rd = nodeAt(ix)
   if !(rd is Index) { return irBMiss("map get") }
   const arm = mapGetArmOf(ix, ibFnIx)
@@ -15688,7 +15744,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   if n is ArrayLit {
     // An open built type is the type of the rep it is built at (`openArrLitRep`).
     const abt = arrLitBuiltTyOf(ix, ibFnIx)
-    const bt = if ar >= 0 && (abt < 0 || irTyOpen(abt)) { repTyOf(rep) } else { abt }
+    // A literal held at its ref-list row (`listRowRep`) is built at that row's list.
+    const rowed = abt >= 0
+      && !irTyOpen(abt)
+      && rep != repNodeOfTy(abt)
+      && listRowTyOf(ix, repNodeOfTy(abt)) >= 0
+      && repNodeOfTy(listRowTyOf(ix, repNodeOfTy(abt))) == rep
+    const bt = if ar >= 0 && (abt < 0 || irTyOpen(abt)) || rowed { repTyOf(rep) } else { abt }
     return arrayLit(b, n, ix, rep, arrLitListBuild(ix, ibFnIx), bt)
   }
   if n is CharLit {
@@ -17864,11 +17926,14 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     }
     // Legacy may build a `[]` its pushes follow at its final size, through locals (D3623).
     const lr = if pos >= 0 { listReserveScan(n, sibs, pos, ibFnIx) } else { null }
-    // The lowering opens a reserve over a function's body only (`reserveOpen`).
+    // The lowering opens a reserve over a function's body or the start body's program
+    // (`reserveOpen`), not another helper's.
     const inFn = ibFnIx >= 0
       && ibFnIx < P.nodes.length
       && nodeAt(ibFnIx) is FuncDecl
-    if lr != null && !inFn { return skip("list reserve outside a function") }
+    if lr != null && !inFn && !irFnBuiltOnce(ib) {
+      return skip("list reserve outside a function")
+    }
     // An annotated binding of a bundle holder's read takes the member its type names, as legacy's
     // `emitTypedHolderInit` picks it ahead of every other initializer.
     if typedHolderMember(ix, ibFnIx) >= 0 { return holderPickLet(b, n, ix, v) }
