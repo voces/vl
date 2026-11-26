@@ -134,6 +134,17 @@ export type RSharedRead = {
   srGlobal: i32,
   srGlobalNonNull: boolean,
 }
+// A field write `shAt` through an un-narrowed union of records (legacy's `emitSharedFieldAssign`):
+// receiver box `shR` staged once (`shStash`), else a box local read per arm, or module global
+// `shGlobal` (`shR` unread) read per arm; then the value, one operand staged once or one per arm.
+export type RSharedFieldSet = {
+  shR: Opnd,
+  shStash: boolean,
+  shGlobal: i32,
+  shGlobalNonNull: boolean,
+  shVs: Opnd[],
+  shAt: i32,
+}
 // A box local read at the variant its narrowing names (`narrowedBoxVariantPlain`), whose record is
 // `bnRep`, the destination's; or, with `bnAtom` an atom kind (`identUnboxAtomOf`), read unboxed to
 // that atom, -1 otherwise. `bnAt` the read.
@@ -241,6 +252,9 @@ export type RSpread = {
   spAt: i32,
   // The union-box row legacy's boxing arm builds at (`emitArrSpreadBoxed`), else -1.
   spBoxRow: i32,
+  // The groups the plan converts to the literal's element kind (`spreadGroupStash`), each a list
+  // at its own element rep.
+  spConv: i32[],
 }
 // `__array_new__(lnLen, lnFill)` at call node `lnAt`, written by legacy's stash and tail.
 export type RListNew = { lnLen: Opnd, lnFill: Opnd, lnAt: i32 }
@@ -250,11 +264,13 @@ export type RListNewDefault = { ldLen: Opnd, ldAt: i32 }
 export type RListCopy = { lcArgs: Opnd[], lcAt: i32 }
 // A linear-memory load or store intrinsic at call node `mmAt` over its address and, for a store,
 // its value: `mmBase` operands (1 a load, 2 a store) at width prim `mmPrim`, as the builder planned.
+// `mmName` is the intrinsic it writes: the call's own, or a zero-extending fold's `_i64` load.
 export type RMemAccess = {
   mmArgs: Opnd[],
   mmAt: i32,
   mmBase: i32,
   mmPrim: string,
+  mmName: string,
 }
 // A declaration-time address fold's initializer (`emitMemConstFoldLet`): bounded part `mfiV`, kept
 // in wasm local `mfiSlot` by a tee, plus constant `mfiK`, the binding's own value.
@@ -419,7 +435,9 @@ export type RClosureEq = { cqL: Opnd, cqR: Opnd, cqAt: i32 }
 export type RIdentityEq = { ieL: Opnd, ieR: Opnd, ieAt: i32 }
 // The `+` of two lists at concat node `ljAt`, written by legacy's concat (`listCatTail`) after each
 // operand's own recovery (`listCatOperandTail`).
-export type RListCat = { ljL: Opnd, ljR: Opnd, ljAt: i32 }
+// `ljWiden` names the side (1 left, 2 right, 0 none) built at its own narrower list, which the
+// lowering widens to the concat's element (`catWidenTail`).
+export type RListCat = { ljL: Opnd, ljR: Opnd, ljAt: i32, ljWiden: i32 }
 // The value `cvV` of node `cvAt` converted by the coercion its checker record owes there, a list
 // copy or a union box's retag, written by legacy's tail after it (`coerceTail`).
 export type RCoerce = { cvV: Opnd, cvAt: i32 }
@@ -797,6 +815,7 @@ export type Rhs = RAfterEffects
   | RResultPick
   | RRetNull
   | RRetag
+  | RSharedFieldSet
   | RSharedRead
   | RSimd
   | RSpread
@@ -914,7 +933,7 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 // union field's test read only that operand before they open.
 export function coalArmStagesLeads(a: CoalValArm): boolean {
   return match a {
-    "litUnion" | "nulBool" | "nulRef" | "nulStr" | "asProp" | "nulBoolJoin" | "valBox" | "valScalar" | "callBox" | "callScalar" | "boxStash" | "fieldBox" | "fieldVal" => true
+    "litUnion" | "nulBool" | "nulRef" | "nulStr" | "asProp" | "nulBoolJoin" | "valBox" | "valScalar" | "callBox" | "callScalar" | "boxStash" | "boxRuntime" | "fieldBox" | "fieldVal" => true
     "boolPop" | "valNoKind" | "elem" | "callNoKind" | "next" | "popOr" | "listGetOr" | "mapIndexGetOr" | "optLeaf" | "optBoxLeaf" | "optRecLeaf" | "optMapField" | "nulAtomJoin" | "boxFieldScalar" => false
   }
 }
@@ -967,6 +986,7 @@ export const TRAP_BLOCK_CUT = 1
 // goes, with every use, once bytes may move.
 export type SDrop = { dpV: Opnd }
 // A helper's raw instruction that yields nothing: `srImm` is a set's field, a data segment, a callee.
+// `as.fail` reports cast node `srImm`'s `as!` failure (`__as_fail__`), in any body.
 export type RawEff = "struct.set"
   | "array.set"
   | "array.copy"
@@ -978,6 +998,7 @@ export type RawEff = "struct.set"
   | "sink.put"
   | "sink.null"
   | "sink.close"
+  | "as.fail"
 export type SRawOp = { srOp: RawEff, srHeap: i32, srArgs: Opnd[], srImm: i32 }
 // A read `saAt` through a box of lists or maps (an element, `.length`, `.has` or `.get`) on
 // legacy's tag chain: `saOps` the box, then its index or key (none for a `.length`); per arm
@@ -1579,6 +1600,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RResultPick |
       RRetNull |
       RRetag |
+      RSharedFieldSet |
       RSharedRead |
       RSimd |
       RSpread |
@@ -1888,6 +1910,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RVariantChain => [r.vcV]
     RVariantDiscrim => [r.vdV]
     RBoxField => [r.bfV]
+    RSharedFieldSet => opndsCat([r.shR], r.shVs)
     RSharedRead => [r.srV]
     RBoxNarrow => [r.bnV]
     RNicheRead => [r.nrV]
@@ -2031,6 +2054,7 @@ function rhsText(r: Rhs): string {
     RVariantChain => "is " + opndText(r.vcV) + " variant " + i32ToStr(r.vcVi) + " chain"
     RVariantDiscrim => "is " + opndText(r.vdV) + " variant " + i32ToStr(r.vdVi) + " discrim"
     RBoxField => "box_field " + opndText(r.bfV) + " @" + i32ToStr(r.bfAt)
+    RSharedFieldSet => "shared_field_set " + opndText(r.shR) + " := " + opndsText(r.shVs)
     RSharedRead => "shared_read "
       + opndText(r.srV)
       + " @"
@@ -2464,7 +2488,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
     SArmSite | SArmWrite => "box"
     SCoalBox => match n.cbArm {
       "popOr" | "listGetOr" => "list"
-      "nulRef" | "boxStash" | "nulAtomJoin" => "box"
+      "nulRef" | "boxStash" | "boxRuntime" | "nulAtomJoin" => "box"
       "litUnion" | "nulBool" | "boxFieldScalar" | "nulStr" | "asProp" | "nulBoolJoin" => "box"
       "fieldBox" | "fieldVal" | "optLeaf" | "optBoxLeaf" | "optRecLeaf" => "record"
       "mapIndexGetOr" | "optMapField" => "map"
@@ -2568,6 +2592,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RCast |
       RNicheRead |
       RNulNoneBox |
+      RSharedFieldSet |
       RSharedRead |
       RTest => "box"
     RRecordFitIs => "record"
@@ -2786,8 +2811,18 @@ export function listRetag(src: i32, dst: i32): boolean {
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
   if !(a is RList) || !(d is RList) { return false }
+  // A `boolean[]` rides the `i32[]` backing, so either is the other as it stands.
+  if i32Backed(a.rlsElem) && i32Backed(d.rlsElem) && a.rlsElem != d.rlsElem {
+    return true
+  }
   const ea = recElemCore(a.rlsElem)
   return ea >= 0 && ea == recElemCore(d.rlsElem)
+}
+
+// Whether element rep `e` is an unpacked `i32` or `bool`, which an `i32[]` backing holds.
+function i32Backed(e: i32): boolean {
+  const n = repNodeAt(e)
+  return n is RPrim && n.rpPacked == 0 && (n.rpK == "i32" || n.rpK == "bool")
 }
 
 // Whether a list at rep `src` and one at rep `dst` hold union boxes of one element kind (both
@@ -2899,12 +2934,12 @@ function repsFillHoles(
   return true
 }
 
-// Whether a record at variant rep `src` is the record at plain rep `dst` as it stands: the same
-// fields, stored on one heap.
+// Whether a record at variant rep `src` is the record at plain rep `dst` as it stands, or a plain
+// record the variant: the same fields, stored on one heap.
 export function recRetag(src: i32, dst: i32): boolean {
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
-  if !(a is RRecord) || !(d is RRecord) || !a.rrVariant || d.rrVariant {
+  if !(a is RRecord) || !(d is RRecord) || a.rrVariant == d.rrVariant {
     return false
   }
   const h = recHeapOf(src)

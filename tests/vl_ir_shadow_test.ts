@@ -639,32 +639,31 @@ Deno.test({
   },
 });
 
-// Outside the set: a `??` over a `null`-typed if-expression and an `as?` over a type parameter
-// each leave their function uncovered, named. A closure parameter, its baked
+// Outside the set: a `??` over a `null`-typed if-expression and an assignment's radix literal
+// widened through an if-expression each leave their function uncovered, named. A closure parameter, its baked
 // callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // An `as!` over a type parameter pinned at no number, which legacy writes as the operand and a
-    // trap inside the expression, is outside the set too.
     const src = `function greet(c: boolean, k: i32): i32 {
   const x = null
   return k + ((if c { x } else { x }) ?? 0)
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv<T>(u: T): i32 {
-  return u as! i32
+function wr(c: boolean): i64 {
+  let x: i64 = 0
+  return x = if c { 0xfffffffe } else { 1 }
 }
 print(greet(true, 1))
 print(ap((x: i32) => x + 1))
-print(cv("s"))
+print(wr(true))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    for (const why of ["expression as"]) {
+    for (const why of ["widen radix"]) {
       if (!rows.has(`uncovered ${why}`)) {
         throw new Error(`want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
       }
@@ -2503,20 +2502,21 @@ Deno.test({
   },
 });
 
-// A returned `if` under the sink that adapts to one wider number with a literal arm is legacy's
-// box-once return (`retIfIsOneNumber`), so it stays a named miss rather than a per-arm build.
+// A returned `if` under the sink that adapts to one wider number with a literal arm is built at
+// that number and boxed once (`retIfIsOneNumber`); here its literal arm at the instance's `i64`
+// is a named miss (`widen instLit`), never a per-arm build.
 const UNION_SINK_ONE_NUMBER =
   `function lit<A, B>(k: i32, a: A, b: B) {\n  if k == 0 { return a }\n  return if k == 1 { b } else { 5 }\n}\nconst z: i64 = 9\nprint(lit(2, z, z) + 1)\n`;
 Deno.test({
-  name: "ir shadow: a returned if boxed once as one wider number under the sink stays a miss",
+  name: "ir shadow: a returned if boxed once as one wider number under the sink, its instance literal arm a named miss",
   ignore,
   fn: () => {
     const { rc, rows } = run(UNION_SINK_ONE_NUMBER, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("uncovered tail if one number") ?? 0) !== 1) {
-      throw new Error(`want lit uncovered at tail if one number, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("uncovered widen instLit") ?? 0) !== 1) {
+      throw new Error(`want lit uncovered at widen instLit, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -2678,14 +2678,11 @@ print(gn[0])
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
-      throw new Error(`want two, glob, field, index covered and matched, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
+      throw new Error(`want two, glob, field, index, nest covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (
-      rows.get("uncovered push late receiver") !== 1 ||
-      rows.get("uncovered short-circuit argument after another") !== 1
-    ) {
-      throw new Error(`want nest and arg left to legacy by name, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered short-circuit argument after another") !== 1) {
+      throw new Error(`want arg left to legacy by name, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -3372,7 +3369,7 @@ Deno.test({
   ignore,
   fn: () => {
     const src = Deno.readTextFileSync(
-      new URL("./cases/unions/shared-nullable-scalar-field-read.vl", import.meta.url),
+      new URL("./cases/closures/captured-hole-fn-handed-on-two-generics.vl", import.meta.url),
     );
     const one = run(src, 1);
     const detail = run(src, 2);
@@ -3381,8 +3378,8 @@ Deno.test({
     if (rows1.some((k) => k.startsWith("detail ")) || one.rows.get("uncovered rep unsup") !== 1) {
       throw new Error(`want mode 1's one \`uncovered rep unsup\` and no detail row, got ${JSON.stringify([...one.rows])}`);
     }
-    if (detail.rows.get("detail rep unsup of member in X") !== 1) {
-      throw new Error(`want the detail row naming the member node in X, got ${JSON.stringify([...detail.rows])}`);
+    if (detail.rows.get("detail rep unsup of call in viaReturn$1") !== 1) {
+      throw new Error(`want the detail row naming the call node in viaReturn$1, got ${JSON.stringify([...detail.rows])}`);
     }
     if (one.out.length !== plain.out.length || one.out.some((b, i) => b !== plain.out[i])) {
       throw new Error("want the armed shadow's module byte-identical to the unarmed one");

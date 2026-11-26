@@ -1,6 +1,8 @@
 import { nullableRecordTyOf, recFieldTyOf } from "./emit_rec_field_codes"
+import { printPlanPinNull } from "./emit_union_registry"
 import {
   asgFieldParks,
+  catWidenTakes,
   coalFieldPlanOfOpt,
   identityOperandUnboxes,
   listFitShadowPlanOf,
@@ -8,6 +10,7 @@ import {
   listFitShadowSameTy,
   listFitShadowTyOf,
   optRecvHoleTyped,
+  spreadGroupConverts,
 } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import {
@@ -22,7 +25,7 @@ import {
   rangeConstVal,
 } from "./emit_plan_list"
 import { blockHasContinueFor, globalIsNonConst } from "./emit_query"
-import { narrowedArmTyAt } from "./emit_local_scope"
+import { narrowedArmTyAt, narrowedStructArmVi } from "./emit_local_scope"
 import {
   cboxElemTyOfCell,
   cboxIsWriteLet,
@@ -76,7 +79,7 @@ import {
 import { irTyF64, irTyI64 } from "./ir_helper"
 import { fnSigIdxOfFn } from "./emit_closure_sites"
 import { numUnionMinted } from "./check_union_mint"
-import { strListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import {
   ArrayLit,
   AsExpr,
@@ -119,9 +122,6 @@ import {
   nodeAt,
   nodeChildrenPush,
   spreadArgOf,
-  tailPushBlockTail,
-  tailPushIfArms,
-  tailPushMatchArms,
 } from "./ast"
 import {
   IrFamily,
@@ -350,6 +350,7 @@ import {
   cloCellReaches,
   cloLiftCalleeOf,
   closureValueCoreWhy,
+  closureValueIsGeneric,
   closureValueWhy,
   coalChainLinkOf,
   coalClosedWidensAtom,
@@ -395,6 +396,7 @@ import {
   holeBoxTyAt,
   hostCallNamed,
   hostCallPlanOf,
+  idxCellReadIsNull,
   idxStoreNullUnitUnstamped,
   idxStoreOtherWhy,
   idxStoreSiteBoxes,
@@ -414,6 +416,7 @@ import {
   keptDeclStoresNothing,
   legacyContextLiveWhy,
   letIfInitPerArmRep,
+  letStoresGenericAliasCore,
   listFitIsPlanOf,
   listOpRecvHeldPlan,
   lowMemFoldsCallee,
@@ -491,6 +494,7 @@ import {
   refListReadPlain,
   retUnionTyOf,
   scalarMapEqPlanOf,
+  sharedFieldStorePlan,
   shiftMaskFoldOf,
   simdCallNamed,
   simdCallRow,
@@ -542,6 +546,7 @@ import {
   variantFieldStoreValueArmOf,
   variantIsArmOf,
   variantRowArmOf,
+  zextLoadName,
   zextLoadOf,
 } from "./wasmEmit"
 import {
@@ -675,7 +680,6 @@ import {
   emptyFitPlanOf,
   fnFallThroughPadOf,
   guardEndsBlockWith,
-  ifJoinAdaptsScalar,
   isArmRank,
   letIfInitSinks,
   letIfInitTy,
@@ -720,6 +724,7 @@ import {
   RRecord,
   RUnsup,
   askRecordHeapNone,
+  nodeMapKeyTyOf,
   repClosureOfReps,
   repDescRet,
   repDescTy,
@@ -745,6 +750,7 @@ import {
   numLitWidth,
   parentBindingFrameArenaOf,
   parentBindingOf,
+  readNarrowedBoxToNull,
   readNarrowedTyAt,
   scopeTyAt,
 } from "./emit_capture_frames"
@@ -766,6 +772,7 @@ import {
   storageReadLeave,
 } from "./emit_elab"
 import {
+  ifJoinAdaptsScalar,
   mapReadScalarBoxKind,
   narrowedNulLitPinBoxKey,
   nulNicheRecoverOwed,
@@ -791,6 +798,7 @@ import {
   captureNamesOf,
   captureValKind,
   captureValStructIdx,
+  catWidenSideOfBin,
   cbIdentNamesFn,
   cloSigKeyExt,
   coalesceDefaultNullable,
@@ -1438,6 +1446,9 @@ let ibMissAt = -1
 // The right side of the name write (`x = v`, or a capture-box write `let`) last built, as legacy's
 // `stubWriteRhs`: a generic function read there is the stub cell's own value, not unfixed.
 let ibStubRhs = -1
+// The initializer of the binding being built when legacy stores it as a generic function's core
+// closure (`letStoresGenericAliasCore`): legacy never refuses that read, so neither does the claim.
+let ibAliasRhs = -1
 let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
@@ -1673,9 +1684,7 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   // narrowed read is its storage's declared box (`storedMemberBoxTest`).
   const st = if stored { readNarrowedStoreAt(n.isObj, ibFnIx) } else { -1 }
   if (
-    stored
-      && !(repNodeAt(irBOpRep(v)) is RBox)
-      && !storedNullableOfValue(irBOpRep(v))
+    stored && !heldAsBox(irBOpRep(v))
     || st >= 0 && irBOpRep(v) != repNodeOfTy(st)
   ) {
     return irBMiss("is member storage rep")
@@ -2844,12 +2853,16 @@ function fieldExplicitNullTyped(
 }
 
 // The null legacy's `nullread` arm writes for identifier read `ix` at its destination
-// (`nullReadDstOwnOf`); NULL_READ_STORED where its storage read is that null; else -1.
+// (`nullReadDstOwnOf`); NULL_READ_STORED where its storage read is that null; else -1. A shared
+// cell's read respelling such a name takes its destination's null the same way.
 const NULL_READ_STORED = 0 - 2
 function nullReadOwnAt(ix: i32): i32 {
   const sl = unwrapParen(ix)
   if sl < 0 || sl >= P.nodes.length { return -1 }
   const n = nodeAt(sl)
+  if n is Index && idxCellReadIsNull(sl, ibFnIx) {
+    return nullReadDstOwnOf(sl, ibFnIx)
+  }
   if !(n is Ident) || !identReadsNull(sl, ibFnIx) { return -1 }
   if exprPrePathWhy(ix, ibFnIx) != "" { return -1 }
   const own = nullReadDstOwnOf(sl, ibFnIx)
@@ -3134,13 +3147,6 @@ function boolNullable(r: i32): boolean {
 export function boxedNullable(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RNullable && n.rnDisc == 4
-}
-
-// Whether `r` is a boxed nullable over a plain value, which an `is` on its field tests at its
-// storage. One over a union box narrows its other arm to a box legacy reads apart.
-function storedNullableOfValue(r: i32): boolean {
-  const n = repNodeAt(r)
-  return n is RNullable && n.rnDisc == 4 && !(repNodeAt(n.rnInner) is RBox)
 }
 
 // Whether rep `r` is held as a union box: a box, or a boxed nullable.
@@ -3444,6 +3450,12 @@ export function irBOpenLocalReadRep(ix: i32): i32 {
   const dn = nodeAt(d)
   const w = if dn is Param { localIndexOf(ibFnIx, ix) } else { -1 }
   const v = if w >= 0 { paramVarAt(w) } else if dn is LetDecl { ibDeclVar[d] ?? -1 } else { -1 }
+  // A global's read is at its cell's rep (`globalRep`), as its initializer noted or its type gives.
+  if v < 0 && dn is LetDecl && localIndexOf(ibFnIx, ix) < 0 {
+    const g = globalIndexOfSid(sidOfNode(ix))
+    const gr = if g >= 0 { globalRep(g, d) } else { -1 }
+    return if gr >= 0 && valueRep(gr, -1) { gr } else { -1 }
+  }
   if v < 0 || v >= ib.irVars.length { return -1 }
   const r = ib.irVars[v].vRep
   return if valueRep(r, ib.irVars[v].vTy) { r } else { -1 }
@@ -3593,6 +3605,15 @@ function bundleCallOf(n: Call, ix: i32, t: i32): boolean {
   // Where legacy picks a member after the call, the value is that member, at the call's type.
   const pk = bundleResultPickOf(ix, pos, ibFnIx)
   return pk.bpField < 0 && pk.bpHeap != -2
+}
+
+// Whether direct call `ix` of `callee` returns its bundle parameter's record where its value is
+// used at none of the members (`bpHeap` -2); the builder declines it, so the program counts as a
+// capability the IR cannot yet lower.
+function bundlePickRefused(ix: i32, callee: i32): boolean {
+  if !elabHasRetRecords() && !bundleAnyNoted() { return false }
+  if bundleResultPickOf(ix, callee, ibFnIx).bpHeap != -2 { return false }
+  return true
 }
 
 function noPick(): BundlePick {
@@ -4615,7 +4636,14 @@ function refIfArm(
   // A struct literal whose row is on the join's record heap is built as that record, as a binding's
   // or an argument's is (`objLitTwinTyAtRow`).
   const lt = if arm == "plain" && tv >= 0 { objLitTwinTyAtRow(tv, rep, -1, -1) } else { -1 }
-  const built = if lt >= 0 { objLitAt(
+  // A plain arm whose own rep is not the join's and no retag reaches it is delivered at the
+  // join's rep, its widening, box or conversion written in the arm.
+  const er = if arm == "plain" && lt < 0 && tv >= 0 { exprRepOf(tv) } else { -1 }
+  const toJoin = er >= 0
+    && er != rep
+    && !holeRetagNoted(er, rep, true)
+    && !repNullRefFits(er, rep)
+  const built = if toJoin { deliver(body, tv, rep, repTyOf(rep)) } else if lt >= 0 { objLitAt(
     body,
     unwrapParen(tv),
     rep,
@@ -5315,7 +5343,10 @@ function globalReadTy(d: i32, ix: i32, rep: i32): i32 {
   const ty = heldTy(exprTyOf(ix))
   if !irTyHeldOpen(ty, rep) { return ty }
   const ht = globalHolderTy(d)
-  return if ht >= 0 && repNodeOfTy(ht) == rep { ht } else { ty }
+  if ht >= 0 && repNodeOfTy(ht) == rep { return ht }
+  // A read whose own type has no rep is at its cell's (`irBOpenLocalReadRep`), whose type it takes.
+  const rt = repTyOf(rep)
+  return if exprRepOf(ix) < 0 && rt >= 0 && !irTyHeldOpen(rt, rep) { rt } else { ty }
 }
 
 // The record type of the struct row global `d`'s cell holds at rep `cellRep`, where the read at
@@ -5689,6 +5720,16 @@ function cloValue(b: i32[], ix: i32, rep: i32, ty: i32): Opnd {
     return irBMiss(cloValueWhy(ix))
   }
   const why = if cloValueIsCore(ix, fe) { closureValueCoreWhy(fe) } else { closureValueWhy(fe) }
+  // A generic function taken as a value is legacy's contract, raised before the claim declines.
+  if (
+    why != ""
+    && emitSoftFail
+    && ix != ibAliasRhs
+    && !cloValueIsCore(ix, fe)
+    && closureValueIsGeneric(fe)
+  ) {
+    emitFailAt(why, ix)
+  }
   if why != "" { return irBMiss("closure value refused") }
   const env: Opnd[] = if fnEnvIdxOf(fe) >= 0 { cloEnvOf(b, fe, ix) } else { [] }
   if ibMiss != "" { return irBMiss(ibMiss) }
@@ -5910,6 +5951,25 @@ function narrowedLocalRead(
     return repTemp(b, { rgV: o }, ix, rep)
   }
   return irBMiss("narrowed read")
+}
+
+// Whether `null` side `ns`, an assignment of an effect-free value to a name other than tested
+// name `t`, gives the same answer written ahead of `t`'s read as after it.
+function rightNullStoreCommutes(ns: i32, t: i32): boolean {
+  const a = unwrapParen(ns)
+  const tr = unwrapParen(t)
+  if a < 0 || a >= P.nodes.length || tr < 0 || tr >= P.nodes.length {
+    return false
+  }
+  const an = nodeAt(a)
+  const tn = nodeAt(tr)
+  if !(an is BinExpr) || an.binOp != "=" || !(tn is Ident) { return false }
+  const tgt = unwrapParen(an.binLeft)
+  if tgt < 0 || tgt >= P.nodes.length || !(nodeAt(tgt) is Ident) {
+    return false
+  }
+  const td = identDeclOf(tr)
+  return td >= 0 && identDeclOf(tgt) != td && exprEffectFree(an.binRight)
 }
 
 // Notes node `ix` as a plain field read, kid `k`, the loop prologue may write again
@@ -7311,8 +7371,17 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
       && bx < 0
       && arm == "general"
       && nodeAt(unwrapParen(c.callArgs[i])) is NullLit { closureParamRep(f, i) } else { -1 }
+    // On the general arm a value the atom hook converts is built at its atom parameter's rep by
+    // the hook's arm, as `emitExpr` writes it there.
+    const ah = if wt < 0
+      && bx < 0
+      && nl < 0
+      && arm == "general"
+      && exprPrePathWhy(c.callArgs[i], ibFnIx) == "pre-path atom hook"
+      && closureParamRep(f, i) >= 0
+      && repNodeAt(closureParamRep(f, i)) is RAtom { closureParamRep(f, i) } else { -1 }
     const a = if wt >= 0 { deliver(b, c.callArgs[i], repNodeOfTy(wt), wt) } else if bx >= 0
-      && (!asIs || nodeAt(unwrapParen(c.callArgs[i])) is NullLit || arm == "atom") { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else if arm == "atomToStr" { closureArgAtomStr(b, c.callArgs[i], f, i) } else if nl >= 0 { deliver(b, c.callArgs[i], nl, -1) } else { irBExpr(b, c.callArgs[i]) }
+      && (!asIs || nodeAt(unwrapParen(c.callArgs[i])) is NullLit || arm == "atom") { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else if arm == "atomToStr" { closureArgAtomStr(b, c.callArgs[i], f, i) } else if nl >= 0 { deliver(b, c.callArgs[i], nl, -1) } else if ah >= 0 { deliver(b, c.callArgs[i], ah, -1) } else { irBExpr(b, c.callArgs[i]) }
     if ibMiss != "" { return missRhs("argument") }
     // An argument that writes a statement stages the call's head, and the arguments before it,
     // ahead of that statement, as legacy writes them before it (`RCallRefHead`).
@@ -8373,6 +8442,8 @@ function printStmt(b: i32[], c: Call, ix: i32) {
     irBNode(b, { efRhs: { pnV: e, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
     return 0
   }
+  if arm == "boxNull" { return printBoxNull(b, c.callArgs[0], ix) }
+  if arm == "nulRefNiche" { return printNulRefNiche(b, c.callArgs[0], ix) }
   const want = printArmRep(arm)
   if want == "" { return skip("print " + arm) }
   // A `K | null` read out of a wider box converts to the niche first (`emitPrintNulLitUnion`).
@@ -8407,6 +8478,41 @@ function printStmt(b: i32[], c: Call, ix: i32) {
     ibNoValue,
     ix,
   )
+  return 0
+}
+
+// A `print` of a box an `is` chain narrowed to `null` (`boxNull`): the argument read at its
+// storage, the box, printed along the union arm it takes there with the plan's null arm pinned, as
+// `emitCallCorePrint` writes it.
+function printBoxNull(b: i32[], arg: i32, ix: i32) {
+  const mark = storageReadEnter(arg)
+  const was = printPlanPinNull(true)
+  const inner = printArmOf(arg, ibFnIx)
+  const v = if inner == "union" { irBExpr(b, arg) } else { irBMiss("print boxNull arm " + inner) }
+  printPlanPinNull(was)
+  storageReadLeave(mark)
+  if ibMiss != "" { return 0 }
+  const vr = irBOpRep(v)
+  if !(repNodeAt(vr) is RBox) && !boxedNullable(vr) {
+    return skip("print operand rep")
+  }
+  irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+  return 0
+}
+
+// A `print` of a nullable reference whose other arm has no printed form (`nulRefNiche`): the
+// argument, then the null test's tail. A name is read at its storage, which holds the nullable
+// reference however far the narrowing went, as legacy's read writes it.
+function printNulRefNiche(b: i32[], arg: i32, ix: i32) {
+  const a = unwrapParen(arg)
+  const stored = readNarrowedBoxToNull(arg, ibFnIx)
+    || a >= 0 && a < P.nodes.length && nodeAt(a) is Ident
+  const mark = if stored { storageReadEnter(arg) } else { storageReadEnter(-1) }
+  const v = irBExpr(b, arg)
+  storageReadLeave(mark)
+  if ibMiss != "" { return 0 }
+  if !refNullable(irBOpRep(v)) { return skip("print operand rep") }
+  irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -8565,7 +8671,7 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
     return skip("map add of a non-set")
   }
   const at = b.length
-  const k = mapKeyAt(b, key, ka == "i64")
+  const k = mapKeyAt(b, recv, key, ka == "i64")
   if ibMiss != "" { return 0 }
   const one: Opnd = { oiRep: ibBool, oiBits: 1 }
   const vAt = b.length
@@ -8629,6 +8735,16 @@ function mapSetValue(
   )
   // A `null` literal on the plain arm is legacy's own null (`nullOwnAt`) at the map's value rep.
   const nul = nodeAt(unwrapParen(val)) is NullLit
+  // On the plain arm an atom-valued map's value the atom hook converts is built at the map's
+  // value rep by the hook's arm, as `emitExpr` writes it there.
+  if (
+    arm == "plain"
+    && mr is RMap
+    && repNodeAt(mr.rmVal) is RAtom
+    && exprPrePathWhy(val, ibFnIx) == "pre-path atom hook"
+  ) {
+    return deliver(b, val, mr.rmVal, -1)
+  }
   if (
     arm != "scalar"
     && arm != "union"
@@ -8742,7 +8858,7 @@ function popValueRhs(b: i32[], m: Member, ix: i32): Rhs {
 // index, which legacy writes from the call twice, so only an index it re-reads in place is taken.
 function getValueRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if popAnyPlanOf(ix, ibFnIx) == null { return missRhs("method get") }
-  if !listGetIdxReReadable(c.callArgs[0]) { return missRhs("get index staged") }
+  const reRead = listGetIdxReReadable(c.callArgs[0])
   const v = irBExpr(b, m.memObj)
   if ibMiss != "" { return missRhs("method operand") }
   if !(repNodeAt(irBOpRep(v)) is RList) {
@@ -8751,11 +8867,21 @@ function getValueRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const at = b.length
   const i = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return missRhs("method operand") }
-  if b.length != at || irBOpRep(i) != repNodeOfTy(TY_I32) {
+  if irBOpRep(i) != repNodeOfTy(TY_I32) { return missRhs("get index operand") }
+  // An index legacy cannot re-read is one temp, written once to a local at its first use
+  // (`irGetIdxBegin`); one re-read in place builds no statement.
+  if reRead && b.length != at || !reRead && !oneTempAt(b, at, i) {
     return missRhs("get index operand")
   }
   const r: Rhs = { lqV: v, lqIx: [i], lqAt: ix }
   return r
+}
+
+// Whether body `b` gained exactly one node from `at` on, the `let` defining temp `o`.
+function oneTempAt(b: i32[], at: i32, o: Opnd): boolean {
+  if b.length != at + 1 || !(o is OVar) || o.ov < 0 { return false }
+  const n = ib.irNodes[b[at]]
+  return n is SLet && n.lDst == o.ov && ib.irVars[o.ov].vKind == "temp"
 }
 
 // Whether map store value `val` into receiver `recv`'s mv slot `sh` is an object literal legacy
@@ -8906,10 +9032,13 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if pp == null { return missRhs("push plan") }
   const why = pushPlainWhy(pp, ibFnIx)
   // A late receiver held in its own local is read by index after the value either way.
-  const late = why == "push late receiver" && pushRecvHeldAtRest(pp.ppRecv)
+  const late = why == "push late receiver"
+  const held = pushRecvHeldAtRest(pp.ppRecv)
   // A nullable element slot's push is legacy's plain build of the value (`pushNestSlot`).
   const nest = why == "push nested list element"
   if why != "" && !late && !nest { return missRhs(why) }
+  // Any other late receiver is built after the value, as legacy stages it (D1280).
+  if late && !held { return pushLateRhs(b, c, m, ix) }
   const clear = !endsInTemp(b)
   const at = b.length
   const v = pushRecvExpr(b, m.memObj)
@@ -8948,6 +9077,27 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     return missRhs("push short-circuit operand")
   }
   const r: Rhs = { lpV: recv, lpX: x, lpAt: ix }
+  return r
+}
+
+// A `.push` `ix` whose value stages a list receiver of its own: the value at the receiver's element
+// rep, then the receiver, so the value's list op cannot overwrite this push's staged receiver.
+function pushLateRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  const ln = repNodeAt(exprRepOf(m.memObj))
+  if !(ln is RList) { return missRhs("push operand coercion") }
+  const er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
+  const x = deliver(b, c.callArgs[0], er, -1)
+  if ibMiss != "" { return missRhs("method operand") }
+  if irBOpRep(x) != er { return missRhs("push operand coercion") }
+  const at = b.length
+  const v = pushRecvExpr(b, m.memObj)
+  if ibMiss != "" || irBOpRep(v) != exprRepOf(m.memObj) {
+    return missRhs("push operand coercion")
+  }
+  if ifBelowLead(b, at, "push short-circuit operand") {
+    return missRhs("push short-circuit operand")
+  }
+  const r: Rhs = { lpV: v, lpX: x, lpAt: ix }
   return r
 }
 
@@ -9088,8 +9238,8 @@ function closureEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { cqL: l, cqR: r, cqAt: ix }, ix, rep)
 }
 
-// A reference identity on legacy's `identRef` route: each operand as `emitExpr` builds it, the
-// payload read and `ref.eq` the lowering's (`RIdentityEq`).
+// A reference identity on legacy's `identRef` or per-arm `identMixed` route: each operand as
+// `emitExpr` builds it, the payload read and the compare the lowering's (`RIdentityEq`).
 function identityEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if repPrim(rep) != "bool" { return irBMiss("identity compare result rep") }
   const l = irBExpr(b, n.binLeft)
@@ -9130,16 +9280,32 @@ function structEqOpAt(
   if repPrim(rep) != "bool" { return irBMiss("record compare result rep") }
   const lS = structEqStagesLeft(n.binLeft, n.binRight)
   const rS = structEqStagesRight(n.binRight)
+  const lAt = b.length
   const ls = structEqSide(b, n.binLeft, lS)
   if ibMiss != "" { return ls[0] }
   const at = b.length
   const rs = structEqSide(b, n.binRight, rS)
   if ibMiss != "" { return rs[0] }
-  const l = ls[0]
-  const r = rs[0]
-  if rS && ifBelowLeadOf(b, at, "record compare right operand", [l]) {
-    return l
+  // A stashed left is written ahead of the right's valued `if`: staged below it (`irBStageLeads`).
+  const leads: Opnd[] = [ls[0]]
+  if (
+    rS
+    && lS
+    && ls.length == 1
+    && !irBStageLeads(b, at, [lAt], leads, [n.binLeft])
+  ) {
+    return irBMiss("record compare right operand")
   }
+  if (
+    rS
+    && lS
+    && ls.length > 1
+    && ifBelowLeadOf(b, at, "record compare right operand", ls)
+  ) {
+    return ls[0]
+  }
+  const l = leads[0]
+  const r = rs[0]
   if repIsScalar(irBOpRep(l)) || repIsScalar(irBOpRep(r)) {
     return irBMiss("record compare operand rep")
   }
@@ -9197,8 +9363,20 @@ function structEqSide(b: i32[], ix: i32, staged: boolean): Opnd[] {
   if ibMiss != "" { return [o] }
   const place = structEqVarOpnd(o) && b.length == at
     || structEqPlaceRead(b, at, o, ix)
-  if !staged && !place { return [irBMiss("record compare place operand")] }
+  // An optional chain no stash or place holds is written once to a fresh local (`structEq`).
+  const once = nodeAt(unwrapParen(ix)) is OptMember
+    && structEqOnceRep(irBOpRep(o))
+  if !staged && !place && !once {
+    return [irBMiss("record compare place operand")]
+  }
   return [o]
+}
+
+// Whether a record compare side at rep `r` is a record or its nullable, which a fresh local holds.
+function structEqOnceRep(r: i32): boolean {
+  const n = repNodeAt(r)
+  if n is RRecord { return true }
+  return n is RNullable && n.rnDisc == 1 && repNodeAt(n.rnInner) is RRecord
 }
 
 // Whether operand `o`, built from `b[at]` on for node `ix`, is a place legacy re-reads at each
@@ -9665,6 +9843,30 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
       return boxTempAt(b, objLitAtVariantRow(b, ix, vi), ix, dst, vi)
     }
   }
+  // At an open destination the atom hook's node is built at its own atom rep, the type the hook
+  // converts it to; the destination then takes that value as it takes any.
+  if (
+    ibMiss == ""
+    && dst >= 0
+    && repNodeAt(dst) is RUnsup
+    && exprPrePathWhy(ix, ibFnIx) == "pre-path atom hook"
+  ) {
+    const own = exprRepOf(ix)
+    if own >= 0 && repNodeAt(own) is RAtom { return deliver(b, ix, own, -1) }
+  }
+  // At a `K | null` destination the atom hook's node is built at `K` by its arm, then widened.
+  if (
+    ibMiss == ""
+    && dst >= 0
+    && atomNullable(dst)
+    && exprPrePathWhy(ix, ibFnIx) == "pre-path atom hook"
+  ) {
+    const dnn = repNodeAt(dst)
+    if dnn is RNullable && repNodeAt(dnn.rnInner) is RAtom {
+      const av = deliver(b, ix, dnn.rnInner, -1)
+      return widenTo(b, av, ix, dst, dstTy)
+    }
+  }
   // At an atom destination the atom hook's node (`exprPrePathWhy`) is built by its arm. A join is
   // built at the destination, each arm delivered there (a member literal as its id), as legacy's
   // `emitIfExprAs` writes it (`litJoin`, `perArmJoin`); a one-literal place is its member's id,
@@ -10037,7 +10239,19 @@ function boxTempIn(
     }
     return repTemp(b, { nnV: v, nnPay: false, nnAt: ix }, ix, dst)
   }
-  const p = holeBoxPlanOf(ix, uTy, ibFnIx)
+  let p = holeBoxPlanOf(ix, uTy, ibFnIx)
+  // An assignment the ladder would box is boxed as its target's value after its store, on the
+  // target's own plan (an `asgLit`, say: the stored literal's box at the target's kind).
+  let pAt = ix
+  const a0 = nodeAt(unwrapParen(ix))
+  if p.hbArm == "ladder" && a0 is BinExpr && a0.binOp == "=" {
+    const tgt = unwrapParen(a0.binLeft)
+    const tp = if tgt >= 0 && tgt < P.nodes.length && nodeAt(tgt) is Ident { holeBoxPlanOf(tgt, uTy, ibFnIx) } else { p }
+    if tp.hbArm == "atom" {
+      p = tp
+      pAt = tgt
+    }
+  }
   // An assignment's value unboxed from the box its store parked, where the plan passes a box: that
   // box itself, the unbox dropped (legacy passes the unboxed value, which no box holds).
   if p.hbArm == "pass" {
@@ -10102,7 +10316,7 @@ function boxTempIn(
     b,
     {
       bxV: v,
-      bxAt: ix,
+      bxAt: pAt,
       bxTy: uTy,
       bxFree: exprEffectFree(ix) || asgSpan.length > 0,
     },
@@ -10238,7 +10452,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd, ix: i32): string {
     "atomAsStr" => repNodeAt(r) is RAtom
     "nulNiche" => refNullable(r) || strNullable(r)
     "nulBool" => repBoolNiche(r)
-    "rec" | "obj" => repNodeAt(r) is RRecord
+    "rec" | "obj" | "recCopy" => repNodeAt(r) is RRecord
     "refList" | "atomList" => repNodeAt(r) is RList
     // A scalar map read is built as the probe's own box (`mapGetAt`), which this plan writes as is.
     "mapScalar" => boxedNullable(r)
@@ -10428,6 +10642,28 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32, dstTy: i32): Opnd {
   return o
 }
 
+// The temp of a call that never returns, `v`, read at i32 and widened to `to` at node `ix`; a
+// never operand of another shape is a miss.
+function neverWidened(b: i32[], v: Opnd, ix: i32, to: i32): Opnd {
+  if ibMiss != "" { return v }
+  if (
+    !(v is OVar)
+    || v.ov < 0
+    || v.ov >= ib.irVars.length
+    || !repIsNoValue(irBOpRep(v))
+  ) {
+    return irBMiss("never operand not a call")
+  }
+  const i32r = repNodeOfTy(TY_I32)
+  ib.irVars[v.ov].vRep = i32r
+  const dk = numKindOf(to)
+  const t = irVarNew(ib, to, repTyOf(to), "temp", -1)
+  const w: Rhs = { nwV: v, nwSrc: numKindOf(i32r), nwDst: dk, nwAt: ix }
+  irBNode(b, { lDst: t, lRhs: w }, repTyOf(to), to, ix)
+  const o: Opnd = { ov: t }
+  return o
+}
+
 // Two lists, each built at its own list rep, compared by legacy's list compare.
 function listEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const l = irBExpr(b, n.binLeft)
@@ -10453,10 +10689,14 @@ function listCat(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const r = irBExpr(b, n.binRight)
   if ibMiss != "" { return r }
   if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
-  if irBOpRep(l) != rep || irBOpRep(r) != rep || !(repNodeAt(rep) is RList) {
+  // A widening concat's narrower side is a list at its own rep, widened by its tail (`catWidenTail`).
+  const ws = if catWidenTakes(ix, ibFnIx) { catWidenSideOfBin(ix, ibFnIx) } else { 0 }
+  const lok = irBOpRep(l) == rep || ws == 1 && repNodeAt(irBOpRep(l)) is RList
+  const rok = irBOpRep(r) == rep || ws == 2 && repNodeAt(irBOpRep(r)) is RList
+  if !lok || !rok || !(repNodeAt(rep) is RList) {
     return irBMiss("list concat operand rep")
   }
-  return irBLetTemp(b, { ljL: l, ljR: r, ljAt: ix }, ix, rep)
+  return irBLetTemp(b, { ljL: l, ljR: r, ljAt: ix, ljWiden: ws }, ix, rep)
 }
 
 // Two union boxes, each built at its own box rep, compared by legacy's staged compare.
@@ -11097,7 +11337,16 @@ function nulTest(
   }
   const arm = nulTestArmOf(bt.bnRef, ibFnIx, bt.bnInvert, false)
   if arm == "mapHas" { return nulTestMapHas(b, bt, ix, rep) }
+  if arm == "optChain" { return nulTestOptChain(b, bt, ix, rep) }
   if arm == "nullty" { return nulTestNullTy(b, bt, ix, rep) }
+  // A read the checker narrowed to `null` (or past it) is legacy's constant, its operand unread.
+  if (arm == "nulfold" || arm == "nnfold") && repPrim(rep) == "bool" {
+    const fo: Opnd = {
+      oiRep: rep,
+      oiBits: if (arm == "nulfold") != bt.bnInvert { 1 } else { 0 },
+    }
+    return fo
+  }
   if (
     arm != "atom"
     && arm != "bool"
@@ -11171,6 +11420,27 @@ function nulTestOperandOk(arm: NulTestArm, vr: i32): boolean {
   }
 }
 
+// `x?.f == null`: the chain built once as its value, then that value's own null test by its rep
+// (`optChainNulTestOk`), where legacy writes the chain's test and its read apart.
+function nulTestOptChain(b: i32[], bt: BinNulTest, ix: i32, rep: i32): Opnd {
+  const v = irBExpr(b, bt.bnRef)
+  if ibMiss != "" { return v }
+  if !optChainNulTestOk(irBOpRep(v)) {
+    return irBMiss("null test optChain rep")
+  }
+  return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
+}
+
+// Whether a nullable value at rep `vr` has a null test of its own: a niche of any discipline, or a
+// union box.
+function optChainNulTestOk(vr: i32): boolean {
+  return atomNullable(vr)
+    || boolNullable(vr)
+    || strNullable(vr)
+    || refNullable(vr)
+    || heldAsBox(vr)
+}
+
 // `m[k] == null` over a scalar map read, as legacy writes it: the map's has probe, then
 // `i32.eqz` for `==`.
 function nulTestMapHas(b: i32[], bt: BinNulTest, ix: i32, rep: i32): Opnd {
@@ -11219,11 +11489,8 @@ function deadNulTest(b: i32[], n: BinExpr, opIx: i32, ix: i32, rep: i32): Opnd {
 function nulTestNullTy(b: i32[], bt: BinNulTest, ix: i32, rep: i32): Opnd {
   if !nulNoneWritesNothing(bt.bnRef) {
     const fr = rawFieldRepOf(bt.bnRef)
-    // A field whose storage rep is not named (a receiver no row decision reached) is not read at
-    // the node's own `null`, which its receiver's row does not hold.
-    if fr < 0 && nodeAt(unwrapParen(bt.bnRef)) is Member {
-      return irBMiss("null test nullty operand")
-    }
+    // A field whose storage rep is not named (a receiver no row decision reached) is read as the
+    // node reads it: its value is dropped, so only its effects stand.
     const v = if fr >= 0 { irMemberHook(b, unwrapParen(bt.bnRef), fr) } else { exprAt(b, bt.bnRef, true) }
     if ibMiss != "" { return v }
     // The drop and the constant stand in the test's place, after any operand pending before it.
@@ -11335,7 +11602,12 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
   }
   const f = nodeAt(c.callFn)
   if !(f is Ident) { return missRhs("memory access callee") }
-  const p = memAccessPlanOf(f.identName)
+  return memAccessNamed(b, c, ix, f.identName)
+}
+
+// Load or store call `c` at node `ix`, written as intrinsic `name`.
+function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
+  const p = memAccessPlanOf(name)
   if p.mxOp < 0 || p.mxAlign < 0 { return missRhs("memory access width") }
   const ap = irBAddrPlan(c, p.mxBase)
   const at = b.length
@@ -11364,8 +11636,27 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
   ) {
     return missRhs("memory access operand coercion")
   }
-  const r: Rhs = { mmArgs: args, mmAt: ix, mmBase: p.mxBase, mmPrim: p.mxPrim }
+  const r: Rhs = {
+    mmArgs: args,
+    mmAt: ix,
+    mmBase: p.mxBase,
+    mmPrim: p.mxPrim,
+    mmName: name,
+  }
   return r
+}
+
+// A narrow load legacy folds with its widening (`zextLoadOf`: `as i64`, or a mask that only
+// zero-extends) into the `_i64` load that zero-extends as it reads, at the fold node `ix`.
+function zextLoadRead(b: i32[], ix: i32, rep: i32): Opnd {
+  const c = zextLoadOf(ix, ibFnIx)
+  if c < 0 || c >= P.nodes.length { return irBMiss("zero-extending load node") }
+  const n = nodeAt(c)
+  if !(n is Call) { return irBMiss("zero-extending load node") }
+  if repPrim(rep) != "i64" { return irBMiss("zero-extending load rep") }
+  const r = memAccessNamed(b, n, c, zextLoadName(c))
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  return irBLetTemp(b, r, ix, rep)
 }
 
 // An atomic intrinsic as legacy's arm writes it (`atomicPlanOf`): the address along
@@ -11660,13 +11951,22 @@ function spreadLit(
   b: i32[],
   n: ArrayLit,
   ix: i32,
-  rep: i32,
+  want: i32,
   lb: ListBuild,
   bt: i32,
 ): Opnd {
   // Legacy notes the literals the spread holds first (`emitArrAt`), so each is typed at its holder's
   // element; the plan asked without that note mints the literals' own lists. The note is idempotent.
   elabSpreadNote(ix)
+  // Built at its built type's list, which a fresh source typed at the destination's element sets
+  // apart from the literal's own (D4871); the consumer meets that rep. A twin keeps the literal's.
+  const btRep = if bt >= 0 { repNodeOfTy(bt) } else { -1 }
+  const rebuilt = btRep >= 0
+    && btRep != want
+    && repNodeAt(btRep) is RList
+    && !listRetag(want, btRep)
+    && !holeRetagNoted(want, btRep, true)
+  const rep = if rebuilt { btRep } else { want }
   const destRow = spreadBoxDestRow(n.arrElems, ibFnIx, lb)
   if destRow >= 0 { return spreadBoxedLit(b, n, ix, lb, destRow) }
   if spreadBoxingSource(ix, ibFnIx) >= 0 {
@@ -11676,8 +11976,19 @@ function spreadLit(
   }
   const p = spreadPlanOf(ix, ibFnIx, lb)
   if p.spWhy != "" { return irBMiss("array spread plan") }
-  for k in p.spSrcKinds {
-    if k != p.spKind { return irBMiss("array spread conversion") }
+  // A group at another element kind is converted by the plan's own tail (`spreadGroupStash`): an
+  // atom list into a `string` list, or a scalar list widened.
+  const conv: i32[] = []
+  let ck = 0
+  while ck < p.spSrcKinds.length {
+    const k = p.spSrcKinds[ck]
+    if k != p.spKind {
+      if !spreadGroupConverts(k, p.spKind) {
+        return irBMiss("array spread conversion")
+      }
+      conv.push(ck)
+    }
+    ck = ck + 1
   }
   for r in p.spGroupRows {
     if r != p.spRow { return irBMiss("array spread sub row") }
@@ -11712,7 +12023,16 @@ function spreadLit(
     // retagged: the plan copies its elements raw, at one kind.
     const v = if irBOpRep(v0) != rep
       && (listRetag(irBOpRep(v0), rep) || holeRetagNoted(irBOpRep(v0), rep, true)) { repTemp(b, { rgV: v0 }, grps[g], rep) } else { v0 }
-    if irBOpRep(v) != rep { return irBMiss("array spread source rep") }
+    // A converted group reaches the tail as a list at its own element rep, which the tail converts.
+    if i32ListHas(conv, g) && irBOpRep(v) == rep {
+      return irBMiss("array spread conversion")
+    }
+    if (
+      irBOpRep(v) != rep
+      && !(i32ListHas(conv, g) && repNodeAt(irBOpRep(v)) is RList)
+    ) {
+      return irBMiss("array spread source rep")
+    }
     srcs.push(v)
     g = g + 1
   }
@@ -11734,10 +12054,11 @@ function spreadLit(
     spSlot: lb.lbSlot,
     spAt: ix,
     spBoxRow: -1,
+    spConv: conv,
   }
   // A minted literal (a variadic push's run) has no checker type; it holds its build's. A literal
   // held at its laid-out row is typed at that row's list (`outTyOf`).
-  const own = heldTy(outTyOf(ix, rep))
+  const own = if rebuilt { heldTy(bt) } else { heldTy(outTyOf(ix, rep)) }
   const ty = if irTyHeldOpen(own, rep) && bt >= 0 { heldTy(bt) } else { own }
   return irBLetTempTy(b, r, ix, rep, ty)
 }
@@ -11807,6 +12128,7 @@ function spreadBoxedLit(
     spSlot: lb.lbSlot,
     spAt: ix,
     spBoxRow: row,
+    spConv: [],
   }
   return irBLetTempTy(b, r, ix, lrep, lt)
 }
@@ -11928,6 +12250,7 @@ function coalesce(
     return v
   }
   if arm == "mapScalarJoin" { return coalMapScalarJoin(b, n, ix, rep) }
+  if arm == "boxRuntime" { return coalBoxRuntime(b, n, ix, rep) }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
 }
@@ -12113,9 +12436,10 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   }
   const m = nodeAt(c.callFn)
   if !(m is Member) { return irBMiss("coalesce listGetOr call") }
-  if !optRecvReReadable(m.memObj) || !listGetIdxReReadable(c.callArgs[0]) {
+  if !optRecvReReadable(m.memObj) {
     return irBMiss("coalesce listGetOr staged operand")
   }
+  const idxReRead = listGetIdxReReadable(c.callArgs[0])
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   // Its value stays on the stack from here, so no temp an operand before it built may wait.
@@ -12129,15 +12453,20 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const at = b.length
   const i = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return i }
-  if b.length != at || irBOpRep(i) != repNodeOfTy(TY_I32) {
+  if irBOpRep(i) != repNodeOfTy(TY_I32) {
     return irBMiss("coalesce listGetOr index operand")
   }
-  // Legacy's head reads the index at each use, so an immediate or a variable is handed to it.
+  // An index legacy cannot re-read is one temp, held once in a local (`irGetIdxBegin`).
+  if idxReRead && b.length != at || !idxReRead && !oneTempAt(b, at, i) {
+    return irBMiss("coalesce listGetOr index operand")
+  }
+  // Legacy's head reads the index at each use, so an immediate, a variable or that temp is handed
+  // to it.
   const reread = i is OImm
     || i is OVar
     && i.ov >= 0
     && i.ov < ib.irVars.length
-    && ib.irVars[i.ov].vKind != "temp"
+    && (ib.irVars[i.ov].vKind != "temp" || !idxReRead)
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
   if !coalNeverDefault(nb, n.binRight, rep, t) {
@@ -12418,10 +12747,34 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
 // test's box-typed `if`, the default built into its absent arm.
 function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !heldAsBox(rep) { return irBMiss("coalesce box stash result rep") }
-  const ty = outTyOf(ix, rep)
-  if irTyOpen(ty) { return irBMiss("open temp type") }
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
+  return coalBoxTagged(b, n, ix, rep, l, "boxStash")
+}
+
+// `l ?? d` whose operand the checker narrowed to `null` though it may have been written since (a
+// loop, a closure, a call), along legacy's `boxRuntime` rung: the box read at its storage, then its
+// tag test, the box stash's at a box result and else the payload's unboxed.
+function coalBoxRuntime(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const mark = storageReadEnter(unwrapParen(n.binLeft))
+  const l = irBExpr(b, n.binLeft)
+  storageReadLeave(mark)
+  if ibMiss != "" { return l }
+  const arm: CoalValArm = if heldAsBox(rep) { "boxStash" } else { "boxRuntime" }
+  return coalBoxTagged(b, n, ix, rep, l, arm)
+}
+
+// The tag-tested `??` over box `l` along `arm`: the default built into its absent arm.
+function coalBoxTagged(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  l: Opnd,
+  arm: CoalValArm,
+): Opnd {
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
   if !heldAsBox(irBOpRep(l)) {
     return irBMiss("coalesce box stash operand rep")
   }
@@ -12439,7 +12792,7 @@ function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     {
       cbL: l,
       cbLB: [],
-      cbArm: "boxStash",
+      cbArm: arm,
       cbNull: nb,
       cbOut: t,
       cbAt: ix,
@@ -12601,6 +12954,13 @@ function coalField(
 function storageReadOf(b: i32[], ix: i32): Opnd {
   const u = unwrapParen(ix)
   const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  // An element read is read at its storage as legacy marks it (`storageReadEnter`), the box.
+  if n is Index {
+    const mark = storageReadEnter(u)
+    const ev = irBExpr(b, ix)
+    storageReadLeave(mark)
+    return ev
+  }
   if !(n is Ident) { return irBExpr(b, ix) }
   const d = identDeclOf(u)
   const w = localIndexOf(ibFnIx, u)
@@ -12976,7 +13336,11 @@ function coalNicheCell(
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
   if !coalNeverDefault(nb, n.binRight, rep, t) {
-    const d = irBExpr(nb, n.binRight)
+    // A default the atom hook writes (a `const` bound to a member literal) is delivered at the
+    // niche's atom, as `const d: K = Z` delivers it.
+    const hook = atom
+      && exprPrePathWhy(n.binRight, ibFnIx) == "pre-path atom hook"
+    const d = if hook { deliver(nb, n.binRight, rep, ty) } else { irBExpr(nb, n.binRight) }
     if ibMiss != "" { return d }
     if irBOpRep(d) != rep { return irBMiss("coalesce niche default rep") }
     irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
@@ -13353,8 +13717,10 @@ function mapGetAt(
   const mr = if rk.mkSym >= 0 { irGlobalRepOf(ib, rk.mkSym) } else { irBOpRep(rk.mkLoc) }
   const m = repNodeAt(mr)
   if !(m is RMap) { return irBMiss("map get receiver rep") }
-  // A union-valued map's read is its value's box, the null-tagged box on a miss; a narrowed read
-  // legacy unboxes after is at another rep and stays a miss.
+  // A union-valued map's read is its value's box, the null-tagged box on a miss. One narrowed to a
+  // record member no plan reads is the box read whole, then narrowed; legacy writes it through
+  // `emitExpr`, which banks the read's row whatever row a caller expecting the box passed.
+  let narrowTo = -1
   if arm == "unionBox" {
     // At its narrowing the read is unboxed to the member's scalar after (`narrowedMapReadOf`).
     const nm = narrowedMapReadOf(ix, ibFnIx)
@@ -13366,7 +13732,12 @@ function mapGetAt(
       "unbox" => repPrim(rep) != null && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
       "container" | "nonNull" => false
     }
-    if box >= 0 || !repOk { return irBMiss("map get union box rep") }
+    if box < 0 && !repOk && !whole && repNodeAt(rep) is RRecord {
+      narrowTo = rep
+    }
+    if (box >= 0 || !repOk) && narrowTo < 0 {
+      return irBMiss("map get union box rep")
+    }
   }
   // A scalar read typed at a boxed nullable its map's value rep is not (one arm of a union of
   // maps) is the probe's own box at that value's kind, as the box plan's `mapScalar` writes it.
@@ -13394,6 +13765,28 @@ function mapGetAt(
     mtTrap: trap,
     mtPrint: -1,
     mtWhole: whole,
+  }
+  if narrowTo >= 0 {
+    const wr: Rhs = {
+      mtSym: rk.mkSym,
+      mtNonNull: rk.mkNonNull,
+      mtLoc: rk.mkLoc,
+      mtKey: rk.mkKey,
+      mtAt: ix,
+      mtBox: -1,
+      mtRow: true,
+      mtTrap: false,
+      mtPrint: -1,
+      mtWhole: true,
+    }
+    const wv = irBLetTempTy(b, wr, ix, m.rmVal, repTyOf(m.rmVal))
+    if ibMiss != "" { return wv }
+    return irBLetTemp(
+      b,
+      { bnV: wv, bnAt: ix, bnRep: narrowTo, bnAtom: -1, bnCon: -1 },
+      ix,
+      narrowTo,
+    )
   }
   if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
   // A read at a twin of the value's rep is the value's own read, retagged.
@@ -13537,7 +13930,7 @@ function mapRecvKeyOf(
   const loc = mapRecvLoc(b, recvIx, g, why)
   if ibMiss != "" { return null }
   const at = b.length
-  const k = mapKeyAt(b, keyIx, wide)
+  const k = mapKeyAt(b, recvIx, keyIx, wide)
   if ibMiss != "" { return null }
   if mapRecvReassigned(b, at, loc) {
     irBMiss("map receiver reassigned")
@@ -13548,10 +13941,16 @@ function mapRecvKeyOf(
   return { mkSym: g, mkNonNull: nonNull, mkLoc: loc, mkKey: k }
 }
 
-// Map key `keyIx` as legacy writes it: at the `i64` an `i64`-keyed map holds where `wide`
-// (`emitScalarValue`), else as itself.
-function mapKeyAt(b: i32[], keyIx: i32, wide: boolean): Opnd {
+// Map key `keyIx` of receiver `recvIx` as legacy writes it: at the `i64` an `i64`-keyed map holds
+// where `wide` (`emitScalarValue`), a key the atom hook converts at the receiver's atom key rep by
+// the hook's arm, else as itself.
+function mapKeyAt(b: i32[], recvIx: i32, keyIx: i32, wide: boolean): Opnd {
   if wide { return deliver(b, keyIx, repNodeOfTy(TY_I64), TY_I64) }
+  if exprPrePathWhy(keyIx, ibFnIx) == "pre-path atom hook" {
+    const kt = nodeMapKeyTyOf(unwrapParen(recvIx))
+    const r = if kt >= 0 { repNodeOfTy(kt) } else { -1 }
+    if r >= 0 && repNodeAt(r) is RAtom { return deliver(b, keyIx, r, kt) }
+  }
   return irBExpr(b, keyIx)
 }
 
@@ -14033,7 +14432,8 @@ function recCopySourceIsName(ix: i32): boolean {
 // value built once past the coercion, then the copy (`coerceTail`); or, for a source the copy
 // re-reads per field (`recCopyReReads`), legacy's whole copy (`RRecCopyPure`).
 function recCopied(b: i32[], ix: i32, cell: boolean): Opnd {
-  if recCopyRowAt(ix, ibFnIx) < 0 {
+  // A copy into a union's variant row (`-2 - vi`) is legacy's copy over that row's fields too.
+  if recCopyRowAt(ix, ibFnIx) == -1 {
     return irBMiss("pre-path coercion recCopy variant")
   }
   const dt = recCopyDstTyAt(ix, ibFnIx)
@@ -14332,11 +14732,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if n.binOp == "&&" || n.binOp == "||" { return shortCircuit(b, n, ix, rep) }
     // Legacy folds a mask that only zero-extends a load into the zero-extending load.
     if n.binOp == "&" && zextLoadOf(ix, ibFnIx) >= 0 {
-      return irBMiss("zero-extending load mask")
+      return zextLoadRead(b, ix, rep)
     }
     if n.binOp == "=" { return assignValue(b, n, ix, rep) }
+    // An identity over a per-arm union is legacy's `identMixed` compare, ahead of its null test.
     const bt = binNulTestOf(n)
-    if bt != null { return nulTest(b, n, bt, ix, rep) }
+    const mixed = n.binIdent != 0 && eqRouteOf(n, ix, ibFnIx) == "identMixed"
+    if bt != null && !mixed { return nulTest(b, n, bt, ix, rep) }
     // A non-literal `null` against a nullable is that operand's null test, by legacy's route; a
     // `null` side other than a name read, which legacy runs for its effect, is legacy's.
     const nt = binNulNameTestOf(n, ibFnIx)
@@ -14345,13 +14747,22 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       const ns = if nulLeft { n.binLeft } else { n.binRight }
       if nulNoneWritesNothing(ns) { return nulTest(b, n, nt, ix, rep) }
       // A left `null` side runs for its effect ahead of the test (`emitNulNameTestBin`).
-      if !nulLeft { return irBMiss("null name test of a non-name null side") }
+      // A right side runs after the tested name; written first it reads alike when it has no effect,
+      // or stores an effect-free value to another name, which no write reaches the tested name through.
+      if (
+        !nulLeft
+        && !exprEffectFree(ns)
+        && !rightNullStoreCommutes(ns, nt.bnRef)
+      ) {
+        return irBMiss("null name test of a non-name null side")
+      }
       const effs: Opnd[] = []
       const e0 = b.length
       const e = nulNoneEffect(b, ns, ix, effs)
       if ibMiss != "" { return e }
-      // A store in it is a statement written where it stands, not with the effects.
-      if !onlyTempsFrom(b, e0) {
+      // A store in it is a statement written where it stands, ahead of the test, as legacy
+      // writes the side first; a tested side with an effect of its own is still legacy's.
+      if !onlyTempsFrom(b, e0) && !exprEffectFree(nt.bnRef) {
         return irBMiss("null name test of a null side that stores")
       }
       const t = nulTest(b, n, nt, ix, rep)
@@ -14405,7 +14816,11 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       return atomCompare(b, n, ix, rep)
     }
     // `===`/`!==` over references is legacy's identity (`emitIdentityBin`).
-    if n.binIdent != 0 && eqRouteOf(n, ix, ibFnIx) == "identRef" {
+    if (
+      n.binIdent != 0
+      && (eqRouteOf(n, ix, ibFnIx) == "identRef"
+        || eqRouteOf(n, ix, ibFnIx) == "identMixed")
+    ) {
       return identityEq(b, n, ix, rep)
     }
     if (
@@ -14436,7 +14851,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
         return listEq(b, n, ix, rep)
       }
       const cat = irListCatHook(ix, ibFnIx)
-      if cat == "plain" { return listCat(b, n, ix, rep) }
+      if cat == "plain" || cat == "widen" && catWidenTakes(ix, ibFnIx) {
+        return listCat(b, n, ix, rep)
+      }
       if cat != "none" { return irBMiss("list concat " + cat) }
       if eqRouteOf(n, ix, ibFnIx) == "numeric" {
         return nicheBoolEq(b, n, ix, rep)
@@ -14500,33 +14917,31 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if rw != "" { return irBMiss(rw) }
     const never = nl || nr
     const sib = if nl { n.binRight } else { n.binLeft }
-    // Legacy writes the op at i32, an operand of another width converted or not (D17064).
+    // Legacy writes the op at i32 beside an i32 operand; beside a wider one, at that operand's
+    // width (D17064): the `never` side diverges first, so no value of it is ever read.
     const i32r = repNodeOfTy(TY_I32)
-    if never && exprRepOf(sib) != i32r {
+    const sr = exprRepOf(sib)
+    if never && sr != i32r && !nl {
       return irBMiss("never operator over a non-i32 operand")
     }
-    const orep = if !never { rep } else if binIsCompare(n.binOp) { ibBool } else { i32r }
+    const orep = if !never { rep } else if binIsCompare(n.binOp) { ibBool } else if sr == i32r { i32r } else { sr }
     // Mixed numeric widths meet at the operator's width, each operand widened before the next
-    // is built, as legacy builds them (`emitBinOperandAs`); a literal there is legacy's to write.
+    // is built, as legacy builds them (`emitBinOperandAs`); a literal there is built at that
+    // width (`emitNumLitAs`).
     const dst = binWidthRep(n)
-    if (
-      dst >= 0
+    const lLit = dst >= 0
       && irRepOtherThan(n.binLeft, dst)
       && numLitAsApplies(n.binLeft)
-    ) {
-      return irBMiss("widen literal")
-    }
-    if (
-      dst >= 0
+    const rLit = dst >= 0
       && irRepOtherThan(n.binRight, dst)
       && numLitAsApplies(n.binRight)
-    ) {
-      return irBMiss("widen literal")
-    }
     const ls = b.length
-    const l = widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1)
+    // A left `never` beside a wider operand is read at i32, its consumer's rep, and widened to
+    // that operand's width, as legacy writes it; no value of it is ever read.
+    const wideNever = never && nl && sr != i32r
+    const l = if lLit { signedLitAt(unwrapParen(n.binLeft), dst) } else if wideNever { neverWidened(b, irBExpr(b, n.binLeft), n.binLeft, sr) } else { widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1) }
     const at = b.length
-    const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1)
+    const r = if rLit { signedLitAt(unwrapParen(n.binRight), dst) } else { widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1) }
     if ibMiss != "" { return l }
     // A left operand that is a variable or immediate is staged below a right operand that holds
     // a valued `if`, a `??` that stages the leads before it, a store, a stash or a tag dispatch's
@@ -14575,6 +14990,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return irBMiss("call") }
+    if rhs is RCall && bundlePickRefused(ix, rhs.caCallee) {
+      return irBMiss("bundle result pick refused")
+    }
     if rhs is RCall && rhs.caNever { return irBLetTemp(b, rhs, ix, rep) }
     if rhs is RCall && nulNoneCallee(rhs.caCallee) {
       const sentinel = nullOwnAt(ix, ibFnIx)
@@ -14633,17 +15051,26 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   }
   if n is AsExpr {
     const arm = asCastArmOf(ix, ibFnIx)
-    if arm == "zextLoad" { return irBMiss("expression as zextLoad") }
+    if arm == "zextLoad" { return zextLoadRead(b, ix, rep) }
     if arm == "union" { return asUnion(b, n, ix, rep) }
     if arm == "litAtom" || arm == "numLitScalar" {
       return asLit(b, n, ix, rep, arm)
     }
     if arm == "numUnion" { return asNumUnion(b, n, ix, rep) }
     if arm == "mapOptBox" { return asMapOptBox(b, n, ix, rep) }
+    // `m[k] as? V` over a read already at `V | null` is the read itself (`emitAsCast`).
+    if arm == "mapOptRead" {
+      const v = irBExpr(b, n.asObj)
+      if ibMiss != "" { return v }
+      if irBOpRep(v) != rep { return irBMiss("map read cast rep") }
+      return v
+    }
     if arm == "mapProbeTrap" { return asMapProbeTrap(b, n, ix, rep) }
     if arm == "instMiss" && n.asMode == "null" {
       return asInstMissOpt(b, n, ix, rep)
     }
+    if arm == "instMiss" { return asInstMissEnd(b, n, ix, rep) }
+    if arm == "holeMiss" { return asHoleMiss(b, n, ix, rep) }
     if arm == "holeOpt" && holeOptShapeOf(ix, ibFnIx) == "null" {
       return asHoleOptNull(b, ix, rep)
     }
@@ -14750,6 +15177,50 @@ function asInstMissOpt(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
   return repTemp(b, { nuAt: ix, nuOwn: own, nuRead: [] }, ix, rep)
 }
 
+// `as!` or a bare `as` at an instance whose operand it can never hit, as `emitAsInstMiss` writes
+// them: `as!` drops the operand and traps, `as` returns it as the remainder. Nothing reaches the
+// cast's own value (`RDeadNever`, whose `unreachable` is `as!`'s trap).
+function asInstMissEnd(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  if n.asMode == "trap" {
+    const v = irBExpr(b, n.asObj)
+    if ibMiss != "" { return v }
+    irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  } else {
+    const v = retDelivered(b, n.asObj)
+    if ibMiss != "" { return v }
+    irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, ix)
+  }
+  return irBLetTempTy(b, { dnAt: ix, dnPad: false }, ix, rep, TY_NEVER)
+}
+
+// `u as! N` or a bare `u as N` over a type parameter pinned at no number (`holeMiss`), as
+// `emitHoleNumCastMiss` writes it: the operand dropped, then `as!`'s report and trap, or `as`
+// returning the function's own null. Nothing reaches the cast's value (`RDeadNever`).
+function asHoleMiss(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  if n.asMode != "trap" && n.asMode != "prop" {
+    return irBMiss("hole cast mode")
+  }
+  const v = irBExpr(b, n.asObj)
+  if ibMiss != "" { return v }
+  irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  if n.asMode == "trap" {
+    irBNode(
+      b,
+      { srOp: "as.fail", srHeap: -1, srArgs: [], srImm: ix },
+      -1,
+      ibNoValue,
+      ix,
+    )
+  } else {
+    const nn = numCastNullNode(ix)
+    if nn < 0 { return irBMiss("as miss null") }
+    const r = retDelivered(b, nn)
+    if ibMiss != "" { return r }
+    irBNode(b, { rtHas: true, rtV: r }, -1, ibNoValue, ix)
+  }
+  return irBLetTempTy(b, { dnAt: ix, dnPad: false }, ix, rep, TY_NEVER)
+}
+
 // `u as? N` over a type parameter pinned at no number or `boolean` (`holeOptShapeOf`'s "null"):
 // the null-tagged box, as `emitHoleNumAsOpt` writes it, the operand never read.
 function asHoleOptNull(b: i32[], ix: i32, rep: i32): Opnd {
@@ -14794,6 +15265,8 @@ function wrapLit(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 // cast's own rep. A cast legacy refuses (`asLitAtomWhy`, `asNumLitScalarWhy`) is left to it.
 function asLit(b: i32[], n: AsExpr, ix: i32, rep: i32, arm: string): Opnd {
   const why = if arm == "litAtom" { asLitAtomWhy(ix, ibFnIx) } else { asNumLitScalarWhy(ix, ibFnIx) }
+  // Each of these refusals is a contract on the cast as written, raised before the claim declines.
+  if why != "" && emitSoftFail { emitFailAt(why, ix) }
   if why != "" { return irBMiss("literal cast refused") }
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
@@ -14908,7 +15381,7 @@ function asCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 // (`numCastKindOf`): the operand is built and widened to that kind as `emitExprAsKind` builds it.
 function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32, ty: i32): Opnd {
   const k = numCastKindOf(ix, ibFnIx)
-  if k < 0 { return irBMiss("expression as") }
+  if k < 0 { return irBMiss("expression as " + asCastArmOf(ix, ibFnIx)) }
   const ow = operandWhy(n.asObj)
   if ow != "" { return irBMiss(ow) }
   const v = irBExpr(b, n.asObj)
@@ -14918,7 +15391,7 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32, ty: i32): Opnd {
     const p = widenPlanOf(n.asObj, k, ibFnIx)
     if p.wpArm != "plain" { return irBMiss("widen " + p.wpArm) }
   }
-  const o = widenTo(b, v, n.asObj, dst, -1)
+  const o = if k >= 3 && repPrim(irBOpRep(v)) == "bool" { boolWiden(b, v, n.asObj, dst, k) } else { widenTo(b, v, n.asObj, dst, -1) }
   if ibMiss != "" { return o }
   if irBOpRep(o) != dst || !repIsScalar(dst) {
     return irBMiss("as operand coercion")
@@ -14929,6 +15402,22 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32, ty: i32): Opnd {
     return irBLetTempTy(b, { ncV: o, ncAt: ix, ncMiss: miss }, ix, rep, ty)
   }
   return irBLetTemp(b, { ncV: o, ncAt: ix, ncMiss: miss }, ix, rep)
+}
+
+// A `boolean` cast operand `v` at node `ix` widened to kind `k` at rep `dst` as the i32 0 or 1
+// it holds, along legacy's plain plan from an i32 (`numPlainCastKind` reads it as one).
+function boolWiden(b: i32[], v: Opnd, ix: i32, dst: i32, k: i32): Opnd {
+  const p = widenPlanOf(ix, k, ibFnIx)
+  if p.wpArm != "plain" || p.wpSrc != 1 {
+    return irBMiss("widen boolean " + p.wpArm)
+  }
+  return irBLetTempTy(
+    b,
+    { nwV: v, nwSrc: 1, nwDst: k, nwAt: ix },
+    ix,
+    dst,
+    repTyOf(dst),
+  )
 }
 
 // The null a bare exact `as` at `ix` returns on its sad path, the function's own, as legacy's
@@ -15586,11 +16075,82 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   return 0
 }
 
+// A field write `o.f = v` through an un-narrowed union of records, on legacy's shared dispatch
+// (`emitSharedFieldAssign`): one value staged for every arm (plan 2), or the value written in each
+// arm at that arm's field (plan 1). Plan 2 reads a named receiver again per arm, as legacy does;
+// plan 1, and any other receiver, stages it once.
+function sharedFieldStore(b: i32[], n: BinExpr, t: Member, ix: i32): i32 {
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const plan = sharedFieldStorePlan(unwrapParen(n.binLeft), ibFnIx, vis, fis)
+  if plan == 0 { return skip("field store shared plan") }
+  const named = nodeAt(unwrapParen(t.memObj)) is Ident
+  const stash = plan == 1 || !named
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  let r: Opnd = none
+  let g = -1
+  if stash { r = irBExpr(b, t.memObj) }
+  else if localIndexOf(ibFnIx, t.memObj) < 0 { g = irBGlobalBoxRecv(t.memObj) }
+  else { r = irBBoxLocal(b, t.memObj) }
+  if ibMiss != "" { return 0 }
+  if g < 0 && !heldAsBox(irBOpRep(r)) {
+    return skip("field store shared receiver rep")
+  }
+  const vs: Opnd[] = []
+  let i = 0
+  while i < (if plan == 1 { vis.length } else { 1 }) {
+    const vt = if vis[i] < uVarTyIx.length { uVarTyIx[vis[i]] } else { -1 }
+    const vr = repNodeOfTy(vt)
+    if !(repNodeAt(vr) is RRecord) { return skip("field store shared arm rep") }
+    const k = repRecordKidOf(vr, vt, t.memProp)
+    if k < 0 { return skip("field store shared arm field") }
+    const dst = repNodeKids(vr)[k]
+    const at = b.length
+    const v = deliver(b, n.binRight, dst, variantFieldBoxTy(vis[i], fis[i]))
+    if ibMiss != "" { return 0 }
+    if irBOpRep(v) != dst { return skip("field store shared value rep") }
+    // A value written inside its arm is one the lowering writes in place.
+    if (
+      plan == 1
+      && (b.length != at || !(v is OImm || v is OStr || v is OVar && irBVarAt(v)))
+    ) {
+      return skip("field store shared arm value")
+    }
+    vs.push(v)
+    i = i + 1
+  }
+  const sh: Rhs = {
+    shR: r,
+    shStash: stash,
+    shGlobal: g,
+    shGlobalNonNull: g >= 0 && irBGlobalBoxRecovers(t.memObj),
+    shVs: vs,
+    shAt: ix,
+  }
+  irBNode(b, { efRhs: sh }, -1, ibNoValue, ix)
+  return 0
+}
+
+// Whether operand `v` is a variable the lowering reads in place: a local or parameter, not a temp.
+function irBVarAt(v: OVar): boolean {
+  return v.ov >= 0 && v.ov < ib.irVars.length && ib.irVars[v.ov].vKind != "temp"
+}
+
+// The variant a narrowed store receiver `ix` reads as: a box local's or global's plain read
+// unboxes to it, and a field read narrowed out of a union is its arm's variant.
+function narrowedRecvVariant(ix: i32): i32 {
+  if nodeAt(unwrapParen(ix)) is Member {
+    return narrowedStructArmVi(ix, ibFnIx)
+  }
+  return narrowedBoxVariantPlain(ix, ibFnIx)
+}
+
 // A struct field store `o.f = v` that legacy writes as the record, the bare value and its
 // store tail (`fieldStoreArmOf`'s `struct` arm, `fieldStoreValueArmOf`); a variant's, the record
 // a variant receiver is or a box narrowed to one yields (`variantParam`, `narrowVariant`).
 function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   const arm = fieldStoreArmOf(n.binLeft, ibFnIx)
+  if arm == "shared" { return sharedFieldStore(b, n, t, ix) }
   if arm != "struct" && arm != "variantParam" && arm != "narrowVariant" {
     return skip("field store " + arm)
   }
@@ -15598,21 +16158,25 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   if sf.length != 2 { return skip("field store shape") }
   // The receiver's narrowed read casts to the variant its own read picks; the store's `struct.set`
   // writes `sf[0]`'s heap, so the two must name one variant.
-  if (
-    arm == "narrowVariant"
-    && narrowedBoxVariantPlain(t.memObj, ibFnIx) != sf[0]
-  ) {
+  if (arm == "narrowVariant" && narrowedRecvVariant(t.memObj) != sf[0]) {
     return skip("field store narrowed variant")
   }
   const va = if arm == "struct" { fieldStoreValueArmOf(sf[0], sf[1], n.binRight, ibFnIx) } else { variantFieldStoreValueArmOf(sf[0], sf[1], n.binRight, ibFnIx) }
   if !fieldStoreValueDelivers(va) { return skip("field store value " + va) }
+  const vAt = b.length
+  const v0 = irBExpr(b, t.memObj)
+  if ibMiss != "" { return 0 }
   const rt = nodeTyAt(t.memObj, ibFnIx)
-  const r = repNodeOfTy(rt)
-  if !(repNodeAt(r) is RRecord) { return skip("field store receiver") }
-  const k = repRecordKidOf(r, rt, t.memProp)
-  if k < 0 { return skip("field kid") }
+  const r0 = repNodeOfTy(rt)
+  if !(repNodeAt(r0) is RRecord) { return skip("field store receiver") }
+  const k0 = repRecordKidOf(r0, rt, t.memProp)
+  if k0 < 0 { return skip("field kid") }
+  // A receiver instanced at a stored row (D15827) is built at that row, whose field legacy's store
+  // writes, where its type reads the field at another rep.
+  const r = if fieldStoreRepFits(va, repNodeKids(r0)[k0]) { r0 } else { irBOpRep(v0) }
+  const k = if r == r0 { k0 } else if repNodeAt(r) is RRecord { repRecordKidOf(r, rt, t.memProp) } else { -1 }
+  if k < 0 { return skip("field store row rep") }
   const dst = repNodeKids(r)[k]
-  // A generic instance's receiver type may read the field at another rep than its row stores.
   if !fieldStoreRepFits(va, dst) { return skip("field store row rep") }
   const siteTy = if arm == "struct" { structFieldBoxTy(sf[0], sf[1]) } else { variantFieldBoxTy(sf[0], sf[1]) }
   // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
@@ -15623,8 +16187,6 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   ) {
     return skip("field store box from a box")
   }
-  const vAt = b.length
-  const v0 = irBExpr(b, t.memObj)
   const at = b.length
   const x = deliver(b, n.binRight, dst, siteTy)
   if ibMiss != "" { return 0 }
@@ -16354,6 +16916,9 @@ function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if sn is LetDecl && sn.letInit >= 0 && cboxIsWriteLet(ix) {
     ibStubRhs = unwrapParen(sn.letInit)
   }
+  if sn is LetDecl && letStoresGenericAliasCore(sn, ibFnIx) {
+    ibAliasRhs = unwrapParen(sn.letInit)
+  }
   const cut = stmtNode(b, ix, sibs, pos) == IF_CUTS_BLOCK
     && nodeAt(ix) is IfStmt
   if ibMiss != "" && ibMissAt < 0 { ibMissAt = ix }
@@ -16997,6 +17562,8 @@ function tailIf(b: i32[], ix: i32) {
   if why == "tail if switch" {
     const p = intSwitchPlanOf(ix, ibFnIx)
     if p != null { return intSwitch(b, ix, p, true) }
+  } else if why == "tail if one number" {
+    return tailIfOneNumber(b, ix)
   } else if why != "" {
     return skip(why)
   }
@@ -17022,6 +17589,21 @@ function tailIf(b: i32[], ix: i32) {
   }
   if ibMiss != "" { return 0 }
   irBNode(b, sIf(c, thenB, elseB, -1, hasElse), -1, ibNoValue, ix)
+  return 0
+}
+
+// A tail `if` typed one wider number (`retIfIsOneNumber`): that number, each arm widened to it,
+// boxed once into the result and returned, as legacy's `emitReturnExit` writes it.
+function tailIfOneNumber(b: i32[], ix: i32) {
+  const r = ib.irRetRep
+  const ru = retUnionTyOf(ibFnIx, ibFnPos)
+  if !heldAsBox(r) || ru < 0 || repNodeOfTy(ru) != r {
+    return skip("tail if one number")
+  }
+  const v = floorDeliver(b, ix, r, ru)
+  if ibMiss != "" { return 0 }
+  if irBOpRep(v) != r { return skip("tail if one number rep") }
+  irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -17147,6 +17729,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
+  ibAliasRhs = -1
   ibMisses = []
   ibReserveEnd = []
   ibReservePushes = []
@@ -17919,6 +18502,7 @@ function buildThunk(fe: i32): string {
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
+  ibAliasRhs = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if fe < 0 || fe >= fnStmts.length { return "thunk target" }
   const d = fnStmts[fe]
@@ -18051,6 +18635,7 @@ function buildEqHelp(si: i32): string {
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
+  ibAliasRhs = -1
   ibNoValue = repNodeOfTy(TY_NEVER)
   if si < 0 || si >= sHeapIdx.length { return "compare helper row" }
   ib.irName = "@eq " + i32ToStr(si)
@@ -18156,6 +18741,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
+  ibAliasRhs = -1
   ibMisses = []
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
@@ -18232,12 +18818,23 @@ function startItemOrd(node: i32, gi: i32): i32 {
 function globalInitNulNone(b: i32[], gi: i32, gst: i32, init: i32): i32 {
   const rep = globalRep(gi, gst)
   if rep < 0 { return skip("global initializer rep") }
-  const src = nulNonePayload(b, init, rep)
+  const src = nulNoneBoxPayload(b, init, rep)
   if ibMiss != "" { return 0 }
   const gm = irGlobalWriteMiss(gi, ibGlobalCtx())
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: gi, gsSrc: src }, -1, ibNoValue, gst)
   return 0
+}
+
+// A `null`-typed value `x` at rep `rep` as `emitNulNoneBoxPayload` writes it: an if-expression
+// for its effects, then the bottom null; any other node as `nulNonePayload` writes it.
+function nulNoneBoxPayload(b: i32[], x: i32, rep: i32): Opnd {
+  const u = unwrapParen(x)
+  const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if !(n is IfStmt) { return nulNonePayload(b, x, rep) }
+  ifForEffect(b, n, u)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  return repTemp(b, { nuAt: u, nuOwn: NULL_OWN_NONE, nuRead: [] }, u, rep)
 }
 
 // A `null`-typed value `x` at rep `rep` as `emitNulNoneLeafPayload` writes it: a call's own value,
@@ -18331,12 +18928,6 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
   if arm != "plain" && arm != "widen" && arm != "variant" {
     return skip("global initializer " + arm)
   }
-  // A widened value `if` holding a nested join that keeps its own type is legacy's adoption
-  // (`numLitAdoptJoin`, D16496): the inner join is built at its type and extended whole, where
-  // the IR's delivery widens per arm.
-  if arm == "widen" && widenJoinKeepsInner(g.letInit) {
-    return skip("global initializer widen join")
-  }
   // A numeric cell's initializer is delivered widened to it, as legacy's `emitWidened` writes it,
   // and a narrowed arm's unbox (`emitGlobalInitArmUnbox`) is the delivery's own.
   // A bare-arm cell takes the arm's struct whatever builds it (`emitVariantCoerce`): the value is
@@ -18347,25 +18938,6 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: gi, gsSrc: src }, -1, ibNoValue, gst)
   return 0
-}
-
-// Whether value join `init` nests a join typed other than the whole, which legacy converts whole.
-function widenJoinKeepsInner(init: i32): boolean {
-  const root = unwrapParen(init)
-  if root < 0 || root >= P.nodes.length { return false }
-  const t = exprTyOf(root)
-  const todo: i32[] = [root]
-  while todo.length > 0 {
-    const at = unwrapParen(todo.pop() ?? -1)
-    if at >= 0 && at < P.nodes.length {
-      if tailPushIfArms(at, todo) || tailPushMatchArms(at, todo) {
-        if at != root && exprTyOf(at) != t { return true }
-      } else {
-        tailPushBlockTail(at, todo)
-      }
-    }
-  }
-  return false
 }
 
 // Global statement `gst`'s alias of a generic function used only as a direct callee: the
@@ -18401,7 +18973,13 @@ function globalInitVariant(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   const rep = globalRep(gi, gst)
   if rep < 0 { return irBMiss("global initializer rep") }
   const ty = heldTy(scopeTyAt(gst, -1))
-  const v = variantCoerced(b, init, rep, ty, globalCellStructIdx(gst))
+  const v0 = variantCoerced(b, init, rep, ty, globalCellStructIdx(gst))
+  // A plain record on the arm row's heap with the arm's fields is the variant as it stands
+  // (`recRetag`), retagged as a local's initializer is.
+  const v = if (ibMiss == ""
+    && irBOpRep(v0) != rep
+    && recRetag(irBOpRep(v0), rep)
+    && exprPrePathWhy(init, ibFnIx) == "") { repTemp(b, { rgV: v0 }, init, rep) } else { v0 }
   if ibMiss == "" && irBOpRep(v) != rep {
     return irBMiss("global initializer variant coercion")
   }

@@ -1481,6 +1481,7 @@ import {
   forInStringSrc,
   forInU8Src,
   globalNulListCellRead,
+  ifJoinAdaptsScalar,
   listFitShadowRow,
   litAtomWidenTexts,
   mapReadScalarBoxKind,
@@ -2441,10 +2442,14 @@ export function emitClosureValue(fe: i32, fnIx: i32) {
 // The refusal `emitClosureValue` raises for function `fe`, or "": a generic function's, then
 // `closureValueCoreWhy`'s.
 export function closureValueWhy(fe: i32): string {
-  if fnHasUnannotatedParam(fe) && !criFnIsAnonLambda(fe) {
-    return genericFnValueRejectMsg(fe)
-  }
+  if closureValueIsGeneric(fe) { return genericFnValueRejectMsg(fe) }
   return closureValueCoreWhy(fe)
+}
+
+// Whether function `fe` taken as a value is a generic one (a named function with an
+// un-annotated parameter), whose refusal is the contract `genericFnValueRejectMsg` states.
+export function closureValueIsGeneric(fe: i32): boolean {
+  return fnHasUnannotatedParam(fe) && !criFnIsAnonLambda(fe)
 }
 
 // The closure-value fat pointer for lifted function `fe`: `struct.new $cloStruct [ env, id,
@@ -3241,6 +3246,47 @@ function emitStructExprAsVariantBox(exprIx: i32, vi: i32, ssi: i32, fnIx: i32) {
   }
   fbStructNew(uBoxIdx)
   return 0
+}
+
+// Record `exprIx` copied onto variant `vi`'s heap (`emitStructExprAsVariantBox` without its tag and
+// box): a source the copy re-reads is read as `src`, else it is on the stack already.
+export function variantCopyEmit(
+  exprIx: i32,
+  vi: i32,
+  fnIx: i32,
+  src: u8[],
+): i32 {
+  if guardVariantFieldSpan(vi, "variantCopyEmit") < 0 || vi < 0 { return -1 }
+  const names: string[] = []
+  const rows: i32[] = []
+  variantRowFields(vi, names, rows)
+  const ssi = structIndexOfExpr(exprIx, fnIx)
+  const heldSrc = rcElem.srcRead
+  rcElem.srcRead = src
+  const built = !variantCopyReReads(exprIx, vi, fnIx)
+  const rc = emitRecCopy(
+    exprIx,
+    ssi,
+    variantHeap(vi),
+    -1,
+    names,
+    rows,
+    fnIx,
+    built,
+  )
+  rcElem.srcRead = heldSrc
+  return rc
+}
+
+// Whether the copy of record `exprIx` onto variant `vi` reads its source again per field
+// (`rcReReadable`), so the value is not built once ahead of it.
+export function variantCopyReReads(exprIx: i32, vi: i32, fnIx: i32): boolean {
+  const ssi = structIndexOfExpr(exprIx, fnIx)
+  if vi < 0 || ssi < 0 || ssi >= sHeapIdx.length { return true }
+  const names: string[] = []
+  const rows: i32[] = []
+  variantRowFields(vi, names, rows)
+  return rcReReadable(exprIx, ssi, -1, names, rows)
 }
 
 // A fresh record at the heap `dHeap`, whose fields are `dNames` at the flat field rows `dFieldRows`, built from
@@ -8289,6 +8335,25 @@ export function listGetStageEnter(callIx: i32): i32[] {
   return sv
 }
 
+// Whether the IR's lowering holds the `.get` index in a local of its own (`irGetIdxBegin`), which
+// legacy's head then reads through `listGetIdxHook` rather than staging it.
+let listGetIdxHeld = false
+
+// Drops the index staging `listGetStageEnter` marked, and stages none until `listGetIdxRelease`,
+// for an index the IR's lowering holds in a local of its own.
+export function listGetIdxUnstage() {
+  listGetIdxStagedIx = -1
+  listGetIdxStagedSet = false
+  listGetIdxHeld = true
+  return 0
+}
+
+// Ends `listGetIdxUnstage`'s hold.
+export function listGetIdxRelease() {
+  listGetIdxHeld = false
+  return 0
+}
+
 // Put back what `listGetStageSave` took.
 export function listGetStageRestore(sv: i32[]) {
   listGetIdxStagedIx = sv[0]
@@ -8310,6 +8375,7 @@ function listGetStageMark(callIx: i32) {
       const stagesRecv = !optRecvReReadable(callee.memObj)
       const stagesIdx = c.callArgs.length == 1
         && !listGetIdxReReadable(c.callArgs[0])
+        && !listGetIdxHeld
       // A call that stages takes the next depth's slots; one that stages nothing takes none.
       if stagesRecv || stagesIdx { listGetDepth = listGetDepth + 1 }
       if stagesRecv {
@@ -10144,7 +10210,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 // value built before the box sits above that tag. `null` and `lit` write no value after theirs.
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
-    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "nulMap" | "clo" => true
+    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "recCopy" | "refList" | "map" | "nulMap" | "clo" => true
     "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
   }
 }
@@ -10160,7 +10226,7 @@ export function holeBoxHeadAhead(a: HoleBoxArm): boolean {
 export function boxTagOnly(a: HoleBoxArm): boolean {
   return match a {
     "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" => true
-    "map" | "nulMap" | "clo" | "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
+    "recCopy" | "map" | "nulMap" | "clo" | "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
   }
 }
 
@@ -10173,7 +10239,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     }
     "atom" | "atomAsStr" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
     "atomList" => fbI32Rel(RS_TAG, atomListArmTag())
-    "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
+    "rec" | "obj" | "recCopy" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
     "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
     "nulMap" => nulMapArmBoxHead(
@@ -10195,7 +10261,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
-    "null" | "rec" | "obj" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
+    "null" | "rec" | "obj" | "recCopy" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
     "atom" | "atomList" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
@@ -10317,6 +10383,7 @@ function unionBoxArgLadders(
   fnIx: i32,
 ): boolean {
   return hp.hbArm == "ladder"
+    || hp.hbArm == "recCopy"
     || hp.hbArm == "mapBox"
     || hp.hbArm == "nulNiche" && nulNicheBoxTagOf(unionTy, exprIx, fnIx) < 0
 }
@@ -10600,19 +10667,6 @@ function emitUnionIfValue(
     }
   }
   return closeIfChainFrames(open, rc, false)
-}
-
-// Whether the value `if` at `ifIx` is typed one number some tail is not: delivered as that
-// number, every tail is built at it, a literal included, so a nested join means what its
-// hoisted twin means (D3571; owner ruling, D3657).
-export function ifJoinAdaptsScalar(ifIx: i32, fnIx: i32): boolean {
-  const pn = tyPrimNameOf(nodeTyAt(ifIx, fnIx))
-  if pn != "i64" && pn != "f64" && pn != "f32" { return false }
-  let widens = false
-  for lf in valueTailLeaves(ifIx) {
-    if tyPrimNameOf(nodeTyAt(lf, fnIx)) != pn { widens = true }
-  }
-  return widens
 }
 
 // One link of `emitUnionIfValue`: 0 or -1 as that function returns, or 1 when the else is another `if`
@@ -13443,28 +13497,97 @@ function emitSharedFieldAssign(memIx: i32, valIx: i32, fnIx: i32) {
     fbLocalSet(vslot)
     let i = 0
     while i < vis.length {
-      const last = i == vis.length - 1
-      if !last {
-        if emitSharedFieldRecv(m.memObj, fnIx, rslot) < 0 { return -1 }
-        fbStructGet(uBoxIdx, 0) // field 0: tag
-        fbI32Rel(RS_TAG, uTags[vis[i]])
-        fbI32Bin(70)            // 0x46 i32.eq
-        fbIf(64)                // 0x40 void
-      }
-      if emitSharedFieldRecv(m.memObj, fnIx, rslot) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-      fbRefCast(variantHeap(vis[i]))
+      if sharedFieldArmOpen(m.memObj, fnIx, rslot, vis, i) < 0 { return -1 }
       fbLocalGet(vslot)
-      fbStructSet(variantHeap(vis[i]), fis[i])
-      if !last { fbElse() }
+      sharedFieldArmClose(vis, fis, i)
       i = i + 1
     }
-    let e = 0
-    while e < vis.length - 1 {
-      fbEnd()
-      e = e + 1
-    }
+    sharedFieldArmsEnd(vis)
     return 1
+  }
+  return 0
+}
+
+// The shared field write's plan for field store `memIx` (`sharedFieldAssignPlanOf`), its members'
+// variant rows into `vis` and field indices into `fis`: 0 none, 1 a value per arm, 2 one value.
+export function sharedFieldStorePlan(
+  memIx: i32,
+  fnIx: i32,
+  vis: i32[],
+  fis: i32[],
+): i32 {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return 0 }
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, vis, fis)
+  return sharedFieldAssignPlanOf(code, vis, fis)
+}
+
+// The one-value plan's staging slot for field store `memIx` (`sharedFieldStorePlan` 2), which its
+// arms read the value from.
+export function sharedFieldValSlot(
+  memIx: i32,
+  fnIx: i32,
+  vis: i32[],
+  fis: i32[],
+): i32 {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return -1 }
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, [], [])
+  return objOrderStashSlot(
+    variantFieldStorageKind(vis[0], fis[0]),
+    code,
+    uFieldStorageSlot(vis[0], fis[0]),
+  )
+}
+
+// Arm `i` of a shared field write over receiver `recvIx` (staged in `rslot`, or -1 to re-read it):
+// all but the last test the box's tag, then each casts the payload to its variant. The arm's value
+// and `sharedFieldArmClose` follow.
+function sharedFieldArmOpen(
+  recvIx: i32,
+  fnIx: i32,
+  rslot: i32,
+  vis: i32[],
+  i: i32,
+): i32 {
+  if i < vis.length - 1 {
+    if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
+    sharedFieldArmTest(vis, i)
+  }
+  if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
+  return sharedFieldArmCast(vis, i)
+}
+
+// After a shared field write's receiver box: the test of arm `i`'s tag, opening its `if`. Legacy
+// and the IR share it, as they share `sharedFieldArmCast` and `sharedFieldArmClose`.
+export function sharedFieldArmTest(vis: i32[], i: i32) {
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Rel(RS_TAG, uTags[vis[i]])
+  fbI32Bin(70)            // 0x46 i32.eq
+  fbIf(64)                // 0x40 void
+  return 0
+}
+
+// After a shared field write's receiver box: its payload cast to arm `i`'s variant.
+export function sharedFieldArmCast(vis: i32[], i: i32) {
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(variantHeap(vis[i]))
+  return 0
+}
+
+// After arm `i`'s value: its store, and the `else` to the next arm.
+export function sharedFieldArmClose(vis: i32[], fis: i32[], i: i32) {
+  fbStructSet(variantHeap(vis[i]), fis[i])
+  if i < vis.length - 1 { fbElse() }
+  return 0
+}
+
+// After the last arm: the `end` of each tag test.
+export function sharedFieldArmsEnd(vis: i32[]) {
+  let e = 0
+  while e < vis.length - 1 {
+    fbEnd()
+    e = e + 1
   }
   return 0
 }
@@ -13484,27 +13607,12 @@ function emitSharedFieldAssignPerArm(
   fbLocalSet(rslot)
   let i = 0
   while i < vis.length {
-    const last = i == vis.length - 1
-    if !last {
-      if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 0) // field 0: tag
-      fbI32Rel(RS_TAG, uTags[vis[i]])
-      fbI32Bin(70)            // 0x46 i32.eq
-      fbIf(64)                // 0x40 void
-    }
-    if emitSharedFieldRecv(recvIx, fnIx, rslot) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(variantHeap(vis[i]))
+    if sharedFieldArmOpen(recvIx, fnIx, rslot, vis, i) < 0 { return -1 }
     if emitVariantFieldValue(vis[i], fis[i], valIx, fnIx) < 0 { return -1 }
-    fbStructSet(variantHeap(vis[i]), fis[i])
-    if !last { fbElse() }
+    sharedFieldArmClose(vis, fis, i)
     i = i + 1
   }
-  let e = 0
-  while e < vis.length - 1 {
-    fbEnd()
-    e = e + 1
-  }
+  sharedFieldArmsEnd(vis)
   return 1
 }
 
@@ -14210,6 +14318,14 @@ export function spreadGroupSlotAt(
     )
   }
   return spreadGroupIdSlot(kk, row, gid)
+}
+
+// Whether a spread group's tail (`spreadGroupStash`) converts a list of kind `gk` into the
+// literal's kind `kk`: an atom list into a `string` list, or a scalar list widened.
+export function spreadGroupConverts(gk: ListKind, kk: ListKind): boolean {
+  if gk == kk { return false }
+  if kk == "strlist" { return gk == "list" }
+  return scalarWidenConvOp(listKindElemKind(gk), listKindElemKind(kk)) >= 0
 }
 
 // A spread group's tail once its list `grp` is on the stack: refresh it if a view, convert it to
@@ -22530,24 +22646,60 @@ function emitCatOperand(
   }
   if widen {
     const sk = mfRecvKindOf(opIx, fnIx)
-    let dk: VKind | null = null
-    if kind == LBK_F64_LIST { dk = "f64" }
-    if kind == LBK_I64_LIST { dk = "i64" }
-    if sk == null || dk == null {
-      return emitFailAt(
-        "emitProgram: a list `+` widening reached an operand `catWidenSideOfBin` does not admit",
-        opIx,
-      )
-    }
-    if emitSpreadGroup(opIx, fnIx, pendingKindOfList(sk, 0), 0) < 0 {
+    if (
+      sk != null
+      && emitSpreadGroup(opIx, fnIx, pendingKindOfList(sk, 0), 0) < 0
+    ) {
       return -1
     }
-    if emitEqRecoverNarrowed(opIx, fnIx) < 0 { return -1 }
-    svSyncRecv(opIx, fnIx)
-    return emitScalarListWidenTop(listKindElemKind(sk), dk)
+    return catScalarWidenTail(opIx, fnIx, kind)
   }
   if emitExpr(opIx, fnIx) < 0 { return -1 }
   return listCatOperandTail(opIx, binIx, fnIx)
+}
+
+// Whether list `+` `binIx` widens one side to the concat's element by a tail over that side's own
+// list (`catWidenTail`): a scalar list converted, or a ref list boxed into the union-box row; not
+// a run the boxing builds at the row itself.
+export function catWidenTakes(binIx: i32, fnIx: i32): boolean {
+  const k = catListKindOfBin(binIx, fnIx)
+  const side = catWidenSideOfBin(binIx, fnIx)
+  if k <= 0 || side == 0 { return false }
+  if k != LBK_REF { return true }
+  const e = nodeAt(binIx)
+  if !(e is BinExpr) { return false }
+  return !spreadBoxedGroupIsRun(
+    if side == 1 { e.binLeft } else { e.binRight },
+    true,
+  )
+}
+
+// List `+` `binIx`'s widened operand `opIx` once its own list is on the stack, at the concat's rep:
+// boxed into the union-box row as a spread group is, or converted element-wise.
+export function catWidenTail(opIx: i32, binIx: i32, fnIx: i32) {
+  const k = catListKindOfBin(binIx, fnIx)
+  if k == LBK_REF {
+    return spreadBoxedGroupTail(opIx, true, catSlotOfBin(binIx, fnIx), fnIx)
+  }
+  return catScalarWidenTail(opIx, fnIx, k)
+}
+
+// A list `+` operand `opIx`'s widening once its narrower scalar list is on the stack: its narrowed
+// recover, then each element converted to concat kind `kind`'s element.
+export function catScalarWidenTail(opIx: i32, fnIx: i32, kind: i32) {
+  const sk = mfRecvKindOf(opIx, fnIx)
+  let dk: VKind | null = null
+  if kind == LBK_F64_LIST { dk = "f64" }
+  if kind == LBK_I64_LIST { dk = "i64" }
+  if sk == null || dk == null {
+    return emitFailAt(
+      "emitProgram: a list `+` widening reached an operand `catWidenSideOfBin` does not admit",
+      opIx,
+    )
+  }
+  if emitEqRecoverNarrowed(opIx, fnIx) < 0 { return -1 }
+  svSyncRecv(opIx, fnIx)
+  return emitScalarListWidenTop(listKindElemKind(sk), dk)
 }
 
 // The reserved LCAT frame base for concat rep `(kind, slot)`, or -1, over the pair the
@@ -24945,7 +25097,6 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   if ifJoinDropsNulAtom(ifIx, fnIx, "scalar") {
     return "string drops null atom"
   }
-  if p.ijVt == 123 { return "valtype" }
   return ""
 }
 
@@ -26062,6 +26213,11 @@ function emitNumExactConvert(src: string, tgt: string) {
 // The `as!` trap's reason, `as! <tgt> at <line>:<col>: not exact`, printed by the one
 // `__as_fail__` body from the site's place and the domain's row, so a site costs one call
 // (SP-056). Line 0 names no place. The caller emits the trap itself.
+// `as!` cast `exprIx`'s failure report over its domain, ahead of its trap (`emitNumCastTrapMsg`).
+export function asFailReport(exprIx: i32): i32 {
+  return emitNumCastTrapMsg(exprIx, asExprNumCastDomain(exprIx))
+}
+
 function emitNumCastTrapMsg(exprIx: i32, tgt: string) {
   if gHelpAsFail < 0 || gImports < 4 {
     return emitFail(
@@ -26305,7 +26461,7 @@ function emitHoleNumCastMiss(e: AsExpr, exprIx: i32, fnIx: i32) {
   if emitExpr(e.asObj, fnIx) < 0 { return -1 }
   fbDrop()
   if e.asMode == "trap" {
-    if emitNumCastTrapMsg(exprIx, asExprNumCastDomain(exprIx)) < 0 { return -1 }
+    if asFailReport(exprIx) < 0 { return -1 }
     fbUnreachable()
     return 0
   }
@@ -28401,13 +28557,18 @@ function zextLoadMasked(x: i32, fnIx: i32): i32 {
 
 // Lowers the expression `zextLoadOf` matched to its one zero-extending i64 load of `callIx`'s
 // width, the call's own address and memarg offset kept.
+// The `_i64` load intrinsic a zero-extending fold over load call `callIx` writes.
+export function zextLoadName(callIx: i32): string {
+  const w = zextLoadWidth(identCalleeAt(callIx))
+  if w == 8 { return "__load_u8_i64__" }
+  if w == 16 { return "__load_u16_i64__" }
+  return "__load_u32_i64__"
+}
+
 function emitZextLoad(callIx: i32, fnIx: i32) {
   const c = nodeAt(callIx)
   if c is Call {
-    const w = zextLoadWidth(identCalleeAt(callIx))
-    let nm = "__load_u32_i64__"
-    if w == 8 { nm = "__load_u8_i64__" }
-    if w == 16 { nm = "__load_u16_i64__" }
+    const nm = zextLoadName(callIx)
     const off = emitMemAddr(c, 1, fnIx, nm)
     if off < 0 { return -1 }
     fbMemAccess(memLoadOpcode(nm), memLoadAlignExp(nm), off)
@@ -37075,6 +37236,19 @@ export function stmtIsBareFnName(stmtIx: i32): boolean {
   return true
 }
 
+// Whether `s` in function `fnIx` binds a generic named function that some call instantiates and
+// the body only calls by name: its initializer is stored as the core closure, never refused.
+export function letStoresGenericAliasCore(s: LetDecl, fnIx: i32): boolean {
+  if fnIx < 0 || s.letInit < 0 || fnTagLeafId(s.letInit) >= 0 { return false }
+  const aliasFe = fieldValueFeOf(s.letInit)
+  if !fnHasUnannotatedParam(aliasFe) || criFnIsAnonLambda(aliasFe) {
+    return false
+  }
+  if !monoInstantiatedAny(aliasFe) { return false }
+  const encl = nodeAt(fnIx)
+  return encl is FuncDecl && !nameUsedAsValueIn(s.letName, encl.fnBody)
+}
+
 function emitLetDeclStmt(s: LetDecl, stmtIx: i32, fnIx: i32) {
   // `let x = <expr>` / `const x = <expr>`: emit the init, then store it into the local's
   // slot. This `LetDecl`'s slot is the next cursor position, not name-resolved (a name
@@ -37120,23 +37294,11 @@ function emitLetDeclStmt(s: LetDecl, stmtIx: i32, fnIx: i32) {
   // A `const g = f` of a generic named function used only as a direct callee stores the closure:
   // `monomorphize` rewrote each `g(args)` to its pinned instance (`monoInstantiatedAny`). A
   // member of a tagged set is held as its id instead, its slot's rep (D15927).
-  if fnIx >= 0 && fnTagLeafId(s.letInit) < 0 {
-    const aliasFe = fieldValueFeOf(s.letInit)
-    if fnHasUnannotatedParam(aliasFe) {
-      if !criFnIsAnonLambda(aliasFe) {
-        if monoInstantiatedAny(aliasFe) {
-          const encl = nodeAt(fnIx)
-          if encl is FuncDecl {
-            if !nameUsedAsValueIn(s.letName, encl.fnBody) {
-              if emitClosureValueCore(aliasFe, fnIx) < 0 { return -1 }
-              fbLocalSet(idx) // 0x21 local.set
-              scopeBind(s.letName, slot)
-              return 0
-            }
-          }
-        }
-      }
-    }
+  if letStoresGenericAliasCore(s, fnIx) {
+    if emitClosureValueCore(fieldValueFeOf(s.letInit), fnIx) < 0 { return -1 }
+    fbLocalSet(idx) // 0x21 local.set
+    scopeBind(s.letName, slot)
+    return 0
   }
   // A never-filled null hole (`let x = null`) is the plain `null` type, whose value is
   // `ref.null none`, not a zero i32; a filled one is a `T | null` box and takes the
@@ -41332,6 +41494,12 @@ export function printNulStrTail(): i32 {
 // never reaches, since no text would be right for it.
 function emitPrintNulRefNiche(argIx: i32, fnIx: i32) {
   if emitExpr(argIx, fnIx) < 0 { return -1 }
+  return printNulRefNicheTail()
+}
+
+// After a `print` argument's nullable reference whose other arm has no printed form: the word
+// `null` where it is null, else `unreachable`.
+export function printNulRefNicheTail(): i32 {
   fbRefIsNull()
   fbIf(64)
   emitPrintNullWord()
@@ -44446,11 +44614,17 @@ export function identityOperandUnboxes(ix: i32, fnIx: i32): boolean {
 // as an `eqref`; two closures compare by declaration and environment, anything else by
 // `ref.eq`, which already holds a record against a function, or either against `null`, apart.
 function emitIdentityMixed(e: BinExpr, fnIx: i32) {
+  if emitIdentityOperand(e.binLeft, fnIx) < 0 { return -1 }
+  fbLocalSet(identityArmSlot(0))
+  if emitIdentityOperand(e.binRight, fnIx) < 0 { return -1 }
+  return identityMixedTail(e)
+}
+
+// After a per-arm identity's left payload is staged and its right payload is on the stack: the
+// compare `emitIdentityMixed` writes. Legacy and the IR share it.
+export function identityMixedTail(e: BinExpr) {
   const a = identityArmSlot(0)
   const b = identityArmSlot(1)
-  if emitIdentityOperand(e.binLeft, fnIx) < 0 { return -1 }
-  fbLocalSet(a)
-  if emitIdentityOperand(e.binRight, fnIx) < 0 { return -1 }
   fbLocalSet(b)
   fbLocalGet(a)
   fbRefTest(cloStructIdx)
@@ -46452,36 +46626,24 @@ function emitCoalesce(e: BinExpr, exprIx: i32, fnIx: i32) {
 // present arm unboxed at the coalesce's rep (a numeric scalar, or the value box itself).
 function emitCoalesceBoxRuntime(e: BinExpr, exprIx: i32, fnIx: i32) {
   const bk = boxTagOfTy(nodeTyIxOf(exprIx))
-  const bVt = nulBoxScalarValtype(bk)
-  const bVb = vbHeapIdxOfKind(bk)
+  const sk = coalBoxRuntimeKind(exprIx)
   let bNm = ""
   if exprUnion(exprIx, fnIx) { bNm = boxTyName(nodeTyIxOf(exprIx)) }
-  if (bVt < 0 || bVb < 0) && bNm == "" {
+  if sk < 0 && bNm == "" {
     return emitFail(
       "emitProgram: `??` over a null-narrowed value box has no rep for its result",
     )
   }
   const bSlot = sharedFieldRecvSlot()
   if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-  fbLocalSet(bSlot)
-  fbLocalGet(bSlot)
-  fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
-  fbI32Bin(71) // 0x47 i32.ne — present?
-  if bVt >= 0 && bVb >= 0 {
-    fbIf(bVt)
-    fbLocalGet(bSlot)
-    fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
-    fbRefCast(bVb)
-    fbStructGet(bVb, 0)
+  if sk >= 0 {
+    coalBoxRuntimeOpen(bSlot, sk)
     fbElse()
     if emitExprAsKind(e.binRight, bk, fnIx) < 0 { return -1 }
     fbEnd()
     return 0
   }
-  fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
-  fbLocalGet(bSlot)
-  fbRefAsNonNull()
+  coalBoxStashOpen(bSlot)
   fbElse()
   if emitUnionBoxOwed(bNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0 {
     return -1
@@ -48434,6 +48596,31 @@ export function coalNulAtomJoinWhy(e: BinExpr, fnIx: i32): string {
     return "emitProgram: `??` default names no arm of the union its result is"
   }
   return ""
+}
+
+// The scalar box kind `??` node `exprIx` unboxes its operand's payload at, or -1 where its result
+// has no scalar rep and is the box itself.
+export function coalBoxRuntimeKind(exprIx: i32): i32 {
+  const bk = boxTagOfTy(nodeTyIxOf(exprIx))
+  if nulBoxScalarValtype(bk) < 0 || vbHeapIdxOfKind(bk) < 0 { return -1 }
+  return bk
+}
+
+// After `??`'s operand box: it into `slot`, its tag tested present opening the `if` of scalar box
+// kind `bk` (`coalBoxRuntimeKind`), and the payload unboxed as that arm's value.
+export function coalBoxRuntimeOpen(slot: i32, bk: i32) {
+  const vt = nulBoxScalarValtype(bk)
+  const vb = vbHeapIdxOfKind(bk)
+  fbLocalSet(slot)
+  fbLocalGet(slot)
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Bin(71) // 0x47 i32.ne  -> present?
+  fbIf(vt)
+  fbLocalGet(slot)
+  fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
+  fbRefCast(vb)
+  fbStructGet(vb, 0)
 }
 
 // After `??`'s operand box: it into `slot`, its tag tested present opening the box-typed `if`, and

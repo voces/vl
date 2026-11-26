@@ -6,7 +6,8 @@ import { mfCallbackLocal } from "./emit_union_casts"
 // `idxArmOf`); a bounds check lowers as nothing, fused into the read after it (rule 8). Scratch
 // slots come from the shared lazy list frame, and a loop opens legacy's header hoists.
 
-import { fbRefAsNonNull } from "./emit_bytes"
+import { fbRefAsNonNull, fbStrLen } from "./emit_bytes"
+import { memberLengthArmOf } from "./emit_plan_union"
 import { unwrapParen } from "./emit_base"
 import {
   BinExpr,
@@ -62,6 +63,7 @@ import {
   arrLenTail,
   arrSlicePlanOf,
   arrSliceTail,
+  catWidenTail,
   clearLenTail,
   clearPlanOf,
   coerceTail,
@@ -95,6 +97,7 @@ import {
   mapFilterPlanOf,
   mfLoopTail,
   mfRecvTail,
+  nullReadDstOwnOf,
   popAnyPlanOf,
   popRefTail,
   popScalarTail,
@@ -143,7 +146,7 @@ import { idxStorePlanOf, pushPlanOf } from "./emit_plan_list"
 import { scalarListElemKind } from "./emit_value_sites"
 import { exprNullableRefArray, refListSlotOfExpr } from "./emit_classify"
 import { rlRowsMinted } from "./emit_state"
-import { callSpillsFcpArg } from "./emit_fn_scans"
+import { callSpillsFcpArg, exprPopBits } from "./emit_fn_scans"
 
 // Why the IR does not lower list read `idxIx`, or "" when it does: legacy's own arm decision
 // (`idxArmOf`) took a scalar list, collected and not a view, a string or `(string | null)` list,
@@ -151,7 +154,9 @@ import { callSpillsFcpArg } from "./emit_fn_scans"
 export function listIdxPlainWhy(idxIx: i32, fnIx: i32): string {
   const nd = nodeAt(idxIx)
   if !(nd is Index) { return "index node" }
-  if idxCellReadIsNull(idxIx, fnIx) { return "index cell null" }
+  if idxCellReadIsNull(idxIx, fnIx) && nullReadDstOwnOf(idxIx, fnIx) >= 0 {
+    return "index cell null"
+  }
   const arm = idxArmOf(nd, fnIx)
   if arm == "ref" { return refReadWhy(nd, fnIx) }
   if arm == "string" || arm == "str" || arm == "nulstr" { return "" }
@@ -243,6 +248,13 @@ function lowerPush(r: RListPush, want: boolean): i32 {
     lIdx = pp.ppSlot.base + 3
   } else if lIdx >= 0 {
     irLSkip(v)
+  } else if (exprPopBits(pp.ppArg, fnIx) & 512) != 0 {
+    // A late receiver is staged after the value (`pushLateRhs`).
+    irLOpnd(r.lpX)
+    pushValueTail(pp, fnIx)
+    irLOpnd(v)
+    stageListRecvTail(pp.ppRecv, fnIx, pp.ppSlot.base)
+    return pushAppendTail(r.lpAt, pp, pp.ppSlot.base + 3, want)
   } else {
     irLOpnd(v)
     stageListRecvTail(pp.ppRecv, fnIx, pp.ppSlot.base)
@@ -460,9 +472,17 @@ function lowerListCat(r: RListCat): i32 {
   if !(e is BinExpr) { return irLMiss("list concat node") }
   const fnIx = irLFn().irAt
   irLOpnd(r.ljL)
-  listCatOperandTail(e.binLeft, r.ljAt, fnIx)
+  if r.ljWiden == 1 {
+    if catWidenTail(e.binLeft, r.ljAt, fnIx) < 0 { return -1 }
+  } else {
+    listCatOperandTail(e.binLeft, r.ljAt, fnIx)
+  }
   irLOpnd(r.ljR)
-  listCatOperandTail(e.binRight, r.ljAt, fnIx)
+  if r.ljWiden == 2 {
+    if catWidenTail(e.binRight, r.ljAt, fnIx) < 0 { return -1 }
+  } else {
+    listCatOperandTail(e.binRight, r.ljAt, fnIx)
+  }
   return listCatTail(r.ljAt, fnIx)
 }
 
@@ -568,6 +588,11 @@ function lowerLenOf(r: RListLen, m: Member): i32 {
     return emitArrLenHeld(hz)
   }
   irLOpnd(r.llV)
+  // An atom's `.length` reads the member string the builder decoded it to (`atomStr`).
+  if memberLengthArmOf(m, r.llAt, irLFn().irAt) == "atomStr" {
+    fbStrLen()
+    return 0
+  }
   return arrLenTail(m, irLFn().irAt)
 }
 
