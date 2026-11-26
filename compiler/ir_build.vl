@@ -121,9 +121,6 @@ import {
   nodeAt,
   nodeChildrenPush,
   spreadArgOf,
-  tailPushBlockTail,
-  tailPushIfArms,
-  tailPushMatchArms,
 } from "./ast"
 import {
   IrFamily,
@@ -10400,7 +10397,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd, ix: i32): string {
     "atomAsStr" => repNodeAt(r) is RAtom
     "nulNiche" => refNullable(r) || strNullable(r)
     "nulBool" => repBoolNiche(r)
-    "rec" | "obj" => repNodeAt(r) is RRecord
+    "rec" | "obj" | "recCopy" => repNodeAt(r) is RRecord
     "refList" | "atomList" => repNodeAt(r) is RList
     // A scalar map read is built as the probe's own box (`mapGetAt`), which this plan writes as is.
     "mapScalar" => boxedNullable(r)
@@ -12189,6 +12186,7 @@ function coalesce(
     return v
   }
   if arm == "mapScalarJoin" { return coalMapScalarJoin(b, n, ix, rep) }
+  if arm == "boxRuntime" { return coalBoxRuntime(b, n, ix, rep) }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
 }
@@ -12685,10 +12683,34 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
 // test's box-typed `if`, the default built into its absent arm.
 function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !heldAsBox(rep) { return irBMiss("coalesce box stash result rep") }
-  const ty = outTyOf(ix, rep)
-  if irTyOpen(ty) { return irBMiss("open temp type") }
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
+  return coalBoxTagged(b, n, ix, rep, l, "boxStash")
+}
+
+// `l ?? d` whose operand the checker narrowed to `null` though it may have been written since (a
+// loop, a closure, a call), along legacy's `boxRuntime` rung: the box read at its storage, then its
+// tag test, the box stash's at a box result and else the payload's unboxed.
+function coalBoxRuntime(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const mark = storageReadEnter(unwrapParen(n.binLeft))
+  const l = irBExpr(b, n.binLeft)
+  storageReadLeave(mark)
+  if ibMiss != "" { return l }
+  const arm: CoalValArm = if heldAsBox(rep) { "boxStash" } else { "boxRuntime" }
+  return coalBoxTagged(b, n, ix, rep, l, arm)
+}
+
+// The tag-tested `??` over box `l` along `arm`: the default built into its absent arm.
+function coalBoxTagged(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  l: Opnd,
+  arm: CoalValArm,
+): Opnd {
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
   if !heldAsBox(irBOpRep(l)) {
     return irBMiss("coalesce box stash operand rep")
   }
@@ -12706,7 +12728,7 @@ function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     {
       cbL: l,
       cbLB: [],
-      cbArm: "boxStash",
+      cbArm: arm,
       cbNull: nb,
       cbOut: t,
       cbAt: ix,
@@ -14811,29 +14833,22 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     const orep = if !never { rep } else if binIsCompare(n.binOp) { ibBool } else if sr == i32r { i32r } else { sr }
     // Mixed numeric widths meet at the operator's width, each operand widened before the next
-    // is built, as legacy builds them (`emitBinOperandAs`); a literal there is legacy's to write.
+    // is built, as legacy builds them (`emitBinOperandAs`); a literal there is built at that
+    // width (`emitNumLitAs`).
     const dst = binWidthRep(n)
-    if (
-      dst >= 0
+    const lLit = dst >= 0
       && irRepOtherThan(n.binLeft, dst)
       && numLitAsApplies(n.binLeft)
-    ) {
-      return irBMiss("widen literal")
-    }
-    if (
-      dst >= 0
+    const rLit = dst >= 0
       && irRepOtherThan(n.binRight, dst)
       && numLitAsApplies(n.binRight)
-    ) {
-      return irBMiss("widen literal")
-    }
     const ls = b.length
     // A left `never` beside a wider operand is read at i32, its consumer's rep, and widened to
     // that operand's width, as legacy writes it; no value of it is ever read.
     const wideNever = never && nl && sr != i32r
-    const l = if wideNever { neverWidened(b, irBExpr(b, n.binLeft), n.binLeft, sr) } else { widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1) }
+    const l = if lLit { signedLitAt(unwrapParen(n.binLeft), dst) } else if wideNever { neverWidened(b, irBExpr(b, n.binLeft), n.binLeft, sr) } else { widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1) }
     const at = b.length
-    const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1)
+    const r = if rLit { signedLitAt(unwrapParen(n.binRight), dst) } else { widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1) }
     if ibMiss != "" { return l }
     // A left operand that is a variable or immediate is staged below a right operand that holds
     // a valued `if`, a `??` that stages the leads before it, a store, a stash or a tag dispatch's
@@ -18693,12 +18708,23 @@ function startItemOrd(node: i32, gi: i32): i32 {
 function globalInitNulNone(b: i32[], gi: i32, gst: i32, init: i32): i32 {
   const rep = globalRep(gi, gst)
   if rep < 0 { return skip("global initializer rep") }
-  const src = nulNonePayload(b, init, rep)
+  const src = nulNoneBoxPayload(b, init, rep)
   if ibMiss != "" { return 0 }
   const gm = irGlobalWriteMiss(gi, ibGlobalCtx())
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: gi, gsSrc: src }, -1, ibNoValue, gst)
   return 0
+}
+
+// A `null`-typed value `x` at rep `rep` as `emitNulNoneBoxPayload` writes it: an if-expression
+// for its effects, then the bottom null; any other node as `nulNonePayload` writes it.
+function nulNoneBoxPayload(b: i32[], x: i32, rep: i32): Opnd {
+  const u = unwrapParen(x)
+  const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if !(n is IfStmt) { return nulNonePayload(b, x, rep) }
+  ifForEffect(b, n, u)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  return repTemp(b, { nuAt: u, nuOwn: NULL_OWN_NONE, nuRead: [] }, u, rep)
 }
 
 // A `null`-typed value `x` at rep `rep` as `emitNulNoneLeafPayload` writes it: a call's own value,
@@ -18792,12 +18818,6 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
   if arm != "plain" && arm != "widen" && arm != "variant" {
     return skip("global initializer " + arm)
   }
-  // A widened value `if` holding a nested join that keeps its own type is legacy's adoption
-  // (`numLitAdoptJoin`, D16496): the inner join is built at its type and extended whole, where
-  // the IR's delivery widens per arm.
-  if arm == "widen" && widenJoinKeepsInner(g.letInit) {
-    return skip("global initializer widen join")
-  }
   // A numeric cell's initializer is delivered widened to it, as legacy's `emitWidened` writes it,
   // and a narrowed arm's unbox (`emitGlobalInitArmUnbox`) is the delivery's own.
   // A bare-arm cell takes the arm's struct whatever builds it (`emitVariantCoerce`): the value is
@@ -18808,25 +18828,6 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: gi, gsSrc: src }, -1, ibNoValue, gst)
   return 0
-}
-
-// Whether value join `init` nests a join typed other than the whole, which legacy converts whole.
-function widenJoinKeepsInner(init: i32): boolean {
-  const root = unwrapParen(init)
-  if root < 0 || root >= P.nodes.length { return false }
-  const t = exprTyOf(root)
-  const todo: i32[] = [root]
-  while todo.length > 0 {
-    const at = unwrapParen(todo.pop() ?? -1)
-    if at >= 0 && at < P.nodes.length {
-      if tailPushIfArms(at, todo) || tailPushMatchArms(at, todo) {
-        if at != root && exprTyOf(at) != t { return true }
-      } else {
-        tailPushBlockTail(at, todo)
-      }
-    }
-  }
-  return false
 }
 
 // Global statement `gst`'s alias of a generic function used only as a direct callee: the
