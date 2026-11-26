@@ -2506,15 +2506,15 @@ Deno.test({
 const UNION_SINK_ONE_NUMBER =
   `function lit<A, B>(k: i32, a: A, b: B) {\n  if k == 0 { return a }\n  return if k == 1 { b } else { 5 }\n}\nconst z: i64 = 9\nprint(lit(2, z, z) + 1)\n`;
 Deno.test({
-  name: "ir shadow: a returned if boxed once as one wider number under the sink, its instance literal arm a named miss",
+  name: "ir shadow: a returned if boxed once as one wider number under the sink, its instance literal arm built at that width",
   ignore,
   fn: () => {
     const { rc, rows } = run(UNION_SINK_ONE_NUMBER, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("uncovered widen instLit") ?? 0) !== 1) {
-      throw new Error(`want lit uncovered at widen instLit, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want lit covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
