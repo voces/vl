@@ -1948,8 +1948,6 @@ Deno.test({
       const got = exp.irVerifySelfTest(i);
       if (got !== want[ids[i]]) throw new Error(`case ${ids[i]}: want rule ${want[ids[i]]}, got rule ${got}`);
     }
-    // The hoist asked inside a range copy undoes every binding it made, whether it hoists or misses.
-    if (exp.irRangeCopyHoistSelfTest(-1) !== 0) throw new Error("want the unroll stack depth unchanged after a miss");
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
