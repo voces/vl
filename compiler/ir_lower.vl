@@ -17,7 +17,11 @@ import {
   sharedFieldRecvSlot,
 } from "./emit_union_casts"
 import { printPlanPinNull } from "./emit_union_registry"
-import { mapRecvScalarBoxKindIn, mapRecvTyIn } from "./emit_ty_canon"
+import {
+  mapRecvScalarBoxKindIn,
+  mapRecvScalarKindInst,
+  mapRecvTyIn,
+} from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { repNodeOfTy, repOfTy, repTyOf, slotRowTyOf } from "./emit_rep"
 import { luOvEnter, luOvLeave } from "./emit_elab"
@@ -592,6 +596,7 @@ import {
   mapGetOrUnionScalarOpen,
   mapGetOrUnionScalarPlanOf,
   mapGetOrUnionScalarTail,
+  mapGetOrWidenHead,
   mapHasTail,
   mapKeysFrameOf,
   mapLengthPlain,
@@ -641,6 +646,7 @@ import {
   numUnionBinTail,
   numUnionConvertTail,
   numUnionIsUnionSide,
+  numUnionNegTail,
   numUnionReboxTail,
   numUnionSideKindOf,
   numUnionSideLit,
@@ -1067,11 +1073,19 @@ function ownedSlot(v: i32): i32 {
 
 // The valtype bytes legacy's `fbValtype` declares a non-null value of rep `r` at, a ref list's or a
 // closure's as `refRepValtype` keys it, a nullable reference's or boxed nullable's at its nullable
-// valtype; none for a niche nullable, one with no kind, or a ref list or closure that keys no shape.
+// valtype, an i32-sentinel or atom nullable's at i32; none for one with no kind, or a ref list or
+// closure that keys no shape.
 function repLocalValtype(r: i32): u8[] {
   const out: u8[] = []
   const d = repOfTy(repTyOf(r))
   const k = d.rdKind
+  // An i32-sentinel (discipline 2) or atom (3) nullable is its i32 cell, null a value of it.
+  if k != null && (d.rdNul == 2 || d.rdNul == 3) {
+    const p0 = wTarget(out)
+    fbValtype("i32", -1)
+    wTarget(p0)
+    return out
+  }
   // A boxed nullable (discipline 4) is its union box's nullable ref, as legacy declares it.
   const boxNul = d.rdNul == 4 && k == "union"
   if k == null || d.rdNul != 0 && d.rdNul != 1 && !boxNul { return out }
@@ -4227,6 +4241,7 @@ function mapGetOr(r: RMapGetOr) {
       r.mgLoc,
       r.mgKey,
       mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
+      rk,
     )
     irLOpnd(r.mgDef)
     return mapGetOrInlineTail(
@@ -4327,9 +4342,12 @@ function mapGetOrInlineHead(
   loc: Opnd,
   key: Opnd,
   qp: MapUnionPlan,
+  rk: i32,
 ): i32 {
   const sh = mapProbeHead(recvIx, sym, nonNull, loc, key)
-  if form == 6 {
+  if form == 9 {
+    mapGetOrWidenHead(mapRecvScalarKindInst(recvIx, lw.irAt), rk)
+  } else if form == 6 {
     mapGetOrSentinelHead(mapGetOrSentinel(mapRecvTyIn(recvIx, lw.irAt)))
   } else if form == 5 {
     mapGetOrUnionHead(sh)
@@ -4348,16 +4366,19 @@ function mapGetOrInlineHead(
 }
 
 // The legacy arm (`mapGetOrArmOf`) inline form `form` writes: the plain `i32` read (1), an
-// atom-valued map's being that read; an mv slot's (2-5); the sentinel's (6); else the helper.
+// atom-valued map's being that read; an mv slot's (2-5); the sentinel's (6); the widened scalar
+// read's (9); else the helper.
 function mapGetOrFormArm(form: i32, arm: MapGetOrArm): MapGetOrArm {
   if form == 1 { return if arm == "atom" { "atom" } else { "i32" } }
   if form == 6 { return "sentinel" }
+  if form == 9 { return "widen" }
   return if form >= 2 { "mv" } else { "helper" }
 }
 
 // An inline map read's tail after its default, by `form`.
 function mapGetOrInlineTail(form: i32, sh: i32, qp: MapUnionPlan) {
   if form == 6 { return mapGetOrSentinelTail() }
+  if form == 9 { return mapGetOrI32Tail() }
   if form == 5 { return mapGetOrUnionBoxTail(sh) }
   if form == 4 { return mapGetOrNicheTail(sh) }
   if form == 3 { return mapGetOrUnionScalarTail(sh, qp) }
@@ -4379,6 +4400,9 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   const rd = if lhsIx >= 0 { nodeAt(lhsIx) } else { null }
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(n.cbAt, fnIx)
+  if mp.prForm == 7 || mp.prForm == 8 {
+    return coalMapScalarBox(n, e, rd, rk, pending)
+  }
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
   const want = mapGetOrFormArm(mp.prForm, arm)
   if (
@@ -4404,6 +4428,7 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
     n.cbL,
     mp.prKey,
     mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
+    rk,
   )
   irLSettle(pending)
   lwFrames.push(-1)
@@ -4414,6 +4439,34 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
     sh,
     mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
   )
+  return 0
+}
+
+// The fused scalar join (7) or scalar box (8): `mapGetOr`'s head for that form, the default body
+// writing the slotless out in the miss arm, then the `end`.
+function coalMapScalarBox(
+  n: SCoalBox,
+  e: BinExpr,
+  rd: Index,
+  rk: i32,
+  pending: i32[],
+): i32 {
+  const mp = n.cbMap
+  if mp == null { return irLMiss("map read probe") }
+  const fnIx = lw.irAt
+  const routed = if mp.prForm == 7 { coalArmOf(e, n.cbAt, fnIx) == "mapScalarJoin" } else { mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk) == "scalarBox" }
+  if !routed { return irLMiss("map read route") }
+  if mp.prSym >= 0 && userGlobalReadClass(mp.prSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map read of a global not read plainly")
+  }
+  lwSeq = []
+  mapProbeHead(rd.idxArr, mp.prSym, mp.prNonNull, n.cbL, mp.prKey)
+  mapScalarJoinOpen(mapRecvScalarBoxKindIn(rd.idxArr, fnIx))
+  irLSettle(pending)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  fbEnd()
   return 0
 }
 
@@ -4762,6 +4815,7 @@ function unionNumCrossEq(r: RUnionNumCrossEq) {
 // stashed sides (`numUnionBinTail`). A literal side stashes nothing.
 function numUnionBin(r: RNumUnionBin) {
   const n = nodeAt(r.nbAt)
+  if n is Unary { return numUnionNeg(r, n) }
   if !(n is BinExpr) { return irLMiss("numeric union node") }
   const fnIx = lw.irAt
   const key = numUnionStashEnter()
@@ -4788,6 +4842,19 @@ function numUnionBin(r: RNumUnionBin) {
   numUnionStashLeave()
   if numUnionBinTail(n, r.nbAt, fnIx, slots[0], slots[1]) < 0 {
     return irLMiss("numeric union dispatch")
+  }
+  return 0
+}
+
+// `RNumUnionBin` at a unary `-`: its one operand's box stashed, then legacy's per-member negation.
+function numUnionNeg(r: RNumUnionBin, n: Unary) {
+  if r.nbArgs.length != 1 { return irLMiss("numeric union operands") }
+  const key = numUnionStashEnter()
+  irLOpnd(r.nbArgs[0])
+  const slot = numUnionStashTail(true, -1, key)
+  numUnionStashLeave()
+  if numUnionNegTail(n.unArg, lw.irAt, slot) < 0 {
+    return irLMiss("numeric union negation")
   }
   return 0
 }

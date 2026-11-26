@@ -600,6 +600,7 @@ import {
   paramIsClosure,
   paramMap,
   paramNulClosure,
+  paramPosOfDecl,
   paramPosOfRead,
   paramTypeNodeOfRead,
 } from "./emit_query"
@@ -2832,7 +2833,8 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
     slot = holderRecordRow(letIx, fnIx)
     if slot < 0 { slot = structIndexOfLet(letIx, fnIx) }
   } else {
-    slot = repSlotOfKind(k, ty)
+    const cr = if k == "struct" { letInitCaptureRow(letIx, fnIx) } else { -1 }
+    slot = if cr >= 0 { cr } else { repSlotOfKind(k, ty) }
   }
   return {
     bgClaims: slot >= 0,
@@ -2841,6 +2843,34 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
     bgSlot: slot,
     bgSlotHave: true,
   }
+}
+
+// The row un-annotated binding `letIx`'s call initializer returns at where its callee returns a
+// hole parameter at that parameter's row (`fnRetCaptureRow`); -1 otherwise.
+export function letInitCaptureRow(letIx: i32, fnIx: i32): i32 {
+  const d = nodeAt(letIx)
+  if !(d is LetDecl) || d.letType >= 0 { return -1 }
+  const c = parenPeelIx(d.letInit)
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) { return -1 }
+  const fe = callCaptureRowFe(cn, fnIx)
+  return if fe >= 0 { fnRetCaptureRow(fe) } else { -1 }
+}
+
+// The function call `c` reaches in `fnIx` where it returns a hole parameter at that parameter's
+// row (`fnRetCaptureRow`): a named callee, or a binding holding such a closure; -1 otherwise.
+function callCaptureRowFe(c: Call, fnIx: i32): i32 {
+  if c.callFn < 0 || !(nodeAt(c.callFn) is Ident) { return -1 }
+  const fe = fnIndexOfAt(sidOfNode(c.callFn), fnIx, c.callFn)
+  if (
+    fe >= 0
+    && fe < fRetKind.length
+    && fRetKind[fe] == "struct"
+    && fnRetCaptureRow(fe) >= 0
+  ) {
+    return fe
+  }
+  return capRowLetFe(c.callFn, fnIx)
 }
 
 // The functions enclosing binding `letIx` at instance `fnIx`, innermost first, `fnIx` included.
@@ -3096,6 +3126,12 @@ function letListRowMint(letIx: i32, fnIx: i32) {
 function letAnnMint(letIx: i32) {
   const ln = nodeAt(letIx)
   if ln is LetDecl && ln.letType >= 0 { arrLitMint(ln.letType) }
+}
+
+// Whether the checker builds the values of `Map()` or list literal binding `letIx` at another
+// record than its type's (`recBuildElemTyOf`).
+export function letValuesBuiltApart(letIx: i32): boolean {
+  return recBuildElemTyOf(letIx) >= 0
 }
 
 // The map shape of binding `letIx`'s type in `fnIx`: the row of the record its values are
@@ -5427,20 +5463,6 @@ export function ifExprRefSlot(
 // True if evaluating `exprIx` yields an i64 scalar (see `exprScalarWidth`).
 export function exprIsI64(exprIx: i32, fnIx: i32) {
   return exprScalarWidth(exprIx, fnIx) == "i64"
-}
-
-// True if the un-annotated `LetDecl` at `letIx` should infer an f32 slot — its initializer
-// already yields an f32. f32 is the checker's weak spot (no f32 typed-IR), so this is
-// annotation-only; without it an un-annotated `let y = s.x` over an f32 source would
-// default to an i32 slot and store an f32 into it. A bare float literal stays f64.
-export function letInfersF32(letIx: i32, fnIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return false }
-    if d.letInit < 0 { return false }
-    return exprIsF32(d.letInit, fnIx)
-  }
-  return false
 }
 
 // True if evaluating `exprIx` yields a v128 vector, a `new v128` brand included (see
@@ -9526,8 +9548,9 @@ function ifArmsAllVariantIdx(ifIx: i32, fnIx: i32, vi: i32): boolean {
   return false
 }
 
-// The one struct row every value closure `fe` returns is stored at, where each is a read of a
-// captured unannotated parameter (its capture slot's row, `captureValStructIdx`); -1 otherwise.
+// The one struct row every value function `fe` returns is stored at, where each is a read of an
+// unannotated parameter: its own (its slot's row) or a captured one (its capture slot's row,
+// `captureValStructIdx`); -1 otherwise.
 export function fnRetCaptureRow(fe: i32): i32 {
   const fd = if fe >= 0 && fe < fnStmts.length { nodeAt(fnStmts[fe]) } else { null }
   if !(fd is FuncDecl) { return -1 }
@@ -9538,11 +9561,13 @@ export function fnRetCaptureRow(fe: i32): i32 {
   for v in vals {
     const pv = parenPeelIx(v)
     const n = if pv >= 0 && pv < P.nodes.length { nodeAt(pv) } else { null }
-    if !(n is Ident) || !strListHas(caps, n.identName) { return -1 }
+    if !(n is Ident) { return -1 }
     const d = identDeclOf(pv)
     const pd = if d >= 0 && d < P.nodes.length { nodeAt(nodeSrc[d] ?? d) } else { null }
     if !(pd is Param) || pd.parType >= 0 { return -1 }
-    const si = captureValStructIdx(fe, n.identName)
+    const own = paramPosOfDecl(fnStmts[fe], d) >= 0
+    if !own && !strListHas(caps, n.identName) { return -1 }
+    const si = if own { annValtypeSlotOf(paramTypeNodeOfRead(fnStmts[fe], pv)) } else { captureValStructIdx(fe, n.identName) }
     if si < 0 || row >= 0 && si != row { return -1 }
     row = si
   }

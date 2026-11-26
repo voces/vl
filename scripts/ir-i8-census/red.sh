@@ -7,9 +7,10 @@
 # <census-out> is census.sh's directory and <sweep-out> is `ir-i8-sweep.sh keep --out`'s, both on
 # the same tree. Rows: pop, program, first stub, unit, class, owner; a program with no census row
 # gets `-` for unit and class. A class is the miss with any `: detail` dropped, and every fallback
-# row is `claim fell back`; a `program:<path>` registry line overrides the class owner for that
-# program, `program:<path>@<unit>` for that one unit, and `fallback:<reason>` for a fallback whose
-# reason (after its last `emitProgram: `) it names. The summary line goes to stderr, with deltas against `--prev`.
+# row is `claim fell back`. A class's owner is its mechanism family's (family.awk) unless the
+# registry names it; a `program:<path>` registry line overrides that for the program,
+# `program:<path>@<unit>` for one unit, and `fallback:<reason>` for a fallback whose reason (after
+# its last `emitProgram: `) it names. The summary line goes to stderr, with deltas against `--prev`.
 set -euo pipefail
 CEN=${1:?usage: red.sh <census-out> <sweep-out> [--sha <sha>] [--prev <red.tsv>]}
 SW=${2:?usage: red.sh <census-out> <sweep-out> [--sha <sha>] [--prev <red.tsv>]}
@@ -23,11 +24,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 OWNERS=$(dirname "$0")/owners.tsv
+FAM=$(cat "$(dirname "$0")/family.awk")
 T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
 
 # Each unclaimed unit, keyed by its program's checkout-relative path (witnesses keep `wit/...`).
-cat "$CEN"/*.rows | awk -F'\t' -v w="$CEN/" '$3 ~ /^(fnu |claim fell back)/ {
+# A refusal a claim met is its unit's `fnr` (refused as expected) or `fnu` row, not a unit apart.
+cat "$CEN"/*.rows | awk -F'\t' -v w="$CEN/" '$3 ~ /^claim fell back: [a-z ]*a legacy helper refused in `/ && $3 !~ /^claim fell back: const cell / { next }
+  $3 ~ /^(fnu |claim fell back)/ {
   p = $1; sub(w, "", p); u = $3; c = $3
   if (u ~ /^fnu /) { sub(/^fnu /, "", u); sub(/ \|.*/, "", u); sub(/^[^|]*\| /, "", c) }
   else { u = "(fallback)"; sub(/^claim fell back: /, "", c) }
@@ -58,7 +62,7 @@ done < "$SW/failing.tsv"
   printf '# I8 red list%s: ir-i8-sweep (keep list) joined with the I8 census on one seed (red.sh).\n' \
     "${SHA:+ on master $SHA}"
   printf '# pop\tprogram\tfirst stub\tunit\tclass\towner\n'
-  awk -F'\t' -v OFS='\t' '
+  awk -F'\t' -v OFS='\t' "$FAM"'
     function cls(u, c) { if (u == "(fallback)") return "claim fell back"; sub(/: .*/, "", c); return c }
     # A fallback is keyed by its reason too: the text after its last `emitProgram: `, else after
     # `claim fell back: `, so the registry can route one reason apart from the class.
@@ -73,7 +77,7 @@ done < "$SW/failing.tsv"
         split(L[i], f, "\t"); k = cls(f[1], f[2])
         pu = "program:" p "@" f[1]
         w = (k == "claim fell back") ? "fallback:" why(f[2]) : ""
-        o = pu in own ? own[pu] : (("program:" p) in own ? own["program:" p] : ((w != "" && w in own) ? own[w] : (k in own ? own[k] : "unowned")))
+        o = pu in own ? own[pu] : (("program:" p) in own ? own["program:" p] : ((w != "" && w in own) ? own[w] : (k in own ? own[k] : family(k))))
         print $1, p, $3, f[1], f[2], o
       }
     }' "$OWNERS" "$T/unc" "$T/fail" | sort
