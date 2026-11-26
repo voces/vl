@@ -1249,6 +1249,9 @@ export function cloRetKeySuffix(fe: i32): string {
     if br >= 0 { return ">" + repSigSlotTokOfKind("struct", br) }
   }
   const sk = repSigKindOfTy(rt)
+  // A record result returned at its capture slot's row is keyed at that row (`fnRetCaptureRow`).
+  const cr = if sk == "struct" { fnRetCaptureRow(fe) } else { -1 }
+  if cr >= 0 { return ">" + repSigSlotTokOfKind("struct", cr) }
   // A list whose returned values join at no one row (D15221) has no row to key.
   if sk == "reflist" && fnRetRefListSlot(fe) == -2 { return "" }
   return repSigRetTokOfTy(rt)
@@ -9510,6 +9513,29 @@ function ifArmsAllVariantIdx(ifIx: i32, fnIx: i32, vi: i32): boolean {
   return false
 }
 
+// The one struct row every value closure `fe` returns is stored at, where each is a read of a
+// captured unannotated parameter (its capture slot's row, `captureValStructIdx`); -1 otherwise.
+export function fnRetCaptureRow(fe: i32): i32 {
+  const fd = if fe >= 0 && fe < fnStmts.length { nodeAt(fnStmts[fe]) } else { null }
+  if !(fd is FuncDecl) { return -1 }
+  const caps = captureNamesOf(fe)
+  const vals: i32[] = []
+  a20RetWalk(fd.fnBody, true, vals)
+  let row = -1
+  for v in vals {
+    const pv = parenPeelIx(v)
+    const n = if pv >= 0 && pv < P.nodes.length { nodeAt(pv) } else { null }
+    if !(n is Ident) || !strListHas(caps, n.identName) { return -1 }
+    const d = identDeclOf(pv)
+    const pd = if d >= 0 && d < P.nodes.length { nodeAt(nodeSrc[d] ?? d) } else { null }
+    if !(pd is Param) || pd.parType >= 0 { return -1 }
+    const si = captureValStructIdx(fe, n.identName)
+    if si < 0 || row >= 0 && si != row { return -1 }
+    row = si
+  }
+  return row
+}
+
 // The struct table index a function `name` returns (recorded in `fRetStructIdx`), or -1.
 // Frame-aware for the same reason its kind companion is: the two must resolve to the SAME
 // function, or the kind says struct while the row is another instance's (D1788).
@@ -14846,6 +14872,9 @@ function readCloSigKeyOfDecl(atIx: i32, fnIx: i32, hops: i32): string {
   if fk != "" && cloSigPosOfKey(fk) >= 0 { return fk }
   const nft = narrowedFnTyOf(atIx, fnIx)
   if nft >= 0 { return sigKeyOfTy(nft) }
+  // A binding of a closure returning its capture at the capture slot's row keys by the closure.
+  const cf = capRowLetFe(atIx, fnIx)
+  if cf >= 0 { return cloSigKeyExt(cf) }
   const rt = tyPeelNul(nodeTyAt(atIx, fnIx))
   if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyFunc && !tyHasTyVar(rt) {
     const rk = sigKeyOfTy(rt)
@@ -14875,6 +14904,17 @@ function readCloSigKeyOfDecl(atIx: i32, fnIx: i32, hops: i32): string {
     // A named function, a loop variable and every other declaration key by the read's own type.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => ""
   }
+}
+
+// The closure an un-annotated `let` read `atIx` holds where it returns a captured hole parameter
+// at its capture slot's row (`fnRetCaptureRow`); -1 otherwise.
+function capRowLetFe(atIx: i32, fnIx: i32): i32 {
+  const sd = bindingDeclInScope(atIx)
+  const d = if sd >= 0 { sd } else { identDeclOf(atIx) }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  const fe = fieldValueFeOfIn(dn.letInit, fnIx)
+  return if fe >= 0 && fnRetCaptureRow(fe) >= 0 { fe } else { -1 }
 }
 
 // The `$fnsig` key of function type `ty`, its `| null` peeled; "" for any other type.
