@@ -4923,6 +4923,10 @@ function structEqSideNul(
     fbI32Const(1)
     return 0
   }
+  // An optional chain's null test would re-read the side's node in legacy (`emitOptChainIsNull`).
+  if arm == "optChain" {
+    return irLMiss("nullable record compare optional chain side")
+  }
   if (
     arm != "nullRef"
     && arm != "nulStr"
@@ -4996,9 +5000,12 @@ function structEqElemPlace(
   const recvIx = if nd is Index { unwrapParen(nd.idxArr) } else { -1 }
   const idxIx = if nd is Index { unwrapParen(nd.idxIndex) } else { -1 }
   const rBytes = placeRecv && recvIx >= 0 && irReadsAgain(recvIx)
+  // A place receiver or index the IR has no read of declines, so legacy never re-reads its node.
+  if placeRecv && !rBytes { irLMiss("record compare element receiver read") }
   const vs = if rBytes { -3 } else if placeRecv { -1 } else { structEqSideLocal(v) }
   const placeIdx = structEqPlaceSide(i)
   const iBytes = placeIdx && idxIx >= 0 && irReadsAgain(idxIx)
+  if placeIdx && !iBytes { irLMiss("record compare element index read") }
   const xs = if i is OImm { -1 } else if iBytes { -3 } else if placeIdx { -2 } else { structEqSideLocal(i) }
   const imm = if i is OImm { i.oiBits as% i32 } else { 0 }
   const bad = vs < 0 && !placeRecv || !(i is OImm) && xs == -1
@@ -5036,11 +5043,16 @@ function readAgainBytes(ix: i32): u8[] {
 }
 
 // The root place of a record compare side at node `ix` that is no list element: a place side
-// (`place`) the IR reads again (`irReadsAgain`) as those bytes, written once here; any other the
-// operand node legacy reads.
+// (`place`) the IR reads again (`irReadsAgain`) as those bytes, written once here. Any other side
+// is stashed or held in a local, so its root is a slot and this place goes unread; a place side
+// the IR has no read of declines, so legacy never re-reads the operand node.
 function structEqRootPlace(ix: i32, place: boolean): EqRootPlace {
   const u = unwrapParen(ix)
-  if !place || !irReadsAgain(u) { return EQ_ROOT_EXPR }
+  if !place { return EQ_ROOT_EXPR }
+  if !irReadsAgain(u) {
+    irLMiss("record compare place read")
+    return EQ_ROOT_EXPR
+  }
   return {
     epKind: "bytes",
     epSlot: -1,
@@ -5312,7 +5324,7 @@ function boxNarrowBox(r: RBoxNarrow, again: boolean) {
 }
 
 // `RRecCopyPure`: legacy's whole copy, its source read as the IR wrote it: whole, where the copy
-// reads it once, or a read written again (`irHoistRecv`); else from the source node.
+// reads it once, or a read written again (`irHoistRecv`); with neither, the claim declines.
 function recCopyPure(r: RRecCopyPure) {
   const src: u8[] = []
   // A source read once is written here whole, into the bytes the copy reads it as.
@@ -5326,12 +5338,14 @@ function recCopyPure(r: RRecCopyPure) {
   for v in r.rpV { irLSkip(v) }
   leaf()
   const u = unwrapParen(r.rpAt)
-  if r.rpV.length > 0 && irReadsAgain(u) {
-    const prev = wTarget(src)
-    irHoistRecv(u)
-    wTarget(prev)
-    if lwMiss != "" { return -1 }
+  // A source the IR has no read of declines, so legacy's copy never re-reads its node.
+  if r.rpV.length == 0 || !irReadsAgain(u) {
+    return irLMiss("record copy source read")
   }
+  const prev = wTarget(src)
+  irHoistRecv(u)
+  wTarget(prev)
+  if lwMiss != "" { return -1 }
   return recCopyPureEmit(r.rpAt, lw.irAt, src)
 }
 
