@@ -10119,16 +10119,54 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const cbx = !vif && (coalBoxFrom(b, xAt, true) || coalBoxFrom(b, xAt, false))
   const recv: PushRecv = if pushRecvHeldAtRest(pp.ppRecv) || !vif && !cbx { v } else { pushStage(b, v, ix, at, xAt, clear, cbx) }
   if ibMiss != "" { return missRhs("push short-circuit operand") }
-  // An unstaged receiver is written at its use, above any valued `if` built from `at` on.
+  // An unstaged receiver is written at its use, above any valued `if` the value builds; a receiver
+  // holding its own branch is written whole before the value, as legacy writes it.
   if (
     !(recv is PStaged)
     && !pushRecvHeldAtRest(pp.ppRecv)
-    && ifBelowLead(b, at, "push short-circuit operand")
+    && !pushRecvReadAtUse(b, v, xAt)
+    && ifBelowLeadIn(b, xAt, b.length, "push short-circuit operand")
   ) {
     return missRhs("push short-circuit operand")
   }
   const r: Rhs = { lpV: recv, lpX: x, lpAt: ix }
   return r
+}
+
+// Whether push receiver `v` is read at its use, as legacy reads it, below the value's statements
+// built from `at` on: a local, or a temp recovering a local (`RRecover`) that none of them assigns,
+// at any depth, whose read is moved after them.
+function pushRecvReadAtUse(b: i32[], v: Opnd, at: i32): boolean {
+  if !(v is OVar) || v.ov < 0 || v.ov >= ib.irVars.length { return false }
+  if ib.irVars[v.ov].vKind != "temp" { return true }
+  let k = -1
+  let src = -1
+  let i = 0
+  while i < at {
+    const n = ib.irNodes[b[i]]
+    if n is SLet && n.lDst == v.ov {
+      const r = n.lRhs
+      if r is RRecover && r.rcV is OVar && !opndsAreTemps([r.rcV]) {
+        k = i
+        src = r.rcV.ov
+      }
+    }
+    i = i + 1
+  }
+  if k < 0 || k != at - 1 { return false }
+  i = at
+  while i < b.length {
+    if nodeAssigns(b[i], src) { return false }
+    i = i + 1
+  }
+  const id = b[k]
+  i = k
+  while i + 1 < b.length {
+    b[i] = b[i + 1]
+    i = i + 1
+  }
+  b[b.length - 1] = id
+  return true
 }
 
 // A `.push` `ix` whose value stages a list receiver of its own: the value at the receiver's element
@@ -15263,11 +15301,19 @@ function mapGetAt(
   // record member no plan reads is the box read whole, then narrowed; legacy writes it through
   // `emitExpr`, which banks the read's row whatever row a caller expecting the box passed.
   let narrowTo = -1
+  // A literal-set member a union box holds as its string is unboxed to that string
+  // (`emitUnionUnboxTail` at the string kind), read as the string it is.
+  let strMember = false
   if arm == "unionBox" {
     // At its narrowing the read is unboxed to the member's scalar after (`narrowedMapReadOf`).
     const nm = narrowedMapReadOf(ix, ibFnIx)
     const na: NarrowedMapReadArm = if whole { "none" } else { nm.nmArm }
-    const repOk = match na {
+    strMember = box < 0
+      && na == "unbox"
+      && nm.nmAk == 2
+      && repNodeAt(rep) is RAtom
+    const repOk = strMember
+      || match na {
       // The read is the value's box, its miss the box's `null` tag.
       "none" => rep == m.rmVal
         || repNodeAt(repBoxCore(rep)) is RBox && repBoxCore(rep) == repBoxCore(m.rmVal)
@@ -15335,6 +15381,7 @@ function mapGetAt(
       narrowTo,
     )
   }
+  if strMember { return irBLetTempTy(b, r, ix, repNodeOfTy(TY_STR), TY_STR) }
   if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
   // A read of a record held at another row's record is that row's, as `mapReadStoredRep`.
   if stTy >= 0 { return irBLetTempTy(b, r, ix, repNodeOfTy(stTy), stTy) }
