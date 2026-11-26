@@ -581,6 +581,40 @@ function elabIsRowEntry(nm: string): boolean {
 // record: the read's rep stamp, which the walk's calls key their callees by. Empty outside a walk.
 let elabWalkReadRows: {[i32]: i32} = Map()
 
+// Per key minted from the walk of a key whose declaration encloses its own, that key's delivered
+// parameters and rows, `[param, row, ...]`: a nested lambda's captures read them (D17574).
+let elabInheritRows: {[i32]: i32[]} = Map()
+
+// The parameters key `k`'s body reads delivered at another record and their rows, `[param, row,
+// ...]`: its declaration's own (`#r.<i>`), then those its encloser's walk handed it.
+function elabRowPairsOf(k: i32): i32[] {
+  const out: i32[] = []
+  const kd = if k >= 0 && k < ekDecl.length { nodeAt(ekDecl[k]) } else { null }
+  let i = 0
+  while kd is FuncDecl && i < kd.fnParams.length {
+    const r = elabKeyRowAt(k, i)
+    if r >= 0 {
+      out.push(kd.fnParams[i])
+      out.push(r)
+    }
+    i = i + 1
+  }
+  for x in elabInheritRows[k] ?? [] { out.push(x) }
+  return out
+}
+
+// Whether declaration `d` is nested, at any depth, in declaration `e`.
+function elabDeclNestedIn(d: i32, e: i32): boolean {
+  const seen: i32[] = []
+  let x = elabEncl.get(d) ?? -1
+  while x >= 0 && !i32ListHas(seen, x) {
+    if x == e { return true }
+    seen.push(x)
+    x = elabEncl.get(x) ?? -1
+  }
+  return false
+}
+
 // The record a call argument `i` of call `call` is delivered at: the record the checker rebuilds
 // it at (`recRebuiltLeafRow`), or the row a read of a delivered parameter is stamped at in the
 // walk (D17574); -1 for none, for another binding (D15172's answer) and for a literal, whose built
@@ -1791,6 +1825,10 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   kids.push(k)
   ekKids[kk] = kids
   if elabRunDone && !elabSpecChecking { elabLateNames.push(elabLateName(decl)) }
+  if from >= 0 && from < ekDecl.length && elabDeclNestedIn(decl, ekDecl[from]) {
+    const inh = elabRowPairsOf(from)
+    if inh.length > 0 { elabInheritRows[k] = inh }
+  }
   ekByDeclNote(decl, k)
   ekDecl.push(decl)
   ekNames.push(fn)
@@ -3349,15 +3387,14 @@ function elabReadRowsStamp(k: i32) {
   let kk = k
   while kk >= 0 && kk < ekDecl.length && !i32ListHas(seen, kk) {
     seen.push(kk)
-    const kd = nodeAt(ekDecl[kk])
+    const pr = elabRowPairsOf(kk)
     let i = 0
-    while kd is FuncDecl && i < kd.fnParams.length {
-      const r = elabKeyRowAt(kk, i)
-      if r >= 0 && !i32ListHas(ps, kd.fnParams[i]) {
-        ps.push(kd.fnParams[i])
-        rows.push(r)
+    while i + 1 < pr.length {
+      if !i32ListHas(ps, pr[i]) {
+        ps.push(pr[i])
+        rows.push(pr[i + 1])
       }
-      i = i + 1
+      i = i + 2
     }
     kk = if kk < ekParent.length { ekParent[kk] } else { -1 }
   }
