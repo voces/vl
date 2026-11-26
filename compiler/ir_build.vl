@@ -880,6 +880,7 @@ import {
   stmtIsTailValue,
   structIndexOfExpr,
   structIndexOfObjCtx,
+  topLambdaRecordFe,
 } from "./emit_classify"
 import {
   declaredSlotOf,
@@ -4101,7 +4102,7 @@ export function irBDeclVar(d: i32): i32 {
     irBMiss("local rep " + repWhat(rep))
     return -1
   }
-  if irTyHeldOpen(ty, rep) {
+  if irTyHeldOpen(ty, rep) && !irFnBuiltOnce(ib) {
     irBMiss("open local type")
     return -1
   }
@@ -4214,7 +4215,7 @@ function fragLoopVar(d: i32, ix: i32, rep: i32): i32 {
   const known = ibDeclVar[d] ?? -1
   if known >= 0 { return known }
   const ty = heldTy(exprTyOf(ix))
-  if irTyHeldOpen(ty, rep) {
+  if irTyHeldOpen(ty, rep) && !irFnBuiltOnce(ib) {
     irBMiss("open local type")
     return -1
   }
@@ -5385,10 +5386,11 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && cn.rnDisc == 4
       && cn.rnInner == rep
       && nullNarrowArmOf(ix, cellRep, rep) == "plain"
-    const narrowed = boxCore
-      || cellRep != rep
-      && globalCellKind(d) != "union"
-      && nullNarrowArmOf(ix, cellRep, rep) == "plain"
+    const nna = if cellRep != rep && globalCellKind(d) != "union" { nullNarrowArmOf(ix, cellRep, rep) } else { "none" }
+    // A read whose type keeps the null its narrowing removed (`held`) is typed at the recovered
+    // read's type, as a local's is (`narrowedLocalRead`).
+    const heldNarrow = nna == "held"
+    const narrowed = boxCore || nna == "plain" || heldNarrow
     // In a build whose initializer stored the cell at its storage row (`globalInitValue`), a read
     // the checker typed at the binding reads the cell as it is, at that row.
     const stored = cellRep != rep
@@ -5480,6 +5482,16 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     ) {
       return globalStoredRead(b, g, ix, cellRep, heldTy(letBindTy(d, -1)))
     }
+    // A read typed `null` of a nullable reference cell (a name read before its binding's type is
+    // known) is the cell as it stands, which a null test reads as legacy does.
+    if (
+      declined
+      && repPrim(rep) == "null"
+      && refNullable(cellRep)
+      && repNodeOfTy(heldTy(letBindTy(d, -1))) == cellRep
+    ) {
+      return globalStoredRead(b, g, ix, cellRep, heldTy(letBindTy(d, -1)))
+    }
     // A struct cell read at a record its row holds is read at that row.
     const rowRt = if declined { globalCellRowReadTy(ix, d, cellRep, rep) } else { -1 }
     if rowRt >= 0 { return globalStoredRead(b, g, ix, cellRep, rowRt) }
@@ -5520,6 +5532,15 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     }
     if member { return irBLetTempTy(b, gr, ix, cellRep, gh) }
     if strHeld { return irBLetTempTy(b, gr, ix, cellRep, TY_STR) }
+    if heldNarrow {
+      return irBLetTempTy(
+        b,
+        gr,
+        ix,
+        rep,
+        recoveredReadTyOf(heldTy(exprTyOf(ix))),
+      )
+    }
     noteCellHeap(d, rep)
     return irBLetTempTy(b, gr, ix, rep, globalReadTy(d, ix, rep))
   }
@@ -5629,14 +5650,18 @@ function globalCellRowReadTy(ix: i32, d: i32, cellRep: i32, rep: i32): i32 {
   if globalCellKind(d) != "struct" || row < 0 || row >= sTyIx.length {
     return -1
   }
+  // A row type open only where its rep closes it (a function field of an un-annotated function,
+  // held as its id) is read at, as legacy's `global.get` reads that row.
   const rt = sTyIx[row]
-  if rt < 0 || irTyOpen(rt) || repNodeOfTy(rt) != cellRep { return -1 }
+  if rt < 0 || irTyHeldOpen(rt, cellRep) || repNodeOfTy(rt) != cellRep {
+    return -1
+  }
   const t = nodeTyAt(ix, ibFnIx)
   if t < 0 || repNodeOfTy(t) != rep || !(repNodeAt(rep) is RRecord) {
     return -1
   }
   if structIndexOfTy(t) == row { return rt }
-  return if rowlessStoredTy(t, rep, rt) == rt { rt } else { -1 }
+  return if rowlessRecord(t, rep) { rt } else { -1 }
 }
 
 // Read `ix` of global `g` as its cell stores it: rep `cellRep`, typed at `ty`, the
@@ -5672,6 +5697,9 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   ) {
     return nullUnitTemp(b, ix, rep, [])
   }
+  // A union-box capture narrowed to a closure's, list's or map's `A | null` (legacy's `niche`
+  // arm) is the box at its storage, then the niche read a box local's takes.
+  if arm == "niche" { return captureNicheRead(b, n, ix, rep) }
   const unbox = arm == "unbox"
   if !unbox && arm != "capture" { return irBMiss("read of " + n.identName) }
   const fe = fnStmtsPosOf(ibFnIx)
@@ -5758,6 +5786,29 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if boxed { return irBLetTemp(b, { sgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
+}
+
+// Read `ix` of capture `n`, a union box narrowed to a niche-repped `A | null`, at `rep`: the box
+// as the capture holds it, then the niche read (`RNicheRead`), as `emitNarrowedNicheRead` writes.
+function captureNicheRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
+  const fe = fnStmtsPosOf(ibFnIx)
+  const cr = capRepOf(fe, n.identName)
+  if cr < 0 || !heldAsBox(cr) { return irBMiss("capture niche cell") }
+  const nk = nicheReadKindAt(ix, ibFnIx)
+  if nk != 1 && nk != 2 && nicheReadRefOf(ix, ibFnIx) == "" {
+    return irBMiss("capture niche kind")
+  }
+  const ct = capTyOf(fe, n.identName)
+  const o = capturedAsHeld(
+    b,
+    fe,
+    n.identName,
+    ix,
+    cr,
+    if ct >= 0 && repNodeOfTy(ct) == cr { ct } else { repTyOf(cr) },
+  )
+  if ibMiss != "" { return o }
+  return irBLetTemp(b, { nrV: o, nrAt: ix, nrKind: nk, nrRow: false }, ix, rep)
 }
 
 // The type capture `name` of `fe`, held at rep `cr`, is held at where its read `ix` names a record
@@ -6635,7 +6686,20 @@ function globalStoreTy(d: i32, rep: i32): i32 {
   // A cell whose type has no rep (`openCellRep`) is stored at its rep's type.
   if globalTyRep(ht) < 0 && repTyOf(rep) >= 0 { return repTyOf(rep) }
   const rt = rowlessStoredTy(ht, repNodeOfTy(ht), repTyOf(rep))
-  return if rt >= 0 { rt } else { st }
+  if rt >= 0 { return rt }
+  // A rowless record held at a row whose type is open only where its rep closes it (a function
+  // field held as its id) is stored at that row, as `globalCellRowReadTy` reads it.
+  const ct = repTyOf(rep)
+  if (
+    ct >= 0
+    && rowlessRecord(ht, repNodeOfTy(ht))
+    && repNodeAt(rep) is RRecord
+    && repNodeOfTy(ht) != rep
+    && !irTyHeldOpen(ct, rep)
+  ) {
+    return ct
+  }
+  return st
 }
 
 // The rep a global held at type `ty` takes; -1 when it is no scalar.
@@ -6857,6 +6921,8 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     if !exprIsClosure(c.callFn, ibFnIx) && callResultMemberTy(rx, ibFnIx) >= 0 {
       return resultMemberCallRhs(b, c, ix, rx)
     }
+    // A call of a `const` lambda's returned record, at the member legacy picks after it.
+    if lambdaRecordCallOf(rx) { return resultMemberCallRhs(b, c, ix, rx) }
     return closureCallRhs(b, c, ix)
   }
   const d = identDeclOf(c.callFn)
@@ -7739,6 +7805,14 @@ function holderCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const f = irBLetTempTy(b, { bpV: v, bpAt: ix }, c.callFn, crep, pk.bpTy)
   if ibMiss != "" { return missRhs(ibMiss) }
   return closureCallAt(b, c, ix, key, f)
+}
+
+// Whether `rx` calls a `const` lambda returning a record of members (`topLambdaRecordFe`), whose
+// call `emitCallRef` follows with the member its use takes.
+function lambdaRecordCallOf(rx: i32): boolean {
+  if rx < 0 || rx >= P.nodes.length { return false }
+  const rn = nodeAt(rx)
+  return rn is Call && topLambdaRecordFe(unwrapParen(rn.callFn)) >= 0
 }
 
 // Call `ix` of the member closure that direct call `rx` picks from the bundle record it returns
@@ -18822,6 +18896,7 @@ function build(fnIx: i32, fnPos: i32): string {
     }
   }
   ibNoValue = if none { ib.irRetRep } else { -1 }
+  ib.irBuiltOnce = fnBuiltOnce(fn, fnIx)
   const pw = buildParams(fn, fnIx, true)
   if pw != "" { return pw }
   ib.irRetExtra = liftRetExtra(fnPos)
@@ -19070,6 +19145,16 @@ function paramFrameTy(p: i32, fnIx: i32): i32 {
   }
   const dt = repDescTy(repDescRet(vtKindOfParam(p), paramStructIdxOf(p), ""))
   return if dt >= 0 { dt } else { ty }
+}
+
+// Whether function `fn` (at `fnIx`) has one instance: no type parameter, every parameter's type
+// closed, and no environment, so nothing an instance binds can re-build it at another rep.
+function fnBuiltOnce(fn: FuncDecl, fnIx: i32): boolean {
+  if fn.fnTyParams.length > 0 || envSlotShift(fnIx) > 0 { return false }
+  for p in fn.fnParams {
+    if irTyOpen(paramHeldTy(p, fnIx)) { return false }
+  }
+  return true
 }
 
 // The variables of `fn`'s parameters, in legacy's slots past the environment; "" or the miss. A
