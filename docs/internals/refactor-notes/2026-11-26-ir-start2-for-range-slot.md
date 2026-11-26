@@ -20,3 +20,10 @@ Two mechanisms:
   armed shadow matched while the claimed build did not. At I8 the builder's ask is the only one.
 - `forRangeStmt`: a copy of the same loop (its declaration's variable on the slot) reuses the slot
   variables. Any other holder of the slot still refuses.
+
+The hazard before I8: a memo that legacy sets first. In shadow and fallback builds, legacy emits a
+function before the IR lowers it, so any emitter-side memo or region state the IR reads holds
+legacy's answer, computed at legacy's moment. The armed shadow then matches, while a claimed build
+(and the I8 build, where only the builder asks) reads whatever the builder's earlier question left.
+A state read the IR shares with legacy is answered at the IR's own moment or invalidated at the
+state change it depends on; a shadow match alone does not prove it.
