@@ -13271,3 +13271,14 @@ queues after family C. Design: `docs/internals/bundle-map-union-2026-11.md`.
 
 **Why.** Building stage 1 as a special case for maps that are only key-tested would have been
 thrown away by stage 2. Building the final storage first means stage 2 only reads.
+
+## A generic call's instance follows the rep its argument is built at (2026-11-26, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-26** (D17641). Where the elaboration builds an argument at a rep
+other than its checker type (D14812's rule that a list's records take the rep of the parameter they
+reach), the generic callee's instance is keyed at the elaboration's binding for the call, and the
+call's value is the instance's result type. Where it does not, the check key and the elaboration's
+key denote the same storage, and the check key stands. It is the rep-follows-storage rule, scoped by
+mechanism, not a pin for one shape. Making the elaboration's key the binding for every call is
+[D17574](docs/internals/inventory/D17574.md), queued after family C's C1. Inside an instance body an
+annotation naming the type parameter still reads the check's binding, so that rule cannot land alone.
