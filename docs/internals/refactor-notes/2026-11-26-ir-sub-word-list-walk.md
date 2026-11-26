@@ -9,7 +9,9 @@ both widen every packed element (`repSubWord`), the predicate the struct paths a
 **Verifier rule changed (rule 2, `SForIn`).** A list walk's variable is a local at the element
 rep, an i32 for any packed sub-word element (was: for a `u8` element only). Controls
 (`ir_selftest.vl`, graded by `tests/vl_ir_shadow_test.ts`): `walk-list-i16-into-i32` holds, and
-`walk-list-i16-into-i16` is refused; under the old rule the two answered the other way round.
+`walk-list-i16-into-i16` is refused; under the old rule the two answered the other way round. The controls need an `i16` list, so
+`ir_selftest.vl` imports `TY_I16`; the phase-state baseline records that one checker symbol
+(`cross` 23 → 24 for `check_types.vl`, `surface` 12 → 13 for `ir_selftest.vl`).
 
 **Reading** (census probe on master's fixpoint seed; regen-11 — 2 units):
 
