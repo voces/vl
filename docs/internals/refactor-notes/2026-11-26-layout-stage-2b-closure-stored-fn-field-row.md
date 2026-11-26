@@ -42,6 +42,13 @@ has no witness among these rows. `records/let-copy-of-fn-record-b4-closure.vl` n
 ## Measured
 
 Master's seed (`origin/master` at this branch's base) against this tree's.
+- **Armed census, tests/cases** (same programs on both seeds, the sweep among them):
+  - covered: 97,846 → 97,856;
+  - verified: 97,842 → 97,852;
+  - matched: 97,558 → 97,568;
+  - nothing rose but the base's own 5 rule-3 rows, on both arms, which #10335 cleared on master.
+- **Other checks:** `--claims` clean; regress: no runs lost; probes 281/282; live-sites 0.
+- **ir-identity --cases:** identical 8,359, differ 0; behaviour 142 same.
 - **Per program:** only gains, nothing newly missed.
   - Each `object field coercion` row is gone (8 rows over 6 programs, D17131's let-copy family):
     - `records/let-copy-of-fn-record-a-minimal.vl`, `-b3-hop2.vl`, `-d-let-src.vl`;
