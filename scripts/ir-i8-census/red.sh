@@ -8,7 +8,8 @@
 # the same tree. Rows: pop, program, first stub, unit, class, owner; a program with no census row
 # gets `-` for unit and class. A class is the miss with any `: detail` dropped, and every fallback
 # row is `claim fell back`; a `program:<path>` registry line overrides the class owner for that
-# program, and `program:<path>@<unit>` for that one unit. The summary line goes to stderr, with deltas against `--prev`.
+# program, `program:<path>@<unit>` for that one unit, and `fallback:<reason>` for a fallback whose
+# reason (after its last `emitProgram: `) it names. The summary line goes to stderr, with deltas against `--prev`.
 set -euo pipefail
 CEN=${1:?usage: red.sh <census-out> <sweep-out> [--sha <sha>] [--prev <red.tsv>]}
 SW=${2:?usage: red.sh <census-out> <sweep-out> [--sha <sha>] [--prev <red.tsv>]}
@@ -59,6 +60,9 @@ done < "$SW/failing.tsv"
   printf '# pop\tprogram\tfirst stub\tunit\tclass\towner\n'
   awk -F'\t' -v OFS='\t' '
     function cls(u, c) { if (u == "(fallback)") return "claim fell back"; sub(/: .*/, "", c); return c }
+    # A fallback is keyed by its reason too: the text after its last `emitProgram: `, else after
+    # `claim fell back: `, so the registry can route one reason apart from the class.
+    function why(c) { if (match(c, /.*emitProgram: /)) return substr(c, RLENGTH + 1); sub(/^claim fell back: /, "", c); return c }
     FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF >= 2) own[$1] = $2; next }
     FILENAME == ARGV[2] { r[$1] = r[$1] $2 "\t" $3 "\n"; next }
     {
@@ -68,7 +72,8 @@ done < "$SW/failing.tsv"
       for (i = 1; i < n; i++) {
         split(L[i], f, "\t"); k = cls(f[1], f[2])
         pu = "program:" p "@" f[1]
-        o = pu in own ? own[pu] : (("program:" p) in own ? own["program:" p] : (k in own ? own[k] : "unowned"))
+        w = (k == "claim fell back") ? "fallback:" why(f[2]) : ""
+        o = pu in own ? own[pu] : (("program:" p) in own ? own["program:" p] : ((w != "" && w in own) ? own[w] : (k in own ? own[k] : "unowned")))
         print $1, p, $3, f[1], f[2], o
       }
     }' "$OWNERS" "$T/unc" "$T/fail" | sort

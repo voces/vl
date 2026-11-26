@@ -76,7 +76,8 @@ Why: [evidence](docs/internals/working-rules-evidence.md#disk).
   deleted with its intent folded into a survivor.
 * **`scripts/gate.sh --fast` runs `tests/vl_ir_shadow_test.ts` on the tree's seed** (the full gate
   runs it in `ci-native`), so a stale IR shadow expectation reds before the queue; no lane runs it
-  by hand.
+  by hand. Its byte mismatches are informational: **byte identity is not a gate** (coordinator
+  ruling, 2026-11-26); behaviour parity is, through `ci-ir-identity` and ready-check's sweep.
 * **`scripts/gate.sh` runs the whole ladder and is the thing to run.** The full gate refuses inside
   `.claude/worktrees/` (override `GATE_IN_WORKTREE=1`) because the merge queue gates every PR;
   `--fast` runs anywhere. Fan-out caps: `GATE_MAX_PAR`, `GATE_MEM_BUDGET_MB`; WALL >> CPU in its
