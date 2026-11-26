@@ -131,9 +131,6 @@ The parts:
   `scripts/self-compile-ledger.txt` (fuel, commit, PR, mechanism); a baseline the ledger's last line
   does not name reds. The coordinator rules on a drift refresh; past **+3%** cumulative it first
   attributes the rise to PRs by measurement and names that in the line (`merge-queue.md` §Fuel drift).
-* **Self-compile IR misses are gated:** `vl run scripts/self-ir-misses.vl -- --check` against
-  `scripts/self-ir-misses-baseline.txt` (0): a compiler function the IR builder misses reds; cover
-  it. `--write-baseline` only lowers the count.
 * **Late demands are gated:** `vl run scripts/late-demands.vl -- --check` against
   `scripts/late-demands-baseline.txt`. A rise fails; a fall passes and is named, and the PR that
   earned it runs `--write-baseline`, **written from a FIXPOINT seed** (refresh until a second
