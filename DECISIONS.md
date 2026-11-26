@@ -13329,3 +13329,47 @@ built rep. Where the built rep is the argument's type, nothing changes. It is th
 rule, stated as an outcome, not a pin per upstream fact. Making the elaboration's key the binding for
 every call, instance bodies included, is [D17574](docs/internals/inventory/D17574.md), next in SOUND's queue, a clause-1 row in its grading list riding on it. Inside an instance body an
 annotation naming the type parameter still reads the check's binding, so that rule cannot land alone.
+
+## A record value names its struct row through `irVarRow`, and its rep is that row's (2026-11-26, coordinator ruling) — D17666
+
+**Ruled by the coordinator 2026-11-26.** A rep can be shared by types laid out at different struct
+rows, so a rep alone does not name a heap. A record value the builder produces at a known row
+(built at it, read off a field that targets it, an element of a list laid out at it) is noted on
+the function with that row (`irVarRowNote`), and one accessor answers it (`irVarRow`, `irOpRow`).
+The value's rep is the row's own, `rowRep(si)`: the rep of the type the row stores, its targeted
+record fields at their rows' stored types (`rowStoredTy`), and a nullable value takes the row of its
+inner record. The verifier holds the invariant (rule 3, `varRowsWhy`): the rep is the row's or its
+nullable, and a value also noted as built on a heap is on the row's. Where `rowRep` and the
+checker type's rep disagree, `rowRep` wins. Every builder read of a row's type goes through
+`rowStoredTy`.
+
+**Why.** Before it, the lowering found a field read's struct by the rep's canonical type, which
+names the wrong heap for a nested record laid out at another row (D17666's
+`[{ r: { f: inc0 }, s: { f: dbl } }]`). Producers (this accessor) and consumers (a place holding
+the value, COV-CALL's list, map and record places) are split so the place side builds on one
+answer; D17666 closes when both are in.
+
+## A maker's returned hole lambda held at two signatures is a record of its holders' signatures (2026-11-26, coordinator rulings)
+
+**Ruled by the coordinator 2026-11-26** (family C, `docs/internals/maker-bundle-record-2026-11.md`).
+A maker returning a hole lambda it creates, one call's value held and called at two signatures,
+returns D15144's record of one closure per signature, so every consumer that record already reaches
+is reused.
+
+1. **One record per maker, the union of its holders' signatures.** Instances are not split per
+   signature set: that would multiply instances per call shape.
+2. **All or nothing.** The maker converts only when every call of it is held at the record (a
+   holder or copy calling through it, a link, or a function returning the call whole to such a
+   holder). Otherwise it keeps today's lowering;
+   `tests/cases/closures/maker-lambda-mixed-holders-unconverted.vl` grades that fallback.
+3. **Slices.** C0 (D16819, #10281), C1 (holders, captures, `return_inferred`, globals: this),
+   C2 (containers, fields, `argument`), then D16079. Each is gated by
+   `maker-fresh-lambda-held-at-two-signatures.matrix.vl` with `--before`/`--after` and no runs →
+   not-runs.
+4. **The record is built in the IR only.** Legacy is deleted at I8, so it gets no return-site build;
+   a maker the IR then declines stays loud, and regress guards the corpus.
+
+**Why.** The read side (holder member picks, calls through, the record row) already exists for a
+bundle parameter returned whole. Only the producer was missing: the signature list from the
+callers' side, the lambda instanced at each signature under the maker's frame, and the `return`
+building the record.

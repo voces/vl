@@ -174,7 +174,10 @@ import {
   irGlobalRepOf,
   irGlobalStoreTyOf,
   irPushBodies,
+  irRowRepOf,
   irSigOf,
+  irVarHeapOf,
+  irVarRow,
   mapBoxReadsAt,
   mapKeyRep,
   mapNicheReadsAt,
@@ -199,6 +202,7 @@ import {
   repTyIsLoneStrLit,
   repTyOf,
 } from "./emit_rep"
+import { sHeapIdx } from "./emit_state"
 import {
   boxListRetag,
   cloHoleRetag,
@@ -1876,10 +1880,15 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if r.mgForm == 5 && dst >= 0 && !mapBoxReadsAt(mgRep, dst) {
         return fail(2, at, "a map read's union box yields no value of its map")
       }
-      // A scalar join boxes a scalar map value, so its read is a union's box (`mapScalarJoinOpen`).
+      // A scalar join boxes a scalar map value, so its read is a union's box (`mapScalarJoinOpen`);
+      // a scalar box's, the boxed `T | null` the same struct holds.
+      const dn = if dst >= 0 { repNodeAt(dst) } else { null }
+      const sjHeld = dn == null
+        || r.mgForm == 7 && dn is RBox
+        || r.mgForm == 8 && dn is RNullable && dn.rnDisc == 4
       if (
-        r.mgForm == 7
-        && (!repIsScalar(mapValOf(mgRep)) || dst >= 0 && !(repNodeAt(dst) is RBox))
+        (r.mgForm == 7 || r.mgForm == 8)
+        && (!repIsScalar(mapValOf(mgRep)) || !sjHeld)
       ) {
         return fail(
           2,
@@ -2441,8 +2450,10 @@ function coalNulRefWhy(n: SCoalBox): string {
     && ir is RMap
     && (on.rmVal == ir.rmVal
     || wv is RNullable && wv.rnInner == ir.rmVal)
-  if !boxed && !maps && or != opRep(n.cbL) && or != lr.rnInner {
-    return "a nullable-reference `??` yields neither the reference, its inner, a map whose value widens the inner's, nor a box"
+  // Its inner may be the result's twin as it stands: a list's, or a closure's apart in openness.
+  const twin = listRetag(lr.rnInner, or) || cloHoleRetag(vf, lr.rnInner, or)
+  if !boxed && !maps && !twin && or != opRep(n.cbL) && or != lr.rnInner {
+    return "a nullable-reference `??` yields neither the reference, its inner, its inner's twin, a map whose value widens the inner's, nor a box"
   }
   return ""
 }
@@ -3754,6 +3765,43 @@ export function u8sSame(a: u8[], b: u8[]): boolean {
   return true
 }
 
+// The first variable noted at a struct row (`irVarRow`) whose rep is not that row's rep or its
+// nullable, or that is built on another heap (`irVarHeapOf`) than the row's; "" when none is. A
+// rep can be shared by rows on different heaps, so the row, not the rep, names the heap.
+function varRowsWhy(f: IrFn): string {
+  let v = 0
+  while v < f.irVars.length {
+    const row = irVarRow(f, v)
+    if row >= 0 {
+      const r = f.irVars[v].vRep
+      const n = repNodeAt(r)
+      const inner = if n is RNullable { n.rnInner } else { r }
+      const rr = irRowRepOf(f, row)
+      if rr < 0 || inner != rr {
+        return "v"
+          + i32ToStr(v)
+          + "'s rep is not struct row "
+          + i32ToStr(row)
+          + "'s"
+      }
+      const h = irVarHeapOf(f, v)
+      if (
+        row >= sHeapIdx.length
+        || h >= sHeapIdx.length
+        || h >= 0 && sHeapIdx[h] != sHeapIdx[row]
+      ) {
+        return "v"
+          + i32ToStr(v)
+          + " is built on another heap than struct row "
+          + i32ToStr(row)
+          + "'s"
+      }
+    }
+    v = v + 1
+  }
+  return ""
+}
+
 // Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
 export function irVerify(f: IrFn): IrVerdict {
   vf = f
@@ -3820,6 +3868,10 @@ export function irVerify(f: IrFn): IrVerdict {
       -1,
       "the result's rep is " + repWhat(f.irRetRep) + ", not a closed rep",
     )
+  }
+  if vfRule == 0 {
+    const rw = varRowsWhy(f)
+    if rw != "" { fail(3, -1, rw) }
   }
   let prev = -1
   for id in f.irBody {

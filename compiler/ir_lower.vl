@@ -319,6 +319,8 @@ import {
   irPushRecvAt,
   irRhsOpnds,
   irSigOf,
+  irVarHeapOf,
+  irVarRow,
   numConvSrcOf,
   primOpcode,
   recHeapOf,
@@ -2995,6 +2997,14 @@ function getField(r: RGetField) {
   const m = nodeAt(r.gfAt)
   if !(m is Member) { return irLMiss("field node") }
   if r.gfShared { return sharedField(r, m) }
+  // A plain struct read takes its row and field index off its receiver's rep, as the shared row
+  // tables lay that rep out; legacy's arms answer only a receiver no struct row records.
+  const rsi = recvStructRow(r.gfV, m.memProp)
+  const ridx = if rsi >= 0 { sFieldIndex(rsi, m.memProp) } else { -1 }
+  if ridx >= 0 && !r.gfStored && !memberBoxReadAt(r.gfAt, lw.irAt) {
+    irLOpnd(r.gfV)
+    return structFieldRead(rsi, ridx, r.gfAt)
+  }
   // A read the builder built at its storage has its shape there.
   const sm = if r.gfStored { storageReadEnter(r.gfAt) } else { storageReadEnter(-1) }
   const fi = fieldIdxAt(r.gfAt, m)
@@ -3015,9 +3025,31 @@ function getField(r: RGetField) {
   // A read the builder built at its storage (an `is` receiver's) is lowered at it too.
   if !r.gfStored { return fieldTail(r.gfAt, m) }
   const mark = storageReadEnter(r.gfAt)
-  const rs = fieldTail(r.gfAt, m)
+  const rs = fieldTailAt(r.gfAt, m, true)
   storageReadLeave(mark)
   return rs
+}
+
+// The struct row receiver `v` is laid out at (`irVarRow`, else the row a struct literal's temp is
+// built at, `irVarHeapOf`), where that row holds field `name`; else -1.
+function recvStructRow(v: Opnd, name: string): i32 {
+  if !(v is OVar) || v.ov < 0 { return -1 }
+  const n = repNodeAt(opRepOf(v))
+  if !(n is RRecord) || n.rrVariant { return -1 }
+  const vr = irVarRow(lw, v.ov)
+  const row = if vr >= 0 { vr } else { irVarHeapOf(lw, v.ov) }
+  return if row >= 0 && sFieldIndex(row, name) >= 0 { row } else { -1 }
+}
+
+// Struct row `si`'s field `idx` read off the receiver on the stack, then its recovers and unbox, as
+// `fieldTail`'s struct arm writes them.
+function structFieldRead(si: i32, idx: i32, at: i32) {
+  const fnIx = lw.irAt
+  if memRecvOwesNonNull(at, fnIx) { fbRefAsNonNull() }
+  structFieldTail(si, idx, at, fnIx)
+  if structUnionBoxTail(si, idx, at, fnIx) < 0 { return irLMiss("field unbox") }
+  if readOwesNonNullRecover(at, fnIx) { fbRefAsNonNull() }
+  return 0
 }
 
 // A shared template member's read (`gfShared`): the record, then the field at its storage, as
@@ -3067,7 +3099,11 @@ function structFieldPlainOrAt(at: i32, fnIx: i32): i32 {
 }
 
 // After a plain field read's object: the field, and the read's recovery.
-function fieldTail(at: i32, m: Member) {
+function fieldTail(at: i32, m: Member) { return fieldTailAt(at, m, false) }
+
+// `fieldTail`, or under `stored` the field's own slot: a union box read at its storage is that
+// box, which no narrowing of the read (a write's included) unboxes.
+function fieldTailAt(at: i32, m: Member, stored: boolean) {
   const fnIx = lw.irAt
   const vi = exprVariantIndex(m.memObj, fnIx)
   const sf = if vi < 0 { structFieldPlainOrAt(at, fnIx) } else { -1 }
@@ -3080,14 +3116,14 @@ function fieldTail(at: i32, m: Member) {
     variantFieldTail(nvi, idx, at, fnIx)
   } else if vi >= 0 {
     variantFieldTail(vi, idx, at, fnIx)
-    if variantUnionBoxTail(vi, idx, at, fnIx) < 0 {
+    if !stored && variantUnionBoxTail(vi, idx, at, fnIx) < 0 {
       return irLMiss("field unbox")
     }
   } else {
     const si = structIndexOfExpr(m.memObj, fnIx)
     if memRecvOwesNonNull(at, fnIx) { fbRefAsNonNull() }
     structFieldTail(si, idx, at, fnIx)
-    if structUnionBoxTail(si, idx, at, fnIx) < 0 {
+    if !stored && structUnionBoxTail(si, idx, at, fnIx) < 0 {
       return irLMiss("field unbox")
     }
   }
@@ -4238,6 +4274,21 @@ function mapGetOr(r: RMapGetOr) {
     fbEnd()
     return 0
   }
+  // The scalar box: the same head, its miss arm the default delivered into `T | null`.
+  if r.mgForm == 8 {
+    const rk8 = coalResultKindOf(r.mgAt, fnIx)
+    if mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk8) != "scalarBox" {
+      return irLMiss("map read route")
+    }
+    if r.mgSym >= 0 && userGlobalReadClass(r.mgSym, lwGlobalCtx) != "plain" {
+      return irLMiss("map read of a global not read plainly")
+    }
+    mapProbeHead(rd.idxArr, r.mgSym, r.mgNonNull, r.mgLoc, r.mgKey)
+    mapScalarJoinOpen(mapRecvScalarBoxKindIn(rd.idxArr, fnIx))
+    irLOpnd(r.mgDef)
+    fbEnd()
+    return 0
+  }
   const rk = coalResultKindOf(r.mgAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
   const want = mapGetOrFormArm(r.mgForm, arm)
@@ -5274,6 +5325,7 @@ function boxOp(r: RToBox) {
     || p.hbArm == "rec"
     || p.hbArm == "obj"
     || p.hbArm == "refList"
+    || p.hbArm == "armLit"
     || p.hbArm == "map"
     || p.hbArm == "nulMap"
     || p.hbArm == "clo"
@@ -5287,7 +5339,9 @@ function boxOp(r: RToBox) {
   } else {
     irLSkip(r.bxV)
   }
-  if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
+  if p.hbArm == "atom" && p.hbSrc >= 0 {
+    numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx)
+  }
   if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
   return holeBoxTail(p, r.bxAt, fnIx)
 }
@@ -5316,7 +5370,9 @@ function boxLate(r: RToBox, p: HoleBox) {
     return irLMiss("box of a valued if at plan " + p.hbArm)
   }
   irLOpnd(r.bxV)
-  if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
+  if p.hbArm == "atom" && p.hbSrc >= 0 {
+    numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx)
+  }
   if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
   if p.hbArm == "atom" || p.hbArm == "atomList" { atomPayloadTail(p.hbKind) }
   const any: u8[] = [VT_ANYREF]
