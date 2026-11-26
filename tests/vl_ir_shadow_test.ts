@@ -613,26 +613,20 @@ function greet(a: boolean, xs: i32[]): i32 {
   return [...xs, if a { 1 } else { 2 }].length
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function use(r) {
-  if r != null { print(r + 1) }
-}
-function fi(k: i32, a: f64, b: i32) {
-  const j = if k == 0 { a } else if k == 1 { b } else { null }
-  use(j)
-}
-function ii(k: i32, a: i32, b: f64) {
-  use(if k == 0 { a } else if k == 1 { b } else { null })
+function run(c: boolean) {
+  let f = (a) => a + 1
+  if c { f = (_a) => "s" }
+  print(f(3))
 }
 print(greet(true, [1]))
 print(ap((x: i32) => x + 1))
-fi(0, 2.5, 7)
-ii(1, 7, 2.5)
+run(true)
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    for (const why of ["box ladder"]) {
+    for (const why of ["tag dispatch arm coercion"]) {
       if (!rows.has(`uncovered ${why}`)) {
         throw new Error(`want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
       }
