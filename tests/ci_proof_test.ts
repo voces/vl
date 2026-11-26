@@ -40,7 +40,6 @@ const LOCAL: Record<string, string> = {
   "distilled corpus":
     "ci-distilled runs its runs-lost check; on master gate.sh adds --verify-fresh",
   "ir shadow": "no ci.yml job runs the IR shadow over the distilled corpus",
-  "ir shadow cases": "no ci.yml job runs the IR shadow over tests/cases",
   "ir claims":
     "no ci.yml job runs the shipped IR claim over the distilled corpus",
   "ir claim refusals":
@@ -99,6 +98,9 @@ const CI_RUNS: Record<string, string[]> = {
   "rep-fuzz": ["run: bash scripts/rep-fuzz-check.sh"],
   "splice scan": [
     "vl run scripts/inventory/splice-scan.vl --compiler build/vl-compiler.wasm -- --self-test",
+  ],
+  "ir shadow cases": [
+    "vl run scripts/silent-sweep/distilled/ir-shadow.vl --compiler build/vl-compiler.wasm -- --seed build/vl-compiler.wasm --cases --prepost",
   ],
 };
 
