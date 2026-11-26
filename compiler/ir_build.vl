@@ -1,3 +1,4 @@
+import { recBuildElemTyOf } from "./check_rec_rows"
 import { nullableRecordTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import { printPlanPinNull } from "./emit_union_registry"
 import {
@@ -5796,6 +5797,16 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     // A struct cell read at a record its row holds is read at that row.
     const rowRt = if declined { globalCellRowReadTy(ix, d, cellRep, rep) } else { -1 }
     if rowRt >= 0 { return globalStoredRead(b, g, ix, cellRep, rowRt) }
+    // A nullable record cell held at a row its narrowed read's record does not record reads past
+    // its null at that row, as a local's does (`storedPastNullTy`).
+    const pn = if declined { globalStoredPastNullTy(ix, d, cellRep, rep) } else { -1 }
+    if pn >= 0 {
+      const o = globalStoredRead(b, g, ix, cellRep, heldTy(letBindTy(d, -1)))
+      if ibMiss != "" { return o }
+      const rc: Rhs = { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) }
+      ib.irReadAgain[ix] = rc
+      return irBLetTempTy(b, rc, ix, repNodeOfTy(pn), pn)
+    }
     if declined { return irBMiss("global read coercion") }
     if stored {
       return globalStoredRead(b, g, ix, cellRep, heldTy(letBindTy(d, -1)))
@@ -20057,6 +20068,28 @@ function storedPastNullTy(ix: i32, v: i32, rep: i32): i32 {
   return if repNodeOfTy(heldTy(exprTyOf(ix))) == rep { st } else { -1 }
 }
 
+// `storedPastNullTy` for read `ix` of global `d`, whose cell is at rep `cellRep`.
+function globalStoredPastNullTy(ix: i32, d: i32, cellRep: i32, rep: i32): i32 {
+  const vn = repNodeAt(cellRep)
+  if (
+    !(vn is RNullable)
+    || vn.rnDisc != 1
+    || vn.rnInner == rep
+    || !(repNodeAt(rep) is RRecord)
+  ) {
+    return -1
+  }
+  const st = recoveredReadTyOf(heldTy(letBindTy(d, -1)))
+  if (
+    st < 0
+    || repNodeOfTy(st) != vn.rnInner
+    || rowlessReadTyAt(nodeTyAt(ix, ibFnIx), st) != st
+  ) {
+    return -1
+  }
+  return if repNodeOfTy(heldTy(exprTyOf(ix))) == rep { st } else { -1 }
+}
+
 // `boundRowlessReadTy` for read `u` of variable `v`, which any local read names, a loop's own.
 function rowlessReadTyOfVar(u: i32, v: i32): i32 {
   if v < 0 { return -1 }
@@ -21404,11 +21437,12 @@ function mapNewInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   return irBLetTemp(b, { mnAt: ix }, ix, nr)
 }
 
-// The map type global `gst`'s `Map()` cell is held at where its slot stores another value record
-// than its type's (`slotMapHeldTyIn`), else -1.
+// The map type global `gst`'s `Map()` cell is held at where the checker builds its values at
+// another record (`recBuildElemTyOf`) and its slot stores that record (`slotMapHeldTyIn`), else -1.
 function globalSlotMapTy(gst: i32): i32 {
   const g = nodeAt(gst)
   if !(g is LetDecl) || g.letType >= 0 || !mapCtorOf(g.letInit) { return -1 }
+  if recBuildElemTyOf(gst) < 0 { return -1 }
   return slotMapHeldTyIn(gst, heldTy(scopeTyAt(gst, -1)), -1)
 }
 
