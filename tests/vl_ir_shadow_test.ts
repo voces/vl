@@ -3319,17 +3319,17 @@ Deno.test({
   ignore,
   fn: () => {
     const src = Deno.readTextFileSync(
-      new URL("./cases/closures/captured-hole-fn-handed-on-two-generics.vl", import.meta.url),
+      new URL("./cases/closures/hole-fn-list-named-callback.vl", import.meta.url),
     );
     const one = run(src, 1);
     const detail = run(src, 2);
     const plain = run(src, 0);
     const rows1 = [...one.rows.keys()];
-    if (rows1.some((k) => k.startsWith("detail ")) || one.rows.get("uncovered rep unsup") !== 1) {
-      throw new Error(`want mode 1's one \`uncovered rep unsup\` and no detail row, got ${JSON.stringify([...one.rows])}`);
+    if (rows1.some((k) => k.startsWith("detail ")) || one.rows.get("start uncovered rep unsup") !== 1) {
+      throw new Error(`want mode 1's one \`start uncovered rep unsup\` and no detail row, got ${JSON.stringify([...one.rows])}`);
     }
-    if (detail.rows.get("detail rep unsup of call in viaReturn$1") !== 1) {
-      throw new Error(`want the detail row naming the call node in viaReturn$1, got ${JSON.stringify([...detail.rows])}`);
+    if (detail.rows.get("detail rep unsup of index in @start") !== 1) {
+      throw new Error(`want the detail row naming the index node in @start, got ${JSON.stringify([...detail.rows])}`);
     }
     if (one.out.length !== plain.out.length || one.out.some((b, i) => b !== plain.out[i])) {
       throw new Error("want the armed shadow's module byte-identical to the unarmed one");
