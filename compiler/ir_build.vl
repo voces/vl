@@ -8303,7 +8303,7 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
       && closureParamRep(f, i) >= 0
       && repNodeAt(closureParamRep(f, i)) is RAtom { closureParamRep(f, i) } else { -1 }
     const a0 = if wt >= 0 { deliver(b, c.callArgs[i], repNodeOfTy(wt), wt) } else if bx >= 0
-      && (!asIs || nodeAt(unwrapParen(c.callArgs[i])) is NullLit || arm == "atom") { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else if arm == "atomToStr" { closureArgAtomStr(b, c.callArgs[i], f, i) } else if nl >= 0 { deliver(b, c.callArgs[i], nl, -1) } else if ah >= 0 { deliver(b, c.callArgs[i], ah, -1) } else { irBExpr(b, c.callArgs[i]) }
+      && (!asIs || nodeAt(unwrapParen(c.callArgs[i])) is NullLit || arm == "atom") { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else if arm == "atomToStr" { closureArgAtomStr(b, c.callArgs[i], f, i) } else if nl >= 0 { deliver(b, c.callArgs[i], nl, -1) } else if ah >= 0 { deliver(b, c.callArgs[i], ah, -1) } else { builtAt(b, c.callArgs[i], closureParamRep(f, i), -1) }
     if ibMiss != "" { return missRhs("argument") }
     // A hole-typed argument (a captured un-annotated parameter) is written as its slot holds it,
     // converted to the scalar the key's parameter names, as legacy's general arm writes it.
@@ -10897,6 +10897,30 @@ function recordRepOrNull(r: i32): boolean {
   return n is RRecord || n is RNullable && repNodeAt(n.rnInner) is RRecord
 }
 
+// Value `ix` for a slot at rep `dst`: built there where it is fresh (`freshAt`), else as built.
+function builtAt(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
+  const fv = if dst >= 0 { freshAt(b, ix, dst, dstTy) } else { null }
+  if fv != null { return fv }
+  return irBExpr(b, ix)
+}
+
+// Fresh value `ix` built at destination rep `dst` (type `dstTy`, or `dst`'s own): an object literal
+// at the destination record's struct row, each field delivered at its kid. Null where `ix` is not
+// fresh, already at `dst`, or `dst` is no plain record with a row.
+function freshAt(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd | null {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is ObjLit) { return null }
+  if objLitArmOf(u, ibFnIx) != "struct" || exprRepOf(u) == dst { return null }
+  const d = repNodeAt(dst)
+  if !(d is RRecord) || d.rrVariant { return null }
+  const ty = if dstTy >= 0 { dstTy } else { repTyOf(dst) }
+  if ty < 0 || irTyOpen(ty) || repNodeOfTy(ty) != dst { return null }
+  const own = structIndexOfTy(ty)
+  const row = if own >= 0 { own } else { structRowOfRecordTy(ty) }
+  if row < 0 || exprPrePathWhy(u, ibFnIx) != "" { return null }
+  return objLitAt(b, u, dst, ty, row, false)
+}
+
 // The value of `ix` delivered at rep `dst`: as built, or widened where legacy widens it, through
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
@@ -10905,6 +10929,11 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // writes no conversion after it.
   if ibMiss == "" && dst >= 0 && exprReadsDeadNever(ix, ibFnIx) {
     return deadNeverTemp(b, ix, dst)
+  }
+  // A fresh value is built at its destination (`freshAt`), so it needs no conversion.
+  if ibMiss == "" && dst >= 0 {
+    const fv = freshAt(b, ix, dst, dstTy)
+    if fv != null { return fv }
   }
   // A `??` whose own type has no rep (a link legacy mints) is built at the destination's rep, as
   // legacy writes it at the kind its consumer asks.
