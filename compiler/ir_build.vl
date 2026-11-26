@@ -12,9 +12,8 @@ import {
   optRecvHoleTyped,
   spreadGroupConverts,
 } from "./wasmEmit"
-import { luElemTy } from "./check_relate_core"
 import { lmForUnionArms } from "./emit_classify"
-import { mapUnionForKnownArm } from "./wasmEmit"
+import { mapUnionForKnownArm, mapUnionForPairTy } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import {
   litAtomMark,
@@ -18027,13 +18026,10 @@ function slotMapWalkValTy(mr: i32, er: i32): i32 {
   return if vt >= 0 && repNodeOfTy(vt) != er && repNodeAt(repNodeOfTy(vt)) is RRecord { vt } else { -1 }
 }
 
-// While a union of maps' arm walk builds (`forInMapUnion`): the value union its pair's value is
-// boxed into, or -1.
-let ibWalkPairTy = -1
-
 // A walk of a union of maps' box (`emitMapUnionFor`): per arm, the walk built over the arm's
 // payload variable, the iterable read as it and typed at the arm (`SArmWrite`).
 function forInMapUnion(b: i32[], n: ForIn, ix: i32) {
+  if ibArmRecvVar >= 0 { return skip("for in map union nested") }
   const arms = lmForUnionArms(n.fiIter, ibFnIx)
   if mapUnionForKnownArm(n.fiIter) >= 0 {
     return skip("for in map union known arm")
@@ -18051,12 +18047,9 @@ function forInMapUnion(b: i32[], n: ForIn, ix: i32) {
   ) {
     return skip("for in map union receiver")
   }
-  const pairTy = if n.fiVar2 != "" { luElemTy(arms) } else { -1 }
+  const pairTy = if n.fiVar2 != "" { mapUnionForPairTy(arms) } else { -1 }
   const bodies: i32[][] = []
   const vars: i32[] = []
-  const outerIx = ibArmRecvIx
-  const outerVar = ibArmRecvVar
-  const outerPair = ibWalkPairTy
   for m in arms {
     const pr = repNodeOfTy(m)
     if pr < 0 { return skip("for in map union arm") }
@@ -18066,11 +18059,9 @@ function forInMapUnion(b: i32[], n: ForIn, ix: i32) {
     readRepMemoAdvance()
     ibArmRecvIx = recv
     ibArmRecvVar = pv
-    ibWalkPairTy = pairTy
-    forInStmt(ab, n, ix)
-    ibArmRecvIx = outerIx
-    ibArmRecvVar = outerVar
-    ibWalkPairTy = outerPair
+    forInStmtAt(ab, n, ix, true, pairTy)
+    ibArmRecvIx = -1
+    ibArmRecvVar = -1
     luOvLeave(mark)
     readRepMemoAdvance()
     if ibMiss != "" { return 0 }
@@ -18090,6 +18081,18 @@ function forInMapUnion(b: i32[], n: ForIn, ix: i32) {
 // A `for` statement along legacy's walk (`forInPlainWhy`, a hoisted one included): the list
 // once, its element variable at the declared slot, and the body. Every other walk is a named miss.
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
+  return forInStmtAt(b, n, ix, false, -1)
+}
+
+// `forInStmt`, inside a union of maps' arm walk when `walkArm`: its receiver read as the arm's
+// payload once, its pair's value named at value union `walkPair` (or -1) it is boxed into.
+function forInStmtAt(
+  b: i32[],
+  n: ForIn,
+  ix: i32,
+  walkArm: boolean,
+  walkPair: i32,
+) {
   if lmForUnionArms(n.fiIter, ibFnIx).length > 0 {
     return forInMapUnion(b, n, ix)
   }
@@ -18109,6 +18112,11 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
   const src = if mr >= 0 { mr } else { n.fiIter }
   const l = if g >= 0 { none } else { irBExpr(b, src) }
+  // An arm walk's body reads no receiver as the arm's payload; a walk nested in it may set its own.
+  if walkArm {
+    ibArmRecvIx = -1
+    ibArmRecvVar = -1
+  }
   if ibMiss != "" { return 0 }
   if mr >= 0 && g < 0 && !mapRecvRepOk(irBOpRep(l), mr) {
     return skip("for in map receiver rep")
@@ -18149,7 +18157,7 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   if n.fiVar2 != "" {
     // Inside a union of maps' arm walk the value is boxed into the value union the name holds.
     const pr = repNodeOfTy(
-      if ibWalkPairTy >= 0 { ibWalkPairTy } else { forInBindTy(readContainerTyAt(n.fiIter, ibFnIx), true) },
+      if walkPair >= 0 { walkPair } else { forInBindTy(readContainerTyAt(n.fiIter, ibFnIx), true) },
     )
     if mr < 0 && pr != repNodeOfTy(TY_I32) { return skip("for in pair rep") }
     v2 = irBLoopVar(n.fiDecl2, pr, repTyOf(pr))
