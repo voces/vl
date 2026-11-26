@@ -4654,6 +4654,14 @@ fn compile_vl_instance(
             set.call(&mut store, k.parse().unwrap_or(0))?;
         }
     }
+    // `$VL_IR_REQUIRE_CLAIM=1`: a function or start body the IR does not claim fails instead of
+    // lowering through legacy. Refused on an old seed, which would build legacy's bytes and pass.
+    if std::env::var("VL_IR_REQUIRE_CLAIM").is_ok_and(|v| !v.is_empty() && v != "0") {
+        let set = inst
+            .get_typed_func::<i32, i32>(&mut store, "setRequireClaim")
+            .map_err(|_| stale_seed_for("$VL_IR_REQUIRE_CLAIM", "setRequireClaim"))?;
+        set.call(&mut store, 1)?;
+    }
     if link.test_emit_refusal {
         let set = inst
             .get_typed_func::<i32, i32>(&mut store, "setTestEmitRefusal")
