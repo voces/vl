@@ -46,7 +46,7 @@ import {
 } from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
-import { sigKeyRetIsVoid } from "./emit_sig_tokens"
+import { sigKeyRetIsVoid, sigKeyRetKind } from "./emit_sig_tokens"
 import {
   litAliasTyOrSelf,
   monoBundleFe,
@@ -3540,6 +3540,11 @@ function openCallValue(b: i32[], n: Call, ix: i32): Opnd {
   }
   const rhs = callRhs(b, n, ix)
   if ibMiss != "" { return irBMiss("call") }
+  // A closure call is at the scalar its key's result names, as legacy's `call_ref` leaves it.
+  if rhs is RCallRef && !rhs.crNever && !rhs.crVoid {
+    const kr = keyScalarRep(sigKeyRetKind(callRefPlainKey(ix, ibFnIx)))
+    if kr >= 0 { return irBLetTempTy(b, rhs, ix, kr, repTyOf(kr)) }
+  }
   if !(rhs is RCall) || rhs.caNever { return repMissAt(ix, miss) }
   const si = irSigOf(ib, rhs.caCallee)
   const r = if si >= 0 { ib.irSigRet[si] } else { -1 }
@@ -3726,6 +3731,21 @@ export function exprTyOf(ix: i32): i32 {
   const v = boundVarOf(ix)
   if v >= 0 { return ib.irVars[v].vTy }
   return if t < 0 { capturedClosureTy(ix) } else { t }
+}
+
+// The element rep index `n`'s list holds closed (`closedListElemTy`), or -1.
+function openIndexRep(n: Index): i32 {
+  const et = closedListElemTy(exprTyOf(n.idxArr))
+  return if et >= 0 { repNodeOfTy(et) } else { -1 }
+}
+
+// The element type a list typed `lt` stores, closed, or -1.
+function closedListElemTy(lt: i32): i32 {
+  if lt < 0 { return -1 }
+  const ln = repNodeAt(repNodeOfTy(lt))
+  if !(ln is RList) { return -1 }
+  const et = repTyOf(ln.rlsElem)
+  return if et >= 0 && !irTyOpen(et) { et } else { -1 }
 }
 
 // Whether direct call `n` (node `ix`), typed `t`, is the bundle record its callee returns at that
@@ -8528,7 +8548,9 @@ function mapHasRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
   const sh = mapRecvShapeOf(recvIx, ibFnIx)
   if sh == -3 { return missRhs("map has value type") }
   const ka = mapKeyArmOf(recvIx, keyIx, ibFnIx, sh)
-  if ka != "plain" && ka != "i64" { return missRhs("map key " + ka) }
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return missRhs("map key " + ka)
+  }
   const rk = mapRecvKeyOf(b, recvIx, keyIx, "map has receiver", ka == "i64")
   if rk == null { return missRhs(ibMiss) }
   const r: Rhs = {
@@ -8547,7 +8569,9 @@ function mapDeleteRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
   const sh = mapRecvShapeOf(recvIx, ibFnIx)
   if sh == -3 { return missRhs("map delete value type") }
   const ka = mapKeyArmOf(recvIx, keyIx, ibFnIx, sh)
-  if ka != "plain" && ka != "i64" { return missRhs("map key " + ka) }
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return missRhs("map key " + ka)
+  }
   const rk = mapRecvKeyOf(b, recvIx, keyIx, "map delete receiver", ka == "i64")
   if rk == null { return missRhs(ibMiss) }
   const r: Rhs = {
@@ -9096,7 +9120,9 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
   const sh = mapRecvShapeOf(recv, ibFnIx)
   if sh == -3 { return skip("map store value type") }
   const ka = mapKeyArmOf(recv, key, ibFnIx, sh)
-  if ka != "plain" && ka != "i64" { return skip("map key " + ka) }
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return skip("map key " + ka)
+  }
   let valArm: MapSetValArm = "plain"
   if val >= 0 {
     if mapSetRefIntoMono(recv, val, ibFnIx) {
@@ -9122,6 +9148,7 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
       && arm != "union"
       && arm != "atomNull"
       && arm != "boolNull"
+      && arm != "atomStr"
     ) {
       return skip("map store value " + arm)
     }
@@ -9209,6 +9236,9 @@ function mapSetValue(
   ) {
     return deliver(b, val, mr.rmVal, -1)
   }
+  // An atom into a string-valued map is decoded to its member's string there, as a delivery
+  // decodes it (`atomToStr`).
+  if arm == "atomStr" && mr is RMap { return deliver(b, val, mr.rmVal, -1) }
   if (
     arm != "scalar"
     && arm != "union"
@@ -10867,11 +10897,12 @@ function boxTempIn(
   }
   // A `null` the builder delivers for a node that is no `null` literal (a binding's absent
   // initializer, an assignment of `null` used as a value) is the destination's null box, as legacy
-  // writes a bare `null`; a `null`-unit read that reads nothing is dropped (`nulReadDropped`).
+  // writes a bare `null`; a `null`-unit read that reads nothing is dropped (`nulReadDropped`),
+  // also where the plan's `null` arm finds that read in place of a `null` literal's immediate.
   if (
-    p.hbArm == "ladder"
+    (p.hbArm == "ladder" || p.hbArm == "null")
     && nullOwnRepFits(NULL_OWN_BOX, dst)
-    && (v is OImm && irBOpRep(v) == ibNoValue
+    && (v is OImm && irBOpRep(v) == ibNoValue && p.hbArm == "ladder"
       || repPrim(irBOpRep(v)) == "null" && nulReadDropped(b, v))
   ) {
     return repTemp(
@@ -11346,23 +11377,22 @@ function radixWideRead(b: i32[], v: Opnd): Opnd {
   return r.uwV
 }
 
-// The temp of a call that never returns, `v`, read at i32 and widened to `to` at node `ix`; a
-// never operand of another shape is a miss.
+// The temp of a call that never returns, `v`, read at i32 and widened to `to` at node `ix`; its
+// temp holds no value or the i32 legacy's never value takes. A never operand an inner operator
+// already widened goes on from its own width; one of another shape is a miss.
 function neverWidened(b: i32[], v: Opnd, ix: i32, to: i32): Opnd {
-  if ibMiss != "" { return v }
-  if (
-    !(v is OVar)
-    || v.ov < 0
-    || v.ov >= ib.irVars.length
-    || !repIsNoValue(irBOpRep(v))
-  ) {
+  if ibMiss != "" || irBOpRep(v) == to { return v }
+  if !(v is OVar) || v.ov < 0 || v.ov >= ib.irVars.length {
     return irBMiss("never operand not a call")
   }
   const i32r = repNodeOfTy(TY_I32)
-  ib.irVars[v.ov].vRep = i32r
+  const own = irBOpRep(v)
+  const src = if repIsNoValue(own) { i32r } else { own }
+  if numKindOf(src) < 0 { return irBMiss("never operand not a call") }
+  ib.irVars[v.ov].vRep = src
   const dk = numKindOf(to)
   const t = irVarNew(ib, to, repTyOf(to), "temp", -1)
-  const w: Rhs = { nwV: v, nwSrc: numKindOf(i32r), nwDst: dk, nwAt: ix }
+  const w: Rhs = { nwV: v, nwSrc: numKindOf(src), nwDst: dk, nwAt: ix }
   irBNode(b, { lDst: t, lRhs: w }, repTyOf(to), to, ix)
   const o: Opnd = { ov: t }
   return o
@@ -14402,7 +14432,9 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
     ibFnIx,
     mapRecvShapeOf(rd.idxArr, ibFnIx),
   )
-  if ka != "plain" && ka != "i64" { return irBMiss("map key " + ka) }
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return irBMiss("map key " + ka)
+  }
   const rp = repPrim(rep)
   const uk = if uq != null { uq.muWide } else { -1 }
   const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32"
@@ -14516,7 +14548,9 @@ function mapGetAt(
   const arm = mapGetArmOf(ix, ibFnIx)
   const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
   const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
-  if ka != "plain" && ka != "i64" { return irBMiss("map key " + ka) }
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return irBMiss("map key " + ka)
+  }
   const rk = mapRecvKeyOf(
     b,
     rd.idxArr,
@@ -14758,13 +14792,20 @@ function mapRecvKeyOf(
 
 // Map key `keyIx` of receiver `recvIx` as legacy writes it: at the `i64` an `i64`-keyed map holds
 // where `wide` (`emitScalarValue`), a key the atom hook converts at the receiver's atom key rep by
-// the hook's arm, else as itself.
+// the hook's arm, an atom key of a string-keyed map as its member text, else as itself.
 function mapKeyAt(b: i32[], recvIx: i32, keyIx: i32, wide: boolean): Opnd {
   if wide { return deliver(b, keyIx, repNodeOfTy(TY_I64), TY_I64) }
   if exprPrePathWhy(keyIx, ibFnIx) == "pre-path atom hook" {
     const kt = nodeMapKeyTyOf(unwrapParen(recvIx))
     const r = if kt >= 0 { repNodeOfTy(kt) } else { -1 }
     if r >= 0 && repNodeAt(r) is RAtom { return deliver(b, keyIx, r, kt) }
+  }
+  // An atom key of a string-keyed map is decoded to its member text (`mapKeyArmOf`'s `atom`).
+  if (
+    mapKeyArmOf(recvIx, keyIx, ibFnIx, mapRecvShapeOf(recvIx, ibFnIx))
+    == "atom"
+  ) {
+    return deliver(b, keyIx, repNodeOfTy(TY_STR), TY_STR)
   }
   return irBExpr(b, keyIx)
 }
@@ -15505,6 +15546,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   const ar = if own < 0 && n is ArrayLit { openArrLitRep(ix) } else { -1 }
   // A shared field read off a hole receiver is at its arms' one storage type (`ir_build_ref`).
   const mr = if own < 0 && !nv && n is Member { irOpenMemberRepHook(ix) } else { -1 }
+  // An element read whose own type has no rep (a hole function's result mapped into a list) is at
+  // the element rep of the list the IR holds closed.
+  const ir = if own < 0 && !nv && n is Index { openIndexRep(n) } else { -1 }
   // A `??` map read whose own type has no rep (a link legacy mints) is at the map's value rep,
   // where legacy's `mapGetOr` arm writes it.
   const cr = if own < 0 && !nv && pr < 0 && br < 0 { openCoalMapRep(ix) } else { -1 }
@@ -15516,7 +15560,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     && !nv
     && n is NullLit
     && nullOwnAt(ix, ibFnIx) == NULL_OWN_NONE
-  const rep = if un { repNodeOfNullUnit() } else if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else if xr >= 0 { xr } else { own }
+  const rep = if un { repNodeOfNullUnit() } else if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else if ir >= 0 { ir } else if xr >= 0 { xr } else { own }
   // A direct call whose own type has no rep is at its callee's result rep.
   if rep < 0 && n is Call && !nv { return openCallValue(b, n, ix) }
   // A desugared optional call's minted callee has no type: it is the field the plain `.f` call reads
@@ -16774,7 +16818,8 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
   const w = if d >= 0 { localIndexOf(ibFnIx, n.binLeft) } else { -1 }
   if w >= 0 {
     const lv = liftWriteVar(t.identName, w)
-    const v = if lv >= 0 { lv } else { irBDeclVar(d) }
+    // A parameter is written at its own variable, as a read of it reads it.
+    const v = if lv >= 0 { lv } else if nodeAt(d) is Param { paramVarAt(w) } else { irBDeclVar(d) }
     if v < 0 { return skip("assignment coercion") }
     // Legacy declares a `null` local storing an assignment of `null` apart from the IR's locals.
     if (
@@ -17035,8 +17080,12 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   const k0 = repRecordKidOf(r0, rt, t.memProp)
   if k0 < 0 { return skip("field kid") }
   // A receiver instanced at a stored row (D15827) is built at that row, whose field legacy's store
-  // writes, where its type reads the field at another rep.
-  const r = if fieldStoreRepFits(va, repNodeKids(r0)[k0]) { r0 } else { irBOpRep(v0) }
+  // writes, where its type reads the field at another rep; so is a receiver built at a record row
+  // other than its type's that holds the field at a rep the value fits.
+  const vRep = irBOpRep(v0)
+  const kv = if vRep != r0 && repNodeAt(vRep) is RRecord { repRecordKidOf(vRep, rt, t.memProp) } else { -1 }
+  const own = kv >= 0 && fieldStoreRepFits(va, repNodeKids(vRep)[kv])
+  const r = if own { vRep } else if fieldStoreRepFits(va, repNodeKids(r0)[k0]) { r0 } else { vRep }
   const k = if r == r0 { k0 } else if repNodeAt(r) is RRecord { repRecordKidOf(r, rt, t.memProp) } else { -1 }
   if k < 0 { return skip("field store row rep") }
   const dst = repNodeKids(r)[k]
@@ -17154,9 +17203,7 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   const g = if mr >= 0 { mapGlobalOf(mr) } else { -1 }
   // A global receiver is read as one, never as an operand; any other is built raw, as legacy's
   // stash writes it, at a map rep its shared recovery owns.
-  if mr >= 0 && g < 0 && mapRecvGlobalIx(mr, ibFnIx) >= 0 {
-    return skip("for in map receiver")
-  }
+
   const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
   const src = if mr >= 0 { mr } else { n.fiIter }
   const l = if g >= 0 { none } else { irBExpr(b, src) }
