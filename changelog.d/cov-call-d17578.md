@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR reads a captured hole parameter at the row its capture slot stores:** take a hole function keyed at a wider record's row, such as a parameter bound to `{ f: null }` with a later view at `J`. A closure capturing that parameter now reads it at the row legacy's capture slot is declared at, not at the parameter's checked type. Its calls into another hole function, a nested function's capture and field tests now build through the IR (D17578; the source parameter must be unannotated, since an annotated parameter's capture keeps its own type). A closure returning that capture is filed as D17676.
