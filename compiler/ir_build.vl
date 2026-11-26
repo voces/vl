@@ -2000,10 +2000,9 @@ function isEmptyFitArms(
 }
 
 // The variable a staged `is` receiver is read from while its rungs build (`isStagedTest`), or -1.
-// The right side an assignment used as a value captures (`asgCapture`), and what it captured.
-let ibAsgCapAt = -1
-let ibAsgCapDone = false
-let ibAsgCapOut: Opnd = { oiRep: -1, oiBits: 0 }
+// The right sides assignments used as values capture (`asgCapture`), and what each captured.
+let ibAsgCapWant: {[i32]: boolean} = Map()
+let ibAsgCapGot: {[i32]: Opnd} = Map()
 let ibStagedVar = -1
 
 // A receiver `emitIsTest` evaluates once into its stash before the rungs re-read it (D12060): the
@@ -10831,8 +10830,8 @@ function recordRepOrNull(r: i32): boolean {
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // A reference an assignment used as a value stores is captured at the rep its store holds it.
-  if ix == ibAsgCapAt && !asgCapBeforeStore(ix) {
-    ibAsgCapAt = -1
+  if (ibAsgCapWant[ix] ?? false) && !asgCapBeforeStore(ix) {
+    ibAsgCapWant.delete(ix)
     return asgStash(b, deliver(b, ix, dst, dstTy), ix)
   }
   // A value a dead `never` read feeds is legacy's `unreachable` at its consumer's rep, which
@@ -16090,7 +16089,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd { return exprAt(b, ix, false) }
 // The value of `ix`; `cell` where a delivery builds it, so a local read may take its cell's rep.
 function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
   if ibMiss != "" || ix < 0 { return irBMiss("no node") }
-  if ix == ibAsgCapAt { return asgCapture(b, ix, cell) }
+  if ibAsgCapWant[ix] ?? false { return asgCapture(b, ix, cell) }
   if ibStagedVar >= 0 && ix == isRecvStagedIx { return stagedRecvRead(ix) }
   if ibArmRecvVar >= 0 {
     if ix == ibArmRecvIx {
@@ -17474,20 +17473,14 @@ function assignValueHeld(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("assignment value target")
   }
   const at = unwrapParen(n.binRight)
-  const prevAt = ibAsgCapAt
-  const prevDone = ibAsgCapDone
-  const prevOut = ibAsgCapOut
-  ibAsgCapAt = at
-  ibAsgCapDone = false
+  ibAsgCapWant[at] = true
   assignTo(b, n, ix)
-  const done = ibAsgCapDone
-  const out = ibAsgCapOut
-  ibAsgCapAt = prevAt
-  ibAsgCapDone = prevDone
-  ibAsgCapOut = prevOut
+  ibAsgCapWant.delete(at)
+  const got = ibAsgCapGot[at] ?? null
+  ibAsgCapGot.delete(at)
   if ibMiss != "" { return irBMiss(ibMiss) }
   // A store that writes a literal without building its node yields that literal, built again.
-  const v = if done { out } else if scalarLitAt(at) { irBExpr(b, at) } else { irBMiss("assignment value built apart from its store") }
+  const v = if got != null { got } else if scalarLitAt(at) { irBExpr(b, at) } else { irBMiss("assignment value built apart from its store") }
   if ibMiss != "" { return v }
   return irConvert(b, v, rep, heldTy(nodeTyAt(ix, ibFnIx)), ix)
 }
@@ -17564,7 +17557,7 @@ function scalarLitAt(x: i32): boolean {
 // The value of the right side `x` an assignment used as a value is storing, built where its store
 // builds it and held in a local, which the assignment then yields (`assignValueGo`).
 function asgCapture(b: i32[], x: i32, cell: boolean): Opnd {
-  ibAsgCapAt = -1
+  ibAsgCapWant.delete(x)
   return asgStash(b, exprAt(b, x, cell), x)
 }
 
@@ -17579,30 +17572,29 @@ function asgCapBeforeStore(x: i32): boolean {
 function repDeclaresLocal(r: i32): boolean {
   const n = repNodeAt(r)
   if n == null { return false }
-  if repPrim(r) != null { return true }
-  if n is RNullable { return repDeclaresLocal(n.rnInner) }
-  if n is RRecord { return repOfTy(repTyOf(r)).rdSlot >= 0 }
-  if n is RList {
-    return refRepValtype(r).length > 0
+  return match n {
+    RPrim => true
+    RAtom | RMap | RBox | RClosure => true
+    RNullable => repDeclaresLocal(n.rnInner)
+    RRecord => repOfTy(repTyOf(r)).rdSlot >= 0
+    RList => refRepValtype(r).length > 0
       || repPrim(n.rlsElem) != null && !repSubWord(n.rlsElem)
+    RUnsup | RNoValue | RRaw => false
   }
-  return n is RClosure || n is RBox || n is RMap || n is RAtom
 }
 
 // Value `o` of right side `x`, held in a local the assignment yields; an immediate as it stands.
 function asgStash(b: i32[], o: Opnd, x: i32): Opnd {
   if ibMiss != "" { return o }
   if !(o is OVar) {
-    ibAsgCapOut = o
-    ibAsgCapDone = true
+    ibAsgCapGot[x] = o
     return o
   }
   const ty = if o.ov >= 0 && o.ov < ib.irVars.length { ib.irVars[o.ov].vTy } else { repTyOf(irBOpRep(o)) }
   const lv = irVarNew(ib, irBOpRep(o), ty, "local", -1)
   irBNode(b, { asDst: lv, asSrc: o }, -1, ibNoValue, x)
   const lo: Opnd = { ov: lv }
-  ibAsgCapOut = lo
-  ibAsgCapDone = true
+  ibAsgCapGot[x] = lo
   return lo
 }
 
