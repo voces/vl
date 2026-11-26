@@ -7028,6 +7028,8 @@ function resultFrameTy(pos: i32, t: i32): i32 {
   if t < 0 || isVoidTy(t) { return t }
   const r = repNodeOfTy(t)
   if valueRep(r, t) && !irTyHeldOpen(t, r) { return t }
+  // A hole function's value is the closure legacy returns, whatever its signature (D17579).
+  if valueRep(r, t) && holeCloTy(t) { return t }
   const dt = resultDescTy(pos)
   return if dt >= 0 { dt } else { t }
 }
@@ -10102,16 +10104,54 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const cbx = !vif && (coalBoxFrom(b, xAt, true) || coalBoxFrom(b, xAt, false))
   const recv: PushRecv = if pushRecvHeldAtRest(pp.ppRecv) || !vif && !cbx { v } else { pushStage(b, v, ix, at, xAt, clear, cbx) }
   if ibMiss != "" { return missRhs("push short-circuit operand") }
-  // An unstaged receiver is written at its use, above any valued `if` built from `at` on.
+  // An unstaged receiver is written at its use, above any valued `if` the value builds; a receiver
+  // holding its own branch is written whole before the value, as legacy writes it.
   if (
     !(recv is PStaged)
     && !pushRecvHeldAtRest(pp.ppRecv)
-    && ifBelowLead(b, at, "push short-circuit operand")
+    && !pushRecvReadAtUse(b, v, xAt)
+    && ifBelowLeadIn(b, xAt, b.length, "push short-circuit operand")
   ) {
     return missRhs("push short-circuit operand")
   }
   const r: Rhs = { lpV: recv, lpX: x, lpAt: ix }
   return r
+}
+
+// Whether push receiver `v` is read at its use, as legacy reads it, below the value's statements
+// built from `at` on: a local, or a temp recovering a local (`RRecover`) that none of them assigns,
+// at any depth, whose read is moved after them.
+function pushRecvReadAtUse(b: i32[], v: Opnd, at: i32): boolean {
+  if !(v is OVar) || v.ov < 0 || v.ov >= ib.irVars.length { return false }
+  if ib.irVars[v.ov].vKind != "temp" { return true }
+  let k = -1
+  let src = -1
+  let i = 0
+  while i < at {
+    const n = ib.irNodes[b[i]]
+    if n is SLet && n.lDst == v.ov {
+      const r = n.lRhs
+      if r is RRecover && r.rcV is OVar && !opndsAreTemps([r.rcV]) {
+        k = i
+        src = r.rcV.ov
+      }
+    }
+    i = i + 1
+  }
+  if k < 0 || k != at - 1 { return false }
+  i = at
+  while i < b.length {
+    if nodeAssigns(b[i], src) { return false }
+    i = i + 1
+  }
+  const id = b[k]
+  i = k
+  while i + 1 < b.length {
+    b[i] = b[i + 1]
+    i = i + 1
+  }
+  b[b.length - 1] = id
+  return true
 }
 
 // A `.push` `ix` whose value stages a list receiver of its own: the value at the receiver's element
@@ -11695,7 +11735,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd, ix: i32): string {
   const ok = match p.hbArm {
     "null" => v is OImm && r == ibNoValue
     "lit" => v is OImm
-    "pass" | "memberBox" | "retag" | "numRebox" | "narrowBox" => repNodeAt(r) is RBox || boxedNullable(r)
+    "pass" | "memberBox" | "retag" | "wideRetag" | "numRebox" | "narrowBox" => repNodeAt(r) is RBox || boxedNullable(r)
     "atomStr" => atomNullable(r)
     "atomAsStr" => repNodeAt(r) is RAtom
     "nulNiche" => refNullable(r) || strNullable(r)
@@ -13251,12 +13291,8 @@ function arrayLit(
       elemTwinTy(e, er),
       objLitLayoutRowOf(unwrapParen(e), ibFnIx),
       false,
-    ) } else { deliver(b, e, er, -1) }
+    ) } else if elemMapNew(e, er) { irBLetTempTy(b, { mnAt: unwrapParen(e) }, unwrapParen(e), er, repTyOf(er)) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
-    // An element written before a valued `if` is staged below it, as a call's argument is.
-    if elems.length > 0 && !irBStageLeads(b, at, starts, elems, n.arrElems) {
-      return irBMiss("short-circuit array element after another")
-    }
     // A closure whose rep leaves a part open, or fills one, is the element's closure struct,
     // retagged, as a record field's is. A record or list element is not: its retag is no closure's.
     const holed = irBOpRep(v) != er
@@ -13267,8 +13303,16 @@ function arrayLit(
     // A list twin, a variant record at its struct twin, or a record on the element's heap or a
     // declared subtype's goes in as it stands, retagged, as an argument does (`retagsAsStands`).
     const ve = if holed || irBOpRep(v) != er && retagsAsStands(irBOpRep(v), er, e) { repTemp(b, { rgV: v }, e, er) } else { v }
-    if irBOpRep(ve) != er { return irBMiss("array element coercion") }
-    elems.push(ve)
+    // Any other element goes in by the converter, as a value into a cell of one rep does.
+    const vc = if irBOpRep(ve) != er { irConvertStored(b, ve, er, repTyOf(er), e) } else { ve }
+    if ibMiss != "" { return vc }
+    if irBOpRep(vc) != er { return irBMiss("array element coercion") }
+    // An element written before a valued `if` is staged below it, as a call's argument is; the
+    // check runs over the element's conversion too, whose nodes may write one.
+    if elems.length > 0 && !irBStageLeads(b, at, starts, elems, n.arrElems) {
+      return irBMiss("short-circuit array element after another")
+    }
+    elems.push(vc)
   }
   // A chunked ref list writes each chunk's flush between its elements, which a valued `if`'s out,
   // waiting on the stack below the elements after it, cannot cross.
@@ -15253,11 +15297,19 @@ function mapGetAt(
   // record member no plan reads is the box read whole, then narrowed; legacy writes it through
   // `emitExpr`, which banks the read's row whatever row a caller expecting the box passed.
   let narrowTo = -1
+  // A literal-set member a union box holds as its string is unboxed to that string
+  // (`emitUnionUnboxTail` at the string kind), read as the string it is.
+  let strMember = false
   if arm == "unionBox" {
     // At its narrowing the read is unboxed to the member's scalar after (`narrowedMapReadOf`).
     const nm = narrowedMapReadOf(ix, ibFnIx)
     const na: NarrowedMapReadArm = if whole { "none" } else { nm.nmArm }
-    const repOk = match na {
+    strMember = box < 0
+      && na == "unbox"
+      && nm.nmAk == 2
+      && repNodeAt(rep) is RAtom
+    const repOk = strMember
+      || match na {
       // The read is the value's box, its miss the box's `null` tag.
       "none" => rep == m.rmVal
         || repNodeAt(repBoxCore(rep)) is RBox && repBoxCore(rep) == repBoxCore(m.rmVal)
@@ -15325,6 +15377,7 @@ function mapGetAt(
       narrowTo,
     )
   }
+  if strMember { return irBLetTempTy(b, r, ix, repNodeOfTy(TY_STR), TY_STR) }
   if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
   // A read of a record held at another row's record is that row's, as `mapReadStoredRep`.
   if stTy >= 0 { return irBLetTempTy(b, r, ix, repNodeOfTy(stTy), stTy) }
@@ -21448,6 +21501,19 @@ function noteRecHeaps(r: i32) {
     RAtom | RBox | RNoValue | RPrim | RRaw | RUnsup => 0
   }
   return 0
+}
+
+// Whether list element `e` is a `Map()` the checker typed at another map than the list's element
+// rep `er` (an un-annotated `Map()` at its default, in a list a generic's parameter instantiates):
+// the empty map is built at the element's rep, as a `let` held at its slot's map is.
+function elemMapNew(e: i32, er: i32): boolean {
+  const u = unwrapParen(e)
+  if u < 0 || u >= P.nodes.length || !(repNodeAt(er) is RMap) { return false }
+  const c = nodeAt(u)
+  return c is Call
+    && mapNewCall(c)
+    && repNodeOfTy(nodeTyAt(u, ibFnIx)) != er
+    && exprPrePathWhy(u, ibFnIx) == ""
 }
 
 // Whether each element is a string literal, an immediate at its use.
