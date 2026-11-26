@@ -6933,6 +6933,10 @@ function elabResultScanReset() {
   elabSlotRecAt = []
   elabPlaceRecs = Map()
   elabRecTable = []
+  elabSlotUnionDecl = []
+  elabSlotUnionAts = []
+  elabSlotUnionCalls = []
+  elabSlotUnionPicks = []
   return 0
 }
 
@@ -7488,7 +7492,9 @@ function elabSlotRecordNote(c: i32) {
     ) {
       return 0
     }
-    if !elabTyListSame(elabCallRecord(v, -1), rec) { return 0 }
+    if !elabTyListSame(elabCallRecord(v, -1), rec) {
+      return if isMap { elabSlotUnionNote(d, vals) } else { 0 }
+    }
     const h = elabSlotHolderOf(v0)
     if h >= 0 {
       const li = i32ListIndexOf(linked, h)
@@ -7641,6 +7647,118 @@ function elabSlotRecordNote(c: i32) {
     }
   }
   return 0
+}
+
+// Per fresh `Map()` binding whose stores return records of different signatures, the records,
+// each an index into `elabRecTable`, in the order first stored.
+let elabSlotUnionDecl: i32[] = []
+let elabSlotUnionAts: i32[][] = []
+// Per such binding, each store's value call beside the index in its records of the one it returns.
+let elabSlotUnionCalls: i32[][] = []
+let elabSlotUnionPicks: i32[][] = []
+
+// Fresh `Map()` binding `d`, whose stores `vals` are calls returning records that differ: its
+// value slot holds the union of those records, each store keeping its own whole. Taken only where
+// no use of the map reads a value; one that does keeps the refusal at the store.
+function elabSlotUnionNote(d: i32, vals: i32[]): i32 {
+  if i32ListHas(elabSlotUnionDecl, d) { return 0 }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) { return 0 }
+  const ats: i32[] = []
+  const recs: i32[][] = []
+  const calls: i32[] = []
+  const picks: i32[] = []
+  for v0 in vals {
+    const v = elabSlotValueCall(v0)
+    if (
+      v < 0
+      || v >= P.nodes.length
+      || !(nodeAt(v) is Call)
+      || !elabInPlainCode(parenPeelIx(v0))
+      || elabSlotHolderOf(v0) >= 0
+    ) {
+      return 0
+    }
+    const r = elabCallRecord(v, -1)
+    if r.length < 2 { return 0 }
+    let pick = -1
+    let q = 0
+    while q < recs.length {
+      if pick < 0 && elabTyListSame(recs[q], r) { pick = q }
+      q = q + 1
+    }
+    if pick < 0 {
+      recs.push(r)
+      pick = recs.length - 1
+    }
+    calls.push(v)
+    picks.push(pick)
+  }
+  if recs.length < 2 { return 0 }
+  const global = elabEnclosingFn(d) == -1
+    && (dn.letKw == "const" || !cwDeclAssigned(d))
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const k = cwIxKind[ow.row]
+    const u = cwIxNode[ow.row]
+    if k == CW_OCC_USE {
+      if !elabSlotUnionUseOk(u, global) { return 0 }
+    } else if k != CW_OCC_BIND && k != CW_OCC_ASG {
+      return 0
+    }
+  }
+  for r in recs {
+    elabRecTable.push(r)
+    ats.push(elabRecTable.length - 1)
+  }
+  elabSlotUnionDecl.push(d)
+  elabSlotUnionAts.push(ats)
+  elabSlotUnionCalls.push(calls)
+  elabSlotUnionPicks.push(picks)
+  elabAnyRetRecord = true
+  for v in vals { elabTriplePut(elabResKeeps, elabSlotValueCall(v), -1, 1) }
+  return 0
+}
+
+// Whether use `u` of a map whose value slot is a union of records reads no value: a store's
+// receiver, a key test, a walk of its keys, or a hand to a parameter only so used.
+function elabSlotUnionUseOk(u: i32, global: boolean): boolean {
+  if !cwIxCovers(u) { return false }
+  const uk = cwIxUpKind[u]
+  if uk == CW_UP_ARG {
+    return elabMapParamReadsNoValue(cwIxUp[u], cwIxUpAux[u])
+  }
+  if cwUseInOtherFrame(u) && !global || uk != CW_UP_OBJ { return false }
+  const m = cwIxUp[u]
+  const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+  const mk = if cwIxCovers(m) { cwIxUpKind[m] } else { -1 }
+  if mn is Index { return mk == CW_UP_ASG_LHS }
+  if !(mn is Member) || mk != CW_UP_CALLEE { return false }
+  return mn.memProp == "has" || mn.memProp == "keys" || mn.memProp == "set"
+}
+
+// The fresh `Map()` bindings whose value slot holds a union of records (`elabSlotUnionNote`).
+export function elabSlotUnionCount(): i32 { return elabSlotUnionDecl.length }
+export function elabSlotUnionDeclAt(i: i32): i32 {
+  return if i >= 0 && i < elabSlotUnionDecl.length { elabSlotUnionDecl[i] } else { -1 }
+}
+
+// Binding `i`'s store value calls, and beside each in `picks` the index of the record it returns.
+export function elabSlotUnionCallsAt(i: i32, picks: i32[]): i32[] {
+  const none: i32[] = []
+  if i < 0 || i >= elabSlotUnionCalls.length { return none }
+  for p in elabSlotUnionPicks[i] { picks.push(p) }
+  return elabSlotUnionCalls[i]
+}
+
+// The records binding `i`'s value slot holds, each a signature list; none for an index out of range.
+export function elabSlotUnionRecsAt(i: i32): i32[][] {
+  const out: i32[][] = []
+  if i < 0 || i >= elabSlotUnionAts.length { return out }
+  for at in elabSlotUnionAts[i] {
+    if at >= 0 && at < elabRecTable.length { out.push(elabRecTable[at]) }
+  }
+  return out
 }
 
 // The `let` binding a fresh `Map()` whose value call `c` stores, by `d[k] = c` or `d.set(k, c)`;
@@ -14348,8 +14466,8 @@ function elabSlotMakerTwins() {
   return 0
 }
 
-// Whether every value function `d` returns is a lambda it writes: a maker, not a function handing
-// back a value a caller handed it.
+// Whether every value function `d` returns is a lambda it writes, itself or through a local
+// `const` bound to it: a maker, not a function handing back a value a caller handed it.
 function elabRetsOnlyLambdas(d: i32): boolean {
   const fn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(fn is FuncDecl) || fn.fnBody < 0 { return false }
@@ -14357,7 +14475,8 @@ function elabRetsOnlyLambdas(d: i32): boolean {
   collectRetValues(fn.fnBody, rets)
   for r in rets {
     const x = parenPeelIx(r)
-    if x < 0 || x >= P.nodes.length || !(nodeAt(x) is FuncDecl) { return false }
+    if x < 0 || x >= P.nodes.length { return false }
+    if !(nodeAt(x) is FuncDecl) && elabArgLam(x) < 0 { return false }
   }
   return rets.length > 0
 }
