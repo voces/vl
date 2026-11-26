@@ -90,9 +90,10 @@ shared plan or tail says why the IR cannot take it alone, or it goes back.
 
 ## 5. Owner rulings (2026-11-26)
 
-- **The bar stays at 100%** (owner). I8 lands only with zero unclaimed units on all five
-  populations. The coordinator had offered landing over a short named list of loud
-  `cannot yet lower` programs; the owner declined, so the `runs → not-runs` veto stands.
+- **I8 cuts over before 100%** (owner, later the same day, overruling the first answer to keep the
+  bar). The units still unclaimed become a ratcheted holdout list, and after I8 they burn down
+  through refactors that generalize the IR, not through per-class claims. DECISIONS.md, "I8 cuts
+  over before 100% coverage".
 - **The coordinator merges green PRs** (owner): CI green on the head, GitHub mergeable,
   `expectedHeadSha`; a red master push is reverted at once (V6).
 - **Eight lanes** (owner): the seven owners of V1 plus I8-PREP.

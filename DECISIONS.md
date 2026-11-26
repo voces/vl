@@ -13373,3 +13373,29 @@ is reused.
 bundle parameter returned whole. Only the producer was missing: the signature list from the
 callers' side, the lambda instanced at each signature under the maker's frame, and the `return`
 building the record.
+
+## I8 cuts over before 100% coverage; the holdouts burn down by generalizing the IR (2026-11-26, owner ruling)
+
+The owner ruled that I8, the deletion of legacy's expression emitter, lands before every unit is
+claimed. This overrules the 2026-11-26 coordinator retro's "bar stays at 100%" and ir-i8-cutover
+§10.3's precondition. After I8, the work is to burn down the holdouts through refactors that
+optimize and generalize the IR and the compiler, not through one claim per census class.
+
+Coordinator rulings that implement it:
+
+1. **What may not be a holdout.** These must still claim every unit at the cutover: the
+   self-compile, every `scripts/` tool and every `std/` module. A unit in std breaks every program
+   that imports it. The rest (`tests/cases`, witnesses, distilled cells, capability probes) may
+   hold out.
+2. **The holdout list is a ratchet.** `scripts/ir-i8-census/holdouts.tsv` names each holdout
+   program with its unit, class and owner. A holdout is graded as an expected `cannot yet lower`
+   refusal, and the list may only shrink. A holdout that starts to run reds its check until it is
+   removed, so a fix is always counted. A program not on the list that stops running is a veto,
+   as before. Holdouts count as clause-2 debt on the scoreboard.
+3. **No new per-class claims after the cutover.** A lane groups its holdouts by mechanism, through
+   ablation and not by message, and proposes one general IR change that subsumes a family. The
+   coordinator rules on each proposal before it is built.
+
+**Why.** At 2 to 3 units a PR, the tail cost one fix in the IR and often a second in legacy. After
+I8, each fix happens once, in the IR, and a general lowering retires a family rather than one
+spelling.
