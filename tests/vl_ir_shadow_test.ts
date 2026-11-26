@@ -615,13 +615,21 @@ function greet(a: boolean, x: i32): i32 {
   return xs[0]
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function wr(c: boolean): i64 | null {
-  let x: i64 | null = null
-  return x = if c { 0xfffffffe } else { 1 }
+type K = 0 | 1
+function own(x: K[][] | string | null) {
+  if x is K[][] { print(x[0][0]) } else { print(9) }
+}
+own([[1]])
+function twin(x: K[][] | i32[][] | string) {
+  if x is K[][] { print(x[0][0]) } else { print(9) }
+}
+function go() {
+  const five: i32[][] = [[5]]
+  twin(five)
 }
 print(greet(true, 1))
 print(ap((x: i32) => x + 1))
-print(wr(true) ?? 0)
+go()
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
