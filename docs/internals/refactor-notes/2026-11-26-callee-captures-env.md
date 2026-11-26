@@ -13,6 +13,9 @@ Q58 position sweep (`tests/cases/closures/nested-closure-captures-module-block-l
 return, call argument, record field, list element, two captures at two reps): base 4 functions
 miss `callee captures env`, head 0; output identical (`7 5 hi 2.5 11`) claims-off and on.
 
-RIPPLE_PLACEHOLDER
+Claims-off ripple (`VL_IR_SHADOW=1`, base and head seeds, every `tests/cases` program): 0 of
+8,175 built programs differ in bytes; 1,448 fail to build on both seeds (expected-error cases).
 
-CENSUS_PLACEHOLDER
+I8 census over the 9,623 `tests/cases` programs: `callee captures env` 10 → 0 unclaimed functions;
+claimed 96,840 → 96,848, unclaimed 510 → 500; no claimed function lost and no other unclaimed
+class moved.
