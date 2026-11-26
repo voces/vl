@@ -15,7 +15,7 @@ width.
 
 - `sub-word-lists.vl`'s start body moves past both classes to `narrowed read`, another class. It
   prints the same output on legacy and under `$VL_IR_STRICT=1`.
-- `distilled/regress.vl`: see the PR.
+- `distilled/regress.vl`: no runs lost. Its movement list is identical to master's seed.
 - The sweep `tests/cases/arrays/sub-word-list-push-and-store-positions.vl` covers an `i8`, a `u16`
   and an `i16` list, and a record's `i16[]` field, in a start body and a function. Each value wraps
   at its width. It prints the same output on legacy and under strict IR. Its start body and both
