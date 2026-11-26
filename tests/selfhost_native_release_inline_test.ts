@@ -36,6 +36,7 @@
 //   `$VL_INLINE_REBOX` flattens it.
 //
 // @test-timing opt
+import { holdoutTest } from "./support/holdouts.ts";
 import {
   ENABLED,
   logsOf,
@@ -158,7 +159,7 @@ for (const [fx, want] of FIXTURES) {
   Deno.test({
     name: `native-release: a never-written record is stored inline — ${fx}`,
     ignore: !ENABLED,
-    fn: async () => {
+    fn: holdoutTest(`tests/selfhost_native_release_inline_test.ts#native-release: a never-written record is stored inline — ${fx}`, async () => {
       const src = `${DIR}/${fx}.vl`;
       const text = Deno.readTextFileSync(src);
       const logs = logsOf(text);
@@ -364,7 +365,7 @@ for (const [fx, want] of FIXTURES) {
       } finally {
         await Deno.remove(tmp, { recursive: true });
       }
-    },
+    }),
   });
 }
 

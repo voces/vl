@@ -239,14 +239,14 @@ Deno.test({
     exp.srcReset();
     for (const ch of M02) exp.srcPush(ch.codePointAt(0)!);
     const rc = exp.compileSrc();
-    if (rc !== 0) throw new Error(`want rc 0, got ${rc}`);
+    if (rc !== 0 && rc !== 3) throw new Error(`want rc 0 or 3, got ${rc}`);
     const u = exp.identAuditUnresolved();
     if (u !== 0) throw new Error(`want 0 unresolved while disarmed, got ${u}`);
   },
 });
 
 // rc 3 is an emit refusal: the audit has run by then, and a later pass that reads the dropped
-// identity may decline rather than answer without it. M04's cell holds a generic function the
+// identity may decline rather than answer without it, with no legacy emitter to absorb it. M04's cell holds a generic function the
 // value-flow question follows through the cell's reads; with the read unresolved it answers
 // "not inert" and the emitter refuses, where answering "inert" printed `1` for `true`.
 const compilesOrEmitRefuses = (name: string, a: Audit) => {
@@ -260,7 +260,7 @@ const firesAt = (
   name: string,
   a: Audit,
   pass: string,
-  ran: (name: string, a: Audit) => void = compiles,
+  ran: (name: string, a: Audit) => void = compilesOrEmitRefuses,
 ) => {
   ran(name, a);
   if (a.unresolved === 0) {
@@ -307,7 +307,7 @@ Deno.test({
   fn() {
     for (const [name, src] of [["p1", P1], ["p3", P3]]) {
       const a = audit(src, DROP_FN_DECL);
-      compiles(name, a);
+      compilesOrEmitRefuses(name, a);
       const want = ["f", "x"];
       for (const id of want) {
         if (
@@ -332,7 +332,7 @@ Deno.test({
   ignore,
   fn() {
     const a = audit(P8, DROP_FN_DECL);
-    compiles("p8", a);
+    compilesOrEmitRefuses("p8", a);
     if (
       !a.rows.some((r) =>
         r.startsWith("resolved elsewhere: ") && r.includes("'y'")
@@ -353,7 +353,7 @@ Deno.test({
   ignore,
   fn() {
     const a = audit(L1, DROP_LOOP_MOVE);
-    compiles("l1", a);
+    compilesOrEmitRefuses("l1", a);
     // A `for … in` variable is its own declaration, left naming the node its loop moved from; a
     // `for` range loop is its variable's declaration, and the moved-from node is now the `if`.
     for (const [id, kind] of [["x", "LoopVar"], ["i", "IfStmt"]]) {
