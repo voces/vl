@@ -26,6 +26,13 @@ The plan legacy built inline is now `luForBoxPlanOf` (`wasmEmit.vl`), which lega
 share. `luForBoxArms` selects the walks whose element union is a box; `luForElemTyOf` wraps
 `luElemTy`, so `ir_build` imports no checker symbol.
 
+## Stack margin
+
+The walk's rule sits in its own verifier helper (`luWalkElemRep`). Written inline in the
+verifier's `SForIn` arm, its locals widened the recursive statement checker's frame. The
+deep-nesting margin case (`VL_DEEP_MARGIN_INNER=1`, 10 KB steps) then needed 970 KB against
+base's 930 KB, which reds `ci-native`. With the helper it passes at 930 KB, the same as base.
+
 ## Behaviour parity, and the claims-off ripple
 
 The bytes differ from legacy's per-arm form by design (#10171's parity bar). Every changed program
