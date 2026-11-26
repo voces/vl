@@ -4,7 +4,7 @@
   literal tail (`retIfIsOneNumber`), and `box ladder` where such a join is an argument. Legacy
   builds the join at that number, each arm widened (`if (result f64)`, `convert_i32_s` on an `i32`
   arm), and boxes it once (`emitReturnExit`, D3656). An outer link keeps its own members.
-- **What landed** (the general rule): `ifJoinAdaptsScalar` moves to `emit_plan_union.vl`, and
+- **What landed** (the general rule): `ifJoinAdaptsScalar` moves to `emit_value_sites.vl` (no new checker import), and
   `holeBoxPlanOf`'s `if` rung lets such a join fall through to the scalar rungs, which name its
   number's atom, as legacy's ladder reaches them past its `if` rung (`unionCoerceIfArmOf`). The
   tail path delivers the link at the result's union (`floorDeliver`) and returns it.

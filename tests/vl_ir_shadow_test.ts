@@ -2502,20 +2502,21 @@ Deno.test({
   },
 });
 
-// A returned `if` under the sink that adapts to one wider number with a literal arm is legacy's
-// box-once return (`retIfIsOneNumber`), so it stays a named miss rather than a per-arm build.
+// A returned `if` under the sink that adapts to one wider number with a literal arm is built at
+// that number and boxed once (`retIfIsOneNumber`); here its literal arm at the instance's `i64`
+// is a named miss (`widen instLit`), never a per-arm build.
 const UNION_SINK_ONE_NUMBER =
   `function lit<A, B>(k: i32, a: A, b: B) {\n  if k == 0 { return a }\n  return if k == 1 { b } else { 5 }\n}\nconst z: i64 = 9\nprint(lit(2, z, z) + 1)\n`;
 Deno.test({
-  name: "ir shadow: a returned if boxed once as one wider number under the sink stays a miss",
+  name: "ir shadow: a returned if boxed once as one wider number under the sink, its instance literal arm a named miss",
   ignore,
   fn: () => {
     const { rc, rows } = run(UNION_SINK_ONE_NUMBER, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("uncovered tail if one number") ?? 0) !== 1) {
-      throw new Error(`want lit uncovered at tail if one number, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("uncovered widen instLit") ?? 0) !== 1) {
+      throw new Error(`want lit uncovered at widen instLit, got ${JSON.stringify([...rows])}`);
     }
   },
 });
