@@ -519,7 +519,9 @@ Deno.test({
       ROW_ID_UNION,
       DROP_NONE,
       true,
-      "kind agree | deliver6=1; kind agree | deliver=1; kind agree | idn=1; row agree | idn$1=1",
+      // `idn$1` is keyed at `J`, the row its argument literal is built at (D17641), while the
+      // recorded result is still the literal's own type: kinds agree, rows do not until D17574.
+      "kind agree | deliver6=1; kind agree | deliver=1; kind agree | idn$1=1; kind agree | idn=1",
       true,
     );
     expectRows(
