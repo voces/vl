@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims a record join whose narrowed arm names no row:** a value `if` over a union `is` test whose arms are records is built at its rep's own record row, the row legacy reads off the narrowed arm. A field read straight off such an `if` reads that row. `union if record join row` falls 3 → 0 units. The flipped spelling (`if x is Err { { a: 8 } } else { x }`), which fell back on master with `ref valtype with no interned shape`, is now claimed. D4645's direct read (`(if r is Out { r } else { { a: 0 } }).a`), which legacy refuses, now runs. So does D17108's, printed at any scalar or string field. D4645 is closed again, and D17108 closed, with every grading-list spelling passing under `VL_IR_REQUIRE_CLAIM=1`.
