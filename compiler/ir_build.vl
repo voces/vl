@@ -7881,6 +7881,32 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
   return true
 }
 
+// A binary operator's left operand `lead[0]`, built into `b` from `ls`, staged below a right
+// operand built from `at` that holds a statement it must be written below (`irBStageLeads`), as a
+// later argument's earlier ones are. False, with a miss, where the right operand holds a statement
+// nothing is staged below (a `??` written in place, a receiver stage) or the stage cannot be made.
+function stageLeftBelow(
+  b: i32[],
+  ls: i32,
+  at: i32,
+  lead: Opnd[],
+  leftIx: i32,
+): boolean {
+  const below = valuedIfFrom(b, at)
+    || coalBoxFrom(b, at, true)
+    || storeFrom(b, at)
+    || stashSetFrom(b, at)
+    || tagStashFrom(b, at)
+  if below && !coalBoxFrom(b, at, false) && !receiverStageFrom(b, at) {
+    if !irBStageLeads(b, at, [ls], lead, [leftIx]) {
+      irBMiss("staged lead")
+      return false
+    }
+    return true
+  }
+  return !ifBelowLeadOf(b, at, "short-circuit right operand", lead)
+}
+
 // Whether the operands built into `b` from `at` up to `to` write a statement legacy would write
 // below a lead opened before them: an `if` (valued, or one run for its effect: a `null` join's or
 // a `null`-typed if-expression's), a boxed `??` or a stash.
@@ -9674,11 +9700,14 @@ function eqOperandRaw(b: i32[], ix: i32): Opnd {
 function nicheBoolEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const p = binPrimOp(n.binOp, false)
   if p == null { return irBMiss("operator " + n.binOp) }
-  const l = irBExpr(b, n.binLeft)
+  const ls = b.length
+  const l0 = irBExpr(b, n.binLeft)
   const at = b.length
   const r = irBExpr(b, n.binRight)
-  if ibMiss != "" { return l }
-  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return l }
+  if ibMiss != "" { return l0 }
+  const lead = [l0]
+  if !stageLeftBelow(b, ls, at, lead, n.binLeft) { return l0 }
+  const l = lead[0]
   const lr = irBOpRep(l)
   const rr = irBOpRep(r)
   const ln = repBoolNiche(lr)
@@ -10821,12 +10850,15 @@ function neverWidened(b: i32[], v: Opnd, ix: i32, to: i32): Opnd {
 
 // Two lists, each built at its own list rep, compared by legacy's list compare.
 function listEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
-  const l = irBExpr(b, n.binLeft)
-  if ibMiss != "" { return l }
+  const ls = b.length
+  const l0 = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l0 }
   const at = b.length
   const r = irBExpr(b, n.binRight)
   if ibMiss != "" { return r }
-  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
+  const lead = [l0]
+  if !stageLeftBelow(b, ls, at, lead, n.binLeft) { return r }
+  const l = lead[0]
   if (
     !(repNodeAt(irBOpRep(l)) is RList)
     || !(repNodeAt(irBOpRep(r)) is RList)
@@ -10838,12 +10870,15 @@ function listEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 
 // Two lists at the concat's rep, concatenated by legacy's concat (`listCatRouteOf` "plain").
 function listCat(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
-  const l = irBExpr(b, n.binLeft)
-  if ibMiss != "" { return l }
+  const ls = b.length
+  const l0 = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l0 }
   const at = b.length
   const r = irBExpr(b, n.binRight)
   if ibMiss != "" { return r }
-  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
+  const lead = [l0]
+  if !stageLeftBelow(b, ls, at, lead, n.binLeft) { return r }
+  const l = lead[0]
   // A widening concat's narrower side is a list at its own rep, widened by its tail (`catWidenTail`).
   const ws = if catWidenTakes(ix, ibFnIx) { catWidenSideOfBin(ix, ibFnIx) } else { 0 }
   const lok = irBOpRep(l) == rep || ws == 1 && repNodeAt(irBOpRep(l)) is RList
@@ -10856,12 +10891,15 @@ function listCat(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 
 // Two union boxes, each built at its own box rep, compared by legacy's staged compare.
 function unionEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
-  const l = unionEqSide(b, n.binLeft)
-  if ibMiss != "" { return l }
+  const ls = b.length
+  const l0 = unionEqSide(b, n.binLeft)
+  if ibMiss != "" { return l0 }
   const at = b.length
   const r = unionEqSide(b, n.binRight)
   if ibMiss != "" { return r }
-  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
+  const lead = [l0]
+  if !stageLeftBelow(b, ls, at, lead, n.binLeft) { return r }
+  const l = lead[0]
   // A boxed nullable is held as the box the staged compare reads.
   if !heldAsBox(irBOpRep(l)) || !heldAsBox(irBOpRep(r)) {
     return irBMiss("union compare operand rep")
@@ -15169,23 +15207,8 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     const at = b.length
     const r = if rLit { signedLitAt(unwrapParen(n.binRight), dst) } else { widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1) }
     if ibMiss != "" { return l }
-    // A left operand that is a variable or immediate is staged below a right operand that holds
-    // a valued `if`, a `??` that stages the leads before it, a store, a stash or a tag dispatch's
-    // stash, as it is below a later argument's (`irBStageLeads`). A `??` that stages nothing and
-    // a receiver stage are written in place, below which nothing is staged.
     const lead = [l]
-    const below = valuedIfFrom(b, at)
-      || coalBoxFrom(b, at, true)
-      || storeFrom(b, at)
-      || stashSetFrom(b, at)
-      || tagStashFrom(b, at)
-    if below && !coalBoxFrom(b, at, false) && !receiverStageFrom(b, at) {
-      if !irBStageLeads(b, at, [ls], lead, [n.binLeft]) {
-        return irBMiss("staged lead")
-      }
-    } else if ifBelowLeadOf(b, at, "short-circuit right operand", lead) {
-      return l
-    }
+    if !stageLeftBelow(b, ls, at, lead, n.binLeft) { return l }
     const sl = lead[0]
     if irBOpRep(sl) != irBOpRep(r) { return irBMiss("operand coercion") }
     if never {
