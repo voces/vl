@@ -2988,6 +2988,14 @@ function getField(r: RGetField) {
   const m = nodeAt(r.gfAt)
   if !(m is Member) { return irLMiss("field node") }
   if r.gfShared { return sharedField(r, m) }
+  // A plain struct read takes its row and field index off its receiver's rep, as the shared row
+  // tables lay that rep out; legacy's arms answer only a receiver no struct row records.
+  const rsi = recvStructRow(r.gfV)
+  const ridx = if rsi >= 0 { sFieldIndex(rsi, m.memProp) } else { -1 }
+  if ridx >= 0 && !r.gfStored && !memberBoxReadAt(r.gfAt, lw.irAt) {
+    irLOpnd(r.gfV)
+    return structFieldRead(rsi, ridx, r.gfAt)
+  }
   // A read the builder built at its storage has its shape there.
   const sm = if r.gfStored { storageReadEnter(r.gfAt) } else { storageReadEnter(-1) }
   const fi = fieldIdxAt(r.gfAt, m)
@@ -3008,6 +3016,27 @@ function getField(r: RGetField) {
   const rs = fieldTail(r.gfAt, m)
   storageReadLeave(mark)
   return rs
+}
+
+// The struct row the record rep of receiver `v` is lowered at, the row its descriptor names
+// (`repLocalValtype` types the value by it), or -1 for a variant, a nullable or any other rep.
+function recvStructRow(v: Opnd): i32 {
+  const rr = opRepOf(v)
+  const n = repNodeAt(rr)
+  if !(n is RRecord) || n.rrVariant { return -1 }
+  const d = repOfTy(repTyOf(rr))
+  return if d.rdKind == "struct" && d.rdNul == 0 { d.rdSlot } else { -1 }
+}
+
+// Struct row `si`'s field `idx` read off the receiver on the stack, then its recovers and unbox, as
+// `fieldTail`'s struct arm writes them.
+function structFieldRead(si: i32, idx: i32, at: i32) {
+  const fnIx = lw.irAt
+  if memRecvOwesNonNull(at, fnIx) { fbRefAsNonNull() }
+  structFieldTail(si, idx, at, fnIx)
+  if structUnionBoxTail(si, idx, at, fnIx) < 0 { return irLMiss("field unbox") }
+  if readOwesNonNullRecover(at, fnIx) { fbRefAsNonNull() }
+  return 0
 }
 
 // A shared template member's read (`gfShared`): the record, then the field at its storage, as
