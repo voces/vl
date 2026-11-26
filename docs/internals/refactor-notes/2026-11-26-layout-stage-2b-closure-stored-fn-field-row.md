@@ -19,13 +19,14 @@ and its field `r` met the row's `r` at another record: `object field coercion`.
 
 ## The mechanism
 
-`openFieldStoredAsIds` now accepts both open function fields:
+`openFieldStoredAsRow` (renamed from `openFieldStoredAsIds`) now accepts both open function fields:
 - a field whose rep is the set's i32 id, where the row stores the id (as before);
-- a field whose rep is a closure, where the row stores a closure.
+- a field whose rep is a closure, where the row stores a non-null closure. A nullable closure slot
+  is not admitted, so a read of one meets a named miss rather than a silent pairing (COV-UNION).
 
 The second reads `structRowFnSlotLayout` (emit_shape_rows.vl), the field-code accessor stage 1
-set aside for its first caller. It answers 1 for a closure slot, 0 for a tagged id and -1
-otherwise. Its variant twin waits for a caller.
+set aside for its first caller. It answers 1 for a closure slot, 2 for a nullable one, 0 for a tagged id
+and -1 otherwise. Its variant twin waits for a caller.
 
 ## Tried and dropped
 
