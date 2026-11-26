@@ -422,6 +422,8 @@ import {
   listFitIsPlanOf,
   listOpRecvHeldPlan,
   lowMemFoldsCallee,
+  luForWalkElemTy,
+  luForWalkPlanOf,
   lvTailAssigns,
   mapFilterWhy,
   mapGetArmOf,
@@ -3236,6 +3238,9 @@ export function irBFn(): IrFn { return ib }
 export function irBFnIx(): i32 { return ibFnIx }
 
 export function irBNoValue(): i32 { return ibNoValue }
+
+// The string rep.
+export function irBStrRep(): i32 { return repNodeOfTy(TY_STR) }
 
 export function irBMiss(why: string): Opnd {
   if ibMiss == "" { ibMiss = why }
@@ -10191,7 +10196,17 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
       ib.irUnbankedRead = unwrapParen(ix)
     }
   }
-  const v = widenTo(b, exprAt(b, ix, true), ix, dst, dstTy)
+  // A box narrowed to an arm the plan re-boxes under a wider one (`narrowBox`) is read as the box
+  // it is stored as, whose payload the box takes, as legacy reads it (`emitUnionWideArmBox`).
+  const nbox = dst >= 0
+    && heldAsBox(dst)
+    && nodeAt(unwrapParen(ix)) is Ident
+    && holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx).hbArm
+    == "narrowBox"
+  const mark = if nbox { storageReadEnter(unwrapParen(ix)) } else { storageReadEnter(-1) }
+  const v0 = exprAt(b, ix, true)
+  storageReadLeave(mark)
+  const v = widenTo(b, v0, ix, dst, dstTy)
   ib.irUnbankedRead = outer
   if (
     ibMiss == ""
@@ -10647,7 +10662,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd, ix: i32): string {
   const ok = match p.hbArm {
     "null" => v is OImm && r == ibNoValue
     "lit" => v is OImm
-    "pass" | "memberBox" | "retag" | "numRebox" => repNodeAt(r) is RBox || boxedNullable(r)
+    "pass" | "memberBox" | "retag" | "numRebox" | "narrowBox" => repNodeAt(r) is RBox || boxedNullable(r)
     "atomStr" => atomNullable(r)
     "atomAsStr" => repNodeAt(r) is RAtom
     "nulNiche" => refNullable(r) || strNullable(r)
@@ -13973,7 +13988,9 @@ function mapGetAt(
       // The read is the value's box, its miss the box's `null` tag.
       "none" => rep == m.rmVal
         || repNodeAt(repBoxCore(rep)) is RBox && repBoxCore(rep) == repBoxCore(m.rmVal)
-      "unbox" => repPrim(rep) != null && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
+      // …to the member's scalar, or a function member's closure (the payload cast to its heap).
+      "unbox" => (repPrim(rep) != null || repNodeAt(rep) is RClosure)
+        && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
       // …or to its container member, at the read's own type (`emitNarrowedMapReadTail`).
       "container" => repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
       "nonNull" => false
@@ -16564,6 +16581,7 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   // the lowering's declared slot names where the two agree.
   const pinned = why == "pinned slot"
     && declSlotPinned(ix) == declaredSlotOfDecl(n.fiDecl1)
+  if why == "list union" { return forInListUnion(b, n, ix) }
   if why != "" && why != "hoisted" && !pinned { return skip("for in " + why) }
   // Inside an unrolled range copy a list literal of the copy's constants is legacy's pooled
   // global, read with `global.get`, where the IR builds the list.
@@ -16662,6 +16680,71 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
       xfMapNonNull: mr >= 0 && globalReadRecovers(sidOfNode(mr), mr, ibFnIx),
       xfVals: vals,
       xfKeyRep: keyRep,
+      xfLu: false,
+    },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  return 0
+}
+
+// A walk of a union of lists' box (`luForWalkPlanOf`), the body built once: the lowering reads each
+// element off the arm the box holds, boxed into the element union or converted to the flat kind.
+function forInListUnion(b: i32[], n: ForIn, ix: i32) {
+  const lp = luForWalkPlanOf(n, ibFnIx)
+  if lp.lbWhy != "" { return skip("for in list union arm") }
+  const l = irBExpr(b, n.fiIter)
+  if ibMiss != "" { return 0 }
+  if !(repNodeAt(irBOpRep(l)) is RBox) {
+    return skip("for in list union box rep")
+  }
+  const et = luForWalkElemTy(n, ibFnIx)
+  const er = repNodeOfTy(et)
+  // A box walk binds the element union's box; a flat one the scalar or string each element becomes.
+  const elemOk = if lp.lbPlan.destKind == "union" { repNodeAt(er) is RBox || boxedNullable(er) } else { repPrim(er) != null }
+  if !elemOk { return skip("for in list union element rep") }
+  const v = irBLoopVar(n.fiDecl1, er, et)
+  if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
+  let v2 = -1
+  if n.fiVar2 != "" {
+    const pr = repNodeOfTy(TY_I32)
+    v2 = irBLoopVar(n.fiDecl2, pr, TY_I32)
+    if v2 < 0 || ib.irVars[v2].vRep != pr {
+      return skip("for in pair variable rep")
+    }
+  }
+  const brk = labelNew()
+  const cont = labelNew()
+  ibLoopName.push(n.fiLabel)
+  ibLoopBrk.push(brk)
+  ibLoopCont.push(cont)
+  const fb: i32[] = []
+  const body = nodeAt(n.fiBody)
+  if body is Block {
+    stmtRun(fb, body.blkStmts)
+  } else {
+    stmt(fb, n.fiBody, NO_SIBS, -1)
+  }
+  ibLoopName.pop()
+  ibLoopBrk.pop()
+  ibLoopCont.pop()
+  if ibMiss != "" { return 0 }
+  irBNode(
+    b,
+    {
+      xfList: l,
+      xfVar: v,
+      xfVar2: v2,
+      xfBody: fb,
+      xfAt: ix,
+      xfBrk: brk,
+      xfCont: cont,
+      xfMap: -1,
+      xfMapNonNull: false,
+      xfVals: false,
+      xfKeyRep: -1,
+      xfLu: true,
     },
     -1,
     ibNoValue,
@@ -16687,14 +16770,21 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
   const s = declaredSlotOfDecl(ix)
   const vw = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
   const bw = if s >= 0 { declaredIndexAt(ibFnIx, s + 1) } else { -1 }
-  if vw < 0 || bw < 0 || localVarAt(vw) >= 0 || localVarAt(bw) >= 0 {
+  // A copy of this loop that an unrolled outer loop builds again reuses the slots' variables.
+  const prior = ibDeclVar[ix] ?? -1
+  const again = prior >= 0 && localVarAt(vw) == prior
+  if (
+    vw < 0
+    || bw < 0
+    || !again && (localVarAt(vw) >= 0 || localVarAt(bw) >= 0)
+  ) {
     return skip("for range slot")
   }
   const ri = repNodeOfTy(TY_I32)
   const a = irBExpr(b, n.frFrom)
   if ibMiss != "" { return 0 }
   if irBOpRep(a) != ri { return skip("for range bound rep") }
-  const v = irVarNew(ib, ri, TY_I32, "local", vw)
+  const v = if again { prior } else { irVarNew(ib, ri, TY_I32, "local", vw) }
   ibDeclVar[ix] = v
   // An instance's loop is a clone whose body reads still name the source's declaration.
   const src = nodeSrc[ix] ?? -1
@@ -16708,7 +16798,7 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
     const t = irBExpr(b, n.frTo)
     if ibMiss != "" { return 0 }
     if irBOpRep(t) != ri { return skip("for range bound rep") }
-    const bv = irVarNew(ib, ri, TY_I32, "local", bw)
+    const bv = if again && localVarAt(bw) >= 0 { localVarAt(bw) } else { irVarNew(ib, ri, TY_I32, "local", bw) }
     irBNode(b, { asDst: bv, asSrc: t }, -1, ibNoValue, ix)
     const o: Opnd = { ov: bv }
     bound = o
