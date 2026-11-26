@@ -767,6 +767,8 @@ import {
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
+  variantCopyEmit,
+  variantCopyReReads,
   variantFieldTail,
   variantStructNewTail,
   variantUnionBoxTail,
@@ -831,6 +833,8 @@ import {
   atomFoldTail,
   atomHookArmOf,
   coalArmRecvCast,
+  coalBoxRuntimeKind,
+  coalBoxRuntimeOpen,
   coalBoxStashOpen,
   coalFieldBoxOpen,
   coalFieldPlanOf,
@@ -5023,6 +5027,10 @@ function boxOp(r: RToBox) {
     }
     holeBoxHead(p, r.bxAt, fnIx)
   }
+  if p.hbArm == "recCopy" {
+    if boxRecCopy(r, p.hbKind) < 0 { return -1 }
+    return holeBoxTail(p, r.bxAt, fnIx)
+  }
   if (
     p.hbArm == "pass"
     || p.hbArm == "memberBox"
@@ -5049,6 +5057,21 @@ function boxOp(r: RToBox) {
   if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
   if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
   return holeBoxTail(p, r.bxAt, fnIx)
+}
+
+// A `recCopy` box's value: the record copied onto variant `vi`, its source read as the IR wrote
+// it, into the bytes the copy reads where it reads them again, else on the stack once.
+function boxRecCopy(r: RToBox, vi: i32): i32 {
+  const src: u8[] = []
+  if variantCopyReReads(r.bxAt, vi, lw.irAt) {
+    const prev = wTarget(src)
+    irLOpnd(r.bxV)
+    wTarget(prev)
+  } else {
+    irLOpnd(r.bxV)
+  }
+  if lwMiss != "" { return -1 }
+  return variantCopyEmit(r.bxAt, vi, lw.irAt, src)
 }
 
 // A late box (`irBoxLate`): its value and payload conversion, held in an `anyref` local
@@ -6319,6 +6342,7 @@ function coalBoxGo(n: SCoalBox, pending: i32[]): i32 {
     "nulAtomJoin" => coalNulAtomJoin(n, e, pending)
     "nulBoolJoin" => coalNulBoolJoin(n, pending)
     "boxStash" => coalBoxStash(n, e, pending)
+    "boxRuntime" => coalBoxRuntime(n, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
     "nulStr" => coalNulStr(n, e, pending)
     "asProp" => irLMiss("propagating as over a `??`")
@@ -6348,6 +6372,22 @@ function coalAsProp(n: SCoalBox, e: AsExpr, pending: i32[]): i32 {
 function coalBoxStash(n: SCoalBox, _e: BinExpr, pending: i32[]): i32 {
   cond(n.cbL, pending)
   coalBoxStashOpen(sharedFieldRecvSlot())
+  fbElse()
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  fbEnd()
+  return 0
+}
+
+// `l ?? d` over a box read at its storage along legacy's `boxRuntime` rung, as
+// `emitCoalesceBoxRuntime` writes a scalar result: the box into the shared slot, its tag tested
+// present opening the scalar `if`, the payload unboxed, the else, the default writing the out.
+function coalBoxRuntime(n: SCoalBox, pending: i32[]): i32 {
+  const bk = coalBoxRuntimeKind(n.cbAt)
+  if bk < 0 { return irLMiss("coalesce box runtime kind") }
+  cond(n.cbL, pending)
+  coalBoxRuntimeOpen(sharedFieldRecvSlot(), bk)
   fbElse()
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)

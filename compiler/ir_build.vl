@@ -10397,7 +10397,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd, ix: i32): string {
     "atomAsStr" => repNodeAt(r) is RAtom
     "nulNiche" => refNullable(r) || strNullable(r)
     "nulBool" => repBoolNiche(r)
-    "rec" | "obj" => repNodeAt(r) is RRecord
+    "rec" | "obj" | "recCopy" => repNodeAt(r) is RRecord
     "refList" | "atomList" => repNodeAt(r) is RList
     // A scalar map read is built as the probe's own box (`mapGetAt`), which this plan writes as is.
     "mapScalar" => boxedNullable(r)
@@ -12186,6 +12186,7 @@ function coalesce(
     return v
   }
   if arm == "mapScalarJoin" { return coalMapScalarJoin(b, n, ix, rep) }
+  if arm == "boxRuntime" { return coalBoxRuntime(b, n, ix, rep) }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
 }
@@ -12682,10 +12683,34 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
 // test's box-typed `if`, the default built into its absent arm.
 function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !heldAsBox(rep) { return irBMiss("coalesce box stash result rep") }
-  const ty = outTyOf(ix, rep)
-  if irTyOpen(ty) { return irBMiss("open temp type") }
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
+  return coalBoxTagged(b, n, ix, rep, l, "boxStash")
+}
+
+// `l ?? d` whose operand the checker narrowed to `null` though it may have been written since (a
+// loop, a closure, a call), along legacy's `boxRuntime` rung: the box read at its storage, then its
+// tag test, the box stash's at a box result and else the payload's unboxed.
+function coalBoxRuntime(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const mark = storageReadEnter(unwrapParen(n.binLeft))
+  const l = irBExpr(b, n.binLeft)
+  storageReadLeave(mark)
+  if ibMiss != "" { return l }
+  const arm: CoalValArm = if heldAsBox(rep) { "boxStash" } else { "boxRuntime" }
+  return coalBoxTagged(b, n, ix, rep, l, arm)
+}
+
+// The tag-tested `??` over box `l` along `arm`: the default built into its absent arm.
+function coalBoxTagged(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  l: Opnd,
+  arm: CoalValArm,
+): Opnd {
+  const ty = outTyOf(ix, rep)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
   if !heldAsBox(irBOpRep(l)) {
     return irBMiss("coalesce box stash operand rep")
   }
@@ -12703,7 +12728,7 @@ function coalBoxStash(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     {
       cbL: l,
       cbLB: [],
-      cbArm: "boxStash",
+      cbArm: arm,
       cbNull: nb,
       cbOut: t,
       cbAt: ix,
@@ -14801,29 +14826,22 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     const orep = if !never { rep } else if binIsCompare(n.binOp) { ibBool } else if sr == i32r { i32r } else { sr }
     // Mixed numeric widths meet at the operator's width, each operand widened before the next
-    // is built, as legacy builds them (`emitBinOperandAs`); a literal there is legacy's to write.
+    // is built, as legacy builds them (`emitBinOperandAs`); a literal there is built at that
+    // width (`emitNumLitAs`).
     const dst = binWidthRep(n)
-    if (
-      dst >= 0
+    const lLit = dst >= 0
       && irRepOtherThan(n.binLeft, dst)
       && numLitAsApplies(n.binLeft)
-    ) {
-      return irBMiss("widen literal")
-    }
-    if (
-      dst >= 0
+    const rLit = dst >= 0
       && irRepOtherThan(n.binRight, dst)
       && numLitAsApplies(n.binRight)
-    ) {
-      return irBMiss("widen literal")
-    }
     const ls = b.length
     // A left `never` beside a wider operand is read at i32, its consumer's rep, and widened to
     // that operand's width, as legacy writes it; no value of it is ever read.
     const wideNever = never && nl && sr != i32r
-    const l = if wideNever { neverWidened(b, irBExpr(b, n.binLeft), n.binLeft, sr) } else { widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1) }
+    const l = if lLit { signedLitAt(unwrapParen(n.binLeft), dst) } else if wideNever { neverWidened(b, irBExpr(b, n.binLeft), n.binLeft, sr) } else { widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1) }
     const at = b.length
-    const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1)
+    const r = if rLit { signedLitAt(unwrapParen(n.binRight), dst) } else { widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1) }
     if ibMiss != "" { return l }
     // A left operand that is a variable or immediate is staged below a right operand that holds
     // a valued `if`, a `??` that stages the leads before it, a store, a stash or a tag dispatch's

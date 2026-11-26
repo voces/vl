@@ -3247,6 +3247,47 @@ function emitStructExprAsVariantBox(exprIx: i32, vi: i32, ssi: i32, fnIx: i32) {
   return 0
 }
 
+// Record `exprIx` copied onto variant `vi`'s heap (`emitStructExprAsVariantBox` without its tag and
+// box): a source the copy re-reads is read as `src`, else it is on the stack already.
+export function variantCopyEmit(
+  exprIx: i32,
+  vi: i32,
+  fnIx: i32,
+  src: u8[],
+): i32 {
+  if guardVariantFieldSpan(vi, "variantCopyEmit") < 0 || vi < 0 { return -1 }
+  const names: string[] = []
+  const rows: i32[] = []
+  variantRowFields(vi, names, rows)
+  const ssi = structIndexOfExpr(exprIx, fnIx)
+  const heldSrc = rcElem.srcRead
+  rcElem.srcRead = src
+  const built = !variantCopyReReads(exprIx, vi, fnIx)
+  const rc = emitRecCopy(
+    exprIx,
+    ssi,
+    variantHeap(vi),
+    -1,
+    names,
+    rows,
+    fnIx,
+    built,
+  )
+  rcElem.srcRead = heldSrc
+  return rc
+}
+
+// Whether the copy of record `exprIx` onto variant `vi` reads its source again per field
+// (`rcReReadable`), so the value is not built once ahead of it.
+export function variantCopyReReads(exprIx: i32, vi: i32, fnIx: i32): boolean {
+  const ssi = structIndexOfExpr(exprIx, fnIx)
+  if vi < 0 || ssi < 0 || ssi >= sHeapIdx.length { return true }
+  const names: string[] = []
+  const rows: i32[] = []
+  variantRowFields(vi, names, rows)
+  return rcReReadable(exprIx, ssi, -1, names, rows)
+}
+
 // A fresh record at the heap `dHeap`, whose fields are `dNames` at the flat field rows `dFieldRows`, built from
 // the record `exprIx` evaluates to at struct row `ssi`: field by field, each number converted
 // (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`,
@@ -10168,7 +10209,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 // value built before the box sits above that tag. `null` and `lit` write no value after theirs.
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
-    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "nulMap" | "clo" => true
+    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "recCopy" | "refList" | "map" | "nulMap" | "clo" => true
     "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
   }
 }
@@ -10184,7 +10225,7 @@ export function holeBoxHeadAhead(a: HoleBoxArm): boolean {
 export function boxTagOnly(a: HoleBoxArm): boolean {
   return match a {
     "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" => true
-    "map" | "nulMap" | "clo" | "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
+    "recCopy" | "map" | "nulMap" | "clo" | "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
   }
 }
 
@@ -10197,7 +10238,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     }
     "atom" | "atomAsStr" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
     "atomList" => fbI32Rel(RS_TAG, atomListArmTag())
-    "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
+    "rec" | "obj" | "recCopy" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
     "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
     "nulMap" => nulMapArmBoxHead(
@@ -10219,7 +10260,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
-    "null" | "rec" | "obj" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
+    "null" | "rec" | "obj" | "recCopy" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
     "atom" | "atomList" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
@@ -10341,6 +10382,7 @@ function unionBoxArgLadders(
   fnIx: i32,
 ): boolean {
   return hp.hbArm == "ladder"
+    || hp.hbArm == "recCopy"
     || hp.hbArm == "mapBox"
     || hp.hbArm == "nulNiche" && nulNicheBoxTagOf(unionTy, exprIx, fnIx) < 0
 }
@@ -25067,7 +25109,6 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   if ifJoinDropsNulAtom(ifIx, fnIx, "scalar") {
     return "string drops null atom"
   }
-  if p.ijVt == 123 { return "valtype" }
   return ""
 }
 
@@ -46591,36 +46632,24 @@ function emitCoalesce(e: BinExpr, exprIx: i32, fnIx: i32) {
 // present arm unboxed at the coalesce's rep (a numeric scalar, or the value box itself).
 function emitCoalesceBoxRuntime(e: BinExpr, exprIx: i32, fnIx: i32) {
   const bk = boxTagOfTy(nodeTyIxOf(exprIx))
-  const bVt = nulBoxScalarValtype(bk)
-  const bVb = vbHeapIdxOfKind(bk)
+  const sk = coalBoxRuntimeKind(exprIx)
   let bNm = ""
   if exprUnion(exprIx, fnIx) { bNm = boxTyName(nodeTyIxOf(exprIx)) }
-  if (bVt < 0 || bVb < 0) && bNm == "" {
+  if sk < 0 && bNm == "" {
     return emitFail(
       "emitProgram: `??` over a null-narrowed value box has no rep for its result",
     )
   }
   const bSlot = sharedFieldRecvSlot()
   if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-  fbLocalSet(bSlot)
-  fbLocalGet(bSlot)
-  fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
-  fbI32Bin(71) // 0x47 i32.ne — present?
-  if bVt >= 0 && bVb >= 0 {
-    fbIf(bVt)
-    fbLocalGet(bSlot)
-    fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
-    fbRefCast(bVb)
-    fbStructGet(bVb, 0)
+  if sk >= 0 {
+    coalBoxRuntimeOpen(bSlot, sk)
     fbElse()
     if emitExprAsKind(e.binRight, bk, fnIx) < 0 { return -1 }
     fbEnd()
     return 0
   }
-  fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
-  fbLocalGet(bSlot)
-  fbRefAsNonNull()
+  coalBoxStashOpen(bSlot)
   fbElse()
   if emitUnionBoxOwed(bNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0 {
     return -1
@@ -48573,6 +48602,31 @@ export function coalNulAtomJoinWhy(e: BinExpr, fnIx: i32): string {
     return "emitProgram: `??` default names no arm of the union its result is"
   }
   return ""
+}
+
+// The scalar box kind `??` node `exprIx` unboxes its operand's payload at, or -1 where its result
+// has no scalar rep and is the box itself.
+export function coalBoxRuntimeKind(exprIx: i32): i32 {
+  const bk = boxTagOfTy(nodeTyIxOf(exprIx))
+  if nulBoxScalarValtype(bk) < 0 || vbHeapIdxOfKind(bk) < 0 { return -1 }
+  return bk
+}
+
+// After `??`'s operand box: it into `slot`, its tag tested present opening the `if` of scalar box
+// kind `bk` (`coalBoxRuntimeKind`), and the payload unboxed as that arm's value.
+export function coalBoxRuntimeOpen(slot: i32, bk: i32) {
+  const vt = nulBoxScalarValtype(bk)
+  const vb = vbHeapIdxOfKind(bk)
+  fbLocalSet(slot)
+  fbLocalGet(slot)
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Bin(71) // 0x47 i32.ne  -> present?
+  fbIf(vt)
+  fbLocalGet(slot)
+  fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
+  fbRefCast(vb)
+  fbStructGet(vb, 0)
 }
 
 // After `??`'s operand box: it into `slot`, its tag tested present opening the box-typed `if`, and
