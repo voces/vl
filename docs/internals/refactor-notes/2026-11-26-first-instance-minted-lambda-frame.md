@@ -6,8 +6,9 @@ A later instance re-pointed its minted lambdas at itself (D943, `monoMakeInstanc
 instance, which takes the template's own slot (`monoMakeInstanceFirst`), did not, so its lambda had
 no frame. Every capture of a local there resolved to no binding: legacy held the env field at
 `captureValKind`'s `i32` default (an invalid module for an f64 or string capture, D17668), and the
-IR missed `closure env capture` or `capture binding`. Both instance paths now share
-`monoReparentMinted`.
+IR missed `closure env capture` or `capture binding`. The first instance now re-points them
+too, through the helper that re-points a nested lambda's clones (`monoReparentNestedLams`), so the
+pin and position layer gains no helper.
 
 ## Measurements
 
