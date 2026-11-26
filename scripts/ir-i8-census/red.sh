@@ -31,6 +31,27 @@ cat "$CEN"/*.rows | awk -F'\t' -v w="$CEN/" '$3 ~ /^(fnu |claim fell back)/ {
   else { u = "(fallback)"; sub(/^claim fell back: /, "", c) }
   print p "\t" u "\t" c }' | sort -u > "$T/unc"
 
+# The sweep keys a failure by the file it lands in, so every program a std module's unit blocks
+# reads as one `std:<mod>` row. Expand it to each program of that population, not listed apart,
+# with an unclaimed unit named for a function `std/<mod>.vl` declares (`filled$m…` is `filled`).
+: > "$T/fail"
+while IFS=$'\t' read -r pop prog stub; do
+  case "$prog" in
+    std:*)
+      mod=${prog#std:}
+      grep -oE '^(export )?function [A-Za-z0-9_]+' "std/$mod.vl" 2> /dev/null | awk '{ print $NF }' > "$T/fns" || true
+      awk -F'\t' -v pop="$pop" -v stub="$stub" -v mod="$mod" -v w="$CEN/" '
+        FILENAME == ARGV[1] { fn[$1] = 1; next }
+        FILENAME == ARGV[2] { if ($1 == pop) listed[$2] = 1; next }
+        $3 ~ /^fnu / { u = $3; sub(/^fnu /, "", u); sub(/ \|.*/, "", u); b = u; sub(/\$.*/, "", b)
+          p = $1; sub(w, "", p)
+          if ((b in fn) && !(p in listed) && !(p in done)) { done[p] = 1; print pop "\t" p "\t" stub; print mod "\t" p > "/dev/stderr" } }
+      ' "$T/fns" "$SW/failing.tsv" "$CEN/$pop.rows" >> "$T/fail" 2>> "$T/stdblock"
+      ;;
+    *) printf '%s\t%s\t%s\n' "$pop" "$prog" "$stub" >> "$T/fail" ;;
+  esac
+done < "$SW/failing.tsv"
+
 {
   printf '# I8 red list%s: ir-i8-sweep (keep list) joined with the I8 census on one seed (red.sh).\n' \
     "${SHA:+ on master $SHA}"
@@ -47,7 +68,7 @@ cat "$CEN"/*.rows | awk -F'\t' -v w="$CEN/" '$3 ~ /^(fnu |claim fell back)/ {
         split(L[i], f, "\t"); k = cls(f[1], f[2])
         print $1, p, $3, f[1], f[2], (k in own ? own[k] : "unowned")
       }
-    }' "$OWNERS" "$T/unc" "$SW/failing.tsv" | sort
+    }' "$OWNERS" "$T/unc" "$T/fail" | sort
 } > "$T/red"
 cat "$T/red"
 
@@ -64,3 +85,6 @@ if [ -n "$PREV" ] && [ -f "$PREV" ]; then
 else
   printf 'red.sh: %d programs, %d units, %d classes\n' "$P" "$U" "$K" >&2
 fi
+# A std module's unit counts once per program it blocks.
+[ -s "$T/stdblock" ] && sort -u "$T/stdblock" | cut -f1 | uniq -c | awk '{ printf "red.sh: std:%s blocks %d programs\n", $2, $1 }' >&2
+exit 0
