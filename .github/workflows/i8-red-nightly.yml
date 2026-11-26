@@ -1,0 +1,148 @@
+# The I8 burn-down, measured nightly on master: the programs that would stop running were legacy's
+# expression emitter deleted, each attributed to the unit and class that blocks it and to the class's
+# owner (scripts/ir-i8-census/owners.tsv). It is CENSUS's recipe, run as is:
+#   census.sh <seed> C; ir-i8-sweep.sh scripts/ir-i8-census/keep --out W; red.sh C W --prev <last>.
+# Artifact `i8-red` holds red.tsv and the sweep report. The job summary carries red.sh's line
+# (programs, units, classes, each with its delta from the previous successful run). It is red only
+# when a step cannot run; a newly failing program is the measurement, not a failure. Off the PR path.
+name: i8-red-nightly
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: i8-red-nightly
+  cancel-in-progress: false
+
+# The same fixed feature level as ci.yml, which shares this seed cache namespace.
+env:
+  VL_ISA: x86-64-v3
+
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      # The seed's compiled forms live in a private cache outside the checkout (DECISIONS.md,
+      # "The seed sidecar lives only in the user's private cache"); the seed cache steps save it.
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+
+      # Keys and caches are ci.yml's `seed` job's, as sweep.yml's are.
+      - name: Cache keys
+        id: keys
+        run: |
+          echo "bin=vl-bin-${{ runner.os }}-$(rustc -V | tr ' ' '_')-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**', 'compiler/check_intrinsics.vl') }}" >> "$GITHUB_OUTPUT"
+          echo "seed=vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/src/**', 'scripts/warm-seed.sh') }}" >> "$GITHUB_OUTPUT"
+          echo "rustc=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache vl-host binary
+        id: vlbin
+        uses: actions/cache@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ steps.keys.outputs.bin }}
+
+      - name: Cache cargo + vl-host target
+        if: steps.vlbin.outputs.cache-hit != 'true'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            scripts/vl-host/target
+          key: cargo-${{ runner.os }}-${{ steps.keys.outputs.rustc }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ steps.keys.outputs.rustc }}-
+            cargo-${{ runner.os }}-
+
+      - name: Build vl-host (native tool)
+        if: steps.vlbin.outputs.cache-hit != 'true'
+        run: cargo build --release
+        working-directory: scripts/vl-host
+
+      - name: Cache seed compiler wasm
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            ${{ runner.temp }}/vl-seed-cache
+          key: ${{ steps.keys.outputs.seed }}
+          restore-keys: |
+            vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
+            vl-seed4-${{ runner.os }}-
+
+      - name: Refresh seed + native fixpoint
+        run: ./scripts/refresh-compiler.sh --allow-refetch --prove-fixpoint --no-fuel-sidecars
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # The census reads binaryen's disassembler from node_modules.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install node deps
+        run: npm ci
+
+      # The previous successful run's red.tsv, for the deltas; none on the first run.
+      - name: Previous red.tsv
+        run: |
+          mkdir -p prev
+          run=$(gh run list --repo "$REPO" --workflow i8-red-nightly.yml --branch master --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "$run" ] && gh run download "$run" --repo "$REPO" -n i8-red -D prev; then
+            echo "previous: run $run"
+          else
+            echo "previous: none"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+
+      - name: Census
+        run: bash scripts/ir-i8-census/census.sh build/vl-compiler.wasm "$RUNNER_TEMP/census"
+        env:
+          JOBS: 4
+
+      # The sweep exits 1 whenever a program newly fails, which is the measurement; 2 is a tree that
+      # does not build, and fails the job.
+      - name: Sweep
+        run: |
+          rc=0
+          bash scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep --out "$RUNNER_TEMP/sweep" || rc=$?
+          [ "$rc" -le 1 ] || exit "$rc"
+          grep '^unexplained' "$RUNNER_TEMP/sweep/report.txt" || true
+        env:
+          JOBS: 4
+
+      - name: Red list
+        run: |
+          mkdir -p out
+          prev=(); [ -f prev/red.tsv ] && prev=(--prev prev/red.tsv)
+          bash scripts/ir-i8-census/red.sh "$RUNNER_TEMP/census" "$RUNNER_TEMP/sweep" --sha "$GITHUB_SHA" "${prev[@]}" \
+            > out/red.tsv 2> out/summary.txt
+          cp "$RUNNER_TEMP/sweep/report.txt" out/sweep-report.txt
+          cat out/summary.txt
+          {
+            echo "### I8 burn-down at ${GITHUB_SHA::9}"
+            echo
+            grep '^red.sh:' out/summary.txt
+            grep '^unexplained' out/sweep-report.txt || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: i8-red
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
