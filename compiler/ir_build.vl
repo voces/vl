@@ -2301,7 +2301,7 @@ function rowlessRecordTy(ix: i32, t: i32, rep: i32): i32 {
   if t < 0 || repNodeOfTy(t) == rep || !builtRecord(t, repNodeOfTy(t)) {
     return t
   }
-  const rt = builtStoredTy(t, repNodeOfTy(t), storeRowTyOf(ix))
+  const rt = builtStoredTy(t, repNodeOfTy(t), storeRowOf(ix))
   return if rt >= 0 && repNodeOfTy(rt) == rep { rt } else { t }
 }
 
@@ -2311,10 +2311,10 @@ function rowlessRecord(t: i32, rep: i32): boolean {
   return t >= 0 && repNodeAt(rep) is RRecord && structIndexOfTy(t) < 0
 }
 
-// The recorded type of the struct row legacy stores value `ix` in (`structIndexOfExpr`), or -1.
-function storeRowTyOf(ix: i32): i32 {
+// The struct row legacy stores value `ix` in (`structIndexOfExpr`), or -1.
+function storeRowOf(ix: i32): i32 {
   const row = structIndexOfExpr(ix, ibFnIx)
-  return if row >= 0 && row < sTyIx.length { sTyIx[row] } else { -1 }
+  return if row >= 0 && row < sTyIx.length { row } else { -1 }
 }
 
 // Storage row type `rowTy` where a value of record type `t` at rep `rep`, a type no struct row
@@ -2338,10 +2338,13 @@ function builtRecord(t: i32, rep: i32): boolean {
   return t >= 0 && repNodeAt(rep) is RRecord
 }
 
-// Storage row type `rowTy` where a built value of record type `t` at rep `rep` is held at that row's
-// rep, another record; else -1.
-function builtStoredTy(t: i32, rep: i32, rowTy: i32): i32 {
-  if !builtRecord(t, rep) || rowTy < 0 || irTyOpen(rowTy) { return -1 }
+// The type of storage row `row` where a built value of record type `t` at rep `rep` is held at
+// that row's rep, another record; else -1. A row open only where it stores closed counts.
+function builtStoredTy(t: i32, rep: i32, row: i32): i32 {
+  const rowTy = if row >= 0 { sTyIx[row] } else { -1 }
+  if !builtRecord(t, rep) || rowTy < 0 || !rowTyBuildsAt(rowTy, row) {
+    return -1
+  }
   const rr = repNodeOfTy(rowTy)
   return if rr != rep && repNodeAt(rr) is RRecord { rowTy } else { -1 }
 }
@@ -3334,22 +3337,14 @@ function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
   // A read of a place holds the place's rep, which the place decides (`rowlessLetTy`).
   const nd = nodeAt(unwrapParen(ix))
   if nd is Ident || nd is Member { return r }
-  const rt = builtStoredTy(t, r, storeRowTyOf(ix))
+  const rt = builtStoredTy(t, r, storeRowOf(ix))
   if rt < 0 { return r }
-  // The exclusions below hold for a type a struct row records; a rowless one moves, as before.
-  // Removed by layout stage 2 (a literal at its row, its function's result at the row too): an
-  // object literal stays at its own rep, the one its function's result returns.
-  if structIndexOfTy(t) >= 0 && nd is ObjLit { return r }
   // An element read moves only off a list laid out at that row (`listRowRep`).
   if (
     structIndexOfTy(t) >= 0
     && nd is Index
     && !listRowElemIs(nd.idxArr, repNodeOfTy(rt))
   ) {
-    return r
-  }
-  // Removed by layout stage 2: a value whose rep retags into the row (a twin) keeps its rep.
-  if structIndexOfTy(t) >= 0 && recRetagNoted(r, repNodeOfTy(rt), ix) {
     return r
   }
   return repNodeOfTy(rt)
@@ -6403,9 +6398,14 @@ function globalTyRep(ty: i32): i32 {
 }
 
 // The result type of the function at `fnStmts` slot `pos` (declared at `d`, annotated by `ann`):
-// its annotation, else its recorded result, which legacy's functype names, else the checker's.
+// its annotation, else its recorded result, which legacy's functype names, else the checker's;
+// either held at the struct row legacy declares it at where that row's rep differs (`retDeclRowTy`).
 function resultTy(pos: i32, ann: i32, d: i32): i32 {
-  if ann >= 0 { return resultFrameTy(pos, nodeTyAt(ann, d)) }
+  if ann >= 0 {
+    const at = nodeTyAt(ann, d)
+    const adt = retDeclRowTy(pos, at)
+    return resultFrameTy(pos, if adt >= 0 { adt } else { at })
+  }
   const rec = if pos >= 0 && pos < fRecRetTy.length { fRecRetTy[pos] } else { -1 }
   const t = if rec >= 0 { rec } else { fnCheckedRetTy(pos) }
   // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`),
@@ -6436,14 +6436,18 @@ function resultDescTy(pos: i32): i32 {
 }
 
 // The record type of the struct row legacy declares `fnStmts` slot `pos`'s inferred result at
-// (`fRetKind`, `fRetStructIdx`) where result type `t` is not that row (`declRowTy`), or -1.
+// (`fRetKind`, `fRetStructIdx`) where result type `t` is held at another rep, or -1: the row's
+// declared type (`declRowTy`), or its recorded one where that is open only where it stores closed.
 function retDeclRowTy(pos: i32, t: i32): i32 {
   if pos < 0 || pos >= fRetKind.length || pos >= fRetStructIdx.length {
     return -1
   }
-  if fRetKind[pos] != "struct" || fRetStructIdx[pos] < 0 { return -1 }
-  if repRowOfTyStruct(t, repScanLim()) == fRetStructIdx[pos] { return -1 }
-  return declRowTy(fRetStructIdx[pos])
+  const si = fRetStructIdx[pos]
+  if fRetKind[pos] != "struct" || si < 0 || si >= sTyIx.length { return -1 }
+  const dt = declRowTy(si)
+  const st = sTyIx[si]
+  const rt = if dt >= 0 { dt } else if st >= 0 && rowTyBuildsAt(st, si) { st } else { -1 }
+  return if rt >= 0 && repNodeOfTy(rt) != repNodeOfTy(t) { rt } else { -1 }
 }
 
 // The result rep of that function. Legacy's voidness (`fRetVoid`) decides no value, as its
