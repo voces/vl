@@ -6,6 +6,7 @@ import { variantFieldTypeAt } from "./emit_atom_kinds"
 // over the same operands; the lowering takes its scratch slots from the shared lazy list frame.
 // Every other element or member read is a named miss. `irRefInstall` sets the hooks.
 
+import { NULL_OWN_NONE, nullOwnAt } from "./emit_plan_null"
 import { BinExpr, Call, Ident, Index, LetDecl, Member, P, nodeAt } from "./ast"
 import {
   IrFn,
@@ -343,6 +344,17 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
     && repPrim(vr.rlsElem) == "str"
     && repNodeAt(rep) is RAtom
     && idxArmOf(n, fnIx) == "str"
+  // An atom element read as its literal's string is read at the atom; its consumer decodes it, as a
+  // field's is.
+  const atomStr = vr is RList
+    && repNodeAt(vr.rlsElem) is RAtom
+    && repPrim(rep) == "str"
+    && exprIsLitAtom(ix, fnIx)
+  // A nullable element the read narrows to the `null` unit is that unit: the element read as stored
+  // and dropped, then the bottom ref (`RNullOf`).
+  const nulDropped = en is RNullable
+    && repPrim(rep) == "null"
+    && nullOwnAt(ix, fnIx) == NULL_OWN_NONE
   // A nullable closure element the read narrows non-null is read as stored, then recovered to the
   // closure (`RRecover`), so a delivery to a non-null closure slot holds one.
   const cloStored = en is RNullable
@@ -364,6 +376,8 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
     && !refRecovered
     && !stored
     && !strAtom
+    && !atomStr
+    && !nulDropped
     && !cloStored
     && !boxView
     && !recTwin
@@ -404,7 +418,20 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
       repTyOf(rep),
     )
   }
-  if (stored || strAtom) && vr is RList {
+  if nulDropped && vr is RList {
+    const ne = irBLetTempTy(b, r, ix, vr.rlsElem, repTyOf(vr.rlsElem))
+    // Read at its storage (a `print` of its nullable arm), it is the element as stored.
+    if stRead { return ne }
+    irBNode(b, { dpV: ne }, -1, irBNoValue(), ix)
+    return irBLetTempTy(
+      b,
+      { nuAt: ix, nuOwn: NULL_OWN_NONE, nuRead: [] },
+      ix,
+      rep,
+      repTyOf(rep),
+    )
+  }
+  if (stored || strAtom || atomStr) && vr is RList {
     return irBLetTempTy(b, r, ix, vr.rlsElem, repTyOf(vr.rlsElem))
   }
   if (recTwin || nicheView) && vr is RList {
