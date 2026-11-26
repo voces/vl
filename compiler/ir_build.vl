@@ -4367,11 +4367,16 @@ function letMapNewHeld(init: i32, v: i32): boolean {
 // shape holds (`letMapShapeOfTy`, the plan legacy's cell is declared from), where that value type is
 // closed at another rep (a later widening's row); else -1.
 function slotMapHeldTy(d: i32, ty: i32): i32 {
+  return slotMapHeldTyIn(d, ty, ibFnIx)
+}
+
+// `slotMapHeldTy` of `let` `d` declared in `fnIx`, -1 for a global's.
+function slotMapHeldTyIn(d: i32, ty: i32, fnIx: i32): i32 {
   const m = repNodeAt(repNodeOfTy(ty))
   if !(m is RMap) || d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) {
     return -1
   }
-  const sh = letMapShapeOfTy(d, ibFnIx)
+  const sh = letMapShapeOfTy(d, fnIx)
   if sh < 0 { return -1 }
   const st = mvValTyIxAt(sh)
   if st < 0 || irTyOpen(st) || repNodeOfTy(st) == m.rmVal { return -1 }
@@ -5683,6 +5688,16 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !narrowed
       && rep == globalTyRep(scopeTyAt(d, -1))
       && cellRep == globalTyRep(letBindTy(d, -1))
+    // A `Map()` cell held at its slot's map (`globalSlotMapTy`), read at its binding's type, reads
+    // the cell as it is stored, as a local's is (`slotMapHeldVar`).
+    const sm = if cellRep != rep && !narrowed && !stored { globalSlotMapTy(d) } else { -1 }
+    if (
+      sm >= 0
+      && repNodeOfTy(sm) == cellRep
+      && rep == globalTyRep(scopeTyAt(d, -1))
+    ) {
+      return globalStoredRead(b, g, ix, cellRep, sm)
+    }
     // An atom-assignment cell (`atomCellRep`) read at a string is its id, decoded as legacy's
     // `emitAtomToStr` decodes it; a delivery (`cell`) takes the id as it stands.
     if (
@@ -6997,6 +7012,11 @@ function globalStoreTy(d: i32, rep: i32): i32 {
     && repTyOf(rep) >= 0
     && cellDeclStores(d, repNodeOfTy(ht), rep)
   ) {
+    return repTyOf(rep)
+  }
+  // A `Map()` cell held at its slot's map (`globalSlotMapTy`) is stored at that map.
+  const sm = globalSlotMapTy(d)
+  if sm >= 0 && repNodeOfTy(sm) == rep && repTyOf(rep) >= 0 {
     return repTyOf(rep)
   }
   // A cell whose type has no rep (`openCellRep`) is stored at its rep's type.
@@ -18146,6 +18166,18 @@ function slotMapWalkValTy(mr: i32, er: i32): i32 {
   return if vt >= 0 && repNodeOfTy(vt) != er && repNodeAt(repNodeOfTy(vt)) is RRecord { vt } else { -1 }
 }
 
+// `slotMapWalkValTy` of a global map receiver `mr`: the value type of the map its slot holds
+// (`mapSlotHeldTy`) where that is another record than element rep `er`'s, else -1.
+function globalSlotMapWalkValTy(mr: i32, er: i32): i32 {
+  const u = unwrapParen(mr)
+  if u < 0 || !(nodeAt(u) is Ident) || !(repNodeAt(er) is RRecord) { return -1 }
+  const ty = scopeTyAt(identDeclOf(u), -1)
+  const ht = mapSlotHeldTy(ty, u)
+  if repNodeOfTy(ht) == repNodeOfTy(ty) { return -1 }
+  const vt = tyMapValOf(ht)
+  return if vt >= 0 && repNodeOfTy(vt) != er && repNodeAt(repNodeOfTy(vt)) is RRecord { vt } else { -1 }
+}
+
 // A walk of a union of maps' box (`emitMapUnionFor`): per arm, the walk built over the arm's
 // payload variable, the iterable read as it and typed at the arm (`SArmWrite`).
 function forInMapUnion(b: i32[], n: ForIn, ix: i32) {
@@ -18258,7 +18290,7 @@ function forInStmtAt(
   // the walk records, as a map rep holds no key. The verifier's rule.
   const vals = mr >= 0 && mapWalkReadsValues(n.fiIter)
   // A map local held at its slot's map (`slotMapHeldTy`) walks its values at that map's value.
-  const sv = if vals && g < 0 { slotMapWalkValTy(mr, er) } else { -1 }
+  const sv = if !vals { -1 } else if g < 0 { slotMapWalkValTy(mr, er) } else { globalSlotMapWalkValTy(mr, er) }
   if sv >= 0 { er = repNodeOfTy(sv) }
   const keyRep = if mr >= 0 && !vals { er } else { -1 }
   if keyRep >= 0 && !mapKeyRep(keyRep) { return skip("for in map element rep") }
@@ -21356,12 +21388,28 @@ function mapNewInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     globalNoteAt(gi, gst, cell)
     return irBLetTemp(b, { mnAt: ix }, ix, nr)
   }
+  // A cell whose values the checker builds at another record is held at its slot's map, which the
+  // constructor builds (`mapCtorShapeOf`), as a local's is (`slotMapHeldTy`).
+  const sm = if irGlobalRepOf(ib, gi) < 0 { globalSlotMapTy(gst) } else { -1 }
+  if sm >= 0 {
+    const sr = repNodeOfTy(sm)
+    globalNoteAt(gi, gst, sr)
+    return irBLetTempTy(b, { mnAt: ix }, ix, sr, sm)
+  }
   const stored = irGlobalRepOf(ib, gi) < 0
     && nr != rep
     && nr == globalTyRep(letBindTy(gst, -1))
   if nr != rep && !stored { return irBMiss("global initializer coercion") }
   globalNoteAt(gi, gst, nr)
   return irBLetTemp(b, { mnAt: ix }, ix, nr)
+}
+
+// The map type global `gst`'s `Map()` cell is held at where its slot stores another value record
+// than its type's (`slotMapHeldTyIn`), else -1.
+function globalSlotMapTy(gst: i32): i32 {
+  const g = nodeAt(gst)
+  if !(g is LetDecl) || g.letType >= 0 || !mapCtorOf(g.letInit) { return -1 }
+  return slotMapHeldTyIn(gst, heldTy(scopeTyAt(gst, -1)), -1)
 }
 
 // Whether name `ix` is read as its function's void twin (`voidTwinForNode`).
