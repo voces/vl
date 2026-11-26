@@ -3070,7 +3070,7 @@ Deno.test({
 // plain record and a union arm: a nullable parameter and a narrowed local. An arm narrowed out of
 // a union arrives boxed, and its unbox is a named miss; an explicit `null` takes the field's typed null.
 Deno.test({
-  name: "ir shadow: a nullable record field's value matches, and an owed arm unbox is a named miss",
+  name: "ir shadow: a nullable record field's value matches, a narrowed arm unboxed into it too",
   ignore,
   fn: () => {
     const { rc, rows } = run(`type Node = { v: i32, next: Node | null }
@@ -3116,11 +3116,11 @@ print(qnull().o == null)
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     const cov = rows.get("covered") ?? 0;
-    if (cov < 4 || (rows.get("matched") ?? 0) !== cov) {
-      throw new Error(`want at least cons, hold, moved and qplain covered and matched, got ${JSON.stringify([...rows])}`);
+    if (cov < 6 || (rows.get("matched") ?? 0) !== cov) {
+      throw new Error(`want cons, hold, moved, qplain, hbox and qnarrow covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if ((rows.get("uncovered object field arm unbox") ?? 0) !== 2) {
-      throw new Error(`want hbox and qnarrow a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered object field arm unbox")) {
+      throw new Error(`want hbox and qnarrow's narrowed arm delivered into the field, got ${JSON.stringify([...rows])}`);
     }
     if (rows.has("uncovered object field explicitNull typed null")) {
       throw new Error(`want hnull and qnull's typed null built, got ${JSON.stringify([...rows])}`);
