@@ -30,6 +30,7 @@ import {
   cboxElemTyOfCell,
   cboxIsWriteLet,
   optCallCalleeOfMember,
+  voidTwinForNode,
 } from "./emit_rewrite"
 // The IR shadow (ir-design-2026-11.md §5.2, step I0): with the shadow armed, `emitFuncCode`
 // hands each function here after its legacy lowering. The phase-A builder covers I1's set
@@ -9983,6 +9984,18 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     const ty = if dstTy >= 0 && !(hole && repNodeOfTy(dstTy) != dst) { dstTy } else { repTyOf(dst) }
     return cloValue(b, unwrapParen(ix), dst, ty)
   }
+  // A name the checker coerced to return `void` is its void twin's closure, whose own rep is the
+  // destination's (`fnValueArmOf`'s `twin`).
+  if (
+    ibMiss == ""
+    && dst >= 0
+    && repNodeAt(dst) is RClosure
+    && cloValueIsTwin(unwrapParen(ix))
+    && instanceAt(unwrapParen(ix), dst)
+  ) {
+    const ty = if dstTy >= 0 && repNodeOfTy(dstTy) == dst { dstTy } else { repTyOf(dst) }
+    return cloValue(b, unwrapParen(ix), dst, ty)
+  }
   // A function name typed as a tagged set's id, read where the set marks no leaf, is the closure
   // its destination holds: legacy's `emitIdentNode` writes `emitClosureValue` whatever the type.
   if (
@@ -19583,6 +19596,14 @@ function mapNewInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   return irBLetTemp(b, { mnAt: ix }, ix, nr)
 }
 
+// Whether name `ix` is read as its function's void twin (`voidTwinForNode`).
+function cloValueIsTwin(ix: i32): boolean {
+  const n = nodeAt(ix)
+  if !(n is Ident) { return false }
+  const fe = fnValueFeOf(n, sidOfNode(ix), ix, ibFnIx)
+  return fe >= 0 && voidTwinForNode(ix, fe) >= 0
+}
+
 // Whether function value `ix` is an instance whose own closure rep is `rep` (`instanceClosureRep`).
 function instanceAt(ix: i32, rep: i32): boolean {
   const fe = cloValueFeOf(ix)
@@ -19606,8 +19627,10 @@ function cloInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   if pre != "" { return irBMiss(pre) }
   // A hole or generic function's value at an annotated cell is the instance legacy picks for it,
   // whose own closure rep is the cell's; it is typed at the cell's type.
+  // So is a function's void twin at a `void` cell (`fnValueArmOf`'s `twin`).
   const nt = nodeTyAt(ix, ibFnIx)
-  const inst = repNodeOfTy(nt) != rep && irTyOpen(heldTy(exprTyOf(ix)))
+  const inst = repNodeOfTy(nt) != rep
+    && (irTyOpen(heldTy(exprTyOf(ix))) || cloValueIsTwin(ix))
   if repNodeOfTy(nt) != rep && !(inst && instanceAt(ix, rep)) {
     return irBMiss("global initializer coercion")
   }
@@ -19634,7 +19657,9 @@ function cloValueFeOf(ix: i32): i32 {
   if fe < 0 { return -1 }
   return match fnValueArmOf(fe, ix, -1) {
     "checked" | "inert" | "aliasCore" => fe
-    "twin" | "unfixed" => -1
+    // A value the checker coerced to return `void` closes over the function's void twin.
+    "twin" => voidTwinForNode(ix, fe)
+    "unfixed" => -1
   }
 }
 
