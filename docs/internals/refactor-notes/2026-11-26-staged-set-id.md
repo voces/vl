@@ -18,5 +18,7 @@ starts lost, no other class moved.
 literal type`), head runs with every body claimed.
 
 Q58 position sweep (`tests/cases/closures/hole-fn-set-id-staged-below-valued-if-positions.vl`: a
-list literal walked, a call's arguments, a list inside a function indexed): base 1 function misses,
-head 0; output identical claims-off and on.
+list literal walked, a list inside a function indexed): base 1 function and the start miss, head 0;
+output identical claims-off and on. A call's arguments (`both(a2, if k { a3 } else { a2 })`, an
+un-annotated callee) also stage the id, but hand the set to the tag decision late (a late tag row),
+so the test leaves that position out.
