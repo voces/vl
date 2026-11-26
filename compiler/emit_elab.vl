@@ -7022,6 +7022,8 @@ function elabResultScanReset() {
   elabRetRecMemo = Map()
   elabPlainRecMemo = Map()
   elabMakerLams = Map()
+  elabLamProducers = []
+  elabLamProducerAt = []
   elabResPlainCalls = Map()
   elabAnyRetRecord = false
   elabArgRecs = Map()
@@ -7587,7 +7589,20 @@ function elabSlotRecordNote(c: i32) {
   // A value that reads a holder stands for the holder's call, and the holder is held whole.
   const linked: i32[] = []
   const stores: i32[] = []
+  // A hole lambda written into the slot is built as the record at its signatures (D17572).
+  const lams: i32[] = []
   for v0 in vals {
+    const lv = parenPeelIx(v0)
+    const ln = if lv >= 0 && lv < P.nodes.length { nodeAt(lv) } else { null }
+    if (
+      ln is FuncDecl
+      && ln.fnName == ""
+      && elabDeclHasHoleParam(lv)
+      && elabInPlainCode(lv)
+    ) {
+      lams.push(lv)
+      continue
+    }
     const v = elabSlotValueCall(v0)
     if (
       v < 0
@@ -7731,7 +7746,15 @@ function elabSlotRecordNote(c: i32) {
   const rft = if !isList && !isMap { elabSlotRecFieldTy(d, nodeTyIxOf(d)) } else { -1 }
   if rft >= 0 { elabSlotTys[elabSlotKey(d, -1)] = rft }
   elabAnyRetRecord = true
-  for v in vals { elabTriplePut(elabResKeeps, elabSlotValueCall(v), -1, 1) }
+  for v in vals {
+    if !i32ListHas(lams, parenPeelIx(v)) {
+      elabTriplePut(elabResKeeps, elabSlotValueCall(v), -1, 1)
+    }
+  }
+  for l in lams {
+    elabLamProducers.push(l)
+    elabLamProducerAt.push(at)
+  }
   for h in linked {
     elabHolderPut(h, -1, at)
     for t in elabResThrough.get(h) ?? [] {
@@ -9046,10 +9069,26 @@ function elabMakerLamRecord(d: i32, dn: FuncDecl): i32[] {
   const lam = elabMakerRetLam(dn)
   if lam < 0 { return none }
   const sigs: i32[] = []
-  if !elabMakerHolderSigs(lam, d, sigs, [d]) || sigs.length < 2 { return none }
+  if !elabMakerCallsSigs(lam, d, sigs, [d]) || sigs.length < 2 { return none }
   elabMakerLams[d] = lam
   return sigs
 }
+
+// Each hole lambda a slot holding a record is written with, and the record (an index into
+// `elabRecTable`) it is built as there (D17572).
+let elabLamProducers: i32[] = []
+let elabLamProducerAt: i32[] = []
+
+// The record signatures hole lambda `lam` is built as where a slot holding a record is written
+// with it; none for any other lambda.
+export function elabLamProducerSigs(lam: i32): i32[] {
+  const at = i32ListIndexOf(elabLamProducers, nodeSrc[lam] ?? lam)
+  const r = if at >= 0 { elabLamProducerAt[at] } else { -1 }
+  return if r >= 0 && r < elabRecTable.length { elabRecTable[r] } else { [] }
+}
+
+// The hole lambdas `elabLamProducerSigs` answers for, in noting order.
+export function elabLamProducerList(): i32[] { return elabLamProducers }
 
 // Per plain maker whose returned lambda the elaboration made a record of, that lambda.
 let elabMakerLams: {[i32]: i32} = Map()
@@ -9059,11 +9098,11 @@ export function elabMakerLamOf(d: i32): i32 {
   return elabMakerLams[nodeSrc[d] ?? d] ?? -1
 }
 
-// Adds to `sigs` the signature of each call through a holder, or a copy of one, of a call of plain
-// function `d`, and of the plain functions in `seen`'s chain that return such a call whole. False
-// where one stays open or a call is not so held: the maker converts only when every call is, all
-// or nothing.
-function elabMakerHolderSigs(
+// Adds to `sigs` the signatures every call of plain function `d` is called at through the
+// destinations its value flows to (`elabMakerDestSigs`), the functions in `seen`'s chain returning
+// such a call whole included. False where one stays open or a destination is not a call-through:
+// the maker converts only when every call's value is, all or nothing.
+function elabMakerCallsSigs(
   lam: i32,
   d: i32,
   sigs: i32[],
@@ -9071,47 +9110,197 @@ function elabMakerHolderSigs(
 ): boolean {
   for c in elabResPlainCalls.keys() {
     if (elabResPlainCalls[c] ?? -1) != d { continue }
-    const h = elabResHolder[c] ?? -1
-    if h >= 0 {
-      const ws: i32[] = [h]
-      for w in elabCopiesDeep(h) { ws.push(w) }
-      const mine: i32[] = []
-      for w in ws {
-        // Every read of the holder or a copy is a call through it, a further copy, or a write or
-        // link of the holder itself.
-        const th = elabResThrough[w] ?? []
-        const own = th.length
-          + (elabResCopies[w] ?? []).length
-          + elabResWriteReads(w)
-          + elabResLinkReads(w)
-        if (elabResReads[w] ?? 0) != own { return false }
-        for t in th {
-          const sig = elabMakerSigOf(lam, t)
-          if sig < 0 { return false }
-          if !elabTyListHolds(mine, sig) { mine.push(sig) }
-          if !elabTyListHolds(sigs, sig) { sigs.push(sig) }
-        }
+    if !elabMakerDestSigs(lam, d, c, sigs, seen) { return false }
+  }
+  return true
+}
+
+// The destination walk for call `c` of maker `d`: a holder and its copies, a slot of a field or
+// list and its reads, or a function returning the call whole. Each arm adds the signatures its
+// calls-through take; false where the value reaches anything else.
+function elabMakerDestSigs(
+  lam: i32,
+  d: i32,
+  c: i32,
+  sigs: i32[],
+  seen: i32[],
+): boolean {
+  const h = elabResHolder[c] ?? -1
+  if h >= 0 {
+    const ws: i32[] = [h]
+    for w in elabCopiesDeep(h) { ws.push(w) }
+    const mine: i32[] = []
+    for w in ws {
+      // Every read of the holder or a copy is a call through it, a further copy, or a write or
+      // link of the holder itself.
+      const th = elabResThrough[w] ?? []
+      const own = th.length
+        + (elabResCopies[w] ?? []).length
+        + elabResWriteReads(w)
+        + elabResLinkReads(w)
+      if (elabResReads[w] ?? 0) != own { return false }
+      for t in th {
+        if !elabMakerSigAdd(lam, t, sigs, mine) { return false }
       }
-      // A holder calling one signature alone, with no copy or link to share the record, is a plain
-      // closure's, which a record does not serve.
-      if mine.length < 2 && ws.length < 2 && elabResLinkReads(h) == 0 {
+    }
+    // A holder calling one signature alone, with no copy or link to share the record, is a plain
+    // closure's, which a record does not serve.
+    return mine.length >= 2 || ws.length >= 2 || elabResLinkReads(h) > 0
+  }
+  const sr = elabMakerSlotSigs(lam, d, c, sigs)
+  if sr >= 0 { return sr == 1 }
+  // A function returning the call whole hands it to its own callers' destinations.
+  const f = elabEnclosingFn(c)
+  const fn = if f >= 0 { nodeAt(f) } else { null }
+  if !(fn is FuncDecl) || i32ListHas(seen, f) { return false }
+  const rv: i32[] = []
+  collectRetValues(fn.fnBody, rv)
+  let ret = false
+  for v in rv {
+    if parenPeelIx(v) == c { ret = true }
+  }
+  if !ret { return false }
+  seen.push(f)
+  return elabMakerCallsSigs(lam, f, sigs, seen)
+}
+
+// Adds the signature call `t` takes lambda `lam` at to `sigs` and `mine`; false where it stays open.
+function elabMakerSigAdd(lam: i32, t: i32, sigs: i32[], mine: i32[]): boolean {
+  const sig = elabMakerSigOf(lam, t)
+  if sig < 0 { return false }
+  if !elabTyListHolds(mine, sig) { mine.push(sig) }
+  if !elabTyListHolds(sigs, sig) { sigs.push(sig) }
+  return true
+}
+
+// The slot arm of the destination walk: call `c` of maker `d` stored as field `f` of a `const`
+// record literal, an element of a `const` list literal, or a value of a fresh map, every value the
+// slot is written a call of `d`. Adds the signatures of each call through the slot's reads and the `const` places holding
+// one; 1, 0 where a read is anything else, -1 where `c` is stored in no such slot.
+function elabMakerSlotSigs(lam: i32, d: i32, c: i32, sigs: i32[]): i32 {
+  cwIxBuild()
+  if c < 0 || !cwIxCovers(c) { return -1 }
+  const uk0 = cwIxUpKind[c]
+  let f = ""
+  // A map's value is stored by `m[k] = c` or `m.set(k, c)` into a fresh `Map()`.
+  const md = if uk0 == CW_UP_ASG_RHS || uk0 == CW_UP_ARG { elabMapStoreDecl(c) } else { -1 }
+  const isMap = md >= 0
+  if uk0 == CW_UP_FIELD {
+    const fx = cwIxUpAux[c]
+    const fiv = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+    if !(fiv is FieldInit) { return -1 }
+    f = fiv.fiName
+  } else if uk0 == CW_UP_ELEM || isMap {
+    f = "[]"
+  } else {
+    return -1
+  }
+  const lit = if isMap { -1 } else { cwIxUp[c] }
+  if (
+    !isMap
+    && (lit < 0 || !cwIxCovers(lit) || cwIxUpKind[lit] != CW_UP_LETINIT)
+  ) {
+    return 0
+  }
+  const s = if isMap { md } else { cwIxUp[lit] }
+  const sn = if s >= 0 && s < P.nodes.length { nodeAt(s) } else { null }
+  if !(sn is LetDecl) || sn.letType >= 0 { return 0 }
+  if !isMap && sn.letKw != "const" { return 0 }
+  const isList = f == "[]" && !isMap
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(s, [f], vals, ats) < 0 || vals.length == 0 { return 0 }
+  for v in vals {
+    const vc = elabSlotValueCall(v)
+    if vc < 0 || (elabResPlainCalls[vc] ?? -1) != d { return 0 }
+  }
+  const mine: i32[] = []
+  const ow = cwOccWalk(s)
+  while cwOccNext(ow) {
+    const k = cwIxKind[ow.row]
+    const u = cwIxNode[ow.row]
+    if k == CW_OCC_USE {
+      if cwUseInOtherFrame(u) || !cwIxCovers(u) || cwIxUpKind[u] != CW_UP_OBJ {
+        return 0
+      }
+      const m = cwIxUp[u]
+      const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+      // The slot's own place: the field, any element, or a map's value read by index or `get`.
+      let place = m
+      let own = false
+      if isMap {
+        if mn is Index {
+          own = true
+        } else if (
+          mn is Member
+          && (mn.memProp == "get"
+            || mn.memProp == "set"
+            || mn.memProp == "has"
+            || mn.memProp == "keys")
+        ) {
+          // `set` is a write the slot's values hold; `has` and `keys` read no value.
+          const mk = if cwIxCovers(m) { cwIxUpKind[m] } else { -1 }
+          if mk != CW_UP_CALLEE && mn.memProp != "has" { return 0 }
+          own = mn.memProp == "get"
+          place = if own { cwIxUp[m] } else { m }
+        } else {
+          return 0
+        }
+      } else {
+        own = if isList { mn is Index } else { mn is Member && mn.memProp == f }
+      }
+      if !own {
+        // A map's other members, a list's length, or another field of the record, read no value.
+        const other = isMap
+          || (if isList { mn is Member && mn.memProp == "length" } else { mn is Member })
+        if !other { return 0 }
+        continue
+      }
+      const uk = if cwIxCovers(place) { cwIxUpKind[place] } else { -1 }
+      if uk == CW_UP_CALLEE {
+        if !elabMakerSigAdd(lam, cwIxUp[place], sigs, mine) { return 0 }
+      } else if uk == CW_UP_LETINIT {
+        if !elabMakerPlaceSigs(lam, cwIxUp[place], sigs, mine) { return 0 }
+      } else if !(isMap && (uk == CW_UP_ASG_LHS || uk == CW_UP_CMP)) {
+        return 0
+      }
+    } else if k != CW_OCC_BIND && k != CW_OCC_ASG {
+      return 0
+    }
+  }
+  return 1
+}
+
+// Adds the signatures of each call through `const` place `h`, initialised with a slot's read, and
+// through its `const` copies; a null test reads no value. False where `h` is read another way.
+function elabMakerPlaceSigs(
+  lam: i32,
+  h: i32,
+  sigs: i32[],
+  mine: i32[],
+): boolean {
+  const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+  if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return false }
+  const hw = cwOccWalk(h)
+  while cwOccNext(hw) {
+    const k = cwIxKind[hw.row]
+    const u = cwIxNode[hw.row]
+    if k == CW_OCC_CALL {
+      if !elabMakerSigAdd(lam, u, sigs, mine) { return false }
+    } else if k == CW_OCC_USE {
+      if cwUseInOtherFrame(u) || !cwIxCovers(u) { return false }
+      const uk = cwIxUpKind[u]
+      // A null test reads no value; a `const` copy is a place of its own.
+      if uk == CW_UP_CALLEE {
+        if !elabMakerSigAdd(lam, cwIxUp[u], sigs, mine) { return false }
+      } else if uk == CW_UP_LETINIT {
+        if !elabMakerPlaceSigs(lam, cwIxUp[u], sigs, mine) { return false }
+      } else if uk != CW_UP_CMP {
         return false
       }
-      continue
+    } else if k != CW_OCC_BIND {
+      return false
     }
-    // A function returning the call whole hands it to its own callers' holders.
-    const f = elabEnclosingFn(c)
-    const fn = if f >= 0 { nodeAt(f) } else { null }
-    if !(fn is FuncDecl) || i32ListHas(seen, f) { return false }
-    const rv: i32[] = []
-    collectRetValues(fn.fnBody, rv)
-    let ret = false
-    for v in rv {
-      if parenPeelIx(v) == c { ret = true }
-    }
-    if !ret { return false }
-    seen.push(f)
-    if !elabMakerHolderSigs(lam, f, sigs, seen) { return false }
   }
   return true
 }
@@ -11338,6 +11527,7 @@ export function elabRun() {
   elabNestedPerEncl()
   elabSoleRekey()
   elabListMemberSigs()
+  elabSlotLamCandidates()
   elabClosedLamRootKeys()
   elabReturnCredits()
   elabStoredHoleDefaults()
@@ -12337,6 +12527,108 @@ function elabListMemberSigs() {
     }
   }
   elabSettle(0)
+}
+
+// Mints, as candidates, each hole lambda written into a slot beside a call at every parameter
+// list an instance of that call's hole lambda arguments has: the signatures the slot's record
+// may take, which `elabSlotRecordNote` builds the lambda at after the run (D17572).
+function elabSlotLamCandidates() {
+  let any = false
+  for c in elabResSlotCalls {
+    const lams = elabSlotHoleLams(c)
+    if lams.length == 0 { continue }
+    const vals: i32[] = []
+    const ats: i32[] = []
+    if !elabSlotValuesOf(c, vals, ats) { continue }
+    for v0 in vals {
+      const v = elabSlotValueCall(v0)
+      const vn = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
+      if !(vn is Call) { continue }
+      for a in vn.callArgs {
+        const al = parenPeelIx(a)
+        if al < 0 || !elabIsHoleLam(al) { continue }
+        let k = 0
+        while k < ekDecl.length {
+          if ekDecl[k] == al {
+            const pts = elabKeyParamTys(k)
+            if pts.length > 0 {
+              for l in lams {
+                if elabMemberKeyAt(l, pts) < 0 {
+                  elabDemandCandidate(l, pts, -1, -1)
+                  any = true
+                }
+              }
+            }
+          }
+          k = k + 1
+        }
+      }
+    }
+  }
+  if any { elabSettle(0) }
+  return 0
+}
+
+// Whether `d` is a lambda with a hole parameter.
+function elabIsHoleLam(d: i32): boolean {
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  return n is FuncDecl && n.fnName == "" && elabDeclHasHoleParam(d)
+}
+
+// The closed parameter types of instance `k`, or [] where one stays open.
+function elabKeyParamTys(k: i32): i32[] {
+  const n = nodeAt(ekDecl[k])
+  if !(n is FuncDecl) { return [] }
+  const out: i32[] = []
+  let i = 0
+  while i < n.fnParams.length {
+    const t = elabKeyParamTy(k, i)
+    if t < 0 { return [] }
+    out.push(t)
+    i = i + 1
+  }
+  return out
+}
+
+// Appends the values written into the slot call `c` initialises, with their sites; false where
+// `c` is no field, element or map value of a fresh binding, or a write is not seen.
+function elabSlotValuesOf(c: i32, vals: i32[], ats: i32[]): boolean {
+  cwIxBuild()
+  if c < 0 || !cwIxCovers(c) { return false }
+  const uk = cwIxUpKind[c]
+  let d = -1
+  let f = "[]"
+  if uk == CW_UP_ASG_RHS || uk == CW_UP_ARG {
+    d = elabMapStoreDecl(c)
+  } else if uk == CW_UP_FIELD || uk == CW_UP_ELEM {
+    const lit = cwIxUp[c]
+    if lit >= 0 && cwIxCovers(lit) && cwIxUpKind[lit] == CW_UP_LETINIT {
+      d = cwIxUp[lit]
+    }
+    if uk == CW_UP_FIELD {
+      const fx = cwIxUpAux[c]
+      const fiv = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+      if !(fiv is FieldInit) { return false }
+      f = fiv.fiName
+    }
+  }
+  return d >= 0 && cwSlotWrittenValues(d, [f], vals, ats) >= 0
+}
+
+// The hole lambdas in plain code written into the slot call `c` initialises.
+function elabSlotHoleLams(c: i32): i32[] {
+  const out: i32[] = []
+  if c < 0 || !elabInPlainCode(c) { return out }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if !elabSlotValuesOf(c, vals, ats) { return out }
+  for v0 in vals {
+    const lv = parenPeelIx(v0)
+    if elabIsHoleLam(lv) && elabInPlainCode(lv) && !i32ListHas(out, lv) {
+      out.push(lv)
+    }
+  }
+  return out
 }
 
 // The instances a set member `m` is minted under: each of a lambda's encloser's instances, a
