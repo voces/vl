@@ -25,6 +25,18 @@ is now claimed, and each runs under `VL_IR_REQUIRE_CLAIM=1` with legacy's output
 | D15716's witness | `7` |
 | D3403's witness | `4`, `i` |
 
+**Whole-corpus census.** `VL_IR_SHADOW=5` probe rows over 29,560 programs: tests/cases, the
+distilled cells, the capability probes and 5,164 witnesses filed `runs`. Merge-base `dfb9a8026`
+against branch:
+
+| arm | `fnc` | `fnu` |
+| --- | --- | --- |
+| merge-base | 168,538 | 308 |
+| branch | 168,538 | 303 |
+
+Only the five `@start` bodies above (the position test among them) leave `fnu`. Nothing is newly
+missed, and no `fail` rows appear.
+
 **Q58.** `tests/cases/records/stored-nullable-wide-field-read-at-own-scalar-positions.vl` reads the
 stored field in five positions: a print argument, a binding, an operand, a call argument and a
 return. It does so at `i64 | null` and `f64 | null`, inside a function and at top level.
