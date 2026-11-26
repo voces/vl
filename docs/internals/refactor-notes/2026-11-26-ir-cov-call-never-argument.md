@@ -9,10 +9,12 @@ Lane COV-CALL; census row `callee signature`, the `never` parameter family (the 
 call. Legacy writes the `fail()` call, then `call $id (unreachable)`: the call is dead past the
 argument.
 
-- `directCallAt` asks `neverArgOf` before signing the callee. With an argument typed `never`,
+- Where `calleeSig` refuses, `directCallAt` asks `neverArgOf`. With an argument typed `never`,
   `deadCallAfter` builds that argument's call as a statement and the call as `RDeadNever`, the
   `unreachable` the IR already writes for a dead `never` value. Effect-free arguments before it
-  are written as nothing; any other misses by name (`dead call argument before`).
+  are written as nothing; any other misses by name (`dead call argument before`). A callee whose
+  signature has reps keeps its ordinary call, so the closure-call positions
+  `tests/ir-shadow-rows/closure-call-never-positions.vl` pins still match legacy's bytes.
 - The `RDeadNever` statement lowering, which took only a dead call through a field, takes any
   call. It drops a value only where a member call yields one.
 - `irNodeEndsPath` counts `RDeadNever` as ending its path, so a returned dead call is the
