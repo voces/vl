@@ -7,9 +7,12 @@ Legacy picks the null-pair constant by `nulNoneEqRoute`: `nulNoneEqSides`, or a 
 `null` (`asgYieldsNullLit`). The builder asked only `nulNoneEqSides`, so the compare fell through
 to the numeric operator and refused the `null` operand. Both builder sites now ask the route.
 
-On the assignment route, legacy drops each side's value where it is built. Sinking the left value
-past the right side would leave the value equal but the bytes not. So `nulNonePairEq` drops in
-place on that route and keeps its sink for a plain `null` pair.
+`nulTest` takes the route only where `eqRouteOf` says `nulNone`. Legacy asks other routes first: a
+null-name test claims `(r = null) == null` (`unions/deep-is-arm-write-in-expression.vl`'s `before`).
+
+Where the right side assigns `null`, legacy drops the left's value before that store. So
+`nulNonePairEq` drops the left in place there and otherwise defers both drops past the sides, as
+it did. Deferring a left call past the right's store would leave the value equal but the bytes not.
 
 `ir-parity`: byte-identical on both programs. The case already holds each position: an assignment
 on the left or the right, both sides assigning, a `null`-typed binding, a global, and a side whose
