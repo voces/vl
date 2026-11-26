@@ -13317,3 +13317,15 @@ function's result at the row too): an object literal keeps its own rep, and a va
 retags into the row keeps its rep. The field-code half is one accessor COV-START owns,
 `structRowFnSlotLayout` (a function slot laid out as a closure or a tagged id). It lands with its
 first caller, D17015's tag pass.
+
+## A generic call's instance follows the rep its argument is built at (2026-11-26, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-26** (D17641). Where an argument is built at a rep other than its
+checker type, the generic callee's instance is keyed at the built rep, and the call's value is the
+instance's result type. The built rep is the checker's own stamp (`nodeRepTyIxOf`, set where a
+literal or list is adopted at another record's row), so mono reads it where it keys the instance:
+each type parameter the argument's parameter names is bound by matching the annotation against the
+built rep. Where the built rep is the argument's type, nothing changes. It is the rep-follows-storage
+rule, stated as an outcome, not a pin per upstream fact. Making the elaboration's key the binding for
+every call, instance bodies included, is [D17574](docs/internals/inventory/D17574.md), next in SOUND's queue, a clause-1 row in its grading list riding on it. Inside an instance body an
+annotation naming the type parameter still reads the check's binding, so that rule cannot land alone.
