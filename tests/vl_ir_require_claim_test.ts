@@ -35,6 +35,7 @@ const run = async (env: Record<string, string>): Promise<Res> => {
       env: nativeEnv({
         NO_COLOR: "1",
         VL_NO_CACHE: "1",
+        VL_IR_STRICT: "",
         VL_IR_REQUIRE_CLAIM: "",
         VL_TEST_CLAIM_REFUSAL: "",
         ...env,
