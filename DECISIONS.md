@@ -13257,6 +13257,21 @@ alone: 316 of the 26,238 programs these modes cover (299 `tests/cases` programs,
 probe, 1 distilled cell, 15 `runs` witnesses), counted as no `print(`, `printErr(` or `@trap` in
 the source.
 
+## A map of bundle records of different signatures holds their union; the read side comes later (2026-11-26, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-26** (D17106). A map whose stores return bundle records of
+different signature sets holds the union of those records in its value slot, each store keeping its
+own record whole, and this storage is the final one. The value read back is a second stage
+([D17573](docs/internals/inventory/D17573.md)), a `ref.test` dispatch on the row and then the member
+pick, with no storage change. Stage 1 is keyed on whether the map has a value read, not on a usage
+shape. A map with a read keeps today's refusal until stage 2, so nothing that runs stops running.
+Calling a map value at a signature some stored record has no member for is a type error, refused by
+the checker with a sentence naming the contract, ahead of stage 2. Stage 2 is not on the I8 path and
+queues after family C. Design: `docs/internals/bundle-map-union-2026-11.md`.
+
+**Why.** Building stage 1 as a special case for maps that are only key-tested would have been
+thrown away by stage 2. Building the final storage first means stage 2 only reads.
+
 ## One structural converter, `irConvert`, for every delivery site (2026-11-26, coordinator ruling)
 
 **Ruled by the coordinator 2026-11-26.** The IR builder converts a value at one rep to another rep of
