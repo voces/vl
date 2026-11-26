@@ -13,6 +13,7 @@
 //
 // @test-timing native
 
+import { holdoutTest } from "./support/holdouts.ts";
 import { COMPILER, exists, ROOT, VL, binaryen } from "./support/tree.ts";
 
 const WASM_DIS = binaryen("wasm-dis");
@@ -211,7 +212,7 @@ Deno.test({
   name:
     "integer `match`: a dense literal set is one `br_table`, a sparse one stays a chain",
   ignore: !ENABLED,
-  fn: () => {
+  fn: holdoutTest("tests/vl_match_br_table_test.ts#integer `match`: a dense literal set is one `br_table`, a sparse one stays a chain", () => {
     const dir = Deno.makeTempDirSync({ prefix: "vl-match-br-table-" });
     try {
       for (const [name, spec] of Object.entries(PROGRAMS)) {
@@ -232,5 +233,5 @@ Deno.test({
     } finally {
       Deno.removeSync(dir, { recursive: true });
     }
-  },
+  }),
 });
