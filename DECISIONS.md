@@ -13275,10 +13275,12 @@ thrown away by stage 2. Building the final storage first means stage 2 only read
 ## A generic call's instance follows the rep its argument is built at (2026-11-26, coordinator ruling)
 
 **Ruled by the coordinator 2026-11-26** (D17641). Where the elaboration builds an argument at a rep
-other than its checker type (D14812's rule that a list's records take the rep of the parameter they
-reach), the generic callee's instance is keyed at the elaboration's binding for the call, and the
-call's value is the instance's result type. Where it does not, the check key and the elaboration's
-key denote the same storage, and the check key stands. It is the rep-follows-storage rule, scoped by
+other than its checker type, the generic callee's instance is keyed at the elaboration's binding for
+the call, and where that binding differs from the check's, the call's value is the instance's
+result type. Built, this reads: a parameter that lists a type parameter (`xs: T[]`) keys the instance
+at the elaboration's binding, because a list's elements keep their build rep across the call,
+while a lone record is converted at it. Where the two keys differ only for a lone record, or not at
+all, they denote the same storage after the call's conversion, and the check key stands. It is the rep-follows-storage rule, scoped by
 mechanism, not a pin for one shape. Making the elaboration's key the binding for every call is
 [D17574](docs/internals/inventory/D17574.md), queued after family C's C1. Inside an instance body an
 annotation naming the type parameter still reads the check's binding, so that rule cannot land alone.
