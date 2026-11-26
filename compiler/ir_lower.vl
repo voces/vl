@@ -737,7 +737,6 @@ import {
   tagIsTail,
   tagStashTail,
   truncSatTail,
-  typedHolderMember,
   uBoxNewIsLast,
   uBoxSinkToPair,
   unionBoxToPairTail,
@@ -1005,6 +1004,8 @@ let lwLive: i32[] = []
 let lwLiveEnd: i32[] = []
 let lwFloor = 0
 let lwFloors: i32[] = []
+// Per open void `if` with an `else`, innermost last: the earlier operands staged below it.
+let lwVoidIfRoots: i32[][] = []
 // The boxes whose spans `boxLeadStage` raised the floor for, innermost last.
 let lwLeadBoxes: i32[] = []
 // The order-stash slots the function's `RStashSet`s opened: literal, layout position, slot.
@@ -2262,11 +2263,7 @@ function handPick(r: RHandPick) {
 
 // `RHolderPick`: the holder's record read, then the member legacy's `emitTypedHolderInit` picks.
 function holderPick(r: RHolderPick) {
-  const pk = bundleMemberPickOf(
-    r.hkArg,
-    typedHolderMember(r.hkAt, lw.irAt),
-    lw.irAt,
-  )
+  const pk = bundleMemberPickOf(r.hkArg, r.hkM, lw.irAt)
   if pk.bpHeap < 0 { return irLMiss("holder pick") }
   irLOpnd(r.hkV)
   fbStructGet(pk.bpHeap, pk.bpField)
@@ -6432,7 +6429,16 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
       return IF_DONE
     }
   }
+  // An earlier operand's temps wait below a void `if` for their reader, as below a valued one.
+  const none: i32[] = []
+  const roots = if exitBr { none } else { stageLead(n.siCond, pending) }
+  if lwMiss != "" { return IF_DONE }
+  if roots.length > 0 {
+    lwFloors.push(lwFloor)
+    lwFloor = lwLive.length - liveCountIn(pending)
+  }
   cond(n.siCond, pending)
+  if roots.length > 0 { lwFloor = lwLive.length }
   if exitBr {
     const b = lw.irNodes[n.siElse[0]]
     if b is SBr {
@@ -6451,11 +6457,23 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   body(n.siThen, tail, -1, false)
   if n.siElse.length > 0 || n.siElseKw {
     fbElse()
+    lwVoidIfRoots.push(roots)
     return IF_ELSE
   }
   lwFrames.pop()
   fbEnd()
+  voidIfUnstage(roots, pending)
   return IF_DONE
+}
+
+// After a void `if` closes, which leaves the stack as it found it, the operands staged below it
+// wait again for their reader.
+function voidIfUnstage(roots: i32[], pending: i32[]) {
+  if roots.length == 0 { return 0 }
+  liveNeutral()
+  lwFloor = lwFloors.pop() ?? 0
+  for r in roots { pending.push(r) }
+  return 0
 }
 
 // The operands a `??` reads in place: its left, and a fused map read's key or a list read's
@@ -7192,6 +7210,7 @@ function coalNulRefTail(n: SCoalBox, tag: i32): i32 {
 function ifClose(id: i32, k: i32, pending: i32[]) {
   lwFrames.pop()
   fbEnd()
+  if k == IF_ELSE { return voidIfUnstage(lwVoidIfRoots.pop() ?? [], pending) }
   if k != IF_VALUED { return 0 }
   lwFloor = lwFloors.pop() ?? 0
   if id < 0 || id >= lw.irNodes.length { return 0 }
@@ -7705,6 +7724,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwRootRun = 0
   lwRootRuns = []
   lwFloors = []
+  lwVoidIfRoots = []
   lwLeadBoxes = []
   lwStashAt = []
   getIdxSlots = []
@@ -7756,6 +7776,7 @@ type LwFrame = {
   lfLiveEnd: i32[],
   lfFloor: i32,
   lfFloors: i32[],
+  lfVoidIfRoots: i32[][],
   lfLeadBoxes: i32[],
   lfRootRun: i32,
   lfRootRuns: i32[],
@@ -7788,6 +7809,7 @@ function lwSave(): LwFrame {
     lfLiveEnd: lwLiveEnd,
     lfFloor: lwFloor,
     lfFloors: lwFloors,
+    lfVoidIfRoots: lwVoidIfRoots,
     lfLeadBoxes: lwLeadBoxes,
     lfRootRun: lwRootRun,
     lfRootRuns: lwRootRuns,
@@ -7821,6 +7843,7 @@ function lwRestore(f: LwFrame) {
   lwLiveEnd = f.lfLiveEnd
   lwFloor = f.lfFloor
   lwFloors = f.lfFloors
+  lwVoidIfRoots = f.lfVoidIfRoots
   lwLeadBoxes = f.lfLeadBoxes
   lwRootRun = f.lfRootRun
   lwRootRuns = f.lfRootRuns
