@@ -594,8 +594,8 @@ Deno.test({
   },
 });
 
-// Outside the set: an operand left below a `??` written in place (whose value waits on the stack at
-// its use, so no stage or spill holds the operand below it) and a radix literal assigned through an
+// Outside the set: a store whose index holds an `if` (the receiver and index wait on the stack below
+// it, so no stage holds them) and a radix literal assigned through an
 // if-expression into a nullable wide cell each leave their function uncovered, named. A closure
 // parameter, its baked callback clone's included, is inside it and covered.
 Deno.test({
@@ -609,13 +609,17 @@ function mk(b: boolean): P | Q {
   return if b { { j: { a: 3 }, k: 1 } } else { { j: null, k: 2 } }
 }
 const g = mk(true)
-function greet(k: i32): i32 { return k + (g.j?.a ?? 0) }
+function greet(a: boolean, x: i32): i32 {
+  const xs: i32[] = [0, 0]
+  xs[if a { 0 } else { 1 }] = x
+  return xs[0]
+}
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function wr(c: boolean): i64 | null {
   let x: i64 | null = null
   return x = if c { 0xfffffffe } else { 1 }
 }
-print(greet(1))
+print(greet(true, 1))
 print(ap((x: i32) => x + 1))
 print(wr(true) ?? 0)
 `;
@@ -1954,15 +1958,15 @@ const g = mk(true)
 function ok(x: i32): i32 { return x + 1 }
 function two(k: i32): i32 {
   const xs = [1, 2]
-  const y = k + (g.j?.a ?? 0)
-  return xs[0] + y
+  xs[if k > 0 { 0 } else { 1 }] = k
+  return xs[0] + k
 }
 print(ok(1))
 print(two(3))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    const want = "blockers short-circuit right operand";
+    const want = "blockers store short-circuit operand";
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }
