@@ -5551,6 +5551,16 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       repPrim(ib.irVars[v].vRep) == "null"
       && identReadArmOf(n, ix, ibFnIx, false) == "nulnone"
     ) {
+      // Read where the unit itself is asked, with no other null in context, it is the bottom
+      // ref, whatever niche the name's storage names (a `T` local of an instance at `null`).
+      if nullUnitRepAt(ix, rep) < 0 && repPrim(rep) == "null" && unitCtxAt(ix) {
+        return repTemp(
+          b,
+          { nuAt: ix, nuOwn: NULL_OWN_NONE, nuRead: [] },
+          ix,
+          rep,
+        )
+      }
       return nullUnitTemp(b, ix, rep, [])
     }
     if ib.irVars[v].vRep != rep {
@@ -10085,9 +10095,11 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if ibMiss != "" || !(ln is RList) { return missRhs("push operand coercion") }
   // A packed list's element, at any sub-word width, is pushed as a plain i32, which its backing
   // truncates.
-  const er = if repSubWord(ln.rlsElem) { repNodeOfTy(TY_I32) } else { ln.rlsElem }
+  const nulPush = repPrim(ln.rlsElem) == "null"
+  const er = if repSubWord(ln.rlsElem) || nulPush { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const xAt = b.length
-  const x0 = deliver(b, c.callArgs[0], er, -1)
+  // A `null[]`'s element is its i32 storage's sentinel, as an element store writes it.
+  const x0 = if nulPush { nulSentinelStore(b, c.callArgs[0], er) } else { deliver(b, c.callArgs[0], er, -1) }
   if ibMiss != "" { return missRhs("method operand") }
   // A value at another rep goes into the element's slot through the one converter.
   const x = if irBOpRep(x0) != er { irConvertStored(b, x0, er, repTyOf(er), c.callArgs[0]) } else { x0 }
@@ -12958,13 +12970,17 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   // legacy boxes is boxed at its union (`arrNewFillBoxTy`), as a union element is.
   // Otherwise at the element rep's own type, so a fill already boxed at that union passes as is.
   const et = repTyOf(ln.rlsElem)
-  const v = if boxTy >= 0 { boxTempIn(b, unionElemValue(b, fill), fill, ln.rlsElem, -1, boxTy) } else { deliver(b, fill, ln.rlsElem, et) }
+  // A `null[]`'s fill is its i32 storage's sentinel, as an element store writes it.
+  const nulFill = repPrim(ln.rlsElem) == "null"
+  const v = if nulFill { nulSentinelStore(b, fill, repNodeOfTy(TY_I32)) } else if boxTy >= 0 { boxTempIn(b, unionElemValue(b, fill), fill, ln.rlsElem, -1, boxTy) } else { deliver(b, fill, ln.rlsElem, et) }
   if ibMiss != "" { return v }
   if ifBelowLead(b, at, "array new short-circuit operand") { return v }
   if repPrim(irBOpRep(len)) != "i32" {
     return irBMiss("array new length coercion")
   }
-  if irBOpRep(v) != ln.rlsElem { return irBMiss("array new fill coercion") }
+  if irBOpRep(v) != (if nulFill { repNodeOfTy(TY_I32) } else { ln.rlsElem }) {
+    return irBMiss("array new fill coercion")
+  }
   return irBLetTemp(b, { lnLen: len, lnFill: v, lnAt: ix }, ix, rep)
 }
 
@@ -16303,6 +16319,12 @@ function nullUnitRepAt(ix: i32, rep: i32): i32 {
   if rep >= 0 && repPrim(rep) != "null" { return -1 }
   const cr = repNodeOfTy(heldTy(ctxTyAt(ix, ibFnIx)))
   return if cr >= 0 && nullOwnRepFits(own, cr) { cr } else { -1 }
+}
+
+// Whether `ix`'s contextual type names no null but the unit's own (none, or `null` itself).
+function unitCtxAt(ix: i32): boolean {
+  const cr = repNodeOfTy(heldTy(ctxTyAt(ix, ibFnIx)))
+  return cr < 0 || repPrim(cr) == "null"
 }
 
 // A `null`-unit value at `ix` (`RNullOf`, after `read` for its effects) at `nullUnitRepAt`'s rep.
