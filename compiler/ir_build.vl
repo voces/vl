@@ -8816,6 +8816,71 @@ function leadFirstAt(b: i32[]): i32 {
   return b.length
 }
 
+// The operands `args` of an n-ary node, operand `j` built into `b` from `starts[j]` (for node
+// `ixs[j]`): where a later operand holds a statement, the earlier ones are staged below it
+// (`irBStageLeads`) or, where `stack` is false (a node that reads an operand more than once) or no
+// stage holds, spilled to locals (`irBSpillLeads`), last operand first; false, with miss `why`,
+// where neither can be made. The first operand has nothing written before it.
+function irBStageOperands(
+  b: i32[],
+  starts: i32[],
+  args: Opnd[],
+  ixs: i32[],
+  stack: boolean,
+  why: string,
+): boolean {
+  let j = args.length - 1
+  while j >= 1 {
+    const end = if j + 1 < starts.length { starts[j + 1] } else { b.length }
+    if ifBelowLeadHas(b, starts[j], end) {
+      const n0 = b.length
+      const lead = args.slice(0, j)
+      const ls = starts.slice(0, j)
+      const li = ixs.slice(0, j)
+      const staged = stack
+        && !coalBoxFrom(b, starts[j], false)
+        && !receiverStageFrom(b, starts[j])
+        && irBStageLeads(b, starts[j], ls, lead, li)
+      if !staged && (ibMiss != "" || !irBSpillLeads(b, starts[j], lead, li)) {
+        if ibMiss == "" { irBMiss(why) }
+        return false
+      }
+      let k = 0
+      while k < j {
+        args[k] = lead[k]
+        k = k + 1
+      }
+      // A node that reads its operands again reads this one from a local, set where it ends, so
+      // no value the statement leaves on the stack waits under a later read.
+      if !stack {
+        const a = args[j]
+        if !(a is OVar) || a.ov < 0 || a.ov >= ib.irVars.length {
+          irBMiss(why)
+          return false
+        }
+        const lv = irVarNew(
+          ib,
+          ib.irVars[a.ov].vRep,
+          ib.irVars[a.ov].vTy,
+          "local",
+          -1,
+        )
+        const one: i32[] = []
+        irBNode(one, { asDst: lv, asSrc: a }, -1, ibNoValue, ixs[j])
+        if ibMiss != "" || one.length != 1 {
+          irBMiss(why)
+          return false
+        }
+        insertAt(b, end + b.length - n0, one[0])
+        const o: Opnd = { ov: lv }
+        args[j] = o
+      }
+    }
+    j = j - 1
+  }
+  return true
+}
+
 // `ifBelowLead` over the operands built into `b` from `at` up to `to`.
 function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
   if !ifBelowLeadHas(b, at, to) { return false }
@@ -8958,20 +9023,25 @@ function simdRhs(b: i32[], c: Call, ix: i32): Rhs {
   const row = simdCallRow(c)
   if row < 0 { return missRhs("simd row") }
   if simdRowIsMem(row) { return simdMemRhs(b, c, ix, row) }
-  const at = b.length
   const args: Opnd[] = []
   const want: string[] = []
+  const starts: i32[] = []
+  const ixs: i32[] = []
   let i = 0
   while i < c.callArgs.length {
     const p = simdOperandPrim(row, i)
     if p != "" {
+      starts.push(b.length)
+      ixs.push(c.callArgs[i])
       args.push(irBExpr(b, c.callArgs[i]))
       want.push(p)
     }
     i = i + 1
   }
   if ibMiss != "" { return missRhs("simd operand") }
-  if ifBelowLead(b, at, "simd short-circuit operand") {
+  if (
+    !irBStageOperands(b, starts, args, ixs, true, "simd short-circuit operand")
+  ) {
     return missRhs("simd short-circuit operand")
   }
   i = 0
@@ -13613,8 +13683,10 @@ function spreadLit(
   }
   const at = b.length
   const srcs: Opnd[] = []
+  const starts: i32[] = []
   let g = 0
   while g < grps.length {
+    starts.push(b.length)
     const v0 = spreadSrcBuild(b, p, g, grps[g], ix, rep)
     if ibMiss != "" { return v0 }
     // A source list whose rep is the literal's twin, or apart only in a hole, is the same list
@@ -13644,7 +13716,18 @@ function spreadLit(
     }
     ib.irSpreadPair[b[at]] = nt
   }
-  if ifBelowLead(b, at, "array spread short-circuit operand") { return srcs[0] }
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      srcs,
+      grps,
+      false,
+      "array spread short-circuit operand",
+    )
+  ) {
+    return srcs[0]
+  }
   const r: Rhs = {
     spSrcs: srcs,
     spGroups: grps,
@@ -13701,8 +13784,10 @@ function spreadBoxedLit(
   }
   const at = b.length
   const srcs: Opnd[] = []
+  const starts: i32[] = []
   let g = 0
   while g < grps.length {
+    starts.push(b.length)
     const v = spreadBoxedGroup(b, grps[g], isSrc[g], row, lrep, lt)
     if ibMiss != "" { return v }
     srcs.push(v)
@@ -13718,7 +13803,18 @@ function spreadBoxedLit(
     }
     ib.irSpreadPair[b[at]] = nt
   }
-  if ifBelowLead(b, at, "array spread short-circuit operand") { return srcs[0] }
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      srcs,
+      grps,
+      false,
+      "array spread short-circuit operand",
+    )
+  ) {
+    return srcs[0]
+  }
   const r: Rhs = {
     spSrcs: srcs,
     spGroups: grps,
