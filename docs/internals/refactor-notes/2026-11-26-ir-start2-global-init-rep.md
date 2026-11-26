@@ -21,7 +21,8 @@ Two mechanisms:
 
 Parity: `ir-parity --run-all` reports behaviour equal on all three programs (the sweep included).
 The bytes differ only in the `null` arm: the IR writes the bottom `ref.null none`, legacy the cell's
-typed `ref.null`. The programs are listed in `ir-divergence-baseline.txt`.
+typed `ref.null`. Since #10171 bytes are informational, so no `ir-divergence-baseline.txt` row (that
+file is for legacy-wrong behaviour; coordinator ruling 2026-11-26).
 
 Left open: the local spelling (`local rep nullable`), and a narrowed read's `.length`
 (`member nullable`).
