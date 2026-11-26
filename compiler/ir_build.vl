@@ -1,4 +1,5 @@
 import { nullableRecordTyOf, recFieldTyOf } from "./emit_rec_field_codes"
+import { printPlanPinNull } from "./emit_union_registry"
 import {
   asgFieldParks,
   catWidenTakes,
@@ -395,6 +396,7 @@ import {
   holeBoxTyAt,
   hostCallNamed,
   hostCallPlanOf,
+  idxCellReadIsNull,
   idxStoreNullUnitUnstamped,
   idxStoreOtherWhy,
   idxStoreSiteBoxes,
@@ -678,7 +680,6 @@ import {
   emptyFitPlanOf,
   fnFallThroughPadOf,
   guardEndsBlockWith,
-  ifJoinAdaptsScalar,
   isArmRank,
   letIfInitSinks,
   letIfInitTy,
@@ -770,6 +771,7 @@ import {
   storageReadLeave,
 } from "./emit_elab"
 import {
+  ifJoinAdaptsScalar,
   mapReadScalarBoxKind,
   narrowedNulLitPinBoxKey,
   nulNicheRecoverOwed,
@@ -2850,12 +2852,16 @@ function fieldExplicitNullTyped(
 }
 
 // The null legacy's `nullread` arm writes for identifier read `ix` at its destination
-// (`nullReadDstOwnOf`); NULL_READ_STORED where its storage read is that null; else -1.
+// (`nullReadDstOwnOf`); NULL_READ_STORED where its storage read is that null; else -1. A shared
+// cell's read respelling such a name takes its destination's null the same way.
 const NULL_READ_STORED = 0 - 2
 function nullReadOwnAt(ix: i32): i32 {
   const sl = unwrapParen(ix)
   if sl < 0 || sl >= P.nodes.length { return -1 }
   const n = nodeAt(sl)
+  if n is Index && idxCellReadIsNull(sl, ibFnIx) {
+    return nullReadDstOwnOf(sl, ibFnIx)
+  }
   if !(n is Ident) || !identReadsNull(sl, ibFnIx) { return -1 }
   if exprPrePathWhy(ix, ibFnIx) != "" { return -1 }
   const own = nullReadDstOwnOf(sl, ibFnIx)
@@ -8435,6 +8441,7 @@ function printStmt(b: i32[], c: Call, ix: i32) {
     irBNode(b, { efRhs: { pnV: e, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
     return 0
   }
+  if arm == "boxNull" { return printBoxNull(b, c.callArgs[0], ix) }
   const want = printArmRep(arm)
   if want == "" { return skip("print " + arm) }
   // A `K | null` read out of a wider box converts to the niche first (`emitPrintNulLitUnion`).
@@ -8469,6 +8476,25 @@ function printStmt(b: i32[], c: Call, ix: i32) {
     ibNoValue,
     ix,
   )
+  return 0
+}
+
+// A `print` of a box an `is` chain narrowed to `null` (`boxNull`): the argument read at its
+// storage, the box, printed along the union arm it takes there with the plan's null arm pinned, as
+// `emitCallCorePrint` writes it.
+function printBoxNull(b: i32[], arg: i32, ix: i32) {
+  const mark = storageReadEnter(arg)
+  const was = printPlanPinNull(true)
+  const inner = printArmOf(arg, ibFnIx)
+  const v = if inner == "union" { irBExpr(b, arg) } else { irBMiss("print boxNull arm " + inner) }
+  printPlanPinNull(was)
+  storageReadLeave(mark)
+  if ibMiss != "" { return 0 }
+  const vr = irBOpRep(v)
+  if !(repNodeAt(vr) is RBox) && !boxedNullable(vr) {
+    return skip("print operand rep")
+  }
+  irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -13653,8 +13679,10 @@ function mapGetAt(
   const mr = if rk.mkSym >= 0 { irGlobalRepOf(ib, rk.mkSym) } else { irBOpRep(rk.mkLoc) }
   const m = repNodeAt(mr)
   if !(m is RMap) { return irBMiss("map get receiver rep") }
-  // A union-valued map's read is its value's box, the null-tagged box on a miss; a narrowed read
-  // legacy unboxes after is at another rep and stays a miss.
+  // A union-valued map's read is its value's box, the null-tagged box on a miss. One narrowed to a
+  // record member no plan reads is the box read whole, then narrowed; legacy writes it through
+  // `emitExpr`, which banks the read's row whatever row a caller expecting the box passed.
+  let narrowTo = -1
   if arm == "unionBox" {
     // At its narrowing the read is unboxed to the member's scalar after (`narrowedMapReadOf`).
     const nm = narrowedMapReadOf(ix, ibFnIx)
@@ -13666,7 +13694,12 @@ function mapGetAt(
       "unbox" => repPrim(rep) != null && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
       "container" | "nonNull" => false
     }
-    if box >= 0 || !repOk { return irBMiss("map get union box rep") }
+    if box < 0 && !repOk && !whole && repNodeAt(rep) is RRecord {
+      narrowTo = rep
+    }
+    if (box >= 0 || !repOk) && narrowTo < 0 {
+      return irBMiss("map get union box rep")
+    }
   }
   // A scalar read typed at a boxed nullable its map's value rep is not (one arm of a union of
   // maps) is the probe's own box at that value's kind, as the box plan's `mapScalar` writes it.
@@ -13694,6 +13727,28 @@ function mapGetAt(
     mtTrap: trap,
     mtPrint: -1,
     mtWhole: whole,
+  }
+  if narrowTo >= 0 {
+    const wr: Rhs = {
+      mtSym: rk.mkSym,
+      mtNonNull: rk.mkNonNull,
+      mtLoc: rk.mkLoc,
+      mtKey: rk.mkKey,
+      mtAt: ix,
+      mtBox: -1,
+      mtRow: true,
+      mtTrap: false,
+      mtPrint: -1,
+      mtWhole: true,
+    }
+    const wv = irBLetTempTy(b, wr, ix, m.rmVal, repTyOf(m.rmVal))
+    if ibMiss != "" { return wv }
+    return irBLetTemp(
+      b,
+      { bnV: wv, bnAt: ix, bnRep: narrowTo, bnAtom: -1, bnCon: -1 },
+      ix,
+      narrowTo,
+    )
   }
   if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
   // A read at a twin of the value's rep is the value's own read, retagged.
@@ -17469,6 +17524,8 @@ function tailIf(b: i32[], ix: i32) {
   if why == "tail if switch" {
     const p = intSwitchPlanOf(ix, ibFnIx)
     if p != null { return intSwitch(b, ix, p, true) }
+  } else if why == "tail if one number" {
+    return tailIfOneNumber(b, ix)
   } else if why != "" {
     return skip(why)
   }
@@ -17494,6 +17551,21 @@ function tailIf(b: i32[], ix: i32) {
   }
   if ibMiss != "" { return 0 }
   irBNode(b, sIf(c, thenB, elseB, -1, hasElse), -1, ibNoValue, ix)
+  return 0
+}
+
+// A tail `if` typed one wider number (`retIfIsOneNumber`): that number, each arm widened to it,
+// boxed once into the result and returned, as legacy's `emitReturnExit` writes it.
+function tailIfOneNumber(b: i32[], ix: i32) {
+  const r = ib.irRetRep
+  const ru = retUnionTyOf(ibFnIx, ibFnPos)
+  if !heldAsBox(r) || ru < 0 || repNodeOfTy(ru) != r {
+    return skip("tail if one number")
+  }
+  const v = floorDeliver(b, ix, r, ru)
+  if ibMiss != "" { return 0 }
+  if irBOpRep(v) != r { return skip("tail if one number rep") }
+  irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, ix)
   return 0
 }
 
