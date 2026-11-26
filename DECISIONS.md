@@ -13256,3 +13256,25 @@ an emitter that I8 deletes protects nothing a user can observe.
 alone: 316 of the 26,238 programs these modes cover (299 `tests/cases` programs, 1 capability
 probe, 1 distilled cell, 15 `runs` witnesses), counted as no `print(`, `printErr(` or `@trap` in
 the source.
+
+## A value's IR rep follows its storage (2026-11-26, coordinator ruling) — the layout family
+
+**Ruled by the coordinator 2026-11-26.** A built value's IR rep is the rep of the storage legacy
+lays it out in, not the type that first minted the row it lands on. A place (a binding, a field,
+an element read) keeps its storage's rep. Where a read's type differs from the stored field's rep,
+the read converts with an explicit IR node, which the verifier checks against the row's layout.
+A retag by heap equality alone is never admitted.
+
+**Why.** Before I8 every unit of this family is unclaimed, and at I8 it fails. Mirroring a value at
+another row only because the two share a heap was unsound: a field the two rows lay out apart is
+read wrongly. Holding the value where legacy stores it makes builder and lowering agree, as
+#10183's list rule (`listRowRep`) did for lists.
+
+**Stage 1.** This is a node-level rule, not a type-level one: the units' record types are
+hole-elaborated, and the type-to-row map cannot see their row. A built record value takes its
+storage row's rep (`rowlessRecordRep`). An element read moves only off a list laid out at that row.
+Two exclusions are stage boundaries, removed by stage 2 (an object literal at its row, its
+function's result at the row too): an object literal keeps its own rep, and a value whose rep
+retags into the row keeps its rep. The field-code half is one accessor,
+`structRowFnSlotLayout` (a function slot laid out as a closure or a tagged id), which D17015's tag
+pass reads.
