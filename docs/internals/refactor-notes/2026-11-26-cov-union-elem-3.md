@@ -20,17 +20,13 @@ legacy writes the nullable element read with no recover, and the module fails to
 (`type mismatch: expected (ref $clo), found (ref null $clo)`), though `vl check` passes. With
 the IR's recover, the shipped build claims the function and runs it.
 
-These two positions stay out of the committed sweep. The claims-off shadow modes (1, 4, 6) let
-legacy emit the function, and its invalid module fails `ir-shadow.vl`'s chunk. The witness:
-
-    function apply(g: (n: i32) => i32, v: i32) { return g(v) }
-    function main() {
-      let k: ((n: i32) => i32) | null = (n: i32) => n + 1
-      const clear = () => { k = null }
-      if k != null { print(apply(k, 2)) }
-      clear()
-    }
-    main()
+The guard is `tests/cases/closures/captured-nullable-closure-narrowed-delivered-runs.vl`
+(passed, bound, passed after a reassignment), which runs under the default build with its `@log`
+(coordinator ruling, 2026-11-26). The claims-off shadow modes (1, 4, 6) let legacy emit the
+function, and its invalid module would fail `ir-shadow.vl`'s chunk. So that one file is listed in
+`scripts/silent-sweep/distilled/claims-off-skip.txt`, which `ir-shadow.vl --cases` reads in every
+mode but `--claims`, with the reason. The row leaves at I8. The position sweep holds the call
+positions alone.
 
 ## Measured
 
