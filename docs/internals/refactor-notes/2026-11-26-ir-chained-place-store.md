@@ -16,11 +16,14 @@ and key read at their use above the IR's statement. They are now staged below it
 | unit | before | after |
 |---|---|---|
 | `element-or-field-write-value-in-any-position.vl` `@start` | `store of a field or element write` | claimed, byte-matched |
-| `map-entry-write-value.vl` `@start` | `store of a field or element write` | verifier: "an assignment's unwidening is not its operand's narrowing to its result" |
+| `map-entry-write-value.vl` `@start` | `store of a field or element write` | `assignment value unwiden rep` |
 
 The second now reaches the store of a record into a `P`-valued map used as a value
-(`(mp[fk] = { v: 4 }).v`), which master's verifier refuses on its own; the guards masked it. Each
-program prints what master's seed prints.
+(`(mp[fk] = { v: 4 }).v`): the parked slot is held non-null, so the non-null cast legacy writes
+after it narrows nothing, which master's verifier refused ("an assignment's unwidening is not its
+operand's narrowing to its result") once the guards stopped masking it. The builder now names that
+miss (`assignValueParked`'s unwiden, `assignment value unwiden rep`; COV-CALL's). Each program
+prints what master's seed prints.
 
 New case `tests/cases/expressions/chained-place-store-positions.vl`: element into field, field into
 element, `f64` and `string` places, a three-place chain in a function body, and map entries from an
