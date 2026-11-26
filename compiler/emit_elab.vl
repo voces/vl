@@ -577,13 +577,54 @@ function elabIsRowEntry(nm: string): boolean {
   return nm.length > 3 && nm.slice(0, 3) == "#r."
 }
 
+// Per read of a parameter the instance being walked delivers at another record (`#r.<i>`), that
+// record: the read's rep stamp, which the walk's calls key their callees by. Empty outside a walk.
+let elabWalkReadRows: {[i32]: i32} = Map()
+
+// Per key minted from the walk of a key whose declaration encloses its own, that key's delivered
+// parameters and rows, `[param, row, ...]`: a nested lambda's captures read them (D17574).
+let elabInheritRows: {[i32]: i32[]} = Map()
+
+// The parameters key `k`'s body reads delivered at another record and their rows, `[param, row,
+// ...]`: its declaration's own (`#r.<i>`), then those its encloser's walk handed it.
+function elabRowPairsOf(k: i32): i32[] {
+  const out: i32[] = []
+  const kd = if k >= 0 && k < ekDecl.length { nodeAt(ekDecl[k]) } else { null }
+  let i = 0
+  while kd is FuncDecl && i < kd.fnParams.length {
+    const r = elabKeyRowAt(k, i)
+    if r >= 0 {
+      out.push(kd.fnParams[i])
+      out.push(r)
+    }
+    i = i + 1
+  }
+  for x in elabInheritRows[k] ?? [] { out.push(x) }
+  return out
+}
+
+// Whether declaration `d` is nested, at any depth, in declaration `e`.
+function elabDeclNestedIn(d: i32, e: i32): boolean {
+  const seen: i32[] = []
+  let x = elabEncl.get(d) ?? -1
+  while x >= 0 && !i32ListHas(seen, x) {
+    if x == e { return true }
+    seen.push(x)
+    x = elabEncl.get(x) ?? -1
+  }
+  return false
+}
+
 // The record a call argument `i` of call `call` is delivered at: the record the checker rebuilds
-// it at (`recRebuiltLeafRow`); -1 for none, for a binding (D15172's answer) and for a literal,
-// whose built row is the record build's own fact.
+// it at (`recRebuiltLeafRow`), or the row a read of a delivered parameter is stamped at in the
+// walk (D17574); -1 for none, for another binding (D15172's answer) and for a literal, whose built
+// row is the record build's own fact.
 function elabArgRowTy(call: i32, i: i32): i32 {
   const cn = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { nodeAt(0) }
   if !(cn is Call) || i >= cn.callArgs.length { return -1 }
   const ax = parenPeelIx(cn.callArgs[i])
+  const wr = if ax >= 0 { elabWalkReadRows[ax] ?? -1 } else { -1 }
+  if wr >= 0 { return wr }
   if ax < 0 || !(nodeAt(ax) is Call) { return -1 }
   return recRebuiltLeafRow(ax, REC_REBUILT_DEPTH)
 }
@@ -1784,6 +1825,10 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   kids.push(k)
   ekKids[kk] = kids
   if elabRunDone && !elabSpecChecking { elabLateNames.push(elabLateName(decl)) }
+  if from >= 0 && from < ekDecl.length && elabDeclNestedIn(decl, ekDecl[from]) {
+    const inh = elabRowPairsOf(from)
+    if inh.length > 0 { elabInheritRows[k] = inh }
+  }
   ekByDeclNote(decl, k)
   ekDecl.push(decl)
   ekNames.push(fn)
@@ -3330,6 +3375,64 @@ function elabTysFirst(names: string[], tys: i32[]): i32[] {
   return out
 }
 
+// Stamps each read the walk of key `k` recorded of a parameter that key, or one enclosing it,
+// delivers at another record (`#r.<i>`) at that record, reads in nested lambdas included: the
+// parameter is typed at its binding and stored at the row (D17574).
+function elabReadRowsStamp(k: i32) {
+  elabWalkReadRows = Map()
+  const ps: i32[] = []
+  const rows: i32[] = []
+  // A nested lambda's key reads its enclosing keys' delivered parameters through its captures.
+  const seen: i32[] = []
+  let kk = k
+  while kk >= 0 && kk < ekDecl.length && !i32ListHas(seen, kk) {
+    seen.push(kk)
+    const pr = elabRowPairsOf(kk)
+    let i = 0
+    while i + 1 < pr.length {
+      if !i32ListHas(ps, pr[i]) {
+        ps.push(pr[i])
+        rows.push(pr[i + 1])
+      }
+      i = i + 2
+    }
+    kk = if kk < ekParent.length { ekParent[kk] } else { -1 }
+  }
+  if ps.length == 0 { return 0 }
+  for ix in elabCapTy.keys() {
+    const d = if nodeAt(ix) is Ident { identDeclOf(ix) } else { -1 }
+    let j = 0
+    while d >= 0 && j < ps.length && ps[j] != d { j = j + 1 }
+    if d >= 0 && j < ps.length {
+      elabWalkReadRows[ix] = rows[j]
+      if (elabCapRep[ix] ?? -1) < 0 { elabCapRep[ix] = rows[j] }
+    }
+  }
+  // A record literal holding such a read is built with that field at the row.
+  for ix in elabCapTy.keys() {
+    const ln = nodeAt(ix)
+    const lt = elabCapTy[ix] ?? -1
+    const lo = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+    if !(ln is ObjLit) || !(lo is TyObj) || (elabCapRep[ix] ?? -1) >= 0 {
+      continue
+    }
+    const fts: i32[] = []
+    for t in lo.objFieldTypes { fts.push(t) }
+    let moved = false
+    for fx in ln.objFields {
+      const fi = nodeAt(fx)
+      const fr = if fi is FieldInit { elabWalkReadRows[parenPeelIx(fi.fiValue)] ?? -1 } else { -1 }
+      const at = if fi is FieldInit { strListIndexOf(lo.objFieldNames, fi.fiName) } else { -1 }
+      if fr >= 0 && at >= 0 && at < fts.length {
+        fts[at] = fr
+        moved = true
+      }
+    }
+    if moved { elabCapRep[ix] = mkObjTy(lo.objFieldNames, fts) }
+  }
+  return 0
+}
+
 // Walks key `k`, with `k` the key every hole row its walk banks records.
 function elabOne(k: i32) {
   const was = elabWalkNowSet(k)
@@ -3403,6 +3506,7 @@ function elabOneAt(k: i32) {
     fvaRetRowsNote(dn.fnBody, ret)
   }
   elabCapEnd()
+  elabReadRowsStamp(k)
   // A default instance only unbound calls key, whose body does not check, stays a guess and its
   // calls are unkeyed after the run: the default raises no diagnostic of its own.
   if (elabUnboundOnly[k] ?? false) && T.diags.length > ed0 {
@@ -3553,6 +3657,7 @@ function elabOneAt(k: i32) {
     }
     c = c + 1
   }
+  elabWalkReadRows = Map()
   for oc in elabCbOpenCalls[decl] ?? [] { elabCbAtBuild(oc, k) }
   let b = 0
   while b < elabCbD.length {
@@ -10785,6 +10890,8 @@ export function elabRun() {
   luOvOn = 0
   elabCalleeTys = Map()
   elabNodeReps = Map()
+  elabInheritRows = Map()
+  elabWalkReadRows = Map()
   elabSlotTys = Map()
   elabHandBackMemo = Map()
   elabNodeRepUnions = Map()
@@ -18428,7 +18535,20 @@ export function elabKeyAtPos(pos0: i32): i32 {
     const d = inPlace[i]
     const ks = elabKidsAt(d, k)
     if ks.length == 1 { k = ks[0] }
-    if ks.length > 1 { return -3 }
+    if ks.length > 1 {
+      // Of sibling keys, the one whose instance mono emits answers for the frame; a list callback
+      // keyed at its list's build (`#r.0`) is emitted at that build alone (D17574).
+      let rk = -1
+      let rn = 0
+      for q in ks {
+        if elabKeyRowAt(q, 0) >= 0 {
+          rk = q
+          rn = rn + 1
+        }
+      }
+      if rn != 1 { return -3 }
+      k = rk
+    }
     i = i - 1
   }
   return k
