@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Patches a copy of compiler/ (the dir $1) into the I8 census's probe: one `[ir]` row per function
-# under `$VL_IR_SHADOW=5`, `fnc <name>` claimed and `fnu <name> | <miss>` not, with the `is rung`,
+# under `$VL_IR_SHADOW=5`, `fnc <name>` claimed, `fnr <name> | <refusal>` declined on a refusal it
+# met, and `fnu <name> | <miss>` otherwise, with the `is rung`,
 # rep-miss and call classes split by rung, node kind and sub-reason. census.sh and ir-i8-sweep.sh
 # build their probe compilers from it. Exits 1 when an anchor in ir_build.vl is not found.
 set -euo pipefail
@@ -13,14 +14,24 @@ awk '
     print "  }"
     a = 1; next
   }
-  /^    count\("claim fell back: " \+ why\)$/ { print; print "    count(\"fnu \" + ib.irName + \" | claim fell back: \" + why)"; b++; next }
+  # A refusal the claim met is `fnr <name> | <refusal>` (census.sh keeps it only where the program
+  # expects that refusal); any other fallback is `fnu`.
+  /^    count\("claim fell back: " \+ why\)$/ {
+    print
+    print "    if why.indexOf(\"a legacy helper refused in \") == 0 && why.indexOf(\"`: \") > 0 {"
+    print "      count(\"fnr \" + ib.irName + \" | \" + why.slice(why.indexOf(\"`: \") + 3, why.length))"
+    print "    } else {"
+    print "      count(\"fnu \" + ib.irName + \" | claim fell back: \" + why)"
+    print "    }"
+    b++; next
+  }
   /^  count\("claimed"\)$/ { print; print "  count(\"fnc \" + ib.irName)"; c = 1; next }
   # The fallbacks that count no `claim fell back: " + why` row: the verifier (a function and a
   # start body), a minted synthetic global, and a legacy helper refusing (`softRefused`).
   /^    count\("claim fell back: verifier"\)$/ { print; print "    count(\"fnu \" + ib.irName + \" | claim fell back: verifier\")"; v++; next }
   /^  count\("claim fell back: build minted a synthetic global"\)$/ { print; print "  count(\"fnu \" + ib.irName + \" | claim fell back: build minted a synthetic global\")"; m = 1; next }
   /^function softRefused\(what: string\): boolean \{$/ { sr = 1 }
-  sr && /^  return true$/ { print "  count(\"fnu \" + ib.irName + \" | claim fell back: a legacy helper refused\")"; sr = 0; r = 1 }
+  sr && /^  return true$/ { print "  count(\"fnr \" + ib.irName + \" | \" + emitSoftMsg)"; sr = 0; r = 1 }
   { print }
   END { if (!a || b != 2 || !c || v != 2 || !m || !r) { print "ir-i8-census: a probe anchor in ir_build.vl was not found" > "/dev/stderr"; exit 1 } }
 ' "$D/ir_build.vl" > "$D/ir_build.vl.new"
