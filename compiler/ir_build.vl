@@ -154,6 +154,7 @@ import {
   RGlobalGet,
   RListSlice,
   RListStage,
+  RMakeClo,
   RMakeRec,
   RMapDelete,
   RMapFilterHead,
@@ -12067,6 +12068,13 @@ function unionEqSide(b: i32[], ix: i32): Opnd {
       const o: Opnd = { ov: v }
       return o
     }
+    // A module `let` held as its box is compared at that box, past its type's narrowing, as a
+    // local is.
+    const d = identDeclOf(ix)
+    const g = if v < 0 && nodeAt(d) is LetDecl { globalIndexOfSid(sidOfNode(ix)) } else { -1 }
+    if g >= 0 && heldAsBox(globalRep(g, d)) {
+      return globalStoredRead(b, g, ix, globalRep(g, d), heldTy(letBindTy(d, -1)))
+    }
   }
   return irBExpr(b, ix)
 }
@@ -12476,11 +12484,15 @@ function unionConcreteEq(
     && bx.ov >= 0
     && bx.ov < ib.irVars.length
     && ib.irVars[bx.ov].vKind != "temp"
-  const otherAgain = nul && atUse && boxVar
+  // Beside a box the lowering also reads again (`again`), the operand's read is moved above the
+  // box's, as legacy reads the operand first on the null leg (`unionNulEq`).
+  const bothAgain = nul && atUse && again && opndAboveBox(b, at, bx)
+  const otherAgain = nul && atUse && (boxVar || bothAgain)
   if (
     (b.length != at || !(o is OVar || o is OImm || o is OStr))
     && !(atUse && !nul)
     && !otherAgain
+    && !(!nul && envlessCloAt(b, at, o))
   ) {
     return irBMiss("union compare operand")
   }
@@ -12517,6 +12529,30 @@ function unionConcreteEq(
     ix,
     rep,
   )
+}
+
+// Whether the one node `b` built from `at` is temp `o`'s closure of a function with no environment,
+// which reads no value and has no effect, so the lowering writes it at its use, as legacy reads
+// the function's closure there.
+function envlessCloAt(b: i32[], at: i32, o: Opnd): boolean {
+  if !(o is OVar) || b.length != at + 1 { return false }
+  const n = ib.irNodes[b[at]]
+  if !(n is SLet) || n.lDst != o.ov { return false }
+  const r = n.lRhs
+  return r is RMakeClo && r.mcEnv.length == 0
+}
+
+// Moves the one node `b` built from `at` (a null leg's operand read) above box temp `bx`'s own
+// read, the node just before it, so the lowering consumes them in its order. False, moving
+// nothing, where either is not that one read.
+function opndAboveBox(b: i32[], at: i32, bx: Opnd): boolean {
+  if !(bx is OVar) || b.length != at + 1 || at < 1 { return false }
+  const p = ib.irNodes[b[at - 1]]
+  if !(p is SLet) || p.lDst != bx.ov { return false }
+  const id = b[at]
+  b[at] = b[at - 1]
+  b[at - 1] = id
+  return true
 }
 
 // Whether operand `ix` is typed at a literal union delivered as an interned atom.
