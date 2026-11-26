@@ -87,7 +87,6 @@ const FLAVOUR_READERS = [
   // A failing list-index guard reads the shared empty backing in a plain build; `-O` keeps its trap.
   "wasmEmit:emitListIdxTrapOf gOptimized",
   // `--low-memory-unused` (only with `-O`) folds an address's constant into the memarg.
-  "wasmEmit:emitLowMemAccessorCall gLowMemUnused",
   "wasmEmit:lowMemFoldsCallee gLowMemUnused",
   "wasmEmit:memAddrPlanWith gLowMemUnused",
 ];
