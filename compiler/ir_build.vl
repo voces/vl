@@ -472,6 +472,7 @@ import {
   memOpCallNamed,
   memOpPlanOf,
   mfShapeIsSum,
+  negIsLitSet,
   nulNicheBoxTagOf,
   nulNicheEqWhy,
   nulNoneWritesNothing,
@@ -587,6 +588,7 @@ import {
   listWrapHeapOfKind,
   narrowedFieldIsUnionBox,
   narrowedFieldPlain,
+  nodeIsNumUnion,
   nullInstanceIsResult,
   scalarAtomNameOfKind,
   variantCoerceArmOf,
@@ -875,15 +877,18 @@ import {
   letBindTy,
   letCellKind,
   letCellSlot,
+  letInitCaptureRow,
   letIsNulNone,
   letMapShapeOfTy,
   letNulMapReadUnionBox,
+  letValuesBuiltApart,
   listTyOfElem,
   localIndexOf,
   mapShapeOfExpr,
   memReadNarrowOp,
   memberBoxReadEnter,
   memberBoxReadLeave,
+  mfRecvKindOf,
   nicheReadKindAt,
   nicheReadRefOf,
   nulLitAtomTexts,
@@ -4372,11 +4377,16 @@ function letMapNewHeld(init: i32, v: i32): boolean {
 // shape holds (`letMapShapeOfTy`, the plan legacy's cell is declared from), where that value type is
 // closed at another rep (a later widening's row); else -1.
 function slotMapHeldTy(d: i32, ty: i32): i32 {
+  return slotMapHeldTyIn(d, ty, ibFnIx)
+}
+
+// `slotMapHeldTy` of `let` `d` declared in `fnIx`, -1 for a global's.
+function slotMapHeldTyIn(d: i32, ty: i32, fnIx: i32): i32 {
   const m = repNodeAt(repNodeOfTy(ty))
   if !(m is RMap) || d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) {
     return -1
   }
-  const sh = letMapShapeOfTy(d, ibFnIx)
+  const sh = letMapShapeOfTy(d, fnIx)
   if sh < 0 { return -1 }
   const st = mvValTyIxAt(sh)
   if st < 0 || irTyOpen(st) || repNodeOfTy(st) == m.rmVal { return -1 }
@@ -4391,12 +4401,18 @@ function declRowLetTy(d: i32, rep: i32): i32 {
   if d < 0 || d >= P.nodes.length { return -1 }
   const n = nodeAt(d)
   if !(n is LetDecl) || n.letInit < 0 { return -1 }
-  const pv = declRowParamVarOf(unwrapParen(n.letInit))
-  if pv < 0 { return -1 }
+  const cr = letInitCaptureRow(d, ibFnIx)
+  const pv = if cr >= 0 { -1 } else { declRowParamVarOf(unwrapParen(n.letInit)) }
+  if pv < 0 && cr < 0 { return -1 }
   const s = declaredSlotOfDecl(d)
   const slot = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
   const lt = irSlotRowTy(slot)
   if lt < 0 || repNodeOfTy(lt) == rep { return -1 }
+  // A call returning a hole parameter at that parameter's row is held at its slot's row.
+  if cr >= 0 {
+    ibDeclRowSeen = true
+    return if repRowOfTyStruct(lt, repScanLim()) == cr { lt } else { -1 }
+  }
   return if repNodeOfTy(lt) == ib.irVars[pv].vRep { lt } else { -1 }
 }
 
@@ -5688,6 +5704,16 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !narrowed
       && rep == globalTyRep(scopeTyAt(d, -1))
       && cellRep == globalTyRep(letBindTy(d, -1))
+    // A `Map()` cell held at its slot's map (`globalSlotMapTy`), read at its binding's type, reads
+    // the cell as it is stored, as a local's is (`slotMapHeldVar`).
+    const sm = if cellRep != rep && !narrowed && !stored { globalSlotMapTy(d) } else { -1 }
+    if (
+      sm >= 0
+      && repNodeOfTy(sm) == cellRep
+      && rep == globalTyRep(scopeTyAt(d, -1))
+    ) {
+      return globalStoredRead(b, g, ix, cellRep, sm)
+    }
     // An atom-assignment cell (`atomCellRep`) read at a string is its id, decoded as legacy's
     // `emitAtomToStr` decodes it; a delivery (`cell`) takes the id as it stands.
     if (
@@ -5786,6 +5812,16 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     // A struct cell read at a record its row holds is read at that row.
     const rowRt = if declined { globalCellRowReadTy(ix, d, cellRep, rep) } else { -1 }
     if rowRt >= 0 { return globalStoredRead(b, g, ix, cellRep, rowRt) }
+    // A nullable record cell held at a row its narrowed read's record does not record reads past
+    // its null at that row, as a local's does (`storedPastNullTy`).
+    const pn = if declined { globalStoredPastNullTy(ix, d, cellRep, rep) } else { -1 }
+    if pn >= 0 {
+      const o = globalStoredRead(b, g, ix, cellRep, heldTy(letBindTy(d, -1)))
+      if ibMiss != "" { return o }
+      const rc: Rhs = { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) }
+      ib.irReadAgain[ix] = rc
+      return irBLetTempTy(b, rc, ix, repNodeOfTy(pn), pn)
+    }
     if declined { return irBMiss("global read coercion") }
     if stored {
       return globalStoredRead(b, g, ix, cellRep, heldTy(letBindTy(d, -1)))
@@ -7002,6 +7038,11 @@ function globalStoreTy(d: i32, rep: i32): i32 {
     && repTyOf(rep) >= 0
     && cellDeclStores(d, repNodeOfTy(ht), rep)
   ) {
+    return repTyOf(rep)
+  }
+  // A `Map()` cell held at its slot's map (`globalSlotMapTy`) is stored at that map.
+  const sm = globalSlotMapTy(d)
+  if sm >= 0 && repNodeOfTy(sm) == rep && repTyOf(rep) >= 0 {
     return repTyOf(rep)
   }
   // A cell whose type has no rep (`openCellRep`) is stored at its rep's type.
@@ -9300,7 +9341,11 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   ) {
     return mapDeleteRhs(b, m.memObj, c.callArgs[0], ix)
   }
-  if m.memProp == "map" || m.memProp == "filter" {
+  // A non-list receiver's `map` or `filter` is a function-valued field's call, as legacy routes it.
+  if (
+    (m.memProp == "map" || m.memProp == "filter")
+    && mfRecvKindOf(m.memObj, ibFnIx) != null
+  ) {
     return mapFilterRhs(b, c, m, ix)
   }
   if (
@@ -10332,6 +10377,44 @@ function numUnionBin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   }
   if primRepOf(ix) != rep { return irBMiss("numeric union result rep") }
   return irBLetTemp(b, { nbArgs: args, nbAt: ix }, ix, rep)
+}
+
+// `-` over two-base literal set operand `n.unArg` at `i64` rep `rep`: zero minus the operand, a box
+// first converted to `i64` at the member it holds (`RNumUnionConvert`), as `emitUnaryNode` writes.
+function litSetNeg(b: i32[], n: Unary, ix: i32, rep: i32): Opnd {
+  if repPrim(rep) != "i64" { return irBMiss("literal set negation rep") }
+  const o = irBExpr(b, n.unArg)
+  if ibMiss != "" { return o }
+  const boxed = repNodeAt(irBOpRep(o)) is RBox
+  if boxed && !numUnionSideBoxed(n.unArg, ibFnIx) {
+    return irBMiss("numeric union side box")
+  }
+  if !boxed && repPrim(irBOpRep(o)) != "i64" {
+    return irBMiss("literal set negation operand")
+  }
+  const w = if boxed { irBLetTempTy(b, { nuV: o, nuTo: 3, nuAt: n.unArg }, n.unArg, rep, repTyOf(rep)) } else { o }
+  const zero: Opnd = { oiRep: rep, oiBits: 0 }
+  return irBLetTempTy(
+    b,
+    { poOp: "sub", poArgs: [zero, w] },
+    ix,
+    rep,
+    repTyOf(rep),
+  )
+}
+
+// `-` over numeric union operand `n.unArg`, its box built as a binary side's is, as `RNumUnionBin`
+// over that one operand at the unary node; the result is the negated member's box.
+function numUnionNeg(b: i32[], n: Unary, ix: i32, rep: i32): Opnd {
+  if !numUnionSideBoxed(n.unArg, ibFnIx) {
+    return irBMiss("numeric union side box")
+  }
+  const o = irBExpr(b, n.unArg)
+  if ibMiss != "" { return o }
+  if !(repNodeAt(irBOpRep(o)) is RBox) || !(repNodeAt(rep) is RBox) {
+    return irBMiss("numeric union side box")
+  }
+  return irBLetTemp(b, { nbArgs: [o], nbAt: ix }, ix, rep)
 }
 
 // A function-value `==`/`!=` legacy writes on its `closure` route (`emitClosureEq`): each closure
@@ -13381,7 +13464,7 @@ function arrayLit(
       er,
       -1,
       arrRefUnionElemTy(ix, uslot, ibFnIx),
-    ) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else if nulSent && arrElemNulSent(e, ibFnIx) { nulSentinelElem(b, e, er) } else if arm == "ref" && elemTwinTy(e, er) >= 0 { objLitAt(
+    ) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else if nulSent && nulSentElemAt(e) { nulSentinelElem(b, e, er) } else if arm == "ref" && elemTwinTy(e, er) >= 0 { objLitAt(
       b,
       unwrapParen(e),
       er,
@@ -13823,6 +13906,8 @@ function coalMapScalarJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
   const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
   if ka != "plain" && ka != "i64" { return irBMiss("map key " + ka) }
+  // A default the miss arm writes as a body leaves the read's value on the stack from here.
+  const clear = !endsInTemp(b)
   const rcv = mapRecvKeyOf(
     b,
     rd.idxArr,
@@ -13835,8 +13920,24 @@ function coalMapScalarJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const dv = deliver(db, n.binRight, rep, boxDstTyOf(n.binRight, ibFnIx))
   if ibMiss != "" { return dv }
   if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
+  // A default that computes is the fused read's miss arm, which writes the out (`mapGetOrBox`).
   if !defaultSelfContained(db, 0, dv) {
-    return irBMiss("coalesce mapScalarJoin default computes")
+    if !clear { return irBMiss("map read default after an operand") }
+    return mapGetOrBox(
+      b,
+      db,
+      dv,
+      ix,
+      rep,
+      {
+        prSym: rcv.mkSym,
+        prNonNull: rcv.mkNonNull,
+        prKey: rcv.mkKey,
+        prForm: 7,
+      },
+      rcv.mkLoc,
+      -1,
+    )
   }
   for id in db { b.push(id) }
   const r: Rhs = {
@@ -13870,6 +13971,8 @@ function mapGetOrScalarBox(
   if ka != "plain" && ka != "i64" && ka != "atom" {
     return irBMiss("map key " + ka)
   }
+  // A default the miss arm writes as a body leaves the read's value on the stack from here.
+  const clear = !endsInTemp(b)
   const rcv = mapRecvKeyOf(
     b,
     rd.idxArr,
@@ -13882,8 +13985,24 @@ function mapGetOrScalarBox(
   const dv = deliver(db, n.binRight, rep, scalarBoxNullTyOf(ak))
   if ibMiss != "" { return dv }
   if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
+  // A default that computes is the fused read's miss arm, which writes the out (`mapGetOrBox`).
   if !defaultSelfContained(db, 0, dv) {
-    return irBMiss("map read scalarBox default computes")
+    if !clear { return irBMiss("map read default after an operand") }
+    return mapGetOrBox(
+      b,
+      db,
+      dv,
+      ix,
+      rep,
+      {
+        prSym: rcv.mkSym,
+        prNonNull: rcv.mkNonNull,
+        prKey: rcv.mkKey,
+        prForm: 8,
+      },
+      rcv.mkLoc,
+      -1,
+    )
   }
   for id in db { b.push(id) }
   const r: Rhs = {
@@ -15224,11 +15343,14 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
   // sentinel's. Each default is delivered at the read's rep, as `emitMonoMapDefault` writes it.
   const at = arm == "atom"
   const st = arm == "sentinel"
+  // A scalar value read at a wider number kind is widened in the hit arm (`mapGetOrWidenHead`).
+  const wd = arm == "widen"
   if (
     arm != "helper"
     && arm != "i32"
     && !at
     && !st
+    && !wd
     && !mv
     && !mvu
     && !nz
@@ -15248,7 +15370,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
   }
   const rp = repPrim(rep)
   const uk = if uq != null { uq.muWide } else { -1 }
-  const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32"
+  const repOk = if mvu { irBAtomKindRep(uk, rep) } else if wd { irBAtomKindRep(rk, rep) } else { rp == "i32"
     || (arm == "i32" || arm == "helper") && rp == "bool"
     || (at || st) && repHeldAsI32(rep)
     || mv
@@ -15291,7 +15413,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
   if irBOpRep(dv) != (if bx { bv } else { rep }) {
     return irBMiss("map read default rep")
   }
-  const form = if st { 6 } else if bx { 5 } else if nz { 4 } else if mvu { 3 } else if mv { 2 } else if inline { 1 } else { 0 }
+  const form = if wd { 9 } else if st { 6 } else if bx { 5 } else if nz { 4 } else if mvu { 3 } else if mv { 2 } else if inline { 1 } else { 0 }
   // The mv slot's read is the map's value as itself: a read held at another rep (a record type no
   // row records, read at its storage row) is one the map's own rep does not yet carry.
   if form == 2 && mapValRepOf(rcvMapRep(rcv)) != rep {
@@ -15390,9 +15512,11 @@ function mapGetAt(
       && repNodeAt(rep) is RAtom
     const repOk = strMember
       || match na {
-      // The read is the value's box, its miss the box's `null` tag.
+      // The read is the value's box, its miss the box's `null` tag; or that box held at the smaller
+      // union the read is narrowed to, as a local's is.
       "none" => rep == m.rmVal
         || repNodeAt(repBoxCore(rep)) is RBox && repBoxCore(rep) == repBoxCore(m.rmVal)
+        || heldAsBox(rep) && heldAsBox(m.rmVal) && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
       // …to the member's scalar, or a function member's closure (the payload cast to its heap).
       "unbox" => (repPrim(rep) != null || repNodeAt(rep) is RClosure)
         && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
@@ -16472,6 +16596,19 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     // `-` and `~` over a `never` operand are legacy's i32, at the operand's own i32 (D14420).
     const unv = exprTyOf(n.unArg) == TY_NEVER
     if unv && n.unOp == "!" { return irBMiss("not over a never operand") }
+    // `-` over a two-base literal set is `0 - x` at `i64`, its box converted there first.
+    if !unv && n.unOp == "-" && negIsLitSet(n.unArg, ibFnIx) {
+      return litSetNeg(b, n, ix, rep)
+    }
+    // `-` over a numeric union is legacy's per-member negation of its box (`emitNumUnionNeg`).
+    if (
+      !unv
+      && n.unOp == "-"
+      && numUnionMinted
+      && nodeIsNumUnion(n.unArg, ibFnIx)
+    ) {
+      return numUnionNeg(b, n, ix, rep)
+    }
     const uw = if unv { "" } else { operandWhy(n.unArg) }
     if uw != "" { return irBMiss(uw) }
     const aat = b.length
@@ -18204,6 +18341,18 @@ function slotMapWalkValTy(mr: i32, er: i32): i32 {
   return if vt >= 0 && repNodeOfTy(vt) != er && repNodeAt(repNodeOfTy(vt)) is RRecord { vt } else { -1 }
 }
 
+// `slotMapWalkValTy` of a global map receiver `mr`: the value type of the map its slot holds
+// (`mapSlotHeldTy`) where that is another record than element rep `er`'s, else -1.
+function globalSlotMapWalkValTy(mr: i32, er: i32): i32 {
+  const u = unwrapParen(mr)
+  if u < 0 || !(nodeAt(u) is Ident) || !(repNodeAt(er) is RRecord) { return -1 }
+  const ty = scopeTyAt(identDeclOf(u), -1)
+  const ht = mapSlotHeldTy(ty, u)
+  if repNodeOfTy(ht) == repNodeOfTy(ty) { return -1 }
+  const vt = tyMapValOf(ht)
+  return if vt >= 0 && repNodeOfTy(vt) != er && repNodeAt(repNodeOfTy(vt)) is RRecord { vt } else { -1 }
+}
+
 // A walk of a union of maps' box (`emitMapUnionFor`): per arm, the walk built over the arm's
 // payload variable, the iterable read as it and typed at the arm (`SArmWrite`).
 function forInMapUnion(b: i32[], n: ForIn, ix: i32) {
@@ -18316,7 +18465,7 @@ function forInStmtAt(
   // the walk records, as a map rep holds no key. The verifier's rule.
   const vals = mr >= 0 && mapWalkReadsValues(n.fiIter)
   // A map local held at its slot's map (`slotMapHeldTy`) walks its values at that map's value.
-  const sv = if vals && g < 0 { slotMapWalkValTy(mr, er) } else { -1 }
+  const sv = if !vals { -1 } else if g < 0 { slotMapWalkValTy(mr, er) } else { globalSlotMapWalkValTy(mr, er) }
   if sv >= 0 { er = repNodeOfTy(sv) }
   const keyRep = if mr >= 0 && !vals { er } else { -1 }
   if keyRep >= 0 && !mapKeyRep(keyRep) { return skip("for in map element rep") }
@@ -20085,6 +20234,28 @@ function storedPastNullTy(ix: i32, v: i32, rep: i32): i32 {
   return if repNodeOfTy(heldTy(exprTyOf(ix))) == rep { st } else { -1 }
 }
 
+// `storedPastNullTy` for read `ix` of global `d`, whose cell is at rep `cellRep`.
+function globalStoredPastNullTy(ix: i32, d: i32, cellRep: i32, rep: i32): i32 {
+  const vn = repNodeAt(cellRep)
+  if (
+    !(vn is RNullable)
+    || vn.rnDisc != 1
+    || vn.rnInner == rep
+    || !(repNodeAt(rep) is RRecord)
+  ) {
+    return -1
+  }
+  const st = recoveredReadTyOf(heldTy(letBindTy(d, -1)))
+  if (
+    st < 0
+    || repNodeOfTy(st) != vn.rnInner
+    || rowlessReadTyAt(nodeTyAt(ix, ibFnIx), st) != st
+  ) {
+    return -1
+  }
+  return if repNodeOfTy(heldTy(exprTyOf(ix))) == rep { st } else { -1 }
+}
+
 // `boundRowlessReadTy` for read `u` of variable `v`, which any local read names, a loop's own.
 function rowlessReadTyOfVar(u: i32, v: i32): i32 {
   if v < 0 { return -1 }
@@ -20670,47 +20841,6 @@ export function irShadowFn(
       + "\n"
       + irFnText(ib),
   )
-  return 0
-}
-
-// The seam for a start body (the single start, or an init function's, `poolFill` false): builds
-// it from `order` (`orderGi` at or above 0 naming a global's initializer), verifies, lowers and
-// compares it with the entry legacy wrote onto `out` from `outStart`. Rows carry a `start `
-// prefix; a mismatch is `mismatch start <why>`, a failure names the body.
-export function irShadowStart(
-  out: u8[],
-  outStart: i32,
-  spanBase: i32,
-  order: i32[],
-  orderGi: i32[],
-  poolFill: boolean,
-) {
-  count("start fns")
-  const built = buildStart(order, orderGi, poolFill)
-  // Under the census a start built on past its misses is uncovered at every class it met.
-  if ibAllMiss && built != "" { censusGoesOn(built) }
-  const why = if ibAllMiss { censusKey() } else { built }
-  if why != "" {
-    count("start uncovered " + why)
-    return 0
-  }
-  count("start covered")
-  const v = irBVerify(ib)
-  if v.vfRule != 0 {
-    count(
-      "fail rule "
-        + i32ToStr(v.vfRule)
-        + " in "
-        + ib.irName
-        + ": "
-        + v.vfMsg
-        + "\n"
-        + irFnText(ib),
-    )
-    return 0
-  }
-  count("start verified")
-  dualEmit("start ", ibGlobalCtx(), out, outStart, spanBase)
   return 0
 }
 
@@ -21418,12 +21548,29 @@ function mapNewInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     globalNoteAt(gi, gst, cell)
     return irBLetTemp(b, { mnAt: ix }, ix, nr)
   }
+  // A cell whose values the checker builds at another record is held at its slot's map, which the
+  // constructor builds (`mapCtorShapeOf`), as a local's is (`slotMapHeldTy`).
+  const sm = if irGlobalRepOf(ib, gi) < 0 { globalSlotMapTy(gst) } else { -1 }
+  if sm >= 0 {
+    const sr = repNodeOfTy(sm)
+    globalNoteAt(gi, gst, sr)
+    return irBLetTempTy(b, { mnAt: ix }, ix, sr, sm)
+  }
   const stored = irGlobalRepOf(ib, gi) < 0
     && nr != rep
     && nr == globalTyRep(letBindTy(gst, -1))
   if nr != rep && !stored { return irBMiss("global initializer coercion") }
   globalNoteAt(gi, gst, nr)
   return irBLetTemp(b, { mnAt: ix }, ix, nr)
+}
+
+// The map type global `gst`'s `Map()` cell is held at where the checker builds its values at
+// another record (`letValuesBuiltApart`) and its slot stores that record (`slotMapHeldTyIn`), else -1.
+function globalSlotMapTy(gst: i32): i32 {
+  const g = nodeAt(gst)
+  if !(g is LetDecl) || g.letType >= 0 || !mapCtorOf(g.letInit) { return -1 }
+  if !letValuesBuiltApart(gst) { return -1 }
+  return slotMapHeldTyIn(gst, heldTy(scopeTyAt(gst, -1)), -1)
 }
 
 // Whether name `ix` is read as its function's void twin (`voidTwinForNode`).
@@ -21826,6 +21973,12 @@ function nulSentinelElem(b: i32[], e: i32, er: i32): Opnd {
   const v = irBExpr(b, e)
   if ibMiss != "" { return v }
   return irBLetTempTy(b, { aeEff: [v], aeV: two, aeAt: e }, e, er, TY_I32)
+}
+
+// Whether element `e` of a `null[]` literal is that list's null: legacy's own test
+// (`arrElemNulSent`), or a value at the `null` rep, an instance's `T | null` at `never`.
+function nulSentElemAt(e: i32): boolean {
+  return arrElemNulSent(e, ibFnIx) || repPrim(exprRepOf(e)) == "null"
 }
 
 // An unstamped `null` stored into a `null[]`, as `emitIdxStoreValue` writes it: the value for its

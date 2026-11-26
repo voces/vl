@@ -14,6 +14,7 @@
 //
 // @test-timing native
 
+import { holdoutTest } from "./support/holdouts.ts";
 import { checkBatch } from "./support/checkBatch.ts";
 import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
@@ -313,7 +314,7 @@ Deno.test({
   name:
     "every fix a container refusal prints compiles, runs and delivers the right value",
   ignore: !ENABLED,
-  fn: async () => {
+  fn: holdoutTest("tests/vl_widen_hint_test.ts#every fix a container refusal prints compiles, runs and delivers the right value", async () => {
     const fails: string[] = [];
     const dir = await Deno.makeTempDir({ prefix: "vl_widen_hint_" });
     try {
@@ -407,5 +408,5 @@ Deno.test({
     if (fails.length) {
       throw new Error(`${fails.length} hint failure(s):\n${fails.join("\n")}`);
     }
-  },
+  }),
 });

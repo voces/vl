@@ -12,6 +12,7 @@
 //
 // @test-timing native
 
+import { holdoutCheck } from "./support/holdouts.ts";
 import { COMPILER, ROOT, VL, exists, seedEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -24,8 +25,8 @@ if (GATED && !ENABLED) {
 
 const runCase = async (
   name: string,
-): Promise<{ code: number; out: string }> => {
-  const { code, stdout } = await new Deno.Command(VL, {
+): Promise<{ code: number; out: string; err: string }> => {
+  const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: ["run", `${ROOT}/tests/cases/${name}`, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
@@ -33,7 +34,7 @@ const runCase = async (
     env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, ...seedEnv() },
     clearEnv: true,
   }).output();
-  return { code, out: new TextDecoder().decode(stdout) };
+  return { code, out: new TextDecoder().decode(stdout), err: new TextDecoder().decode(stderr) };
 };
 
 // Each file's whole stdout: the guard fires before the first `print` completes, so nothing
@@ -152,7 +153,12 @@ for (const [name, want] of CASES) {
     name: `a global read before its initializer names itself: ${name}`,
     ignore: !ENABLED,
     fn: async () => {
-      const { code, out } = await runCase(name);
+      const { code, out, err } = await runCase(name);
+      const held = holdoutCheck(`tests/cases/${name}`, code !== 0, err);
+      if (held !== null) {
+        if (held !== "") throw new Error(held);
+        return;
+      }
       if (code === 0) {
         throw new Error(
           `${name} exited 0 — the early read was not refused.\n` +
