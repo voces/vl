@@ -19,7 +19,7 @@ Deno.test("holdouts: rows are <program> <unit> <class> <owner>, sorted, unique, 
       bad.push(`not 4 fields: ${l}`);
     } else {
       try {
-        Deno.statSync(new URL(f[0], ROOT));
+        Deno.statSync(new URL(f[0].split("#")[0], ROOT));
       } catch {
         bad.push(`no such program: ${f[0]}`);
       }

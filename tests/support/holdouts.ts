@@ -1,7 +1,8 @@
 // The I8 holdouts (`scripts/ir-i8-census/holdouts.tsv`, read as `scripts/lib/holdouts.vl` reads
 // it): programs the IR does not claim yet. A grader expects each one refused with
 // `cannot yet lower` and fails when one is not, so the list only shrinks. Keys are
-// checkout-relative paths (`tests/cases/...`). Side-effect free apart from one file read.
+// checkout-relative paths (`tests/cases/...`), or `tests/<file>.ts#<case>` for a program a test
+// writes inline. Side-effect free apart from one file read.
 
 export const HOLDOUTS_PATH = "scripts/ir-i8-census/holdouts.tsv";
 export const HOLDOUT_REFUSAL = "cannot yet lower";
@@ -39,3 +40,11 @@ export const holdoutVerdict = (
   }
   return "";
 };
+
+/**
+ * For a test that builds program `key` itself: null when `key` is not a holdout (grade it as
+ * usual), else "" when its build failed with `cannot yet lower`, or why it fails. `failed` says
+ * the build failed; `err` is its error text.
+ */
+export const holdoutCheck = (key: string, failed: boolean, err: string): string | null =>
+  HOLDOUTS.has(key) ? holdoutVerdict(key, failed, err) : null;
