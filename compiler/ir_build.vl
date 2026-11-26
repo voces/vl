@@ -202,6 +202,7 @@ import {
   irGlobalStoreTyOf,
   irNodeFamily,
   irNodeNew,
+  irOpRow,
   irPushRecvNote,
   irRecHeapNote,
   irRecHeapNoteOne,
@@ -214,6 +215,7 @@ import {
   irVarHeapNote,
   irVarHeapOf,
   irVarNew,
+  irVarRowNote,
   mapKeyRep,
   mapWalkValRep,
   numConvSrcOf,
@@ -2252,7 +2254,7 @@ function objLit(b: i32[], ix: i32, rep: i32): Opnd {
     if cr >= 0 && cr != rep && repNodeAt(cr) is RRecord {
       return objLitAt(b, ix, cr, ct, built, false)
     }
-    const rt = if row >= 0 && row < sTyIx.length { sTyIx[row] } else { -1 }
+    const rt = if row >= 0 && row < sTyIx.length { rowStoredTy(row) } else { -1 }
     const rr = if rt >= 0 && rowTyBuildsAt(rt, row) { repNodeOfTy(rt) } else { -1 }
     if rr >= 0 && rr != rep && repNodeAt(rr) is RRecord {
       return objLitAt(b, ix, rr, rt, row, false)
@@ -2372,7 +2374,7 @@ function builtRecord(t: i32, rep: i32): boolean {
 // The type of storage row `row` where a built value of record type `t` at rep `rep` is held at
 // that row's rep, another record; else -1. A row open only where it stores closed counts.
 function builtStoredTy(t: i32, rep: i32, row: i32): i32 {
-  const rowTy = if row >= 0 { sTyIx[row] } else { -1 }
+  const rowTy = if row >= 0 { rowStoredTy(row) } else { -1 }
   if !builtRecord(t, rep) || rowTy < 0 || !rowTyBuildsAt(rowTy, row) {
     return -1
   }
@@ -2406,11 +2408,13 @@ function rowTyBuildsAtGo(rt: i32, row: i32, seen: i32[]): boolean {
     if r == row { return false }
   }
   // The type holds a tagged set as its id where a row may still store it as a closure, so each
-  // open field asks the row's own storage.
-  seen.push(row)
+  // open field asks the row's own storage. `seen` is the path: sibling fields that target one row
+  // are no cycle.
+  const path = seen.slice(0, seen.length)
+  path.push(row)
   for name in repRecordFieldNames(rr) {
     const ft = recFieldTyOf(rt, name)
-    if irTyOpen(ft) && !openFieldStoredAsRow(ft, row, name, seen) {
+    if irTyOpen(ft) && !openFieldStoredAsRow(ft, row, name, path) {
       return false
     }
   }
@@ -2703,8 +2707,36 @@ function objLitAt(
 function builtAtRow(o: Opnd, arm: ObjLitArm, row: i32): Opnd {
   if ibMiss == "" && arm == "struct" && o is OVar {
     irVarHeapNote(ib, o.ov, row)
+    irBNoteRow(o, row)
   }
   return o
+}
+
+// The struct row the ref-list row of list `arr` lays its elements out at (`rlElemStructRow`), or -1.
+function listElemStructRow(arr: i32): i32 {
+  const slot = refListSlotOfExpr(unwrapParen(arr), ibFnIx)
+  return if slot >= 0 { rlElemStructRow(slot) } else { -1 }
+}
+
+// Notes record operand `o` as laid out at struct row `row` (`irVarRowNote`) where its rep is that
+// row's (`rowRep`) or its nullable, the invariant the verifier holds; any other operand is left.
+export function irBNoteRow(o: Opnd, row: i32): Opnd {
+  if !(o is OVar) || o.ov < 0 || row < 0 { return o }
+  const rr = rowRep(row)
+  const vr = irBOpRep(o)
+  const vn = repNodeAt(vr)
+  if rr >= 0 && (vr == rr || vn is RNullable && vn.rnInner == rr) {
+    irVarRowNote(ib, o.ov, row)
+  }
+  return o
+}
+
+// The struct row field `name` of record operand `o`'s row (`irOpRow`) targets
+// (`sFieldTgtStructIdx`), or -1.
+export function irBRowFieldTarget(o: Opnd, name: string): i32 {
+  const row = irOpRow(ib, o)
+  const fi = if row >= 0 { sFieldIndex(row, name) } else { -1 }
+  return if fi >= 0 { sFieldTgtStructIdx(row, fi) } else { -1 }
 }
 
 // The row literal `ix` (arm `arm`, destination row `at` or -1) is built at through legacy's drop
@@ -4482,14 +4514,14 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   }
   // A record join legacy writes at a row of another record (`ifTypedStructRow`, its destination's)
   // is built at that row's record, each arm delivered there.
-  const sr = if kind == "struct" && rj.rjSlot >= 0 && rj.rjSlot < sTyIx.length { repNodeOfTy(sTyIx[rj.rjSlot]) } else { -1 }
+  const sr = if kind == "struct" && rj.rjSlot >= 0 && rj.rjSlot < sTyIx.length { repNodeOfTy(rowStoredTy(rj.rjSlot)) } else { -1 }
   const atRow = sr >= 0
     && sr != rep
     && repNodeAt(sr) is RRecord
     && repNodeAt(rep) is RRecord
-    && !irTyOpen(sTyIx[rj.rjSlot])
+    && !irTyOpen(rowStoredTy(rj.rjSlot))
   const jr = if atRow { sr } else { rep }
-  const ty = if atRow { sTyIx[rj.rjSlot] } else { rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep) }
+  const ty = if atRow { rowStoredTy(rj.rjSlot) } else { rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep) }
   if irTyHeldOpen(ty, jr) { return irBMiss("open temp type") }
   // A union-typed join legacy writes at its destination's row names no row of its own: its out
   // would declare a local of no interned shape (D4645's module-scope spelling).
@@ -5635,7 +5667,7 @@ function globalCellRowReadTy(ix: i32, d: i32, cellRep: i32, rep: i32): i32 {
   if globalCellKind(d) != "struct" || row < 0 || row >= sTyIx.length {
     return -1
   }
-  const rt = sTyIx[row]
+  const rt = rowStoredTy(row)
   if rt < 0 || irTyOpen(rt) || repNodeOfTy(rt) != cellRep { return -1 }
   const t = nodeTyAt(ix, ibFnIx)
   if t < 0 || repNodeOfTy(t) != rep || !(repNodeAt(rep) is RRecord) {
@@ -6678,7 +6710,7 @@ function retDeclRowTy(pos: i32, t: i32): i32 {
   const si = fRetStructIdx[pos]
   if fRetKind[pos] != "struct" || si < 0 || si >= sTyIx.length { return -1 }
   const dt = declRowTy(si)
-  const st = sTyIx[si]
+  const st = rowStoredTy(si)
   const rt = if dt >= 0 { dt } else if st >= 0 && rowTyBuildsAt(st, si) { st } else { -1 }
   if rt < 0 || repNodeOfTy(rt) == repNodeOfTy(t) { return -1 }
   // A result whose type is the row's own keeps its rep where that is a twin of the row's.
@@ -10701,7 +10733,7 @@ function elemTwinTy(e: i32, er: i32): i32 {
   if objLitArmOf(ol, ibFnIx) != "struct" { return -1 }
   const row = objLitLayoutRowOf(ol, ibFnIx)
   if row < 0 || row >= sTyIx.length { return -1 }
-  if exprRepOf(ol) == er && repNodeOfTy(sTyIx[row]) == er { return -1 }
+  if exprRepOf(ol) == er && repNodeOfTy(rowStoredTy(row)) == er { return -1 }
   return litTwinTyOnHeap(ol, er, -1, -1, true)
 }
 
@@ -14395,15 +14427,15 @@ function mapReadStoredRep(ix: i32, rep: i32, vr: i32): i32 {
   }
   const t = nodeTyAt(ix, ibFnIx)
   const si = if t >= 0 { structIndexOfTy(t) } else { -1 }
-  if si < 0 || si >= sTyIx.length || sTyIx[si] == t { return rep }
-  return if repNodeOfTy(sTyIx[si]) == vr { vr } else { rep }
+  if si < 0 || si >= sTyIx.length || rowStoredTy(si) == t { return rep }
+  return if repNodeOfTy(rowStoredTy(si)) == vr { vr } else { rep }
 }
 
 // The type `mapReadStoredRep`'s row records for read `ix`, or -1.
 function mapReadStoredTy(ix: i32): i32 {
   const t = nodeTyAt(ix, ibFnIx)
   const si = if t >= 0 { structIndexOfTy(t) } else { -1 }
-  return if si >= 0 && si < sTyIx.length { sTyIx[si] } else { -1 }
+  return if si >= 0 && si < sTyIx.length { rowStoredTy(si) } else { -1 }
 }
 
 // `g[k] ?? d` along legacy's helper route, its plain `i32` read or its plain mv slot read
@@ -15945,7 +15977,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     return irBLetTemp(b, rhs, ix, rep)
   }
-  if n is Index { return irIndexHook(b, ix, rep) }
+  // An element read of a list laid out at a struct row is that row's value (`irBNoteRow`).
+  if n is Index {
+    return irBNoteRow(irIndexHook(b, ix, rep), listElemStructRow(n.idxArr))
+  }
   if n is Member { return irMemberHook(b, ix, rep) }
   if n is StrLit { return strLit(ix, rep) }
   if n is ArrayLit {
@@ -18564,7 +18599,7 @@ function tagIdIntoClosure(valIx: i32, dst: i32): boolean {
 // The rep a struct literal laid out at row `row` is built at: the row's recorded type's, or -1.
 function sFieldRowRep(row: i32): i32 {
   if row < 0 || row >= sTyIx.length { return -1 }
-  const rt = sTyIx[row]
+  const rt = rowStoredTy(row)
   return if rt >= 0 && rowTyBuildsAt(rt, row) { repNodeOfTy(rt) } else { -1 }
 }
 
@@ -18829,7 +18864,7 @@ function paramCheckedTy(p: i32, fnIx: i32): i32 {
 function declRowTy(si: i32): i32 {
   const t = slotRowTyOf(si)
   if t < 0 || irTyOpen(t) { return -1 }
-  return if repRowOfTyStruct(t, repScanLim()) == si { t } else { -1 }
+  return if repRowOfTyStruct(t, repScanLim()) == si { rowStoredTy(si) } else { -1 }
 }
 
 // The variable of read `ix` where the IR holds it at legacy's declared row: a parameter's
