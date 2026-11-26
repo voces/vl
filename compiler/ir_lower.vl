@@ -143,6 +143,7 @@ import {
   declaredIndexAt,
   exprVariantIndex,
   forInElemKind,
+  lmForUnionArms,
   localIndexOf,
   memberBoxReadEnter,
   memberBoxReadLeave,
@@ -887,6 +888,10 @@ import {
   litIsBoxLexes,
   litMemberEqArmOf,
   mapGetUnionBoxTail,
+  mapUnionForArmEnter,
+  mapUnionForArmLeave,
+  mapUnionForArmPayload,
+  mapUnionForArmTest,
   memberOrTail,
   nulStrMemberClose,
   nulStrMemberGuard,
@@ -3213,6 +3218,9 @@ function nicheRead(r: RNicheRead) {
 // from its name's local, its tag test, the box again and its payload cast into the arm's wrapper
 // local, the arm's store under the arm's overrides, its parked value dropped; `unreachable` last.
 function armWriteStmt(n: SArmWrite, pending: i32[]) {
+  if n.awAt >= 0 && n.awAt < P.nodes.length && nodeAt(n.awAt) is ForIn {
+    return armWalkStmt(n, pending)
+  }
   const a = nodeAt(n.awAt)
   if !(a is BinExpr) { return irLMiss("arm write node") }
   const t = nodeAt(unwrapParen(a.binLeft))
@@ -3248,6 +3256,56 @@ function armWriteStmt(n: SArmWrite, pending: i32[]) {
     armIndexWriteDrop(t, lw.irAt)
     luOvLocalLeave(lmark)
     luOvLeave(mark)
+    fbElse()
+    k = k + 1
+  }
+  fbUnreachable()
+  while k > 0 {
+    lwFrames.pop()
+    fbEnd()
+    k = k - 1
+  }
+  return 0
+}
+
+// `SArmWrite` over a union-of-maps walk, as `emitMapUnionFor` writes it: per arm the box, its tag
+// test, the box again and its payload cast into the arm's wrapper local, then the arm's walk under
+// the arm's overrides (`mapUnionForArmEnter`); `unreachable` last.
+function armWalkStmt(n: SArmWrite, pending: i32[]) {
+  if n.awAt < 0 || n.awAt >= P.nodes.length { return irLMiss("arm walk node") }
+  const s = nodeAt(n.awAt)
+  if !(s is ForIn) { return irLMiss("arm walk node") }
+  const recv = unwrapParen(s.fiIter)
+  const arms = lmForUnionArms(s.fiIter, lw.irAt)
+  if arms.length == 0 || arms.length != n.awArms.length {
+    return irLMiss("arm walk arms")
+  }
+  const bl = plainVarLocal(n.awV)
+  if bl < 0 && !irReadsAgain(recv) { return irLMiss("arm walk receiver") }
+  if bl < 0 { irLSkip(n.awV) }
+  irLSettle(pending)
+  let k = 0
+  while k < arms.length && lwMiss == "" {
+    if armWriteRecv(bl, recv) < 0 { break }
+    if mapUnionForArmTest(arms[k]) < 0 {
+      irLMiss("arm walk arm")
+      break
+    }
+    if armWriteRecv(bl, recv) < 0 { break }
+    const loc = mapUnionForArmPayload(arms[k])
+    if loc < 0 {
+      irLMiss("arm walk arm")
+      break
+    }
+    lw.irVars[n.awVars[k]].vSlot = loc
+    const marks = mapUnionForArmEnter(s, arms, k, loc)
+    if marks.length == 0 {
+      irLMiss("arm walk value box")
+      break
+    }
+    lwFrames.push(-1)
+    body(n.awArms[k], false, -1, false)
+    mapUnionForArmLeave(marks)
     fbElse()
     k = k + 1
   }
