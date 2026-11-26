@@ -7,6 +7,7 @@ import { blockHasContinueFor } from "./emit_query"
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
 import { fnEnvIdxOf, readNarrowedBoxToNull } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
+import { refRepValtype } from "./ir_verify_facts"
 import { printUnionPlan } from "./emit_fn_scans"
 import {
   armIdxSlot,
@@ -411,11 +412,11 @@ import {
   arrLitChunkStep,
   arrLitDataClose,
   arrLitDataOpen,
+  arrLitDataSegLeaves,
   arrLitDataStoreAt,
   arrLitDataStoreEnd,
   arrLitDataTry,
   arrLitElemIsConst,
-  arrLitHoistGlobal,
   arrLitIsForIter,
   arrLitLongRouteOf,
   arrLitPackedShortTail,
@@ -637,6 +638,7 @@ import {
   numUnionBinTail,
   numUnionConvertTail,
   numUnionIsUnionSide,
+  numUnionReboxTail,
   numUnionSideKindOf,
   numUnionSideLit,
   numUnionStashEnter,
@@ -764,11 +766,8 @@ import {
   unionUnionBoxesTail,
   unionVariantEqHead,
   unionVariantEqTail,
-  urBindConst,
-  urDepth,
   urLocalRead,
   urSlotUnrolled,
-  urUnbind,
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
@@ -1063,13 +1062,15 @@ function ownedSlot(v: i32): i32 {
   return s
 }
 
-// The valtype bytes legacy's `fbValtype` declares a non-null value of rep `r` at; none for a
-// nullable rep or one with no kind.
+// The valtype bytes legacy's `fbValtype` declares a non-null value of rep `r` at, a ref list's or a
+// closure's as `refRepValtype` keys it; none for a nullable rep, one with no kind, or a ref list or
+// closure that keys no shape.
 function repLocalValtype(r: i32): u8[] {
   const out: u8[] = []
   const d = repOfTy(repTyOf(r))
   const k = d.rdKind
   if k == null || d.rdNul != 0 { return out }
+  if k == "reflist" || k == "closure" { return refRepValtype(r) }
   const prev = wTarget(out)
   fbValtype(k, d.rdSlot)
   wTarget(prev)
@@ -2565,12 +2566,12 @@ export function irGetIdxBegin(o: Opnd): boolean {
   const once = o is OVar && isTemp(o.ov) && repPrim(opRepOf(o)) == "i32"
   if !(o is OImm || o is OVar && !isTemp(o.ov) || once) { return false }
   const slot = if once { irOnceSlot([127]) } else { -1 }
-  // Legacy's staging of the index is dropped: the tail reads this local through the hook.
   if slot >= 0 {
     irLOpnd(o)
     fbLocalSet(slot)
-    listGetIdxUnstage()
   }
+  // Legacy's staging of the index is dropped: the tail reads it through the hook.
+  listGetIdxUnstage()
   getIdxOs.push(o)
   getIdxReads.push(0)
   getIdxSlots.push(slot)
@@ -2582,7 +2583,8 @@ export function irGetIdxBegin(o: Opnd): boolean {
 export function irGetIdxEnd() {
   getIdxOs.pop()
   getIdxReads.pop()
-  if (getIdxSlots.pop() ?? -1) >= 0 { listGetIdxRelease() }
+  getIdxSlots.pop()
+  listGetIdxRelease()
   if getIdxOs.length == 0 { listGetIdxHook = listGetIdxLegacy }
   return 0
 }
@@ -3526,6 +3528,10 @@ function makeList(r: RMakeList) {
     if arrLitLongRouteOf(a.arrElems, fnIx, arm, lb.lbSlot) != "dataConst" {
       return irLMiss("array long route")
     }
+    // A leaf the data segment would write through the expression lowering is no constant here.
+    if !arrLitDataSegLeaves(a.arrElems, fnIx, arm, lb.lbSlot) {
+      return irLMiss("array long element not a constant leaf")
+    }
     for e in r.mlElems { irLSkip(e) }
     const d = arrLitDataTry(a.arrElems, fnIx, arm, lb.lbSlot)
     if d < 0 { return -1 }
@@ -3547,6 +3553,9 @@ function makeList(r: RMakeList) {
   ) {
     if la.arrElems.length != r.mlElems.length {
       return irLMiss("array long element")
+    }
+    if !arrLitDataSegLeaves(la.arrElems, fnIx, arm, lb.lbSlot) {
+      return irLMiss("array long element not a constant leaf")
     }
     const dst = arrLitDataOpen(la.arrElems, fnIx, arm, lb.lbSlot)
     if dst < 0 { return irLMiss("array long data") }
@@ -3601,23 +3610,17 @@ function refLitSlot(r: RMakeList, fnIx: i32, lb: ListBuild): i32 {
 }
 
 // `for` iterable `r`'s module list at arm `arm`, as legacy's hoist (`arrLitHoistGlobal`) builds
-// it, each element written alone (`forLitElemAt`). Where one is none the IR can write, legacy's
-// own hoist decides (`hoistInRangeCopy`), and its hoist is then a miss. Its global, -1 where it
-// does not hoist, -2 on a miss.
+// it, each element written alone (`forLitElemAt`); where one is none the IR can write, the list
+// builds as usual. Its global, -1 where it does not hoist, -2 on a miss.
 function irForLitHoist(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
   const t = forLitHoistTysOf(arm)
   const a = if r.mlAt >= 0 && r.mlAt < P.nodes.length { nodeAt(r.mlAt) } else { null }
   if !(a is ArrayLit) || a.arrElems.length != r.mlElems.length { return -1 }
   let i = 0
   while i < r.mlElems.length {
-    if !forLitElemWrites(r.mlElems[i], t) {
-      const g = hoistInRangeCopy(r, fnIx, arm)
-      if g >= 0 {
-        irLMiss("for iterable element")
-        return -2
-      }
-      return g
-    }
+    // An element no constant writes builds the list as usual: the loop only reads it, so the
+    // hoist is no more than legacy's saving, and asking legacy's would run its element writers.
+    if !forLitElemWrites(r.mlElems[i], t) { return -1 }
     i = i + 1
   }
   if t.fhBack < 0 || !forLitHoistable(r.mlAt, a.arrElems) { return -1 }
@@ -3681,58 +3684,6 @@ function globalGetRhs(r: RGlobalGet) {
   globalRead(r.ggSym, r.ggNonNull)
   if r.ggNn > 0 { fbRefAsNonNull() }
   return 0
-}
-
-// Legacy's hoist of `for` iterable `r` (`arrLitHoistGlobal`), asked with each range variable its
-// elements read bound to its copy's constant; every binding is undone before it returns.
-function hoistInRangeCopy(r: RMakeList, fnIx: i32, arm: ArrLitArm): i32 {
-  const bound = bindRangeCopyElems(r, fnIx)
-  const g = arrLitHoistGlobal(r.mlAt, fnIx, arm)
-  let k = 0
-  while k < bound {
-    urUnbind()
-    k = k + 1
-  }
-  return g
-}
-
-// The unroll stack's depth change across `hoistInRangeCopy` of a literal node `at` (a miss where
-// it is no list literal), for the host test: 0, the bindings undone.
-export function irRangeCopyHoistSelfTest(at: i32): i32 {
-  const d = urDepth()
-  const r: RMakeList = {
-    mlElems: [],
-    mlKind: 0,
-    mlSlot: 0,
-    mlAt: at,
-    mlArm: "i32",
-  }
-  hoistInRangeCopy(r, -1, "i32")
-  return urDepth() - d
-}
-
-// Binds each element of literal `r` that reads a range loop's variable, held as an immediate, to
-// that constant on legacy's copy stack (`urBindConst`); returns how many it bound.
-function bindRangeCopyElems(r: RMakeList, fnIx: i32): i32 {
-  if r.mlAt < 0 || r.mlAt >= P.nodes.length { return 0 }
-  const a = nodeAt(r.mlAt)
-  if !(a is ArrayLit) || a.arrElems.length != r.mlElems.length { return 0 }
-  let n = 0
-  let k = 0
-  while k < a.arrElems.length {
-    const x = unwrapParen(a.arrElems[k])
-    const o = r.mlElems[k]
-    if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident && o is OImm {
-      const d = identDeclOf(x)
-      const w = localIndexOf(fnIx, x)
-      if d >= 0 && d < P.nodes.length && nodeAt(d) is ForRange && w >= 0 {
-        urBindConst(w, o.oiBits as% i32)
-        n = n + 1
-      }
-    }
-    k = k + 1
-  }
-  return n
 }
 
 // `RSpread`: legacy's prologue, the source, then the group stash and join `emitArrSpread`'s plain
@@ -5153,6 +5104,15 @@ function boxOp(r: RToBox) {
   if p.hbArm == "recCopy" {
     if boxRecCopy(r, p.hbKind) < 0 { return -1 }
     return holeBoxTail(p, r.bxAt, fnIx)
+  }
+  // A numeric union re-boxed member by member: its box stashed, then legacy's dispatch.
+  if p.hbArm == "numRebox" {
+    irLOpnd(r.bxV)
+    if lwMiss != "" { return -1 }
+    const key = numUnionStashEnter()
+    const bs = numUnionStashTail(true, -1, key)
+    numUnionStashLeave()
+    return numUnionReboxTail(r.bxAt, p.hbKind, fnIx, bs)
   }
   if (
     p.hbArm == "pass"
@@ -6830,11 +6790,8 @@ function coalListGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   // A receiver legacy would stage is the builder's local (`heldInLocal`), read through the hook.
   const recvHooked = recvIx >= 0 && irGetRecvBegin(n.cbL, recvIx)
   if recvHooked { listGetRecvUnstage() }
-  // So is an index held in a local of its own: legacy's head reads it through the index hook.
-  if hooked { listGetIdxUnstage() }
   const ek = listGetOrOpen(unwrapParen(e.binLeft), lw.irAt)
   if recvHooked { listGetRecvRelease() }
-  if hooked { listGetIdxRelease() }
   if recvHooked { irGetRecvEnd() }
   if hooked { irGetIdxEnd() }
   if ek == null { return irLMiss("listGetOr head") }

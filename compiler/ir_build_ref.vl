@@ -35,6 +35,7 @@ import {
 import { exprEffectFree, unwrapParen } from "./emit_base"
 import {
   localIndexOf,
+  memReadBoxNarrowTy,
   refListSlotOfExpr,
   structIndexOfExpr,
 } from "./emit_classify"
@@ -68,6 +69,7 @@ import {
   irBOpRep,
   irBOpenLocalReadRep,
   irBStageLeads,
+  irBStrRep,
   irBUnboxKindRep,
   irInPlaceHook,
   irIndexHook,
@@ -116,6 +118,7 @@ import {
   RNullable,
   RRecord,
   RUnsup,
+  boxTagOfTy,
   repNodeAt,
   repNodeKids,
   repNodeOfTy,
@@ -355,6 +358,14 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
   const nulDropped = en is RNullable
     && repPrim(rep) == "null"
     && nullOwnAt(ix, fnIx) == NULL_OWN_NONE
+  // A union box element narrowed to string literal arms is the string legacy's tail unboxes
+  // (`refListReadUnboxOf`'s string kind); its consumer takes the string.
+  const boxStr = vr is RList
+    && heldAsBox(vr.rlsElem)
+    && repNodeAt(rep) is RAtom
+    && idxArmOf(n, fnIx) == "ref"
+    && !listElemStaysNullable(n.idxArr, fnIx)
+    && refListReadUnboxOf(ix, fnIx) == 2
   // A nullable closure element the read narrows non-null is read as stored, then recovered to the
   // closure (`RRecover`), so a delivery to a non-null closure slot holds one.
   const cloStored = en is RNullable
@@ -378,6 +389,7 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
     && !strAtom
     && !atomStr
     && !nulDropped
+    && !boxStr
     && !cloStored
     && !boxView
     && !recTwin
@@ -431,6 +443,7 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
       repTyOf(rep),
     )
   }
+  if boxStr { return irBLetTempTy(b, r, ix, irBStrRep(), repTyOf(irBStrRep())) }
   if (stored || strAtom || atomStr) && vr is RList {
     return irBLetTempTy(b, r, ix, vr.rlsElem, repTyOf(vr.rlsElem))
   }
@@ -607,7 +620,8 @@ function readsAgain(o: Opnd): boolean {
 }
 
 // Whether ref list read `ix` leaves rep `rep` by the unbox legacy's tail writes after the element
-// (`refListReadUnboxOf`): its narrowed container, or the scalar of an atom kind.
+// (`refListReadUnboxOf`): its narrowed container, the scalar of an atom kind, or a function arm's
+// closure.
 function refUnboxedAt(n: Index, ix: i32, fnIx: i32, rep: i32): boolean {
   if idxArmOf(n, fnIx) != "ref" || listElemStaysNullable(n.idxArr, fnIx) {
     return false
@@ -616,6 +630,10 @@ function refUnboxedAt(n: Index, ix: i32, fnIx: i32, rep: i32): boolean {
   if u == REF_READ_CONTAINER {
     const rn = repNodeAt(rep)
     return rn is RList || rn is RMap
+  }
+  // A function arm's box tag unboxes to its closure: the payload cast to the closure's heap.
+  if u >= 0 && repNodeAt(rep) is RClosure {
+    return boxTagOfTy(nodeTyAt(ix, fnIx)) == u
   }
   return u >= 0 && irBAtomKindRep(u, rep)
 }
@@ -868,6 +886,11 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     if skr != kr && own && !boxRead && !boxUnbox {
       return irBMiss("field read of a stored row's box")
     }
+    // A read at its storage (an `is` receiver's raw slot) is the stored row's box; one the read's
+    // type does not name is no box this read holds.
+    if isStorageRead(ix) && repNodeAt(skr) is RBox && rep != skr {
+      return irBMiss("storage read of a wider row's box")
+    }
     const gf: Rhs = {
       gfV: rv,
       gfIx: k,
@@ -877,6 +900,18 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
       gfShared: false,
     }
     if ur != rep { return irBLetStrTemp(b, gf, ix) }
+    // A box stored at a wider record's members is read rebuilt at the read's own union
+    // (`memReadBoxNarrowTy`, D3006), which legacy's field tail writes after the field.
+    const ownTy = nodeTyAt(ix, fnIx)
+    if (
+      !isStorageRead(ix)
+      && memReadBoxNarrowTy(ix, fnIx) >= 0
+      && repNodeAt(skr) is RBox
+      && ownTy >= 0
+      && repNodeAt(repNodeOfTy(ownTy)) is RBox
+    ) {
+      return irBLetTempTy(b, gf, ix, repNodeOfTy(ownTy), ownTy)
+    }
     if atomStr || strAtom { return irBLetTempTy(b, gf, ix, kr, repTyOf(kr)) }
     // The read at the kid is at the operand's own stored row (`skr`), the row legacy reads.
     if atKid { return irBLetTempTy(b, gf, ix, skr, repTyOf(skr)) }

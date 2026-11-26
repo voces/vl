@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR builds a plain `xs.get(i)` whose index is a fused `??` or a global read:** the plain `.get` builder now uses the fused read's operand holds. Ahead of an index legacy cannot re-read, a re-readable receiver's read waits aside and any other receiver is held in an IR-owned local. An index that built statements is held too, and a global-read index takes the once-slot (`get index operand`, `coalesce listGetOr after an operand`). `irGetIdxBegin` now stands legacy's index staging down whenever it hands the index. A ref-element list or closure local is declared at the valtype `refRepValtype` keys. A string `??` with a literal default refuses, by name, an operand that holds an inner `??`.

@@ -10227,7 +10227,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
     "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "recCopy" | "refList" | "map" | "nulMap" | "clo" => true
-    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
+    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "numRebox" | "ladder" => false
   }
 }
 
@@ -10242,7 +10242,7 @@ export function holeBoxHeadAhead(a: HoleBoxArm): boolean {
 export function boxTagOnly(a: HoleBoxArm): boolean {
   return match a {
     "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" => true
-    "recCopy" | "map" | "nulMap" | "clo" | "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
+    "recCopy" | "numRebox" | "map" | "nulMap" | "clo" | "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
   }
 }
 
@@ -10269,7 +10269,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     // The niche's stash slot is taken ahead of its value, as legacy's rung takes it.
     "nulNiche" => if nulNicheBoxSlot() < 0 { -1 } else { 0 }
     "nulBool" => if nulBoolBoxSlot() < 0 { -1 } else { 0 }
-    "pass" | "memberBox" | "atomStr" | "mapScalar" | "mapBox" | "retag" => 0
+    "pass" | "memberBox" | "atomStr" | "mapScalar" | "mapBox" | "retag" | "numRebox" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
 }
@@ -10285,7 +10285,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "retag" => boxRetagTail(p.hbKind, exprIx, fnIx)
     "mapBox" => mapBoxTail(p.hbKind, exprIx, fnIx)
     "nulMap" => nulMapArmBoxTail()
-    "pass" | "memberBox" | "mapScalar" | "ladder" => 0
+    "pass" | "memberBox" | "mapScalar" | "numRebox" | "ladder" => 0
   }
 }
 
@@ -10400,6 +10400,7 @@ function unionBoxArgLadders(
 ): boolean {
   return hp.hbArm == "ladder"
     || hp.hbArm == "recCopy"
+    || hp.hbArm == "numRebox"
     || hp.hbArm == "mapBox"
     || hp.hbArm == "nulNiche" && nulNicheBoxTagOf(unionTy, exprIx, fnIx) < 0
 }
@@ -18678,6 +18679,44 @@ function arrLitDataElemEmit(ix: i32, fnIx: i32, form: i32): i32 {
     return 0
   }
   return arrLitDataElemExpr(ix, fnIx, form)
+}
+
+// Whether data-literal element `ix` of form `form` writes as one constant leaf (a literal leaf, or a
+// tagged set's member id), never through the expression lowering `arrLitDataElemExpr` takes; the
+// leaf is written to a scratch buffer and dropped.
+export function arrLitDataElemIsLeaf(ix: i32, fnIx: i32, form: i32): boolean {
+  if arrLitElemIsConst(ix) {
+    const scratch: u8[] = []
+    const prev = wTarget(scratch)
+    const rc = arrLitConstLeafEmit(ix, fnIx, form)
+    wTarget(prev)
+    if rc != -2 { return true }
+  }
+  return form == ALD_I32
+    && fnTagLeafEmitted(ix, fnIx) >= 0
+    && !exprReadsDeadNever(ix, fnIx)
+    && coerceKindAt(ix, fnIx) == "none"
+}
+
+// Whether every element the data segment of a long literal of arm `arm` at row `row` writes (each
+// one not computed, `arrLitDataComputed`) is a constant leaf (`arrLitDataElemIsLeaf`).
+export function arrLitDataSegLeaves(
+  elems: i32[],
+  fnIx: i32,
+  arm: ArrLitArm,
+  row: i32,
+): boolean {
+  const form = arrLitDataFormOf(arm, row)
+  const computed = arrLitDataComputed(elems, fnIx, form)
+  if computed == null { return false }
+  let i = 0
+  let ci = 0
+  while i < elems.length {
+    if ci < computed.length && computed[ci] == i { ci = ci + 1 }
+    else if !arrLitDataElemIsLeaf(elems[i], fnIx, form) { return false }
+    i = i + 1
+  }
+  return true
 }
 
 // Element `ix` through the expression lowering, widened to the form's number kind.
@@ -37725,6 +37764,8 @@ export function listReserveOpen(
     lbPushOf.push(reg)
     k = k + 1
   }
+  // A block's hoist safety reads the open regions (`listBuildRegionOf`), so its memo restarts.
+  hmFn = -2
   return 0
 }
 
@@ -37811,6 +37852,7 @@ export function listBuildClose(ix: i32) {
       fbLocalGet(lbCnt[reg])
       fbStructSet(lbWrap[reg], 1) // len
       lbEnd[reg] = -1
+      hmFn = -2
     }
     reg = reg + 1
   }
@@ -39430,25 +39472,6 @@ export function urLocalRead(idx: i32): boolean {
     fbI32Bin(106) // 0x6a i32.add
   }
   return true
-}
-
-// Binds local `idx` to constant `v` as a full unroll's copy does, so legacy's questions about the
-// copy's nodes (a hoisted iterable's elements) read it as that copy's value; `urUnbind` undoes it.
-export function urBindConst(idx: i32, v: i32) {
-  urSlot.push(idx)
-  urVal.push(v)
-  urBase.push(-1)
-  return 0
-}
-
-// How many copies the unroll stack holds.
-export function urDepth(): i32 { return urSlot.length }
-
-export function urUnbind() {
-  urSlot.pop()
-  urVal.pop()
-  urBase.pop()
-  return 0
 }
 
 // The innermost unrolled copy whose loop var is local `idx`, or -1.
@@ -43980,6 +44003,19 @@ function emitNumUnionRebox(
   if bs < 0 { return -1 }
   if njReboxArm(ms, 0, bs, dk) < 0 { return -1 }
   return 1
+}
+
+// After numeric union `ix`'s box is stashed in slot `bs`: its re-box into union `unionTy`
+// (`emitNumUnionRebox`'s dispatch).
+export function numUnionReboxTail(
+  ix: i32,
+  unionTy: i32,
+  fnIx: i32,
+  bs: i32,
+): i32 {
+  const dk: i32[] = []
+  msMemberValKindsOf(msSetOfTyAny(unionTy), dk)
+  return njReboxArm(njMembersOf(ix, fnIx), 0, bs, dk)
 }
 
 // The re-box dispatch from member `i` on; the last member is the bare `else`.

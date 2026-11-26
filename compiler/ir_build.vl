@@ -566,6 +566,7 @@ import {
   narrowedFieldIsUnionBox,
   narrowedFieldPlain,
   nullInstanceIsResult,
+  scalarAtomNameOfKind,
   variantCoerceArmOf,
 } from "./emit_plan_union"
 import {
@@ -3215,6 +3216,9 @@ export function irBFnIx(): i32 { return ibFnIx }
 
 export function irBNoValue(): i32 { return ibNoValue }
 
+// The string rep.
+export function irBStrRep(): i32 { return repNodeOfTy(TY_STR) }
+
 export function irBMiss(why: string): Opnd {
   if ibMiss == "" { ibMiss = why }
   const o: Opnd = { ov: -1 }
@@ -5229,6 +5233,14 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     // A binding holding one closed member of a returned record, read where the read's type leaves
     // a variable open, is that member's closure as its cell holds it (`globalHolderTy`).
     const gh = if cellRep != rep && !narrowed && !stored && !holed && !alike { globalHolderTy(d) } else { -1 }
+    // A string cell narrowed to a literal set reads, where legacy decodes no atom
+    // (`exprIsLitAtom`), as the string it holds, as a local's does.
+    const strHeld = cellRep != rep
+      && !narrowed
+      && !stored
+      && repNodeAt(rep) is RAtom
+      && repPrim(cellRep) == "str"
+      && !exprIsLitAtom(ix, ibFnIx)
     const member = gh >= 0
       && repNodeOfTy(gh) == cellRep
       && irTyHeldOpen(heldTy(exprTyOf(ix)), rep)
@@ -5241,6 +5253,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !atomId
       && rowTy < 0
       && !tagId
+      && !strHeld
     // A read narrowed to `null` whose storage is that null (`NULL_READ_STORED`) is the cell as it
     // stands, at the binding's row, as a local's storage read is.
     if (
@@ -5289,6 +5302,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       return irBLetTempTy(b, gr, ix, cellRep, at)
     }
     if member { return irBLetTempTy(b, gr, ix, cellRep, gh) }
+    if strHeld { return irBLetTempTy(b, gr, ix, cellRep, TY_STR) }
     noteCellHeap(d, rep)
     return irBLetTempTy(b, gr, ix, rep, globalReadTy(d, ix, rep))
   }
@@ -8943,19 +8957,39 @@ function popValueRhs(b: i32[], m: Member, ix: i32): Rhs {
 function getValueRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if popAnyPlanOf(ix, ibFnIx) == null { return missRhs("method get") }
   const reRead = listGetIdxReReadable(c.callArgs[0])
-  const v = irBExpr(b, m.memObj)
+  const la = b.length
+  const v0 = irBExpr(b, m.memObj)
   if ibMiss != "" { return missRhs("method operand") }
-  if !(repNodeAt(irBOpRep(v)) is RList) {
+  if !(repNodeAt(irBOpRep(v0)) is RList) {
     return missRhs("get operand coercion")
   }
+  // Ahead of an index legacy cannot re-read, a receiver read legacy re-reads waits aside while the
+  // index builds, and any other is held in a local of its own (`heldInLocal`), so an index's own
+  // fused `??` finds no temp waiting.
+  const aside: i32[] = []
+  const pure = optRecvReReadable(m.memObj)
+  if !reRead && pure {
+    while b.length > la { aside.push(b.pop() ?? -1) }
+  }
+  const v = if !reRead && !pure && v0 is OVar { heldInLocal(b, v0, ix) } else { v0 }
   const at = b.length
-  const i = irBExpr(b, c.callArgs[0])
+  const i0 = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return missRhs("method operand") }
-  if irBOpRep(i) != repNodeOfTy(TY_I32) { return missRhs("get index operand") }
-  // An index legacy cannot re-read is one temp, written once to a local at its first use
-  // (`irGetIdxBegin`); one re-read in place builds no statement.
-  if reRead && b.length != at || !reRead && !oneTempAt(b, at, i) {
-    return missRhs("get index operand")
+  if irBOpRep(i0) != repNodeOfTy(TY_I32) { return missRhs("get index operand") }
+  // An index that built nothing is legacy's own re-read; any other is one temp, written once to a
+  // local at its first use (`irGetIdxBegin`), or held in a local of its own after its statements.
+  const idxNodes = b.length - at
+  const idxOneTemp = oneTempAt(b, at, i0)
+  const idxPlain = reRead && idxNodes == 0
+  if !idxPlain && !(i0 is OVar) { return missRhs("get index operand") }
+  const i = if !idxPlain && !idxOneTemp { heldInLocal(b, i0, ix) } else { i0 }
+  if aside.length > 0 {
+    const tail: i32[] = []
+    if idxNodes == 0 || idxOneTemp {
+      while b.length > at { tail.push(b.pop() ?? -1) }
+    }
+    while aside.length > 0 { b.push(aside.pop() ?? -1) }
+    while tail.length > 0 { b.push(tail.pop() ?? -1) }
   }
   const r: Rhs = { lqV: v, lqIx: [i], lqAt: ix }
   return r
@@ -10579,7 +10613,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd, ix: i32): string {
   const ok = match p.hbArm {
     "null" => v is OImm && r == ibNoValue
     "lit" => v is OImm
-    "pass" | "memberBox" | "retag" => repNodeAt(r) is RBox || boxedNullable(r)
+    "pass" | "memberBox" | "retag" | "numRebox" => repNodeAt(r) is RBox || boxedNullable(r)
     "atomStr" => atomNullable(r)
     "atomAsStr" => repNodeAt(r) is RAtom
     "nulNiche" => refNullable(r) || strNullable(r)
@@ -10609,6 +10643,8 @@ function mapNullable(r: i32): boolean {
 
 // Whether rep `r` is value-atom kind `k`'s own: `i32`, `boolean`, `string`, or a list's.
 function holeKindRep(k: i32, r: i32): boolean {
+  // The vector's kind is an atom appended past the list kinds; its payload is the vector.
+  if scalarAtomNameOfKind(k) == "v128" { return repPrim(r) == "v128" }
   // A list kind's payload is the list itself, the plan's kind read off the value's own type.
   if k > 5 { return repNodeAt(r) is RList }
   const p = repPrim(r)
@@ -12689,8 +12725,12 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const lat = b.length
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
-  // Legacy writes the operand inside the coalesce's block, above which a valued `if` cannot sit.
+  // Legacy writes the operand inside the coalesce's block, above which a valued `if` cannot sit,
+  // nor an inner `??`, whose out stays on the stack as one's does.
   if valuedIfFrom(b, lat) { return irBMiss("coalesce of a valued if") }
+  if coalBoxFrom(b, lat, true) || coalBoxFrom(b, lat, false) {
+    return irBMiss("coalesce string operand holds a ??")
+  }
   if !strNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
   const nul = coalesceNulStrStaysNullable(ix, ibFnIx)
   const want = if nul { irBOpRep(l) } else { strInnerOf(irBOpRep(l)) }
@@ -13797,8 +13837,11 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
   if bx && !mapBoxReadsAt(rcvMapRep(rcv), rep) {
     return irBMiss("map read box rep")
   }
-  // The box arm's default is boxed into the slot's union, the map's value rep.
-  const bv = if bx { mapValRepOf(rcvMapRep(rcv)) } else { -1 }
+  // The box arm's default is boxed into the slot's union, the map's value rep; where that is the
+  // boxed `T | null` of a non-null read, into the read's box, the same struct.
+  const bv0 = if bx { mapValRepOf(rcvMapRep(rcv)) } else { -1 }
+  const bn = if bv0 >= 0 { repNodeAt(bv0) } else { null }
+  const bv = if bv0 != rep && bn is RNullable && bn.rnDisc == 4 && bn.rnInner == rep { rep } else { bv0 }
   const bm = if bx { mapGetOrBoxDefaultMiss(n.binRight, bv, sh) } else { "" }
   if bm != "" { return irBMiss(bm) }
   const dv: Opnd = if ub { deliver(db, n.binRight, rep, mvValTyIxAt(sh)) } else if bx { deliver(db, n.binRight, bv, mvValTyIxAt(sh)) } else if at || st { deliver(db, n.binRight, rep, -1) } else if inline { inlineDefault(db, n.binRight, rep) } else { { oiRep: rep, oiBits: 0 } }
@@ -13896,7 +13939,9 @@ function mapGetAt(
       // The read is the value's box, its miss the box's `null` tag.
       "none" => rep == m.rmVal
         || repNodeAt(repBoxCore(rep)) is RBox && repBoxCore(rep) == repBoxCore(m.rmVal)
-      "unbox" => repPrim(rep) != null && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
+      // …to the member's scalar, or a function member's closure (the payload cast to its heap).
+      "unbox" => (repPrim(rep) != null || repNodeAt(rep) is RClosure)
+        && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
       // …or to its container member, at the read's own type (`emitNarrowedMapReadTail`).
       "container" => repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
       "nonNull" => false
@@ -16159,6 +16204,13 @@ function storedAsStands(b: i32[], v: Opnd, rep: i32, x: i32): Opnd {
 // effect and then the bottom null at `at`, as legacy's `nulnone` store writes it
 // (`emitNulNoneForEffect`).
 function storeValue(b: i32[], x: i32, rep: i32, at: i32): Opnd {
+  // An empty list literal holds no element to type it, so it is built at its cell's list, as legacy
+  // writes it at the cell's type.
+  const xu = unwrapParen(x)
+  const xn = if xu >= 0 && xu < P.nodes.length { nodeAt(xu) } else { null }
+  if xn is ArrayLit && xn.arrElems.length == 0 && repNodeAt(rep) is RList {
+    return arrayLit(b, xn, xu, rep, arrLitListBuild(xu, ibFnIx), repTyOf(rep))
+  }
   if repPrim(rep) != "null" { return deliver(b, x, rep, -1) }
   const e = nulNoneEffect(b, x, at, null)
   if ibMiss != "" { return e }
@@ -16603,14 +16655,21 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
   const s = declaredSlotOfDecl(ix)
   const vw = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
   const bw = if s >= 0 { declaredIndexAt(ibFnIx, s + 1) } else { -1 }
-  if vw < 0 || bw < 0 || localVarAt(vw) >= 0 || localVarAt(bw) >= 0 {
+  // A copy of this loop that an unrolled outer loop builds again reuses the slots' variables.
+  const prior = ibDeclVar[ix] ?? -1
+  const again = prior >= 0 && localVarAt(vw) == prior
+  if (
+    vw < 0
+    || bw < 0
+    || !again && (localVarAt(vw) >= 0 || localVarAt(bw) >= 0)
+  ) {
     return skip("for range slot")
   }
   const ri = repNodeOfTy(TY_I32)
   const a = irBExpr(b, n.frFrom)
   if ibMiss != "" { return 0 }
   if irBOpRep(a) != ri { return skip("for range bound rep") }
-  const v = irVarNew(ib, ri, TY_I32, "local", vw)
+  const v = if again { prior } else { irVarNew(ib, ri, TY_I32, "local", vw) }
   ibDeclVar[ix] = v
   // An instance's loop is a clone whose body reads still name the source's declaration.
   const src = nodeSrc[ix] ?? -1
@@ -16624,7 +16683,7 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
     const t = irBExpr(b, n.frTo)
     if ibMiss != "" { return 0 }
     if irBOpRep(t) != ri { return skip("for range bound rep") }
-    const bv = irVarNew(ib, ri, TY_I32, "local", bw)
+    const bv = if again && localVarAt(bw) >= 0 { localVarAt(bw) } else { irVarNew(ib, ri, TY_I32, "local", bw) }
     irBNode(b, { asDst: bv, asSrc: t }, -1, ibNoValue, ix)
     const o: Opnd = { ov: bv }
     bound = o
