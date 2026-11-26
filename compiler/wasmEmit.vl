@@ -2441,10 +2441,14 @@ export function emitClosureValue(fe: i32, fnIx: i32) {
 // The refusal `emitClosureValue` raises for function `fe`, or "": a generic function's, then
 // `closureValueCoreWhy`'s.
 export function closureValueWhy(fe: i32): string {
-  if fnHasUnannotatedParam(fe) && !criFnIsAnonLambda(fe) {
-    return genericFnValueRejectMsg(fe)
-  }
+  if closureValueIsGeneric(fe) { return genericFnValueRejectMsg(fe) }
   return closureValueCoreWhy(fe)
+}
+
+// Whether function `fe` taken as a value is a generic one (a named function with an
+// un-annotated parameter), whose refusal is the contract `genericFnValueRejectMsg` states.
+export function closureValueIsGeneric(fe: i32): boolean {
+  return fnHasUnannotatedParam(fe) && !criFnIsAnonLambda(fe)
 }
 
 // The closure-value fat pointer for lifted function `fe`: `struct.new $cloStruct [ env, id,
@@ -10173,6 +10177,15 @@ export function holeBoxLeads(a: HoleBoxArm): boolean {
 // (`holeBoxLeads`), or takes the niche's stash slot (`nulNiche`, `nulBool`).
 export function holeBoxHeadAhead(a: HoleBoxArm): boolean {
   return holeBoxLeads(a) || a == "nulNiche" || a == "nulBool"
+}
+
+// Whether arm `a`'s head is its tag alone, so its value may be held in a local and the tag written
+// after it (the IR's late box): a map, closure or niche head writes more than a tag.
+export function boxTagOnly(a: HoleBoxArm): boolean {
+  return match a {
+    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" => true
+    "map" | "nulMap" | "clo" | "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "ladder" => false
+  }
 }
 
 // What plan `p` writes ahead of its value; a `lit` plan writes its literal too.
@@ -37194,6 +37207,19 @@ export function stmtIsBareFnName(stmtIx: i32): boolean {
   return true
 }
 
+// Whether `s` in function `fnIx` binds a generic named function that some call instantiates and
+// the body only calls by name: its initializer is stored as the core closure, never refused.
+export function letStoresGenericAliasCore(s: LetDecl, fnIx: i32): boolean {
+  if fnIx < 0 || s.letInit < 0 || fnTagLeafId(s.letInit) >= 0 { return false }
+  const aliasFe = fieldValueFeOf(s.letInit)
+  if !fnHasUnannotatedParam(aliasFe) || criFnIsAnonLambda(aliasFe) {
+    return false
+  }
+  if !monoInstantiatedAny(aliasFe) { return false }
+  const encl = nodeAt(fnIx)
+  return encl is FuncDecl && !nameUsedAsValueIn(s.letName, encl.fnBody)
+}
+
 function emitLetDeclStmt(s: LetDecl, stmtIx: i32, fnIx: i32) {
   // `let x = <expr>` / `const x = <expr>`: emit the init, then store it into the local's
   // slot. This `LetDecl`'s slot is the next cursor position, not name-resolved (a name
@@ -37239,23 +37265,11 @@ function emitLetDeclStmt(s: LetDecl, stmtIx: i32, fnIx: i32) {
   // A `const g = f` of a generic named function used only as a direct callee stores the closure:
   // `monomorphize` rewrote each `g(args)` to its pinned instance (`monoInstantiatedAny`). A
   // member of a tagged set is held as its id instead, its slot's rep (D15927).
-  if fnIx >= 0 && fnTagLeafId(s.letInit) < 0 {
-    const aliasFe = fieldValueFeOf(s.letInit)
-    if fnHasUnannotatedParam(aliasFe) {
-      if !criFnIsAnonLambda(aliasFe) {
-        if monoInstantiatedAny(aliasFe) {
-          const encl = nodeAt(fnIx)
-          if encl is FuncDecl {
-            if !nameUsedAsValueIn(s.letName, encl.fnBody) {
-              if emitClosureValueCore(aliasFe, fnIx) < 0 { return -1 }
-              fbLocalSet(idx) // 0x21 local.set
-              scopeBind(s.letName, slot)
-              return 0
-            }
-          }
-        }
-      }
-    }
+  if letStoresGenericAliasCore(s, fnIx) {
+    if emitClosureValueCore(fieldValueFeOf(s.letInit), fnIx) < 0 { return -1 }
+    fbLocalSet(idx) // 0x21 local.set
+    scopeBind(s.letName, slot)
+    return 0
   }
   // A never-filled null hole (`let x = null`) is the plain `null` type, whose value is
   // `ref.null none`, not a zero i32; a filled one is a `T | null` box and takes the
