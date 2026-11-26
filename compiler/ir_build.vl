@@ -2298,10 +2298,10 @@ function nullFoldedTy(t: i32, rep: i32): i32 {
 // Type `t` of `ix`, or where `rowlessRecordRep` moved its rep `rep` to a storage row, that row's
 // recorded type.
 function rowlessRecordTy(ix: i32, t: i32, rep: i32): i32 {
-  if t < 0 || repNodeOfTy(t) == rep || !rowlessRecord(t, repNodeOfTy(t)) {
+  if t < 0 || repNodeOfTy(t) == rep || !builtRecord(t, repNodeOfTy(t)) {
     return t
   }
-  const rt = rowlessStoredTy(t, repNodeOfTy(t), storeRowTyOf(ix))
+  const rt = builtStoredTy(t, repNodeOfTy(t), storeRowTyOf(ix))
   return if rt >= 0 && repNodeOfTy(rt) == rep { rt } else { t }
 }
 
@@ -2321,6 +2321,27 @@ function storeRowTyOf(ix: i32): i32 {
 // records, is held at that row's rep; else -1. A value and a place each name the row they store it in.
 function rowlessStoredTy(t: i32, rep: i32, rowTy: i32): i32 {
   if !rowlessRecord(t, rep) || rowTy < 0 || irTyOpen(rowTy) { return -1 }
+  const rr = repNodeOfTy(rowTy)
+  return if rr != rep && repNodeAt(rr) is RRecord { rowTy } else { -1 }
+}
+
+// Whether the ref-list row legacy lays list `arr` out on (`refListSlotOfExpr`) holds its elements
+// at rep `e`: the row a built list is held at (`listRowRep`), so its element reads there.
+function listRowElemIs(arr: i32, e: i32): boolean {
+  const slot = refListSlotOfExpr(unwrapParen(arr), ibFnIx)
+  const et = if slot >= 0 { rlElemTyIxAt(slot) } else { -1 }
+  return et >= 0 && !irTyOpen(et) && repNodeOfTy(et) == e
+}
+
+// Whether a value of type `t` (any type at all) is held at record rep `rep`: the rep alone decides.
+function builtRecord(t: i32, rep: i32): boolean {
+  return t >= 0 && repNodeAt(rep) is RRecord
+}
+
+// Storage row type `rowTy` where a built value of record type `t` at rep `rep` is held at that row's
+// rep, another record; else -1.
+function builtStoredTy(t: i32, rep: i32, rowTy: i32): i32 {
+  if !builtRecord(t, rep) || rowTy < 0 || irTyOpen(rowTy) { return -1 }
   const rr = repNodeOfTy(rowTy)
   return if rr != rep && repNodeAt(rr) is RRecord { rowTy } else { -1 }
 }
@@ -3306,15 +3327,32 @@ function listRowTyOf(ix: i32, r: i32): i32 {
   return lt
 }
 
-// Rep `r` of `ix` at type `t`, or, for a built value of a record type no struct row records, the
-// rep of the row legacy stores it in (`structIndexOfExpr`).
+// Rep `r` of built value `ix` at record type `t`, or the rep of the row legacy stores it in
+// (`structIndexOfExpr`): a value's rep follows its storage. A place keeps its own.
 function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
-  if !rowlessRecord(t, r) { return r }
+  if !builtRecord(t, r) { return r }
   // A read of a place holds the place's rep, which the place decides (`rowlessLetTy`).
   const nd = nodeAt(unwrapParen(ix))
   if nd is Ident || nd is Member { return r }
-  const rt = rowlessStoredTy(t, r, storeRowTyOf(ix))
-  return if rt >= 0 { repNodeOfTy(rt) } else { r }
+  const rt = builtStoredTy(t, r, storeRowTyOf(ix))
+  if rt < 0 { return r }
+  // The exclusions below hold for a type a struct row records; a rowless one moves, as before.
+  // Removed by layout stage 2 (a literal at its row, its function's result at the row too): an
+  // object literal stays at its own rep, the one its function's result returns.
+  if structIndexOfTy(t) >= 0 && nd is ObjLit { return r }
+  // An element read moves only off a list laid out at that row (`listRowRep`).
+  if (
+    structIndexOfTy(t) >= 0
+    && nd is Index
+    && !listRowElemIs(nd.idxArr, repNodeOfTy(rt))
+  ) {
+    return r
+  }
+  // Removed by layout stage 2: a value whose rep retags into the row (a twin) keeps its rep.
+  if structIndexOfTy(t) >= 0 && recRetagNoted(r, repNodeOfTy(rt), ix) {
+    return r
+  }
+  return repNodeOfTy(rt)
 }
 
 // The type of `??` `ix` along the `mapIndexGetOr` arm: its map's value, the default filling a
