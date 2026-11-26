@@ -928,6 +928,7 @@ import {
   bankSpanRow,
   bankedRowsDrop,
   callRefDepth,
+  cloCellIdx,
   ctrlDepth,
   dfeCallee,
   emitFnSpanEnd,
@@ -2105,12 +2106,52 @@ function stashSlotOf(at: i32, fi: i32): i32 {
   return -1
 }
 
+// `RMakeClo` through `mcFn`'s function-value cell: filled from the environment operands when null.
+function makeCloCell(r: RMakeClo) {
+  const fe = r.mcFn
+  if emitCloCellRef(fe, lw.irAt) < 0 { return -1 }
+  fbStructGet(cloCellIdx, 0)
+  fbRefIsNull()
+  fbIf(64) // void
+  if emitCloCellRef(fe, lw.irAt) < 0 { return -1 }
+  if makeCloEnv(r) < 0 { return -1 }
+  emitClosureIds(fe)
+  fbStructSet(cloCellIdx, 0)
+  fbEnd()
+  if emitCloCellRef(fe, lw.irAt) < 0 { return -1 }
+  fbStructGet(cloCellIdx, 0)
+  fbRefAsNonNull()
+  return 0
+}
+
+// The fresh environment struct of `r.mcFn`: each capture's operand, a cell capture its cell.
+function makeCloEnv(r: RMakeClo) {
+  let k = 0
+  for name in captureNamesOf(r.mcFn) {
+    const cell = capCellTargetOf(name)
+    if cell >= 0 {
+      if emitCloCellRef(cell, lw.irAt) < 0 { return -1 }
+    } else {
+      if k >= r.mcEnv.length { return irLMiss("closure env") }
+      irLOpnd(r.mcEnv[k])
+      k = k + 1
+    }
+  }
+  if k != r.mcEnv.length { return irLMiss("closure env") }
+  fbStructNew(fnEnvIdxOf(r.mcFn))
+  return 0
+}
+
 // `RMakeClo`: legacy's closure writer for a capture-free function, then a name read's recovery,
 // as `emitExpr` writes a function literal or a function name.
 // `RMakeClo` written where another node's lowering builds its closure (`RMapFilter`).
 export function irLMakeClo(r: RMakeClo) { return makeClo(r) }
 
 function makeClo(r: RMakeClo) {
+  // A function-value cell this frame fills from its own operands (D7700): the first read builds
+  // the closure into the cell, as `emitClosureValueOf` does, and every read loads it.
+  const viaCell = fnEnvIdxOf(r.mcFn) >= 0 && cloCellReaches(r.mcFn, lw.irAt)
+  if viaCell && r.mcEnv.length > 0 { return makeCloCell(r) }
   if fnEnvIdxOf(r.mcFn) >= 0 && !cloCellReaches(r.mcFn, lw.irAt) {
     // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure. A
     // function-value cell capture has no operand: it is legacy's read of the cell this frame reaches.
