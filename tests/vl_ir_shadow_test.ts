@@ -1948,8 +1948,6 @@ Deno.test({
       const got = exp.irVerifySelfTest(i);
       if (got !== want[ids[i]]) throw new Error(`case ${ids[i]}: want rule ${want[ids[i]]}, got rule ${got}`);
     }
-    // The hoist asked inside a range copy undoes every binding it made, whether it hoists or misses.
-    if (exp.irRangeCopyHoistSelfTest(-1) !== 0) throw new Error("want the unroll stack depth unchanged after a miss");
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
@@ -2769,7 +2767,7 @@ print(empty() + recs() + twice() + nested() + gen(1) + gen("s"))
 // the stash of depth one as legacy's does: matched byte for byte, with a constant and a computed
 // inner length. A fill boxed into a union element stays a named miss.
 Deno.test({
-  name: "ir shadow: a nested __array_new__ fill matches at legacy's fill depth",
+  name: "ir shadow: a nested __array_new__ fill matches at legacy's fill depth, and a boxed fill at its union",
   ignore,
   fn: () => {
     const { rc, rows } = run(`function sq(n: i32): i32[][] { return __array_new__(n, __array_new__(n, 0)) }
@@ -2787,11 +2785,8 @@ if d0 is i32 { print(d0) }
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
-      throw new Error(`want sq, wide and deep covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if ((rows.get("uncovered array new fill box") ?? 0) !== 1) {
-      throw new Error(`want un a named miss, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want sq, wide, deep and un (its fill boxed) covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

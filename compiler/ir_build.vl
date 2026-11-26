@@ -8971,19 +8971,14 @@ function oneTempAt(b: i32[], at: i32, o: Opnd): boolean {
   return n is SLet && n.lDst == o.ov && ib.irVars[o.ov].vKind == "temp"
 }
 
-// Whether body `b` gained, from `at` on, only `let`s of temps, the last defining temp `o`: an
-// operand whose own operands are temps its definition consumes.
-function tempsEndingAt(b: i32[], at: i32, o: Opnd): boolean {
-  if b.length <= at || !(o is OVar) || o.ov < 0 { return false }
-  let k = at
-  while k < b.length {
-    const n = ib.irNodes[b[k]]
-    if !(n is SLet) || n.lDst < 0 || n.lDst >= ib.irVars.length { return false }
-    if ib.irVars[n.lDst].vKind != "temp" { return false }
-    k = k + 1
-  }
-  const last = ib.irNodes[b[b.length - 1]]
-  return last is SLet && last.lDst == o.ov
+// Operand `l` of a fused read at node `ix`, which legacy's head reads twice, held in a local of its
+// own (the lowering's `ownedSlot`): a later operand's own fused `??` then finds no temp waiting.
+function heldInLocal(b: i32[], l: Opnd, ix: i32): Opnd {
+  if !(l is OVar) || l.ov < 0 || l.ov >= ib.irVars.length { return l }
+  const v = irVarNew(ib, ib.irVars[l.ov].vRep, ib.irVars[l.ov].vTy, "local", -1)
+  irBNode(b, { asDst: v, asSrc: l }, -1, ibNoValue, ix)
+  const o: Opnd = { ov: v }
+  return o
 }
 
 // Whether map store value `val` into receiver `recv`'s mv slot `sh` is an object literal legacy
@@ -9159,7 +9154,10 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     && repNodeAt(er) is RClosure
     && holeRetagNoted(irBOpRep(x0), er, true)
     && exprPrePathWhy(c.callArgs[0], ibFnIx) == ""
-  const x = if holed { repTemp(b, { rgV: x0 }, c.callArgs[0], er) } else { x0 }
+  // So is a value that stands at the element's rep (`retagsAsStands`).
+  const stands = irBOpRep(x0) != er
+    && retagsAsStands(irBOpRep(x0), er, c.callArgs[0])
+  const x = if holed || stands { repTemp(b, { rgV: x0 }, c.callArgs[0], er) } else { x0 }
   if irBOpRep(x) != er { return missRhs("push operand coercion") }
   if nest && !pushNullableElemPlain(c.callArgs[0], er) {
     return missRhs("push nullable element coercion")
@@ -10584,7 +10582,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd, ix: i32): string {
   const ok = match p.hbArm {
     "null" => v is OImm && r == ibNoValue
     "lit" => v is OImm
-    "pass" | "memberBox" | "retag" => repNodeAt(r) is RBox || boxedNullable(r)
+    "pass" | "memberBox" | "retag" | "numRebox" => repNodeAt(r) is RBox || boxedNullable(r)
     "atomStr" => atomNullable(r)
     "atomAsStr" => repNodeAt(r) is RAtom
     "nulNiche" => refNullable(r) || strNullable(r)
@@ -11639,8 +11637,8 @@ function nulTestNullTy(b: i32[], bt: BinNulTest, ix: i32, rep: i32): Opnd {
 }
 
 // `__array_new__(n, fill)` as legacy's arm writes it (`arrNewPlanOf`): the length, the fill at the
-// list's element rep, then the allocation; `__array_new_default__` its own. A refused site and a
-// fill legacy boxes into a union element (`arrNewFillBoxTy`) are named misses.
+// list's element rep, then the allocation; `__array_new_default__` its own. A refused site is a
+// named miss.
 function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   if n.callFn < 0 || n.callFn >= P.nodes.length {
     return irBMiss("array new callee")
@@ -11658,14 +11656,14 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   }
   const fill = n.callArgs[1]
   if arrNewWhyOf(ix, fill, ibFnIx) != "" { return irBMiss("array new refused") }
-  if arrNewFillBoxTy(ix, fill, ibFnIx) >= 0 {
-    return irBMiss("array new fill box")
-  }
+  const boxTy = arrNewFillBoxTy(ix, fill, ibFnIx)
   const ln = repNodeAt(rep)
   if !(ln is RList) { return irBMiss("array new rep") }
   const at = b.length
   const len = irBExpr(b, n.callArgs[0])
-  const v = irBExpr(b, fill)
+  // The fill is delivered at the element rep, as a literal element of the same value is; one
+  // legacy boxes is boxed at its union (`arrNewFillBoxTy`), as a union element is.
+  const v = if boxTy >= 0 { boxTempIn(b, unionElemValue(b, fill), fill, ln.rlsElem, -1, boxTy) } else { deliver(b, fill, ln.rlsElem, -1) }
   if ibMiss != "" { return v }
   if ifBelowLead(b, at, "array new short-circuit operand") { return v }
   if repPrim(irBOpRep(len)) != "i32" {
@@ -12025,7 +12023,9 @@ function arrayLit(
       && repNodeAt(er) is RClosure
       && holeRetagNoted(irBOpRep(v), er, true)
       && exprPrePathWhy(e, ibFnIx) == ""
-    const ve = if holed { repTemp(b, { rgV: v }, e, er) } else { v }
+    // A list twin, a variant record at its struct twin, or a record on the element's heap or a
+    // declared subtype's goes in as it stands, retagged, as an argument does (`retagsAsStands`).
+    const ve = if holed || irBOpRep(v) != er && retagsAsStands(irBOpRep(v), er, e) { repTemp(b, { rgV: v }, e, er) } else { v }
     if irBOpRep(ve) != er { return irBMiss("array element coercion") }
     elems.push(ve)
   }
@@ -12590,23 +12590,45 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const la = b.length
   const l = irBExpr(b, m.memObj)
   if ibMiss != "" { return l }
-  // A receiver legacy cannot re-read is a temp, held once in a local (`irGetRecvOnce`).
-  if !recvReRead && !tempsEndingAt(b, la, l) {
+  // A receiver legacy cannot re-read is held in a local of its own (`heldInLocal`).
+  if !recvReRead && !(l is OVar) {
     return irBMiss("coalesce listGetOr staged operand")
   }
+  const recv = if recvReRead { l } else { heldInLocal(b, l, ix) }
   const ln = repNodeAt(irBOpRep(l))
   if !(ln is RList) || ln.rlsElem != rep {
     return irBMiss("coalesce listGetOr result rep")
   }
+  // A receiver legacy re-reads is a pure read the lowering skips: its nodes wait aside while the
+  // index builds, so an index's own fused `??` finds no temp waiting, and go back before a plain
+  // index or after an index's statements.
+  const aside: i32[] = []
+  if recvReRead {
+    while b.length > la { aside.push(b.pop() ?? -1) }
+  }
   const at = b.length
-  const i = irBExpr(b, c.callArgs[0])
-  if ibMiss != "" { return i }
-  if irBOpRep(i) != repNodeOfTy(TY_I32) {
+  const i0 = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return i0 }
+  const idxNodes = b.length - at
+  const idxOneTemp = oneTempAt(b, at, i0)
+  if irBOpRep(i0) != repNodeOfTy(TY_I32) {
     return irBMiss("coalesce listGetOr index operand")
   }
-  // An index legacy cannot re-read is one temp, held once in a local (`irGetIdxBegin`).
-  if idxReRead && b.length != at || !idxReRead && !oneTempAt(b, at, i) {
+  // An index that built nothing is legacy's own re-read; any other is one temp, held once in a
+  // local (`irGetIdxBegin`), or held in a local of its own after the statements it built (an inner
+  // fused `??`, say).
+  const idxPlain = idxReRead && idxNodes == 0
+  if !idxPlain && !(i0 is OVar) {
     return irBMiss("coalesce listGetOr index operand")
+  }
+  const i = if !idxPlain && !idxOneTemp { heldInLocal(b, i0, ix) } else { i0 }
+  if aside.length > 0 {
+    const tail: i32[] = []
+    if idxNodes == 0 || idxOneTemp {
+      while b.length > at { tail.push(b.pop() ?? -1) }
+    }
+    while aside.length > 0 { b.push(aside.pop() ?? -1) }
+    while tail.length > 0 { b.push(tail.pop() ?? -1) }
   }
   // Legacy's head reads the index at each use, so an immediate, a variable or that temp is handed
   // to it.
@@ -12614,7 +12636,7 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     || i is OVar
     && i.ov >= 0
     && i.ov < ib.irVars.length
-    && (ib.irVars[i.ov].vKind != "temp" || !idxReRead)
+    && (ib.irVars[i.ov].vKind != "temp" || !idxPlain)
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
   if !coalNeverDefault(nb, n.binRight, rep, t) {
@@ -12627,7 +12649,7 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   irBNode(
     b,
     {
-      cbL: l,
+      cbL: recv,
       cbLB: [],
       cbArm: "listGetOr",
       cbNull: nb,
@@ -13778,8 +13800,11 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
   if bx && !mapBoxReadsAt(rcvMapRep(rcv), rep) {
     return irBMiss("map read box rep")
   }
-  // The box arm's default is boxed into the slot's union, the map's value rep.
-  const bv = if bx { mapValRepOf(rcvMapRep(rcv)) } else { -1 }
+  // The box arm's default is boxed into the slot's union, the map's value rep; where that is the
+  // boxed `T | null` of a non-null read, into the read's box, the same struct.
+  const bv0 = if bx { mapValRepOf(rcvMapRep(rcv)) } else { -1 }
+  const bn = if bv0 >= 0 { repNodeAt(bv0) } else { null }
+  const bv = if bv0 != rep && bn is RNullable && bn.rnDisc == 4 && bn.rnInner == rep { rep } else { bv0 }
   const bm = if bx { mapGetOrBoxDefaultMiss(n.binRight, bv, sh) } else { "" }
   if bm != "" { return irBMiss(bm) }
   const dv: Opnd = if ub { deliver(db, n.binRight, rep, mvValTyIxAt(sh)) } else if bx { deliver(db, n.binRight, bv, mvValTyIxAt(sh)) } else if at || st { deliver(db, n.binRight, rep, -1) } else if inline { inlineDefault(db, n.binRight, rep) } else { { oiRep: rep, oiBits: 0 } }
@@ -16235,8 +16260,10 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   if nulStore && repPrim(ln.rlsElem) != "null" {
     return skip("store null unit sentinel rep")
   }
-  const x = if nulStore { nulSentinelStore(b, n.binRight, er) } else if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
+  const x0 = if nulStore { nulSentinelStore(b, n.binRight, er) } else if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
   if ibMiss != "" { return 0 }
+  // A value that stands at the element's rep (`retagsAsStands`) is stored retagged.
+  const x = if irBOpRep(x0) != er && retagsAsStands(irBOpRep(x0), er, n.binRight) { repTemp(b, { rgV: x0 }, n.binRight, er) } else { x0 }
   if ifBelowLeadIn(b, at, xat, "store short-circuit operand") { return 0 }
   if repPrim(irBOpRep(i)) != "i32" || irBOpRep(x) != er {
     return skip("store operand coercion")
