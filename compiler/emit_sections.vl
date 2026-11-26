@@ -60,7 +60,6 @@ import {
   irShadowEqHelp,
   irShadowEqHelpCheck,
   irShadowFn,
-  irShadowStart,
   irShadowThunk,
   irStartClaimOn,
 } from "./ir_build"
@@ -528,7 +527,6 @@ import {
   gPromoInStart,
   gPromoOk,
   gPromoSlot,
-  gRequireClaim,
   gSawEqOp,
   gSharedMemPages,
   gStrDataIx,
@@ -805,7 +803,6 @@ import {
   fnReturnsClosure,
   forInMapRecv,
   globalCellKind,
-  globalCellStructIdx,
   inferredRetMapSlot,
   letCellSlot,
   refListSlotOfExpr,
@@ -933,7 +930,6 @@ import {
   scanArrLitCommit,
   scanExprArmLocals,
   stmtArmRoot,
-  stmtArmScopeClose,
   stmtArmScopeOpen,
 } from "./emit_collect"
 import {
@@ -960,28 +956,17 @@ import {
   monomorphize,
 } from "./emit_mono"
 import {
-  StartInitArm,
   TEST_EMIT_REFUSAL_MSG,
   capCacheBuild,
   coalChainsPrime,
   coalChainsPrimeStart,
   coalChainsReset,
-  emitAtomToStr,
   emitClosureValueCore,
   emitExpr,
-  emitFuncBody,
-  emitGlobalInitArmUnbox,
-  emitMapGetUnionBox,
-  emitNulNoneBoxPayload,
   emitNullForRet,
-  emitStmt,
-  emitTypedHolderInit,
   emitUnionBoxOwed,
   emitUnionRetSink,
-  emitUserGlobalSet,
-  emitVariantCoerce,
   emitVoidTailCall,
-  emitWidened,
   eqHelpFnBody,
   eqHelpFnName,
   eqHelpFuncType,
@@ -992,7 +977,6 @@ import {
   mapSetFnBody,
   mapSetFuncType,
   sFieldStorageSlot,
-  startInitArmOf,
   strAccScanStart,
   stubWriteRhsReset,
   testHookNamed,
@@ -1397,12 +1381,10 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // A function the IR claims has its code entry written by the lowering, in the frame laid out
     // above, and legacy's body lowering does not run. A function under the box-dst shadow (which
     // instruments legacy) stays legacy's.
-    const claimTried = !boxDstShadowArmed()
-    if claimTried && irClaimFn(fnIx, fnPos, out) {
+    if irClaimFn(fnIx, fnPos, out) {
       fbEndFunc()
       return 0
     }
-    if gRequireClaim != 0 { return requireClaimFail(fnIx) }
 
     const bodyExpr: u8[] = []
     // Binds the writer at `bodyExpr` so the `fb*` opcode methods (which append to `curBuf`) write
@@ -1416,10 +1398,8 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // moves them onto the code payload with the rest of this entry (ROADMAP row 22).
     const stmtSpanBase = emitFnSpanStart.length
     shIdxReset()
-    if emitFuncBody(fn.fnBody, fnIx) < 0 {
-      if claimTried { noteDecline(fnIx) }
-      return -1
-    }
+    if emitUnclaimed(fnIx) < 0 { return -1 }
+    fbUnreachable()
     // A void body whose last instruction is a call falls off its end with nothing to hand
     // back, so that call is a tail call (D4655).
     emitVoidTailCall(fnIx)
@@ -2463,10 +2443,6 @@ function emitStartBodyCode(out: u8[], k: i32) {
   emitCurFnIx = -1
   emitCurFnPos = -1
   nodeTyInstEnter(-1)
-  // Where THIS body's span rows begin (D1594). The merge loop below banks one row per
-  // top-level statement at `bodyExpr`-relative offsets; the tail rebases exactly this
-  // suffix onto `out` once the locals vector and the size prefix are known.
-  const spanBase = emitFnSpanStart.length
   // The element-read rows the armed shadow notes start empty, as for a function body.
   shIdxReset()
   const nStartLocals = collectStartLocals()
@@ -2488,7 +2464,7 @@ function emitStartBodyCode(out: u8[], k: i32) {
   // A start body the IR claims (the single start, or init function `k`) has its code entry
   // written by the lowering, in the frame laid out above, and legacy's does not run. Under the
   // box-dst shadow (which instruments legacy) it stays legacy's.
-  const startTried = !boxDstShadowArmed() && irStartClaimOn()
+  const startTried = irStartClaimOn()
   const startUnit = startUnitOf(ent)
   if startTried {
     startFrameReset()
@@ -2501,119 +2477,7 @@ function emitStartBodyCode(out: u8[], k: i32) {
       return 0
     }
   }
-  if gRequireClaim != 0 { return requireClaimFail(startUnit) }
-
-  const bodyExpr: u8[] = []
-  const exprPrev = wTarget(bodyExpr)
-  // The pool fills first: every later line of the module may read a pool string.
-  if k < 0 { emitStrFillCalls() }
-  // Reset the emit-time scope/loop bookkeeping (the start fn has its own empty frame),
-  // mirroring `emitFuncCode` — no leak from the last user function or a fallen-back claim.
-  startFrameReset()
-  // One frame for the top-level statement list, as `collectStartLocals` pushes for the same
-  // walk. A function body takes its frame from `emitStmts` on its `Block`; the top level
-  // has no `Block`, so without this the lowering cannot be told from a scope-less detection
-  // pass. Popped below; a `return -1` path leaves it, and the next program resets. D1597.
-  scopePush()
-  // The promotion context window (G2c): a promoted binding's `local.get`/`local.set` is only
-  // meaningful in this frame, so the flag that lets `emitUserGlobalGet`/`emitUserGlobalSet`
-  // produce one is armed for exactly the span streaming this body. Every user function body and
-  // every const cell's constexpr init has already run with the flag false, so a promoted binding reaching them is a loud reject rather than a wrong opcode.
-  gPromoInStart = true
-  for e in ent {
-    if e >= 0 {
-      const gi = e
-      // ANCHOR any emit failure raised below at the top-level node being lowered (see
-      // `emitCurStmtIx`) — the start function has no declaration of its own to name.
-      emitCurStmtIx = globalStmts[gi]
-      gInitStartOrd = globalStmtOrd[gi]
-      const gSpanAt = bodyExpr.length
-      let gArmKept = -1
-      if globalArmScopeOk(globalStmts[gi]) {
-        gArmKept = stmtArmScopeOpen(globalStmts[gi])
-      }
-      const gInitRc = emitStartGlobalInit(
-        bodyExpr,
-        exprPrev,
-        gi,
-        globalStmts[gi],
-      )
-      if gArmKept >= 0 { stmtArmScopeClose(gArmKept) }
-      if gInitRc < 0 {
-        if startTried { noteDecline(startUnit) }
-        return gInitRc
-      }
-      emitInitProgressAt(globalStmtOrd[gi])
-      // The row the D1594 diagnostic reads: this initializer's own byte range, so an
-      // offset inside it names the `const`/`let` rather than the whole start function.
-      // A global whose init did not run here contributes no bytes and no row.
-      if bodyExpr.length > gSpanAt {
-        bankFnSpan(globalStmts[gi], -1, gSpanAt, bodyExpr.length, 1, "")
-      }
-    } else {
-      const si = -1 - e
-      emitCurStmtIx = startStmts[si]
-      gInitStartOrd = startStmtOrd[si]
-      const sSpanAt = bodyExpr.length
-      if emitStmt(startStmts[si], -1) < 0 {
-        if startTried { noteDecline(startUnit) }
-        wTarget(exprPrev)
-        return -1
-      }
-      emitInitProgressAt(startStmtOrd[si])
-      if bodyExpr.length > sSpanAt {
-        bankFnSpan(startStmts[si], -1, sSpanAt, bodyExpr.length, 1, "")
-      }
-    }
-  }
-  scopePop()
-  gInitStartOrd = -1
-  // The cursor is armed for exactly the span that streams this body; the `return -1` paths
-  // above leave it set, which is what carries the anchor out to the diagnostic.
-  emitCurStmtIx = -1
-  // Close the promotion window. The `return -1` paths above leave it armed, which is
-  // inert: a failed body aborts the whole module emit, and `computeGlobalPromotion`
-  // clears the flag at the top of the next one.
-  gPromoInStart = false
-  wTarget(exprPrev)
-
-  const body: u8[] = []
-  // Locals vector: the start fn's declared locals (for-loop vars), then the scratch frames.
-  if fbEmitLocalsVec(body, nStartLocals) < 0 { return -1 }
-  // Where `bodyExpr` lands INSIDE the body — everything before it is the locals vector.
-  const exprInBody = body.length
-  relCopy(bodyExpr, body, exprInBody)
-  appendAll(body, bodyExpr)
-  const endPrev = wTarget(body)
-  fbEnd() // 0x0b end (void → void: stack already empty)
-  fbEndFunc()
-  wTarget(endPrev)
-
-  const outPrev = wTarget(out)
-  const outStart = out.length
-  wULEB(body.length)
-  // REBASE this body's statement rows off `bodyExpr` and onto the entry (D1594): the size
-  // prefix is written, so `out.length` is where the body itself begins. The caller moves
-  // them onto the payload and then the module, exactly as it does for a user function's row.
-  const bodyInOut = out.length
-  rebaseStmtSpans(spanBase, bodyInOut, exprInBody)
-  wBytes(body)
-  wTarget(outPrev)
-  // The IR shadow reads the start body (or init function `k`) after legacy wrote it; it writes no byte.
-  // It is built in the frame the claim path builds it in, opened again, not legacy's closed one.
-  if irShadowArmed() {
-    fnUses.unionSink = false
-    fnUses.unionLetSink = false
-    envCacheOpen(-1)
-    fbBeginFunc(0, nStartLocals)
-    startFrameReset()
-    const order: i32[] = []
-    const orderGi: i32[] = []
-    startIrOrder(ent, order, orderGi)
-    irShadowStart(out, outStart, spanBase, order, orderGi, k < 0)
-    fbEndFunc()
-  }
-  return 0
+  return emitUnclaimed(startUnit)
 }
 
 // Empties the emit-time scope and loop bookkeeping before the start body is lowered.
@@ -2668,92 +2532,6 @@ function startIrOrder(ent: i32[], order: i32[], orderGi: i32[]) {
       order.push(startStmts[-1 - e])
       orderGi.push(-1)
     }
-  }
-  return 0
-}
-
-// `emitStartFnCode`'s step for global `gi`, whose statement is `gst`: when its initializer runs
-// in the start function, emits it into `bodyExpr` under the cell's context, then its
-// `global.set`. On failure restores the writer to `exprPrev` and returns the failure; else 0.
-function emitStartGlobalInit(
-  bodyExpr: u8[],
-  exprPrev: u8[],
-  gi: i32,
-  gst: i32,
-) {
-  // A `const` every read copied the tree of is never read, as at a local (D15001).
-  if !globalRunsInStartFn(gi) || lbiKeptDeclUnread(gst) { return 0 }
-  if gst < 0 || gst >= P.nodes.length { return 0 }
-  const g = nodeAt(gst)
-  if !(g is LetDecl) { return 0 }
-  const gck = globalCellKind(gst)
-  const arm = startInitArmOf(gst, gck)
-  if arm == "holder" {
-    if emitTypedHolderInit(gst, -1) < 0 {
-      wTarget(exprPrev)
-      return -1
-    }
-  } else if arm == "widen" {
-    // Numeric widening at the global-init boundary (a `: f64`/`: f32`/`: i64` global whose
-    // init is a narrower numeric): the start-fn `global.set` matches the cell valtype.
-    const wk = if gck == "f32" { 5 } else if gck == "f64" { 4 } else { 3 }
-    if emitWidened(g.letInit, wk, -1) < 0 {
-      wTarget(exprPrev)
-      return -1
-    }
-  } else {
-    if emitStartGlobalInitValue(exprPrev, gst, g, arm) < 0 { return -1 }
-    emitGlobalInitArmUnbox(gst, gck, g.letInit)
-  }
-  const setPrev = wTarget(bodyExpr)
-  if emitUserGlobalSet(gi) < 0 {
-    wTarget(setPrev)
-    wTarget(exprPrev)
-    return -1
-  }
-  wTarget(setPrev)
-  return 0
-}
-
-// `emitStartGlobalInit`'s value step for global statement `gst` (its `LetDecl` `g`), at value
-// arm `arm` of `startInitArmOf`. On failure restores the writer to `exprPrev`
-// and returns -1, else 0.
-function emitStartGlobalInitValue(
-  exprPrev: u8[],
-  gst: i32,
-  g: LetDecl,
-  arm: StartInitArm,
-) {
-  const rc = match arm {
-    // A bare top-level `const t = m[k]` over a union-valued map lowers its miss as the
-    // null-tagged box the consuming tag compare recovers, not `emitMapGet`'s bare `ref.null`.
-    "mapBox" => {
-      const gumrN = nodeAt(unwrapParen(g.letInit))
-      if gumrN is Index {
-        emitMapGetUnionBox(gumrN.idxArr, gumrN.idxIndex, -1)
-      } else {
-        emitFail(
-          "emitProgram: union-valued map read binding's init is not an index read",
-        )
-      }
-    }
-    // A union cell is always the box: a concrete-variant init is boxed as a call argument is.
-    "unionBox" => emitUnionBoxOwed("", letBindingUnionTy(gst, -1), g.letInit, -1)
-    // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
-    "variant" => emitVariantCoerce(globalCellStructIdx(gst), g.letInit, -1)
-    // A module-level alias of a generic function, used only as a direct-call callee: the
-    // closure through the floor-less core, the start-fn twin of `emitGlobalSection`'s arm.
-    "alias" => emitClosureValueCore(monoGenericAliasFe(gst), -1)
-    // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
-    "nulnone" => emitNulNoneBoxPayload(g.letInit, -1)
-    // A literal-union atom initializing a `string` global widens to its member string.
-    "atom" => emitAtomToStr(g.letInit, -1)
-    "plain" => emitExpr(g.letInit, -1)
-    "holder" | "widen" => emitFail("emitProgram: a start global init arm reached the value step")
-  }
-  if rc < 0 {
-    wTarget(exprPrev)
-    return -1
   }
   return 0
 }
@@ -5446,6 +5224,10 @@ function emitProgramReset(rootIx: i32) {
   emitSoftFail = false
   emitSoftMsg = ""
   emitSoftAt = -1
+  unclaimedMsg = ""
+  unclaimedAt = -1
+  unclaimedFn = -1
+  unclaimedStmt = -1
   // Fresh per program: the diagnostic anchor + the "function being lowered"
   // cursor. A failure before any function body emits leaves these -1 (positionless).
   emitErrAt = -1
@@ -5726,7 +5508,7 @@ export function emitProgram(rootIx: i32) {
     )
   }
   if rc >= 0 && rowFieldAsksCheck() < 0 { return -1 }
-  return rc
+  return unclaimedFlush(rc)
 }
 
 // `tyEmitEpoch` at the per-program reset, where the window from `elabPrepare` (or an unprepared
@@ -8430,43 +8212,35 @@ function startUnitOf(ent: i32[]): i32 {
   return startStmts[-1 - ent[0]]
 }
 
-// A legacy refusal of a unit whose IR claim declined says on a second line what the IR declined
-// and on which line. Legacy's message stays the refusal; the note concedes nothing.
-function noteDecline(unit: i32) {
-  const what = irDeclinedFor(unit)
-  // A refusal the claim met is legacy's own message: a note would only repeat it.
-  if !emitFailed || what == "" || irDeclineRefusalFor(unit) != "" { return }
-  emitErr = emitErr
-    + "\n  note: the IR declined "
-    + what
-    + " at line "
-    + i32ToStr(declineLine(irDeclineAt()))
-}
+// A function or the top-level code the IR declines has no other lowering. A contract the claim
+// raised fails at once, verbatim; a miss is recorded and the body becomes a trap, so a contract
+// in a later function still outranks it. `unclaimedFlush` reports the first miss.
+let unclaimedMsg = ""
+let unclaimedAt = -1
+let unclaimedFn = -1
+let unclaimedStmt = -1
 
-// The source line of node `at`'s anchor token, or 0 when it has none.
-function declineLine(at: i32): i32 {
-  if at < 0 || at >= nodeToks.length { return 0 }
-  const tk = nodeToks[at]
-  if tk < 0 || tk >= P.toks.length { return 0 }
-  return P.toks[tk].line
-}
-
-// Under `$VL_IR_REQUIRE_CLAIM`, unit `unit` the IR did not claim: the refusal its claim met,
-// verbatim, else the miss it declined on, else that it tried no claim.
-function requireClaimFail(unit: i32): i32 {
+function emitUnclaimed(unit: i32): i32 {
   const refusal = irDeclineRefusalFor(unit)
   if refusal != "" { return emitFailAt(refusal, irDeclineAt()) }
+  if unclaimedMsg != "" { return 0 }
   const what = irDeclinedFor(unit)
+  unclaimedFn = emitCurFnIx
+  unclaimedStmt = emitCurStmtIx
   if what == "" {
-    return emitFailAt(
-      "emitProgram: the IR did not claim this code, and VL_IR_REQUIRE_CLAIM refuses legacy's lowering",
-      unit,
-    )
+    unclaimedMsg = "emitProgram: the compiler cannot yet lower this code"
+    unclaimedAt = unit
+  } else {
+    unclaimedMsg = "emitProgram: the compiler cannot yet lower " + what
+    unclaimedAt = irDeclineAt()
   }
-  return emitFailAt(
-    "emitProgram: the IR declined "
-      + what
-      + ", and VL_IR_REQUIRE_CLAIM refuses legacy's lowering",
-    irDeclineAt(),
-  )
+  return 0
+}
+
+// The run's result once emission ends: a pending miss fails it unless an error came first.
+function unclaimedFlush(rc: i32): i32 {
+  if unclaimedMsg == "" || emitFailed { return rc }
+  emitCurFnIx = unclaimedFn
+  emitCurStmtIx = unclaimedStmt
+  return emitFailAt(unclaimedMsg, unclaimedAt)
 }
