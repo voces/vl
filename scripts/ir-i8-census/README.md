@@ -12,7 +12,9 @@ conflicts with another PR on a shared line.
   only deletes files. Counts are not graded (coordinator ruling, 2026-11-25).
 - `edges/<caller>--<callee>`: the static edges into stage B `--edges --check` accepts; the files are
   empty. `--edges --write-baseline` adds and deletes files to match the tree.
-- `owners.tsv`: the red list's owner registry, one `class<TAB>owner` line per owned class
-  (`closed:<pr>` for a class a merged PR closed). `red.sh <census-out> <sweep-out>` joins
-  `census.sh` and `ir-i8-sweep.sh keep --out` into the red list with this column. Lane CENSUS
-  alone edits the registry, so it is one file.
+- `scoreboard.sh <red.tsv> [<prev>]`: units and classes per owner as a markdown table, with deltas; the
+  hourly run's job summary.
+- `owners.tsv`: the exceptions to the owner `red.sh` derives from a class's mechanism family, one
+  `class<TAB>owner` line per class that family routes wrongly. `red.sh <census-out> <sweep-out>`
+  joins `census.sh` and `ir-i8-sweep.sh keep --out` into the red list with the owner column. A new
+  class routes itself; a line is added only when the coordinator rules against the family.
