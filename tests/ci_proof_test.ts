@@ -39,13 +39,6 @@ const LOCAL: Record<string, string> = {
     "ci-witnesses grades it in two --shard runs, not the one command the row runs",
   "distilled corpus":
     "ci-distilled runs its runs-lost check; on master gate.sh adds --verify-fresh",
-  "ir shadow": "no ci.yml job runs the IR shadow over the distilled corpus",
-  "ir claims":
-    "no ci.yml job runs the shipped IR claim over the distilled corpus",
-  "ir claim refusals":
-    "no ci.yml job builds the programs legacy refuses at emit claimed and claimless (`ir-parity.vl --pop refusals`)",
-  "ir claim cross":
-    "no ci.yml job builds and runs the probes, pins and a cases sample claimed and claimless (`ir-parity.vl --cross`)",
 };
 
 // What ci.yml must run for each covered row: fragments of the same command, on the seed.
