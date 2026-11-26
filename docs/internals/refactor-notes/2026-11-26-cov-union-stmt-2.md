@@ -33,3 +33,20 @@ Q58 sweep: `tests/cases/operators/left-operand-staged-below-valued-if-right-in-e
 (a parameter, a local and a literal on the left of each operator, printed and bound). Its output
 equals master's. Master reports `short-circuit right operand` on it; this tree reports blockers
 none, and the claim takes it.
+
+## The atom compare (D17244)
+
+`"a" == (s ?? "b")` and `t == (s ?? "b")` over a `K | null` fell back in the lowering (`operand
+above a valued if's value`). The `??`'s join is a valued `if`, and legacy writes the left side
+first.
+- The `ids` arm (two atom values) calls `stageLeftBelow`, as the other operators do.
+- The `static` arm with the literal on the left stages the literal's member id when the atom side
+  holds a statement that leads below (`stagedStaticId`). It records `aeStatic` 4, a staged id that
+  the lowering reads like any operand. The literal must spell the plan's member (`aqLex`). An
+  `OStr` at an atom rep now lowers as its member's id (`strOpnd`). Every earlier atom `OStr` was
+  minted only where `strLitTakesAtom` holds, so their bytes are unchanged.
+- Measured: both witnesses and the sweep
+  `tests/cases/literal-unions/atom-compare-left-staged-below-coalesce-right-positions.vl` fall
+  back in 4 functions on the merge base (lit, litNe, param, start). This tree claims them, they
+  match under `VL_IR_SHADOW=6`, and they are byte-identical to the claimless build. The tests/cases
+  census (9,621 programs) is unchanged row for row. `ir-identity.sh --cases`: differ 0.
