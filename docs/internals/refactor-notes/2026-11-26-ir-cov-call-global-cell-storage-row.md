@@ -31,7 +31,23 @@ withdrawn row copy), so the result follows the storage instead.
 as a map default (bound and stored into a record field), a binding, a field, an argument, a
 returned value and a call through it, a list element, and a record field.
 
-CENSUS_PLACEHOLDER
+**Census.** The whole-corpus per-function census covers tests/cases, the distilled cells and
+named sets, the capability probes and the runs-witnesses of both inventories. The merge-base probe
+is compared against this branch's probe:
+
+| | fnc | fnu | fail |
+| --- | --- | --- | --- |
+| merge-base | 167,533 | 265 | 0 |
+| branch | 167,535 | 262 | 0 |
+
+There are none newly missed. The newly claimed are `put` in each of the two tests, and D2939's
+`@start` (`convert record -> record` before, `claimed start` now; it prints `7 8` armed). Two misses
+change sentence and still miss:
+- D14870's `@start`: `object variant field box` → `object rep`.
+- soundness/covariant-record-field-read-only-runs `@init`: `convert list -> list` → `field read of
+  a stored row`.
+
+Two 100-file batches exit 70 on both probes alike, from the same programs.
 
 **Not covered.** The two tests' `@start` still misses `global initializer coercion` at
 `const m = Map()`, on master too; that's regen-11's class, next in the series.
