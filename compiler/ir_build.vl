@@ -3733,6 +3733,21 @@ export function exprTyOf(ix: i32): i32 {
   return if t < 0 { capturedClosureTy(ix) } else { t }
 }
 
+// The element rep index `n`'s list holds closed (`closedListElemTy`), or -1.
+function openIndexRep(n: Index): i32 {
+  const et = closedListElemTy(exprTyOf(n.idxArr))
+  return if et >= 0 { repNodeOfTy(et) } else { -1 }
+}
+
+// The element type a list typed `lt` stores, closed, or -1.
+function closedListElemTy(lt: i32): i32 {
+  if lt < 0 { return -1 }
+  const ln = repNodeAt(repNodeOfTy(lt))
+  if !(ln is RList) { return -1 }
+  const et = repTyOf(ln.rlsElem)
+  return if et >= 0 && !irTyOpen(et) { et } else { -1 }
+}
+
 // Whether direct call `n` (node `ix`), typed `t`, is the bundle record its callee returns at that
 // type (`fnRetHeldAsBundle`), kept whole, so its value is the callee's `resultTy`.
 function bundleCallOf(n: Call, ix: i32, t: i32): boolean {
@@ -15524,6 +15539,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   const ar = if own < 0 && n is ArrayLit { openArrLitRep(ix) } else { -1 }
   // A shared field read off a hole receiver is at its arms' one storage type (`ir_build_ref`).
   const mr = if own < 0 && !nv && n is Member { irOpenMemberRepHook(ix) } else { -1 }
+  // An element read whose own type has no rep (a hole function's result mapped into a list) is at
+  // the element rep of the list the IR holds closed.
+  const ir = if own < 0 && !nv && n is Index { openIndexRep(n) } else { -1 }
   // A `??` map read whose own type has no rep (a link legacy mints) is at the map's value rep,
   // where legacy's `mapGetOr` arm writes it.
   const cr = if own < 0 && !nv && pr < 0 && br < 0 { openCoalMapRep(ix) } else { -1 }
@@ -15535,7 +15553,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     && !nv
     && n is NullLit
     && nullOwnAt(ix, ibFnIx) == NULL_OWN_NONE
-  const rep = if un { repNodeOfNullUnit() } else if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else if xr >= 0 { xr } else { own }
+  const rep = if un { repNodeOfNullUnit() } else if nv { repNodeOfTy(TY_I32) } else if pr >= 0 { pr } else if br >= 0 { br } else if ar >= 0 { ar } else if mr >= 0 { mr } else if cr >= 0 { cr } else if ir >= 0 { ir } else if xr >= 0 { xr } else { own }
   // A direct call whose own type has no rep is at its callee's result rep.
   if rep < 0 && n is Call && !nv { return openCallValue(b, n, ix) }
   // A desugared optional call's minted callee has no type: it is the field the plain `.f` call reads
@@ -17054,8 +17072,12 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   const k0 = repRecordKidOf(r0, rt, t.memProp)
   if k0 < 0 { return skip("field kid") }
   // A receiver instanced at a stored row (D15827) is built at that row, whose field legacy's store
-  // writes, where its type reads the field at another rep.
-  const r = if fieldStoreRepFits(va, repNodeKids(r0)[k0]) { r0 } else { irBOpRep(v0) }
+  // writes, where its type reads the field at another rep; so is a receiver built at a record row
+  // other than its type's that holds the field at a rep the value fits.
+  const vRep = irBOpRep(v0)
+  const kv = if vRep != r0 && repNodeAt(vRep) is RRecord { repRecordKidOf(vRep, rt, t.memProp) } else { -1 }
+  const own = kv >= 0 && fieldStoreRepFits(va, repNodeKids(vRep)[kv])
+  const r = if own { vRep } else if fieldStoreRepFits(va, repNodeKids(r0)[k0]) { r0 } else { vRep }
   const k = if r == r0 { k0 } else if repNodeAt(r) is RRecord { repRecordKidOf(r, rt, t.memProp) } else { -1 }
   if k < 0 { return skip("field store row rep") }
   const dst = repNodeKids(r)[k]
@@ -17173,9 +17195,7 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   const g = if mr >= 0 { mapGlobalOf(mr) } else { -1 }
   // A global receiver is read as one, never as an operand; any other is built raw, as legacy's
   // stash writes it, at a map rep its shared recovery owns.
-  if mr >= 0 && g < 0 && mapRecvGlobalIx(mr, ibFnIx) >= 0 {
-    return skip("for in map receiver")
-  }
+
   const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
   const src = if mr >= 0 { mr } else { n.fiIter }
   const l = if g >= 0 { none } else { irBExpr(b, src) }
