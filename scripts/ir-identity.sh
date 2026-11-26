@@ -176,6 +176,19 @@ expected_divergence() {
 }
 
 # Whether file $1 has a `legacy-wrong:` line in the baseline.
+# A holdout (scripts/ir-i8-census/holdouts.tsv) is graded by its own side alone: refused with
+# `cannot yet lower`, whatever the other side does; one that is not refused so differs.
+HOLDOUTS=${IR_I8_HOLDOUTS:-scripts/ir-i8-census/holdouts.tsv}
+holdout() {
+  [ -f "$HOLDOUTS" ] && awk -F '\t' -v f="$(bkey "$1")" '$1 == f { hit = 1 } END { exit !hit }' "$HOLDOUTS"
+}
+# Grades holdout $1 (key $3) built under dir $2: 0 when refused as expected, else prints its DIFF.
+held_ok() {
+  [ "$(cat "$2/$3.rc")" != 0 ] && grep -q 'cannot yet lower' "$2/$3.err" && return 0
+  echo "DIFF $1 (holdout no longer refused with 'cannot yet lower': remove its line from $HOLDOUTS)"
+  return 1
+}
+
 legacy_wrong() {
   [ -f "$BASELINE" ] && awk -F '\t' -v f="$(bkey "$1")" '$1 == f && $3 ~ /^legacy-wrong:/ { hit = 1 } END { exit !hit }' "$BASELINE"
 }
@@ -186,13 +199,17 @@ keep() { printf '%s\t%s\n%s\t%s\n' "$1" "$3" "$2" "$3" >> "$T/keep"; }
 # Compares the builds of the files listed in $1 under dirs $2 and $3; prints each that differs.
 # With $ERRCMP=1, a file that fails under both differs when its first diagnostic line does.
 compare_all() {
-  same=0; both=0; diff=0; tmo=0; expd=0; bytes=0; why=""
+  same=0; both=0; diff=0; tmo=0; expd=0; bytes=0; held=0; why=""
   : > "$T/bdiff"
   while read -r f; do
     k=$(printf "%s" "$f" | tr "/" "_")
     why=""
     ra=$(cat "$2/$k.rc"); rb=$(cat "$3/$k.rc")
     if timed_out "$f" "$2" "$3" "$ra" "$rb" "$k"; then tmo=$((tmo + 1)); continue; fi
+    if holdout "$f"; then
+      if held_ok "$f" "$2" "$k"; then held=$((held + 1)); else diff=$((diff + 1)); fi
+      continue
+    fi
     [ "$ra" = "$rb" ] && { [ "$ra" != 0 ] || cmp -s "$2/$k.wasm" "$3/$k.wasm"; } \
       && { [ "$ra" = 0 ] || [ "${ERRCMP:-0}" != 1 ] || cmp -s "$2/$k.err" "$3/$k.err"; } || keep "$2" "$3" "$k"
     if [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
@@ -213,12 +230,16 @@ compare_all() {
 # Compares the refusals of the files listed in $1 under dirs $2 and $3: the exit code and the
 # first diagnostic line, or the wasm when both build; prints each that differs.
 compare_errors() {
-  esame=0; ediff=0; etmo=0; eexpd=0; ebytes=0; why=""
+  esame=0; ediff=0; etmo=0; eexpd=0; ebytes=0; eheld=0; why=""
   while read -r f; do
     k=$(printf "%s" "$f" | tr "/" "_")
     why=""
     ra=$(cat "$2/$k.rc"); rb=$(cat "$3/$k.rc")
     if timed_out "$f" "$2" "$3" "$ra" "$rb" "$k"; then etmo=$((etmo + 1)); continue; fi
+    if holdout "$f"; then
+      if held_ok "$f" "$2" "$k"; then eheld=$((eheld + 1)); else ediff=$((ediff + 1)); fi
+      continue
+    fi
     if [ "$ra" != "$rb" ] || { [ "$ra" = 0 ] && ! cmp -s "$2/$k.wasm" "$3/$k.wasm"; } \
       || ! cmp -s "$2/$k.err" "$3/$k.err"; then keep "$2" "$3" "$k"; fi
     if [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
@@ -268,14 +289,14 @@ verdict() {
 
 if [ "${1:-}" = "--compare" ]; then
   ERRCMP=1 compare_all "${2:?usage: --compare <list> <dir-a> <dir-b>}" "${3:?}" "${4:?}"
-  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, bytes differ $bytes (informational)"
+  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, holdouts refused $held, bytes differ $bytes (informational)"
   verdict "$diff" "$tmo"
   exit
 fi
 
 if [ "${1:-}" = "--compare-errors" ]; then
   compare_errors "${2:?usage: --compare-errors <list> <dir-a> <dir-b>}" "${3:?}" "${4:?}"
-  echo "errors: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd, bytes differ $ebytes (informational)"
+  echo "errors: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd, holdouts refused $eheld, bytes differ $ebytes (informational)"
   verdict "$ediff" "$etmo"
   exit
 fi
@@ -341,7 +362,7 @@ if [ "${1:-}" = "--claimless" ]; then
   build_all "$T/list" "$SEED" "$T/a"
   build_all "$T/list" "$T/claimless.wasm" "$T/b"
   compare_all "$T/list" "$T/a" "$T/b"
-  echo "claimless: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, bytes differ $bytes (informational)"
+  echo "claimless: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, holdouts refused $held, bytes differ $bytes (informational)"
   behaviour_check "$SEED" "$T/claimless.wasm"
   verdict $((diff + bdiff)) $((tmo + btmo))
   exit
@@ -358,7 +379,7 @@ if [ "${1:-}" = "--cases" ]; then
   build_all "$T/list" "$SEED" "$T/a"
   build_all "$T/list" "$T/claimless.wasm" "$T/b"
   compare_all "$T/list" "$T/a" "$T/b"
-  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, bytes differ $bytes (informational)"
+  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, holdouts refused $held, bytes differ $bytes (informational)"
   behaviour_check "$SEED" "$T/claimless.wasm"
   "$VL" run scripts/inventory/witnesses.vl --compiler "$SEED" -- --outcome emit_reject --out "$T/w" > "$T/errs"
   shard_list "$T/errs"
@@ -366,7 +387,7 @@ if [ "${1:-}" = "--cases" ]; then
   FLAGS=--test-emit-refusal build_all "$T/errs" "$SEED" "$T/ea"
   FLAGS=--test-emit-refusal build_all "$T/errs" "$T/claimless.wasm" "$T/eb"
   compare_errors "$T/errs" "$T/ea" "$T/eb"
-  echo "witnesses: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd, bytes differ $ebytes (informational)"
+  echo "witnesses: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd, holdouts refused $eheld, bytes differ $ebytes (informational)"
   verdict $((diff + ediff + bdiff)) $((tmo + etmo + btmo))
   exit
 fi

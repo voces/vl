@@ -89,6 +89,7 @@ import { runWasm, VLRuntimeError } from "./runWasm.ts";
 // is the guard that keeps them agreeing.
 import { needsModules } from "../../compiler/moduleGate.ts";
 import { isStdKey } from "../../lsp/src/editorText.ts";
+import { HOLDOUTS, holdoutVerdict } from "./holdouts.ts";
 import { isDisplayableType } from "../../lsp/src/typeFeatures.ts";
 import {
   engineRefusal,
@@ -793,6 +794,15 @@ export const registerCorpusOracle = (shard: number, shards: number): void => {
         const entryKey = filePath(
           c.kind === "single" ? c.url : c.entry,
         ).replaceAll("\\", "/");
+        const holdout = `tests/cases/${name}`;
+        if (HOLDOUTS.has(holdout)) {
+          // A holdout is graded by its refusal alone: no directive, lint or hint tier.
+          const h = driveCase(exports!, entryKey, src, true, c.kind === "module");
+          const why = holdoutVerdict(holdout, h.rc === 3, h.diags.map((x) => x.message).join("\n"));
+          if (why !== "") throw new Error(why);
+          casesRun++;
+          return;
+        }
         const r = driveCase(
           exports!,
           entryKey,
