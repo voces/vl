@@ -292,6 +292,7 @@ import {
   ObjLitArm,
   PrintArm,
   StructFieldArm,
+  TEST_EMIT_REFUSAL_MSG,
   UnionEqNulPlan,
   VariantFieldArm,
   VariantIsArm,
@@ -524,6 +525,7 @@ import {
   tagDispatchTyIsVoid,
   tailArmStmtIsValue,
   tailIfPlainWhy,
+  testHookNamed,
   tplStrHoleOf,
   trapCallNamed,
   truncSatCallNamed,
@@ -905,6 +907,7 @@ import {
   gInitProgIdx,
   gMemLogIdx,
   gPromoInStart,
+  gTestEmitRefusal,
   globalStmtOrd,
   liFrameRestore,
   liFrameSave,
@@ -3118,6 +3121,13 @@ function atomNullable(r: i32): boolean {
 // narrowing read past its `-1` null.
 function atomIdRep(r: i32): boolean {
   return atomNullable(r) || repNodeAt(r) is RAtom
+}
+
+// The atom whose id rep `r` holds (`atomIdRep`): `r` itself, or the member inside a `K | null`
+// niche; -1 for any other rep.
+function atomOfIdRep(r: i32): i32 {
+  if !atomIdRep(r) { return -1 }
+  return if atomNullable(r) { repOfNulInner(r) } else { r }
 }
 
 // Whether rep `r` is `string | null` (discipline 1): the string's ref, or a null ref.
@@ -6207,8 +6217,9 @@ function atomCellRep(d: i32, r: i32): i32 {
   if !(g is LetDecl) || g.letInit < 0 { return r }
   const ai = nodeAt(unwrapParen(g.letInit))
   if !(ai is BinExpr) || ai.binOp != "=" { return r }
-  const ar = repNodeOfTy(heldTy(exprTyOf(ai.binLeft)))
-  return if repNodeAt(ar) is RAtom { ar } else { r }
+  // A `K | null` place's assignment value is the member written, the atom inside its niche.
+  const at = atomOfIdRep(repNodeOfTy(heldTy(exprTyOf(ai.binLeft))))
+  return if at >= 0 { at } else { r }
 }
 
 // A record global whose checked rep `r` has no struct heap is held at its storage row's rep
@@ -6402,9 +6413,26 @@ function tplHoleStr(b: i32[], c: Call): Opnd {
 }
 
 // A direct call `ix` of a declared, capture-free function by name; its arguments by position.
+// The test harness's emit-refusal hook (`--test-emit-refusal`), raised where legacy's call arm
+// raises it: at the call, or unanchored for the declaration-anchored twin.
+function testEmitRefused(cf: Ident, ix: i32): boolean {
+  if testHookNamed(cf.identName, "__vl_test_emit_refusal__") {
+    if emitSoftFail { emitFailAt(TEST_EMIT_REFUSAL_MSG, ix) }
+    return true
+  }
+  if testHookNamed(cf.identName, "__vl_test_emit_refusal_decl__") {
+    if emitSoftFail { emitFail(TEST_EMIT_REFUSAL_MSG) }
+    return true
+  }
+  return false
+}
+
 function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callFn < 0 { return missRhs("named call") }
   const cf = nodeAt(c.callFn)
+  if gTestEmitRefusal != 0 && cf is Ident && testEmitRefused(cf, ix) {
+    return missRhs("test emit refusal")
+  }
   // Named arguments reach only a declared function's direct call, which binds them to its
   // parameters (`orderedDirectArgs`).
   if hasNamedArgs(c.callArgNames) { return namedCallRhs(b, c, ix) }
@@ -8462,7 +8490,8 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   const unionIf = arm == "union" && nodeAt(unwrapParen(c.callArgs[0])) is IfStmt
   const from = b.length
   // An atom arm, or its `K | null`, streams the id its operand is held at (`emitStashAtomId`).
-  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else if fromBox { nulLitNicheRead(b, c.callArgs[0]) } else if want == "atom" || want == "nulAtom" { exprAt(b, c.callArgs[0], true) } else { irBExpr(b, c.callArgs[0]) }
+  const asgAtom = if want == "atom" { asgAtomRep(c.callArgs[0]) } else { -1 }
+  const v = if unionIf { printUnionIf(b, c.callArgs[0]) } else if fromBox { nulLitNicheRead(b, c.callArgs[0]) } else if asgAtom >= 0 { deliver(b, c.callArgs[0], asgAtom, -1) } else if want == "atom" || want == "nulAtom" { exprAt(b, c.callArgs[0], true) } else { irBExpr(b, c.callArgs[0]) }
   if ibMiss != "" { return 0 }
   // Legacy opens a nullable string's or boolean's print blocks before its operand, so where the
   // operand wrote a valued `if` (or a stash) the blocks open before it (`RPrintOpen`).
@@ -8524,6 +8553,16 @@ function printNulRefNiche(b: i32[], arg: i32, ix: i32) {
   if !refNullable(irBOpRep(v)) { return skip("print operand rep") }
   irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
   return 0
+}
+
+// The atom an assignment `ix` used as a value writes to its place (a `K` place, or the member
+// inside a `K | null` niche), which legacy delivers as the id it is; -1 otherwise.
+function asgAtomRep(ix: i32): i32 {
+  const a = unwrapParen(ix)
+  if a < 0 || a >= P.nodes.length { return -1 }
+  const n = nodeAt(a)
+  if !(n is BinExpr) || n.binOp != "=" { return -1 }
+  return atomOfIdRep(repNodeOfTy(heldTy(exprTyOf(n.binLeft))))
 }
 
 // Place `ix`, narrowed to `K | null` out of a wider box, as that niche: read at its storage, the
@@ -9689,6 +9728,10 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // legacy writes it at the kind its consumer asks.
   const du = unwrapParen(ix)
   const dn = if du >= 0 && du < P.nodes.length { nodeAt(du) } else { null }
+  // An assignment delivered at its place's atom is that atom's id, not the string its type reps.
+  if ibMiss == "" && dst >= 0 && dn is BinExpr && asgAtomRep(du) == dst {
+    return assignValue(b, dn, du, dst)
+  }
   if (
     ibMiss == ""
     && dst >= 0
@@ -10242,7 +10285,13 @@ function boxTempIn(
     // A name read or a bare `null` writes nothing; its payload is the bottom ref, and the read
     // built for it (a leaf reading no operand) is dropped unread.
     if !nulNoneWritesNothing(ix) || !nulReadDropped(b, v) {
-      return irBMiss("box of a null-typed value")
+      // Any other `null`-typed value (a valued `if` run for its effects) is run and dropped, and
+      // its box is the null box, reading no payload.
+      if !(v is OVar) { return irBMiss("box of a null-typed value") }
+      const drop: IrNode = { dpV: v }
+      irBNode(b, drop, -1, ibNoValue, ix)
+      const none: Opnd = { oiRep: irBOpRep(v), oiBits: 0 }
+      return repTemp(b, { nnV: none, nnPay: false, nnAt: ix }, ix, dst)
     }
     return repTemp(b, { nnV: v, nnPay: false, nnAt: ix }, ix, dst)
   }
@@ -10402,6 +10451,11 @@ function boxTagLateAt(b: i32[], at: i32): boolean {
   const n = ib.irNodes[b[b.length - 1]]
   if !(n is SLet) { return false }
   const r = n.lRhs
+  // A `null`-typed call's box writes the null tag alone ahead of its call.
+  if r is RNulNoneBox && r.nnPay {
+    ib.irBoxLate.push(unwrapParen(r.nnAt))
+    return true
+  }
   if (
     !(r is RToBox)
     || !boxTagOnly(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
@@ -13737,7 +13791,9 @@ function mapGetAt(
       "none" => rep == m.rmVal
         || repNodeAt(repBoxCore(rep)) is RBox && repBoxCore(rep) == repBoxCore(m.rmVal)
       "unbox" => repPrim(rep) != null && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
-      "container" | "nonNull" => false
+      // …or to its container member, at the read's own type (`emitNarrowedMapReadTail`).
+      "container" => repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
+      "nonNull" => false
     }
     if box < 0 && !repOk && !whole && repNodeAt(rep) is RRecord {
       narrowTo = rep
