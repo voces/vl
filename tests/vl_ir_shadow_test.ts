@@ -1759,8 +1759,6 @@ Deno.test({
       "record-arms-unbox-at-another-record": 2,
       "asg-arm-unbox-at-its-record": 0,
       "asg-arm-unbox-without-dest": 2,
-      "led-box-follows-its-dispatch": 0,
-      "led-box-past-a-node": 10,
       "box-list-retag-into-i32-list": 2,
       "list-of-lists-retag-into-nullable-lists": 0,
       "list-of-lists-retag-into-other-lists": 2,

@@ -44,7 +44,6 @@ import {
 } from "./wasmEmit"
 import {
   atomPayloadTail,
-  boxTagOnly,
   pushRecvCastOn,
   pushRecvCastSet,
 } from "./wasmEmit"
@@ -313,7 +312,6 @@ import {
   SSwitch,
   STrap,
   armUnboxRoute,
-  coalArmStagesLeads,
   irFnNew,
   irNoTailEffHas,
   irNoTailHas,
@@ -541,8 +539,6 @@ import {
   hoistRowMark,
   hoistRowReads,
   holeBoxHead,
-  holeBoxHeadAhead,
-  holeBoxLeads,
   holeBoxTail,
   holeOptBoxHead,
   holeOptBoxTail,
@@ -786,6 +782,7 @@ import {
 } from "./wasmEmit"
 import {
   HoleBox,
+  HoleBoxArm,
   arrLitVariantSlot,
   atomEqPlanOf,
   holeBoxPlanOf,
@@ -1006,21 +1003,10 @@ let lwFloor = 0
 let lwFloors: i32[] = []
 // Per open void `if` with an `else`, innermost last: the earlier operands staged below it.
 let lwVoidIfRoots: i32[][] = []
-// The boxes whose spans `boxLeadStage` raised the floor for, innermost last.
-let lwLeadBoxes: i32[] = []
 // The order-stash slots the function's `RStashSet`s opened: literal, layout position, slot.
 let lwStashAt: i32[] = []
 let lwStashFi: i32[] = []
 let lwStashSlots: i32[] = []
-// The order-stashed literals whose box head their first `RStashSet` wrote, as legacy's tag leads.
-let lwBoxHeadAt: i32[] = []
-// Each order-stashed literal by the out its first source field reads, noted once per function.
-let lwIfHeadAt: {[i32]: i32} = Map()
-let lwIfHeadBuilt = false
-// Each box by the out its value is (`stashIfBoxHead`), noted with `lwIfHeadAt`.
-let lwIfBoxAt: {[i32]: i32} = Map()
-// Each such box's union (`RToBox.bxTy`), by the same out.
-let lwIfBoxTy: {[i32]: i32} = Map()
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -1601,8 +1587,8 @@ function rhs(r: Rhs, tail: boolean) {
     RStage => irLOpnd(r.sgV)
     RNulTest => nulTestOp(r)
     RNulNoneBox => {
-      // A late box (`irBoxLate`): the call held in an `anyref` once-slot, then the null tag.
-      if r.nnPay && i32ListHas(lw.irBoxLate, unwrapParen(r.nnAt)) {
+      // A call's payload held in an `anyref` once-slot, then the null tag.
+      if r.nnPay {
         irLOpnd(r.nnV)
         const any: u8[] = [VT_ANYREF]
         const s = irOnceSlot(any)
@@ -1611,15 +1597,10 @@ function rhs(r: Rhs, tail: boolean) {
         fbLocalGet(s)
         return nulNoneBoxTail()
       }
-      // Legacy's null tag, the payload (the call, else the bottom ref), then the box.
+      // The null tag, the bottom ref, then the box.
       leaf()
       nulNoneBoxHead()
-      if r.nnPay {
-        irLOpnd(r.nnV)
-      } else {
-        leaf()
-        fbRefNullNone()
-      }
+      fbRefNullNone()
       nulNoneBoxTail()
     }
     RNulNicheEq => nulNicheEq(r)
@@ -1985,169 +1966,12 @@ function stashSet(r: RStashSet) {
   const row = recRowOf(r.ssAt, r.ssRow, r.ssVariant, true)
   if row < 0 { return irLMiss("record row") }
   const fi = r.ssFi
-  if !i32ListHas(lwBoxHeadAt, r.ssAt) { stashBoxHead(r.ssAt) }
   irLOpnd(r.ssV)
   const slot = stashSlotAt(row, fi, r.ssVariant)
   lwStashAt.push(r.ssAt)
   lwStashFi.push(fi)
   lwStashSlots.push(slot)
   fbLocalSet(slot)
-  return 0
-}
-
-// Where the order-stashed literal at `at` is boxed under a plan that writes a head, that head,
-// ahead of the literal's first field (legacy writes the tag before the literal).
-function stashBoxHead(at: i32) {
-  for n in lw.irNodes {
-    if !(n is SLet) { continue }
-    const r = n.lRhs
-    if !(r is RToBox) || unwrapParen(r.bxAt) != at { continue }
-    const bx = r.bxAt
-    const p = holeBoxPlanOf(bx, r.bxTy, lw.irAt)
-    if p.hbArm == "rec" || p.hbArm == "obj" {
-      leaf()
-      holeBoxHead(p, bx, lw.irAt)
-      lwBoxHeadAt.push(at)
-    }
-    return 0
-  }
-  return 0
-}
-
-// Where valued `if` node `id` is the first field an order-stashed literal sets, in either stash
-// form, that literal's box head, ahead of the `if` (legacy writes the tag before the literal).
-function stashIfBoxHead(id: i32) {
-  const n = lw.irNodes[id]
-  const out = if n is SIf { n.siOut } else if n is SCoalBox { n.cbOut } else { -1 }
-  if out < 0 { return 0 }
-  if !lwIfHeadBuilt { stashIfHeadsNote() }
-  const at = lwIfHeadAt.get(out) ?? -1
-  if at >= 0 && !i32ListHas(lwBoxHeadAt, at) { return stashBoxHead(at) }
-  // A valued `if`'s box head follows the operands staged ahead of it (`valuedIfOpen`), as does a
-  // `??`'s (`coalBox`).
-  return 0
-}
-
-// Where node `id` opens a box-lead span, the temps earlier operands left pending, written first
-// as legacy writes those operands before the box's leading tag; each stays for its reader.
-function boxLeadStage(id: i32, pending: i32[]) {
-  if pending.length == 0 { return 0 }
-  let i = 0
-  while i < lw.irBoxLeadFirst.length && lw.irBoxLeadFirst[i] != id { i = i + 1 }
-  if i >= lw.irBoxLeadFirst.length { return 0 }
-  const roots = stageLeadOf([], pending)
-  if lwMiss != "" { return 0 }
-  // The span writes above the roots until its box is written (`boxLeadUnstage`).
-  lwFloors.push(lwFloor)
-  lwFloor = lwLive.length
-  lwLeadBoxes.push(lw.irBoxLeadBox[i])
-  for r in roots { pending.push(r) }
-  return 0
-}
-
-// After box node `id` is written, the floor its span's staging raised is lowered again.
-function boxLeadUnstage(id: i32) {
-  if lwLeadBoxes.length == 0 || lwLeadBoxes[lwLeadBoxes.length - 1] != id {
-    return 0
-  }
-  lwLeadBoxes.pop()
-  lwFloor = lwFloors.pop() ?? 0
-  return 0
-}
-
-// Where node `id` opens a tag dispatch a box directly follows (`irBoxLeadFirst`), that box's head,
-// ahead of the dispatch, as legacy writes the dispatch under the box's leading tag.
-function dispatchBoxHead(id: i32) {
-  let i = 0
-  while i < lw.irBoxLeadFirst.length {
-    if lw.irBoxLeadFirst[i] == id {
-      return dispatchBoxHeadOf(lw.irBoxLeadBox[i])
-    }
-    i = i + 1
-  }
-  return 0
-}
-
-function dispatchBoxHeadOf(boxId: i32) {
-  const n = lw.irNodes[boxId]
-  if !(n is SLet) { return irLMiss("dispatch box node") }
-  const r = n.lRhs
-  if !(r is RToBox) { return irLMiss("dispatch box node") }
-  const p = holeBoxPlanOf(r.bxAt, r.bxTy, lw.irAt)
-  if !holeBoxLeads(p.hbArm) {
-    return irLMiss("dispatch box with no leading head")
-  }
-  leaf()
-  holeBoxHead(p, r.bxAt, lw.irAt)
-  lwBoxHeadAt.push(unwrapParen(r.bxAt))
-  return 0
-}
-
-// The head of the box whose value is join out `out`, ahead of the join, as legacy's box leads;
-// `staged` where it lands above the operands an earlier argument staged for the join.
-function joinBoxHead(out: i32, staged: boolean) {
-  if !lwIfHeadBuilt { stashIfHeadsNote() }
-  const bx = lwIfBoxAt.get(out) ?? -1
-  // A late box (`irBoxLate`) writes its own head after its value.
-  if (
-    bx < 0
-    || i32ListHas(lwBoxHeadAt, unwrapParen(bx))
-    || i32ListHas(lw.irBoxLate, unwrapParen(bx))
-  ) {
-    return 0
-  }
-  const p = holeBoxPlanOf(bx, lwIfBoxTy.get(out) ?? -1, lw.irAt)
-  if holeBoxHeadAhead(p.hbArm) {
-    if staged { lwPushing = true } else { leaf() }
-    holeBoxHead(p, bx, lw.irAt)
-    lwPushing = false
-    lwBoxHeadAt.push(unwrapParen(bx))
-  }
-  return 0
-}
-
-// Notes, once per function, the out each order-stashed literal's first source field reads, by
-// that out: the literal (`stashIfBoxHead`).
-function stashIfHeadsNote() {
-  lwIfHeadBuilt = true
-  const seen: i32[] = []
-  // The var each numeric step converts, by the step's own var: a box of a step is keyed by the
-  // value the steps start from, the join's out (`boxOfJoinAt`).
-  const convSrc: {[i32]: i32} = Map()
-  for m in lw.irNodes {
-    const cs = numConvSrcOf(m)
-    if cs >= 0 && m is SLet { convSrc.set(m.lDst, cs) }
-  }
-  for m in lw.irNodes {
-    if m is SLet {
-      const mr = m.lRhs
-      if mr is RToBox {
-        const bv = mr.bxV
-        if bv is OVar {
-          lwIfBoxAt.set(bv.ov, mr.bxAt)
-          lwIfBoxTy.set(bv.ov, mr.bxTy)
-          let src = convSrc.get(bv.ov) ?? -1
-          while src >= 0 {
-            lwIfBoxAt.set(src, mr.bxAt)
-            lwIfBoxTy.set(src, mr.bxTy)
-            src = convSrc.get(src) ?? -1
-          }
-        }
-      }
-      if mr is RMakeRec && !mr.mrSet && mr.mrSrc.length > 0 {
-        const k0 = mr.mrSrc[0]
-        const f0 = if k0 >= 0 && k0 < mr.mrFields.length { mr.mrFields[k0] } else { null }
-        if f0 is OVar { lwIfHeadAt.set(f0.ov, mr.mrAt) }
-      }
-      continue
-    }
-    if !(m is SEffect) { continue }
-    const r = m.efRhs
-    if !(r is RStashSet) || i32ListHas(seen, r.ssAt) { continue }
-    seen.push(r.ssAt)
-    const sv = r.ssV
-    if sv is OVar { lwIfHeadAt.set(sv.ov, r.ssAt) }
-  }
   return 0
 }
 
@@ -5375,29 +5199,14 @@ function nulNicheEq(r: RNulNicheEq) {
   return 0
 }
 
-// `RToBox`: the shared box plan's head, the value (a `null` or a literal leaves its immediate
-// unread), an atom box's widening, and the plan's tail.
+// `RToBox`: the value and its payload step (a widening, an atom's value box, a narrowed box's
+// payload), then the shared box plan's head and tail. A head that pushes ahead of the payload
+// takes the payload from an `anyref` once-slot; one that writes nothing (a pass, a niche's slot)
+// follows the value. A `null` or a literal leaves its immediate unread.
 function boxOp(r: RToBox) {
   const fnIx = lw.irAt
   const p = holeBoxPlanOf(r.bxAt, r.bxTy, fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
-  if i32ListHas(lw.irBoxLate, unwrapParen(r.bxAt)) { return boxLate(r, p) }
-  // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
-  if !i32ListHas(lwBoxHeadAt, unwrapParen(r.bxAt)) {
-    if (
-      p.hbArm != "pass"
-      && p.hbArm != "memberBox"
-      && p.hbArm != "retag"
-      && p.hbArm != "wideRetag"
-    ) {
-      leaf()
-    }
-    holeBoxHead(p, r.bxAt, fnIx)
-  }
-  if p.hbArm == "recCopy" {
-    if boxRecCopy(r, p.hbKind) < 0 { return -1 }
-    return holeBoxTail(p, r.bxAt, fnIx)
-  }
   // A numeric union re-boxed member by member: its box stashed, then legacy's dispatch.
   if p.hbArm == "numRebox" {
     irLOpnd(r.bxV)
@@ -5407,37 +5216,43 @@ function boxOp(r: RToBox) {
     numUnionStashLeave()
     return numUnionReboxTail(r.bxAt, p.hbKind, fnIx, bs)
   }
-  if (
-    p.hbArm == "pass"
-    || p.hbArm == "memberBox"
-    || p.hbArm == "atom"
-    || p.hbArm == "atomList"
-    || p.hbArm == "atomStr"
-    || p.hbArm == "nulNiche"
-    || p.hbArm == "nulBool"
-    || p.hbArm == "rec"
-    || p.hbArm == "obj"
-    || p.hbArm == "refList"
-    || p.hbArm == "armLit"
-    || p.hbArm == "map"
-    || p.hbArm == "nulMap"
-    || p.hbArm == "clo"
-    || p.hbArm == "atomAsStr"
-    || p.hbArm == "retag"
-    || p.hbArm == "wideRetag"
-    || p.hbArm == "mapBox"
-    || p.hbArm == "mapScalar"
-    || p.hbArm == "narrowBox"
-  ) {
+  const reads = p.hbArm != "null" && p.hbArm != "lit"
+  if p.hbArm == "recCopy" {
+    if boxRecCopy(r, p.hbKind) < 0 { return -1 }
+  } else if reads {
     irLOpnd(r.bxV)
   } else {
     irLSkip(r.bxV)
   }
+  if lwMiss != "" { return -1 }
   if p.hbArm == "atom" && p.hbSrc >= 0 {
     numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx)
   }
   if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
-  return holeBoxTail(p, r.bxAt, fnIx)
+  if !boxHeadPushes(p.hbArm) {
+    if !reads { leaf() }
+    if holeBoxHead(p, r.bxAt, fnIx) < 0 { return -1 }
+    return holeBoxTail(p, r.bxAt, fnIx)
+  }
+  if p.hbArm == "atom" || p.hbArm == "atomList" { atomPayloadTail(p.hbKind) }
+  if p.hbArm == "narrowBox" { fbStructGet(uBoxIdx, 1) }
+  const any: u8[] = [VT_ANYREF]
+  const s = irOnceSlot(any)
+  fbLocalSet(s)
+  if holeBoxHead(p, r.bxAt, fnIx) < 0 { return -1 }
+  fbLocalGet(s)
+  if p.hbArm == "nulMap" { return holeBoxTail(p, r.bxAt, fnIx) }
+  fbStructNew(uBoxIdx)
+  return 0
+}
+
+// Whether box plan arm `a`'s head pushes ahead of its payload, so the payload is held while it is
+// written (`boxOp`); every other head writes nothing, or reads no value.
+function boxHeadPushes(a: HoleBoxArm): boolean {
+  return match a {
+    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "recCopy" | "narrowBox" | "refList" | "armLit" | "map" | "nulMap" | "clo" => true
+    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "mapBox" | "retag" | "wideRetag" | "numRebox" | "ladder" => false
+  }
 }
 
 // A `recCopy` box's value: the record copied onto variant `vi`, its source read as the IR wrote
@@ -5455,29 +5270,6 @@ function boxRecCopy(r: RToBox, vi: i32): i32 {
   return variantCopyEmit(r.bxAt, vi, lw.irAt, src)
 }
 
-// A late box (`irBoxLate`): its value and payload conversion, held in an `anyref` local
-// (`irOnceSlot`), then the plan's tag, the payload again and the box. Only a plan whose head is
-// its tag alone takes this; any other refuses.
-function boxLate(r: RToBox, p: HoleBox) {
-  const fnIx = lw.irAt
-  if !boxTagOnly(p.hbArm) {
-    return irLMiss("box of a valued if at plan " + p.hbArm)
-  }
-  irLOpnd(r.bxV)
-  if p.hbArm == "atom" && p.hbSrc >= 0 {
-    numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx)
-  }
-  if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
-  if p.hbArm == "atom" || p.hbArm == "atomList" { atomPayloadTail(p.hbKind) }
-  const any: u8[] = [VT_ANYREF]
-  const s = irOnceSlot(any)
-  fbLocalSet(s)
-  holeBoxHead(p, r.bxAt, fnIx)
-  lwBoxHeadAt.push(unwrapParen(r.bxAt))
-  fbLocalGet(s)
-  fbStructNew(uBoxIdx)
-  return 0
-}
 
 // Opens legacy's header hoists for the loop over `condIx` and `bodyIx`, its rows and header
 // reads legacy's, each receiver read as the builder read it (`irHoistRecv`).
@@ -5755,13 +5547,9 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
       // A valueless `return` after a call in its tail form writes nothing.
       if !(i > 0 && callReturns(b, i - 1)) {
         const tl = ft[top] && i == b.length - 1 || callReturns(b, i)
-        boxLeadStage(id, pending)
-        dispatchBoxHead(id)
-        stashIfBoxHead(id)
         const k = ifOpen(id, pending, tl)
         if k == IF_NOT {
           node(id, pending, tl, if i == b.length - 1 { fo[top] } else { -1 })
-          boxLeadUnstage(id)
         }
         if k == IF_ELSE || k == IF_VALUED {
           const n = lw.irNodes[id]
@@ -6682,7 +6470,6 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
   if lwMiss != "" { return IF_DONE }
   // A row this `if` opens starts above the earlier operands staged below it (`emitIndexBanked`).
   rowOpenNote(id)
-  joinBoxHead(t, true)
   // The condition is written before the `if` opens and may read values already on the stack;
   // the `if` itself reads none of the values beneath it.
   lwFloors.push(lwFloor)
@@ -6725,12 +6512,9 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   if !(e0 is BinExpr) && !(e0 is AsExpr && n.cbArm == "asProp") {
     return irLMiss("coalesce box node")
   }
-  // An earlier operand's temps are written below the operand, and the box head after them, as
-  // legacy writes that operand first.
-  const stages = coalArmStagesLeads(n.cbArm)
+  // An earlier operand's temps are written below the operand, as legacy writes that operand first.
   const roots = stageLeadOf(coalReads(n), pending)
   if lwMiss != "" { return -1 }
-  joinBoxHead(t, stages || roots.length > 0)
   lwFloors.push(lwFloor)
   lwFloor = lwLive.length - liveCountIn(pending)
   const got = coalBoxGo(n, pending)
@@ -7727,15 +7511,9 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwRootRuns = []
   lwFloors = []
   lwVoidIfRoots = []
-  lwLeadBoxes = []
   lwStashAt = []
   getIdxSlots = []
   lwOwnedSlots = []
-  lwBoxHeadAt = []
-  lwIfHeadAt = Map()
-  lwIfHeadBuilt = false
-  lwIfBoxAt = Map()
-  lwIfBoxTy = Map()
   lwStashFi = []
   lwStashSlots = []
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
@@ -7779,7 +7557,6 @@ type LwFrame = {
   lfFloor: i32,
   lfFloors: i32[],
   lfVoidIfRoots: i32[][],
-  lfLeadBoxes: i32[],
   lfRootRun: i32,
   lfRootRuns: i32[],
   lfSeq: i32[],
@@ -7812,7 +7589,6 @@ function lwSave(): LwFrame {
     lfFloor: lwFloor,
     lfFloors: lwFloors,
     lfVoidIfRoots: lwVoidIfRoots,
-    lfLeadBoxes: lwLeadBoxes,
     lfRootRun: lwRootRun,
     lfRootRuns: lwRootRuns,
     lfSeq: lwSeq,
@@ -7846,7 +7622,6 @@ function lwRestore(f: LwFrame) {
   lwFloor = f.lfFloor
   lwFloors = f.lfFloors
   lwVoidIfRoots = f.lfVoidIfRoots
-  lwLeadBoxes = f.lfLeadBoxes
   lwRootRun = f.lfRootRun
   lwRootRuns = f.lfRootRuns
   lwSeq = f.lfSeq
