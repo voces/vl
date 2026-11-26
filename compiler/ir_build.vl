@@ -629,6 +629,7 @@ import {
   annTyOf,
   mapTyWithVal,
   mvValVariantOf,
+  rlElemStructRow,
   rlElemVariantRow,
   structRowFieldStoresAtom,
   structRowFnSlotLayout,
@@ -2339,6 +2340,24 @@ function listRowElemIs(arr: i32, e: i32): boolean {
   return et >= 0 && !irTyOpen(et) && repNodeOfTy(et) == e
 }
 
+// Whether list `arr` is held at a list of element rep `e`.
+function listRepElemIs(arr: i32, e: i32): boolean {
+  const ln = repNodeAt(exprRepOf(arr))
+  return ln is RList && ln.rlsElem == e
+}
+
+// The record rep the ref-list row of list `arr` lays its elements out at (`elemRowTy`), or -1. Its
+// own element type's rep counts only where `own` asks: a read whose type no struct row records.
+function listElemRowRep(arr: i32, own: boolean): i32 {
+  const slot = refListSlotOfExpr(unwrapParen(arr), ibFnIx)
+  const et = if slot >= 0 { rlElemTyIxAt(slot) } else { -1 }
+  if et < 0 || irTyOpen(et) { return -1 }
+  const eu = elemRowTy(et, slot)
+  if eu == et && !own { return -1 }
+  const er = repNodeOfTy(eu)
+  return if repNodeAt(er) is RRecord { er } else { -1 }
+}
+
 // Whether a value of type `t` (any type at all) is held at record rep `rep`: the rep alone decides.
 function builtRecord(t: i32, rep: i32): boolean {
   return t >= 0 && repNodeAt(rep) is RRecord
@@ -3326,7 +3345,7 @@ function listRowTyOf(ix: i32, r: i32): i32 {
   const slot = refListSlotOfExpr(unwrapParen(ix), ibFnIx)
   const et = if slot >= 0 { rlElemTyIxAt(slot) } else { -1 }
   if et < 0 || irTyOpen(et) { return -1 }
-  const lt = listTyOfElem(et)
+  const lt = listTyOfElem(elemRowTy(et, slot))
   const ln = repNodeAt(repNodeOfTy(lt))
   if (
     !(ln is RList)
@@ -3338,6 +3357,22 @@ function listRowTyOf(ix: i32, r: i32): i32 {
   return lt
 }
 
+// Element type `et` of ref-list row `slot`, or the declared type of the struct row legacy lays
+// its elements out at (`rlElemStructRow`) where that row's rep is another record, no twin of
+// `et`'s (`recTwinRep`), which keeps its own.
+function elemRowTy(et: i32, slot: i32): i32 {
+  const si = rlElemStructRow(slot)
+  const dt = if si >= 0 { declRowTy(si) } else { -1 }
+  if dt < 0 || repNodeOfTy(dt) == repNodeOfTy(et) { return et }
+  if (
+    !(repNodeAt(repNodeOfTy(dt)) is RRecord)
+    || recTwinRep(repNodeOfTy(et), repNodeOfTy(dt))
+  ) {
+    return et
+  }
+  return dt
+}
+
 // Rep `r` of built value `ix` at record type `t`, or the rep of the row legacy stores it in
 // (`structIndexOfExpr`): a value's rep follows its storage. A place keeps its own.
 function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
@@ -3345,6 +3380,11 @@ function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
   // A read of a place holds the place's rep, which the place decides (`rowlessLetTy`).
   const nd = nodeAt(unwrapParen(ix))
   if nd is Ident || nd is Member { return r }
+  // An element read off a list laid out at another record's row (`elemRowTy`) is that row's; a
+  // read whose type no struct row records is the element its list's row lays out.
+  const la = if nd is Index { nd.idxArr } else { -1 }
+  const lr = if la >= 0 { listElemRowRep(la, structIndexOfTy(t) < 0) } else { -1 }
+  if lr >= 0 && lr != r && listRepElemIs(la, lr) { return lr }
   const rt = builtStoredTy(t, r, storeRowOf(ix))
   if rt < 0 { return r }
   // An element read moves only off a list laid out at that row (`listRowRep`).
@@ -15691,7 +15731,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   if n is ArrayLit {
     // An open built type is the type of the rep it is built at (`openArrLitRep`).
     const abt = arrLitBuiltTyOf(ix, ibFnIx)
-    const bt = if ar >= 0 && (abt < 0 || irTyOpen(abt)) { repTyOf(rep) } else { abt }
+    // A literal held at its ref-list row (`listRowRep`) is built at that row's list.
+    const rowed = abt >= 0
+      && !irTyOpen(abt)
+      && rep != repNodeOfTy(abt)
+      && listRowTyOf(ix, repNodeOfTy(abt)) >= 0
+      && repNodeOfTy(listRowTyOf(ix, repNodeOfTy(abt))) == rep
+    const bt = if ar >= 0 && (abt < 0 || irTyOpen(abt)) || rowed { repTyOf(rep) } else { abt }
     return arrayLit(b, n, ix, rep, arrLitListBuild(ix, ibFnIx), bt)
   }
   if n is CharLit {
