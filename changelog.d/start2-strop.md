@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR stages an operand below a void `if`:** an operand built before a `null`-typed `if` run for its effect (a string concat's earlier part, a binary operator's left) waits on the stack below it, as legacy writes it, where the IR refused it or spilled it to a local of its own. `string operand after another` falls 1 → 0: `types/infer-null-hole-if-coalesce-in-each-position.vl` (`concat`) is claimed, and four functions the IR built with a spilled local (`after`, and `add`, `eq` and `local` in `operators/left-operand-spilled-below-void-if-right-positions.vl`) now match legacy byte for byte.

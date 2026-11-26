@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims a null name test whose `null` side stores:** a right side with an effect runs after the tested name, the test staged below it on the stack, and a left side ahead of a tested side with an effect of its own is written as a statement, its value dropped, both as legacy's `emitNulNameTestBin` writes them; a dropped effect may now sit above a staged value in the lowering. `null name test of a null side that stores` falls 3 → 0: `null/compare-an-assignment-of-null-to-a-nullable.vl` (`@start`, `eq`, `pairs`) is fully claimed, its `binding` now matches legacy, and three neighbouring `null/` programs lose 29 miss and mismatch rows between them. Claimed builds match legacy byte for byte.
