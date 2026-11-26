@@ -2,8 +2,11 @@
 # The I8 census (ir-design-2026-11.md §10.3): every function of every I8 population, claimed or
 # not as shipped ($VL_IR_SHADOW=5), and the first miss that keeps each unclaimed one.
 #
-#     scripts/ir-i8-census/census.sh <seed> <out-dir>
+#     scripts/ir-i8-census/census.sh <seed> <out-dir> [--tree <dir>]
 #
+# The probe compiler is <dir>/compiler/ (default: this checkout's) built WITH <seed>, not <seed>
+# itself: a before/after pair from one checkout compares a head with itself, so point the before
+# arm's --tree at a merge-base checkout. The header names the tree measured.
 # Populations: the self-compile, distilled cells/ and named/, every tests/cases program, every
 # capability probe, every inventory witness filed `runs` (witnesses.vl), and every scripts/ tool
 # (the gate tools are programs I8 must build too). A throwaway copy of
@@ -16,14 +19,20 @@
 # $CENSUS_CLASS names a class-programs.sh list: each population is cut to the programs it lists,
 # and the self-compile runs only when the list names it.
 set -euo pipefail
-SEED=${1:?usage: scripts/ir-i8-census/census.sh <seed> <out-dir>}
-OUT=${2:?usage: scripts/ir-i8-census/census.sh <seed> <out-dir>}
+SEED=${1:?usage: scripts/ir-i8-census/census.sh <seed> <out-dir> [--tree <dir>]}
+OUT=${2:?usage: scripts/ir-i8-census/census.sh <seed> <out-dir> [--tree <dir>]}
+TREE=.
+if [ "${3:-}" = --tree ]; then TREE=${4:?census.sh: --tree needs a directory}; fi
+[ -d "$TREE/compiler" ] || { echo "census.sh: no compiler/ under $TREE" >&2; exit 2; }
+TREE_ID=$(git -C "$TREE" rev-parse HEAD:compiler 2> /dev/null || echo untracked)
+[ -z "$(git -C "$TREE" status --porcelain -- compiler 2> /dev/null)" ] || TREE_ID="$TREE_ID+dirty"
 VL=${VL:-$PWD/scripts/vl-host/target/release/vl}
 JOBS=${JOBS:-4}
 T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
 mkdir -p "$OUT"
-cp -r compiler "$T/probe"
+echo "census: compiler tree $TREE_ID ($TREE), built with $SEED" | tee "$OUT/tree.txt"
+cp -r "$TREE/compiler" "$T/probe"
 bash scripts/ir-i8-census/probe-patch.sh "$T/probe"
 "$VL" build "$T/probe/entry.vl" -o "$T/probe.wasm" --compiler "$SEED" > /dev/null
 
@@ -51,7 +60,7 @@ VL_IR_SHADOW=5 "$VL" check --codegen --compiler "$PROBE" "$@" 2>&1 > /dev/null |
   }'
 ONE
 if [ -z "${CENSUS_CLASS:-}" ] || grep -q '^self'$'\t' "$CENSUS_CLASS"; then
-VL_IR_SHADOW=5 "$VL" build compiler/entry.vl -o "$T/self.wasm" --compiler "$T/probe.wasm" 2>&1 > /dev/null \
+VL_IR_SHADOW=5 "$VL" build "$TREE/compiler/entry.vl" -o "$T/self.wasm" --compiler "$T/probe.wasm" 2>&1 > /dev/null \
   | awk -F'\t' '/^\[ir\] / { n = $1; sub(/.*: /, "", n); if ($2 ~ /^(fnc |fnu |claimed start|start uncovered |claim fell back)/) print "self\t" n "\t" $2 }' \
   > "$OUT/self.rows"
   echo 1 > "$OUT/self.programs"
@@ -64,4 +73,4 @@ for pop in distilled cases probes witnesses scripts; do
 done
 cat "$T/distilled" "$T/cases" "$T/probes" "$T/witnesses" "$T/scripts" > "$OUT/programs.txt"
 
-scripts/ir-i8-census/summary.sh "$OUT" | tee "$OUT/summary.txt"
+{ cat "$OUT/tree.txt"; scripts/ir-i8-census/summary.sh "$OUT"; } | tee "$OUT/summary.txt"
