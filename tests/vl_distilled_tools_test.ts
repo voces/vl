@@ -155,7 +155,7 @@ const checkout = async (dir: string) => {
     `${ROOT}/${CENSUS}/gradecensus.vl`,
     `${dir}/${CENSUS}/gradecensus.vl`,
   );
-  for (const f of ["common.vl", "corpus.vl", "census-grade.vl"]) {
+  for (const f of ["common.vl", "corpus.vl", "census-grade.vl", "holdouts.vl"]) {
     await Deno.copyFile(`${ROOT}/scripts/lib/${f}`, `${dir}/scripts/lib/${f}`);
   }
   await Deno.symlink(STD, `${dir}/std`);
