@@ -13275,6 +13275,6 @@ hole-elaborated, and the type-to-row map cannot see their row. A built record va
 storage row's rep (`rowlessRecordRep`). An element read moves only off a list laid out at that row.
 Two exclusions are stage boundaries, removed by stage 2 (an object literal at its row, its
 function's result at the row too): an object literal keeps its own rep, and a value whose rep
-retags into the row keeps its rep. The field-code half is one accessor,
-`structRowFnSlotLayout` (a function slot laid out as a closure or a tagged id), which D17015's tag
-pass reads.
+retags into the row keeps its rep. The field-code half is one accessor COV-START owns,
+`structRowFnSlotLayout` (a function slot laid out as a closure or a tagged id). It lands with its
+first caller, D17015's tag pass.

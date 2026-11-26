@@ -12,7 +12,7 @@ conversion.
   storage type (`sFieldStoreTy`) where the two parted at a function position, closure versus tagged
   id. It moved no unit: the units' literal types are hole-elaborated, so `structRowOfRecordTy`
   finds no row for them. The row keys the field untagged while the type is tagged. The field-code
-  half survives as an accessor (below).
+  half survives as an accessor, which lands with its first caller (below).
 - **Moving every built record,** `rowlessRecordRep` widened past rowless types. It made 5 verifier
   failures (rule 2, a retag across rows laid out apart). Each was a maker's object literal moved to
   its row while the function's result stayed at the literal's own rep. Object literals are now
@@ -30,9 +30,10 @@ conversion.
 (`storeRowTyOf`). It does so where that rep differs, except for two stage boundaries: an object
 literal, and a value whose rep already retags into the row. Both are marked in the code as removed by
 stage 2. An element read moves only where its list's laid-out row holds the row's rep.
-`structRowFnSlotLayout` and `variantRowFnSlotLayout` (`emit_shape_rows.vl`) answer how a row lays
-out a function slot: 1 a closure, 0 a tagged set's i32 id, -1 otherwise. COV-CLOS's D17015 tag pass
-reads them.
+The field-code half, `structRowFnSlotLayout` and `variantRowFnSlotLayout` (how a row lays out a
+function slot: 1 a closure, 0 a tagged set's i32 id, -1 otherwise), is left out of this PR. An
+export with no caller reds the dead-export budget, so it lands with its first caller, COV-CLOS's
+D17015 tag pass.
 
 ## Measured
 
