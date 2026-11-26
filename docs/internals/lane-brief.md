@@ -87,6 +87,9 @@ not list reds that job. ready-check does not cover these:
 4. For a measurement, one refactor note. Never edit `CHANGELOG.md` or architecture-target's Status.
 5. Grade the inventory rows you file or close with `VL_IR_STRICT=1`, as CI does:
    `VL_IR_STRICT=1 vl run scripts/check-filed-witnesses.vl -- --strict <dirs>` (coordinator, 2026-11-25).
+6. A claim that a unit is covered is proven under `VL_IR_REQUIRE_CLAIM=1`, which refuses a function or
+   start body the IR does not claim. `VL_IR_STRICT=1` cannot prove it: a unit the IR declines cleanly
+   still builds and runs through legacy (coordinator ruling, 2026-11-26).
 
 ## Landing
 
