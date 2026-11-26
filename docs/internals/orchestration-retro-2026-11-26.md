@@ -97,3 +97,19 @@ shared plan or tail says why the IR cannot take it alone, or it goes back.
 - **The coordinator merges green PRs** (owner): CI green on the head, GitHub mergeable,
   `expectedHeadSha`; a red master push is reverted at once (V6).
 - **Eight lanes** (owner): the seven owners of V1 plus I8-PREP.
+
+## 6. Outcome (2026-11-26 23:39Z)
+
+**I8 landed** as #10465 (d36fea97) at 23:22Z. It deleted 24,280 lines and added 917. Master CI
+was green, and seed-latest carries the I8 compiler. It landed with 192 holdout rows. The
+self-compile and `scripts/` have 0 unclaimed units; `std/` has one, whose only importer is a
+holdout. L2 is 141.35G, −2.7%. Section 1 estimated 2026-11-28 to 11-29, so it landed about two
+days early. What made the difference: the owner's cutover-before-100% ruling, restarting the
+fleet, lanes merging their own PRs, and the docs-optional ruling.
+
+**Lessons from the freeze.** A freeze sent as an ordinary message reached lanes up to an hour
+late, so three compiler PRs landed during it. Send a freeze with `priority: now` to every lane at
+once. A permission to merge given earlier can outrun a later freeze.
+
+**After I8:** the delivery layers (DECISIONS.md "Delivery after I8: four layers"), the native
+`??`, and the profile-led speed work (COV-START), plus I8-PREP's dead-pass deletion.
