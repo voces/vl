@@ -7021,6 +7021,7 @@ function elabResultScanReset() {
   elabFnCalleeReads = Map()
   elabRetRecMemo = Map()
   elabPlainRecMemo = Map()
+  elabMakerLams = Map()
   elabResPlainCalls = Map()
   elabAnyRetRecord = false
   elabArgRecs = Map()
@@ -9026,12 +9027,89 @@ function elabPlainRetRecord(d: i32): i32[] {
   elabPlainRecMemo[d] = none
   const dn = nodeAt(d)
   if !(dn is FuncDecl) || !elabRetRecordShape(d) { return none }
-  const rec = elabRetValuesRecord(dn.fnBody, -1)
+  const rv = elabRetValuesRecord(dn.fnBody, -1)
+  const rec = if rv.length > 0 { rv } else { elabMakerLamRecord(d, dn) }
   elabPlainRecMemo[d] = rec
   // A maker handing back a record of members is built whole, never at the one member's result
   // a destination or a use names (D15243).
   if rec.length >= 2 { elabMakerBlock(d) }
   return rec
+}
+
+// The record plain maker `d` returns where every value it returns is one hole lambda it creates
+// (directly or through a `const`): one closure per signature the holders of its calls call through,
+// their union (D16845; coordinator ruling 2026-11-26). None for fewer than two signatures.
+function elabMakerLamRecord(d: i32, dn: FuncDecl): i32[] {
+  const none: i32[] = []
+  const lam = elabMakerRetLam(dn)
+  if lam < 0 { return none }
+  const sigs: i32[] = []
+  for c in elabResPlainCalls.keys() {
+    const h = if (elabResPlainCalls[c] ?? -1) == d { elabResHolder[c] ?? -1 } else { -1 }
+    for t in if h >= 0 { elabResThrough[h] ?? [] } else { [] } {
+      const sig = elabMakerSigOf(lam, t)
+      if sig < 0 { return none }
+      let have = false
+      for g in sigs {
+        if tySameSealed(g, sig) { have = true }
+      }
+      if !have { sigs.push(sig) }
+    }
+  }
+  if sigs.length < 2 { return none }
+  elabMakerLams[d] = lam
+  return sigs
+}
+
+// Per plain maker whose returned lambda the elaboration made a record of, that lambda.
+let elabMakerLams: {[i32]: i32} = Map()
+
+// The hole lambda maker `d` returns as a record of its signatures (`elabMakerLamRecord`), or -1.
+export function elabMakerLamOf(d: i32): i32 { return elabMakerLams[nodeSrc[d] ?? d] ?? -1 }
+
+// The one hole lambda every value maker `dn` returns is, written in its body directly or bound to
+// a `const` it returns; -1 for anything else.
+function elabMakerRetLam(dn: FuncDecl): i32 {
+  const vs: i32[] = []
+  collectRetValues(dn.fnBody, vs)
+  let lam = -1
+  for v0 in vs {
+    const v = parenPeelIx(v0)
+    let x = v
+    if v >= 0 && nodeAt(v) is Ident {
+      const ld = identDeclOf(v)
+      const ln = if ld >= 0 { nodeAt(ld) } else { null }
+      x = if ln is LetDecl && ln.letKw == "const" && ln.letType < 0 { parenPeelIx(ln.letInit) } else { -1 }
+    }
+    const xn = if x >= 0 { nodeAt(x) } else { null }
+    if !(xn is FuncDecl) || xn.fnName != "" || !elabDeclHasHoleParam(x) { return -1 }
+    if lam >= 0 && lam != x { return -1 }
+    lam = x
+  }
+  return lam
+}
+
+// The signature call `t` through a holder calls lambda `lam` at: its arguments' widened closed
+// types to the lambda's result there, instancing the lambda where none is yet; -1 where one
+// stays open.
+function elabMakerSigOf(lam: i32, t: i32): i32 {
+  const tn = nodeAt(t)
+  if !(tn is Call) { return -1 }
+  const wp: i32[] = []
+  for a in tn.callArgs {
+    const et = elabNodeTy(a, -1)
+    const at = widenLitTy(if et >= 0 { et } else { nodeTyIxOf(a) })
+    if at < 0 || !elabTyClosed(at) { return -1 }
+    wp.push(at)
+  }
+  let r = elabMemberResultAt(lam, wp)
+  if r < 0 {
+    const n0 = ekDecl.length
+    elabEnqueueAtParams(lam, wp)
+    elabSettle(n0)
+    r = elabMemberResultAt(lam, wp)
+  }
+  return if r < 0 { -1 } else { mkFuncTy(wp, widenLitTy(r)) }
 }
 
 // Appends to `out` every value function body `body` returns, by `return` or as its last
