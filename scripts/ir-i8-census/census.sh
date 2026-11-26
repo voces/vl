@@ -81,7 +81,7 @@ cat "$T/distilled" "$T/cases" "$T/probes" "$T/witnesses" "$T/scripts" > "$OUT/pr
 # A refused unit (`fnr`) stays refused only where its program expects that refusal: one of its
 # `// @emit-error <text>` lines is a substring of the refusal. Any other is unclaimed (`fnu`), since
 # legacy may build it, and the I8 cutover would then turn a running program into a refused one.
-for pop in self distilled cases probes witnesses scripts; do
+for pop in self distilled cases probes witnesses scripts harness; do
   [ -f "$OUT/$pop.rows" ] || continue
   LC_ALL=C awk -F'\t' -v OFS='\t' '
     function expects(f, msg,   line, e, ok, n, i, E) {
