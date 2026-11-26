@@ -7594,7 +7594,12 @@ function elabSlotRecordNote(c: i32) {
   for v0 in vals {
     const lv = parenPeelIx(v0)
     const ln = if lv >= 0 && lv < P.nodes.length { nodeAt(lv) } else { null }
-    if ln is FuncDecl && ln.fnName == "" && elabDeclHasHoleParam(lv) && elabInPlainCode(lv) {
+    if (
+      ln is FuncDecl
+      && ln.fnName == ""
+      && elabDeclHasHoleParam(lv)
+      && elabInPlainCode(lv)
+    ) {
       lams.push(lv)
       continue
     }
@@ -9191,7 +9196,10 @@ function elabMakerSlotSigs(lam: i32, d: i32, c: i32, sigs: i32[]): i32 {
     return -1
   }
   const lit = if isMap { -1 } else { cwIxUp[c] }
-  if !isMap && (lit < 0 || !cwIxCovers(lit) || cwIxUpKind[lit] != CW_UP_LETINIT) {
+  if (
+    !isMap
+    && (lit < 0 || !cwIxCovers(lit) || cwIxUpKind[lit] != CW_UP_LETINIT)
+  ) {
     return 0
   }
   const s = if isMap { md } else { cwIxUp[lit] }
@@ -9223,7 +9231,13 @@ function elabMakerSlotSigs(lam: i32, d: i32, c: i32, sigs: i32[]): i32 {
       if isMap {
         if mn is Index {
           own = true
-        } else if mn is Member && (mn.memProp == "get" || mn.memProp == "set" || mn.memProp == "has" || mn.memProp == "keys") {
+        } else if (
+          mn is Member
+          && (mn.memProp == "get"
+            || mn.memProp == "set"
+            || mn.memProp == "has"
+            || mn.memProp == "keys")
+        ) {
           // `set` is a write the slot's values hold; `has` and `keys` read no value.
           const mk = if cwIxCovers(m) { cwIxUpKind[m] } else { -1 }
           if mk != CW_UP_CALLEE && mn.memProp != "has" { return 0 }
@@ -9237,7 +9251,8 @@ function elabMakerSlotSigs(lam: i32, d: i32, c: i32, sigs: i32[]): i32 {
       }
       if !own {
         // A map's other members, a list's length, or another field of the record, read no value.
-        const other = isMap || (if isList { mn is Member && mn.memProp == "length" } else { mn is Member })
+        const other = isMap
+          || (if isList { mn is Member && mn.memProp == "length" } else { mn is Member })
         if !other { return 0 }
         continue
       }
@@ -9258,7 +9273,12 @@ function elabMakerSlotSigs(lam: i32, d: i32, c: i32, sigs: i32[]): i32 {
 
 // Adds the signatures of each call through `const` place `h`, initialised with a slot's read, and
 // through its `const` copies; a null test reads no value. False where `h` is read another way.
-function elabMakerPlaceSigs(lam: i32, h: i32, sigs: i32[], mine: i32[]): boolean {
+function elabMakerPlaceSigs(
+  lam: i32,
+  h: i32,
+  sigs: i32[],
+  mine: i32[],
+): boolean {
   const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
   if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return false }
   const hw = cwOccWalk(h)
@@ -11507,6 +11527,7 @@ export function elabRun() {
   elabNestedPerEncl()
   elabSoleRekey()
   elabListMemberSigs()
+  elabSlotLamCandidates()
   elabClosedLamRootKeys()
   elabReturnCredits()
   elabStoredHoleDefaults()
@@ -12506,6 +12527,108 @@ function elabListMemberSigs() {
     }
   }
   elabSettle(0)
+}
+
+// Mints, as candidates, each hole lambda written into a slot beside a call at every parameter
+// list an instance of that call's hole lambda arguments has: the signatures the slot's record
+// may take, which `elabSlotRecordNote` builds the lambda at after the run (D17572).
+function elabSlotLamCandidates() {
+  let any = false
+  for c in elabResSlotCalls {
+    const lams = elabSlotHoleLams(c)
+    if lams.length == 0 { continue }
+    const vals: i32[] = []
+    const ats: i32[] = []
+    if !elabSlotValuesOf(c, vals, ats) { continue }
+    for v0 in vals {
+      const v = elabSlotValueCall(v0)
+      const vn = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
+      if !(vn is Call) { continue }
+      for a in vn.callArgs {
+        const al = parenPeelIx(a)
+        if al < 0 || !elabIsHoleLam(al) { continue }
+        let k = 0
+        while k < ekDecl.length {
+          if ekDecl[k] == al {
+            const pts = elabKeyParamTys(k)
+            if pts.length > 0 {
+              for l in lams {
+                if elabMemberKeyAt(l, pts) < 0 {
+                  elabDemandCandidate(l, pts, -1, -1)
+                  any = true
+                }
+              }
+            }
+          }
+          k = k + 1
+        }
+      }
+    }
+  }
+  if any { elabSettle(0) }
+  return 0
+}
+
+// Whether `d` is a lambda with a hole parameter.
+function elabIsHoleLam(d: i32): boolean {
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  return n is FuncDecl && n.fnName == "" && elabDeclHasHoleParam(d)
+}
+
+// The closed parameter types of instance `k`, or [] where one stays open.
+function elabKeyParamTys(k: i32): i32[] {
+  const n = nodeAt(ekDecl[k])
+  if !(n is FuncDecl) { return [] }
+  const out: i32[] = []
+  let i = 0
+  while i < n.fnParams.length {
+    const t = elabKeyParamTy(k, i)
+    if t < 0 { return [] }
+    out.push(t)
+    i = i + 1
+  }
+  return out
+}
+
+// Appends the values written into the slot call `c` initialises, with their sites; false where
+// `c` is no field, element or map value of a fresh binding, or a write is not seen.
+function elabSlotValuesOf(c: i32, vals: i32[], ats: i32[]): boolean {
+  cwIxBuild()
+  if c < 0 || !cwIxCovers(c) { return false }
+  const uk = cwIxUpKind[c]
+  let d = -1
+  let f = "[]"
+  if uk == CW_UP_ASG_RHS || uk == CW_UP_ARG {
+    d = elabMapStoreDecl(c)
+  } else if uk == CW_UP_FIELD || uk == CW_UP_ELEM {
+    const lit = cwIxUp[c]
+    if lit >= 0 && cwIxCovers(lit) && cwIxUpKind[lit] == CW_UP_LETINIT {
+      d = cwIxUp[lit]
+    }
+    if uk == CW_UP_FIELD {
+      const fx = cwIxUpAux[c]
+      const fiv = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+      if !(fiv is FieldInit) { return false }
+      f = fiv.fiName
+    }
+  }
+  return d >= 0 && cwSlotWrittenValues(d, [f], vals, ats) >= 0
+}
+
+// The hole lambdas in plain code written into the slot call `c` initialises.
+function elabSlotHoleLams(c: i32): i32[] {
+  const out: i32[] = []
+  if c < 0 || !elabInPlainCode(c) { return out }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if !elabSlotValuesOf(c, vals, ats) { return out }
+  for v0 in vals {
+    const lv = parenPeelIx(v0)
+    if elabIsHoleLam(lv) && elabInPlainCode(lv) && !i32ListHas(out, lv) {
+      out.push(lv)
+    }
+  }
+  return out
 }
 
 // The instances a set member `m` is minted under: each of a lambda's encloser's instances, a
