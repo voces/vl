@@ -319,6 +319,8 @@ import {
   irPushRecvAt,
   irRhsOpnds,
   irSigOf,
+  irVarHeapOf,
+  irVarRow,
   numConvSrcOf,
   primOpcode,
   recHeapOf,
@@ -2995,6 +2997,14 @@ function getField(r: RGetField) {
   const m = nodeAt(r.gfAt)
   if !(m is Member) { return irLMiss("field node") }
   if r.gfShared { return sharedField(r, m) }
+  // A plain struct read takes its row and field index off its receiver's rep, as the shared row
+  // tables lay that rep out; legacy's arms answer only a receiver no struct row records.
+  const rsi = recvStructRow(r.gfV, m.memProp)
+  const ridx = if rsi >= 0 { sFieldIndex(rsi, m.memProp) } else { -1 }
+  if ridx >= 0 && !r.gfStored && !memberBoxReadAt(r.gfAt, lw.irAt) {
+    irLOpnd(r.gfV)
+    return structFieldRead(rsi, ridx, r.gfAt)
+  }
   // A read the builder built at its storage has its shape there.
   const sm = if r.gfStored { storageReadEnter(r.gfAt) } else { storageReadEnter(-1) }
   const fi = fieldIdxAt(r.gfAt, m)
@@ -3018,6 +3028,28 @@ function getField(r: RGetField) {
   const rs = fieldTail(r.gfAt, m)
   storageReadLeave(mark)
   return rs
+}
+
+// The struct row receiver `v` is laid out at (`irVarRow`, else the row a struct literal's temp is
+// built at, `irVarHeapOf`), where that row holds field `name`; else -1.
+function recvStructRow(v: Opnd, name: string): i32 {
+  if !(v is OVar) || v.ov < 0 { return -1 }
+  const n = repNodeAt(opRepOf(v))
+  if !(n is RRecord) || n.rrVariant { return -1 }
+  const vr = irVarRow(lw, v.ov)
+  const row = if vr >= 0 { vr } else { irVarHeapOf(lw, v.ov) }
+  return if row >= 0 && sFieldIndex(row, name) >= 0 { row } else { -1 }
+}
+
+// Struct row `si`'s field `idx` read off the receiver on the stack, then its recovers and unbox, as
+// `fieldTail`'s struct arm writes them.
+function structFieldRead(si: i32, idx: i32, at: i32) {
+  const fnIx = lw.irAt
+  if memRecvOwesNonNull(at, fnIx) { fbRefAsNonNull() }
+  structFieldTail(si, idx, at, fnIx)
+  if structUnionBoxTail(si, idx, at, fnIx) < 0 { return irLMiss("field unbox") }
+  if readOwesNonNullRecover(at, fnIx) { fbRefAsNonNull() }
+  return 0
 }
 
 // A shared template member's read (`gfShared`): the record, then the field at its storage, as
