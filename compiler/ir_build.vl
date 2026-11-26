@@ -2298,10 +2298,10 @@ function nullFoldedTy(t: i32, rep: i32): i32 {
 // Type `t` of `ix`, or where `rowlessRecordRep` moved its rep `rep` to a storage row, that row's
 // recorded type.
 function rowlessRecordTy(ix: i32, t: i32, rep: i32): i32 {
-  if t < 0 || repNodeOfTy(t) == rep || !rowlessRecord(t, repNodeOfTy(t)) {
+  if t < 0 || repNodeOfTy(t) == rep || !builtRecord(t, repNodeOfTy(t)) {
     return t
   }
-  const rt = rowlessStoredTy(t, repNodeOfTy(t), storeRowTyOf(ix))
+  const rt = builtStoredTy(t, repNodeOfTy(t), storeRowTyOf(ix))
   return if rt >= 0 && repNodeOfTy(rt) == rep { rt } else { t }
 }
 
@@ -2321,6 +2321,27 @@ function storeRowTyOf(ix: i32): i32 {
 // records, is held at that row's rep; else -1. A value and a place each name the row they store it in.
 function rowlessStoredTy(t: i32, rep: i32, rowTy: i32): i32 {
   if !rowlessRecord(t, rep) || rowTy < 0 || irTyOpen(rowTy) { return -1 }
+  const rr = repNodeOfTy(rowTy)
+  return if rr != rep && repNodeAt(rr) is RRecord { rowTy } else { -1 }
+}
+
+// Whether the ref-list row legacy lays list `arr` out on (`refListSlotOfExpr`) holds its elements
+// at rep `e`: the row a built list is held at (`listRowRep`), so its element reads there.
+function listRowElemIs(arr: i32, e: i32): boolean {
+  const slot = refListSlotOfExpr(unwrapParen(arr), ibFnIx)
+  const et = if slot >= 0 { rlElemTyIxAt(slot) } else { -1 }
+  return et >= 0 && !irTyOpen(et) && repNodeOfTy(et) == e
+}
+
+// Whether a value of type `t` (any type at all) is held at record rep `rep`: the rep alone decides.
+function builtRecord(t: i32, rep: i32): boolean {
+  return t >= 0 && repNodeAt(rep) is RRecord
+}
+
+// Storage row type `rowTy` where a built value of record type `t` at rep `rep` is held at that row's
+// rep, another record; else -1.
+function builtStoredTy(t: i32, rep: i32, rowTy: i32): i32 {
+  if !builtRecord(t, rep) || rowTy < 0 || irTyOpen(rowTy) { return -1 }
   const rr = repNodeOfTy(rowTy)
   return if rr != rep && repNodeAt(rr) is RRecord { rowTy } else { -1 }
 }
@@ -3306,15 +3327,32 @@ function listRowTyOf(ix: i32, r: i32): i32 {
   return lt
 }
 
-// Rep `r` of `ix` at type `t`, or, for a built value of a record type no struct row records, the
-// rep of the row legacy stores it in (`structIndexOfExpr`).
+// Rep `r` of built value `ix` at record type `t`, or the rep of the row legacy stores it in
+// (`structIndexOfExpr`): a value's rep follows its storage. A place keeps its own.
 function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
-  if !rowlessRecord(t, r) { return r }
+  if !builtRecord(t, r) { return r }
   // A read of a place holds the place's rep, which the place decides (`rowlessLetTy`).
   const nd = nodeAt(unwrapParen(ix))
   if nd is Ident || nd is Member { return r }
-  const rt = rowlessStoredTy(t, r, storeRowTyOf(ix))
-  return if rt >= 0 { repNodeOfTy(rt) } else { r }
+  const rt = builtStoredTy(t, r, storeRowTyOf(ix))
+  if rt < 0 { return r }
+  // The exclusions below hold for a type a struct row records; a rowless one moves, as before.
+  // Removed by layout stage 2 (a literal at its row, its function's result at the row too): an
+  // object literal stays at its own rep, the one its function's result returns.
+  if structIndexOfTy(t) >= 0 && nd is ObjLit { return r }
+  // An element read moves only off a list laid out at that row (`listRowRep`).
+  if (
+    structIndexOfTy(t) >= 0
+    && nd is Index
+    && !listRowElemIs(nd.idxArr, repNodeOfTy(rt))
+  ) {
+    return r
+  }
+  // Removed by layout stage 2: a value whose rep retags into the row (a twin) keeps its rep.
+  if structIndexOfTy(t) >= 0 && recRetagNoted(r, repNodeOfTy(rt), ix) {
+    return r
+  }
+  return repNodeOfTy(rt)
 }
 
 // The type of `??` `ix` along the `mapIndexGetOr` arm: its map's value, the default filling a
@@ -3835,7 +3873,16 @@ export function irBLetTempTy(
     || p == "f32"
     || p == "f64"
     || p == "bool"
-  const ty = if scalar && irTyHeldOpen(ty1, rep) && repTyOf(rep) >= 0 { repTyOf(rep) } else { ty1 }
+  const ty2 = if scalar && irTyHeldOpen(ty1, rep) && repTyOf(rep) >= 0 { repTyOf(rep) } else { ty1 }
+  // A closure held at an open type's uniform closure rep is typed at that rep's own type, which
+  // rule 1 takes as held (`closureHeld`), so its type and rep agree for rule 3.
+  const crt = repTyOf(rep)
+  const cloHeld = repNodeAt(rep) is RClosure
+    && repNodeOfTy(ty2) != rep
+    && crt >= 0
+    && repNodeOfTy(crt) == rep
+    && !irTyHeldOpen(crt, rep)
+  const ty = if cloHeld { crt } else { ty2 }
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
   // the verifier can close, so its function stays legacy's.
   if ibTyOpen(ty, rep) { return irBMiss("open temp type") }
@@ -5390,6 +5437,14 @@ function capturedStrRecovered(
 // binding holds where the read's leaves a variable open and the held type's rep is `rep`.
 function globalReadTy(d: i32, ix: i32, rep: i32): i32 {
   const ty = heldTy(exprTyOf(ix))
+  // A read typed where nothing fixes a list's element (`openListCellRep`) is at its rep's type.
+  if (
+    globalTyRep(ty) < 0
+    && repTyOf(rep) >= 0
+    && globalTyRep(scopeTyAt(d, -1)) < 0
+  ) {
+    return repTyOf(rep)
+  }
   if !irTyHeldOpen(ty, rep) { return ty }
   const ht = globalHolderTy(d)
   if ht >= 0 && repNodeOfTy(ht) == rep { return ht }
@@ -6231,12 +6286,23 @@ function globalRep(g: i32, d: i32): i32 {
   // A holder's cell beside `null` (cell kind `nulstruct`) is the record's nullable.
   const ct = if ht >= 0 && globalCellKind(d) == "nulstruct" { nullableRecordTyOf(ht) } else { ht }
   const r0 = globalTyRep(if ht >= 0 { ct } else { scopeTyAt(d, -1) })
-  const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, r0)) } else { r0 }
+  const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, openListCellRep(d, r0))) } else { r0 }
   if r >= 0 {
     globalNoteAt(g, d, r)
     if ht >= 0 { ib.irGlobalHeld[g] = true }
   }
   return r
+}
+
+// Global `d`'s cell where its type has no rep (a list whose element nothing fixes): the `i32`
+// list its cell kind (`list`, `nullist`) declares, as legacy's global section writes it; else `r`.
+function openListCellRep(d: i32, r: i32): i32 {
+  if r >= 0 { return r }
+  const k = globalCellKind(d)
+  if k != "list" && k != "nullist" { return r }
+  const lt = repElemTyOfName("i32[]")
+  if lt < 0 { return r }
+  return globalTyRep(if k == "nullist" { nullableTyOf(lt) } else { lt })
 }
 
 // Global `d`'s cell where the global section declares an i32 cell for a string binding whose
@@ -6323,6 +6389,8 @@ function globalStoreTy(d: i32, rep: i32): i32 {
   ) {
     return repTyOf(rep)
   }
+  // A cell whose type has no rep (`openListCellRep`) is stored at its rep's type.
+  if globalTyRep(ht) < 0 && repTyOf(rep) >= 0 { return repTyOf(rep) }
   const rt = rowlessStoredTy(ht, repNodeOfTy(ht), repTyOf(rep))
   return if rt >= 0 { rt } else { st }
 }
@@ -6746,7 +6814,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   // A callee with a hidden environment parameter takes a null one before its arguments, and a
   // lifted one its captures next; one that captures through its environment stays legacy's.
   const env = envSlotShift(inst) > 0
-  const caps = if cloLifted(pos) { liftCaps(pos) } else { [] }
+  const caps = if cloLifted(pos) { liftCaps(b, pos, ix) } else { [] }
   if ibMiss != "" { return missRhs("callee captures") }
   // A lifted callee that assigns a capture hands it back after its result (D3664).
   const wb = liftWriteBacks(pos, caps)
@@ -7080,8 +7148,9 @@ function loopCapVar(fe: i32, name: string): i32 {
 }
 
 // The captures lifted function `pos` takes after its environment, each a parameter, a binding or
-// a lifted capture of the function being built, read in order; a miss names any other.
-function liftCaps(pos: i32): Opnd[] {
+// a lifted capture of the function being built, or a capture its environment holds, read in
+// order at call `ix`; a miss names any other.
+function liftCaps(b: i32[], pos: i32, ix: i32): Opnd[] {
   const out: Opnd[] = []
   for name in captureNamesOf(pos) {
     const p = paramIndexOf(ibFnIx, name)
@@ -7095,13 +7164,23 @@ function liftCaps(pos: i32): Opnd[] {
     }
     const d = if p < 0 && lv < 0 { liftCapDecl(pos, name) } else { -1 }
     let v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if lv >= 0 { lv } else if d >= 0 { irBDeclVar(d) } else { -1 }
-    // A capture of this frame passes on as this frame reads it: a lifted frame's own parameter.
-    // An environment field would be written ahead of the callee's null environment, so it misses.
+    // A capture of this frame passes on as this frame reads it: a lifted frame's own parameter,
+    // or a field of its environment read at the callee's rep (a cell or another rep misses).
     if v < 0 && captureSlotOf(name, ibFnIx) >= 0 {
       const self = fnStmtsPosOf(ibFnIx)
+      // The environment read is a temp ahead of the callee's null environment; it has no effect.
       if !cloLifted(self) {
-        irBMiss("callee captures env")
-        return out
+        const cr = capRepOf(self, name)
+        if cr < 0 || cr != capRepOf(pos, name) || capCellTargetOf(name) >= 0 {
+          irBMiss("callee captures env")
+          return out
+        }
+        const ct = capTyOf(self, name)
+        const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: -1 }
+        out.push(
+          irBLetTempTy(b, ev, ix, cr, if ct >= 0 { ct } else { repTyOf(cr) }),
+        )
+        continue
       }
       if (
         capRepOf(self, name) >= 0
@@ -7750,38 +7829,18 @@ function inPlaceUnstagedFrom(b: i32[], at: i32): boolean {
 // Whether operands built into `b` from `at` on hold a push receiver's stage, which the lowering
 // writes with nothing pending below it.
 function receiverStageFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SEffect && (n.efRhs is RListStage || n.efRhs is RStashSet) {
-      return true
-    }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, "listStage") || stmtFrom(b, at, "stash")
 }
 
 // Whether operands built into `b` from `at` on hold a push receiver's stage.
 function listStageFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SEffect && n.efRhs is RListStage { return true }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, "listStage")
 }
 
 // Whether operands built into `b` from `at` on hold a tag dispatch's stash, which the lowering
 // writes below the operands staged before it (`tagStashEffect`).
 function tagStashFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SEffect && n.efRhs is RTagStash { return true }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, "tagStash")
 }
 
 // Whether operands built into `b` from `at` on hold a tag dispatch's stash under a box the
@@ -7812,32 +7871,12 @@ function boxLeadSpanFrom(b: i32[], at: i32): boolean {
 
 // Whether operands built into `b` from `at` on hold an order-stashed literal's field set.
 function stashSetFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SEffect && n.efRhs is RStashSet { return true }
-    i = i + 1
-  }
-  return false
-}
-
-// Whether node `n` is a store statement: to a local, a global, a field, an element or a cell.
-function storeAt(n: IrNode): boolean {
-  return n is SAssign
-    || n is SGlobalSet
-    || n is SSetField
-    || n is SListSet
-    || n is SCellSet
+  return stmtFrom(b, at, "stash")
 }
 
 // Whether operands built into `b` from `at` on hold a store statement.
 function storeFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    if storeAt(ib.irNodes[b[i]]) { return true }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, "store")
 }
 
 // Whether variable `v` is the out of a valued `if` in body `b`.
@@ -7853,13 +7892,7 @@ function valuedIfOut(b: i32[], v: i32): boolean {
 // earlier operand below it, as a valued `if` does (`coalArmStagesLeads`), or, with `stages`
 // false, one whose arm does not.
 function coalBoxFrom(b: i32[], at: i32, stages: boolean): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SCoalBox && coalArmStagesLeads(n.cbArm) == stages { return true }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, if stages { "coalStaged" } else { "coalInPlace" })
 }
 
 // Whether `v` is the out of a `??` in `b` (`SCoalBox`).
@@ -7874,21 +7907,63 @@ function coalBoxOut(b: i32[], v: i32): boolean {
 // Whether operands built into `b` from `at` on hold a void `if` (a `null`-typed one run for its
 // effect), a statement as a store is.
 function voidIfFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SIf && n.siOut < 0 { return true }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, "voidIf")
 }
 
 // Whether operands built into `b` from `at` on hold a valued `if` (an arm-site read's chain is one).
 function valuedIfFrom(b: i32[], at: i32): boolean {
+  return stmtFrom(b, at, "valuedIf")
+}
+
+// What node `n` is to the operands built around it: a temp is written inline at its one use, any
+// other node is a statement written where it stands, which an operand built before it and used
+// after it must be staged below (`irBStageLeads`). A void `if` and a receiver stage are not yet
+// staged around: `irBStageLeads` refuses them.
+type StmtClass = "temp" | "valuedIf" | "voidIf" | "coalStaged" | "coalInPlace" | "store"
+  | "stash" | "tagStash" | "listStage" | "effect" | "control"
+
+function stmtClassOf(n: IrNode): StmtClass {
+  return match n {
+    SLet => "temp"
+    SIf => if n.siOut >= 0 { "valuedIf" } else { "voidIf" }
+    SArmSite => "valuedIf"
+    SCoalBox => if coalArmStagesLeads(n.cbArm) { "coalStaged" } else { "coalInPlace" }
+    SAssign | SGlobalSet | SSetField | SListSet | SCellSet => "store"
+    SEffect => effectStmtClassOf(n.efRhs)
+    SArmWrite | SDrop | SBoundsCheck | SRawOp => "effect"
+    SBlock | SBr | SForIn | SIntSwitch | SLoop | SRangeLoop | SReturn | SSwitch | STrap => "control"
+  }
+}
+
+// The class of an effect statement over `r`: a literal's order stash, a tag dispatch's stash or a
+// push receiver's stage; any other effect is a plain one, written where it stands.
+function effectStmtClassOf(r: Rhs): StmtClass {
+  if stashRhs(r) { return "stash" }
+  if tagStashRhs(r) { return "tagStash" }
+  return if listStageRhs(r) { "listStage" } else { "effect" }
+}
+
+function stashRhs(r: Rhs): boolean { return r is RStashSet }
+
+function tagStashRhs(r: Rhs): boolean { return r is RTagStash }
+
+function listStageRhs(r: Rhs): boolean { return r is RListStage }
+
+// Whether a statement of class `c` among an operand's later siblings has the operands before it
+// written below it, as `ifBelowLeadHas` reads it: a valued or void `if`, a `??` box, a store or a
+// literal's order stash.
+function stmtLeadsBelow(c: StmtClass): boolean {
+  return match c {
+    "valuedIf" | "voidIf" | "coalStaged" | "coalInPlace" | "store" | "stash" => true
+    "temp" | "tagStash" | "listStage" | "effect" | "control" => false
+  }
+}
+
+// Whether body `b` from `at` on holds a statement of class `c`.
+function stmtFrom(b: i32[], at: i32, c: StmtClass): boolean {
   let i = at
   while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SIf && n.siOut >= 0 || n is SArmSite { return true }
+    if stmtClassOf(ib.irNodes[b[i]]) == c { return true }
     i = i + 1
   }
   return false
@@ -7939,16 +8014,7 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
 function ifBelowLeadHas(b: i32[], at: i32, to: i32): boolean {
   let i = at
   while i < to {
-    const n = ib.irNodes[b[i]]
-    if (
-      n is SIf
-      || n is SCoalBox
-      || n is SArmSite
-      || n is SEffect && n.efRhs is RStashSet
-      || storeAt(n)
-    ) {
-      return true
-    }
+    if stmtLeadsBelow(stmtClassOf(ib.irNodes[b[i]])) { return true }
     i = i + 1
   }
   return false
@@ -9880,6 +9946,11 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     }
     return coalesce(b, dn, du, dst, false)
   }
+  // A value `if` whose own type has no rep (a list whose element nothing fixes) is built at the
+  // destination's rep, each arm delivered there.
+  if ibMiss == "" && dst >= 0 && dn is IfStmt && exprRepOf(du) < 0 {
+    return ifExprAt(b, dn, du, dst, repTyOf(dst))
+  }
   // A read the checker narrowed to `null` is the destination's null where legacy's `nullread` arm
   // writes one (`nullReadDstOwnOf`), not its storage's.
   const nro = if ibMiss == "" && dst >= 0 { nullReadOwnAt(ix) } else { -1 }
@@ -10464,6 +10535,21 @@ function boxTempIn(
     return repTemp(b, { nnV: v, nnPay: false, nnAt: ix }, ix, dst)
   }
   let p = holeBoxPlanOf(ix, uTy, ibFnIx)
+  // A `null` the builder delivers for a node that is no `null` literal (a binding's absent
+  // initializer) is the destination's null box, as legacy writes a bare `null`.
+  if (
+    p.hbArm == "ladder"
+    && v is OImm
+    && irBOpRep(v) == ibNoValue
+    && nullOwnRepFits(NULL_OWN_BOX, dst)
+  ) {
+    return repTemp(
+      b,
+      { nuAt: unwrapParen(ix), nuOwn: NULL_OWN_BOX, nuRead: [] },
+      ix,
+      dst,
+    )
+  }
   // An assignment the ladder would box is boxed as its target's value after its store, on the
   // target's own plan (an `asgLit`, say: the stored literal's box at the target's kind).
   let pAt = ix
@@ -11754,7 +11840,9 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   const len = irBExpr(b, n.callArgs[0])
   // The fill is delivered at the element rep, as a literal element of the same value is; one
   // legacy boxes is boxed at its union (`arrNewFillBoxTy`), as a union element is.
-  const v = if boxTy >= 0 { boxTempIn(b, unionElemValue(b, fill), fill, ln.rlsElem, -1, boxTy) } else { deliver(b, fill, ln.rlsElem, -1) }
+  // Otherwise at the element rep's own type, so a fill already boxed at that union passes as is.
+  const et = repTyOf(ln.rlsElem)
+  const v = if boxTy >= 0 { boxTempIn(b, unionElemValue(b, fill), fill, ln.rlsElem, -1, boxTy) } else { deliver(b, fill, ln.rlsElem, et) }
   if ibMiss != "" { return v }
   if ifBelowLead(b, at, "array new short-circuit operand") { return v }
   if repPrim(irBOpRep(len)) != "i32" {
@@ -17622,7 +17710,14 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       irBNode(b, { rtHas: false, rtV: z }, -1, ibNoValue, ix)
       return 0
     }
-    if none { return skip("void return value") }
+    // At a function with no result, `return <expr>` is `<expr>` for its effect, then a bare return.
+    if none {
+      stmtNode(b, n.retArg, NO_SIBS, -1)
+      if ibMiss != "" { return 0 }
+      const z: Opnd = { ov: -1 }
+      irBNode(b, { rtHas: false, rtV: z }, -1, ibNoValue, ix)
+      return 0
+    }
     // A returned call that never returns is that call, then the `return` legacy writes after it,
     // dead and bare; at a wider number legacy also widens the dead value.
     const rx = unwrapParen(n.retArg)
@@ -17659,38 +17754,17 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       return 0
     }
     const built = retCloAt(b, n.retArg) ?? retDelivered(b, n.retArg)
-    // A list returned at its result's storage is the same list where no coercion is recorded: a
-    // record-or-null twin, a result whose type holds a hole the value fills, or a variant record
-    // returned as its struct twin.
-    const v = if (ibMiss == ""
-      && irBOpRep(built) != ib.irRetRep
-      && (listRetag(irBOpRep(built), ib.irRetRep)
-      || holeRetagNoted(
-      irBOpRep(built),
-      ib.irRetRep,
-      retHoleMap(irBOpRep(built)) || nulCloPair(irBOpRep(built), ib.irRetRep),
-    )
-      || recRetag(irBOpRep(built), ib.irRetRep)
-      || recRetagNoted(irBOpRep(built), ib.irRetRep, n.retArg)
-      || recValRetagNoted(built, ib.irRetRep))
-      && exprPrePathWhy(n.retArg, ibFnIx) == "") { repTempTy(b, { rgV: built }, n.retArg, ib.irRetRep, ib.irRetTy) } else { built }
-    const vr = if ibMiss == "" { irBOpRep(v) } else { -1 }
-    // A value stored at the result's valtype, or a `null` the nullable result's ref holds, is
-    // returned as it stands, as at an argument.
+    if ibMiss != "" { return 0 }
+    // A returned literal whose nested field sits at another rep of its row (D17385).
     if (
-      ibMiss != ""
-      || vr != ib.irRetRep
-        && !openRepTakes(ib.irRetTy, ib.irRetRep, vr)
-        && !repStoresAs(ib.irRetRep, vr)
-        && !repNullRefFits(vr, ib.irRetRep)
-        && !nicheRefTakes(ib.irRetRep, vr)
+      ibRetNestedTwin >= 0
+      && ibRetNestedTwin == unwrapParen(n.retArg)
+      && convertKindOf(built, ib.irRetRep, ib.irRetTy, n.retArg) < 0
     ) {
-      // A returned literal whose nested field sits at another rep of its row (D17385).
-      if ibRetNestedTwin >= 0 && ibRetNestedTwin == unwrapParen(n.retArg) {
-        return skip("return coercion nested twin")
-      }
-      return skip("return coercion")
+      return skip("return coercion nested twin")
     }
+    const v = irConvert(b, built, ib.irRetRep, ib.irRetTy, n.retArg)
+    if ibMiss != "" { return 0 }
     irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, ix)
     return 0
   }
@@ -17820,9 +17894,10 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   }
   const n0 = b.length
   if retRefusedWhy(last, ibFnIx) != "" { return skip("return refused") }
-  const v = retDelivered(b, last)
+  const v0 = retDelivered(b, last)
   if ibMiss != "" { return 0 }
-  if irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
+  const v = irConvert(b, v0, ib.irRetRep, ib.irRetTy, last)
+  if ibMiss != "" { return 0 }
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])
   return 0
@@ -18034,14 +18109,11 @@ function tailArm(blockIx: i32): i32[] {
   if ibMiss != "" { return body }
   // A scalar arm value at a boxed result is boxed at the result's union, the box plan legacy's
   // owed box writes (`emitUnionBoxOwed`).
-  const v = if irBOpRep(v0) != ib.irRetRep
+  const v1 = if irBOpRep(v0) != ib.irRetRep
     && heldAsBox(ib.irRetRep)
     && repPrim(irBOpRep(v0)) != null { boxTempIn(body, v0, last, ib.irRetRep, -1, ib.irRetTy) } else { v0 }
+  const v = irConvert(body, v1, ib.irRetRep, ib.irRetTy, last)
   if ibMiss != "" { return body }
-  if irBOpRep(v) != ib.irRetRep {
-    skip("tail coercion")
-    return body
-  }
   // Legacy banks no statement row for an arm's tail value (`emitTailReturnExit`).
   irBNode(body, { rtHas: true, rtV: v }, -1, ibNoValue, last)
   return body
@@ -19387,7 +19459,7 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     return av
   }
   const noted = irGlobalRepOf(ib, gi)
-  const rep = if noted >= 0 { noted } else { globalTyRep(globalHeldTy(gst)) }
+  const rep = if noted >= 0 { noted } else { openListCellRep(gst, globalTyRep(globalHeldTy(gst))) }
   if rep < 0 { return irBMiss("global initializer rep") }
   // A constant list literal whose binding's storage row (`letBindTy`, D14434) is another list, a
   // wider record's, is built at that row, which the cell then stores.
@@ -19777,21 +19849,65 @@ function recValRetagNoted(o: Opnd, dst: i32): boolean {
   return recValRetag(ib, o.ov, src, dst)
 }
 
-// Whether reps `a` and `b` are both a closure's ref niche, which a hole may leave open in either.
-function nulCloPair(a: i32, b: i32): boolean {
-  const x = repNodeAt(a)
-  const y = repNodeAt(b)
-  return x is RNullable
-    && y is RNullable
-    && x.rnDisc == 1
-    && y.rnDisc == 1
-    && repNodeAt(x.rnInner) is RClosure
-    && repNodeAt(y.rnInner) is RClosure
+// Value `v` delivered at rep `dst` (type `dstTy`) at node `at`, converted from its own rep where the
+// checker's types agree: as it stands, retagged, or a named miss the scoreboard counts as capability
+// debt. The one conversion every delivery site calls; each arm is its destination kind's cases.
+export function irConvert(
+  b: i32[],
+  v: Opnd,
+  dst: i32,
+  dstTy: i32,
+  at: i32,
+): Opnd {
+  if ibMiss != "" { return v }
+  const k = convertKindOf(v, dst, dstTy, at)
+  if k == CONVERT_AS_IS { return v }
+  if k == CONVERT_RETAG { return repTempTy(b, { rgV: v }, at, dst, dstTy) }
+  return irBMiss("convert " + repWhat(irBOpRep(v)) + " -> " + repWhat(dst))
 }
 
-// Whether a returned value at rep `r` is a map, whose closures a hole may leave open in the
-// result, retagged as it stands (a list's are `listRetagHole`'s; a record's retag is unverified).
-function retHoleMap(r: i32): boolean { return repNodeAt(r) is RMap }
+// How `irConvert` takes value `v` to rep `dst`: as it stands, by a retag, or -1 for no case yet.
+const CONVERT_AS_IS = 0
+const CONVERT_RETAG = 1
+function convertKindOf(v: Opnd, dst: i32, dstTy: i32, at: i32): i32 {
+  const src = irBOpRep(v)
+  if src == dst || convertAsIs(src, dst, dstTy) { return CONVERT_AS_IS }
+  const d = repNodeAt(dst)
+  if d == null { return -1 }
+  // Records retag only by the verifier's field-wise rules; a row copy is not yet a case.
+  const re = match d {
+    RRecord => convertRetag(v, src, dst, at, false)
+    RList | RMap | RClosure | RNullable | RBox => convertRetag(v, src, dst, at, true)
+    RAtom | RPrim | RRaw | RNoValue | RUnsup => convertRetag(v, src, dst, at, true)
+  }
+  return if re { CONVERT_RETAG } else { -1 }
+}
+
+// Whether a value at rep `src` is the value at `dst` as it stands: an open type's rep, a valtype
+// `dst` stores, the bottom ref in a nullable ref, or a niche's ref.
+function convertAsIs(src: i32, dst: i32, dstTy: i32): boolean {
+  return openRepTakes(dstTy, dst, src)
+    || repStoresAs(dst, src)
+    || repNullRefFits(src, dst)
+    || nicheRefTakes(dst, src)
+}
+
+// Whether value `v` at rep `src` retags to `dst`: a list's twin, closure openness (`clo`, never a
+// record's), or a record's struct twin or noted row, with the operand's pre-path clear.
+function convertRetag(
+  v: Opnd,
+  src: i32,
+  dst: i32,
+  at: i32,
+  clo: boolean,
+): boolean {
+  const ok = listRetag(src, dst)
+    || holeRetagNoted(src, dst, clo && !(repNodeAt(src) is RRecord))
+    || recRetag(src, dst)
+    || recRetagNoted(src, dst, at)
+    || recValRetagNoted(v, dst)
+  return ok && exprPrePathWhy(at, ibFnIx) == ""
+}
 
 // Whether rep `src` is `dst` as it stands, a list (`listRetagHole`) or, with `clo`, any value
 // (`cloHoleRetag`), apart only in closure openness; each record rep's heap is noted first, which
