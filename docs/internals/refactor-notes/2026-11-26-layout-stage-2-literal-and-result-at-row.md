@@ -82,3 +82,9 @@ Master `47cbeeef6`'s seed against this tree's, both built by the same seed.
   nested literals at their rows, read off a binding, an argument, a list element, an `if` arm,
   another literal's field, a relayed call, and a four-deep nest. It is covered on both seeds and
   prints the same; it guards the positions the exclusions used to keep.
+- **Sweep:** `tests/cases/records/stored-row-permuted-twin-read-positions.vl`. A list stored at a
+  row spelled `{b, a}`, held whole in a field spelled `{a, b}` and read by name: through the
+  field, off the list, a second element, a bound element, a function over the field, and a loop.
+  It is covered on master and on the head and prints the same. The control is this tree with the
+  literal exclusion deleted but the read at the row's own slot (`sk`) not yet added: there its
+  start misses `field read of a stored row`.
