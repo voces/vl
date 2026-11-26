@@ -21,7 +21,6 @@ import { strListSameMembers } from "./listutil"
 let bdsArmed = false
 let bdsNamed = false
 let bdsDrop = 0
-let bdsDepth = 0
 let bdsRowKey: string[] = []
 let bdsRowN: i32[] = []
 let bdsAs = ""
@@ -45,7 +44,6 @@ export function boxDstDropSet(v: i32) {
 export function boxDstShadowBegin() {
   bdsRowKey = []
   bdsRowN = []
-  bdsDepth = 0
   return 0
 }
 
@@ -63,92 +61,11 @@ function bdsCount(key: string) {
   return 0
 }
 
-// The box record for delivery node `ix` in `fnIx`, read through a paren and the node a rewrite or
-// mono copy made it from; -1 for none.
-function bdsRecord(ix: i32, fnIx: i32): i32 {
-  if bdsDrop == 1 { return -1 }
-  let r = boxDstTyAt(ix, fnIx)
-  if r < 0 { r = boxDstTyAt(unwrapParen(ix), fnIx) }
-  if r < 0 { r = boxDstTyAt(nodeSrc[ix] ?? -1, fnIx) }
-  if r < 0 { return -1 }
-  if bdsDrop == 2 { return 0 }
-  // A record a generic body banked names its type parameters; the instance closes them.
-  if tyHasTyVar(r) {
-    const it = elabInstTyAt(r, fnIx)
-    if it >= 0 { return it }
-  }
-  return r
-}
-
-// The class of the delivery of `ix` into the union the site names `unionName` (type `unionTy`
-// where it has one); `form` is 1 when the value is already a box, 2 when it never returns.
-function bdsClass(
-  unionName: string,
-  unionTy: i32,
-  ix: i32,
-  fnIx: i32,
-  form: i32,
-) {
-  if form == 1 { return "value already a box" }
-  if form == 2 { return "value never returns" }
-  const r = bdsRecord(ix, fnIx)
-  if r < 0 { return "no record" }
-  if unionTy >= 0 && unionTy == r { return "agree" }
-  const rn = tyToEmitName(r)
-  if rn == unionName { return "agree" }
-  if rn == "" { return "record renders empty" }
-  // Two spellings of one union type: an alias against its members, or the members in another
-  // order. The canonical type key decides; a site that names no type is graded by spelling alone.
-  if unionTy >= 0 {
-    const k = utkTyKeyText(unionTy)
-    if k != "" && k == utkTyKeyText(r) { return "agree up to spelling" }
-  }
-  return "disagree"
-}
-
-// Note a site's union-box delivery of `ix` into `unionName`, `site` naming the entry point and
-// `form` the value's (`bdsClass`). A delivery inside another's lowering counts as `nested`.
-export function boxDstShadowNote(
-  site: string,
-  unionName: string,
-  unionTy: i32,
-  ix: i32,
-  fnIx: i32,
-  form: i32,
-) {
-  if !bdsArmed { return 0 }
-  let key = bdsAs
-  bdsAs = ""
-  if key == "" { key = bdsClass(unionName, unionTy, ix, fnIx, form) }
-  // A delivery a site boxes inside its own lowering is counted apart, so a class over sites
-  // stays comparable, and a nested delivery with no record is still seen.
-  if bdsDepth > 0 { key = "nested " + key }
-  if bdsNamed {
-    const r = bdsRecord(ix, fnIx)
-    let col = "-"
-    if r >= 0 { col = tyToEmitName(r) }
-    key = key + " | " + site + " | site " + unionName + " | record " + col
-  }
-  bdsCount(key)
-  return 0
-}
-
 // The class the next noted delivery counts as instead of being graded: `table` where the table
 // boxes it at its record, `floor: <why>` where a position the table serves boxes at its own union.
 // A switched position is graded by the sweep, so only its floors are named.
 export function boxDstShadowAs(c: string) {
   if bdsArmed { bdsAs = c }
-  return 0
-}
-
-// Bracket a site's own lowering, so the deliveries inside it count as nested.
-export function boxDstShadowEnter() {
-  if bdsArmed { bdsDepth = bdsDepth + 1 }
-  return 0
-}
-
-export function boxDstShadowLeave() {
-  if bdsArmed && bdsDepth > 0 { bdsDepth = bdsDepth - 1 }
   return 0
 }
 
@@ -167,55 +84,6 @@ function bdsInst(r: i32, fnIx: i32): i32 {
   if r < 0 || !tyHasTyVar(r) { return r }
   const it = elabInstTyAt(r, fnIx)
   return if it >= 0 { it } else { r }
-}
-
-// Note an atom-to-string decode of `ix` against member texts `texts` the site derived, `nul` when
-// the site maps `-1` to null: graded against the literal set the checker recorded at the delivery.
-export function atomSrcShadowNote(
-  texts: string[],
-  nul: boolean,
-  ix: i32,
-  fnIx: i32,
-) {
-  if !bdsArmed { return 0 }
-  let r = atomSrcTyAt(ix, fnIx)
-  if r < 0 { r = atomSrcTyAt(unwrapParen(ix), fnIx) }
-  if r < 0 { r = atomSrcTyAt(nodeSrc[ix] ?? -1, fnIx) }
-  r = bdsInst(r, fnIx)
-  if bdsDrop == 1 { r = -1 }
-  let cls = "no record"
-  let rt: string[] = []
-  if r >= 0 {
-    const rn = tyNulLitUnionMemberTexts(r)
-    rt = if rn.length > 0 { rn } else { tyLitMemberTexts(r) }
-    if bdsDrop == 2 { rt = ["<drop>"] }
-    if rt.length == 0 {
-      cls = "record holds no member"
-    } else if strListSameMembers(texts, rt) {
-      cls = if (rn.length > 0) == nul { "agree" } else { "agree up to null" }
-    } else if texts.length == 0 {
-      cls = "site has no member"
-    } else if bdsSubTexts(rt, texts) {
-      cls = "record narrower"
-    } else {
-      cls = "disagree"
-    }
-  }
-  let key = "atom " + cls
-  if bdsAs != "" {
-    key = "atom " + bdsAs
-    if bdsAs == "table" && cls != "agree" { key = key + " (" + cls + ")" }
-    bdsAs = ""
-  }
-  if bdsNamed {
-    key = key
-      + " | site "
-      + bdsJoin(texts, nul)
-      + " | record "
-      + bdsJoin(rt, r >= 0 && tyNulLitUnionMemberTexts(r).length > 0)
-  }
-  bdsCount(key)
-  return 0
 }
 
 // Note a narrowed-arm unbox of `ix` to heap `heap` the site derived: graded against the heap of the
@@ -300,23 +168,4 @@ export function armHeapOfTy(a: i32): i32 {
   const si = structIndexOfTy(x)
   if si >= 0 && si < sHeapIdx.length { return sHeapIdx[si] }
   return -1
-}
-
-// Whether every text of `a` is one of `b`'s.
-function bdsSubTexts(a: string[], b: string[]): boolean {
-  for x in a {
-    let hit = false
-    for y in b {
-      if y == x { hit = true }
-    }
-    if !hit { return false }
-  }
-  return true
-}
-
-function bdsJoin(xs: string[], nul: boolean): string {
-  let o = ""
-  for x in xs { o = if o == "" { x } else { o + "|" + x } }
-  if nul { o = o + "|null" }
-  return o
 }
