@@ -9056,44 +9056,61 @@ let elabMakerLams: {[i32]: i32} = Map()
 export function elabMakerLamOf(d: i32): i32 { return elabMakerLams[nodeSrc[d] ?? d] ?? -1 }
 
 // Adds to `sigs` the signature of each call through a holder, or a copy of one, of a call of plain
-// function `d`, and of the plain functions in `seen`'s chain that return such a call whole; false
-// where one stays open.
+// function `d`, and of the plain functions in `seen`'s chain that return such a call whole. False
+// where one stays open or a call is not so held: the maker converts only when every call is
+// (coordinator ruling Q2, all or nothing).
 function elabMakerHolderSigs(lam: i32, d: i32, sigs: i32[], seen: i32[]): boolean {
   for c in elabResPlainCalls.keys() {
     if (elabResPlainCalls[c] ?? -1) != d { continue }
     const h = elabResHolder[c] ?? -1
-    const ws: i32[] = if h >= 0 { [h] } else { [] }
     if h >= 0 {
+      const ws: i32[] = [h]
       for w in elabCopiesDeep(h) { ws.push(w) }
-    }
-    for w in ws {
-      for t in elabResThrough[w] ?? [] {
-        const sig = elabMakerSigOf(lam, t)
-        if sig < 0 { return false }
-        let have = false
-        for g in sigs {
-          if tySameSealed(g, sig) { have = true }
+      const mine: i32[] = []
+      for w in ws {
+        // Every read of the holder or a copy is a call through it, a further copy, or a write or
+        // link of the holder itself.
+        const th = elabResThrough[w] ?? []
+        const own = th.length
+          + (elabResCopies[w] ?? []).length
+          + elabResWriteReads(w)
+          + elabResLinkReads(w)
+        if (elabResReads[w] ?? 0) != own { return false }
+        for t in th {
+          const sig = elabMakerSigOf(lam, t)
+          if sig < 0 { return false }
+          if !elabTyListHolds(mine, sig) { mine.push(sig) }
+          if !elabTyListHolds(sigs, sig) { sigs.push(sig) }
         }
-        if !have { sigs.push(sig) }
       }
+      // A holder calling one signature alone, with no copy or link to share the record, is a plain
+      // closure's, which a record does not serve.
+      if mine.length < 2 && ws.length < 2 && elabResLinkReads(h) == 0 { return false }
+      continue
     }
     // A function returning the call whole hands it to its own callers' holders.
     const f = elabEnclosingFn(c)
     const fn = if f >= 0 { nodeAt(f) } else { null }
-    if h < 0 && fn is FuncDecl && !i32ListHas(seen, f) {
-      const rv: i32[] = []
-      collectRetValues(fn.fnBody, rv)
-      let ret = false
-      for v in rv {
-        if parenPeelIx(v) == c { ret = true }
-      }
-      if ret {
-        seen.push(f)
-        if !elabMakerHolderSigs(lam, f, sigs, seen) { return false }
-      }
+    if !(fn is FuncDecl) || i32ListHas(seen, f) { return false }
+    const rv: i32[] = []
+    collectRetValues(fn.fnBody, rv)
+    let ret = false
+    for v in rv {
+      if parenPeelIx(v) == c { ret = true }
     }
+    if !ret { return false }
+    seen.push(f)
+    if !elabMakerHolderSigs(lam, f, sigs, seen) { return false }
   }
   return true
+}
+
+// Whether `tys` holds a type sealed-equal to `t`.
+function elabTyListHolds(tys: i32[], t: i32): boolean {
+  for g in tys {
+    if tySameSealed(g, t) { return true }
+  }
+  return false
 }
 
 // The one hole lambda every value maker `dn` returns is, written in its body directly or bound to
