@@ -1243,6 +1243,17 @@ let lwRootRun = 0
 // The outer stagings' runs, as `lwFloors` holds the outer floors.
 let lwRootRuns: i32[] = []
 
+// Whether variable `v` is on the stack already, or a temp defined ahead of every effect in `effs`.
+function aheadOfEffects(v: i32, effs: Opnd[]): boolean {
+  if v < 0 || v >= lwStackVal.length { return false }
+  if lwStackVal[v] { return true }
+  if !isTemp(v) { return false }
+  for e in effs {
+    if e is OVar && e.ov <= v { return false }
+  }
+  return true
+}
+
 // Puts value `v`, just written, on the live stack.
 function livePush(v: i32) {
   lwStackVal[v] = true
@@ -1536,11 +1547,31 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RAtomEq => atomEq(r)
     RAfterEffects => {
+      // A value defined ahead of its effects, staged or not, is written first, in its definition
+      // order; a dropped effect leaves the stack as it found it, so it may sit above that value.
+      const v = r.aeV
+      const staged = v is OVar && aheadOfEffects(v.ov, r.aeEff)
+      if staged { irLOpnd(v) }
       for e in r.aeEff {
-        irLOpnd(e)
-        fbDrop()
+        // An effect staged itself is taken off the stack where it waits.
+        if (
+          e is OVar
+          && e.ov >= 0
+          && e.ov < lwStackVal.length
+          && lwStackVal[e.ov]
+        ) {
+          irLOpnd(e)
+          fbDrop()
+        } else {
+          lwFloors.push(lwFloor)
+          lwFloor = lwLive.length
+          irLOpnd(e)
+          fbDrop()
+          liveNeutral()
+          lwFloor = lwFloors.pop() ?? 0
+        }
       }
-      irLOpnd(r.aeV)
+      if !staged { irLOpnd(v) }
     }
     RAsTail => {
       irLOpnd(r.akV)
