@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR builds a fused `xs.get(i) ?? d` nested in another's index or receiver:** a non-re-readable receiver or index of a fused list read is now held in an IR-owned local (`heldInLocal`). The lowering gives a slotless local assigned outside a valued frame a slot of its own (`ownedSlot`). An inner fused `??` built after the outer receiver therefore finds no temp waiting (`coalesce listGetOr after an operand`). An index that builds statements, or a re-readable one that reads a global, is held too (`index operand`). This replaces #10254's once-slot receiver path with the IR's own general form. Legacy's staging of a held receiver or index stands down for its head.
