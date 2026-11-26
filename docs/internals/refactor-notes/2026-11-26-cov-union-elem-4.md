@@ -17,16 +17,25 @@ stores the atom. A field narrowed alike is read at its atom and decoded by its c
 null test is built for its effect and dropped (`nulNoneEffect`). Its element read at the `null`
 unit refused over the `nulbool` element.
 
-- `buildIndex`: a nullable element read at the `null` unit is read as stored (`nulDropped`). A
-  consumer that keeps the value checks its rep and misses: `const q = a[0]` reports
-  `declaration coercion`, and an argument at a `null` parameter reports `argument coercion`.
+- `buildIndex`: a nullable element read at the `null` unit (`nulDropped`) is the element read as
+  stored and dropped, then the bottom ref (`RNullOf`, no `nuRead`). The verifier admits `nuRead`
+  only where legacy's own pre-path names a null-unit place read, and that predicate is false for a
+  `nulbool` element.
+- Read at its storage, it is the element as stored. `nulNoneEffect` builds an element operand at
+  its storage, since it drops the value, and `print`'s nullable arms (`nulBool`, `nulStr`) read a
+  null-narrowed element at its storage, as legacy prints the stored niche.
 
-## A clause-1 defect seen beside it (legacy, no row by the brief)
+## A clause-1 defect this closes (coordinator ruling, 2026-11-26)
 
-`const q = a[0]` (or passing `a[0]` at a `null` parameter, or `print(a[0])`) with `a[0]` narrowed
-to `null` over a `(boolean | null)[]`: master emits a module that fails to validate inside the
-function (`type mismatch: expected nullref, found i32`). The IR does not claim those functions, so
-it stays legacy's.
+Passing `a[0]` at a `null` parameter, with `a[0]` narrowed to `null` over a `(boolean | null)[]`:
+master delivers the element's i32 niche and the module fails to validate
+(`type mismatch: expected nullref, found i32`), though `vl check` passes. The IR now claims the
+function and delivers the unit.
+
+The guard is `tests/cases/null/narrowed-null-element-delivered-runs.vl` (passed, bound, printed,
+passed again after binding), which runs under the default build with its `@log`. It is listed in
+`scripts/silent-sweep/distilled/claims-off-skip.txt`, with the reason, because the claims-off
+shadow modes let legacy emit the function. The row leaves at I8.
 
 ## Measured
 
