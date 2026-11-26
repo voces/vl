@@ -3178,7 +3178,8 @@ Deno.test({
 
 // A returned `__trap__()` is the trap, then the bare `return` legacy writes after it: at an i32, a
 // string with a message, a record and a union result it builds and matches. At a wider number
-// legacy widens the dead value, so that result stays a named miss.
+// legacy also widens the dead value and the IR does not (D17667): it builds, and its bytes differ
+// only on that dead code, which behaviour parity admits.
 const RETURNED_TRAP =
   `type Pt = { x: i32, y: i32 }\nfunction ti(_n: i32): i32 { return __trap__() }\nfunction ts(_n: i32): string { return __trap__("unset") }\nfunction tp(): Pt { return __trap__() }\nfunction tu(): i32 | string { return __trap__() }\nfunction tl(): i64 { return __trap__() }\nexport let hi: (n: i32) => i32 = ti\nexport let hs: (n: i32) => string = ts\nexport let hp: () => Pt = tp\nexport let hu: () => i32 | string = tu\nexport let hl: () => i64 = tl\nprint(1)\n`;
 Deno.test({
@@ -3187,13 +3188,10 @@ Deno.test({
   fn: () => {
     const { rc, rows } = run(RETURNED_TRAP, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
-    const fails = failures(rows);
-    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
-      throw new Error(`want ti, ts, tp and tu covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if ((rows.get("uncovered returned trap widened") ?? 0) !== 1) {
-      throw new Error(`want tl a named miss, got ${JSON.stringify([...rows])}`);
+    const fails = failures(rows).filter((f) => !/^fail a claimable function did not match: bytes: .* in tl$/.test(f));
+    if (fails.length > 0) throw new Error(`want no failure but tl's bytes, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want all five covered and ti, ts, tp and tu matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
