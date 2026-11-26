@@ -4,7 +4,7 @@
 // with one code byte corrupted; the uncorrupted module must pass. No assertion library, per
 // CLAUDE.md.
 //
-// Run with:  deno test -A tests/claim_invalid_module_test.ts
+// Run with:  deno test -A tests/playground_claim_invalid_module_test.ts
 
 import { engineRefusal, invalidClaimedModule, invalidHeadline } from "../lsp/src/claimFallback.ts";
 import { COMPILER, exists } from "./support/tree.ts";
