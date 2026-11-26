@@ -23,6 +23,10 @@ done | awk -F'\t' -v out="$OUT/classes" '
   function key(f, nm) { return (nm ~ /\$m/) ? nm : f "::" nm }
   function slug(s,   t) { t = tolower(s); gsub(/\+/, " plus ", t); gsub(/[^a-z0-9]+/, "-", t); gsub(/^-|-$/, "", t); return substr(t, 1, 60) }
   function lane(c) {
+    # Re-cut 2026-11-26 (coordinator rulings): the late box and the open-type family go to CENSUS,
+    # the listGetOr staged and index reads to COV-CALL.
+    if (c ~ /^(box of a (valued if|null-typed value)|open (local|temp|parameter) type|parameter rep unsup|shared member callee kid|closure argument box)/) return "CENSUS"
+    if (c ~ /^(coalesce listGetOr (staged|index) operand|get index)/) return "COV-CALL"
     if (c ~ /^(short-circuit right operand|short-circuit argument after another|(slice|method|push|store|simd|array spread) short-circuit operand)$/) return "CENSUS"
     if (c ~ /^(read of <name>|closure |capture|callee captures|array spread |for in |map |list |null unit read rep|null unit element|coalesce listGetOr|coalesce mapJoin|coalesce optional mapField|hole closure|tag dispatch lambda|expression if |scalar map|ref if |rep nullable of if|union if |box of a valued if|declaration if per arm coercion)/ || c ~ /list delivery|valued if/) return "COV-CLOS"
     if (c ~ /^(call of a non-declaration|indirect call|intrinsic |bundle parameter read|method |named call|record compare|coalesce optional record field|coalesce boxRuntime|callee signature|short-circuit closure argument|print )/) return "COV-CALL"

@@ -92,15 +92,37 @@ function corpus(): string[] {
   return out
 }
 
-// Every `tests/cases` program the checkout tracks, sorted; a capability matrix is a template.
-function casesPaths(): string[] {
+// The programs `claims-off-skip.txt` keeps out of a claims-off run: legacy's output for them is an
+// invalid module the shipped claim does not emit.
+const CLAIMS_OFF_SKIP = "scripts/silent-sweep/distilled/claims-off-skip.txt"
+
+function claimsOffSkips(): string[] {
+  const out: string[] = []
+  for line in split(readOr(CLAIMS_OFF_SKIP), "\n") {
+    if line == "" || startsWith(line, "#") { continue }
+    const t = line.indexOf("\t")
+    out.push(if t < 0 { line } else { line.slice(0, t) })
+  }
+  return out
+}
+
+// Every `tests/cases` program the checkout tracks, sorted; a capability matrix is a template. A
+// claims-off run (`claimsOff`) leaves out the programs `claims-off-skip.txt` names.
+function casesPaths(claimsOff: boolean): string[] {
+  const skip = if claimsOff { claimsOffSkips() } else { [] }
   const x = spawn("git", ["ls-files", "tests/cases"])
   if x.code != 0 {
     die("ir-shadow: git ls-files tests/cases failed\n\{x.err}", 2)
   }
   const out: string[] = []
   for line in split(x.out, "\n") {
-    if endsWith(line, ".vl") && !endsWith(line, ".matrix.vl") { out.push(line) }
+    if (
+      endsWith(line, ".vl")
+      && !endsWith(line, ".matrix.vl")
+      && indexOf(skip, line) < 0
+    ) {
+      out.push(line)
+    }
   }
   sort(out, (a: string, b: string) => a < b)
   return out
@@ -742,10 +764,10 @@ function main(args: readonly string[]) {
   const seed = argOr(args, "--seed", "build/vl-compiler.wasm")
   const cases = hasFlag(args, "--cases")
   const files = filesArg(args)
-  const paths = if files.length > 0 { files } else if cases { casesPaths() } else { corpus() }
-  if paths.length == 0 { die("ir-shadow: no programs to build", 2) }
   const census = hasFlag(args, "--blockers")
   const claims = hasFlag(args, "--claims")
+  const paths = if files.length > 0 { files } else if cases { casesPaths(!claims) } else { corpus() }
+  if paths.length == 0 { die("ir-shadow: no programs to build", 2) }
   const prepost = hasFlag(args, "--prepost")
   const mode = if census { "4" } else if claims { "5" } else if prepost { "6" } else { "1" }
   const hold: Map<string, string[]> = if census || claims { Map() } else { divergences() }
@@ -808,6 +830,13 @@ function main(args: readonly string[]) {
   )
   const mm = classes(m.rows, "mismatch ")
   const fails = classes(m.rows, "fail ")
+  // A claim that fails only on its bytes is a byte difference, which behaviour parity reports and
+  // `$IR_SHADOW_BYTES=1` gates; any other fail (a verifier failure) reds the corpus.
+  const bytesGate = envOr("IR_SHADOW_BYTES", "0") == "1"
+  const hardFails: Row[] = []
+  for r in fails {
+    if bytesGate || !bytesClass(r.key) { hardFails.push(r) }
+  }
   for r in mm { print("  \{r.n}\t\{r.key}") }
   for r in fails { print("  \{r.n}\t\{r.key}") }
   if m.broken.length > 0 { exit(2) }
@@ -825,7 +854,7 @@ function main(args: readonly string[]) {
   // The corpus admits no verifier failure; `tests/cases` baselines its own, which may only fall.
   const tracked: Row[] = if cases { mm.concat(fails) } else { mm }
   if hasFlag(args, "--write-baseline") {
-    if !cases && fails.length > 0 {
+    if !cases && hardFails.length > 0 {
       die("ir-shadow: a verifier failure is never a baseline", 1)
     }
     if cases {
@@ -844,10 +873,9 @@ function main(args: readonly string[]) {
     return 0
   }
   const base = loadBaseline(if cases { CASES_BASELINE } else { BASELINE })
-  let red = orderRed || !cases && fails.length > 0
+  let red = orderRed || !cases && hardFails.length > 0
   // A byte difference from legacy is reported, not gated: behaviour parity (ci-ir-identity) is
   // the check (coordinator ruling 2026-11-25); `$IR_SHADOW_BYTES=1` restores the gate.
-  const bytesGate = envOr("IR_SHADOW_BYTES", "0") == "1"
   for r in tracked {
     if bytesClass(r.key) {
       if bytesGate {

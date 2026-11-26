@@ -2502,20 +2502,21 @@ Deno.test({
   },
 });
 
-// A returned `if` under the sink that adapts to one wider number with a literal arm is legacy's
-// box-once return (`retIfIsOneNumber`), so it stays a named miss rather than a per-arm build.
+// A returned `if` under the sink that adapts to one wider number with a literal arm is built at
+// that number and boxed once (`retIfIsOneNumber`); here its literal arm at the instance's `i64`
+// is a named miss (`widen instLit`), never a per-arm build.
 const UNION_SINK_ONE_NUMBER =
   `function lit<A, B>(k: i32, a: A, b: B) {\n  if k == 0 { return a }\n  return if k == 1 { b } else { 5 }\n}\nconst z: i64 = 9\nprint(lit(2, z, z) + 1)\n`;
 Deno.test({
-  name: "ir shadow: a returned if boxed once as one wider number under the sink stays a miss",
+  name: "ir shadow: a returned if boxed once as one wider number under the sink, its instance literal arm a named miss",
   ignore,
   fn: () => {
     const { rc, rows } = run(UNION_SINK_ONE_NUMBER, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("uncovered tail if one number") ?? 0) !== 1) {
-      throw new Error(`want lit uncovered at tail if one number, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("uncovered widen instLit") ?? 0) !== 1) {
+      throw new Error(`want lit uncovered at widen instLit, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -2768,7 +2769,7 @@ print(empty() + recs() + twice() + nested() + gen(1) + gen("s"))
 // the stash of depth one as legacy's does: matched byte for byte, with a constant and a computed
 // inner length. A fill boxed into a union element stays a named miss.
 Deno.test({
-  name: "ir shadow: a nested __array_new__ fill matches at legacy's fill depth",
+  name: "ir shadow: a nested __array_new__ fill matches at legacy's fill depth, and a boxed fill at its union",
   ignore,
   fn: () => {
     const { rc, rows } = run(`function sq(n: i32): i32[][] { return __array_new__(n, __array_new__(n, 0)) }
@@ -2786,11 +2787,8 @@ if d0 is i32 { print(d0) }
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
-      throw new Error(`want sq, wide and deep covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if ((rows.get("uncovered array new fill box") ?? 0) !== 1) {
-      throw new Error(`want un a named miss, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want sq, wide, deep and un (its fill boxed) covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

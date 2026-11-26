@@ -1017,8 +1017,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       let si = 0
       for s in r.spSrcs {
-        // A group the plan converts is a list at its own element rep (`spConv`).
-        const conv = i32ListHas(r.spConv, si) && repNodeAt(opRep(s)) is RList
+        // A group the plan converts, or one at its own sub row, is a list at its own rep (`spOwn`).
+        const conv = i32ListHas(r.spOwn, si) && repNodeAt(opRep(s)) is RList
         if opRep(s) != dst && !conv {
           return fail(2, at, "a spread's source rep is not the literal's")
         }
@@ -1364,9 +1364,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RListCat => {
       use(r.ljL, at)
       use(r.ljR, at)
+      // The side a widening concat names (`ljWiden`) is a narrower list the lowering widens.
+      const lw = r.ljWiden == 1 && repNodeAt(opRep(r.ljL)) is RList
+      const rw = r.ljWiden == 2 && repNodeAt(opRep(r.ljR)) is RList
       if (
-        opRep(r.ljL) != dst
-        || opRep(r.ljR) != dst
+        opRep(r.ljL) != dst && !lw
+        || opRep(r.ljR) != dst && !rw
         || !(repNodeAt(dst) is RList)
       ) {
         return fail(2, at, "a list concat's operands are not its list")
@@ -1457,7 +1460,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(2, at, "a push of a non-element onto a non-list")
       }
       // A packed list's element is pushed as a plain i32, which its backing truncates.
-      const want = if repPrim(ln.rlsElem) == "u8" { vfI32 } else { ln.rlsElem }
+      const want = if repSubWord(ln.rlsElem) { vfI32 } else { ln.rlsElem }
       if opRep(r.lpX) != want {
         return fail(2, at, "a push of a non-element onto a non-list")
       }
@@ -1756,6 +1759,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       // A union value's narrowed read is unboxed to its member's scalar (`narrowedMapReadOf`).
       const unboxed = irFactIntOf(vf, at, 0) == 1 && repPrim(dst) != null
+      // …or to its container member, a map or a list.
+      const container = irFactIntOf(vf, at, 0) == 2
+        && (repNodeAt(dst) is RMap || repNodeAt(dst) is RList)
       // A union value's read is its box, `null` one more tag of it.
       const sameBox = m is RMap
         && repNodeAt(repBoxCore(dst)) is RBox
@@ -1770,6 +1776,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         && m is RMap
         && !mapGetDstOk(m.rmVal, dst)
         && !unboxed
+        && !container
         && !sameBox
         && !scalarBox
       ) {
@@ -2756,7 +2763,7 @@ function coalBoxCheck(n: SCoalBox, id: i32) {
     "optMapField" => coalOptMapFieldWhy(n, id)
     "nulAtomJoin" => coalNulAtomJoinWhy(n)
     "nulBoolJoin" => coalNulBoolJoinWhy(n)
-    "boxStash" => coalBoxStashWhy(n)
+    "boxStash" | "boxRuntime" => coalBoxStashWhy(n)
     "boxFieldScalar" => coalBoxFieldScalarWhy(n)
     "nulStr" => coalNulStrWhy(n)
     "asProp" => coalAsPropWhy(n)
@@ -2898,8 +2905,7 @@ function stmt(id: i32, prev: i32) {
       const ln = repNodeAt(l)
       // A `null[]` list's element is its i32 storage's sentinel (`emitIdxStoreValue`).
       const asI32 = ln is RList
-        && (repPrim(ln.rlsElem) == "u8"
-        || repPrim(ln.rlsElem) == "null")
+        && (repSubWord(ln.rlsElem) || repPrim(ln.rlsElem) == "null")
       const want = if asI32 { vfI32 } else { kidAt(l, 0) }
       if (!(ln is RList) || opRep(n.lsIx) != vfI32 || want != opRep(n.lsSrc)) {
         return fail(2, id, "an element write's reps do not match the list")

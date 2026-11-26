@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR delivers an atom assignment's value as its id:** an assignment to a literal-union place used as a value (`print(o.f = "ww")`, `show(v = "ww")`) is the member written, which legacy streams or passes as its atom id. The IR built it at the string its type reps as, and then missed (`print operand rep`, `argument coercion`). `deliver` now builds an assignment at its place's atom when the destination takes that atom, the member inside a `K | null` niche included. A global bound to such an assignment over a `K | null` place is read as the atom cell legacy declares.

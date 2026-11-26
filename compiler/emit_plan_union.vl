@@ -162,6 +162,7 @@ import {
   localIndexOf,
   mapDeliveriesRecorded,
   mapShapeOfExpr,
+  memReadBoxNarrowTy,
   memReadNarrowOp,
   memReadUnboxAtomKind,
   memberUnionFieldNameRead,
@@ -394,10 +395,12 @@ import {
   exactUnionLacksMap,
   exactUnionLacksTwin,
   exprIsAtomList,
+  ifJoinAdaptsScalar,
   litAtomWidenTexts,
   mapExactHeldTyOf,
   mapReadScalarBoxKind,
   memReadBoxAmbiguous,
+  unionArmLandingForStructExpr,
   unionArmVariantForObj,
   unionArmVariantForStructExpr,
 } from "./emit_value_sites"
@@ -1368,8 +1371,17 @@ export function tagIsArmOf(isIx: i32, nd: IsExpr, fnIx: i32): TagIsArm {
     }
     if vrecv is Member && memberUnionFieldNameRead(r, fnIx) != "" {
       if memReadArmOf(r, fnIx) == "narrowed" { return "memNarrow" }
+      // A field stored at a wider record's members is read rebuilt at the receiver's own
+      // (`memReadBoxNarrowTy`, D3006), so its tag is the value's, not the raw slot's.
       const msi = structIndexOfExpr(vrecv.memObj, fnIx)
-      if msi >= 0 && sFieldIndex(msi, vrecv.memProp) >= 0 { return "memStruct" }
+      if (
+        msi >= 0
+        && sFieldIndex(msi, vrecv.memProp) >= 0
+        && memReadBoxNarrowTy(r, fnIx) < 0
+        && !memReadBoxAmbiguous(r, fnIx)
+      ) {
+        return "memStruct"
+      }
       const vi = exprVariantIndex(vrecv.memObj, fnIx)
       if vi >= 0 && variantFieldIndex(vi, vrecv.memProp) >= 0 {
         return "memVariant"
@@ -2079,8 +2091,8 @@ export function coerceListAtomOf(
 
 // How a value is boxed: `null`, a box as itself (`pass`), a member read as its field's box
 // (`memberBox`), an atom box of kind `hbKind` from `hbSrc` (`atom`) or a literal (`lit`), a `K | null`
-// or `K` atom as its string (`atomStr`, `atomAsStr`), a record or literal under arm `hbKind` (`rec`, `obj`), a ref list
-// or scalar map read, a map, `M | null` or closure of union `hbKind` (`nulMap`, …), or the ladder.
+// or `K` atom as its string (`atomStr`, `atomAsStr`), a record, literal or copied record under arm
+// `hbKind` (`rec`, `obj`, `recCopy`), a list, map read, map or closure (`nulMap`, …), or the ladder.
 export type HoleBoxArm = "null"
   | "pass"
   | "memberBox"
@@ -2093,6 +2105,7 @@ export type HoleBoxArm = "null"
   | "nulBool"
   | "rec"
   | "obj"
+  | "recCopy"
   | "refList"
   | "mapScalar"
   | "mapBox"
@@ -2154,7 +2167,9 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   if callIsNever(bareIx) { return ladder }
   // A join that is one arm's record reaches `emitUnionArmValueBox` whole, ahead of the ladder's
   // if rung (`emitUnionIfValue`), which boxes every other join arm by arm.
-  if bare is IfStmt {
+  // A join typed one wider number (`ifJoinAdaptsScalar`) is that number, which the scalar rungs
+  // below box once, as legacy's ladder reaches them past its if rung (`unionCoerceIfArmOf`).
+  if bare is IfStmt && !ifJoinAdaptsScalar(bareIx, fnIx) {
     const iv = recArmPlainOf(unionTy, exprIx, fnIx)
     return if iv >= 0 { holeBox("rec", iv, -1) } else { ladder }
   }
@@ -2233,6 +2248,17 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     && !tyBearsNull(nodeTyAt(bareIx, fnIx))
   ) {
     return holeBox("rec", sv, -1)
+  }
+  // `emitUnionCoerceRecord`'s copy rungs: a record at another row, copied field by field onto the
+  // arm it matches or lands on (`emitStructExprAsVariantBox`), then boxed under that arm.
+  const cv = recCopyArmOf(unionTy, exprIx, fnIx)
+  if (
+    cv >= 0
+    && !(bare is ObjLit)
+    && !nodeTyIsNullable(bareIx)
+    && !tyBearsNull(nodeTyAt(bareIx, fnIx))
+  ) {
+    return holeBox("recCopy", cv, -1)
   }
   // `emitUnionMapArmBox`'s nullable rung: a `M | null` under its map arm's tag, or the null box.
   if (
@@ -2527,6 +2553,17 @@ export function nulBoolBoxesInto(
   return exprNulBool(nnIx, fnIx)
     && unionSetHasNullTy(unionKey, unionTy)
     && vbHeapIdxOfKind(1) >= 0
+}
+
+// The arm `emitUnionCoerceRecord` copies record `exprIx` onto before boxing it into `unionTy`: the
+// arm its layout matches, else the one its row lands on; -1 for a value with no row or no such arm.
+function recCopyArmOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  if !exprStruct(exprIx, fnIx) || structIndexOfExpr(exprIx, fnIx) < 0 {
+    return -1
+  }
+  const rb = unionArmVariantForStructExpr(unionTy, exprIx, fnIx)
+  if rb >= 0 { return rb }
+  return unionArmLandingForStructExpr(unionTy, exprIx, fnIx)
 }
 
 // The arm whose variant heap struct value `exprIx` is on, which `emitUnionCoerceRecord` boxes it
@@ -3867,6 +3904,38 @@ export function memRecvOwesNonNull(memIx: i32, fnIx: i32): boolean {
   if !(m is Member) { return false }
   return exprNullableStruct(m.memObj, fnIx)
     && !readOwesNonNullRecover(m.memObj, fnIx)
+}
+
+// The field index of plain member read `memIx` off a struct whose recorded kind is not the field's:
+// none over a plain i32 (a hole's read), the `null` unit a narrowing leaves (read for effect), or
+// the template's variant over a nullable record of the read's own struct, recovered non-null. The
+// read takes the field as stored. -1 otherwise.
+export function structFieldAt(memIx: i32, fnIx: i32): i32 {
+  const m = nodeAt(memIx)
+  if !memberReadPlain(memIx, fnIx) || !(m is Member) || !sDeclared { return -1 }
+  const rk = repOfNode(memIx, fnIx).rdKind
+  if rk != null && rk != "variant" && rk != "nulnone" { return -1 }
+  const o = m.memObj
+  if memReadArmOf(memIx, fnIx) != "shared" || exprUnion(o, fnIx) { return -1 }
+  if nodeTyAt(o, fnIx) == TY_NEVER { return -1 }
+  const si = structIndexOfExpr(o, fnIx)
+  if si < 0 || si >= sHeapIdx.length { return -1 }
+  const idx = sFieldIndex(si, m.memProp)
+  if idx < 0 || memReadNarrowOp(memIx, fnIx) >= 0 || sFieldIsUnionBox(si, idx) {
+    return -1
+  }
+  const sk = fieldRowStorageKind(sFieldStart[si] + idx)
+  if rk == null { return if sk == "i32" { idx } else { -1 } }
+  if rk == "nulnone" {
+    const dropped = sk != null && !readOwesNonNullRecover(memIx, fnIx)
+    return if dropped { idx } else { -1 }
+  }
+  if sk != "nulstruct" || exprVariantIndex(memIx, fnIx) >= 0 { return -1 }
+  const t = sFieldTgtStructIdx(si, idx)
+  const own = t >= 0
+    && t == structIndexOfExpr(memIx, fnIx)
+    && readOwesNonNullRecover(memIx, fnIx)
+  return if own { idx } else { -1 }
 }
 
 // The field `emitExpr` reads off a plain struct receiver in `emitMemStructRead`'s plain form, or

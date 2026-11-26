@@ -166,6 +166,7 @@ import {
 import {
   narrowedFieldPlain,
   nulVariantFieldPlain,
+  structFieldAt,
   structFieldPlain,
   unionEqNameless,
   unionUnionEqStagedOf,
@@ -336,6 +337,19 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
     && rn.rnDisc == 1
     && rn.rnInner == vr.rlsElem
     && repPrim(vr.rlsElem) == null
+  // A literal set's element stored as its string and read as its atom is read at the string it is,
+  // as a field's is; its consumer takes the string.
+  const strAtom = vr is RList
+    && repPrim(vr.rlsElem) == "str"
+    && repNodeAt(rep) is RAtom
+    && idxArmOf(n, fnIx) == "str"
+  // A nullable closure element the read narrows non-null is read as stored, then recovered to the
+  // closure (`RRecover`), so a delivery to a non-null closure slot holds one.
+  const cloStored = en is RNullable
+    && en.rnInner == rep
+    && repNodeAt(rep) is RClosure
+    && idxArmOf(n, fnIx) == "ref"
+    && !refRecovered
   // A union box element read at a narrower union's box is the same box (`RStage`).
   const boxView = vr is RList
     && vr.rlsElem != rep
@@ -349,6 +363,8 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
     && !nicheNarrowed
     && !refRecovered
     && !stored
+    && !strAtom
+    && !cloStored
     && !boxView
     && !recTwin
     && !nicheView
@@ -378,7 +394,17 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
       lgAgain: true,
     }
   }
-  if stored && vr is RList {
+  if cloStored && vr is RList {
+    const ce = irBLetTempTy(b, r, ix, vr.rlsElem, repTyOf(vr.rlsElem))
+    return irBLetTempTy(
+      b,
+      { rcV: ce, rcAt: ix, rcNn: 1 },
+      ix,
+      rep,
+      repTyOf(rep),
+    )
+  }
+  if (stored || strAtom) && vr is RList {
     return irBLetTempTy(b, r, ix, vr.rlsElem, repTyOf(vr.rlsElem))
   }
   if (recTwin || nicheView) && vr is RList {
@@ -403,6 +429,44 @@ function listElemHeapOf(arr: i32, fnIx: i32): i32 {
   if slot < 0 { return -1 }
   const si = rlElemStructIdxAt(slot)
   return if si >= 0 && si < sHeapIdx.length { sHeapIdx[si] } else { -1 }
+}
+
+// Plain field `n` of a nullable record receiver at rep `r` over record `inner`, read at the field's
+// own rep `rep`: the receiver, recovered to its record with no `ref.as_non_null` (`RRecover`), then
+// the field.
+function nullRecvField(
+  b: i32[],
+  n: Member,
+  ix: i32,
+  rep: i32,
+  r: i32,
+  inner: i32,
+): Opnd {
+  const fnIx = irBFnIx()
+  if structFieldPlain(ix, fnIx) < 0 { return irBMiss("member nullable") }
+  const it = repTyOf(inner)
+  const k = if it >= 0 { repRecordKidOf(inner, it, n.memProp) } else { -1 }
+  if k < 0 || repNodeKids(inner)[k] != rep { return irBMiss("member nullable") }
+  const rv = irBExpr(b, n.memObj)
+  if missed(rv) { return rv }
+  if irBOpRep(rv) != r { return irBMiss("member nullable receiver rep") }
+  const rc = irBLetTempTy(
+    b,
+    { rcV: rv, rcAt: n.memObj, rcNn: 0 },
+    n.memObj,
+    inner,
+    it,
+  )
+  if missed(rc) { return rc }
+  const gf: Rhs = {
+    gfV: rc,
+    gfIx: k,
+    gfAt: ix,
+    gfStored: isStorageRead(ix),
+    gfStr: false,
+    gfShared: false,
+  }
+  return irBLetTemp(b, gf, ix, rep)
 }
 
 // Read `ix` through a box of lists or maps (`armSiteRecv`: an element, `.length`, `.has` or
@@ -564,6 +628,16 @@ function strRowAtomRead(ix: i32, rep: i32): boolean {
   return repPrim(rep) == "str" && strReppedLitUnionAt(ix, irBFnIx())
 }
 
+// The atom kid rep of narrowed record `r`'s field `n` that read `ix` takes at string `rep` because
+// the read is itself a literal atom (the plain read's `atomStr`), or -1.
+function narrowedAtomKid(r: i32, n: Member, ix: i32, rep: i32): i32 {
+  if repPrim(rep) != "str" || !exprIsLitAtom(ix, irBFnIx()) { return -1 }
+  const k = repRecordKidOf(r, repTyOf(r), n.memProp)
+  if k < 0 { return -1 }
+  const kr = repNodeKids(r)[k]
+  return if repNodeAt(kr) is RAtom { kr } else { -1 }
+}
+
 // The read of closure field `k` of member `n` (at `ix`) whose recorded type is a hole function's:
 // at the kid rep of the record the receiver is built at, typed as that rep.
 function holeCloFieldRead(b: i32[], n: Member, ix: i32, k: i32): Opnd {
@@ -635,6 +709,29 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   const r0 = repNodeOfTy(ot)
   const hr = if repNodeAt(r0) is RUnsup { holeRecvBox(irBOpenLocalReadRep(n.memObj)) } else { -1 }
   const r = if hr >= 0 { hr } else { r0 }
+  // A call whose result type is open (an empty `[]`'s element) returns the list its callee's
+  // result descriptor names (`resultFrameTy`): its `.length` reads the list as built.
+  if (
+    repNodeAt(r) is RUnsup
+    && n.memProp == "length"
+    && nodeAt(unwrapParen(n.memObj)) is Call
+  ) {
+    const cv = irBExpr(b, n.memObj)
+    if missed(cv) || !(cv is OVar) {
+      return irBMiss("open list length receiver")
+    }
+    const cr = irBOpRep(cv)
+    if !(repNodeAt(cr) is RList) || !refRepOk(cr, -1) {
+      return irBMiss("open list length rep")
+    }
+    return irBLetTemp(b, { llV: cv, llAt: ix }, ix, rep)
+  }
+  // A plain field read off a nullable record (a guarded compare's field read, `recEqTyped`) reads
+  // the record inside: `struct.get` takes the nullable reference, whose null the guard rules out.
+  const rn = repNodeAt(r)
+  if rn is RNullable && repNodeAt(rn.rnInner) is RRecord {
+    return nullRecvField(b, n, ix, rep, r, rn.rnInner)
+  }
   if repNodeAt(r) is RList {
     if n.memProp != "length" { return irBMiss("list member") }
     if !refRepOk(r, -1) { return irBMiss("list length rep") }
@@ -670,9 +767,12 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   }
   // A plain field read off a struct or a bare variant.
   const fnIx = irBFnIx()
+  // A read whose recorded kind is not its field's (`structFieldAt`) is read at the field as stored.
+  const unrec = structFieldAt(ix, fnIx) >= 0 && structFieldPlain(ix, fnIx) < 0
   const plain = variantFieldPlain(ix, fnIx) >= 0
     || structFieldPlain(ix, fnIx) >= 0
     || nulVariantFieldPlain(ix, fnIx) >= 0
+    || structFieldAt(ix, fnIx) >= 0
   if repNodeAt(r) is RRecord && plain {
     const k = repRecordKidOf(r, ot, n.memProp)
     if k < 0 { return irBMiss("field kid") }
@@ -680,6 +780,17 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     const own = memFieldUnionBox(ix, fnIx)
       && rep == repNodeOfTy(nodeTyAt(ix, fnIx))
     const kr = repNodeKids(r)[k]
+    const krn = repNodeAt(kr)
+    // A `null` unit read is built for its effect and dropped (`nulUnitPlaceRead`).
+    const dropped = repPrim(rep) == "null"
+    if (
+      unrec
+      && kr != rep
+      && !(krn is RNullable && krn.rnInner == rep)
+      && !dropped
+    ) {
+      return irBMiss("unrecorded field read at another rep")
+    }
     // A hole function's field reads at the closure rep the built record holds (`holeCloTy`).
     if holeCloTy(nodeTyAt(ix, fnIx)) && repNodeAt(kr) is RClosure {
       return holeCloFieldRead(b, n, ix, k)
@@ -770,11 +881,20 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
         }
         return irBMiss("narrowed field unbox rep")
       }
-    } else if !fieldReadsAt(r, n, rep) && !strRowAtomRead(ix, rep) {
+    } else if (
+      !fieldReadsAt(r, n, rep)
+      && !strRowAtomRead(ix, rep)
+      && narrowedAtomKid(r, n, ix, rep) < 0
+    ) {
       return irBMiss("narrowed field read coercion")
     }
     const bv = if nodeAt(n.memObj) is Ident { irBBoxLocal(b, n.memObj) } else { storedBoxRead(b, n.memObj) }
     if missed(bv) { return bv }
+    // A literal atom field read at its string is read at the atom, as the plain read's `atomStr`.
+    const ak = narrowedAtomKid(r, n, ix, rep)
+    if ak >= 0 && !fieldReadsAt(r, n, rep) {
+      return irBLetTempTy(b, { bfV: bv, bfAt: ix }, ix, ak, repTyOf(ak))
+    }
     // A raw read at the field's storage (`rawFieldRepOf`) is typed at that rep.
     if rep != repNodeOfTy(nodeTyAt(ix, irBFnIx())) {
       return irBLetTempTy(b, { bfV: bv, bfAt: ix }, ix, rep, repTyOf(rep))

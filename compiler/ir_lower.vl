@@ -5,18 +5,20 @@ import { blockHasContinueFor } from "./emit_query"
 // which holds only when the temps are consumed in their definition order; the lowering
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
-import { fnEnvIdxOf } from "./emit_capture_frames"
+import { fnEnvIdxOf, readNarrowedBoxToNull } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
 import { printUnionPlan } from "./emit_fn_scans"
 import {
   armIdxSlot,
   irOnceRefSlot,
   irOnceSlot,
+  irOnceSlotAt,
   sharedFieldRecvSlot,
 } from "./emit_union_casts"
+import { printPlanPinNull } from "./emit_union_registry"
 import { mapRecvScalarBoxKindIn, mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
-import { repTyOf, slotRowTyOf } from "./emit_rep"
+import { repNodeOfTy, repOfTy, repTyOf, slotRowTyOf } from "./emit_rep"
 import { luOvEnter, luOvLeave } from "./emit_elab"
 import {
   armIndexWriteArmsOf,
@@ -39,7 +41,12 @@ import {
   luOvLocalLeave,
   optLeafArmOf,
 } from "./wasmEmit"
-import { atomPayloadTail, pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
+import {
+  atomPayloadTail,
+  boxTagOnly,
+  pushRecvCastOn,
+  pushRecvCastSet,
+} from "./wasmEmit"
 import {
   armSiteRecv,
   capCellTargetOf,
@@ -545,8 +552,12 @@ import {
   listBuildClose,
   listGetIdxHook,
   listGetIdxLegacy,
+  listGetIdxRelease,
+  listGetIdxUnstage,
   listGetOrOpen,
   listGetRecvHook,
+  listGetRecvRelease,
+  listGetRecvUnstage,
   listOpRecvHeld,
   listOpStageBase,
   listReserveOpen,
@@ -649,6 +660,7 @@ import {
   printAtomTail,
   printNulBoolOpen,
   printNulBoolTail,
+  printNulRefNicheTail,
   printNulStrOpen,
   printNulStrTail,
   printScalarMapTail,
@@ -760,6 +772,8 @@ import {
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
+  variantCopyEmit,
+  variantCopyReReads,
   variantFieldTail,
   variantStructNewTail,
   variantUnionBoxTail,
@@ -783,6 +797,7 @@ import {
   narrowedVariantRepIs,
   nulVariantFieldPlain,
   numIsPlanOf,
+  structFieldAt,
   structFieldPlain,
   tagIsArmOf,
   variantFieldPlain,
@@ -823,6 +838,8 @@ import {
   atomFoldTail,
   atomHookArmOf,
   coalArmRecvCast,
+  coalBoxRuntimeKind,
+  coalBoxRuntimeOpen,
   coalBoxStashOpen,
   coalFieldBoxOpen,
   coalFieldPlanOf,
@@ -941,6 +958,7 @@ import {
   uBoxNewEnd,
   uFieldCount,
   uVarRow,
+  uVarTyIx,
   unionSinkBase,
 } from "./emit_state"
 import { ListBuild } from "./emit_ref_list_kinds"
@@ -1023,7 +1041,39 @@ function softMiss(name: string) {
 
 function varSlot(v: i32): i32 {
   if v < 0 || v >= lw.irVars.length { return -1 }
-  return lw.irVars[v].vSlot
+  const s = lw.irVars[v].vSlot
+  return if s >= 0 { s } else if v < lwOwnedSlots.length { lwOwnedSlots[v] } else { -1 }
+}
+
+// By variable, the local `ownedSlot` gives a slotless variable the builder assigns outside a valued
+// frame, else -1.
+let lwOwnedSlots: i32[] = []
+
+// A local of its own for slotless local `v` at its assignment, declared at its rep's valtype and
+// keyed by `v`, so no other holder shares it; -1 where its rep writes no valtype.
+function ownedSlot(v: i32): i32 {
+  if v < 0 || v >= lw.irVars.length || lw.irVars[v].vKind != "local" {
+    return -1
+  }
+  const vt = repLocalValtype(lw.irVars[v].vRep)
+  if vt.length == 0 { return -1 }
+  const s = irOnceSlotAt(vt, v + 1)
+  while lwOwnedSlots.length <= v { lwOwnedSlots.push(-1) }
+  lwOwnedSlots[v] = s
+  return s
+}
+
+// The valtype bytes legacy's `fbValtype` declares a non-null value of rep `r` at; none for a
+// nullable rep or one with no kind.
+function repLocalValtype(r: i32): u8[] {
+  const out: u8[] = []
+  const d = repOfTy(repTyOf(r))
+  const k = d.rdKind
+  if k == null || d.rdNul != 0 { return out }
+  const prev = wTarget(out)
+  fbValtype(k, d.rdSlot)
+  wTarget(prev)
+  return out
 }
 
 function tempDefined(v: i32): boolean {
@@ -1484,6 +1534,16 @@ function rhs(r: Rhs, tail: boolean) {
     RStage => irLOpnd(r.sgV)
     RNulTest => nulTestOp(r)
     RNulNoneBox => {
+      // A late box (`irBoxLate`): the call held in an `anyref` once-slot, then the null tag.
+      if r.nnPay && i32ListHas(lw.irBoxLate, unwrapParen(r.nnAt)) {
+        irLOpnd(r.nnV)
+        const any: u8[] = [VT_ANYREF]
+        const s = irOnceSlot(any)
+        fbLocalSet(s)
+        nulNoneBoxHead()
+        fbLocalGet(s)
+        return nulNoneBoxTail()
+      }
       // Legacy's null tag, the payload (the call, else the bottom ref), then the box.
       leaf()
       nulNoneBoxHead()
@@ -1505,13 +1565,22 @@ function rhs(r: Rhs, tail: boolean) {
       }
     }
     RNullOf => {
+      // A shared cell's read banks its element-read row over the null, as legacy's
+      // `emitIndexBanked` does; an element read written for its effects first banks none of its own.
+      const cellRead = r.nuAt >= 0
+        && r.nuAt < P.nodes.length
+        && nodeAt(r.nuAt) is Index
+      const from = if cellRead { irLIndexFrom(r.nuAt, irLAt()) } else { -1 }
       if r.nuRead.length > 0 {
+        if cellRead { lwIdxRowMutes.push(r.nuAt) }
         irLOpnd(r.nuRead[0])
+        if cellRead { lwIdxRowMutes.pop() }
         fbDrop()
       } else {
         leaf()
       }
       emitNullOwn(r.nuOwn)
+      if cellRead { irLIndexRow(r.nuAt, from) }
     }
     RJoinNull => {
       leaf()
@@ -2435,6 +2504,7 @@ function numIs(r: RNumIs): i32 {
 // last, and beside each the reads of it so far.
 const getIdxOs: Opnd[] = []
 const getIdxReads: i32[] = []
+let getIdxSlots: i32[] = []
 
 // The `.get` receiver operands `listGetRecvHook` reads while `coalListGetOr` writes legacy's head,
 // innermost last; each read is the operand read again (`opndAgain`).
@@ -2491,9 +2561,19 @@ function irListGetRecvRead(objIx: i32, _fnIx: i32): i32 {
 // Hands legacy's `.get` head index operand `o` (`listGetIdxHook`) where it is read at each use: an
 // immediate or a variable, never a temp. Returns whether it did; `irGetIdxEnd` then undoes it.
 export function irGetIdxBegin(o: Opnd): boolean {
-  if !(o is OImm || o is OVar && !isTemp(o.ov)) { return false }
+  // A temp (a call, say) is written once to a fresh i32 local and read from it at each use.
+  const once = o is OVar && isTemp(o.ov) && repPrim(opRepOf(o)) == "i32"
+  if !(o is OImm || o is OVar && !isTemp(o.ov) || once) { return false }
+  const slot = if once { irOnceSlot([127]) } else { -1 }
+  // Legacy's staging of the index is dropped: the tail reads this local through the hook.
+  if slot >= 0 {
+    irLOpnd(o)
+    fbLocalSet(slot)
+    listGetIdxUnstage()
+  }
   getIdxOs.push(o)
   getIdxReads.push(0)
+  getIdxSlots.push(slot)
   listGetIdxHook = irListGetIdxRead
   return true
 }
@@ -2502,6 +2582,7 @@ export function irGetIdxBegin(o: Opnd): boolean {
 export function irGetIdxEnd() {
   getIdxOs.pop()
   getIdxReads.pop()
+  if (getIdxSlots.pop() ?? -1) >= 0 { listGetIdxRelease() }
   if getIdxOs.length == 0 { listGetIdxHook = listGetIdxLegacy }
   return 0
 }
@@ -2515,6 +2596,8 @@ function irListGetIdxRead(idxIx: i32, _fnIx: i32): i32 {
   }
   const k = getIdxReads[at]
   getIdxReads[at] = k + 1
+  const slot = getIdxSlots[at] ?? -1
+  if slot >= 0 { return fbLocalGet(slot) }
   if k == 0 {
     irLOpnd(getIdxOs[at])
     return 0
@@ -2841,7 +2924,11 @@ function getField(r: RGetField) {
   const m = nodeAt(r.gfAt)
   if !(m is Member) { return irLMiss("field node") }
   if r.gfShared { return sharedField(r, m) }
-  if fieldIdxAt(r.gfAt, m) < 0 { return irLMiss("field shape") }
+  // A read the builder built at its storage has its shape there.
+  const sm = if r.gfStored { storageReadEnter(r.gfAt) } else { storageReadEnter(-1) }
+  const fi = fieldIdxAt(r.gfAt, m)
+  storageReadLeave(sm)
+  if fi < 0 { return irLMiss("field shape") }
   irLOpnd(r.gfV)
   // A member record read the box plan passes as its field's box is lowered at its storage, as
   // the builder built it (`memberBoxTemp`).
@@ -2881,15 +2968,21 @@ function fieldIdxAt(at: i32, m: Member): i32 {
   if exprVariantIndex(m.memObj, fnIx) >= 0 {
     return variantFieldPlain(at, fnIx)
   }
-  const sf = structFieldPlain(at, fnIx)
+  const sf = structFieldPlainOrAt(at, fnIx)
   return if sf >= 0 { sf } else { nulVariantFieldPlain(at, fnIx) }
+}
+
+// `structFieldPlain`, or the stored field a read that records no kind takes (`structFieldAt`).
+function structFieldPlainOrAt(at: i32, fnIx: i32): i32 {
+  const sf = structFieldPlain(at, fnIx)
+  return if sf >= 0 { sf } else { structFieldAt(at, fnIx) }
 }
 
 // After a plain field read's object: the field, and the read's recovery.
 function fieldTail(at: i32, m: Member) {
   const fnIx = lw.irAt
   const vi = exprVariantIndex(m.memObj, fnIx)
-  const sf = if vi < 0 { structFieldPlain(at, fnIx) } else { -1 }
+  const sf = if vi < 0 { structFieldPlainOrAt(at, fnIx) } else { -1 }
   const idx = if vi >= 0 { variantFieldPlain(at, fnIx) } else if sf >= 0 { sf } else { nulVariantFieldPlain(at, fnIx) }
   if idx < 0 { return irLMiss("field shape") }
   // A narrowed `V | null` receiver, read non-null as `emitMemNulVariantRead` reads it.
@@ -2925,17 +3018,40 @@ function boxNarrowAt(r: RBoxNarrow, again: boolean) {
     boxNarrowBox(r, again)
     return emitUnionUnboxTail(r.bnAtom)
   }
-  const vi = narrowedBoxVariantPlain(r.bnAt, lw.irAt)
+  // A read with no narrowing plan of its own (a union-valued map read narrowed to a member) takes the
+  // variant its rep is.
+  const vp = narrowedBoxVariantPlain(r.bnAt, lw.irAt)
+  const vi = if narrowedVariantRepIs(vp, r.bnRep) { vp } else { variantOfRep(r.bnRep) }
   if !narrowedVariantRepIs(vi, r.bnRep) { return irLMiss("box narrow shape") }
   boxNarrowBox(r, again)
   return narrowedVariantTail(vi)
 }
 
+// The registered variant whose type's rep is `rep` (`uVarTyIx`), or -1.
+function variantOfRep(rep: i32): i32 {
+  let i = 0
+  while i < uVarTyIx.length {
+    if repNodeOfTy(uVarTyIx[i]) == rep { return i }
+    i = i + 1
+  }
+  return -1
+}
+
 // `RNicheRead`: the box, then legacy's niche tail (`emitNicheReadTail`), as `emitNarrowedNicheRead`
 // writes it after its storage read.
 function nicheRead(r: RNicheRead) {
+  // As legacy's `emitIndexBanked` wraps `emitNarrowedNicheRead` whole.
+  const cellRead = r.nrRow
+    && r.nrAt >= 0
+    && r.nrAt < P.nodes.length
+    && nodeAt(r.nrAt) is Index
+  const from = if cellRead { irLIndexFrom(r.nrAt, irLAt()) } else { -1 }
+  if cellRead { lwIdxRowMutes.push(r.nrAt) }
   irLOpnd(r.nrV)
-  return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
+  if cellRead { lwIdxRowMutes.pop() }
+  const rc = emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
+  if cellRead { irLIndexRow(r.nrAt, from) }
+  return rc
 }
 
 // `SArmWrite` as legacy's `is K[]` store chain (`emitArmIndexWriteAt`) writes it: per arm the box
@@ -3953,6 +4069,13 @@ function printOp(r: RPrint) {
     irLOpnd(r.pnV)
     return printNulBoolTail()
   }
+  if arm == "nulRefNiche" {
+    const stored = readNarrowedBoxToNull(c.callArgs[0], lw.irAt)
+    const mark = if stored { storageReadEnter(c.callArgs[0]) } else { storageReadEnter(-1) }
+    irLOpnd(r.pnV)
+    storageReadLeave(mark)
+    return printNulRefNicheTail()
+  }
   if arm == "union" {
     // Legacy reads the plan, writes the box, then takes the stash slot.
     const kinds: i32[] = []
@@ -3960,12 +4083,32 @@ function printOp(r: RPrint) {
     irLOpnd(r.pnV)
     return printUnionTail(sharedFieldRecvSlot(), kinds)
   }
+  // A box narrowed to `null` prints at its storage along the union arm, its plan pinned to keep
+  // the null arm (`emitCallCorePrint`'s `boxNull`).
+  if arm == "boxNull" { return printBoxNullOp(r, c.callArgs[0]) }
   irLOpnd(r.pnV)
   if arm == "str" { return printStrTail() }
   if arm == "atom" || arm == "nulAtom" || arm == "nulLitPin" {
     return printAtomTail(arm, c.callArgs[0], lw.irAt)
   }
   return printScalarTail(arm)
+}
+
+// `RPrint` of `boxNull` argument `arg`: the union arm's plan, box and tail inside the storage
+// scope and the plan's null pin legacy writes them under.
+function printBoxNullOp(r: RPrint, arg: i32) {
+  const mark = storageReadEnter(arg)
+  const was = printPlanPinNull(true)
+  const kinds: i32[] = []
+  const union = printArmOf(arg, lw.irAt) == "union"
+  if union {
+    printUnionPlan(arg, lw.irAt, kinds)
+    irLOpnd(r.pnV)
+  }
+  const rc = if union { printUnionTail(sharedFieldRecvSlot(), kinds) } else { irLMiss("print boxNull arm") }
+  printPlanPinNull(was)
+  storageReadLeave(mark)
+  return rc
 }
 
 // `RMapGetOr`, inline: the global, its recovery, the key and the op context, then legacy's probe,
@@ -4995,6 +5138,10 @@ function boxOp(r: RToBox) {
     }
     holeBoxHead(p, r.bxAt, fnIx)
   }
+  if p.hbArm == "recCopy" {
+    if boxRecCopy(r, p.hbKind) < 0 { return -1 }
+    return holeBoxTail(p, r.bxAt, fnIx)
+  }
   if (
     p.hbArm == "pass"
     || p.hbArm == "memberBox"
@@ -5023,18 +5170,29 @@ function boxOp(r: RToBox) {
   return holeBoxTail(p, r.bxAt, fnIx)
 }
 
+// A `recCopy` box's value: the record copied onto variant `vi`, its source read as the IR wrote
+// it, into the bytes the copy reads where it reads them again, else on the stack once.
+function boxRecCopy(r: RToBox, vi: i32): i32 {
+  const src: u8[] = []
+  if variantCopyReReads(r.bxAt, vi, lw.irAt) {
+    const prev = wTarget(src)
+    irLOpnd(r.bxV)
+    wTarget(prev)
+  } else {
+    irLOpnd(r.bxV)
+  }
+  if lwMiss != "" { return -1 }
+  return variantCopyEmit(r.bxAt, vi, lw.irAt, src)
+}
+
 // A late box (`irBoxLate`): its value and payload conversion, held in an `anyref` local
 // (`irOnceSlot`), then the plan's tag, the payload again and the box. Only a plan whose head is
 // its tag alone takes this; any other refuses.
 function boxLate(r: RToBox, p: HoleBox) {
   const fnIx = lw.irAt
-  const tagOnly = p.hbArm == "atom"
-    || p.hbArm == "atomAsStr"
-    || p.hbArm == "atomList"
-    || p.hbArm == "rec"
-    || p.hbArm == "obj"
-    || p.hbArm == "refList"
-  if !tagOnly { return irLMiss("box of a valued if at plan " + p.hbArm) }
+  if !boxTagOnly(p.hbArm) {
+    return irLMiss("box of a valued if at plan " + p.hbArm)
+  }
   irLOpnd(r.bxV)
   if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
   if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
@@ -5527,7 +5685,8 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       cond(n.asSrc, pending)
       // An arm's write of its valued `if`'s out leaves the value as the arm's result.
       if armOut >= 0 && n.asDst == armOut { return 0 }
-      const s = varSlot(n.asDst)
+      const s0 = varSlot(n.asDst)
+      const s = if s0 >= 0 { s0 } else { ownedSlot(n.asDst) }
       if s < 0 { return irLMiss("unmapped slot") }
       fbLocalSet(s)
     }
@@ -6295,6 +6454,7 @@ function coalBoxGo(n: SCoalBox, pending: i32[]): i32 {
     "nulAtomJoin" => coalNulAtomJoin(n, e, pending)
     "nulBoolJoin" => coalNulBoolJoin(n, pending)
     "boxStash" => coalBoxStash(n, e, pending)
+    "boxRuntime" => coalBoxRuntime(n, pending)
     "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
     "nulStr" => coalNulStr(n, e, pending)
     "asProp" => irLMiss("propagating as over a `??`")
@@ -6324,6 +6484,22 @@ function coalAsProp(n: SCoalBox, e: AsExpr, pending: i32[]): i32 {
 function coalBoxStash(n: SCoalBox, _e: BinExpr, pending: i32[]): i32 {
   cond(n.cbL, pending)
   coalBoxStashOpen(sharedFieldRecvSlot())
+  fbElse()
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  fbEnd()
+  return 0
+}
+
+// `l ?? d` over a box read at its storage along legacy's `boxRuntime` rung, as
+// `emitCoalesceBoxRuntime` writes a scalar result: the box into the shared slot, its tag tested
+// present opening the scalar `if`, the payload unboxed, the else, the default writing the out.
+function coalBoxRuntime(n: SCoalBox, pending: i32[]): i32 {
+  const bk = coalBoxRuntimeKind(n.cbAt)
+  if bk < 0 { return irLMiss("coalesce box runtime kind") }
+  cond(n.cbL, pending)
+  coalBoxRuntimeOpen(sharedFieldRecvSlot(), bk)
   fbElse()
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
@@ -6627,15 +6803,24 @@ function coalListGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwSeq = []
   irLSkip(n.cbL)
   if lwMiss != "" { return -1 }
-  irLSettle(pending)
+  // An index temp is consumed into its local ahead of the head, before the pending temps settle.
   const ci = n.cbIdx
-  const hooked = if ci != null { irGetIdxBegin(ci) } else { false }
+  const tempIdx = ci != null && ci is OVar && isTemp(ci.ov)
+  const early = if tempIdx && ci != null { irGetIdxBegin(ci) } else { false }
+  irLSettle(pending)
+  const hooked = if early { true } else if ci != null { irGetIdxBegin(ci) } else { false }
   // The receiver, skipped above, is read again at each of the head's reads where it can be.
   const call = nodeAt(unwrapParen(e.binLeft))
   const callee = if call is Call && call.callFn >= 0 { nodeAt(call.callFn) } else { null }
   const recvIx = if callee is Member { unwrapParen(callee.memObj) } else { -1 }
+  // A receiver legacy would stage is the builder's local (`heldInLocal`), read through the hook.
   const recvHooked = recvIx >= 0 && irGetRecvBegin(n.cbL, recvIx)
+  if recvHooked { listGetRecvUnstage() }
+  // So is an index held in a local of its own: legacy's head reads it through the index hook.
+  if hooked { listGetIdxUnstage() }
   const ek = listGetOrOpen(unwrapParen(e.binLeft), lw.irAt)
+  if recvHooked { listGetRecvRelease() }
+  if hooked { listGetIdxRelease() }
   if recvHooked { irGetRecvEnd() }
   if hooked { irGetIdxEnd() }
   if ek == null { return irLMiss("listGetOr head") }
@@ -7236,6 +7421,8 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwFloors = []
   lwLeadBoxes = []
   lwStashAt = []
+  getIdxSlots = []
+  lwOwnedSlots = []
   lwBoxHeadAt = []
   lwIfHeadAt = Map()
   lwIfHeadBuilt = false
