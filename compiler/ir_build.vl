@@ -7702,38 +7702,18 @@ function inPlaceUnstagedFrom(b: i32[], at: i32): boolean {
 // Whether operands built into `b` from `at` on hold a push receiver's stage, which the lowering
 // writes with nothing pending below it.
 function receiverStageFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SEffect && (n.efRhs is RListStage || n.efRhs is RStashSet) {
-      return true
-    }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, "listStage") || stmtFrom(b, at, "stash")
 }
 
 // Whether operands built into `b` from `at` on hold a push receiver's stage.
 function listStageFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SEffect && n.efRhs is RListStage { return true }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, "listStage")
 }
 
 // Whether operands built into `b` from `at` on hold a tag dispatch's stash, which the lowering
 // writes below the operands staged before it (`tagStashEffect`).
 function tagStashFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SEffect && n.efRhs is RTagStash { return true }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, "tagStash")
 }
 
 // Whether operands built into `b` from `at` on hold a tag dispatch's stash under a box the
@@ -7764,32 +7744,12 @@ function boxLeadSpanFrom(b: i32[], at: i32): boolean {
 
 // Whether operands built into `b` from `at` on hold an order-stashed literal's field set.
 function stashSetFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SEffect && n.efRhs is RStashSet { return true }
-    i = i + 1
-  }
-  return false
-}
-
-// Whether node `n` is a store statement: to a local, a global, a field, an element or a cell.
-function storeAt(n: IrNode): boolean {
-  return n is SAssign
-    || n is SGlobalSet
-    || n is SSetField
-    || n is SListSet
-    || n is SCellSet
+  return stmtFrom(b, at, "stash")
 }
 
 // Whether operands built into `b` from `at` on hold a store statement.
 function storeFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    if storeAt(ib.irNodes[b[i]]) { return true }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, "store")
 }
 
 // Whether variable `v` is the out of a valued `if` in body `b`.
@@ -7805,13 +7765,7 @@ function valuedIfOut(b: i32[], v: i32): boolean {
 // earlier operand below it, as a valued `if` does (`coalArmStagesLeads`), or, with `stages`
 // false, one whose arm does not.
 function coalBoxFrom(b: i32[], at: i32, stages: boolean): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SCoalBox && coalArmStagesLeads(n.cbArm) == stages { return true }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, if stages { "coalStaged" } else { "coalInPlace" })
 }
 
 // Whether `v` is the out of a `??` in `b` (`SCoalBox`).
@@ -7826,21 +7780,63 @@ function coalBoxOut(b: i32[], v: i32): boolean {
 // Whether operands built into `b` from `at` on hold a void `if` (a `null`-typed one run for its
 // effect), a statement as a store is.
 function voidIfFrom(b: i32[], at: i32): boolean {
-  let i = at
-  while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SIf && n.siOut < 0 { return true }
-    i = i + 1
-  }
-  return false
+  return stmtFrom(b, at, "voidIf")
 }
 
 // Whether operands built into `b` from `at` on hold a valued `if` (an arm-site read's chain is one).
 function valuedIfFrom(b: i32[], at: i32): boolean {
+  return stmtFrom(b, at, "valuedIf")
+}
+
+// What node `n` is to the operands built around it: a temp is written inline at its one use, any
+// other node is a statement written where it stands, which an operand built before it and used
+// after it must be staged below (`irBStageLeads`). A void `if` and a receiver stage are not yet
+// staged around: `irBStageLeads` refuses them.
+export type StmtClass = "temp" | "valuedIf" | "voidIf" | "coalStaged" | "coalInPlace" | "store"
+  | "stash" | "tagStash" | "listStage" | "effect" | "control"
+
+export function stmtClassOf(n: IrNode): StmtClass {
+  return match n {
+    SLet => "temp"
+    SIf => if n.siOut >= 0 { "valuedIf" } else { "voidIf" }
+    SArmSite => "valuedIf"
+    SCoalBox => if coalArmStagesLeads(n.cbArm) { "coalStaged" } else { "coalInPlace" }
+    SAssign | SGlobalSet | SSetField | SListSet | SCellSet => "store"
+    SEffect => effectStmtClassOf(n.efRhs)
+    SArmWrite | SDrop | SBoundsCheck | SRawOp => "effect"
+    SBlock | SBr | SForIn | SIntSwitch | SLoop | SRangeLoop | SReturn | SSwitch | STrap => "control"
+  }
+}
+
+// The class of an effect statement over `r`: a literal's order stash, a tag dispatch's stash or a
+// push receiver's stage; any other effect is a plain one, written where it stands.
+function effectStmtClassOf(r: Rhs): StmtClass {
+  if stashRhs(r) { return "stash" }
+  if tagStashRhs(r) { return "tagStash" }
+  return if listStageRhs(r) { "listStage" } else { "effect" }
+}
+
+function stashRhs(r: Rhs): boolean { return r is RStashSet }
+
+function tagStashRhs(r: Rhs): boolean { return r is RTagStash }
+
+function listStageRhs(r: Rhs): boolean { return r is RListStage }
+
+// Whether a statement of class `c` among an operand's later siblings has the operands before it
+// written below it, as `ifBelowLeadHas` reads it: a valued or void `if`, a `??` box, a store or a
+// literal's order stash.
+function stmtLeadsBelow(c: StmtClass): boolean {
+  return match c {
+    "valuedIf" | "voidIf" | "coalStaged" | "coalInPlace" | "store" | "stash" => true
+    "temp" | "tagStash" | "listStage" | "effect" | "control" => false
+  }
+}
+
+// Whether body `b` from `at` on holds a statement of class `c`.
+function stmtFrom(b: i32[], at: i32, c: StmtClass): boolean {
   let i = at
   while i < b.length {
-    const n = ib.irNodes[b[i]]
-    if n is SIf && n.siOut >= 0 || n is SArmSite { return true }
+    if stmtClassOf(ib.irNodes[b[i]]) == c { return true }
     i = i + 1
   }
   return false
@@ -7891,16 +7887,7 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
 function ifBelowLeadHas(b: i32[], at: i32, to: i32): boolean {
   let i = at
   while i < to {
-    const n = ib.irNodes[b[i]]
-    if (
-      n is SIf
-      || n is SCoalBox
-      || n is SArmSite
-      || n is SEffect && n.efRhs is RStashSet
-      || storeAt(n)
-    ) {
-      return true
-    }
+    if stmtLeadsBelow(stmtClassOf(ib.irNodes[b[i]])) { return true }
     i = i + 1
   }
   return false
