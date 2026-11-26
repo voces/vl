@@ -47,7 +47,8 @@ slice.
   rep, which has no struct heap, while legacy builds it at the result's row. That is F3's
   mechanism, as is `d15293_bound_returned`'s list of such records.
 - **Armed sweep:** 3,317 `@run` programs under `tests/cases/{closures,arrays,functions,unions}/`.
-  Three differ armed; all three differ the same way on a current-master seed.
+  None prints otherwise armed, apart from `closures/captured-nullable-closure-narrowed-delivered-runs`,
+  which `scripts/silent-sweep/distilled/claims-off-skip.txt` lists for that reason.
 - **Q58:** `tests/cases/closures/returned-closure-container-openness-positions.vl` returns at a
   `return`, a lambda's tail, a tail `if`'s arms, a nested list and a generic instance's result. On
   the master seed three functions miss on `return coercion`/`tail coercion`; on this branch all
