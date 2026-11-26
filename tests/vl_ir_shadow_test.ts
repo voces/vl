@@ -2018,8 +2018,8 @@ Deno.test({
 function mk2() { return { f: null } }
 const dA: J = mk2()
 let xs = [mk2()]
-if xs.length > 9 { xs = [] }
-print(xs.length)
+xs.push(mk2())
+print(xs[1].f)
 print(dA.f ?? 1)
 `;
     const armed = run(src, true);
