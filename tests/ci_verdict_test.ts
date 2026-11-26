@@ -237,6 +237,12 @@ Deno.test({
           " && git merge -q --no-commit master && echo x >> b && git add b && git commit -qm hand",
       );
       const hand = g("git rev-parse HEAD");
+      // A catch-up whose master side changed the compiler since the branch's merge base.
+      g("git checkout -q master && mkdir -p compiler && echo c > compiler/c.vl && git add compiler && git commit -qm compiler");
+      const codeBase = g("git rev-parse HEAD");
+      g("git checkout -qb code " + before + " && git merge -q --no-edit master");
+      const code = g("git rev-parse HEAD");
+      g("git checkout -q master && git reset -q --hard " + base);
       g("git checkout -q master && git merge -q --squash pr && git commit -qm 'change (#7)'");
       const squash = g("git rev-parse HEAD");
       const tree = g("git rev-parse HEAD^{tree}");
@@ -267,6 +273,12 @@ Deno.test({
             write(`runs-${before}`, runs("success"));
             write("jobs-99", runJobs());
           },
+        ],
+        [
+          "clean catch-up that brings a master compiler/ change, previous head green",
+          { ...pr(code), PR_BASE: codeBase },
+          "full",
+          () => {},
         ],
         [
           "clean catch-up, previous head green but it ran no job ci.yml added since",
