@@ -681,6 +681,7 @@ import {
 } from "./emit_state"
 import {
   emitFail,
+  emitFailAt,
   fbArrayNewDefault,
   fbArrayNewFixed,
   fbBeginFunc,
@@ -967,12 +968,10 @@ import {
   emitAtomToStr,
   emitClosureValueCore,
   emitExpr,
-  emitFuncBody,
   emitGlobalInitArmUnbox,
   emitMapGetUnionBox,
   emitNulNoneBoxPayload,
   emitNullForRet,
-  emitStmt,
   emitTypedHolderInit,
   emitUnionBoxOwed,
   emitUnionRetSink,
@@ -1395,8 +1394,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // A function the IR claims has its code entry written by the lowering, in the frame laid out
     // above, and legacy's body lowering does not run. A function under the test refusal hook or
     // the box-dst shadow (both instrument legacy) stays legacy's.
-    const claimTried = gTestEmitRefusal == 0 && !boxDstShadowArmed()
-    if claimTried && irClaimFn(fnIx, fnPos, out) {
+    if irClaimFn(fnIx, fnPos, out) {
       fbEndFunc()
       return 0
     }
@@ -1413,10 +1411,8 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // moves them onto the code payload with the rest of this entry (ROADMAP row 22).
     const stmtSpanBase = emitFnSpanStart.length
     shIdxReset()
-    if emitFuncBody(fn.fnBody, fnIx) < 0 {
-      if claimTried { noteDecline(fnIx) }
-      return -1
-    }
+    if emitUnclaimed(fnIx) < 0 { return -1 }
+    fbUnreachable()
     // A void body whose last instruction is a call falls off its end with nothing to hand
     // back, so that call is a tail call (D4655).
     emitVoidTailCall(fnIx)
@@ -2485,9 +2481,7 @@ function emitStartBodyCode(out: u8[], k: i32) {
   // A start body the IR claims (the single start, or init function `k`) has its code entry
   // written by the lowering, in the frame laid out above, and legacy's does not run. Under the
   // test refusal hook or the box-dst shadow (both instrument legacy) it stays legacy's.
-  const startTried = gTestEmitRefusal == 0
-    && !boxDstShadowArmed()
-    && irStartClaimOn()
+  const startTried = irStartClaimOn()
   const startUnit = startUnitOf(ent)
   if startTried {
     startFrameReset()
@@ -2500,6 +2494,7 @@ function emitStartBodyCode(out: u8[], k: i32) {
       return 0
     }
   }
+  return emitUnclaimed(startUnit)
 
   const bodyExpr: u8[] = []
   const exprPrev = wTarget(bodyExpr)
@@ -2553,7 +2548,7 @@ function emitStartBodyCode(out: u8[], k: i32) {
       emitCurStmtIx = startStmts[si]
       gInitStartOrd = startStmtOrd[si]
       const sSpanAt = bodyExpr.length
-      if emitStmt(startStmts[si], -1) < 0 {
+      if emitUnclaimed(startStmts[si]) < 0 {
         if startTried { noteDecline(startUnit) }
         wTarget(exprPrev)
         return -1
@@ -5444,6 +5439,10 @@ function emitProgramReset(rootIx: i32) {
   emitSoftFail = false
   emitSoftMsg = ""
   emitSoftAt = -1
+  unclaimedMsg = ""
+  unclaimedAt = -1
+  unclaimedFn = -1
+  unclaimedStmt = -1
   // Fresh per program: the diagnostic anchor + the "function being lowered"
   // cursor. A failure before any function body emits leaves these -1 (positionless).
   emitErrAt = -1
@@ -5724,7 +5723,7 @@ export function emitProgram(rootIx: i32) {
     )
   }
   if rc >= 0 && rowFieldAsksCheck() < 0 { return -1 }
-  return rc
+  return unclaimedFlush(rc)
 }
 
 // `tyEmitEpoch` at the per-program reset, where the window from `elabPrepare` (or an unprepared
@@ -8447,4 +8446,37 @@ function declineLine(at: i32): i32 {
   const tk = nodeToks[at]
   if tk < 0 || tk >= P.toks.length { return 0 }
   return P.toks[tk].line
+}
+
+// A function or the top-level code the IR declines has no other lowering. A contract the claim
+// raised fails at once, verbatim; a miss is recorded and the body becomes a trap, so a contract
+// in a later function still outranks it. `unclaimedFlush` reports the first miss.
+let unclaimedMsg = ""
+let unclaimedAt = -1
+let unclaimedFn = -1
+let unclaimedStmt = -1
+
+function emitUnclaimed(unit: i32): i32 {
+  const refusal = irDeclineRefusalFor(unit)
+  if refusal != "" { return emitFailAt(refusal, irDeclineAt()) }
+  if unclaimedMsg != "" { return 0 }
+  const what = irDeclinedFor(unit)
+  unclaimedFn = emitCurFnIx
+  unclaimedStmt = emitCurStmtIx
+  if what == "" {
+    unclaimedMsg = "emitProgram: the compiler cannot yet lower this code"
+    unclaimedAt = unit
+  } else {
+    unclaimedMsg = "emitProgram: the compiler cannot yet lower " + what
+    unclaimedAt = irDeclineAt()
+  }
+  return 0
+}
+
+// The run's result once emission ends: a pending miss fails it unless an error came first.
+function unclaimedFlush(rc: i32): i32 {
+  if unclaimedMsg == "" || emitFailed { return rc }
+  emitCurFnIx = unclaimedFn
+  emitCurStmtIx = unclaimedStmt
+  return emitFailAt(unclaimedMsg, unclaimedAt)
 }
