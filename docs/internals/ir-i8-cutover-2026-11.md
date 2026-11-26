@@ -255,9 +255,12 @@ claimless side is master's fetched seed for that PR only; afterwards there is no
 and each program's run is graded against its `@log`/Want alone. A program that prints nothing is
 graded by exit code and validity: 316 of the 26,238 programs the job covers.
 
-## 8. The I8 PR's checklist (a plan; nothing is deleted before the I8 PR)
+## 8. The I8 PR's checklist
 
-The coordinator ruled on 2026-11-25 that this checklist be kept as a plan. The I8 PR carries it out
+**Status: carried out by the I8 PR**, which cut over before 100% coverage (owner ruling,
+2026-11-26, DECISIONS.md): the programs still unclaimed are the holdouts,
+`scripts/ir-i8-census/holdouts.tsv`, and step 1's "newly failing programs at zero" became "every
+newly failing program is a holdout". The coordinator ruled on 2026-11-25 that this checklist be kept as a plan. The I8 PR carries it out
 in one pass, in this order. Each step is one commit, and each commit is one mechanism.
 
 1. **Preconditions.** The newest regeneration of the dress rehearsal shows each of these at zero:

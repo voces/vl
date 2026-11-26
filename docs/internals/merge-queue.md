@@ -265,7 +265,8 @@ For the queue:
 - **Q44.** On each MERGED, the queue sends a one-line "#X merged" to the lane that owns the PR and to
   any lane that asked "notify me when #X merges". A blocked lane asks for that instead of waiting
   silently (coordinator ruling, 2026-11-23, after four lanes waited hours on merges already made).
-- **Q45.** The gate carries the `self ir misses` row (#9701; kill-matrix mutant `selfirmiss`, about
+- **Q45.** (Retired at I8: a self-compile miss is now an `emitUnclaimed` refusal, which the native
+  fixpoint catches.) The gate carried the `self ir misses` row (#9701; kill-matrix mutant `selfirmiss`, about
   65 CPU-s): it is the only row that catches a new self-compile function landing in a missed shape.
   When it reds on a train, the queue pulls that PR and rebuilds the trains behind it without it
   (coordinator ruling, 2026-11-23; its first catch was on a train).
