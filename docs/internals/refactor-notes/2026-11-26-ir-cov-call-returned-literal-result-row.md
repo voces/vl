@@ -27,6 +27,22 @@ divergence rows, as D17665's and D17666's do.
 **Q58.** `tests/cases/lists/maker-returned-hole-fn-record-literal-at-result-row-positions.vl`: a list
 of the maker's results read by row, inside a function and at top level.
 
+**Census.** The whole-corpus per-function census covers tests/cases, the distilled cells and
+named sets, the capability probes and the runs-witnesses of both inventories. Merge-base probe
+against this branch's probe:
+
+| | fnc | fnu | fail |
+| --- | --- | --- | --- |
+| merge-base | 168,569 | 281 | 0 |
+| branch | 168,571 | 279 | 0 |
+
+There are two newly claimed functions and none newly missed: `mk` in D17671's witness and in the
+Q58 test. Two of the merge-base probe's 100-file batches exit 70. In each, the batch holding one of
+those two programs reports `mk`'s invalid module, and the branch's run of the same batches exits 0.
+
+**Armed sweep.** The 7,794 `@run` programs under `tests/cases/` print the same armed and
+unarmed, except the seven already listed in `scripts/ir-divergence-baseline.txt`.
+
 **Not covered.**
 
 - D17677: a call result bound to a `let`, or a reassigned-let maker's results stored into a list at
