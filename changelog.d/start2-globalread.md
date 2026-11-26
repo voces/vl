@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims three global reads at another rep than the cell's:** a name typed `null` because it is read before its binding (a null test of a module `const` map read, in a function declared above it); a `K | null` binding read as `K` after an assignment, typed as a local's held narrowing is; and a holder of an un-annotated function's id, whose row type is open only where its rep closes it, read into another binding at that row. `global read coercion` falls 6 → 1. The one left is D17385's twin, which waits on `return coercion nested twin`. Claimed and claims-off builds are byte-identical.
