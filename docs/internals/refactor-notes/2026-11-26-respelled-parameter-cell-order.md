@@ -6,13 +6,14 @@ frame is the seed's slot. Written as well, the parameter is boxed, and the captu
 cell (`g$cb = [g]`) at the top of the body, ahead of the seed: the cell read the seed's slot before
 the seed was set, and the seed read the cell. A reference-typed parameter built an invalid module;
 an `i32` one read zero and ran. The cell of a parameter with a respelling seed is now put right
-after that seed, and the seed reads the argument itself (`cboxRespellSeedOf`, `cboxSeedReadsArg`).
+after that seed (`cboxRespellSeedOf`, `cboxInsert`), and the capture-box walk leaves the seed's
+initializer reading the argument itself (`cboxParamSeed`), adding no arena write.
 
 ## Measurements
 
-I8 census over the `tests/cases` programs (base the callee-captures tree, #10401, head on it):
-`local rep` 1 → 0 (the position test's `written`). Claimed functions 98,469 → 98,470, claimed
-starts 8,526 → 8,526, claims fallen back 11 → 11; 0 claimed functions or starts lost.
+I8 census over the `tests/cases` programs (base at master `ecfacf50f`, head on it): `local rep` 1 → 0
+(the position test's `written`). Claimed functions 98,497 → 98,498, claimed starts 8,531 → 8,531,
+claims fallen back 11 → 11; 0 claimed functions or starts lost.
 
 `scripts/silent-sweep/distilled/regress.vl` on the head seed: no runs lost (0 of 261,224 cells).
 
