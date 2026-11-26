@@ -8,8 +8,9 @@
 //   legacy builds, strict — `$VL_IR_STRICT=1`, as gates and CI run: the invalid module, rc 70.
 //
 // `tests/ir-claim-fallback/*-refused.vl` are programs a claim once escaped legacy's refusal on. The
-// two graded here stay refused after #9839, and the IR now declines them (`bundlePickRefused`), so
-// the note names the decline; D17095's and D17096's witnesses
+// one graded here stays refused after #9839, and the IR now declines it (`bundlePickRefused`), so
+// the note names the decline (its sibling of two bundle shapes runs since D17106, pinned in
+// `tests/cases/maps/bundle-map-two-records-stored-from-function.vl`); D17095's and D17096's witnesses
 // beside them are graded by `ir-parity.vl --pop refusals` instead, since a legacy rung lifts them. `claimed-and-valid.vl`
 // with `$VL_FAULT_INJECT_CLAIMED` (the claimed module corrupted, the rebuild not) is the control
 // for the two outcomes legacy builds. No assertion library, per CLAUDE.md.
@@ -22,7 +23,7 @@ const ignore = !exists(VL) || !exists(COMPILER);
 if (ignore) console.warn("[ir-claim-fallback] skipped — needs the vl binary and build/vl-compiler.wasm");
 
 const DIR = `${ROOT}/tests/ir-claim-fallback`;
-const STABLE = ["closure-stored-from-function-refused.vl", "other-bundle-stored-from-function-refused.vl"];
+const STABLE = ["closure-stored-from-function-refused.vl"];
 const REFUSAL = "emitProgram: a function returning a parameter called at two signatures";
 const NOTE = "the IR declined this statement (bundle result pick refused)";
 const FELL_BACK = "IR claim produced an invalid module; used the legacy emitter";

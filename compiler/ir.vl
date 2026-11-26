@@ -192,7 +192,7 @@ export type RAsTail = { akV: Opnd, akAt: i32 }
 export type RAfterEffects = { aeEff: Opnd[], aeV: Opnd, aeAt: i32 }
 // A record copy at node `rpAt` of a source legacy re-reads per field (`recCopyReReads`), written
 // whole by legacy's copy (`recCopyPureEmit`), which reads the source as `rpV` (read once where
-// `rpOnce`, else a read the IR writes again), else from the node. Retired at I8 with `RMapNew`.
+// `rpOnce`, else a read the IR writes again). Retired at I8 with `RMapNew`.
 export type RRecCopyPure = { rpAt: i32, rpV: Opnd[], rpOnce: boolean }
 export type RCast = { ctV: Opnd, ctTarget: i32, ctOnFail: CastFail }
 export type RTagOf = { tgV: Opnd }
@@ -370,10 +370,10 @@ export type RNulNicheEq = { neL: Opnd, neR: Opnd, neR2: Opnd, neAt: i32 }
 // `ntV`, a `K | null`, a nullable reference or a union box, tested against `null` at compare node `ntAt`; `ntInvert` for `!=`, as the
 // binary dispatch hands it to legacy's null test (`binNulTestOf`).
 export type RNulTest = { ntV: Opnd, ntInvert: boolean, ntAt: i32 }
-// The `==` (or, with `aeNe`, `!=`) of two atoms at compare node `aeAt`. `aeStatic` 1 or 2 names
-// the left or right side typed as one string literal, whose id comes from its lexeme: its operand
-// is an unread immediate for a literal, else a value evaluated and dropped. 0 is two atom values,
-// 3 two literal sides the compare folds to a constant.
+// The `==` (or, with `aeNe`, `!=`) of two atoms at `aeAt`. `aeStatic` 1 or 2: that side is one
+// string literal, its id from its lexeme (an unread immediate, else evaluated and dropped); 0 two
+// atom values; 3 two literal sides folded to a constant; 4 a literal left side whose id `aeL` is
+// staged below a statement the right side writes.
 export type RAtomEq = {
   aeL: Opnd,
   aeR: Opnd,
@@ -469,7 +469,11 @@ function mapFilterOpnds(r: RMapFilter): Opnd[] {
 
 // A `.map` or `.filter` of list `hfV` at call `hfAt` by callback `hfC`: a function-typed value, or
 // the `null` immediate for a function built at the loop, from its captures `hfEnv` when it has any.
+// `hfV` is the no-value immediate where an `RMapFilterHead` statement already wrote the list.
 export type RMapFilter = { hfV: Opnd, hfC: Opnd, hfEnv: Opnd[], hfAt: i32 }
+// The list `mhV` of `.map`/`.filter` call `mhAt` and its store into the call's source local, as a
+// statement ahead of a callback that writes one; named by exactly one later headed `RMapFilter`.
+export type RMapFilterHead = { mhV: Opnd, mhAt: i32 }
 // A list `.slice` of list `scV` at call `scAt` over its bounds `scArgs` (start, then an optional end).
 export type RListSlice = { scV: Opnd, scArgs: Opnd[], scAt: i32 }
 // A map operation `mpOp` at node `mpAt` over `mpArgs`, its receiver first: `size` is `m.length`,
@@ -783,6 +787,7 @@ export type Rhs = RAfterEffects
   | RMapDelete
   | RMapEq
   | RMapFilter
+  | RMapFilterHead
   | RMapGet
   | RMapGetOr
   | RMapHas
@@ -891,6 +896,9 @@ export type SForIn = {
   xfVals: boolean,
   // A keys walk's key rep, from the receiver's checked map type (a map rep holds no key), else -1.
   xfKeyRep: i32,
+  // A walk of a union of lists' box (`luForWalkPlanOf`): each element read off the arm the box holds,
+  // boxed into the element union or converted to the flat kind, the body written once.
+  xfLu: boolean,
 }
 // `siElseKw`: the source wrote a live `else`, which legacy writes even when its arm is empty.
 // `siJoin`, `siJoinNul`: a reference join decided for this `if` (a chain's head's, as
@@ -1207,6 +1215,11 @@ export function irNoTailHas(f: IrFn, v: i32): boolean {
   return false
 }
 
+// Whether `f` is a start body, built once: no instance re-builds it at other reps.
+export function irFnBuiltOnce(f: IrFn): boolean {
+  return f.irName == "@start" || f.irName == "@init"
+}
+
 export function irFnNew(at: i32, name: string): IrFn {
   const f: IrFn = {
     irNodes: [],
@@ -1505,6 +1518,8 @@ export function irNodeEndsPath(n: IrNode): boolean {
     RCallHost => r.chNever
     RCallRef => r.crNever
     RCallRefHead => false
+    // A dead call writes `unreachable`.
+    RDeadNever => true
     RAfterEffects |
       RArmUnbox |
       RAsTail |
@@ -1526,7 +1541,6 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RCoalAtomStr |
       RCoalStr |
       RCoerce |
-      RDeadNever |
       RDeadNullTest |
       REnvDrop |
       REnvGet |
@@ -1568,6 +1582,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RMapDelete |
       RMapEq |
       RMapFilter |
+      RMapFilterHead |
       RMapGet |
       RMapGetOr |
       RMapHas |
@@ -1939,6 +1954,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListPop => opndsCat([r.lqV], r.lqIx)
     RListClear => [r.lkV]
     RMapFilter => mapFilterOpnds(r)
+    RMapFilterHead => [r.mhV]
     RListSlice => opndsCat([r.scV], r.scArgs)
     RMapOp => r.mpArgs
     RMapNew => []
@@ -2093,6 +2109,7 @@ function rhsText(r: Rhs): string {
       + "("
       + opndsText(r.hfEnv)
       + ")"
+    RMapFilterHead => "mapfilter_head " + opndText(r.mhV)
     RListSlice => "slice " + opndText(r.scV) + ", " + opndsText(r.scArgs)
     RNumWiden => "widen " + opndText(r.nwV)
     ROptRead => "opt_read "
@@ -2574,6 +2591,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RListStage |
       RMakeList |
       RMapFilter |
+      RMapFilterHead |
       RSpread |
       RStrOp => "list"
     RMapClear |
@@ -2807,7 +2825,8 @@ export function numConvSrcOf(n: IrNode): i32 {
 }
 
 // Whether a list at rep `src` is the list at rep `dst` as it stands: the same record, list or map
-// elements, one side's possibly `| null`, which one ref list holds (its backing is already nullable).
+// elements, or record twins on one heap (`recRetag`), one side's possibly `| null`, which one ref
+// list holds (its backing is already nullable).
 export function listRetag(src: i32, dst: i32): boolean {
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
@@ -2816,8 +2835,15 @@ export function listRetag(src: i32, dst: i32): boolean {
   if i32Backed(a.rlsElem) && i32Backed(d.rlsElem) && a.rlsElem != d.rlsElem {
     return true
   }
-  const ea = recElemCore(a.rlsElem)
-  return ea >= 0 && ea == recElemCore(d.rlsElem)
+  return elemCoresRetag(a.rlsElem, d.rlsElem)
+}
+
+// Whether element or value reps `a` and `d` are stored alike: one core (`recElemCore`), or
+// record twins on one heap.
+function elemCoresRetag(a: i32, d: i32): boolean {
+  const ea = recElemCore(a)
+  const ed = recElemCore(d)
+  return ea >= 0 && (ea == ed || ed >= 0 && recRetag(ea, ed))
 }
 
 // Whether element rep `e` is an unpacked `i32` or `bool`, which an `i32[]` backing holds.
@@ -2839,16 +2865,27 @@ export function boxListRetag(src: i32, dst: i32): boolean {
   return ea is RNullable && ea.rnDisc == 4 && ed is RNullable && ed.rnDisc == 4
 }
 
-// Whether a map at rep `src` and one at rep `dst` hold union boxes of one kind as values, as
-// `boxListRetag` asks of a list's elements: one map shape over the one box heap.
+// Whether a map at rep `src` and one at rep `dst` hold union boxes as values, a box or a boxed
+// nullable on either side: one map shape over the one box heap, whose values are nullable refs.
 export function boxMapRetag(src: i32, dst: i32): boolean {
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
   if !(a is RMap) || !(d is RMap) || a.rmVal == d.rmVal { return false }
-  const va = repNodeAt(a.rmVal)
-  const vd = repNodeAt(d.rmVal)
-  if va is RBox { return vd is RBox }
-  return va is RNullable && va.rnDisc == 4 && vd is RNullable && vd.rnDisc == 4
+  return boxOrBoxedNullable(a.rmVal) && boxOrBoxedNullable(d.rmVal)
+}
+
+function boxOrBoxedNullable(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RBox || n is RNullable && n.rnDisc == 4
+}
+
+// Whether a map at rep `src` is the map at rep `dst` as it stands: values stored alike
+// (`elemCoresRetag`), one side's possibly `| null`, or union boxes (`boxMapRetag`).
+export function mapRetag(src: i32, dst: i32): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if !(a is RMap) || !(d is RMap) || a.rmVal == d.rmVal { return false }
+  return elemCoresRetag(a.rmVal, d.rmVal) || boxMapRetag(src, dst)
 }
 
 // Whether a list at rep `src` is the list at rep `dst` as it stands, `dst` leaving a closure's

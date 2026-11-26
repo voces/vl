@@ -339,6 +339,7 @@ import {
   arenaSetNode,
   binderNameAt,
   callIsNever,
+  callMarksCarry,
   declNameTokOf,
   elseIfLink,
   fnNameIsLambda,
@@ -761,6 +762,10 @@ import {
   elabSlotRecDeclAt,
   elabSlotSetCalls,
   elabSlotTyAt,
+  elabSlotUnionCallsAt,
+  elabSlotUnionCount,
+  elabSlotUnionDeclAt,
+  elabSlotUnionRecsAt,
   elabSpecBindOf,
   elabSpecHoleBind,
   elabSrcDecl,
@@ -836,7 +841,12 @@ import {
   tyIsArmedDeferredJoin,
   tyIsTpJoinUnion,
 } from "./check_tp_join"
-import { binArithOp, numUnionMinted, tyIsNumUnion } from "./check_union_mint"
+import {
+  binArithOp,
+  mkUnionTy,
+  numUnionMinted,
+  tyIsNumUnion,
+} from "./check_union_mint"
 import {
   elabFnListClosedLit,
   elabMakerCallSig,
@@ -3050,10 +3060,12 @@ function monoRemintCall(ix: i32, callee: i32, args: i32[]): i32 {
 }
 
 // `monoRemintCall` for a pass that rewrites only the call's parts: the copy answers the
-// template's type, so it carries the type recorded on `ix`.
+// template's type, so it carries the type recorded on `ix` and the per-call marks derived from it.
+// An instance's copy answers its own type, so it carries neither.
 function monoRemintCallTpl(ix: i32, callee: i32, args: i32[]): i32 {
   const nc = monoRemintCall(ix, callee, args)
   nodeTyCarry(nc, ix)
+  callMarksCarry(nc, ix)
   return nc
 }
 
@@ -9539,7 +9551,8 @@ function monoMakeInstanceRetIx(fn: FuncDecl, origFe: i32, nret: i32): i32 {
 }
 
 // Installs the first instance `nfn` in the template's own slot: it keeps the bare name and
-// the original's wasm index.
+// the original's wasm index, and the lambdas minted for it hang off that slot, as a later
+// instance's do (D943).
 function monoMakeInstanceFirst(
   origFe: i32,
   nfn: i32,
@@ -9550,6 +9563,7 @@ function monoMakeInstanceFirst(
   fnTagLeafCarry(nfn, monoOrigNode[origFe])
   voidCtxLambdaCarry(nfn, monoOrigNode[origFe])
   fnStmts[origFe] = nfn
+  monoReparentNestedLams(0, origFe)
   // A call through a lambda binding, or a never-written alias of a named generic, takes the
   // instance's name, as a later instance's or a registry hit's does (D16420). A capturing
   // function keeps its value call, whose env the name would drop; so does a reassigned binding.
@@ -14978,6 +14992,40 @@ function monoSlotRecordsApply(): i32 {
     }
     i = i + 1
   }
+  // A fresh `Map()` whose value slot holds records of different signatures is typed at the union
+  // of their rows, and each store's call at the row of the record it returns.
+  i = 0
+  while i < elabSlotUnionCount() {
+    const at = elabSlotUnionDeclAt(i)
+    const dn = if at >= 0 && at < P.nodes.length { nodeAt(at) } else { null }
+    const lx = if dn is LetDecl { unwrapParen(dn.letInit) } else { -1 }
+    const ot = if lx >= 0 { nodeTyIxOf(lx) } else { -1 }
+    const om = if ot >= 0 && ot < T.tys.length { tyAt(ot) } else { null }
+    if dn is LetDecl && dn.letType < 0 && om is TyMap && !i32ListHas(done, at) {
+      done.push(at)
+      const bts: i32[] = []
+      for sigs in elabSlotUnionRecsAt(i) {
+        const bt = monoBundleRecordAt(bundleRecordTyOf(sigs), lx)
+        if bt < 0 { return -1 }
+        bts.push(bt)
+      }
+      const mt = mkMapTy(tyKeyOf(om), mkUnionTy(bts), 0)
+      if tyIsEmitRepresentable(mt) {
+        dn.letType = synthTypeRefOfTy(mt, -1)
+        nodeTyRecord(lx, mt)
+        const picks: i32[] = []
+        const calls = elabSlotUnionCallsAt(i, picks)
+        let j = 0
+        while j < calls.length && j < picks.length {
+          if picks[j] >= 0 && picks[j] < bts.length {
+            nodeTyRecord(calls[j], bts[picks[j]])
+          }
+          j = j + 1
+        }
+      }
+    }
+    i = i + 1
+  }
   return 0
 }
 
@@ -20379,6 +20427,46 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       // The gate keeps the order change inert: where the argument is a concrete function
       // the two orders agree, so they differ only when one answer is a type variable.
       const declTys = monoDeclParamTys(origFe, params.length)
+      // An argument built at another rep than its checker type binds the type parameters its
+      // parameter names at that rep, the storage the instance takes (D17641).
+      let repArg = false
+      let ai = 0
+      while ai < args.length && ai < params.length {
+        const pp = nodeAt(params[ai])
+        const sa = monoArgSrcOf(args[ai])
+        const br0 = if sa >= 0 { nodeRepTyIxOf(sa) } else { -1 }
+        // Only a storage row counts: a record, or a list of records, built at another record's row.
+        const bel = if br0 >= 0 && br0 < T.tys.length && tyAt(br0) is TyArray { tyArrayElemIx(br0) } else { br0 }
+        const br = if bel >= 0 && bel < T.tys.length && tyAt(bel) is TyObj { br0 } else { -1 }
+        const at0 = if sa >= 0 { nodeTyIxOf(sa) } else { -1 }
+        const ael = if at0 >= 0 && at0 < T.tys.length && tyAt(at0) is TyArray { tyArrayElemIx(at0) } else { at0 }
+        const at = if ael >= 0 && ael < T.tys.length && tyAt(ael) is TyObj { at0 } else { -1 }
+        if (
+          pp is Param
+          && pp.parType >= 0
+          && br >= 0
+          && at >= 0
+          && !tySameSealed(br, at)
+        ) {
+          const bn: string[] = []
+          const bt: i32[] = []
+          bindGenWalk(nodeTyIxOf(pp.parType), br, bn, bt)
+          let k = 0
+          while k < bn.length && k < bt.length {
+            const free = strListHas(fn.fnTyParams, bn[k])
+              && !strListHas(tvN, bn[k])
+            const sp = if free && !tyHasTyVar(bt[k]) { monoPinNominalSpelling(bt[k]) } else { "" }
+            if sp != "" {
+              tvN.push(bn[k])
+              tvV.push(sp)
+              monoTvTyLast(tvN, tvT, bt[k])
+              repArg = true
+            }
+            k = k + 1
+          }
+        }
+        ai = ai + 1
+      }
       if monoCallGenFnToTyParamArrow(params, args, fn.fnTyParams, ctx) {
         monoPreBindNonArrowArgs(origFe, callIx, fn, params, args, tvN, tvV, tvT)
       }
@@ -20570,6 +20658,11 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       )
       monoBakeSpecK = specKWas
       const specFe = if monoKeys.length > specKeys0 { monoInstFe[specKeys0] } else { monoLastInstFe }
+      // That instance returns at the built rep, and a reader of the call takes its result rather
+      // than the checker's (D17641).
+      const ifn = if repArg && monoLastInstFe >= 0 && monoLastInstFe < fnStmts.length { nodeAt(fnStmts[monoLastInstFe]) } else { null }
+      const irt = if ifn is FuncDecl && ifn.fnRet >= 0 { nodeTyIxOf(ifn.fnRet) } else { -1 }
+      if irt >= 0 && !tyHasTyVar(irt) { nodeTyRecord(callIx, irt) }
       elabSpecMonoGroup(specAt, i32ToStr(specFe))
       elabSpecMonoSlot(specAt, specFe)
       return made

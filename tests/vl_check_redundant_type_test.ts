@@ -102,6 +102,26 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-check-redundant-type: does NOT flag a list of only `null` (removing it is refused)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Each list's elements are `null`-typed reads, a hole binding, or an `if` of such lists; without
+    // the annotation the checker refuses "a list of only `null` has no element type". `y` is the
+    // control that must still be flagged.
+    const r = await check(
+      "const a: null[] = [null, null]\nconst k = 0\nlet x = null\n" +
+        "const b: null[] = [a[k], a[1]]\nconst d: null[] = [x]\n" +
+        "const e: null[] = if a.length > 1 { [a[0]] } else { [a[1]] }\n" +
+        "const y: i32 = k + 1\nprint(b.length + d.length + e.length + y)\n",
+    );
+    const hits = redundantLines(r.err);
+    if (hits.length !== 1 || !hits[0].includes("`y`")) {
+      throw new Error(`want one redundant hint, on \`y\`; got ${hits.length}:\n${r.err}`);
+    }
+  },
+});
+
+Deno.test({
   name: "vl-check-redundant-type: --fix removes `: T`, keeps a multi-token init intact, idempotent",
   ignore: !ENABLED,
   fn: async () => {

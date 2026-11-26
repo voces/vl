@@ -405,16 +405,14 @@ before the lane relies on it. Byte identity cannot prove such a function, so beh
 - `scripts/ir-identity.sh` then prints `expected divergence <program> (<functions>)` for that
   program and passes it, but only when every function whose body differs is listed for it. An
   unlisted function or program still reds as `DIFF`.
-- The armed shadow subtracts the same pairs: `ir-shadow.vl` (every mode but `--claims` and
-  `--blockers`) and `tests/vl_ir_shadow_test.ts`'s row files turn a listed program's byte
-  mismatches into `expected divergence` when a detail build (`$VL_IR_SHADOW=2`) names each one,
-  each a listed function (`f@1` is the detail row's `f`, `__start__@1` its `@start`). An
-  unlisted function, a mismatch the detail cannot name (it names at most three a class), or any
-  non-bytes row (a verifier failure, spans, order) still reds.
+- The armed shadow no longer grades bytes (coordinator ruling, 2026-11-26: byte identity is not a
+  gate). `ir-shadow.vl` prints a byte mismatch as informational unless `$IR_SHADOW_BYTES=1`, and
+  `tests/vl_ir_shadow_test.ts`'s row files pass one, listed or not. Any non-bytes row (a verifier
+  failure, spans, order) still reds.
 - `vl run scripts/ir-parity.vl` is the proof. It builds each program with the IR on (the seed) and
   off (the `CLAIMED`-empty twin), runs both, and compares stdout, exit code and trap message.
-  Any `differs` or one-sided `build-fails` reds, and so does a byte differ the baseline does not
-  list (`--behaviour-only` drops that last check, for after the I8 cutover drops byte identity).
+  Any `differs` or one-sided `build-fails` reds. A byte differ the baseline does not list reds only
+  without `--behaviour-only`; every gate row passes that flag or `--cross` (2026-11-26 ruling).
   A listed divergence must still behave alike.
 - The READY quotes the parity summary line over the three default populations (distilled cells,
   `tests/cases`, capability probes), with the diverging programs among them, or `--files`
