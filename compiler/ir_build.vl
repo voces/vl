@@ -1018,6 +1018,10 @@ import {
   TY_NEVER,
   TY_NUL_STR,
   TY_STR,
+  TyObj,
+  mkNullableTy,
+  mkObjTy,
+  tyAt,
   tyIsRecord,
   tyScalarBasePrim,
 } from "./check_types"
@@ -1422,6 +1426,7 @@ export function irShadowBegin() {
   ibRowN = []
   claimScopeOpen = false
   cellHeapMemo = Map()
+  rowStoredMemo = Map()
   return 0
 }
 
@@ -4085,6 +4090,57 @@ export function irBDeclVar(d: i32): i32 {
   if rl >= 0 { return declVarAt(d, repNodeOfTy(rl), rl) }
   if letLitUndeclaredRow(d) { ibDeclRowSeen = true }
   return declVarAt(d, rep, ty)
+}
+
+// Each struct row's stored type (`rowStoredTy`), per compile; -2 while the row is being built.
+let rowStoredMemo: {[i32]: i32} = Map()
+
+// The type struct row `si`'s storage is held at: its recorded type, with each record field that
+// targets another struct row (`sFieldTgtStructIdx`) at that row's own stored type, or its nullable.
+// A row met again while it is being built (a recursive record) answers its recorded type.
+export function rowStoredTy(si: i32): i32 {
+  if si < 0 || si >= sTyIx.length { return -1 }
+  const memo = rowStoredMemo[si] ?? -1
+  if memo == -2 { return sTyIx[si] }
+  if memo >= 0 { return memo }
+  const t = sTyIx[si]
+  const n = if t >= 0 { tyAt(t) } else { null }
+  if !(n is TyObj) {
+    rowStoredMemo[si] = t
+    return t
+  }
+  rowStoredMemo[si] = -2
+  const tys: i32[] = []
+  let moved = false
+  let i = 0
+  while i < n.objFieldNames.length {
+    const ft = n.objFieldTypes[i]
+    const fi = sFieldIndex(si, n.objFieldNames[i])
+    const tg = if fi >= 0 { sFieldTgtStructIdx(si, fi) } else { -1 }
+    const st = if tg >= 0 && tg != si { rowStoredTy(tg) } else { -1 }
+    const fn = repNodeAt(repNodeOfTy(ft))
+    const nul = fn is RNullable
+    const inner = if fn is RNullable { fn.rnInner } else { repNodeOfTy(ft) }
+    const take = st >= 0
+      && repNodeAt(repNodeOfTy(st)) is RRecord
+      && repNodeOfTy(st) != inner
+      && repNodeAt(inner) is RRecord
+    tys.push(if !take { ft } else if nul { mkNullableTy(st) } else { st })
+    if take { moved = true }
+    i = i + 1
+  }
+  const out = if moved { mkObjTy(n.objFieldNames, tys) } else { t }
+  rowStoredMemo[si] = out
+  return out
+}
+
+// The IR rep of struct row `si`: its stored type's (`rowStoredTy`), where the row builds at it
+// (`rowTyBuildsAt`); else -1.
+export function rowRep(si: i32): i32 {
+  const t = rowStoredTy(si)
+  if t < 0 || !rowTyBuildsAt(t, si) { return -1 }
+  const r = repNodeOfTy(t)
+  return if repNodeAt(r) is RRecord { r } else { -1 }
 }
 
 // The record type of the struct row legacy declares `let` `d`'s local at, where that row is not
