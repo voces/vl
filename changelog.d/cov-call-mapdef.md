@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **A record global is held at its storage row wherever legacy declares its cell there:** take `const d = { f: 1 }` read as the default of a `J`-valued map (`m.get(k) ?? d`). Legacy stores `d` at `J`'s row even though `{ f: i32 }` has a struct row of its own. The IR noted the cell at the type's own row, so it missed `map read default rep` and two neighbouring positions. It now notes the cell at the binding's storage row (`cellAtStorageRow`). A function returning such a global is declared at that row too, on legacy and on the IR alike, which closes D17680 (`check-clean invalid wasm` before).
