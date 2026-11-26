@@ -48,3 +48,21 @@ export const holdoutVerdict = (
  */
 export const holdoutCheck = (key: string, failed: boolean, err: string): string | null =>
   HOLDOUTS.has(key) ? holdoutVerdict(key, failed, err) : null;
+
+/**
+ * `fn` as a test body graded as holdout `key` (`tests/<file>.ts#<test name>`) when that key is
+ * listed: it passes only while it fails with `cannot yet lower`, and fails once it passes. An
+ * unlisted key runs `fn` unchanged.
+ */
+export const holdoutTest = (key: string, fn: () => void | Promise<void>): () => Promise<void> =>
+async () => {
+  if (!HOLDOUTS.has(key)) return await fn();
+  let err = "";
+  try {
+    await fn();
+  } catch (e) {
+    err = e instanceof Error ? e.message : String(e);
+  }
+  const why = holdoutVerdict(key, err !== "", err);
+  if (why !== "") throw new Error(why);
+};
