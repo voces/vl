@@ -74,8 +74,8 @@ scripts/ready-check.sh [--sweep <program>...]
 ```
 
 It refuses a dirty tree and runs `scripts/gate.sh --fast`, read by its exit code. With `--sweep`,
-it also checks the Q58 armed position sweep. It checks that `changelog.d/<branch>.md` exists, and
-it ends with a block to paste into the READY. CI's `ci-ir-identity` runs `ir-identity.sh --cases`
+it also checks the Q58 armed position sweep. It notes whether `changelog.d/<branch>.md` exists
+(optional), and it ends with a block to paste into the READY. CI's `ci-ir-identity` runs `ir-identity.sh --cases`
 and `--claimless` on the PR, so a lane no longer runs them; a differ the divergence baseline does
 not list reds that job. ready-check does not cover these:
 
@@ -85,7 +85,8 @@ not list reds that job. ready-check does not cover these:
    CENSUS lane publishes the program lists. Not a full-population census.
 3. A PR that touches `std/*.vl` exports: the `std-api-reviewer` agent's verdict (ready-check names
    the need).
-4. For a measurement, one refactor note. Never edit `CHANGELOG.md` or architecture-target's Status.
+4. A refactor note and a `changelog.d/` entry are optional (DECISIONS.md, "Docs and comments are
+   not part of the job"). Never edit `CHANGELOG.md` or architecture-target's Status.
 5. Grade the inventory rows you file or close with `VL_IR_STRICT=1`, as CI does:
    `VL_IR_STRICT=1 vl run scripts/check-filed-witnesses.vl -- --strict <dirs>` (coordinator, 2026-11-25).
 6. A claim that a unit is covered is proven under `VL_IR_REQUIRE_CLAIM=1`, which refuses a function or
