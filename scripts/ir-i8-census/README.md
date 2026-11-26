@@ -17,6 +17,8 @@ conflicts with another PR on a shared line.
 - A unit whose claim declined on a refusal its program expects (an `@emit-error` line the refusal
   contains) is `fnr <name> | <refusal>` in the census rows: refused as designed or as clause-2 debt
   the capability probes track, not unclaimed, so no I8 count includes it. Any other refusal is `fnu`.
+- `scoreboard.sh <red.tsv> [<prev>]`: units and classes per owner as a markdown table, with deltas; the
+  hourly run's job summary.
 - `owners.tsv`: the exceptions to the owner `red.sh` derives from a class's mechanism family, one
   `class<TAB>owner` line per class that family routes wrongly. `red.sh <census-out> <sweep-out>`
   joins `census.sh` and `ir-i8-sweep.sh keep --out` into the red list with the owner column. A new
