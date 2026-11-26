@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR retags a list of record twins and a map whose values store alike (irConvert, slice 3):** `listRetag` admits a list whose elements are record twins on one heap. A new `mapRetag` admits a map whose values share one stored core (one side possibly `| null`), or are union boxes, box or boxed nullable. The same predicates serve the builder and the verifier. A `Node[]` built from a `Node & {…}` maker, a `{[string]: string}` delivered as `{[string]: string | null}`, and a union-valued map delivered at a wider union now run through the IR, at a declaration, an argument or a return.

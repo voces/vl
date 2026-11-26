@@ -13272,6 +13272,52 @@ queues after family C. Design: `docs/internals/bundle-map-union-2026-11.md`.
 **Why.** Building stage 1 as a special case for maps that are only key-tested would have been
 thrown away by stage 2. Building the final storage first means stage 2 only reads.
 
+## One structural converter, `irConvert`, for every delivery site (2026-11-26, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-26.** The IR builder converts a value at one rep to another rep of
+a checker-compatible type in one function, `irConvert(b, v, dst, dstTy, at)` (ir_build). Every delivery
+site calls it: argument, return, tail, tail `if` arm, declaration, assignment, and COV-START's layout
+reads. It is a `match` over the destination's rep kind with no `_` arm, and its cases are:
+- the identity, or a value the destination stores as it stands;
+- a retag the verifier checks (a list's twin, closure openness, a record's struct twin or noted row);
+- widening into a nullable niche or a union box;
+- a list, map or record copy.
+
+What has no case misses as `convert <src> -> <dst>`, which I8 reads as "cannot yet lower (…)",
+capability debt. Each slice deletes the ad-hoc chain it replaces at the sites it converts, so old and
+new paths never coexist at a site. Slices:
+1. the as-is and retag cases at return, tail and tail-`if` arm (lane COV-CALL);
+2. widening, with the argument, declaration and assignment sites;
+3. list and map copies;
+4. the record row copy, which COV-START writes inside `irConvert` and COV-CALL reviews.
+
+**Why.** Regen-9's argument, return and tail coercion rows split into four families by source and
+destination rep: closure openness, element widening, record row, and nullable or box wrapping. All four
+are one structural conversion recursing through containers. Built separately they would be four
+copies of one walk at each site, and COV-START's layout family would add a fifth.
+
+## A value's IR rep follows its storage (2026-11-26, coordinator ruling) — the layout family
+
+**Ruled by the coordinator 2026-11-26.** A built value's IR rep is the rep of the storage legacy
+lays it out in, not the type that first minted the row it lands on. A place (a binding, a field,
+an element read) keeps its storage's rep. Where a read's type differs from the stored field's rep,
+the read converts with an explicit IR node, which the verifier checks against the row's layout.
+A retag by heap equality alone is never admitted.
+
+**Why.** Before I8 every unit of this family is unclaimed, and at I8 it fails. Mirroring a value at
+another row only because the two share a heap was unsound: a field the two rows lay out apart is
+read wrongly. Holding the value where legacy stores it makes builder and lowering agree, as
+#10183's list rule (`listRowRep`) did for lists.
+
+**Stage 1.** This is a node-level rule, not a type-level one: the units' record types are
+hole-elaborated, and the type-to-row map cannot see their row. A built record value takes its
+storage row's rep (`rowlessRecordRep`). An element read moves only off a list laid out at that row.
+Two exclusions are stage boundaries, removed by stage 2 (an object literal at its row, its
+function's result at the row too): an object literal keeps its own rep, and a value whose rep
+retags into the row keeps its rep. The field-code half is one accessor COV-START owns,
+`structRowFnSlotLayout` (a function slot laid out as a closure or a tagged id). It lands with its
+first caller, D17015's tag pass.
+
 ## A generic call's instance follows the rep its argument is built at (2026-11-26, coordinator ruling)
 
 **Ruled by the coordinator 2026-11-26** (D17641). Where an argument is built at a rep other than its
