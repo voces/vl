@@ -26,7 +26,8 @@
 - `CONVERT_BOX`: a value of no box into a box rep, through `boxTempIn` at the destination's
   union.
 - A cell site calls `irConvertStored`. SAssign and the verifier want one rep, so a value taken
-  as it stands at another rep goes in by its niche or misses.
+  as it stands at another rep is retagged where `convertRetag` admits it (a holed closure, list
+  or map, START-2's finding), goes in by its niche, or misses.
 
 **Census (regen-9's coercion classes, this branch's probe).**
 
