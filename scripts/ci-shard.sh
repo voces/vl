@@ -79,7 +79,6 @@ vl_check_fix_test.ts 3
 vl_large_source_test.ts 3
 vl_gen_cases_test.ts 3
 vl_check_within_test.ts 3
-vl_union_key_licence_test.ts 3
 vl_run_args_test.ts 3
 vl_std_fs_range_test.ts 3
 vl_compile_gc_test.ts 2

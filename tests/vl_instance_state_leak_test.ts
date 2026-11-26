@@ -54,6 +54,7 @@
 //
 // Run with:  deno test -A --no-check tests/vl_instance_state_leak_test.ts
 
+import { holdoutTest } from "./support/holdouts.ts";
 import { filePath } from "./support/filePath.ts";
 import { runWasm } from "./support/runWasm.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
@@ -579,7 +580,7 @@ Deno.test({
   name:
     "instance-leak oracle: every program compiles and its module instantiates under V8",
   ignore,
-  fn: async () => {
+  fn: holdoutTest("tests/vl_instance_state_leak_test.ts#instance-leak oracle: every program compiles and its module instantiates under V8", async () => {
     buildOracle();
     const bad: string[] = [];
     for (const p of PROGRAMS) {
@@ -604,7 +605,7 @@ Deno.test({
           bad.join("\n  "),
       );
     }
-  },
+  }),
 });
 
 Deno.test({
