@@ -84,6 +84,12 @@ export -f first_error
 # Builds each file listed in $1 under seed $2 into dir $3, keeping its exit code beside it.
 build_all() {
   mkdir -p "$3"
+  # The first build with a compiler compiles that module into the host's cache. Four parallel cold
+  # compiles share nothing and can pass the 60 s limit together (the first four programs of a side
+  # timed out at once); one untimed warm build first leaves the limit timing the programs alone.
+  printf 'print(1)\n' > "$3/warm.vl"
+  VL_COMPILER_WASM=$2 "$VL" build "$3/warm.vl" -o "$3/warm.wasm" $FLAGS > /dev/null 2>&1 || true
+  rm -f "$3/warm.vl" "$3/warm.wasm"
   xargs -P "${JOBS:-4}" -I{} bash -c '
     k=$(printf "%s" "$1" | tr "/" "_")
     rc=0
