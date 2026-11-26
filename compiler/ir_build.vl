@@ -710,6 +710,7 @@ import {
   unionLitIsPlanOf,
 } from "./wasmEmit"
 import {
+  fnInPinnedInstance,
   mapReadScalarBoxKindIn,
   mapRecvScalarBoxKindIn,
   mapRecvTyIn,
@@ -4936,6 +4937,23 @@ function endsInTemp(b: i32[]): boolean {
   const n = ib.irNodes[id]
   if !(n is SLet) || n.lDst < 0 || n.lDst >= ib.irVars.length { return false }
   return ib.irVars[n.lDst].vKind == "temp"
+}
+
+// The list rep `dst` (or its nullable's inner) holds where list literal `ix`, in a pinned
+// instance, is built at a list of a narrower number than that list's element; else -1.
+function widerNumListAt(ix: i32, dst: i32): i32 {
+  if !fnInPinnedInstance(ibFnIx) { return -1 }
+  const dn = repNodeAt(dst)
+  const lr = if dn is RList { dst } else if dn is RNullable && repNodeAt(dn.rnInner) is RList { dn.rnInner } else { -1 }
+  if lr < 0 { return -1 }
+  const own = repNodeAt(exprRepOf(ix))
+  const want = repNodeAt(lr)
+  if !(own is RList) || !(want is RList) || own.rlsElem == want.rlsElem {
+    return -1
+  }
+  const sk = numKindOf(own.rlsElem)
+  const dk = numKindOf(want.rlsElem)
+  return if sk >= 0 && dk >= 3 && sk != dk { lr } else { -1 }
 }
 
 // The body of value-`if` arm `blockIx`: its one value, delivered at `rep`, written to out `t`. A
@@ -10068,6 +10086,23 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // destination's rep, each arm delivered there.
   if ibMiss == "" && dst >= 0 && dn is IfStmt && exprRepOf(du) < 0 {
     return ifExprAt(b, dn, du, dst, repTyOf(dst))
+  }
+  // A list literal delivered to a wider number's list, or that list's nullable, in a pinned
+  // instance is built at that list, each element widened there, as legacy writes it.
+  if ibMiss == "" && dst >= 0 && dn is ArrayLit {
+    const lr = widerNumListAt(du, dst)
+    if lr >= 0 {
+      const lv = arrayLit(
+        b,
+        dn,
+        du,
+        lr,
+        arrLitListBuild(du, ibFnIx),
+        repTyOf(lr),
+      )
+      if ibMiss != "" || lr == dst { return lv }
+      return widenTo(b, lv, ix, dst, dstTy)
+    }
   }
   // A read the checker narrowed to `null` is the destination's null where legacy's `nullread` arm
   // writes one (`nullReadDstOwnOf`), not its storage's.
