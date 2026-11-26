@@ -880,6 +880,7 @@ import {
   stmtIsTailValue,
   structIndexOfExpr,
   structIndexOfObjCtx,
+  topLambdaRecordFe,
 } from "./emit_classify"
 import {
   declaredSlotOf,
@@ -1824,6 +1825,32 @@ function isLitArms(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   }
 }
 
+// A `memberEq` receiver `v` read at a `string | null` whose every member compares as a plain
+// string (the receiver narrowed non-null): its recover, held in a local; else `v`.
+function memberEqRecv(b: i32[], recvIx: i32, ix: i32, v: Opnd): Opnd {
+  const r = unwrapParen(recvIx)
+  if !strNullable(irBOpRep(v)) || !(v is OVar) || r < 0 { return v }
+  const texts = litIsMemberTexts(ix)
+  if texts.length == 0 { return v }
+  for t in texts {
+    if litMemberEqArmOf(recvIx, quoteLex(t), ibFnIx) != "str" { return v }
+  }
+  // Recovered once into a local, which each member's compare reads.
+  const sr = repNodeOfTy(TY_STR)
+  const t = irBLetTempTy(
+    b,
+    { rcV: v, rcAt: r, rcNn: atLeastOneRecover(r) },
+    r,
+    sr,
+    TY_STR,
+  )
+  if ibMiss != "" { return t }
+  const lv = irVarNew(ib, sr, TY_STR, "local", -1)
+  irBNode(b, { asDst: lv, asSrc: t }, -1, ibNoValue, r)
+  const o: Opnd = { ov: lv }
+  return o
+}
+
 // Why a member of `is` test `ix`'s `memberEq` arm does not compare as a string over receiver
 // `recvIx` at rep `r` (a string's plain compare, or a `string | null`'s guarded one), else "".
 function memberEqMissOf(recvIx: i32, ix: i32, r: i32): string {
@@ -1874,7 +1901,9 @@ function isLitArmsTest(
 ): Opnd {
   if rep != ibBool { return irBMiss("is result rep") }
   // An atom compare reads its operand's cell, the id legacy compares, not its string decode.
-  const v = exprAt(b, n.isObj, la == "atomEq" || la == "atomNotNul")
+  const v0 = exprAt(b, n.isObj, la == "atomEq" || la == "atomNotNul")
+  if ibMiss != "" { return v0 }
+  const v = if la == "memberEq" { memberEqRecv(b, n.isObj, ix, v0) } else { v0 }
   if ibMiss != "" { return v }
   const vn = repNodeAt(irBOpRep(v))
   const ok = match la {
@@ -5660,6 +5689,9 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   ) {
     return nullUnitTemp(b, ix, rep, [])
   }
+  // A union-box capture narrowed to a closure's, list's or map's `A | null` (legacy's `niche`
+  // arm) is the box at its storage, then the niche read a box local's takes.
+  if arm == "niche" { return captureNicheRead(b, n, ix, rep) }
   const unbox = arm == "unbox"
   if !unbox && arm != "capture" { return irBMiss("read of " + n.identName) }
   const fe = fnStmtsPosOf(ibFnIx)
@@ -5746,6 +5778,29 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if boxed { return irBLetTemp(b, { sgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
+}
+
+// Read `ix` of capture `n`, a union box narrowed to a niche-repped `A | null`, at `rep`: the box
+// as the capture holds it, then the niche read (`RNicheRead`), as `emitNarrowedNicheRead` writes.
+function captureNicheRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
+  const fe = fnStmtsPosOf(ibFnIx)
+  const cr = capRepOf(fe, n.identName)
+  if cr < 0 || !heldAsBox(cr) { return irBMiss("capture niche cell") }
+  const nk = nicheReadKindAt(ix, ibFnIx)
+  if nk != 1 && nk != 2 && nicheReadRefOf(ix, ibFnIx) == "" {
+    return irBMiss("capture niche kind")
+  }
+  const ct = capTyOf(fe, n.identName)
+  const o = capturedAsHeld(
+    b,
+    fe,
+    n.identName,
+    ix,
+    cr,
+    if ct >= 0 && repNodeOfTy(ct) == cr { ct } else { repTyOf(cr) },
+  )
+  if ibMiss != "" { return o }
+  return irBLetTemp(b, { nrV: o, nrAt: ix, nrKind: nk, nrRow: false }, ix, rep)
 }
 
 // The type capture `name` of `fe`, held at rep `cr`, is held at where its read `ix` names a record
@@ -6163,6 +6218,16 @@ function narrowedLocalRead(
   }
   // A list read's overrides (`identListOverrideOf`) are asked at the lowering, which holds them.
   const na = if arm == "local" { nullNarrowArmOf(ix, ib.irVars[v].vRep, rep) } else { "none" }
+  // A `string | null` narrowed to a literal set, read where a string is wanted, is its recover.
+  if (
+    na == "miss"
+    && repPrim(rep) == "str"
+    && litSetBaseIsStr(heldTy(exprTyOf(ix)))
+  ) {
+    const rs: Rhs = { rcV: o, rcAt: ix, rcNn: atLeastOneRecover(ix) }
+    ib.irReadAgain[ix] = rs
+    return irBLetTempTy(b, rs, ix, rep, TY_STR)
+  }
   if na == "miss" { return irBMiss("nullable read recover") }
   if na == "held" || na == "plain" {
     // Legacy writes the recover again where it re-reads the name (`irReadAgain`).
@@ -6482,6 +6547,18 @@ function nullNarrowArmOf(ix: i32, cellRep: i32, rep: i32): NullNarrowArm {
   if inner >= 0 && repNodeOfTy(inner) == rep { return "held" }
   // Any other recover to a rep the read's type is not would mint a temp of the nullable type.
   return "miss"
+}
+
+// `recoverNonNulls(ix)`, at least one: a non-null read off a nullable cell is always recovered.
+function atLeastOneRecover(ix: i32): i32 {
+  const k = recoverNonNulls(ix)
+  return if k > 0 { k } else { 1 }
+}
+
+// Whether `ty` is a union of string literals, whose value is a string.
+function litSetBaseIsStr(ty: i32): boolean {
+  const p = tyScalarBasePrim(ty)
+  return p != null && p == "string"
 }
 
 // The rep of global `g`, declared at `d`, noted in `ib`; -1 when it is no scalar.
@@ -6836,6 +6913,8 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     if !exprIsClosure(c.callFn, ibFnIx) && callResultMemberTy(rx, ibFnIx) >= 0 {
       return resultMemberCallRhs(b, c, ix, rx)
     }
+    // A call of a `const` lambda's returned record, at the member legacy picks after it.
+    if lambdaRecordCallOf(rx) { return resultMemberCallRhs(b, c, ix, rx) }
     return closureCallRhs(b, c, ix)
   }
   const d = identDeclOf(c.callFn)
@@ -7718,6 +7797,14 @@ function holderCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const f = irBLetTempTy(b, { bpV: v, bpAt: ix }, c.callFn, crep, pk.bpTy)
   if ibMiss != "" { return missRhs(ibMiss) }
   return closureCallAt(b, c, ix, key, f)
+}
+
+// Whether `rx` calls a `const` lambda returning a record of members (`topLambdaRecordFe`), whose
+// call `emitCallRef` follows with the member its use takes.
+function lambdaRecordCallOf(rx: i32): boolean {
+  if rx < 0 || rx >= P.nodes.length { return false }
+  const rn = nodeAt(rx)
+  return rn is Call && topLambdaRecordFe(unwrapParen(rn.callFn)) >= 0
 }
 
 // Call `ix` of the member closure that direct call `rx` picks from the bundle record it returns
