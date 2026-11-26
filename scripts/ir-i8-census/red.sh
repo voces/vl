@@ -8,7 +8,7 @@
 # the same tree. Rows: pop, program, first stub, unit, class, owner; a program with no census row
 # gets `-` for unit and class. A class is the miss with any `: detail` dropped, and every fallback
 # row is `claim fell back`; a `program:<path>` registry line overrides the class owner for that
-# program. The summary line goes to stderr, with deltas against `--prev`.
+# program, and `program:<path>@<unit>` for that one unit. The summary line goes to stderr, with deltas against `--prev`.
 set -euo pipefail
 CEN=${1:?usage: red.sh <census-out> <sweep-out> [--sha <sha>] [--prev <red.tsv>]}
 SW=${2:?usage: red.sh <census-out> <sweep-out> [--sha <sha>] [--prev <red.tsv>]}
@@ -67,7 +67,8 @@ done < "$SW/failing.tsv"
       if (n <= 1) { print $1, p, $3, "-", "-", "unowned"; next }
       for (i = 1; i < n; i++) {
         split(L[i], f, "\t"); k = cls(f[1], f[2])
-        o = ("program:" p) in own ? own["program:" p] : (k in own ? own[k] : "unowned")
+        pu = "program:" p "@" f[1]
+        o = pu in own ? own[pu] : (("program:" p) in own ? own["program:" p] : (k in own ? own[k] : "unowned"))
         print $1, p, $3, f[1], f[2], o
       }
     }' "$OWNERS" "$T/unc" "$T/fail" | sort
