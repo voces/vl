@@ -5,10 +5,8 @@
 # class, `<lane>\t<rows>\t<distinct functions>\t<start bodies>\t<programs>\t<slug>\t<class>`, where
 # rows = functions + start bodies, counted as summary.sh counts them and summed over populations;
 # a module-level `claim fell back` (no function row holds it) counts one row for its program.
-# Lanes follow the coordinator's ownership list of 2026-11-25 (if joins to COV-CLOS, unions and
-# most `??` arms to COV-UNION, the lead-staging family, other start-only classes and orphans to
-# CENSUS), by nearest family. A witness path is written from `wit/` on, since each census
-# regenerates the witnesses.
+# The lane is red.sh's owner (family.awk over owners.tsv). A witness path is written from `wit/`
+# on, since each census regenerates the witnesses.
 # Feed one list back as `CENSUS_CLASS=<file> scripts/ir-i8-census/census.sh <seed> <out>`.
 #
 #     scripts/ir-i8-census/class-programs.sh <out-dir> [top]     # top: the first <top> rows only
@@ -19,38 +17,17 @@ mkdir -p "$OUT/classes"
 rm -f "$OUT"/classes/*.txt "$OUT/classes/index.tsv"
 for pop in self distilled cases probes witnesses scripts harness; do
   [ -f "$OUT/$pop.rows" ] && awk -F'\t' -v pop="$pop" '{ print pop "\t" $0 }' "$OUT/$pop.rows"
-done | awk -F'\t' -v out="$OUT/classes" '
+done | awk -F'\t' -v out="$OUT/classes" -v owners="$(dirname "$0")/owners.tsv" "$(cat "$(dirname "$0")/family.awk")"'
+  BEGIN { famLoad(owners) }
   function key(f, nm) { return (nm ~ /\$m/) ? nm : f "::" nm }
   function slug(s,   t) { t = tolower(s); gsub(/\+/, " plus ", t); gsub(/[^a-z0-9]+/, "-", t); gsub(/^-|-$/, "", t); return substr(t, 1, 60) }
-  function lane(c) {
-    # Re-cut 2026-11-26 (coordinator rulings): the late box and the open-type family go to CENSUS,
-    # the listGetOr staged and index reads to COV-CALL.
-    if (c ~ /^(box of a (valued if|null-typed value)|open (local|temp|parameter) type|parameter rep unsup|shared member callee kid|closure argument box)/) return "CENSUS"
-    if (c ~ /^(coalesce listGetOr (staged|index) operand|get index)/) return "COV-CALL"
-    if (c ~ /^(short-circuit right operand|short-circuit argument after another|(slice|method|push|store|simd|array spread) short-circuit operand)$/) return "CENSUS"
-    if (c ~ /^(read of <name>|closure |capture|callee captures|array spread |for in |map |list |null unit read rep|null unit element|coalesce listGetOr|coalesce mapJoin|coalesce optional mapField|hole closure|tag dispatch lambda|expression if |scalar map|ref if |rep nullable of if|union if |box of a valued if|declaration if per arm coercion)/ || c ~ /list delivery|valued if/) return "COV-CLOS"
-    if (c ~ /^(call of a non-declaration|indirect call|intrinsic |bundle parameter read|method |named call|record compare|coalesce optional record field|coalesce boxRuntime|callee signature|short-circuit closure argument|print )/) return "COV-CALL"
-    if (c ~ /^(union (compare|cast|staged)|coalesce |optional read|assignment value|store arm)/) return "COV-UNION"
-    if (c ~ /^(box |null test |null name test|array null sentinel|is box not a local|is member storage rep|atom tower place|pre-path nul atom niche|narrowed read|claim fell back: verifier)/) return "COV-IS"
-    if (c ~ /coercion/ || c ~ /^(widen |void return value|open .* type|parameter rep unsup|operand type)/) return "COV-START"
-    if (c ~ /arm unbox|box|^(is |null|tail if |else-less|never |not over a never|identity compare|store null|store of an assignment of null|object field explicitNull|object field nulStrAtom|rep nullable|local rep nullable|nullable|atom |decided is|int switch|operand at null|compare of a joined const atom|string atom)/) return "COV-IS"
-    if (c ~ /^(member |shared member|field store|field read|object field|object variant|get index|index |array ref|string operand)/) return "COV-CALL"
-    if (c ~ /^(global |rep |list reserve|float literal|unary |operator |string literal|array long|array new|staged literal|local slot|for range|zero-extending|expression as|trap message|returned trap|integer negation|simd |push |assignment target|store element|pre-path |arm site|expression null|tail arm)/) return "COV-START"
-    return "CENSUS"
-  }
-  # A class only start bodies miss on goes to CENSUS unless COV-START owns it or it is a `??` or union
-  # class, which COV-UNION takes (coordinator rulings, 2026-11-25): its function owner never meets it.
-  function owner(w,   l) {
-    l = lane(w)
-    if (dist[w] > 0 || st[w] == 0 || l == "COV-START") return l
-    if (w ~ /^(coalesce |union (compare|cast|staged)|optional read|assignment value|store arm)/) return "COV-UNION"
-    return "CENSUS"
-  }
   function norm(w) {
     sub(/^read of [A-Za-z0-9_$]+$/, "read of <name>", w)
     sub(/^claim fell back: .*list delivery.*/, "claim fell back: list delivery", w)
     return w
   }
+  # A refusal a claim met is held by the `fnr` or `fnu` row of its unit; `fnr` is no class.
+  $4 ~ /^claim fell back: [a-z ]*a legacy helper refused in `/ && $4 !~ /^claim fell back: const cell / { next }
   $4 ~ /^claim fell back/ { f = $2; j = index(f, "/wit/"); if (j) f = substr(f, j + 1); fb[$1 "\t" f, norm($4)] = 1; next }
   $4 ~ /^fnu / {
     r = substr($4, 5); i = index(r, " | "); nm = substr(r, 1, i - 1); why = norm(substr(r, i + 3))
@@ -67,7 +44,7 @@ done | awk -F'\t' -v out="$OUT/classes" '
       split(x, q, SUBSEP); mod[q[2]]++; cls[q[2]] = 1
       p = q[2] SUBSEP q[1]; if (!(p in prog)) { prog[p] = 1; np[q[2]]++ }
     }
-    for (w in cls) printf "%s\t%d\t%d\t%d\t%d\t%s\t%s\n", owner(w), dist[w] + st[w] + mod[w], dist[w], st[w], np[w], slug(w), w > (out "/index.unsorted")
+    for (w in cls) printf "%s\t%d\t%d\t%d\t%d\t%s\t%s\n", famOwner(w), dist[w] + st[w] + mod[w], dist[w], st[w], np[w], slug(w), w > (out "/index.unsorted")
     for (p in prog) { split(p, q, SUBSEP); print q[2] > (out "/" slug(q[1]) ".unsorted") }
   }'
 sort -t$'\t' -k2,2nr -k7,7 "$OUT/classes/index.unsorted" > "$OUT/classes/index.tsv"
