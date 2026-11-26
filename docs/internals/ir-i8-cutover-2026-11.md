@@ -219,7 +219,9 @@ start body.
 **The dress rehearsal and its red list** (coordinator ruling, 2026-11-25). A draft PR titled "I8
 DRESS REHEARSAL" holds the I8 PR built on fresh master: `--apply`, the driver arms as
 `emitUnclaimed`, the hand fixes, `ir-i8-rebaseline.sh`. INFRA regenerates it every few hours and
-posts the red list there; this table is the latest, by owner.
+posts the red list there; this table is the latest, by owner. One regeneration is
+`scripts/ir-i8-regen.sh`: it replays the draft's hand commits onto `--apply` on fresh master, so a
+hand fix is a commit on the draft and is never redone by hand.
 
 | as of | what fails | count | owner |
 |---|---|---:|---|

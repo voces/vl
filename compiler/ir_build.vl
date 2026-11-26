@@ -13372,7 +13372,7 @@ function arrayLit(
       er,
       -1,
       arrRefUnionElemTy(ix, uslot, ibFnIx),
-    ) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else if nulSent && arrElemNulSent(e, ibFnIx) { nulSentinelElem(b, e, er) } else if arm == "ref" && elemTwinTy(e, er) >= 0 { objLitAt(
+    ) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else if nulSent && nulSentElemAt(e) { nulSentinelElem(b, e, er) } else if arm == "ref" && elemTwinTy(e, er) >= 0 { objLitAt(
       b,
       unwrapParen(e),
       er,
@@ -13814,6 +13814,8 @@ function coalMapScalarJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
   const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
   if ka != "plain" && ka != "i64" { return irBMiss("map key " + ka) }
+  // A default the miss arm writes as a body leaves the read's value on the stack from here.
+  const clear = !endsInTemp(b)
   const rcv = mapRecvKeyOf(
     b,
     rd.idxArr,
@@ -13826,8 +13828,24 @@ function coalMapScalarJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const dv = deliver(db, n.binRight, rep, boxDstTyOf(n.binRight, ibFnIx))
   if ibMiss != "" { return dv }
   if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
+  // A default that computes is the fused read's miss arm, which writes the out (`mapGetOrBox`).
   if !defaultSelfContained(db, 0, dv) {
-    return irBMiss("coalesce mapScalarJoin default computes")
+    if !clear { return irBMiss("map read default after an operand") }
+    return mapGetOrBox(
+      b,
+      db,
+      dv,
+      ix,
+      rep,
+      {
+        prSym: rcv.mkSym,
+        prNonNull: rcv.mkNonNull,
+        prKey: rcv.mkKey,
+        prForm: 7,
+      },
+      rcv.mkLoc,
+      -1,
+    )
   }
   for id in db { b.push(id) }
   const r: Rhs = {
@@ -13861,6 +13879,8 @@ function mapGetOrScalarBox(
   if ka != "plain" && ka != "i64" && ka != "atom" {
     return irBMiss("map key " + ka)
   }
+  // A default the miss arm writes as a body leaves the read's value on the stack from here.
+  const clear = !endsInTemp(b)
   const rcv = mapRecvKeyOf(
     b,
     rd.idxArr,
@@ -13873,8 +13893,24 @@ function mapGetOrScalarBox(
   const dv = deliver(db, n.binRight, rep, scalarBoxNullTyOf(ak))
   if ibMiss != "" { return dv }
   if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
+  // A default that computes is the fused read's miss arm, which writes the out (`mapGetOrBox`).
   if !defaultSelfContained(db, 0, dv) {
-    return irBMiss("map read scalarBox default computes")
+    if !clear { return irBMiss("map read default after an operand") }
+    return mapGetOrBox(
+      b,
+      db,
+      dv,
+      ix,
+      rep,
+      {
+        prSym: rcv.mkSym,
+        prNonNull: rcv.mkNonNull,
+        prKey: rcv.mkKey,
+        prForm: 8,
+      },
+      rcv.mkLoc,
+      -1,
+    )
   }
   for id in db { b.push(id) }
   const r: Rhs = {
@@ -15212,11 +15248,14 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
   // sentinel's. Each default is delivered at the read's rep, as `emitMonoMapDefault` writes it.
   const at = arm == "atom"
   const st = arm == "sentinel"
+  // A scalar value read at a wider number kind is widened in the hit arm (`mapGetOrWidenHead`).
+  const wd = arm == "widen"
   if (
     arm != "helper"
     && arm != "i32"
     && !at
     && !st
+    && !wd
     && !mv
     && !mvu
     && !nz
@@ -15236,7 +15275,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
   }
   const rp = repPrim(rep)
   const uk = if uq != null { uq.muWide } else { -1 }
-  const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32"
+  const repOk = if mvu { irBAtomKindRep(uk, rep) } else if wd { irBAtomKindRep(rk, rep) } else { rp == "i32"
     || (arm == "i32" || arm == "helper") && rp == "bool"
     || (at || st) && repHeldAsI32(rep)
     || mv
@@ -15279,7 +15318,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
   if irBOpRep(dv) != (if bx { bv } else { rep }) {
     return irBMiss("map read default rep")
   }
-  const form = if st { 6 } else if bx { 5 } else if nz { 4 } else if mvu { 3 } else if mv { 2 } else if inline { 1 } else { 0 }
+  const form = if wd { 9 } else if st { 6 } else if bx { 5 } else if nz { 4 } else if mvu { 3 } else if mv { 2 } else if inline { 1 } else { 0 }
   // The mv slot's read is the map's value as itself: a read held at another rep (a record type no
   // row records, read at its storage row) is one the map's own rep does not yet carry.
   if form == 2 && mapValRepOf(rcvMapRep(rcv)) != rep {
@@ -21745,6 +21784,12 @@ function nulSentinelElem(b: i32[], e: i32, er: i32): Opnd {
   const v = irBExpr(b, e)
   if ibMiss != "" { return v }
   return irBLetTempTy(b, { aeEff: [v], aeV: two, aeAt: e }, e, er, TY_I32)
+}
+
+// Whether element `e` of a `null[]` literal is that list's null: legacy's own test
+// (`arrElemNulSent`), or a value at the `null` rep, an instance's `T | null` at `never`.
+function nulSentElemAt(e: i32): boolean {
+  return arrElemNulSent(e, ibFnIx) || repPrim(exprRepOf(e)) == "null"
 }
 
 // An unstamped `null` stored into a `null[]`, as `emitIdxStoreValue` writes it: the value for its
