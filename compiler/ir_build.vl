@@ -2299,10 +2299,10 @@ function nullFoldedTy(t: i32, rep: i32): i32 {
 // Type `t` of `ix`, or where `rowlessRecordRep` moved its rep `rep` to a storage row, that row's
 // recorded type.
 function rowlessRecordTy(ix: i32, t: i32, rep: i32): i32 {
-  if t < 0 || repNodeOfTy(t) == rep || !rowlessRecord(t, repNodeOfTy(t)) {
+  if t < 0 || repNodeOfTy(t) == rep || !builtRecord(t, repNodeOfTy(t)) {
     return t
   }
-  const rt = rowlessStoredTy(t, repNodeOfTy(t), storeRowTyOf(ix))
+  const rt = builtStoredTy(t, repNodeOfTy(t), storeRowTyOf(ix))
   return if rt >= 0 && repNodeOfTy(rt) == rep { rt } else { t }
 }
 
@@ -2322,6 +2322,27 @@ function storeRowTyOf(ix: i32): i32 {
 // records, is held at that row's rep; else -1. A value and a place each name the row they store it in.
 function rowlessStoredTy(t: i32, rep: i32, rowTy: i32): i32 {
   if !rowlessRecord(t, rep) || rowTy < 0 || irTyOpen(rowTy) { return -1 }
+  const rr = repNodeOfTy(rowTy)
+  return if rr != rep && repNodeAt(rr) is RRecord { rowTy } else { -1 }
+}
+
+// Whether the ref-list row legacy lays list `arr` out on (`refListSlotOfExpr`) holds its elements
+// at rep `e`: the row a built list is held at (`listRowRep`), so its element reads there.
+function listRowElemIs(arr: i32, e: i32): boolean {
+  const slot = refListSlotOfExpr(unwrapParen(arr), ibFnIx)
+  const et = if slot >= 0 { rlElemTyIxAt(slot) } else { -1 }
+  return et >= 0 && !irTyOpen(et) && repNodeOfTy(et) == e
+}
+
+// Whether a value of type `t` (any type at all) is held at record rep `rep`: the rep alone decides.
+function builtRecord(t: i32, rep: i32): boolean {
+  return t >= 0 && repNodeAt(rep) is RRecord
+}
+
+// Storage row type `rowTy` where a built value of record type `t` at rep `rep` is held at that row's
+// rep, another record; else -1.
+function builtStoredTy(t: i32, rep: i32, rowTy: i32): i32 {
+  if !builtRecord(t, rep) || rowTy < 0 || irTyOpen(rowTy) { return -1 }
   const rr = repNodeOfTy(rowTy)
   return if rr != rep && repNodeAt(rr) is RRecord { rowTy } else { -1 }
 }
@@ -3307,15 +3328,32 @@ function listRowTyOf(ix: i32, r: i32): i32 {
   return lt
 }
 
-// Rep `r` of `ix` at type `t`, or, for a built value of a record type no struct row records, the
-// rep of the row legacy stores it in (`structIndexOfExpr`).
+// Rep `r` of built value `ix` at record type `t`, or the rep of the row legacy stores it in
+// (`structIndexOfExpr`): a value's rep follows its storage. A place keeps its own.
 function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
-  if !rowlessRecord(t, r) { return r }
+  if !builtRecord(t, r) { return r }
   // A read of a place holds the place's rep, which the place decides (`rowlessLetTy`).
   const nd = nodeAt(unwrapParen(ix))
   if nd is Ident || nd is Member { return r }
-  const rt = rowlessStoredTy(t, r, storeRowTyOf(ix))
-  return if rt >= 0 { repNodeOfTy(rt) } else { r }
+  const rt = builtStoredTy(t, r, storeRowTyOf(ix))
+  if rt < 0 { return r }
+  // The exclusions below hold for a type a struct row records; a rowless one moves, as before.
+  // Removed by layout stage 2 (a literal at its row, its function's result at the row too): an
+  // object literal stays at its own rep, the one its function's result returns.
+  if structIndexOfTy(t) >= 0 && nd is ObjLit { return r }
+  // An element read moves only off a list laid out at that row (`listRowRep`).
+  if (
+    structIndexOfTy(t) >= 0
+    && nd is Index
+    && !listRowElemIs(nd.idxArr, repNodeOfTy(rt))
+  ) {
+    return r
+  }
+  // Removed by layout stage 2: a value whose rep retags into the row (a twin) keeps its rep.
+  if structIndexOfTy(t) >= 0 && recRetagNoted(r, repNodeOfTy(rt), ix) {
+    return r
+  }
+  return repNodeOfTy(rt)
 }
 
 // The type of `??` `ix` along the `mapIndexGetOr` arm: its map's value, the default filling a
@@ -3836,7 +3874,16 @@ export function irBLetTempTy(
     || p == "f32"
     || p == "f64"
     || p == "bool"
-  const ty = if scalar && irTyHeldOpen(ty1, rep) && repTyOf(rep) >= 0 { repTyOf(rep) } else { ty1 }
+  const ty2 = if scalar && irTyHeldOpen(ty1, rep) && repTyOf(rep) >= 0 { repTyOf(rep) } else { ty1 }
+  // A closure held at an open type's uniform closure rep is typed at that rep's own type, which
+  // rule 1 takes as held (`closureHeld`), so its type and rep agree for rule 3.
+  const crt = repTyOf(rep)
+  const cloHeld = repNodeAt(rep) is RClosure
+    && repNodeOfTy(ty2) != rep
+    && crt >= 0
+    && repNodeOfTy(crt) == rep
+    && !irTyHeldOpen(crt, rep)
+  const ty = if cloHeld { crt } else { ty2 }
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
   // the verifier can close, so its function stays legacy's.
   if ibTyOpen(ty, rep) { return irBMiss("open temp type") }
@@ -5500,15 +5547,20 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     && heldAsBox(cr)
     && heldAsBox(rep)
     && readNarrowedTyAt(ix, ibFnIx) >= 0
+  // A capture held at a record row its read's type does not record is read as it is held, as a
+  // local's read is (`rowlessReadTyOfVar`), typed at the row its fields are read at.
+  const rowTy = if cr != rep && !narrowed && !holed && !boxed { capRowlessTy(fe, name, ix, cr) } else { -1 }
   if (
     cr != rep
     && !narrowed
     && !holed
     && !boxed
+    && rowTy < 0
     && !capCellListSame(fe, name, cr, rep)
   ) {
     return irBMiss("capture binding")
   }
+  if rowTy >= 0 { return capturedAsHeld(b, fe, name, ix, cr, rowTy) }
   // The capture is held at its binding's type, or a walk variable's (`capLoopTyOf`), whose rep
   // must be the one it is read at first.
   const atOwn = narrowed || holed || boxed
@@ -5547,6 +5599,37 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if boxed { return irBLetTemp(b, { sgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
+}
+
+// The type capture `name` of `fe`, held at rep `cr`, is held at where its read `ix` names a record
+// row that type does not record (`rowlessReadTyAt`); -1 for none.
+function capRowlessTy(fe: i32, name: string, ix: i32, cr: i32): i32 {
+  const ct = capTyOf(fe, name)
+  if ct < 0 || repNodeOfTy(ct) != cr { return -1 }
+  const rt = rowlessReadTyAt(nodeTyAt(ix, ibFnIx), ct)
+  return if rt == ct { ct } else { -1 }
+}
+
+// Read `ix` of capture `name` of `fe` at its own rep `cr` and type `ct`: the environment's field,
+// or the lifted function's parameter.
+function capturedAsHeld(
+  b: i32[],
+  fe: i32,
+  name: string,
+  ix: i32,
+  cr: i32,
+  ct: i32,
+): Opnd {
+  if !cloLifted(fe) {
+    const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
+    ib.irReadAgain[ix] = ev
+    return irBLetTempTy(b, ev, ix, cr, ct)
+  }
+  const v = liftCapVar(fe, name, cr)
+  if v < 0 || ib.irVars[v].vRep != cr { return irBMiss("capture binding") }
+  ib.irReadVar[ix] = v
+  const o: Opnd = { ov: v }
+  return o
 }
 
 // The atom rep capture `name` of `fe` is held at where its read `ix` at plain string `rep` reads
@@ -10448,6 +10531,15 @@ function nulReadDropped(b: i32[], v: Opnd): boolean {
   return true
 }
 
+// Whether `v` is the temp the last node of `b` defines by a call that never returns.
+function neverCallTempIn(b: i32[], v: Opnd): boolean {
+  if !(v is OVar) || b.length == 0 { return false }
+  const n = ib.irNodes[b[b.length - 1]]
+  if !(n is SLet) || n.lDst != v.ov { return false }
+  const r = n.lRhs
+  return r is RCall && r.caNever || r is RCallRef && r.crNever
+}
+
 // Where the last node of `b` defines `v` as the unbox of an assignment's parked box
 // (`assignValueBoxedArm`): that node dropped and the box returned; else null.
 function parkedBoxOf(b: i32[], v: Opnd): Opnd | null {
@@ -10501,13 +10593,30 @@ function boxTempIn(
     return repTemp(b, { nnV: v, nnPay: false, nnAt: ix }, ix, dst)
   }
   let p = holeBoxPlanOf(ix, uTy, ibFnIx)
+  // A call that never returns has no value to box: its temp takes the box's rep, its consumer's,
+  // as legacy writes the call alone (`callIsNever`).
+  if neverCallTempIn(b, v) {
+    const last = b[b.length - 1]
+    if (
+      v is OVar
+      && v.ov >= 0
+      && v.ov < ib.irVars.length
+      && last >= 0
+      && last < ib.irNodeRep.length
+    ) {
+      ib.irVars[v.ov].vRep = dst
+      ib.irNodeRep[last] = dst
+      return v
+    }
+  }
   // A `null` the builder delivers for a node that is no `null` literal (a binding's absent
-  // initializer) is the destination's null box, as legacy writes a bare `null`.
+  // initializer, an assignment of `null` used as a value) is the destination's null box, as legacy
+  // writes a bare `null`; a `null`-unit read that reads nothing is dropped (`nulReadDropped`).
   if (
     p.hbArm == "ladder"
-    && v is OImm
-    && irBOpRep(v) == ibNoValue
     && nullOwnRepFits(NULL_OWN_BOX, dst)
+    && (v is OImm && irBOpRep(v) == ibNoValue
+      || repPrim(irBOpRep(v)) == "null" && nulReadDropped(b, v))
   ) {
     return repTemp(
       b,
@@ -17676,7 +17785,14 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       irBNode(b, { rtHas: false, rtV: z }, -1, ibNoValue, ix)
       return 0
     }
-    if none { return skip("void return value") }
+    // At a function with no result, `return <expr>` is `<expr>` for its effect, then a bare return.
+    if none {
+      stmtNode(b, n.retArg, NO_SIBS, -1)
+      if ibMiss != "" { return 0 }
+      const z: Opnd = { ov: -1 }
+      irBNode(b, { rtHas: false, rtV: z }, -1, ibNoValue, ix)
+      return 0
+    }
     // A returned call that never returns is that call, then the `return` legacy writes after it,
     // dead and bare; at a wider number legacy also widens the dead value.
     const rx = unwrapParen(n.retArg)
@@ -18289,9 +18405,13 @@ function boundRowlessReadTy(u: i32): i32 {
 // `boundRowlessReadTy` for read `u` of variable `v`, which any local read names, a loop's own.
 function rowlessReadTyOfVar(u: i32, v: i32): i32 {
   if v < 0 { return -1 }
-  const t = nodeTyAt(u, ibFnIx)
+  return rowlessReadTyAt(nodeTyAt(u, ibFnIx), ib.irVars[v].vTy)
+}
+
+// The type `vt` a place is held at where a read of it typed `t` names a record row `vt` does not
+// record, or none (`rowlessStoredTy`); -1 when the two agree.
+function rowlessReadTyAt(t: i32, vt: i32): i32 {
   const r = repNodeOfTy(t)
-  const vt = ib.irVars[v].vTy
   const rl = rowlessStoredTy(t, r, vt)
   if rl >= 0 { return rl }
   if t < 0 || vt < 0 || t == vt || !(repNodeAt(r) is RRecord) { return -1 }
