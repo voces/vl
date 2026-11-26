@@ -564,6 +564,10 @@ import {
   listReserveOpen,
   loopHoistCands,
   loopHoistClose,
+  luForBoxArms,
+  luForBoxPlanOf,
+  luForElemChain,
+  luForLenChain,
   mapClearTail,
   mapDeleteTail,
   mapGetArmOf,
@@ -947,7 +951,9 @@ import {
   localIsRef,
   localStructIdx,
   loopBrkDepth,
+  loopBrkLabel,
   loopContDepth,
+  loopContLabel,
   sHeapIdx,
   sTy,
   shIdxFrom,
@@ -3773,6 +3779,7 @@ export function mapRecvGlobalIx(recvIx: i32, fnIx: i32): i32 {
 // element variable's slot, the list stored, its header hoist, the cursor, the body's index hoists,
 // the IR's body in each unrolled copy and the rolled loop, and the scope closed.
 function forIn(n: SForIn, pending: i32[]) {
+  if n.xfLu { return forInListUnion(n, pending) }
   const fnIx = lw.irAt
   if n.xfAt < 0 { return irLMiss("walk node") }
   const s = nodeAt(n.xfAt)
@@ -3915,6 +3922,70 @@ function rangeLoop(n: SRangeLoop, pending: i32[]) {
     rangePartialOuterClose()
   }
   irLoopCloseHook(hoists)
+  scopeUnbind()
+  return 0
+}
+
+// `SForIn` over a union of lists' box (`xfLu`): the box in the walk's list slot, then one loop
+// whose bound and element are each read off the arm the box holds, the cursor stepped before the
+// body as legacy's union walk steps it.
+function forInListUnion(n: SForIn, pending: i32[]) {
+  const fnIx = lw.irAt
+  if n.xfAt < 0 { return irLMiss("walk node") }
+  const s = nodeAt(n.xfAt)
+  if !(s is ForIn) { return irLMiss("walk node") }
+  const lp = luForBoxPlanOf(luForBoxArms(s, fnIx))
+  if lp.lbWhy != "" { return irLMiss("walk list union") }
+  const vSlot = declaredSlotOfDecl(s.fiDecl1)
+  const vIdx = varSlot(n.xfVar)
+  if vSlot < 0 || vIdx < 0 { return irLMiss("walk slot") }
+  const iIdx = vIdx + 1
+  const lIdx = vIdx + 2
+  const pair = s.fiVar2 != ""
+  if pair && (n.xfVar2 < 0 || varSlot(n.xfVar2) != vIdx + 3) {
+    return irLMiss("walk pair slot")
+  }
+  cond(n.xfList, pending)
+  fbLocalSet(lIdx)
+  fbI32Const(0)
+  fbLocalSet(iIdx)
+  const h = irLoopHoistOpen(-1, s.fiBody, s.fiDecl1, s.fiDecl2)
+  if h < 0 { return irLMiss("walk hoists") }
+  scopeBind(s.fiVar, vSlot)
+  if pair { scopeBind(s.fiVar2, forInPairSlotOf(vSlot)) }
+  const d0 = ctrlDepth
+  forInBreakOpen(s)
+  fbLoop(64) // 0x03 loop, void
+  loopContDepth.push(ctrlDepth)
+  loopContLabel.push(s.fiLabel)
+  const k = walkFrames(n, d0)
+  fbLocalGet(iIdx)
+  luForLenChain(lIdx, lp.lbPlan, 0)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)
+  if luForElemChain(lIdx, iIdx, lp.lbPlan, 0) < 0 {
+    return irLMiss("walk element")
+  }
+  fbLocalSet(vIdx)
+  if pair {
+    fbLocalGet(iIdx)
+    fbLocalSet(vIdx + 3)
+  }
+  fbLocalGet(iIdx)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iIdx)
+  body(n.xfBody, false, -1, false)
+  framesPop(k)
+  fbBr(0)
+  fbEnd()
+  loopContDepth.pop()
+  loopContLabel.pop()
+  fbEnd()
+  loopBrkDepth.pop()
+  loopBrkLabel.pop()
+  loopHoistClose(h)
+  if pair { scopeUnbind() }
   scopeUnbind()
   return 0
 }
