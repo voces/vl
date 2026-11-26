@@ -855,6 +855,7 @@ import {
   letCellKind,
   letCellSlot,
   letIsNulNone,
+  letMapShapeOfTy,
   letNulMapReadUnionBox,
   listTyOfElem,
   localIndexOf,
@@ -4121,10 +4122,52 @@ export function irBDeclVar(d: i32): i32 {
   }
   const lt = declRowLetTy(d, rep)
   if lt >= 0 { return declVarAt(d, repNodeOfTy(lt), lt) }
+  const sm = slotMapHeldTy(d, ty)
+  if sm >= 0 { return declVarAt(d, repNodeOfTy(sm), sm) }
   const rl = rowlessLetTy(d, ty, rep)
   if rl >= 0 { return declVarAt(d, repNodeOfTy(rl), rl) }
   if letLitUndeclaredRow(d) { ibDeclRowSeen = true }
   return declVarAt(d, rep, ty)
+}
+
+// Whether local `v`, declared at `d`, is held at the map type its slot stores (`slotMapHeldTy`).
+function slotMapHeldVar(d: i32, v: i32): boolean {
+  if d < 0 || v < 0 || v >= ib.irVars.length { return false }
+  const st = slotMapHeldTy(d, heldTy(scopeTyAt(d, ibFnIx)))
+  return st >= 0 && repNodeOfTy(st) == ib.irVars[v].vRep
+}
+
+// Whether initializer `init` is a `Map()` and local `v` is held at a map other than the call's own
+// type: legacy's constructor writes the slot's shape (`mapNewShapeOf`), so the map is built at
+// the local's rep.
+function letMapNewHeld(init: i32, v: i32): boolean {
+  const u = unwrapParen(init)
+  if u < 0 || u >= P.nodes.length || v < 0 || v >= ib.irVars.length {
+    return false
+  }
+  const c = nodeAt(u)
+  return c is Call
+    && mapNewCall(c)
+    && repNodeAt(ib.irVars[v].vRep) is RMap
+    && repNodeOfTy(nodeTyAt(u, ibFnIx)) != ib.irVars[v].vRep
+    && exprPrePathWhy(u, ibFnIx) == ""
+}
+
+// The map type `let` `d`'s local of map type `ty` is stored at: the map of the value type its cell's
+// shape holds (`letMapShapeOfTy`, the plan legacy's cell is declared from), where that value type is
+// closed at another rep (a later widening's row); else -1.
+function slotMapHeldTy(d: i32, ty: i32): i32 {
+  const m = repNodeAt(repNodeOfTy(ty))
+  if !(m is RMap) || d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) {
+    return -1
+  }
+  const sh = letMapShapeOfTy(d, ibFnIx)
+  if sh < 0 { return -1 }
+  const st = mvValTyIxAt(sh)
+  if st < 0 || irTyOpen(st) || repNodeOfTy(st) == m.rmVal { return -1 }
+  if !(repNodeAt(repNodeOfTy(st)) is RRecord) { return -1 }
+  const mt = mapTyWithVal(ty, st)
+  return if mt >= 0 && repNodeAt(repNodeOfTy(mt)) is RMap { mt } else { -1 }
 }
 
 // The record type of the struct row legacy declares `let` `d`'s local at, where that row is not
@@ -6320,6 +6363,16 @@ function narrowedLocalRead(
   // A read of a variable held at a row its read type does not record is the variable as it is,
   // the row `declRowReadTy` reads its fields at (`rowlessReadTyOfVar`).
   if rowlessReadTyOfVar(ix, v) == ib.irVars[v].vTy { return o }
+  // A map local held at its slot's map (`slotMapHeldTy`) reads as it is stored.
+  if slotMapHeldVar(identDeclOf(ix), v) { return o }
+  // A nullable record local held at a row its narrowed read's record does not record reads past
+  // its null at that row.
+  const pn = storedPastNullTy(ix, v, rep)
+  if pn >= 0 {
+    const rc: Rhs = { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) }
+    ib.irReadAgain[ix] = rc
+    return irBLetTempTy(b, rc, ix, repNodeOfTy(pn), pn)
+  }
   if (
     holeRetagNoted(ib.irVars[v].vRep, rep, true)
     && exprPrePathWhy(ix, ibFnIx) == ""
@@ -14523,6 +14576,11 @@ function mapGetOrUnionMiss(
 // another record, whose rep is the map's value rep `vr`, the value legacy holds there (the
 // storage-key row D14890 keeps the type's own rep beside); else `rep`.
 function mapReadStoredRep(ix: i32, rep: i32, vr: i32): i32 {
+  return storedRowRep(nodeTyAt(ix, ibFnIx), rep, vr)
+}
+
+// `mapReadStoredRep` for a read of record type `t` at its rep `rep`.
+function storedRowRep(t: i32, rep: i32, vr: i32): i32 {
   if (
     vr < 0
     || vr == rep
@@ -14531,7 +14589,6 @@ function mapReadStoredRep(ix: i32, rep: i32, vr: i32): i32 {
   ) {
     return rep
   }
-  const t = nodeTyAt(ix, ibFnIx)
   const si = if t >= 0 { structIndexOfTy(t) } else { -1 }
   if si < 0 || si >= sTyIx.length || sTyIx[si] == t { return rep }
   return if repNodeOfTy(sTyIx[si]) == vr { vr } else { rep }
@@ -14539,9 +14596,31 @@ function mapReadStoredRep(ix: i32, rep: i32, vr: i32): i32 {
 
 // The type `mapReadStoredRep`'s row records for read `ix`, or -1.
 function mapReadStoredTy(ix: i32): i32 {
-  const t = nodeTyAt(ix, ibFnIx)
+  return storedRowTy(nodeTyAt(ix, ibFnIx))
+}
+
+// The type the struct row of record type `t` records, or -1.
+function storedRowTy(t: i32): i32 {
   const si = if t >= 0 { structIndexOfTy(t) } else { -1 }
   return if si >= 0 && si < sTyIx.length { sTyIx[si] } else { -1 }
+}
+
+// The `R | null` type a bare read `ix` typed at a nullable record is held at, where the map's
+// value rep `val` is its slot `sh`'s stored record, or the record its struct row records
+// (`storedRowRep`); -1 for any other read.
+function mapGetStoredTy(ix: i32, sh: i32, rep: i32, val: i32): i32 {
+  const n = repNodeAt(rep)
+  if !(n is RNullable) || n.rnDisc != 1 || !(repNodeAt(n.rnInner) is RRecord) {
+    return -1
+  }
+  const t = recoveredReadTyOf(nodeTyAt(ix, ibFnIx))
+  if t < 0 || repNodeOfTy(t) != n.rnInner { return -1 }
+  const st = if sh >= 0 { mvValTyIxAt(sh) } else { -1 }
+  const vt = if st >= 0 && !irTyOpen(st) && repNodeOfTy(st) == val { st } else if storedRowRep(t, n.rnInner, val) == val { storedRowTy(t) } else { -1 }
+  if vt < 0 { return -1 }
+  const nt = nullableTyOf(vt)
+  const nn = repNodeAt(repNodeOfTy(nt))
+  return if nn is RNullable && nn.rnDisc == 1 && nn.rnInner == val { nt } else { -1 }
 }
 
 // `g[k] ?? d` along legacy's helper route, its plain `i32` read or its plain mv slot read
@@ -14762,7 +14841,8 @@ function mapGetAt(
     || mapGetRepOk(sh, m.rmVal, rep, rd.idxArr)
   const nt = if plain { -1 } else { mapReadNicheTy(sh, m.rmVal, rep, rd.idxArr) }
   const twTy = if plain || nt >= 0 { -1 } else { mapGetTwinTy(sh, m.rmVal, rep, rd.idxArr) }
-  if !plain && nt < 0 && twTy < 0 { return irBMiss("map get rep") }
+  const stTy = if plain || nt >= 0 || twTy >= 0 { -1 } else { mapGetStoredTy(ix, sh, rep, m.rmVal) }
+  if !plain && nt < 0 && twTy < 0 && stTy < 0 { return irBMiss("map get rep") }
   const r: Rhs = {
     mtSym: rk.mkSym,
     mtNonNull: rk.mkNonNull,
@@ -14798,6 +14878,8 @@ function mapGetAt(
     )
   }
   if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
+  // A read of a record held at another row's record is that row's, as `mapReadStoredRep`.
+  if stTy >= 0 { return irBLetTempTy(b, r, ix, repNodeOfTy(stTy), stTy) }
   // A read at a twin of the value's rep is the value's own read, retagged.
   if twTy >= 0 {
     const v = irBLetTempTy(b, r, ix, repNodeOfTy(twTy), twTy)
@@ -15073,15 +15155,20 @@ function bodyAssigns(body: i32[], v: i32): boolean {
 }
 
 // Map type `ty` of a binding as legacy stores it, its mv slot read off expression `recvIx` (a read
-// of a global, a local's initializer): where its value type is open (a hole) and that slot stores a
-// closed value type (a bundle's record), the map of that type; else `ty`.
+// of a global, a local's initializer): where that slot stores a closed value type at another rep
+// than `ty`'s (a bundle's record for a hole, a later widening's row), the map of that type; else
+// `ty`.
 function mapSlotHeldTy(ty: i32, recvIx: i32): i32 {
   const m = repNodeAt(repNodeOfTy(ty))
-  if !(m is RMap) || !irTyOpen(repTyOf(m.rmVal)) || recvIx < 0 { return ty }
+  if !(m is RMap) || recvIx < 0 { return ty }
   const sh = mapRecvShapeOf(recvIx, ibFnIx)
   if sh < 0 { return ty }
   const st = mvValTyIxAt(sh)
-  if st < 0 || irTyOpen(st) { return ty }
+  if st < 0 || irTyOpen(st) || repNodeOfTy(st) == m.rmVal { return ty }
+  // A closed value held at another rep is the slot's only where it is a record.
+  if !irTyOpen(repTyOf(m.rmVal)) && !(repNodeAt(repNodeOfTy(st)) is RRecord) {
+    return ty
+  }
   const mt = mapTyWithVal(ty, st)
   return if mt >= 0 && repNodeAt(repNodeOfTy(mt)) is RMap { mt } else { ty }
 }
@@ -17395,6 +17482,17 @@ function mapWalkReadsValues(iter: i32): boolean {
   return c is Member && c.memProp == "values"
 }
 
+// The value type a values walk of map receiver `mr` holds its variable at, where `mr` reads a map
+// local held at its slot's map (`slotMapHeldVar`) whose record value is not rep `er`; else -1.
+function slotMapWalkValTy(mr: i32, er: i32): i32 {
+  const u = unwrapParen(mr)
+  if u < 0 || !(nodeAt(u) is Ident) || !(repNodeAt(er) is RRecord) { return -1 }
+  const v = boundVarOf(u)
+  if v < 0 || !slotMapHeldVar(identDeclOf(u), v) { return -1 }
+  const vt = tyMapValOf(ib.irVars[v].vTy)
+  return if vt >= 0 && repNodeOfTy(vt) != er && repNodeAt(repNodeOfTy(vt)) is RRecord { vt } else { -1 }
+}
+
 // A `for` statement along legacy's walk (`forInPlainWhy`, a hoisted one included): the list
 // once, its element variable at the declared slot, and the body. Every other walk is a named miss.
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
@@ -17444,13 +17542,16 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   // at (`rmVal`); its keys at the key rep legacy declares the variable at (`forInElemTyOf`), which
   // the walk records, as a map rep holds no key. The verifier's rule.
   const vals = mr >= 0 && mapWalkReadsValues(n.fiIter)
+  // A map local held at its slot's map (`slotMapHeldTy`) walks its values at that map's value.
+  const sv = if vals && g < 0 { slotMapWalkValTy(mr, er) } else { -1 }
+  if sv >= 0 { er = repNodeOfTy(sv) }
   const keyRep = if mr >= 0 && !vals { er } else { -1 }
   if keyRep >= 0 && !mapKeyRep(keyRep) { return skip("for in map element rep") }
   if mr >= 0 && vals && er != repNodeOfTy(TY_I32) && repPrim(er) != "str" {
     const mrep = if g >= 0 { irGlobalRepOf(ib, g) } else { irBOpRep(l) }
     if er != mapWalkValRep(mrep) { return skip("for in map element rep") }
   }
-  const v = irBLoopVar(n.fiDecl1, er, repTyOf(er))
+  const v = irBLoopVar(n.fiDecl1, er, if sv >= 0 { sv } else { repTyOf(er) })
   if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
   // A second name binds a sequence's index, an i32, or a map's value at its type's rep
   // (`forInBindTy`): legacy's walk writes either into the pair slot, which the body reads.
@@ -18349,7 +18450,13 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     // A `const` legacy keeps the bounded part of for later memory addresses (`emitLetPlainInit`).
     const mk = foldLetK(n, ix)
     if mk >= 0 { return foldLetAt(b, n, ix, v, mk) }
-    const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(
+    const built = if letMapNewHeld(n.letInit, v) { irBLetTempTy(
+      b,
+      { mnAt: unwrapParen(n.letInit) },
+      unwrapParen(n.letInit),
+      ib.irVars[v].vRep,
+      ib.irVars[v].vTy,
+    ) } else if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(
       b,
       unwrapParen(n.letInit),
       ib.irVars[v].vRep,
@@ -19080,6 +19187,31 @@ export function declRowReadTy(ix: i32): i32 {
 // row, which a `let`'s read also takes (`declRowParamVarOf`); else -1.
 function boundRowlessReadTy(u: i32): i32 {
   return rowlessReadTyOfVar(u, boundVarOf(u))
+}
+
+// The record type local `v`, held at `R | null`, is read at past its null where read `ix`, typed
+// at a record of rep `rep`, names a row `R` does not record (`rowlessReadTyAt`); else -1.
+function storedPastNullTy(ix: i32, v: i32, rep: i32): i32 {
+  if v < 0 || v >= ib.irVars.length { return -1 }
+  const vn = repNodeAt(ib.irVars[v].vRep)
+  if (
+    !(vn is RNullable)
+    || vn.rnDisc != 1
+    || vn.rnInner == rep
+    || !(repNodeAt(rep) is RRecord)
+  ) {
+    return -1
+  }
+  const st = recoveredReadTyOf(ib.irVars[v].vTy)
+  if (
+    st < 0
+    || repNodeOfTy(st) != vn.rnInner
+    || rowlessReadTyAt(nodeTyAt(ix, ibFnIx), st) != st
+  ) {
+    return -1
+  }
+  // The read is the checker's non-null narrowing itself, as `nullNarrowArmOf`'s "plain".
+  return if repNodeOfTy(heldTy(exprTyOf(ix))) == rep { st } else { -1 }
 }
 
 // `boundRowlessReadTy` for read `u` of variable `v`, which any local read names, a loop's own.
