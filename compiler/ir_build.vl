@@ -138,6 +138,7 @@ import {
   PrimOp,
   PushRecv,
   RAsgParked,
+  RAsgUnwiden,
   RBoxNarrow,
   RCall,
   RCallRef,
@@ -11000,9 +11001,38 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32, dstTy: i32): Opnd {
   if p.wpArm == "asgLit" && v is OImm && asg is BinExpr {
     return signedLitAt(unwrapParen(asg.binRight), dst)
   }
+  // An assignment of a wide cell (`asgRadixWidePrim`) hands on the cell's own read where the
+  // width is the cell's, or that read converted; any other width converts the narrowed value
+  // (`emitAsgRadixAs`).
+  if p.wpArm == "radix" {
+    const wk = if p.wpWide == "i64" { 3 } else if p.wpWide == "f64" { 4 } else if p.wpWide == "f32" { 5 } else { -1 }
+    if wk < 0 { return irBMiss("widen radix width") }
+    if wk == dk || dk == 4 && wk == 3 {
+      const wide = radixWideRead(b, v)
+      if ibMiss != "" { return wide }
+      if wk == dk {
+        if irBOpRep(wide) != dst { return irBMiss("widen radix rep") }
+        return wide
+      }
+      return numWidenTemp(b, wide, 3, 4, dst, ix)
+    }
+    return numWidenTemp(b, v, sk, dk, dst, ix)
+  }
   if p.wpArm != "plain" { return irBMiss("widen " + p.wpArm) }
   if p.wpSrc != sk { return irBMiss("widen source") }
-  // The temp is typed at the destination, whose rep it holds.
+  return numWidenTemp(b, v, sk, dk, dst, ix)
+}
+
+// Value `v` at number kind `sk` widened to kind `dk` at rep `dst`, node `ix`, in a temp typed at
+// the destination, whose rep it holds.
+function numWidenTemp(
+  b: i32[],
+  v: Opnd,
+  sk: i32,
+  dk: i32,
+  dst: i32,
+  ix: i32,
+): Opnd {
   const ty = repTyOf(dst)
   const t = irVarNew(ib, dst, ty, "temp", -1)
   irBNode(
@@ -11014,6 +11044,20 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32, dstTy: i32): Opnd {
   )
   const o: Opnd = { ov: t }
   return o
+}
+
+// The cell's own read under assignment value `v`, the narrowing `assignValueGo` wrote last
+// (`RAsgUnwiden`) taken back off `b`; any other value is a miss.
+function radixWideRead(b: i32[], v: Opnd): Opnd {
+  if !(v is OVar) || b.length == 0 { return irBMiss("widen radix value") }
+  const id = b[b.length - 1]
+  if id < 0 || id >= ib.irNodes.length { return irBMiss("widen radix value") }
+  const n = ib.irNodes[id]
+  if !(n is SLet) || n.lDst != v.ov { return irBMiss("widen radix value") }
+  const r = n.lRhs
+  if !(r is RAsgUnwiden) { return irBMiss("widen radix value") }
+  b.pop()
+  return r.uwV
 }
 
 // The temp of a call that never returns, `v`, read at i32 and widened to `to` at node `ix`; a
