@@ -13,6 +13,8 @@ type. Every builder read of a row's type goes through `rowStoredTy`. The lowerin
 the noted row (`recvStructRow`). A struct literal nested into a field that targets another row than
 the literal's layout row is built by the targeted row's layout (`nestedLitTargetRow`). The list place
 is COV-CALL's (their lists part, stacked on this branch).
+`mkObjTy` does not intern (`addTy` appends), so `rowStoredTy` mints at most one type per row whose
+fields move, per compile: the memo is reset in `irShadowBegin`, which runs once per compile.
 
 **Verifier.** Rule 3 holds the invariant (`varRowsWhy`): a noted variable's rep is the row's rep or
 its nullable. Where the variable is also noted as built on a heap (`irVarHeapOf`), that heap is the
