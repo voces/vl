@@ -8943,19 +8943,14 @@ function oneTempAt(b: i32[], at: i32, o: Opnd): boolean {
   return n is SLet && n.lDst == o.ov && ib.irVars[o.ov].vKind == "temp"
 }
 
-// Whether body `b` gained, from `at` on, only `let`s of temps, the last defining temp `o`: an
-// operand whose own operands are temps its definition consumes.
-function tempsEndingAt(b: i32[], at: i32, o: Opnd): boolean {
-  if b.length <= at || !(o is OVar) || o.ov < 0 { return false }
-  let k = at
-  while k < b.length {
-    const n = ib.irNodes[b[k]]
-    if !(n is SLet) || n.lDst < 0 || n.lDst >= ib.irVars.length { return false }
-    if ib.irVars[n.lDst].vKind != "temp" { return false }
-    k = k + 1
-  }
-  const last = ib.irNodes[b[b.length - 1]]
-  return last is SLet && last.lDst == o.ov
+// Operand `l` of a fused read at node `ix`, which legacy's head reads twice, held in a local of its
+// own (the lowering's `ownedSlot`): a later operand's own fused `??` then finds no temp waiting.
+function heldInLocal(b: i32[], l: Opnd, ix: i32): Opnd {
+  if !(l is OVar) || l.ov < 0 || l.ov >= ib.irVars.length { return l }
+  const v = irVarNew(ib, ib.irVars[l.ov].vRep, ib.irVars[l.ov].vTy, "local", -1)
+  irBNode(b, { asDst: v, asSrc: l }, -1, ibNoValue, ix)
+  const o: Opnd = { ov: v }
+  return o
 }
 
 // Whether map store value `val` into receiver `recv`'s mv slot `sh` is an object literal legacy
@@ -12540,23 +12535,45 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const la = b.length
   const l = irBExpr(b, m.memObj)
   if ibMiss != "" { return l }
-  // A receiver legacy cannot re-read is a temp, held once in a local (`irGetRecvOnce`).
-  if !recvReRead && !tempsEndingAt(b, la, l) {
+  // A receiver legacy cannot re-read is held in a local of its own (`heldInLocal`).
+  if !recvReRead && !(l is OVar) {
     return irBMiss("coalesce listGetOr staged operand")
   }
+  const recv = if recvReRead { l } else { heldInLocal(b, l, ix) }
   const ln = repNodeAt(irBOpRep(l))
   if !(ln is RList) || ln.rlsElem != rep {
     return irBMiss("coalesce listGetOr result rep")
   }
+  // A receiver legacy re-reads is a pure read the lowering skips: its nodes wait aside while the
+  // index builds, so an index's own fused `??` finds no temp waiting, and go back before a plain
+  // index or after an index's statements.
+  const aside: i32[] = []
+  if recvReRead {
+    while b.length > la { aside.push(b.pop() ?? -1) }
+  }
   const at = b.length
-  const i = irBExpr(b, c.callArgs[0])
-  if ibMiss != "" { return i }
-  if irBOpRep(i) != repNodeOfTy(TY_I32) {
+  const i0 = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return i0 }
+  const idxNodes = b.length - at
+  const idxOneTemp = oneTempAt(b, at, i0)
+  if irBOpRep(i0) != repNodeOfTy(TY_I32) {
     return irBMiss("coalesce listGetOr index operand")
   }
-  // An index legacy cannot re-read is one temp, held once in a local (`irGetIdxBegin`).
-  if idxReRead && b.length != at || !idxReRead && !oneTempAt(b, at, i) {
+  // An index that built nothing is legacy's own re-read; any other is one temp, held once in a
+  // local (`irGetIdxBegin`), or held in a local of its own after the statements it built (an inner
+  // fused `??`, say).
+  const idxPlain = idxReRead && idxNodes == 0
+  if !idxPlain && !(i0 is OVar) {
     return irBMiss("coalesce listGetOr index operand")
+  }
+  const i = if !idxPlain && !idxOneTemp { heldInLocal(b, i0, ix) } else { i0 }
+  if aside.length > 0 {
+    const tail: i32[] = []
+    if idxNodes == 0 || idxOneTemp {
+      while b.length > at { tail.push(b.pop() ?? -1) }
+    }
+    while aside.length > 0 { b.push(aside.pop() ?? -1) }
+    while tail.length > 0 { b.push(tail.pop() ?? -1) }
   }
   // Legacy's head reads the index at each use, so an immediate, a variable or that temp is handed
   // to it.
@@ -12564,7 +12581,7 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     || i is OVar
     && i.ov >= 0
     && i.ov < ib.irVars.length
-    && (ib.irVars[i.ov].vKind != "temp" || !idxReRead)
+    && (ib.irVars[i.ov].vKind != "temp" || !idxPlain)
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
   if !coalNeverDefault(nb, n.binRight, rep, t) {
@@ -12577,7 +12594,7 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   irBNode(
     b,
     {
-      cbL: l,
+      cbL: recv,
       cbLB: [],
       cbArm: "listGetOr",
       cbNull: nb,
