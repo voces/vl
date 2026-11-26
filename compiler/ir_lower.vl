@@ -5,7 +5,7 @@ import { blockHasContinueFor } from "./emit_query"
 // which holds only when the temps are consumed in their definition order; the lowering
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
-import { fnEnvIdxOf } from "./emit_capture_frames"
+import { fnEnvIdxOf, readNarrowedBoxToNull } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
 import { printUnionPlan } from "./emit_fn_scans"
 import {
@@ -17,7 +17,7 @@ import {
 import { printPlanPinNull } from "./emit_union_registry"
 import { mapRecvScalarBoxKindIn, mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
-import { repTyOf, slotRowTyOf } from "./emit_rep"
+import { repNodeOfTy, repTyOf, slotRowTyOf } from "./emit_rep"
 import { luOvEnter, luOvLeave } from "./emit_elab"
 import {
   armIndexWriteArmsOf,
@@ -657,6 +657,7 @@ import {
   printAtomTail,
   printNulBoolOpen,
   printNulBoolTail,
+  printNulRefNicheTail,
   printNulStrOpen,
   printNulStrTail,
   printScalarMapTail,
@@ -954,6 +955,7 @@ import {
   uBoxNewEnd,
   uFieldCount,
   uVarRow,
+  uVarTyIx,
   unionSinkBase,
 } from "./emit_state"
 import { ListBuild } from "./emit_ref_list_kinds"
@@ -2965,10 +2967,23 @@ function boxNarrowAt(r: RBoxNarrow, again: boolean) {
     boxNarrowBox(r, again)
     return emitUnionUnboxTail(r.bnAtom)
   }
-  const vi = narrowedBoxVariantPlain(r.bnAt, lw.irAt)
+  // A read with no narrowing plan of its own (a union-valued map read narrowed to a member) takes the
+  // variant its rep is.
+  const vp = narrowedBoxVariantPlain(r.bnAt, lw.irAt)
+  const vi = if narrowedVariantRepIs(vp, r.bnRep) { vp } else { variantOfRep(r.bnRep) }
   if !narrowedVariantRepIs(vi, r.bnRep) { return irLMiss("box narrow shape") }
   boxNarrowBox(r, again)
   return narrowedVariantTail(vi)
+}
+
+// The registered variant whose type's rep is `rep` (`uVarTyIx`), or -1.
+function variantOfRep(rep: i32): i32 {
+  let i = 0
+  while i < uVarTyIx.length {
+    if repNodeOfTy(uVarTyIx[i]) == rep { return i }
+    i = i + 1
+  }
+  return -1
 }
 
 // `RNicheRead`: the box, then legacy's niche tail (`emitNicheReadTail`), as `emitNarrowedNicheRead`
@@ -3992,6 +4007,13 @@ function printOp(r: RPrint) {
     printNulBoolOpen()
     irLOpnd(r.pnV)
     return printNulBoolTail()
+  }
+  if arm == "nulRefNiche" {
+    const stored = readNarrowedBoxToNull(c.callArgs[0], lw.irAt)
+    const mark = if stored { storageReadEnter(c.callArgs[0]) } else { storageReadEnter(-1) }
+    irLOpnd(r.pnV)
+    storageReadLeave(mark)
+    return printNulRefNicheTail()
   }
   if arm == "union" {
     // Legacy reads the plan, writes the box, then takes the stash slot.
