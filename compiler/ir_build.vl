@@ -280,6 +280,8 @@ import {
   irLowerProbe,
   irLoweredEntry,
   irShadowLowerEqHelper,
+  irSlotIdx,
+  irSlotKind,
   irSlotRowTy,
   irSlotRunAgrees,
   irSlotValtype,
@@ -4069,10 +4071,52 @@ export function irBDeclVar(d: i32): i32 {
   }
   const lt = declRowLetTy(d, rep)
   if lt >= 0 { return declVarAt(d, repNodeOfTy(lt), lt) }
+  const sm = slotMapHeldTy(d, ty)
+  if sm >= 0 { return declVarAt(d, repNodeOfTy(sm), sm) }
   const rl = rowlessLetTy(d, ty, rep)
   if rl >= 0 { return declVarAt(d, repNodeOfTy(rl), rl) }
   if letLitUndeclaredRow(d) { ibDeclRowSeen = true }
   return declVarAt(d, rep, ty)
+}
+
+// Whether local `v`, declared at `d`, is held at the map type its slot stores (`slotMapHeldTy`).
+function slotMapHeldVar(d: i32, v: i32): boolean {
+  if d < 0 || v < 0 || v >= ib.irVars.length { return false }
+  const st = slotMapHeldTy(d, heldTy(scopeTyAt(d, ibFnIx)))
+  return st >= 0 && repNodeOfTy(st) == ib.irVars[v].vRep
+}
+
+// Whether initializer `init` is a `Map()` and local `v` is held at a map: legacy's constructor
+// writes the slot's shape (`mapNewShapeOf`), so the map is built at the local's rep.
+function letMapNewHeld(init: i32, v: i32): boolean {
+  const u = unwrapParen(init)
+  if u < 0 || u >= P.nodes.length || v < 0 || v >= ib.irVars.length {
+    return false
+  }
+  const c = nodeAt(u)
+  return c is Call
+    && mapNewCall(c)
+    && repNodeAt(ib.irVars[v].vRep) is RMap
+    && exprPrePathWhy(u, ibFnIx) == ""
+}
+
+// The map type `let` `d`'s local of map type `ty` is stored at, where legacy declares its slot at a
+// map shape whose value type is closed at another rep (a later widening's row), its bytes that map's
+// where its rep writes any; else -1.
+function slotMapHeldTy(d: i32, ty: i32): i32 {
+  const m = repNodeAt(repNodeOfTy(ty))
+  if !(m is RMap) || d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) {
+    return -1
+  }
+  const s = declaredSlotOfDecl(d)
+  const slot = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
+  if slot < 0 || irSlotKind(slot) != "map" { return -1 }
+  const st = mvValTyIxAt(irSlotIdx(slot))
+  if st < 0 || irTyOpen(st) || repNodeOfTy(st) == m.rmVal { return -1 }
+  const mt = mapTyWithVal(ty, st)
+  if mt < 0 || !(repNodeAt(repNodeOfTy(mt)) is RMap) { return -1 }
+  const vb = refRepValtype(repNodeOfTy(mt))
+  return if vb.length == 0 || u8sSame(irSlotValtype(slot), vb) { mt } else { -1 }
 }
 
 // The record type of the struct row legacy declares `let` `d`'s local at, where that row is not
@@ -6205,6 +6249,8 @@ function narrowedLocalRead(
   // A read of a variable held at a row its read type does not record is the variable as it is,
   // the row `declRowReadTy` reads its fields at (`rowlessReadTyOfVar`).
   if rowlessReadTyOfVar(ix, v) == ib.irVars[v].vTy { return o }
+  // A map local held at its slot's map (`slotMapHeldTy`) reads as it is stored.
+  if slotMapHeldVar(identDeclOf(ix), v) { return o }
   if (
     holeRetagNoted(ib.irVars[v].vRep, rep, true)
     && exprPrePathWhy(ix, ibFnIx) == ""
@@ -18067,7 +18113,13 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     // A `const` legacy keeps the bounded part of for later memory addresses (`emitLetPlainInit`).
     const mk = foldLetK(n, ix)
     if mk >= 0 { return foldLetAt(b, n, ix, v, mk) }
-    const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(
+    const built = if letMapNewHeld(n.letInit, v) { irBLetTempTy(
+      b,
+      { mnAt: unwrapParen(n.letInit) },
+      unwrapParen(n.letInit),
+      ib.irVars[v].vRep,
+      ib.irVars[v].vTy,
+    ) } else if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(
       b,
       unwrapParen(n.letInit),
       ib.irVars[v].vRep,
