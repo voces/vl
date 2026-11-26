@@ -37,7 +37,11 @@ Three move on to the two later classes.
 The seven left are list elements: `generics/list-of-param-or-null-at-never.vl` ×4 and
 `types/null-unit-heap-positions.vl` ×3. Legacy builds the list at its built type
 (`listLitBuiltTy`), whose element's null is `nullOwnAt`'s, while the IR builds it at the checker's
-`null[]`. That is the list-built rep question, not this read's.
+`null[]`. That is the list-built rep question, not this read's. #10248 moves two more units here,
+nine in all. They are parked (coordinator ruling, 2026-11-26). At `T = never`, legacy builds
+`[x]` (`x: T | null`) as an `i32` list holding the bool's null, and the generic's result is that
+list. Building the literal alone at its built type still leaves the read a miss: the generic's IR
+signature rep has to move with it, which is a shared layout change for nine units.
 
 ## Positions
 
