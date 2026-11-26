@@ -83,6 +83,7 @@ import {
   RMapDelete,
   RMapEq,
   RMapFilter,
+  RMapFilterHead,
   RMapGet,
   RMapGetOr,
   RMapHas,
@@ -604,6 +605,16 @@ function mapPrintScalar(val: i32): boolean {
   return p == "i32" || p == "i64" || p == "f32" || p == "f64"
 }
 
+// Whether the function holds an `RMapFilterHead` statement for `.map`/`.filter` call `at`.
+function mapFilterHeadOf(at: i32): boolean {
+  for n in vf.irNodes {
+    if n is SEffect && n.efRhs is RMapFilterHead && n.efRhs.mhAt == at {
+      return true
+    }
+  }
+  return false
+}
+
 // The receiver stage node `id` is, or null.
 function stageAt(id: i32): RListStage | null {
   if id < 0 || id >= vf.irNodes.length { return null }
@@ -942,7 +953,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RGetField => {
       use(r.gfV, at)
-      const v = opRep(r.gfV)
+      const v = gfRecvRecord(r)
       if !(repNodeAt(v) is RRecord) {
         return fail(2, at, "a field read of a non-record")
       }
@@ -1482,14 +1493,25 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RMapFilter => {
-      use(r.hfV, at)
-      if !(repNodeAt(opRep(r.hfV)) is RList) {
-        return fail(2, at, "a map or filter of a non-list")
+      // A headed call's list is its `RMapFilterHead`'s, earlier in the body.
+      if !(r.hfV is OImm && mapFilterHeadOf(r.hfAt)) {
+        use(r.hfV, at)
+        if !(repNodeAt(opRep(r.hfV)) is RList) {
+          return fail(2, at, "a map or filter of a non-list")
+        }
       }
       if !(r.hfC is OImm) { use(r.hfC, at) }
       uses(r.hfEnv, at)
       if r.hfEnv.length > 0 && !(r.hfC is OImm) {
         return fail(2, at, "a map callback built from captures is no value")
+      }
+      0
+    }
+    RMapFilterHead => {
+      if dst >= 0 { return fail(2, at, "a map head is a statement") }
+      use(r.mhV, at)
+      if !(repNodeAt(opRep(r.mhV)) is RList) {
+        return fail(2, at, "a map or filter of a non-list")
       }
       0
     }
@@ -3488,6 +3510,7 @@ function rhsReadsList(r: Rhs): boolean {
       RMapDelete |
       RMapEq |
       RMapFilter |
+      RMapFilterHead |
       RMapGet |
       RMapGetOr |
       RMapHas |
@@ -3990,4 +4013,15 @@ function luWalkElemRep(n: SForIn): i32 {
     || vn is RNullable && vn.rnDisc == 4
     || vr >= 0 && repPrim(vr) != null
   return if repNodeAt(opRep(n.xfList)) is RBox && boxVar { vr } else { -1 }
+}
+
+// The record field read `r` reads from: its receiver's rep, or, for a shared template member's,
+// the inner record of the nullable one a `?.` chain tested, read as legacy reads it (`sharedField`).
+function gfRecvRecord(r: RGetField): i32 {
+  const v = opRep(r.gfV)
+  const vn = repNodeAt(v)
+  if r.gfShared && vn is RNullable && repNodeAt(vn.rnInner) is RRecord {
+    return vn.rnInner
+  }
+  return v
 }
