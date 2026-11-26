@@ -11,6 +11,7 @@ import { printUnionPlan } from "./emit_fn_scans"
 import {
   armIdxSlot,
   irOnceRefSlot,
+  irOnceRefSlotAt,
   irOnceSlot,
   sharedFieldRecvSlot,
 } from "./emit_union_casts"
@@ -555,6 +556,9 @@ import {
   listGetIdxUnstage,
   listGetOrOpen,
   listGetRecvHook,
+  listGetRecvRelease,
+  listGetRecvUnstage,
+  listGetRecvWrapOf,
   listOpRecvHeld,
   listOpStageBase,
   listReserveOpen,
@@ -2462,6 +2466,8 @@ let getIdxSlots: i32[] = []
 // The `.get` receiver operands `listGetRecvHook` reads while `coalListGetOr` writes legacy's head,
 // innermost last; each read is the operand read again (`opndAgain`).
 const getRecvOs: Opnd[] = []
+// Beside each, the local a receiver temp is held in (`irGetRecvOnce`), else -1.
+let getRecvSlots: i32[] = []
 
 // Whether receiver operand `o` of node `ix` can be read again at each use: a variable, or a temp
 // whose read the builder recorded (`irHoistRecv`'s tables).
@@ -2489,13 +2495,33 @@ function hoistedReadKnown(ix: i32): boolean {
 function irGetRecvBegin(o: Opnd, ix: i32): boolean {
   if !recvReadAgainOk(o, ix) { return false }
   getRecvOs.push(o)
+  getRecvSlots.push(-1)
   listGetRecvHook = irListGetRecvRead
   return true
 }
 
-// Undoes the innermost `irGetRecvBegin`.
+// A receiver temp (a call, say) of fused read `getIx`, written once to a local of its list ahead of
+// the index, as legacy evaluates it (D3756), and read from it at each of the head's reads; a
+// nesting depth's holder takes its own local. `irGetRecvEnd` undoes it.
+function irGetRecvOnce(o: Opnd, getIx: i32): boolean {
+  const heap = listGetRecvWrapOf(getIx, lw.irAt)
+  if heap < 0 {
+    irLMiss("get receiver heap")
+    return false
+  }
+  const slot = irOnceRefSlotAt(heap, getRecvOs.length + 1)
+  irLOpnd(o)
+  fbLocalSet(slot)
+  getRecvOs.push(o)
+  getRecvSlots.push(slot)
+  listGetRecvHook = irListGetRecvRead
+  return true
+}
+
+// Undoes the innermost `irGetRecvBegin` or `irGetRecvOnce`.
 function irGetRecvEnd() {
   getRecvOs.pop()
+  getRecvSlots.pop()
   if getRecvOs.length == 0 { listGetRecvHook = listGetIdxLegacy }
   return 0
 }
@@ -2507,6 +2533,8 @@ function irListGetRecvRead(objIx: i32, _fnIx: i32): i32 {
     irLMiss("get receiver unset")
     return -1
   }
+  const slot = getRecvSlots[at] ?? -1
+  if slot >= 0 { return fbLocalGet(slot) }
   if opndAgain(getRecvOs[at], objIx) < 0 { return -1 }
   return 0
 }
@@ -6739,7 +6767,14 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
 // operand where it holds one (`listGetIdxHook`); then the default and the end.
 function coalListGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwSeq = []
-  irLSkip(n.cbL)
+  // A receiver temp is consumed into its local first, as legacy evaluates it before the index.
+  const cl = n.cbL
+  const tempRecv = cl is OVar && isTemp(cl.ov)
+  if tempRecv {
+    if !irGetRecvOnce(cl, unwrapParen(e.binLeft)) { return -1 }
+  } else {
+    irLSkip(n.cbL)
+  }
   if lwMiss != "" { return -1 }
   // An index temp is consumed into its local ahead of the head, before the pending temps settle.
   const ci = n.cbIdx
@@ -6751,8 +6786,10 @@ function coalListGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   const call = nodeAt(unwrapParen(e.binLeft))
   const callee = if call is Call && call.callFn >= 0 { nodeAt(call.callFn) } else { null }
   const recvIx = if callee is Member { unwrapParen(callee.memObj) } else { -1 }
-  const recvHooked = recvIx >= 0 && irGetRecvBegin(n.cbL, recvIx)
+  const recvHooked = tempRecv || recvIx >= 0 && irGetRecvBegin(n.cbL, recvIx)
+  if tempRecv { listGetRecvUnstage() }
   const ek = listGetOrOpen(unwrapParen(e.binLeft), lw.irAt)
+  if tempRecv { listGetRecvRelease() }
   if recvHooked { irGetRecvEnd() }
   if hooked { irGetIdxEnd() }
   if ek == null { return irLMiss("listGetOr head") }
@@ -7354,6 +7391,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwLeadBoxes = []
   lwStashAt = []
   getIdxSlots = []
+  getRecvSlots = []
   lwBoxHeadAt = []
   lwIfHeadAt = Map()
   lwIfHeadBuilt = false

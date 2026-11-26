@@ -8884,6 +8884,20 @@ function oneTempAt(b: i32[], at: i32, o: Opnd): boolean {
   return n is SLet && n.lDst == o.ov && ib.irVars[o.ov].vKind == "temp"
 }
 
+// Whether body `b` gained, from `at` on, only `let`s of temps, the last defining temp `o`: an
+// operand whose own operands are temps its definition consumes.
+function tempsEndingAt(b: i32[], at: i32, o: Opnd): boolean {
+  if b.length <= at || !(o is OVar) || o.ov < 0 { return false }
+  let k = at
+  while k < b.length {
+    const n = ib.irNodes[b[k]]
+    if !(n is SLet) || ib.irVars[n.lDst].vKind != "temp" { return false }
+    k = k + 1
+  }
+  const last = ib.irNodes[b[b.length - 1]]
+  return last is SLet && last.lDst == o.ov
+}
+
 // Whether map store value `val` into receiver `recv`'s mv slot `sh` is an object literal legacy
 // builds at the slot's variant row (`mapSetValArmOf` `variant`, `variantCoerceArmOf` `struct`).
 function mapSetVariantLit(recv: i32, val: i32, sh: i32): boolean {
@@ -12425,16 +12439,19 @@ function coalListGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   }
   const m = nodeAt(c.callFn)
   if !(m is Member) { return irBMiss("coalesce listGetOr call") }
-  if !optRecvReReadable(m.memObj) {
-    return irBMiss("coalesce listGetOr staged operand")
-  }
+  const recvReRead = optRecvReReadable(m.memObj)
   const idxReRead = listGetIdxReReadable(c.callArgs[0])
   const ty = outTyOf(ix, rep)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   // Its value stays on the stack from here, so no temp an operand before it built may wait.
   if endsInTemp(b) { return irBMiss("coalesce listGetOr after an operand") }
+  const la = b.length
   const l = irBExpr(b, m.memObj)
   if ibMiss != "" { return l }
+  // A receiver legacy cannot re-read is a temp, held once in a local (`irGetRecvOnce`).
+  if !recvReRead && !tempsEndingAt(b, la, l) {
+    return irBMiss("coalesce listGetOr staged operand")
+  }
   const ln = repNodeAt(irBOpRep(l))
   if !(ln is RList) || ln.rlsElem != rep {
     return irBMiss("coalesce listGetOr result rep")
