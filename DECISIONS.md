@@ -13415,3 +13415,24 @@ The coordinator ruled:
 4. **What stays:** an inventory row for a clause-1 defect the finder does not fix in the same PR;
    the `std-api-reviewer` pass on a std export change, which reviews the API and not its prose; and
    CLAUDE.md's rules. A stale doc is deleted when it misleads a lane, not maintained.
+
+## Delivery after I8: four layers, one owner each (2026-11-26, coordinator ruling)
+
+The post-I8 generalization proposals all touch how a value reaches a slot (an argument, return,
+field, element, map value, global or binding). They are one design in four layers, each with one
+owner:
+
+1. **Source rep** (START-2): a binding's rep is its build. Every reader asks this layer, and none
+   re-derives it.
+2. **Build at destination** (COV-CALL): a fresh value (an object or list literal, or an `if`/`??`
+   whose arms are fresh) is built at the destination's rep, so it needs no conversion. A fresh
+   value bound to a binding is layer 1's.
+3. **One converter** (COV-CLOS): every delivery site calls `irConvert`/`convertKindOf`, and the
+   per-site ladders (objLit's retag ladder, mapSet's legacy-arm mirrors, the coercion sites) are
+   deleted. A missing conversion is a new kind in `convertKindOf`, never a site arm. This is the
+   2026-11-26 "One structural converter" ruling, carried out.
+4. **Union kinds** (COV-IS): boxing into a union is `convertKindOf`'s union arm, the `deliverUnion`
+   proposal. `testUnion` is COV-IS's separately.
+
+Each conversion kind lands with its own position sweep. A narrowing that loses a value stays a
+miss. Layers 2 to 4 read layer 1's rep.
