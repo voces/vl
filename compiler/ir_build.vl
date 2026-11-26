@@ -60,6 +60,7 @@ import {
   repRecordFieldNames,
   slotRowTyOf,
   tyDenotesFunc,
+  vbHeapIdxOfKind,
 } from "./emit_rep"
 import {
   asInstMissNullOwn,
@@ -707,6 +708,7 @@ import {
   numCastNullNode,
   optMapFieldPlanOf,
   retRefusedWhy,
+  scalarBoxNullTyOf,
   spreadRunLit,
   unionBoxArgReadsMapBox,
   unionLitIsPlanOf,
@@ -13351,6 +13353,53 @@ function coalMapScalarJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, r, ix, rep)
 }
 
+// `m[k] ?? d` over a null-free scalar-valued map with a nullable default, as
+// `emitMapGetOrScalarBox` writes it: a hit's scalar boxed into `T | null`, `d` delivered there.
+function mapGetOrScalarBox(
+  b: i32[],
+  n: BinExpr,
+  rd: Index,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  const ak = mapRecvScalarBoxKindIn(rd.idxArr, ibFnIx)
+  if ak < 0 || vbHeapIdxOfKind(ak) < 0 {
+    return irBMiss("map read scalarBox kind")
+  }
+  if !heldAsBox(rep) { return irBMiss("map read scalarBox rep") }
+  const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
+  const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
+  if ka != "plain" && ka != "i64" && ka != "atom" {
+    return irBMiss("map key " + ka)
+  }
+  const rcv = mapRecvKeyOf(
+    b,
+    rd.idxArr,
+    rd.idxIndex,
+    "map read receiver",
+    ka == "i64",
+  )
+  if rcv == null { return irBMiss(ibMiss) }
+  const db: i32[] = []
+  const dv = deliver(db, n.binRight, rep, scalarBoxNullTyOf(ak))
+  if ibMiss != "" { return dv }
+  if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
+  if !defaultSelfContained(db, 0, dv) {
+    return irBMiss("map read scalarBox default computes")
+  }
+  for id in db { b.push(id) }
+  const r: Rhs = {
+    mgSym: rcv.mkSym,
+    mgNonNull: rcv.mkNonNull,
+    mgLoc: rcv.mkLoc,
+    mgKey: rcv.mkKey,
+    mgAt: ix,
+    mgForm: 8,
+    mgDef: dv,
+  }
+  return irBLetTemp(b, r, ix, rep)
+}
+
 // A `null`-typed operand `x` run for its effect, as legacy's `emitNulNoneForEffect` writes it:
 // nothing for a `null` or a name, the receiver of a `?.`, both sides of a `??`, an if-expression's
 // void `if` (`ifForEffect`), else the value built and dropped here, or where `sink` is given,
@@ -14657,6 +14706,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
   if !(rd is Index) { return irBMiss("map read") }
   const rk = coalResultKindOf(ix, ibFnIx)
   const arm = mapGetOrArmOf(rd.idxArr, n.binRight, ibFnIx, rk)
+  if arm == "scalarBox" { return mapGetOrScalarBox(b, n, rd, ix, rep) }
   const mv = arm == "mv" && mapGetOrMvPlain(rd.idxArr, n.binRight, ibFnIx)
   // A `scalar | null` union value peels to its scalar, the default in the result's kind.
   const uq = if arm == "mv" && !mv { mapGetOrUnionScalarPlanOf(mapRecvShapeOf(rd.idxArr, ibFnIx), n.binRight, rk) } else { null }
