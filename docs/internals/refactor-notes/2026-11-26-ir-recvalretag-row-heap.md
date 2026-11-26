@@ -15,3 +15,6 @@
 - The verifier selftest `value-retag-built-heap` now notes rows past heaps 1 and 2
   (`selfRowsOnHeaps`, removed after the case). A compiler with the old comparison fails it:
   `want rule 0, got rule 2`.
+- A row with no heap (`structRowHeap` -1) is refused before the comparison, since a heapless
+  destination also answers -1 (COV-UNION's review). Selftest `value-retag-heapless-row` covers it,
+  and a compiler comparing `structRowHeap(row)` unguarded fails it: `want rule 2, got rule 0`.

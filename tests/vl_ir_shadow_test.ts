@@ -1773,6 +1773,7 @@ Deno.test({
       "record-retag-one-noted-heap": 0,
       "value-retag-built-heap": 0,
       "value-retag-other-heap": 2,
+      "value-retag-heapless-row": 2,
       "value-retag-field-other-valtype": 2,
       "width-retag-noted-leading": 0,
       "width-retag-field-not-leading": 2,
