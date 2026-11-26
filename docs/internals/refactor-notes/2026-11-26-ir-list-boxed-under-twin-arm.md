@@ -19,3 +19,7 @@ Lane COV-IS, 2026-11-26. Regen-10 row `box ladder` on
   `VL_IR_REQUIRE_CLAIM=1`.
 - Sweep `tests/cases/unions/list-boxed-under-twin-arm-positions.vl`: argument, binding, return,
   assignment, record field and list element; output equals the `VL_IR=0` run.
+- `tests/vl_ir_shadow_test.ts`'s "construct outside the set" case took this shape as its
+  `box ladder` witness; it now takes the one function-level `box ladder` left in `tests/cases`
+  (a hole parameter bound to two numeric-union instances, from
+  `numerics/hole-param-numeric-union-past-null.vl`).
