@@ -6854,10 +6854,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       // reference its parameter's valtype holds as it stands is passed as is (`repStoresAs`).
       const fa0 = if fu >= 0 && irBOpRep(ra) != pr { boxTempIn(b, ra, cargs[i], pr, -1, fu) } else { ra }
       if ibMiss != "" { return missRhs(ibMiss) }
-      // A closure handed to a parameter that holds a closure of its struct or `null` (the niche):
-      // retagged to that closure, then into its niche, as a field's (`objLitAt`).
-      const fn0 = if cloNicheTakes(fa0, pr, cargs[i]) { cloNicheRetag(b, fa0, pr, cargs[i]) } else { fa0 }
-      const fa = irConvert(b, fn0, pr, pt, cargs[i])
+      const fa = irConvert(b, fa0, pr, pt, cargs[i])
       if ibMiss != "" { return missRhs(ibMiss) }
       args.push(fa)
       i = i + 1
@@ -16449,7 +16446,11 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
     return skip("field store box from a box")
   }
   const at = b.length
-  const x = deliver(b, n.binRight, dst, siteTy)
+  const x0 = deliver(b, n.binRight, dst, siteTy)
+  if ibMiss != "" { return 0 }
+  // A sub-word field (`repSubWord`) takes a plain i32, which `struct.set` truncates.
+  const subWord = repSubWord(dst) && repPrim(irBOpRep(x0)) == "i32"
+  const x = if subWord { x0 } else { irConvertStored(b, x0, dst, siteTy, n.binRight) }
   if ibMiss != "" { return 0 }
   // Legacy reads the receiver, then the value: a receiver variable is staged at its own start, so
   // the lowering writes it below a valued `if` the value wrote ahead of the store.
@@ -16462,11 +16463,7 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   }
   if ibMiss != "" || ifBelowLeadOf(b, at, why, leads) { return 0 }
   const v = leads[0]
-  // A sub-word field (`repSubWord`) takes a plain i32, which `struct.set` truncates.
-  const subWord = repSubWord(dst) && repPrim(irBOpRep(x)) == "i32"
-  if irBOpRep(v) != r || irBOpRep(x) != dst && !subWord {
-    return skip("field store coercion")
-  }
+  if irBOpRep(v) != r { return skip("field store receiver rep") }
   irBNode(b, { sfV: v, sfIx: k, sfSrc: x, sfPark: false }, -1, ibNoValue, ix)
   return 0
 }
@@ -19719,6 +19716,7 @@ export function irConvert(
   const k = convertKindOf(v, dst, dstTy, at)
   if k == CONVERT_AS_IS { return v }
   if k == CONVERT_RETAG { return repTempTy(b, { rgV: v }, at, dst, dstTy) }
+  if k == CONVERT_NICHE { return nicheInto(b, v, dst, at) }
   return irBMiss("convert " + repWhat(irBOpRep(v)) + " -> " + repWhat(dst))
 }
 
@@ -19727,16 +19725,20 @@ export function irConvert(
 function irConvertStored(b: i32[], v: Opnd, dst: i32, dstTy: i32, at: i32): Opnd {
   if ibMiss != "" { return v }
   if irBOpRep(v) != dst && convertKindOf(v, dst, dstTy, at) == CONVERT_AS_IS {
+    if nicheIntoTakes(v, dst, at) { return nicheInto(b, v, dst, at) }
     return irBMiss("convert " + repWhat(irBOpRep(v)) + " -> " + repWhat(dst))
   }
   return irConvert(b, v, dst, dstTy, at)
 }
 
-// How `irConvert` takes value `v` to rep `dst`: as it stands, by a retag, or -1 for no case yet.
+// How `irConvert` takes value `v` to rep `dst`: as it stands, by a retag, into a nullable's niche,
+// or -1 for no case yet. A closure goes into a nullable closure by its niche, retagged.
 const CONVERT_AS_IS = 0
 const CONVERT_RETAG = 1
+const CONVERT_NICHE = 2
 function convertKindOf(v: Opnd, dst: i32, dstTy: i32, at: i32): i32 {
   const src = irBOpRep(v)
+  if cloNicheTakes(v, dst, at) { return CONVERT_NICHE }
   if src == dst || convertAsIs(src, dst, dstTy) { return CONVERT_AS_IS }
   const d = repNodeAt(dst)
   if d == null { return -1 }
@@ -19746,7 +19748,30 @@ function convertKindOf(v: Opnd, dst: i32, dstTy: i32, at: i32): i32 {
     RList | RMap | RClosure | RNullable | RBox => convertRetag(v, src, dst, at, true)
     RAtom | RPrim | RRaw | RNoValue | RUnsup => convertRetag(v, src, dst, at, true)
   }
-  return if re { CONVERT_RETAG } else { -1 }
+  if re { return CONVERT_RETAG }
+  return if nicheIntoTakes(v, dst, at) { CONVERT_NICHE } else { -1 }
+}
+
+// Whether value `v` goes into niche nullable rep `dst` (`rnDisc` 1): it is the nullable's inner
+// value, or retags to it, with the operand's pre-path clear.
+function nicheIntoTakes(v: Opnd, dst: i32, at: i32): boolean {
+  const dn = repNodeAt(dst)
+  if !(dn is RNullable) || dn.rnDisc != 1 || irBOpRep(v) == dst { return false }
+  if exprPrePathWhy(at, ibFnIx) != "" { return false }
+  return irBOpRep(v) == dn.rnInner
+    || cloNicheTakes(v, dst, at)
+    || convertKindOf(v, dn.rnInner, repTyOf(dn.rnInner), at) == CONVERT_RETAG
+}
+
+// Value `v` retagged to niche nullable rep `dst`'s inner rep where it is apart, then into the niche.
+function nicheInto(b: i32[], v: Opnd, dst: i32, at: i32): Opnd {
+  const dn = repNodeAt(dst)
+  if !(dn is RNullable) { return irBMiss("convert into a niche of no nullable") }
+  if repNodeAt(dn.rnInner) is RClosure && repNodeAt(irBOpRep(v)) is RClosure {
+    return cloNicheRetag(b, v, dst, at)
+  }
+  const c = if irBOpRep(v) == dn.rnInner { v } else { repTemp(b, { rgV: v }, at, dn.rnInner) }
+  return repTemp(b, { rgV: c }, at, dst)
 }
 
 // Whether a value at rep `src` is the value at `dst` as it stands: an open type's rep, a valtype
