@@ -1,8 +1,6 @@
-// The TS hosts' half of the claims-off fallback (coordinator ruling 2026-11-24; the native host's
-// half is `claims_off_rebuild` in scripts/vl-host). A unit the IR claims never runs legacy's
-// lowering, so a refusal legacy raises there never fires and the claimed module can fail
-// validation. A host then compiles again with every claim off: legacy's answer stands. This
-// leaves at I8, with legacy (ir-design-2026-11.md, after the step table).
+// The TS hosts' half of the invalid-module report (the native host's is `invalid_headline` in
+// scripts/vl-host): a claimed module the engine refuses is the compiler's bug, located in the
+// source by the guest's spans, and a claim that recorded a refusal is named beside the compile's.
 
 /** The seed exports the fallback reads; a seed without them never takes a claim it can report. */
 export type ClaimExports = {
@@ -28,23 +26,9 @@ export const claimsTaken = (exp: ClaimExports): boolean => {
   return false;
 };
 
-/** Whether `bytes`, a claimed compile's module, must be compiled again with claims off. */
-export const needsClaimsOff = (exp: ClaimExports, bytes: Uint8Array): boolean =>
+/** Whether `bytes`, a claimed compile's module, fails validation: the compiler's bug. */
+export const invalidClaimedModule = (exp: ClaimExports, bytes: Uint8Array): boolean =>
   claimsTaken(exp) && !WebAssembly.validate(bytes as Uint8Array<ArrayBuffer>);
-
-/** Runs `compile` with every IR claim off (the shadow armed at mode 1, under which legacy writes
- * every function), and disarms after. */
-export const withClaimsOff = <T>(exp: ClaimExports, compile: () => T): T => {
-  exp.irShadowArm?.(1);
-  try {
-    return compile();
-  } finally {
-    exp.irShadowArm?.(0);
-  }
-};
-
-/** The one line a fallback that shipped legacy's bytes reports, as the native host words it. */
-export const FELL_BACK = "IR claim produced an invalid module; used the legacy emitter";
 
 /** The guest exports that locate a module byte offset in its source (the native `EmitSpans`). */
 export type SpanExports = ClaimExports & {
@@ -126,15 +110,8 @@ export const invalidHeadline = (exp: SpanExports, msg: string, entryKey: string)
   };
 };
 
-/** The note beside legacy's refusal, as the native host words it. */
-export const refusedNote = (headline: string): string =>
-  `an IR claim wrote an invalid module (${headline}); legacy's emitter refuses the program`;
-
-/** The warning beside legacy's bytes, as the native host words it. */
-export const fellBackLine = (headline: string): string => `${headline}: ${FELL_BACK}`;
-
-/** Each claimed unit whose build or lowering met a shared legacy helper's refusal, and so declined
- * in the guest (legacy wrote the unit): `[name, message]` from its `… a legacy helper refused in
+/** Each claimed unit whose build or lowering recorded a refusal, and so declined in the guest:
+ * `[name, message]` from its `… a legacy helper refused in
  * `name`: message` rows, which the guest counts even unarmed. */
 export const softRefusals = (exp: ClaimExports): Array<[string, string]> => {
   const { irShadowRowCount: count, irShadowRowLen: len, irShadowRowAt: at } = exp;
@@ -152,10 +129,6 @@ export const softRefusals = (exp: ClaimExports): Array<[string, string]> => {
   return out;
 };
 
-/** The note beside legacy's refusal when such a claim declined, as the native host words it. */
+/** The note beside the compile's refusal when such a claim declined, as the native host words it. */
 export const softNote = (name: string, msg: string): string =>
-  `an IR claim refused inside \`${name}\` (${msg}); legacy's emitter refuses the program`;
-
-/** The line beside legacy's bytes when such a claim declined and legacy built the unit. */
-export const softFellBack = (name: string, msg: string): string =>
-  `inside \`${name}\`: ${msg}: IR claim refused; used the legacy emitter`;
+  `an IR claim refused inside \`${name}\` (${msg})`;
