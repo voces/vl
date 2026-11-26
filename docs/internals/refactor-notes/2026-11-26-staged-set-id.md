@@ -8,4 +8,15 @@ which names that rep by construction.
 
 ## Measurements
 
-MEASUREMENTS_PLACEHOLDER
+I8 census over the `tests/cases` programs, the new position test among them (base and head at
+master `903f71519`): `staged literal type` 3 → 0 (1 function, 2 start bodies). Claimed functions
+97,865 → 97,866, claimed starts 8,434 → 8,436, claims fallen back 16 → 16; 0 claimed functions or
+starts lost, no other class moved.
+
+`VL_IR_REQUIRE_CLAIM=1 vl run` on
+`tests/cases/closures/hole-fn-list-called-at-two-fn-types-choice-element.vl`: base fails (`staged
+literal type`), head runs with every body claimed.
+
+Q58 position sweep (`tests/cases/closures/hole-fn-set-id-staged-below-valued-if-positions.vl`: a
+list literal walked, a call's arguments, a list inside a function indexed): base 1 function misses,
+head 0; output identical claims-off and on.
