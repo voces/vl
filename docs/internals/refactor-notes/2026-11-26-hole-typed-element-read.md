@@ -7,7 +7,17 @@ element rep (`openIndexRep`, `closedListElemTy`), as any open read takes its sto
 
 ## Measurements
 
-MEASUREMENTS_PLACEHOLDER
+I8 census over the `tests/cases` programs, the new position test among them (base and head at
+master `903f71519`): `rep unsup` 3 → 2 (the position test's start claimed; the two left are
+`hole-fn-list-named-callback.vl`'s start, below, and a call's, `viaReturn$1`, which
+cov-clos-callrep closes). Claimed starts 8,433 → 8,434, claimed functions 97,867 → 97,867, claims
+fallen back 16 → 16; 0 claimed functions or starts lost.
+
+`VL_IR_REQUIRE_CLAIM=1 vl run` on the position test
+(`tests/cases/closures/hole-typed-element-read-of-closed-list-positions.vl`: a mapped list bound
+and indexed, indexed in arithmetic, mapped and indexed inside a function, a nested list's element
+called): base fails (`rep unsup`), head runs with every body claimed; output identical claims-off
+and on.
 
 ## Left open
 
