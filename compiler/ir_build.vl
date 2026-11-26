@@ -2535,7 +2535,10 @@ function objLitAt(
     // writes the minted `null` at the field.
     const omitOwn = if given < 0 && own < 0 && arm == "variant" { nullOwnOfRep(ks[k]) } else { -1 }
     const omitNul = omitOwn >= 0 && nullOwnRepFits(omitOwn, ks[k])
-    const v0 = if omitNul { repTemp(b, { nuAt: valIx, nuOwn: omitOwn, nuRead: [] }, valIx, ks[k]) } else if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own, nuRead: [] }, valIx, ks[k]) } else if typed { fieldNullTemp(b, row, fi, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
+    // A function name typed at a tagged set's id, into a field the row stores as a closure, is the
+    // function's closure: the row's storage decides, not the set's id (D17665).
+    const idAsClo = own < 0 && !typed && tagIdIntoClosure(valIx, ks[k])
+    const v0 = if idAsClo { cloValue(b, unwrapParen(valIx), ks[k], fieldSiteTy(arm, row, fi)) } else if omitNul { repTemp(b, { nuAt: valIx, nuOwn: omitOwn, nuRead: [] }, valIx, ks[k]) } else if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own, nuRead: [] }, valIx, ks[k]) } else if typed { fieldNullTemp(b, row, fi, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
     if ibMiss != "" { return v0 }
     // A value built at its own rep, into a field the row holds as that rep's nullable (a record
     // built at a wider row, D16957), is widened to it.
@@ -14995,6 +14998,23 @@ function tagLeaf(ix: i32): Opnd {
   return o
 }
 
+// The closure signature key every member of a tagged set's dispatch `arms` shares (`cloSigKeyExt`
+// of each named member); "" for a lambda arm, no arms, or members whose keys differ.
+function tagSetCloKey(arms: i32[]): string {
+  let key = ""
+  for a in arms {
+    if tagArmLambdaCallee(a) >= 0 { return "" }
+    const an = nodeAt(a)
+    if !(an is Call) { return "" }
+    const fe = cloValueFeOf(unwrapParen(an.callFn))
+    if fe < 0 { return "" }
+    const k = cloSigKeyExt(fe)
+    if key != "" && k != key { return "" }
+    key = k
+  }
+  return key
+}
+
 // A call through a tagged function set, as `emitFnTagDispatch` writes it: the callee's set id kept,
 // then a valued `if` per member but the last, which takes the final `else`. Each arm is its call,
 // delivered at the call's rep. A lambda arm, which legacy stages at its instance, and a result
@@ -15027,6 +15047,15 @@ function tagDispatchAt(b: i32[], ix: i32, read: boolean): Opnd {
   const b0 = b.length
   const f = tagCallee(b, c.callFn)
   if ibMiss != "" { return f }
+  // A callee its place stores as a closure (D17665) is called through that closure, at the
+  // signature every member of the set shares.
+  if repNodeAt(irBOpRep(f)) is RClosure {
+    const key = tagSetCloKey(arms)
+    if key == "" { return irBMiss("tag dispatch closure key") }
+    const r = closureCallAt(b, c, ix, key, f)
+    if ibMiss != "" { return irBMiss(ibMiss) }
+    return irBLetTempTy(b, r, ix, rep, ty)
+  }
   if repPrim(irBOpRep(f)) != "i32" { return irBMiss("tag dispatch callee rep") }
   irBNode(b, { efRhs: { tgsV: f } }, -1, ibNoValue, ix)
   if arms.length == 1 {
@@ -18550,6 +18579,21 @@ function retLitFieldsAtTheirReps(ix: i32, r: i32, ty: i32, row: i32): boolean {
     i = i + 1
   }
   return true
+}
+
+// Whether value `valIx` is a function name read at a tagged set's i32 id (`exprTypedTagId`) that a
+// slot of closure rep `dst` holds as the function's closure instead.
+function tagIdIntoClosure(valIx: i32, dst: i32): boolean {
+  const u = if valIx >= 0 { unwrapParen(valIx) } else { -1 }
+  if u < 0 || !(nodeAt(u) is Ident) || !(repNodeAt(dst) is RClosure) {
+    return false
+  }
+  // Its pre-path is the leaf's id, the write this replaces.
+  const pre = exprPrePathWhy(u, ibFnIx)
+  if !exprTypedTagId(u, ibFnIx) || pre != "" && pre != "pre-path tag leaf" {
+    return false
+  }
+  return cloValueFeOf(u) >= 0
 }
 
 // The rep a struct literal laid out at row `row` is built at: the row's recorded type's, or -1.
