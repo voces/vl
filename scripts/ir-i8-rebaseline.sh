@@ -69,6 +69,15 @@ ratchet phase-state "$VL" run scripts/phase-state-census.vl --compiler "$SEED" -
   :: "$VL" run scripts/phase-state-census.vl --compiler "$SEED" -- --write-baseline
 ratchet plumb-shape-cost "$VL" run scripts/plumb-shape-cost.vl --compiler "$SEED" -- --check \
   :: "$VL" run scripts/plumb-shape-cost.vl --compiler "$SEED" -- --write-baseline
+# Only plumb-shape's two fuels are the deletion's: its RSS and CPU readings depend on the box (and
+# are null without GNU time or a native wasm-opt), so those stay the committed baseline's.
+PS=scripts/plumb-shape-baseline.json
+if git show HEAD:$PS > "$T/ps.json" 2>/dev/null; then
+  mapfile -t PF < <(grep -o '"fuel": [0-9]*' "$PS" | awk '{print $2}')
+  if [ "${#PF[@]}" = 2 ]; then
+    sed -E "s/\"fuel\": [0-9]+/\"fuel\": ${PF[0]}/1; s/(\"tail\": \{\"fuel\": )[0-9]+/\1${PF[1]}/" "$T/ps.json" > "$PS"
+  fi
+fi
 
 # The two the deletion lowers, written whatever they read.
 "$VL" run scripts/seed-size.vl --compiler "$SEED" -- --write-baseline 2>&1 | tail -1 | sed 's/^/rebaseline: seed size: /'
