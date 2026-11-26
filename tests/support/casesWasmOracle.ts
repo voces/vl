@@ -89,14 +89,9 @@ import { runWasm, VLRuntimeError } from "./runWasm.ts";
 // is the guard that keeps them agreeing.
 import { needsModules } from "../../compiler/moduleGate.ts";
 import { isStdKey } from "../../lsp/src/editorText.ts";
+import { HOLDOUTS, holdoutVerdict } from "./holdouts.ts";
 import { isDisplayableType } from "../../lsp/src/typeFeatures.ts";
-import {
-  engineRefusal,
-  invalidHeadline,
-  needsClaimsOff,
-  softRefusals,
-  withClaimsOff,
-} from "../../lsp/src/claimFallback.ts";
+import { engineRefusal, invalidClaimedModule, invalidHeadline, softRefusals } from "../../lsp/src/claimFallback.ts";
 
 const CASES_DIR = new URL("../cases/", import.meta.url);
 const STD_DIR = new URL("../../std/", import.meta.url);
@@ -288,28 +283,19 @@ const driveCase = (
   isModule: boolean,
 ): { rc: number; diags: WasmDiag[]; bytes?: Uint8Array; redun: LintDiag[] } => {
   stageCase(exp, entryKey, src, isModule);
-  let rc = emit ? exp.compileSrc() : exp.checkSrc();
-  // Strict, as a gate: a claim that declined on a shared legacy helper's refusal while legacy built
-  // the program is the claim's bug. Legacy's own refusal (rc 3) stands.
+  const rc = emit ? exp.compileSrc() : exp.checkSrc();
+  // A claim that recorded a refusal beside a module the compile wrote is the compiler's bug.
   const soft = emit && rc === 0 ? softRefusals(exp) : [];
   if (soft.length > 0) {
     const [name, msg] = soft[0];
     throw new Error(
-      `${entryKey}: inside \`${name}\`: ${msg}\nan IR claim refused, and the legacy emitter builds the program (strict)`,
+      `${entryKey}: inside \`${name}\`: ${msg}\nan IR claim refused, yet the compile wrote a module`,
     );
   }
-  // A claimed module the engine refuses is compiled again with claims off (`claimFallback.ts`).
-  // Strict, as every gate is: legacy's refusal stands, and legacy building it is the claim's bug.
+  // A claimed module the engine refuses is the compiler's bug.
   const claimed = emit && rc === 0 ? moduleBytes(exp) : undefined;
-  if (claimed !== undefined && needsClaimsOff(exp, claimed)) {
-    const where = invalidHeadline(exp, engineRefusal(claimed), entryKey);
-    stageCase(exp, entryKey, src, isModule);
-    rc = withClaimsOff(exp, () => exp.compileSrc());
-    if (rc === 0) {
-      throw new Error(
-        `${where.headline}\nan IR claim produced an invalid module, and the legacy emitter builds the program (strict)`,
-      );
-    }
+  if (claimed !== undefined && invalidClaimedModule(exp, claimed)) {
+    throw new Error(`${invalidHeadline(exp, engineRefusal(claimed), entryKey).headline}\ninvalid module`);
   }
   // rc 0 means no diagnostics (the Rust host reads them only on failure) —
   // and the instance is shared across cases, so don't trust `diagCount` on a
@@ -793,6 +779,15 @@ export const registerCorpusOracle = (shard: number, shards: number): void => {
         const entryKey = filePath(
           c.kind === "single" ? c.url : c.entry,
         ).replaceAll("\\", "/");
+        const holdout = `tests/cases/${name}`;
+        if (HOLDOUTS.has(holdout)) {
+          // A holdout is graded by its refusal alone: no directive, lint or hint tier.
+          const h = driveCase(exports!, entryKey, src, true, c.kind === "module");
+          const why = holdoutVerdict(holdout, h.rc === 3, h.diags.map((x) => x.message).join("\n"));
+          if (why !== "") throw new Error(why);
+          casesRun++;
+          return;
+        }
         const r = driveCase(
           exports!,
           entryKey,
