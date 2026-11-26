@@ -13,7 +13,7 @@ type's", rises 0 -> 1. The failing functions:
 retag only surfaced once #10321 let the list itself retag and these functions were claimed.
 Each PR passed alone.
 
-**Fix.** The retag's type is the literal's element type (`nodeArrayElemTyIx`) where that type's
+**Fix.** The retag's type is the literal's element type (`ctxTyAt` of the element) where that type's
 rep is `er`, else `repTyOf(er)`. Where neither names `er`, the builder misses
 `array element retag type` rather than writing an untyped temp. The other `repTemp` sites are
 unchanged; a probe flagged no other untyped retag in these programs.
