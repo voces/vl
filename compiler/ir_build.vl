@@ -9703,7 +9703,7 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
   const vAt = b.length
   const v0 = if val < 0 { one } else if mapSetVariantLit(recv, val, sh) { mapVariantLit(b, val, sh) } else { mapSetValue(b, val, g, loc, sh, valArm) }
   if ibMiss != "" { return 0 }
-  const v = if valArm == "variant" && val >= 0 && !mapSetVariantLit(recv, val, sh) { variantPassValue(v0, val, g, loc) } else { v0 }
+  const v = if valArm == "variant" && val >= 0 && !mapSetVariantLit(recv, val, sh) { variantPassValue(b, v0, val, g, loc) } else { v0 }
   if ibMiss != "" { return 0 }
   if mapRecvReassigned(b, at, loc) { return skip("map receiver reassigned") }
   const nonNull = g >= 0 && globalReadRecovers(sidOfNode(recv), recv, ibFnIx)
@@ -9731,13 +9731,17 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
 // it (`emitVariantPassThrough`). Legacy's `ref.as_non_null` for a nullable ref niche its read does
 // not recover has no witness program, so that case is a named miss. It lands at the map's value
 // rep or misses.
-function variantPassValue(v: Opnd, val: i32, g: i32, loc: Opnd): Opnd {
+function variantPassValue(b: i32[], v: Opnd, val: i32, g: i32, loc: Opnd): Opnd {
   const mr = repNodeAt(
     if g >= 0 { irGlobalRepOf(ib, g) } else { irBOpRep(loc) },
   )
   if !(mr is RMap) { return irBMiss("map store receiver rep") }
   if exprNullableRefNiche(val, ibFnIx) && !readOwesNonNullRecover(val, ibFnIx) {
     return irBMiss("map store value variant bare recover")
+  }
+  // A variant record at the value's plain twin (`recRetag`) goes in as it stands, retagged.
+  if irBOpRep(v) != mr.rmVal && recRetag(irBOpRep(v), mr.rmVal) {
+    return repTemp(b, { rgV: v }, val, mr.rmVal)
   }
   if irBOpRep(v) != mr.rmVal {
     return irBMiss("map store value variant bare rep")
@@ -9970,14 +9974,7 @@ function mapVariantLit(b: i32[], val: i32, sh: i32): Opnd {
   if pre != "" { return irBMiss(pre) }
   const ty = mvValTyIxAt(sh)
   if ty < 0 { return irBMiss("map store value type") }
-  return objLitAt(
-    b,
-    unwrapParen(val),
-    repNodeOfTy(ty),
-    ty,
-    mvValVariantOf(sh),
-    true,
-  )
+  return variantRowLit(b, val, repNodeOfTy(ty), ty, mvValVariantOf(sh))
 }
 
 // A `.pop()` statement over any list legacy pops (`popAnyPlanOf`), through legacy's pop tail.
@@ -13454,6 +13451,18 @@ function variantCoerced(b: i32[], e: i32, rep: i32, ty: i32, vi: i32): Opnd {
   }
   const pre = exprPrePathWhy(e, ibFnIx)
   if pre != "" { return irBMiss(pre) }
+  return variantRowLit(b, e, rep, ty, vi)
+}
+
+// Object literal `e` built at variant row `vi` for rep `rep` of type `ty`; where the row's own type
+// is another record `rep` retags (a rowless `{ r: null }` narrowed to its arm), at that type, the
+// consumer retagging it.
+function variantRowLit(b: i32[], e: i32, rep: i32, ty: i32, vi: i32): Opnd {
+  const vt = if vi >= 0 && vi < uVarTyIx.length { uVarTyIx[vi] } else { -1 }
+  const vr = if vt >= 0 && !irTyOpen(vt) { repNodeOfTy(vt) } else { -1 }
+  if vr >= 0 && vr != rep && repNodeAt(vr) is RRecord && recRetag(vr, rep) {
+    return objLitAt(b, unwrapParen(e), vr, vt, vi, true)
+  }
   return objLitAt(b, unwrapParen(e), rep, ty, vi, true)
 }
 
