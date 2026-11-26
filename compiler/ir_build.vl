@@ -13672,8 +13672,10 @@ function mapGetAt(
   const mr = if rk.mkSym >= 0 { irGlobalRepOf(ib, rk.mkSym) } else { irBOpRep(rk.mkLoc) }
   const m = repNodeAt(mr)
   if !(m is RMap) { return irBMiss("map get receiver rep") }
-  // A union-valued map's read is its value's box, the null-tagged box on a miss; a narrowed read
-  // legacy unboxes after is at another rep and stays a miss.
+  // A union-valued map's read is its value's box, the null-tagged box on a miss. One narrowed to a
+  // record member no plan reads is the box read whole, then narrowed; legacy writes it through
+  // `emitExpr`, which banks the read's row whatever row a caller expecting the box passed.
+  let narrowTo = -1
   if arm == "unionBox" {
     // At its narrowing the read is unboxed to the member's scalar after (`narrowedMapReadOf`).
     const nm = narrowedMapReadOf(ix, ibFnIx)
@@ -13685,7 +13687,12 @@ function mapGetAt(
       "unbox" => repPrim(rep) != null && repNodeOfTy(nodeTyAt(ix, ibFnIx)) == rep
       "container" | "nonNull" => false
     }
-    if box >= 0 || !repOk { return irBMiss("map get union box rep") }
+    if box < 0 && !repOk && !whole && repNodeAt(rep) is RRecord {
+      narrowTo = rep
+    }
+    if (box >= 0 || !repOk) && narrowTo < 0 {
+      return irBMiss("map get union box rep")
+    }
   }
   // A scalar read typed at a boxed nullable its map's value rep is not (one arm of a union of
   // maps) is the probe's own box at that value's kind, as the box plan's `mapScalar` writes it.
@@ -13713,6 +13720,28 @@ function mapGetAt(
     mtTrap: trap,
     mtPrint: -1,
     mtWhole: whole,
+  }
+  if narrowTo >= 0 {
+    const wr: Rhs = {
+      mtSym: rk.mkSym,
+      mtNonNull: rk.mkNonNull,
+      mtLoc: rk.mkLoc,
+      mtKey: rk.mkKey,
+      mtAt: ix,
+      mtBox: -1,
+      mtRow: true,
+      mtTrap: false,
+      mtPrint: -1,
+      mtWhole: true,
+    }
+    const wv = irBLetTempTy(b, wr, ix, m.rmVal, repTyOf(m.rmVal))
+    if ibMiss != "" { return wv }
+    return irBLetTemp(
+      b,
+      { bnV: wv, bnAt: ix, bnRep: narrowTo, bnAtom: -1, bnCon: -1 },
+      ix,
+      narrowTo,
+    )
   }
   if nt >= 0 { return irBLetTempTy(b, r, ix, m.rmVal, nt) }
   // A read at a twin of the value's rep is the value's own read, retagged.
