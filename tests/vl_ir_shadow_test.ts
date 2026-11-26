@@ -639,9 +639,9 @@ Deno.test({
   },
 });
 
-// Outside the set: a `??` over a `null`-typed if-expression and an assignment's radix literal
-// widened through an if-expression each leave their function uncovered, named. A closure parameter, its baked
-// callback clone's included, is inside it and covered.
+// Outside the set: a `??` over a `null`-typed if-expression and a radix literal assigned through an
+// if-expression into a nullable wide cell each leave their function uncovered, named. A closure
+// parameter, its baked callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
@@ -651,19 +651,19 @@ Deno.test({
   return k + ((if c { x } else { x }) ?? 0)
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function wr(c: boolean): i64 {
-  let x: i64 = 0
+function wr(c: boolean): i64 | null {
+  let x: i64 | null = null
   return x = if c { 0xfffffffe } else { 1 }
 }
 print(greet(true, 1))
 print(ap((x: i32) => x + 1))
-print(wr(true))
+print(wr(true) ?? 0)
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    for (const why of ["widen radix"]) {
+    for (const why of ["box ladder"]) {
       if (!rows.has(`uncovered ${why}`)) {
         throw new Error(`want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
       }
