@@ -11,7 +11,7 @@
   `closures/shared-let-read-early-traps-union.vl` and `unions/literal-tag-arm-row-not-taken-by-string-record.vl`;
   `closures/shared-let-without-zero-value.vl` moves on to other classes.
 - **Q58 position sweep** (`tests/cases/closures/captured-union-let-without-initializer-positions.vl`,
-  new): a record union, a value union, read twice, and at the top level. Master: 3 functions
-  `box ladder`; here all claimed.
+  new): a record union, a value union, read twice, and at the top level. Master: 1 function
+  `box ladder`; here all claimed and byte-identical.
 - Left: a record literal assigned to the captured cell inside the closure (`const set = () => { u =
   { b: "s" } }`) still misses `box ladder`, another mechanism.
