@@ -5,7 +5,8 @@
 #   full     run everything.
 #   inherit  a same-repository pull_request `synchronize` whose new head is a CLEAN merge of
 #            the previous head with a commit of the base branch (what `gh pr update-branch`
-#            pushes), and whose previous head's CI run passed with
+#            pushes) that brings no compiler/, std/ or scripts/vl-host/ change since their merge
+#            base, and whose previous head's CI run passed with
 #            a successful job for every job this tree's ci.yml names (but INHERIT_EXEMPT): a
 #            job added since, or one that run skipped, was never proved, so it runs.
 #            The run carries that verdict instead of re-running it.
@@ -65,6 +66,10 @@ if [ "${EVENT:-}" = pull_request ]; then
     full "the merge does not apply cleanly"
   [ "${clean%%$'\n'*}" = "$(git rev-parse "$PR_HEAD^{tree}")" ] ||
     full "the merge's tree is not the clean merge of its parents"
+  # A catch-up that brings master's compiler, std or host changes merges code the previous run
+  # never built with this branch: two green PRs can still meet there, so it re-runs.
+  git diff --quiet "$(git merge-base "${fam[1]}" "${fam[2]}")" "${fam[2]}" -- compiler/ std/ scripts/vl-host/ ||
+    full "the catch-up brings compiler/, std/ or scripts/vl-host/ changes the previous run never built with this branch"
   v=$(ci_verdict "$PR_BEFORE")
   [ "$v" = success ] || full "previous head ${PR_BEFORE:0:9} CI is $v"
   [ -f "$CI_YML" ] || full "no $CI_YML to list the jobs an inherited run must have passed"
