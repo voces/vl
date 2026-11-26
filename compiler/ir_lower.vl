@@ -7,6 +7,7 @@ import { blockHasContinueFor } from "./emit_query"
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
 import { fnEnvIdxOf, readNarrowedBoxToNull } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
+import { refRepValtype } from "./ir_verify_facts"
 import { printUnionPlan } from "./emit_fn_scans"
 import {
   armIdxSlot,
@@ -1063,13 +1064,15 @@ function ownedSlot(v: i32): i32 {
   return s
 }
 
-// The valtype bytes legacy's `fbValtype` declares a non-null value of rep `r` at; none for a
-// nullable rep or one with no kind.
+// The valtype bytes legacy's `fbValtype` declares a non-null value of rep `r` at, a ref list's or a
+// closure's as `refRepValtype` keys it; none for a nullable rep, one with no kind, or a ref list or
+// closure that keys no shape.
 function repLocalValtype(r: i32): u8[] {
   const out: u8[] = []
   const d = repOfTy(repTyOf(r))
   const k = d.rdKind
   if k == null || d.rdNul != 0 { return out }
+  if k == "reflist" || k == "closure" { return refRepValtype(r) }
   const prev = wTarget(out)
   fbValtype(k, d.rdSlot)
   wTarget(prev)
@@ -2565,12 +2568,12 @@ export function irGetIdxBegin(o: Opnd): boolean {
   const once = o is OVar && isTemp(o.ov) && repPrim(opRepOf(o)) == "i32"
   if !(o is OImm || o is OVar && !isTemp(o.ov) || once) { return false }
   const slot = if once { irOnceSlot([127]) } else { -1 }
-  // Legacy's staging of the index is dropped: the tail reads this local through the hook.
   if slot >= 0 {
     irLOpnd(o)
     fbLocalSet(slot)
-    listGetIdxUnstage()
   }
+  // Legacy's staging of the index is dropped: the tail reads it through the hook.
+  listGetIdxUnstage()
   getIdxOs.push(o)
   getIdxReads.push(0)
   getIdxSlots.push(slot)
@@ -2582,7 +2585,8 @@ export function irGetIdxBegin(o: Opnd): boolean {
 export function irGetIdxEnd() {
   getIdxOs.pop()
   getIdxReads.pop()
-  if (getIdxSlots.pop() ?? -1) >= 0 { listGetIdxRelease() }
+  getIdxSlots.pop()
+  listGetIdxRelease()
   if getIdxOs.length == 0 { listGetIdxHook = listGetIdxLegacy }
   return 0
 }
@@ -6802,11 +6806,8 @@ function coalListGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   // A receiver legacy would stage is the builder's local (`heldInLocal`), read through the hook.
   const recvHooked = recvIx >= 0 && irGetRecvBegin(n.cbL, recvIx)
   if recvHooked { listGetRecvUnstage() }
-  // So is an index held in a local of its own: legacy's head reads it through the index hook.
-  if hooked { listGetIdxUnstage() }
   const ek = listGetOrOpen(unwrapParen(e.binLeft), lw.irAt)
   if recvHooked { listGetRecvRelease() }
-  if hooked { listGetIdxRelease() }
   if recvHooked { irGetRecvEnd() }
   if hooked { irGetIdxEnd() }
   if ek == null { return irLMiss("listGetOr head") }
