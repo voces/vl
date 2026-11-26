@@ -594,23 +594,28 @@ Deno.test({
   },
 });
 
-// Outside the set: a `??` over a `null`-typed if-expression and a radix literal assigned through an
+// Outside the set: an operand left below a `??` written in place (whose value waits on the stack at
+// its use, so no stage or spill holds the operand below it) and a radix literal assigned through an
 // if-expression into a nullable wide cell each leave their function uncovered, named. A closure
 // parameter, its baked callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    const src = `function greet(c: boolean, k: i32): i32 {
-  const x = null
-  return k + ((if c { x } else { x }) ?? 0)
+    const src = `type J = { a: i32 }
+type P = { j: J, k: i32 }
+type Q = { j: null, k: i32 }
+function mk(b: boolean): P | Q {
+  return if b { { j: { a: 3 }, k: 1 } } else { { j: null, k: 2 } }
 }
+const g = mk(true)
+function greet(k: i32): i32 { return k + (g.j?.a ?? 0) }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function wr(c: boolean): i64 | null {
   let x: i64 | null = null
   return x = if c { 0xfffffffe } else { 1 }
 }
-print(greet(true, 1))
+print(greet(1))
 print(ap((x: i32) => x + 1))
 print(wr(true) ?? 0)
 `;
@@ -1937,15 +1942,21 @@ Deno.test({
   name: "ir shadow: the blocker census names every class a function missed, and moves no byte",
   ignore,
   fn: () => {
-    const src = `function ok(x: i32): i32 { return x + 1 }
-function two(c: boolean, k: i32): i32 {
+    const src = `type J = { a: i32 }
+type P = { j: J, k: i32 }
+type Q = { j: null, k: i32 }
+function mk(b: boolean): P | Q {
+  return if b { { j: { a: 3 }, k: 1 } } else { { j: null, k: 2 } }
+}
+const g = mk(true)
+function ok(x: i32): i32 { return x + 1 }
+function two(k: i32): i32 {
   const xs = [1, 2]
-  const x = null
-  const y = k + ((if c { x } else { x }) ?? 0)
+  const y = k + (g.j?.a ?? 0)
   return xs[0] + y
 }
 print(ok(1))
-print(two(true, 3))
+print(two(3))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
@@ -1953,8 +1964,8 @@ print(two(true, 3))
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }
-    if ((census.rows.get("blockers none") ?? 0) !== 1) {
-      throw new Error(`want one covered function, got ${JSON.stringify([...census.rows])}`);
+    if ((census.rows.get("blockers none") ?? 0) !== 2) {
+      throw new Error(`want two covered functions (ok, mk), got ${JSON.stringify([...census.rows])}`);
     }
     const plain = run(src, false);
     if (plain.out.length !== census.out.length || plain.out.some((b, i) => b !== census.out[i])) {
