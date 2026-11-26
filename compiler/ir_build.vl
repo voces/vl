@@ -611,6 +611,7 @@ import {
   numIsPlanOf,
   recoveredReadTyOf,
   tagIsArmOf,
+  unionListArmTyOfSlot,
   widenPlanOf,
 } from "./emit_plan_union"
 import {
@@ -10755,6 +10756,12 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
       return unionIfLink(b, en, unwrapParen(ix), dst, eu, eu, true)
     }
   }
+  // A list literal the box plan builds at a ref-list arm its own type is not (`armLit`) is built
+  // at that arm, as legacy's `emitUnionListLitViaRefArm` builds it.
+  if ibMiss == "" && dst >= 0 && heldAsBox(dst) {
+    const al = armLitAt(b, ix, dst)
+    if al != null { return al }
+  }
   // A literal the box plan boxes as another variant arm is built at that arm's row, as legacy's
   // `emitVariantStruct` builds it.
   if ibMiss == "" && dst >= 0 && heldAsBox(dst) && boxOwedAt(ix, ibFnIx) {
@@ -11162,6 +11169,31 @@ function parkedBoxOf(b: i32[], v: Opnd): Opnd | null {
   return pv
 }
 
+// Set while `armLitAt` builds a literal at its arm: each element goes into the slot's union box
+// (`irConvert`), whatever its own type records.
+let ibArmLitBuild = false
+
+// List literal `ix` boxed into box rep `dst` by an `armLit` plan: built at the arm's list row,
+// then boxed under its tag; null where the plan is another arm.
+function armLitAt(b: i32[], ix: i32, dst: i32): Opnd | null {
+  const al = unwrapParen(ix)
+  if al < 0 || al >= P.nodes.length { return null }
+  const an = nodeAt(al)
+  if !(an is ArrayLit) { return null }
+  const t0 = holeBoxTyAt(ix, ibFnIx)
+  const uTy = if t0 >= 0 { t0 } else { repTyOf(dst) }
+  const p = holeBoxPlanOf(ix, uTy, ibFnIx)
+  if p.hbArm != "armLit" { return null }
+  const at = unionListArmTyOfSlot(uTy, p.hbSrc)
+  if at < 0 { return irBMiss("list literal arm type") }
+  const lb: ListBuild = { lbKind: LBK_UNION, lbSlot: p.hbSrc }
+  ibArmLitBuild = true
+  const lv = arrayLit(b, an, al, repNodeOfTy(at), lb, at)
+  ibArmLitBuild = false
+  if ibMiss != "" { return lv }
+  return boxTempIn(b, lv, ix, dst, -1, uTy)
+}
+
 // `boxTemp` for `v` built at variant row `at`, or at its own layout where `at` is -1.
 function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   return boxTempIn(b, v, ix, dst, at, holeBoxTyAt(ix, ibFnIx))
@@ -11455,7 +11487,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd, ix: i32): string {
     "nulNiche" => refNullable(r) || strNullable(r)
     "nulBool" => repBoolNiche(r)
     "rec" | "obj" | "recCopy" => repNodeAt(r) is RRecord
-    "refList" | "atomList" => repNodeAt(r) is RList
+    "refList" | "atomList" | "armLit" => repNodeAt(r) is RList
     // A scalar map read is built as the probe's own box (`mapGetAt`), which this plan writes as is.
     "mapScalar" => boxedNullable(r)
     // A union-valued map read is built as its box, a miss the null-tagged box (`mapGetAt`).
@@ -12978,7 +13010,13 @@ function arrayLit(
   for e in n.arrElems {
     const at = b.length
     starts.push(at)
-    const v = if dataConst || dataComputed && arrLitElemIsConst(e) { longConstElem(e, er) } else if vslot >= 0 { variantElem(b, e, er, vslot) } else if uslot >= 0 { boxTempIn(
+    const v = if dataConst || dataComputed && arrLitElemIsConst(e) { longConstElem(e, er) } else if ibArmLitBuild && heldAsBox(er) { irConvert(
+      b,
+      unionElemValue(b, e),
+      er,
+      arrRefUnionElemTy(ix, lb.lbSlot, ibFnIx),
+      e,
+    ) } else if vslot >= 0 { variantElem(b, e, er, vslot) } else if uslot >= 0 { boxTempIn(
       b,
       unionElemValue(b, e),
       e,
