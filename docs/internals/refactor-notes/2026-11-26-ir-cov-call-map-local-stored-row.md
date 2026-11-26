@@ -34,6 +34,14 @@ programs, plus the two witnesses, merge-base against branch:
   the series' records PR.
 - The class programs' own rows do not move.
 
+**Whole `tests/cases` delta.** The same probe rows were taken for every program (9,687), merge-base
+`a084d009c` against branch. Totals: `fnc` 97,683 -> 97,687, `fnu` 319 -> 315. Only the two
+witnesses above differ.
+
+A first run also moved two union-valued map locals: `aliasMap` lost its claim, and `places` changed
+its miss. A map is therefore held at its slot's map only where the slot's value is a record, and
+`Map()` is built at the local's held rep only where that differs from the call's own type.
+
 **Q58.** `tests/cases/maps/map-local-record-value-read-at-stored-row-positions.vl` covers six read
 sites: an optional chain, a narrowed local, `??`, a values loop, a null test and an argument.
 
