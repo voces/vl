@@ -37,7 +37,8 @@
 # bytes are wrong, the IR's right) may also build under the claims seed where the claimless one
 # refuses (`expected divergence f (legacy-wrong: claimless exit N)`); `ir-parity.vl` proves its
 # IR-on run against the program's expected output instead of against IR off.
-# `--build-claimless <seed> <out>` writes the claimless compiler alone.
+# `--build-claimless <seed> <out>` writes the claimless compiler alone, built from THIS tree's
+# compiler/ (the seed only builds it), with `<out>.src` naming that source; it prints the tree.
 # Either exits 1 on any other difference. Run from the checkout root; $VL names the host, $JOBS the
 # fan-out (default 4); $VL defaults to the checkout's host. Temp files live under $TMPDIR and are removed on exit.
 # `--shard i/n` keeps every n-th program of each list, starting at the i-th, so n runs partition
@@ -281,8 +282,28 @@ shard_list() {
 }
 
 # The checkout's compiler with `CLAIMED` empty, built by seed $1 to $T/claimless.wasm.
+# The source a claimless compiler is built from is this tree's compiler/, whatever seed builds it:
+# `src_id` names it, `claimless` records it beside the build (`<out>.src`), and a comparison of two
+# compilers from one source is refused rather than run (it would compare the tree with itself).
+src_id() { cat compiler/*.vl | sha256sum | cut -c1-16; }
+src_where() {
+  local rev; rev=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
+  [ -z "$(git status --porcelain -- compiler 2>/dev/null)" ] || rev="$rev+dirty"
+  echo "$(pwd) at $rev, compiler/ $(src_id)"
+}
 claimless() {
-  if [ -n "${IR_IDENTITY_CLAIMLESS:-}" ]; then cp "$IR_IDENTITY_CLAIMLESS" "$T/claimless.wasm"; return; fi
+  if [ -n "${IR_IDENTITY_CLAIMLESS:-}" ]; then
+    local want; want=$(src_id)
+    if [ -f "$IR_IDENTITY_CLAIMLESS.src" ] && [ "$(cat "$IR_IDENTITY_CLAIMLESS.src")" != "$want" ]; then
+      echo "ir-identity: \$IR_IDENTITY_CLAIMLESS was built from compiler/ $(cat "$IR_IDENTITY_CLAIMLESS.src"), not this tree's ($want); rebuild it here" >&2
+      exit 2
+    fi
+    cp "$IR_IDENTITY_CLAIMLESS" "$T/claimless.wasm"
+    src_id > "$T/claimless.src"
+    return
+  fi
+  echo "ir-identity: the claimless compiler is built from $(src_where)" >&2
+  src_id > "$T/claimless.src"
   cp -r compiler "$T/c0"
   awk '
     /^const CLAIMED: IrFamily\[\] = \[$/ { print "const CLAIMED: IrFamily[] = []"; skip = 1; hit = 1; next }
@@ -296,6 +317,7 @@ claimless() {
 if [ "${1:-}" = "--build-claimless" ]; then
   claimless "${2:?usage: --build-claimless <seed> <out.wasm>}"
   cp "$T/claimless.wasm" "${3:?usage: --build-claimless <seed> <out.wasm>}"
+  cp "$T/claimless.src" "$3.src"
   exit
 fi
 
@@ -347,6 +369,11 @@ A=${1:?usage: scripts/ir-identity.sh <seed-a> <seed-b> [--names] | --cases <seed
 B=${2:?usage: scripts/ir-identity.sh <seed-a> <seed-b> [--names] | --cases <seed> | --claimless <seed>}
 export FLAGS=${3:-}
 SEED_A=$A SEED_B=$B
+# Two claimless builds of one compiler/ source are the same compiler: the comparison is vacuous.
+if [ -f "$A.src" ] && [ -f "$B.src" ] && [ "$(cat "$A.src")" = "$(cat "$B.src")" ]; then
+  echo "ir-identity: $A and $B were both built from compiler/ $(cat "$A.src"), so comparing them compares a tree with itself; build each side in its own tree (git worktree)" >&2
+  exit 2
+fi
 # Two seeds have no claimless relation to run against, so this mode stays a byte identity.
 BYTES=${IR_IDENTITY_BYTES:-1}
 D=scripts/silent-sweep/distilled
