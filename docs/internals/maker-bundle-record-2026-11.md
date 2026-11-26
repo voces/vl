@@ -7,7 +7,7 @@ captures taken once (D16845's contract). Widening the lambda's parameter to the 
 the directly bound lambda's contract, `const f = (a) => a / 2; f(3); f(3.0)` printing `1` then
 `1.5`.
 
-Status: draft. The template is committed; nothing else is built.
+Status: C0 landed (#10281); C1 built (holders, captures, `return_inferred`, globals; the template runs 57 of 66). C2 and D16079 remain.
 
 ## The family is three shapes, not one
 
