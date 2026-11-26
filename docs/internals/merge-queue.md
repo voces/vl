@@ -348,7 +348,7 @@ For the queue:
 - **Q68.** A verifier grades on a host whose `scripts/vl-host` matches the train's own tree and quotes its sha256; `scripts/ir-parity.vl` runs `$VL`, so check it. A host built before `c0cbdab7` lacks the claims-off fallback, and one built before `6bf25409` (#9888) lacks the soft-refusal note; a train containing either commit is graded on a host built from a tree containing it, a train that lacks it on its own tree's host (queue rulings, 2026-11-24, BROADCASTS #27 and #30).
 - **Q69.** A reading of a claimless face names the claimless compiler's sha256 and the commit of the tree it was built in, with `git status --short compiler` clean: a claimless compiler built on a fix branch, read as master's, opened a false G3 express (coordinator ruling, 2026-11-24, BROADCAST #29).
 - **Q70.** Each active lane files new inventory rows only from its own reserved range (`docs/internals/inventory/reserved/`, 20 ids each, ids 17140 to 17479, #9893) and asks the queue for another when it runs out: ids raced four times in ten minutes before the ranges (coordinator directive, 2026-11-24, BROADCAST #28).
-- **Q71.** A row whose filed witness falls back to legacy (a `runs` witness the claims run builds) lands with its line in `scripts/silent-sweep/distilled/claims-fallbacks.txt` in the same PR (queue rule, after #9910's row reddened `ir claims`, fixed by #9913).
+- **Q71.** A row whose filed witness falls back to legacy (a `runs` witness the claims run builds) lands with its line in `scripts/silent-sweep/distilled/claims-fallbacks.txt` (retired at I8 with `ir claims`) in the same PR (queue rule, after #9910's row reddened `ir claims`, fixed by #9913).
 
 Readings recorded at the eighteenth fold, for the next reader of the same class: a legacy plan never shadows a region once it mutates or is reassigned, so #9862's guard protected nothing (V7); #9878's skipped cross-tag delivery check is unconstructible, since the checker refuses `is` narrowing to a contained arm (V6); a wrong heap fill in #9899 is caught by the builder as a miss, not by the verifier, and cannot reach a claim (V3); #9887's relaxed door-guard case reds on its miss clause, since no path produces a differ once the atom is declared (V6); a verifier's coverage gap, a mutant that ships wrong output while every committed program passes, is closed before merge with a committed witness (#9885 and #9891, queue rulings).
 
@@ -399,7 +399,7 @@ Q57 (coordinator ruling) lets an IR lane write bytes legacy would not, when matc
 cost more than about two hours. The queue or the coordinator acks the divergence and its cost
 before the lane relies on it. Byte identity cannot prove such a function, so behaviour does:
 
-- The lane adds one line per diverging function to `scripts/ir-divergence-baseline.txt`:
+- The lane adds one line per diverging function to `scripts/ir-divergence-baseline.txt` (retired at I8):
   `<program>\t<function>\t<mechanism>\t<PR>`, the function as a `--names` build spells it
   (`f@1`), `<module>` for anything outside the function bodies.
 - `scripts/ir-identity.sh` then prints `expected divergence <program> (<functions>)` for that

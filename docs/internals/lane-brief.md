@@ -29,9 +29,8 @@ Re-run `scripts/refresh-compiler.sh` after every `compiler/*.vl` edit.
 
 - Do not fix a defect in legacy's emitter (`wasmEmit.vl`, `emit_*.vl` outside the plans and tails
   the IR shares) unless your claim needs that fix. Claim the shape in the IR. Bytes that differ from
-  legacy's need no listing; only behaviour is graded. Where legacy is wrong, list the divergence
-  (`scripts/ir-divergence-baseline.txt`, a `legacy-wrong:` mechanism) and prove it with the
-  program's expected output.
+  legacy's need no listing; only behaviour is graded. Where legacy is wrong, prove it with the
+  program's expected output (its `@log` or `Want:`).
 - Do not file a row for a legacy-emitter defect. Give it one line in your refactor note.
 - Do not re-run proof that CI runs on your PR. `scripts/ci-proof.sh rows` lists the gate rows CI
   covers. In particular, no local byte A/B, claimless or `--cases` identity run over the corpus:
