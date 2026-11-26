@@ -13348,3 +13348,28 @@ names the wrong heap for a nested record laid out at another row (D17666's
 `[{ r: { f: inc0 }, s: { f: dbl } }]`). Producers (this accessor) and consumers (a place holding
 the value, COV-CALL's list, map and record places) are split so the place side builds on one
 answer; D17666 closes when both are in.
+
+## A maker's returned hole lambda held at two signatures is a record of its holders' signatures (2026-11-26, coordinator rulings)
+
+**Ruled by the coordinator 2026-11-26** (family C, `docs/internals/maker-bundle-record-2026-11.md`).
+A maker returning a hole lambda it creates, one call's value held and called at two signatures,
+returns D15144's record of one closure per signature, so every consumer that record already reaches
+is reused.
+
+1. **One record per maker, the union of its holders' signatures.** Instances are not split per
+   signature set: that would multiply instances per call shape.
+2. **All or nothing.** The maker converts only when every call of it is held at the record (a
+   holder or copy calling through it, a link, or a function returning the call whole to such a
+   holder). Otherwise it keeps today's lowering;
+   `tests/cases/closures/maker-lambda-mixed-holders-unconverted.vl` grades that fallback.
+3. **Slices.** C0 (D16819, #10281), C1 (holders, captures, `return_inferred`, globals: this),
+   C2 (containers, fields, `argument`), then D16079. Each is gated by
+   `maker-fresh-lambda-held-at-two-signatures.matrix.vl` with `--before`/`--after` and no runs →
+   not-runs.
+4. **The record is built in the IR only.** Legacy is deleted at I8, so it gets no return-site build;
+   a maker the IR then declines stays loud, and regress guards the corpus.
+
+**Why.** The read side (holder member picks, calls through, the record row) already exists for a
+bundle parameter returned whole. Only the producer was missing: the signature list from the
+callers' side, the lambda instanced at each signature under the maker's frame, and the `return`
+building the record.

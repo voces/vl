@@ -790,6 +790,7 @@ import {
   elabHasHolderRecords,
   elabHasRetRecords,
   elabInstTyAt,
+  elabMakerLamOf,
   elabSpreadNote,
   isStorageRead,
   luOvEnter,
@@ -817,6 +818,7 @@ import {
   asgReadUnwidenOp,
   asgYieldsNullLit,
   boxedFieldUnionTyOf,
+  bundleRecordRowOfSigs,
   callIsArrSlice,
   callResultMemberTy,
   capCellName,
@@ -5412,17 +5414,22 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const lat = b.length
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" || irBOpRep(l) != ibBool { return irBMiss("logical operand") }
-  // Legacy reads a constant `is` back off its bytes and writes the right side as a dead arm.
-  if bareConstIs(l, n.binLeft, b, lat) {
-    return irBMiss("decided is short-circuit")
-  }
+  // Legacy reads a constant `is` back off its bytes and writes the right side as `unreachable`
+  // where the constant rules it out: under a decided `&&` false or `||` true.
+  const decided = bareConstIs(l, n.binLeft, b, lat)
+  const on = l is OImm && l.oiBits != 0
+  const rhsLive = !decided || (n.binOp == "&&") == on
   const ty = outTyOf(ix, rep)
   if ibTyOpen(ty, rep) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const rhsBody: i32[] = []
-  const r = irBExpr(rhsBody, n.binRight)
-  if irBOpRep(r) != ibBool { return irBMiss("logical operand") }
-  irBNode(rhsBody, { asDst: t, asSrc: r }, -1, irBNoValue(), ix)
+  if rhsLive {
+    const r = irBExpr(rhsBody, n.binRight)
+    if irBOpRep(r) != ibBool { return irBMiss("logical operand") }
+    irBNode(rhsBody, { asDst: t, asSrc: r }, -1, irBNoValue(), ix)
+  } else {
+    irBNode(rhsBody, { tpWhy: 0 }, -1, ibNoValue, n.binRight)
+  }
   const fixBody: i32[] = []
   const bits: i64 = if n.binOp == "&&" { 0 } else { 1 }
   const fixed: Opnd = { oiRep: ibBool, oiBits: bits }
@@ -16327,15 +16334,26 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       const ones: Opnd = { oiRep: rep, oiBits: -1 }
       return irBLetTempTy(b, { poOp: "xor", poArgs: [a, ones] }, ix, rep, uty)
     }
-    // Legacy's integer `-x` is `0 - x`, the zero written before the operand, which a valued `if`
-    // in it would sit above.
+    // Legacy's integer `-x` is `0 - x`, the zero written before the operand: over a valued `if`,
+    // the zero is staged below it and the negation is that subtraction.
     const vt = valtypeOf(rep)
     if (
       n.unOp == "-"
       && (vt == 0x7f || vt == 0x7e)
-      && ifBelowLead(b, aat, "integer negation of a valued if")
+      && ifBelowLeadHas(b, aat, b.length)
     ) {
-      return a
+      const zero: Opnd = { oiRep: rep, oiBits: 0 }
+      const lead = [zero]
+      if !irBStageLeads(b, aat, [aat], lead, [ix]) {
+        return irBMiss("integer negation of a valued if")
+      }
+      return irBLetTempTy(
+        b,
+        { poOp: "sub", poArgs: [lead[0], a] },
+        ix,
+        rep,
+        uty,
+      )
     }
     const op: PrimOp = if n.unOp == "-" { "neg" } else { "not" }
     return irBLetTempTy(b, { poOp: op, poArgs: [a] }, ix, rep, uty)
@@ -19038,6 +19056,23 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       }
       // Legacy's `unreachable` after the `end` its returning arms leave behind.
       irBNode(b, { tpWhy: 0 }, -1, ibNoValue, ix)
+      return 0
+    }
+    // A maker returning its hole lambda as the record of the signatures its holders call it at
+    // builds that record, one closure per signature (D16845).
+    const mpos = fnStmtsPosOf(ibFnIx)
+    const msigs = if elabMakerLamOf(ibFnIx) == unwrapParen(n.retArg) && mpos >= 0 { fnBundleRetSigs(mpos) } else { [] }
+    if msigs.length >= 2 {
+      const mv = bundleRecBuild(
+        b,
+        unwrapParen(n.retArg),
+        msigs,
+        bundleRecordRowOfSigs(msigs),
+        bundleRecordTyOf(msigs),
+        false,
+      )
+      if ibMiss != "" { return 0 }
+      irBNode(b, { rtHas: true, rtV: mv }, -1, ibNoValue, ix)
       return 0
     }
     const built = retCloAt(b, n.retArg) ?? retDelivered(b, n.retArg)
