@@ -9,7 +9,7 @@
 set -euo pipefail
 OUT=${1:?usage: scripts/ir-i8-census/summary.sh <out-dir> [top]}
 TOP=${2:-25}
-for pop in self distilled cases probes witnesses scripts; do
+for pop in self distilled cases probes witnesses scripts harness; do
   [ -f "$OUT/$pop.rows" ] || continue
   awk -F'\t' -v pop="$pop" -v top="$TOP" -v progs="$(cat "$OUT/$pop.programs")" '
     function key(f, nm) { return (nm ~ /\$m/) ? nm : f "::" nm }
