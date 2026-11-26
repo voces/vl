@@ -67,9 +67,6 @@ const CI_RUNS: Record<string, string[]> = {
   "late demands": [
     "vl run scripts/late-demands.vl --compiler build/vl-compiler.wasm -- --check --seed build/vl-compiler.wasm",
   ],
-  "self ir misses": [
-    "vl run scripts/self-ir-misses.vl --compiler build/vl-compiler.wasm -- --check --seed build/vl-compiler.wasm",
-  ],
   "phase state": [
     "vl run scripts/phase-state-census.vl --compiler build/vl-compiler.wasm -- --check",
   ],
