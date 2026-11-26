@@ -9046,7 +9046,7 @@ function elabMakerLamRecord(d: i32, dn: FuncDecl): i32[] {
   const lam = elabMakerRetLam(dn)
   if lam < 0 { return none }
   const sigs: i32[] = []
-  if !elabMakerHolderSigs(lam, d, sigs, [d]) || sigs.length < 2 { return none }
+  if !elabMakerCallsSigs(lam, d, sigs, [d]) || sigs.length < 2 { return none }
   elabMakerLams[d] = lam
   return sigs
 }
@@ -9059,11 +9059,11 @@ export function elabMakerLamOf(d: i32): i32 {
   return elabMakerLams[nodeSrc[d] ?? d] ?? -1
 }
 
-// Adds to `sigs` the signature of each call through a holder, or a copy of one, of a call of plain
-// function `d`, and of the plain functions in `seen`'s chain that return such a call whole. False
-// where one stays open or a call is not so held: the maker converts only when every call is, all
-// or nothing.
-function elabMakerHolderSigs(
+// Adds to `sigs` the signatures every call of plain function `d` is called at through the
+// destinations its value flows to (`elabMakerDestSigs`), the functions in `seen`'s chain returning
+// such a call whole included. False where one stays open or a destination is not a call-through:
+// the maker converts only when every call's value is, all or nothing.
+function elabMakerCallsSigs(
   lam: i32,
   d: i32,
   sigs: i32[],
@@ -9071,47 +9071,153 @@ function elabMakerHolderSigs(
 ): boolean {
   for c in elabResPlainCalls.keys() {
     if (elabResPlainCalls[c] ?? -1) != d { continue }
-    const h = elabResHolder[c] ?? -1
-    if h >= 0 {
-      const ws: i32[] = [h]
-      for w in elabCopiesDeep(h) { ws.push(w) }
-      const mine: i32[] = []
-      for w in ws {
-        // Every read of the holder or a copy is a call through it, a further copy, or a write or
-        // link of the holder itself.
-        const th = elabResThrough[w] ?? []
-        const own = th.length
-          + (elabResCopies[w] ?? []).length
-          + elabResWriteReads(w)
-          + elabResLinkReads(w)
-        if (elabResReads[w] ?? 0) != own { return false }
-        for t in th {
-          const sig = elabMakerSigOf(lam, t)
-          if sig < 0 { return false }
-          if !elabTyListHolds(mine, sig) { mine.push(sig) }
-          if !elabTyListHolds(sigs, sig) { sigs.push(sig) }
-        }
+    if !elabMakerDestSigs(lam, d, c, sigs, seen) { return false }
+  }
+  return true
+}
+
+// The destination walk for call `c` of maker `d`: a holder and its copies, a slot of a field or
+// list and its reads, or a function returning the call whole. Each arm adds the signatures its
+// calls-through take; false where the value reaches anything else.
+function elabMakerDestSigs(
+  lam: i32,
+  d: i32,
+  c: i32,
+  sigs: i32[],
+  seen: i32[],
+): boolean {
+  const h = elabResHolder[c] ?? -1
+  if h >= 0 {
+    const ws: i32[] = [h]
+    for w in elabCopiesDeep(h) { ws.push(w) }
+    const mine: i32[] = []
+    for w in ws {
+      // Every read of the holder or a copy is a call through it, a further copy, or a write or
+      // link of the holder itself.
+      const th = elabResThrough[w] ?? []
+      const own = th.length
+        + (elabResCopies[w] ?? []).length
+        + elabResWriteReads(w)
+        + elabResLinkReads(w)
+      if (elabResReads[w] ?? 0) != own { return false }
+      for t in th {
+        if !elabMakerSigAdd(lam, t, sigs, mine) { return false }
       }
-      // A holder calling one signature alone, with no copy or link to share the record, is a plain
-      // closure's, which a record does not serve.
-      if mine.length < 2 && ws.length < 2 && elabResLinkReads(h) == 0 {
+    }
+    // A holder calling one signature alone, with no copy or link to share the record, is a plain
+    // closure's, which a record does not serve.
+    return mine.length >= 2 || ws.length >= 2 || elabResLinkReads(h) > 0
+  }
+  const sr = elabMakerSlotSigs(lam, d, c, sigs)
+  if sr >= 0 { return sr == 1 }
+  // A function returning the call whole hands it to its own callers' destinations.
+  const f = elabEnclosingFn(c)
+  const fn = if f >= 0 { nodeAt(f) } else { null }
+  if !(fn is FuncDecl) || i32ListHas(seen, f) { return false }
+  const rv: i32[] = []
+  collectRetValues(fn.fnBody, rv)
+  let ret = false
+  for v in rv {
+    if parenPeelIx(v) == c { ret = true }
+  }
+  if !ret { return false }
+  seen.push(f)
+  return elabMakerCallsSigs(lam, f, sigs, seen)
+}
+
+// Adds the signature call `t` takes lambda `lam` at to `sigs` and `mine`; false where it stays open.
+function elabMakerSigAdd(lam: i32, t: i32, sigs: i32[], mine: i32[]): boolean {
+  const sig = elabMakerSigOf(lam, t)
+  if sig < 0 { return false }
+  if !elabTyListHolds(mine, sig) { mine.push(sig) }
+  if !elabTyListHolds(sigs, sig) { sigs.push(sig) }
+  return true
+}
+
+// The slot arm of the destination walk: call `c` of maker `d` stored as field `f` of a `const`
+// record literal, or an element of a `const` list literal, every value the slot is written a call
+// of `d`. Adds the signatures of each call through the slot's reads and the `const` places holding
+// one; 1, 0 where a read is anything else, -1 where `c` is stored in no such slot.
+function elabMakerSlotSigs(lam: i32, d: i32, c: i32, sigs: i32[]): i32 {
+  cwIxBuild()
+  if c < 0 || !cwIxCovers(c) { return -1 }
+  const uk0 = cwIxUpKind[c]
+  let f = ""
+  if uk0 == CW_UP_FIELD {
+    const fx = cwIxUpAux[c]
+    const fiv = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+    if !(fiv is FieldInit) { return -1 }
+    f = fiv.fiName
+  } else if uk0 == CW_UP_ELEM {
+    f = "[]"
+  } else {
+    return -1
+  }
+  const lit = cwIxUp[c]
+  if lit < 0 || !cwIxCovers(lit) || cwIxUpKind[lit] != CW_UP_LETINIT { return 0 }
+  const s = cwIxUp[lit]
+  const sn = if s >= 0 && s < P.nodes.length { nodeAt(s) } else { null }
+  if !(sn is LetDecl) || sn.letKw != "const" || sn.letType >= 0 { return 0 }
+  const isList = f == "[]"
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(s, [f], vals, ats) < 0 || vals.length == 0 { return 0 }
+  for v in vals {
+    const vc = elabSlotValueCall(v)
+    if vc < 0 || (elabResPlainCalls[vc] ?? -1) != d { return 0 }
+  }
+  const mine: i32[] = []
+  const ow = cwOccWalk(s)
+  while cwOccNext(ow) {
+    const k = cwIxKind[ow.row]
+    const u = cwIxNode[ow.row]
+    if k == CW_OCC_USE {
+      if cwUseInOtherFrame(u) || !cwIxCovers(u) || cwIxUpKind[u] != CW_UP_OBJ {
+        return 0
+      }
+      const m = cwIxUp[u]
+      const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+      const own = if isList { mn is Index } else { mn is Member && mn.memProp == f }
+      if !own {
+        // A list's length, or another field of the record, reads no value of the slot.
+        const other = if isList { mn is Member && mn.memProp == "length" } else { mn is Member }
+        if !other { return 0 }
+        continue
+      }
+      const uk = if cwIxCovers(m) { cwIxUpKind[m] } else { -1 }
+      if uk == CW_UP_CALLEE {
+        if !elabMakerSigAdd(lam, cwIxUp[m], sigs, mine) { return 0 }
+      } else if uk == CW_UP_LETINIT {
+        if !elabMakerPlaceSigs(lam, cwIxUp[m], sigs, mine) { return 0 }
+      } else {
+        return 0
+      }
+    } else if k != CW_OCC_BIND && k != CW_OCC_ASG {
+      return 0
+    }
+  }
+  return 1
+}
+
+// Adds the signatures of each call through `const` place `h`, initialised with a slot's read; false
+// where `h` is read another way.
+function elabMakerPlaceSigs(lam: i32, h: i32, sigs: i32[], mine: i32[]): boolean {
+  const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+  if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return false }
+  const hw = cwOccWalk(h)
+  while cwOccNext(hw) {
+    const k = cwIxKind[hw.row]
+    const u = cwIxNode[hw.row]
+    if k == CW_OCC_CALL {
+      if !elabMakerSigAdd(lam, u, sigs, mine) { return false }
+    } else if k == CW_OCC_USE {
+      if cwUseInOtherFrame(u) || !cwIxCovers(u) || cwIxUpKind[u] != CW_UP_CALLEE {
         return false
       }
-      continue
+      if !elabMakerSigAdd(lam, cwIxUp[u], sigs, mine) { return false }
+    } else if k != CW_OCC_BIND {
+      return false
     }
-    // A function returning the call whole hands it to its own callers' holders.
-    const f = elabEnclosingFn(c)
-    const fn = if f >= 0 { nodeAt(f) } else { null }
-    if !(fn is FuncDecl) || i32ListHas(seen, f) { return false }
-    const rv: i32[] = []
-    collectRetValues(fn.fnBody, rv)
-    let ret = false
-    for v in rv {
-      if parenPeelIx(v) == c { ret = true }
-    }
-    if !ret { return false }
-    seen.push(f)
-    if !elabMakerHolderSigs(lam, f, sigs, seen) { return false }
   }
   return true
 }
