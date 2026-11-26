@@ -54,6 +54,7 @@ import {
 } from "./emit_mono"
 import {
   boxTagOfTy,
+  repDescIsNullRef,
   repElemTyOfName,
   repRecordFieldNames,
   slotRowTyOf,
@@ -5245,6 +5246,15 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !atomId
       && rowTy < 0
       && !tagId
+    // A read narrowed to `null` whose storage is that null (`NULL_READ_STORED`) is the cell as it
+    // stands, at the binding's row, as a local's storage read is.
+    if (
+      declined
+      && nullReadOwnAt(ix) == NULL_READ_STORED
+      && repNodeOfTy(heldTy(letBindTy(d, -1))) == cellRep
+    ) {
+      return globalStoredRead(b, g, ix, cellRep, heldTy(letBindTy(d, -1)))
+    }
     // A struct cell read at a record its row holds is read at that row.
     const rowRt = if declined { globalCellRowReadTy(ix, d, cellRep, rep) } else { -1 }
     if rowRt >= 0 { return globalStoredRead(b, g, ix, cellRep, rowRt) }
@@ -9769,6 +9779,15 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
       && holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx).hbArm == "null"
     ) {
       return boxTemp(b, { oiRep: ibNoValue, oiBits: 0 }, ix, dst)
+    }
+    // The `null` unit holds that null alone, written as its own (`ref.null`), the storage unread.
+    if dst == repNodeOfNullUnit() {
+      return repTemp(
+        b,
+        { nuAt: unwrapParen(ix), nuOwn: NULL_OWN_NONE, nuRead: [] },
+        ix,
+        dst,
+      )
     }
     const sv = exprAt(b, ix, true)
     // At the `null` unit the storage read is returned as it stands: a fresh binding takes it at
@@ -14523,6 +14542,16 @@ function recCopied(b: i32[], ix: i32, cell: boolean): Opnd {
   return irBLetTempTy(b, { cvV: v, cvAt: ix }, ix, rep, ty)
 }
 
+// Whether fresh binding `letIx`'s initializer `init` is a read narrowed to `null` whose storage is
+// that null (`NULL_READ_STORED`), where the binding is stored as a nullable reference
+// (`letBindRep`): legacy copies the storage as it stands, which `localStoredAt` then takes.
+function letStoresNullRead(letIx: i32, init: i32, v: i32): boolean {
+  return nullReadOwnAt(init) == NULL_READ_STORED
+    && letBindRepClaims(letIx, ibFnIx)
+    && repDescIsNullRef(letBindRep(letIx, ibFnIx))
+    && repNodeOfTy(heldTy(letBindTy(letIx, ibFnIx))) != ib.irVars[v].vRep
+}
+
 // Whether binding `letIx`'s initializer `init` is a narrowed arm unboxed into a nullable arm cell
 // (`letCellKind` "nulvariant"), which legacy's `emitLetDelivery` casts to as a nullable ref.
 function letCellNulArmUnbox(letIx: i32, init: i32, dst: i32): boolean {
@@ -17218,7 +17247,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       ib.irVars[v].vRep,
       ib.irVars[v].vTy,
       letArmCellRow(ix, ibFnIx),
-    ) } else { deliver(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy) }
+    ) } else if letStoresNullRead(ix, n.letInit, v) { exprAt(b, n.letInit, true) } else { deliver(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy) }
     if ibMiss != "" { return 0 }
     // A ref list bound at its record-or-null twin, or a union-box list or map at another union's,
     // is the same value; legacy writes no convert where no coercion is recorded at the initializer.
