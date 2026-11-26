@@ -9805,14 +9805,14 @@ function mapSetStageLeads(
   leads: Opnd[],
 ): boolean {
   const why = "map store short-circuit operand"
-  // A store the value makes (an assignment as the value) is written in place by legacy, after
-  // a receiver and key it reads at their use; the IR's statement would land above them.
-  if storeFrom(b, vAt) && !opndsAreTemps(leads) {
-    irBMiss("map store value store")
-    return false
-  }
+  // A store the value makes (an assignment as the value) is a statement: the receiver and key
+  // legacy reads at their use are staged below it, as below a valued `if`.
+  const store = storeFrom(b, vAt)
   const stagingCoal = coalBoxFrom(b, vAt, true)
-  if !valuedIfFrom(b, vAt) && !stagingCoal || inPlaceUnstagedFrom(b, vAt) {
+  if (
+    !valuedIfFrom(b, vAt) && !stagingCoal && !store
+    || inPlaceUnstagedFrom(b, vAt)
+  ) {
     return !ifBelowLead(b, keyAt, why)
   }
   if exprNullableMap(recv, ibFnIx) {
@@ -17608,6 +17608,17 @@ function isSignedNumLit(ix: i32): boolean {
   return n is Unary && n.unOp == "-" && isSignedNumLit(n.unArg)
 }
 
+// Whether `rhs` is a map entry write used as a value, which legacy writes into another store's
+// value through its parked scratch frame; a field or element write builds as any value.
+function writesMapEntryValue(rhs: i32): boolean {
+  const x = unwrapParen(rhs)
+  if x < 0 || x >= P.nodes.length { return false }
+  const e = nodeAt(x)
+  if !(e is BinExpr) || e.binOp != "=" { return false }
+  const t = nodeAt(e.binLeft)
+  return t is Index && repNodeAt(exprRepOf(t.idxArr)) is RMap
+}
+
 function assignTo(b: i32[], n: BinExpr, ix: i32) {
   const at = b.length
   if nodeAt(n.binLeft) is Ident { ibStubRhs = unwrapParen(n.binRight) }
@@ -17628,6 +17639,9 @@ function siteArmNote(b: i32[], at: i32, n: BinExpr, ix: i32) {
 }
 
 function assignToGo(b: i32[], n: BinExpr, ix: i32) {
+  if writesMapEntryValue(n.binRight) {
+    return skip("store of a map entry write")
+  }
   const t = nodeAt(n.binLeft)
   if t is Index { return elemStore(b, n, t, ix) }
   if t is Member { return fieldStore(b, n, t, ix) }
