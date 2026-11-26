@@ -1878,6 +1878,8 @@ Deno.test({
       "walk-map-key-record": 2,
       "map-scalar-join-of-i32": 0,
       "map-scalar-join-of-string": 2,
+      "map-scalar-box-of-i32": 0,
+      "map-scalar-box-into-union-box": 2,
       "asg-unwiden-wrap-of-i64": 0,
       "asg-unwiden-trunc-of-i64": 2,
       "asg-unwiden-non-null-of-nullable-record": 0,
