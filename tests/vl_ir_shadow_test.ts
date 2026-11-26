@@ -594,8 +594,8 @@ Deno.test({
   },
 });
 
-// Outside the set: a store whose index holds an `if` (the receiver and index wait on the stack below
-// it, so no stage holds them) and a radix literal assigned through an
+// Outside the set: a spread list literal whose later element holds an `if` (the spread's walk waits
+// below it, so no stage holds it) and a radix literal assigned through an
 // if-expression into a nullable wide cell each leave their function uncovered, named. A closure
 // parameter, its baked callback clone's included, is inside it and covered.
 Deno.test({
@@ -609,17 +609,15 @@ function mk(b: boolean): P | Q {
   return if b { { j: { a: 3 }, k: 1 } } else { { j: null, k: 2 } }
 }
 const g = mk(true)
-function greet(a: boolean, x: i32): i32 {
-  const xs: i32[] = [0, 0]
-  xs[if a { 0 } else { 1 }] = x
-  return xs[0]
+function greet(a: boolean, xs: i32[]): i32 {
+  return [...xs, if a { 1 } else { 2 }].length
 }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function wr(c: boolean): i64 | null {
   let x: i64 | null = null
   return x = if c { 0xfffffffe } else { 1 }
 }
-print(greet(true, 1))
+print(greet(true, [1]))
 print(ap((x: i32) => x + 1))
 print(wr(true) ?? 0)
 `;
@@ -1456,8 +1454,8 @@ print(k(2, true, false) + f(true, false) + f2(false, true) + re(true))
 // Every node that writes a receiver or an earlier operand before a later one names a valued `if`
 // in that later operand; one in the first operand written stays covered, and an intrinsic's
 // earlier argument, an operator's left operand, or an element store's receiver and index, is
-// staged below the `if` (`intr`, `bin`, `eq`, `st`), so only `stIx`'s `if` in the index is a
-// store miss.
+// staged below the `if` (`intr`, `bin`, `eq`, `st`, and `stIx`'s receiver below its index's), so
+// only `sp`'s `if` after a spread is a miss.
 Deno.test({
   name: "ir shadow: a short-circuit operand below a node's lead is a named miss, not a fallback",
   ignore,
@@ -1483,7 +1481,9 @@ function push(a: boolean, b: boolean): i32 {
   return g.length
 }
 function first(a: boolean, b: boolean, x: i32): i32 { return (if a && b { 1 } else { 2 }) + x }
+function sp(a: boolean, xs: i32[]): i32 { return [...xs, if a { 1 } else { 2 }].length }
 m[1] = st(true, true, 0) || stIx(true, 5) > 0
+print(sp(true, [1]))
 print(bin(true, 1) + push(true, false) + first(true, true, 3))
 print(eq(true, false))
 print(meth(true, "hello"))
@@ -1491,12 +1491,15 @@ print(intr(true, 0.5))
 `;
     const { rows } = run(src, true);
     const want: [string, number][] = [
-      ["uncovered store short-circuit operand", 1],
+      ["uncovered array spread short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
       if (rows.get(k) !== n) throw new Error(`want ${n} "${k}" rows, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered store short-circuit operand")) {
+      throw new Error(`want \`stIx\` staged, got ${JSON.stringify([...rows])}`);
+    }
     if (rows.has("uncovered method short-circuit operand")) {
       throw new Error(`want \`meth\` staged, got ${JSON.stringify([...rows])}`);
     }
@@ -1959,15 +1962,14 @@ const g = mk(true)
 function ok(x: i32): i32 { return x + 1 }
 function two(k: i32): i32 {
   const xs = [1, 2]
-  xs[if k > 0 { 0 } else { 1 }] = k
-  return xs[0] + k
+  return [...xs, if k > 0 { 0 } else { 1 }].length + k
 }
 print(ok(1))
 print(two(3))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    const want = "blockers store short-circuit operand";
+    const want = "blockers array spread short-circuit operand";
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }
