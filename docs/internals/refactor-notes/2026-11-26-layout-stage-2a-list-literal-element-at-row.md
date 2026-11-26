@@ -46,6 +46,11 @@ Merged stage 2's seed against this tree's, over the same tests/cases.
   - before: `node-in array: miss array element coercion` and `blockers array element coercion`;
   - after: neither, and no other blocker. One `node-in array: miss fragment rep` node row remains;
     it is a node shadow row and blocks nothing.
+- **`$VL_IR_REQUIRE_CLAIM=1 vl run`** (the claim acceptance check) on the witness and on the sweep:
+  - master's seed exits 1 on both (`the IR declined this statement (array element coercion)` and
+    `(index element coercion)`);
+  - the head exits 0 on both, and the sweep prints `1`…`5`;
+  - control: D17131, still a fallback, exits 1 on the head.
 - **Sweep:** `tests/cases/lists/maker-list-literal-at-union-member-row-into-generic-positions.vl`.
   The witness reads an element in a closure, in a function, bound, as an argument, and the
   list's length. On merged stage 2 it shows `blockers index element coercion` (2) and its start is
