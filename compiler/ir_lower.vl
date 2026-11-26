@@ -14,6 +14,7 @@ import {
   irOnceSlot,
   sharedFieldRecvSlot,
 } from "./emit_union_casts"
+import { printPlanPinNull } from "./emit_union_registry"
 import { mapRecvScalarBoxKindIn, mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { repTyOf, slotRowTyOf } from "./emit_rep"
@@ -1524,7 +1525,14 @@ function rhs(r: Rhs, tail: boolean) {
       } else {
         leaf()
       }
+      // A shared cell's read banks its element-read row over the null, as legacy's
+      // `emitIndexBanked` does.
+      const cellRead = r.nuAt >= 0
+        && r.nuAt < P.nodes.length
+        && nodeAt(r.nuAt) is Index
+      const from = if cellRead { irLIndexFrom(r.nuAt, irLAt()) } else { -1 }
       emitNullOwn(r.nuOwn)
+      if cellRead { irLIndexRow(r.nuAt, from) }
     }
     RJoinNull => {
       leaf()
@@ -4000,12 +4008,32 @@ function printOp(r: RPrint) {
     irLOpnd(r.pnV)
     return printUnionTail(sharedFieldRecvSlot(), kinds)
   }
+  // A box narrowed to `null` prints at its storage along the union arm, its plan pinned to keep
+  // the null arm (`emitCallCorePrint`'s `boxNull`).
+  if arm == "boxNull" { return printBoxNullOp(r, c.callArgs[0]) }
   irLOpnd(r.pnV)
   if arm == "str" { return printStrTail() }
   if arm == "atom" || arm == "nulAtom" || arm == "nulLitPin" {
     return printAtomTail(arm, c.callArgs[0], lw.irAt)
   }
   return printScalarTail(arm)
+}
+
+// `RPrint` of `boxNull` argument `arg`: the union arm's plan, box and tail inside the storage
+// scope and the plan's null pin legacy writes them under.
+function printBoxNullOp(r: RPrint, arg: i32) {
+  const mark = storageReadEnter(arg)
+  const was = printPlanPinNull(true)
+  const kinds: i32[] = []
+  const union = printArmOf(arg, lw.irAt) == "union"
+  if union {
+    printUnionPlan(arg, lw.irAt, kinds)
+    irLOpnd(r.pnV)
+  }
+  const rc = if union { printUnionTail(sharedFieldRecvSlot(), kinds) } else { irLMiss("print boxNull arm") }
+  printPlanPinNull(was)
+  storageReadLeave(mark)
+  return rc
 }
 
 // `RMapGetOr`, inline: the global, its recovery, the key and the op context, then legacy's probe,

@@ -1,4 +1,5 @@
 import { nullableRecordTyOf, recFieldTyOf } from "./emit_rec_field_codes"
+import { printPlanPinNull } from "./emit_union_registry"
 import {
   asgFieldParks,
   catWidenTakes,
@@ -395,6 +396,7 @@ import {
   holeBoxTyAt,
   hostCallNamed,
   hostCallPlanOf,
+  idxCellReadIsNull,
   idxStoreNullUnitUnstamped,
   idxStoreOtherWhy,
   idxStoreSiteBoxes,
@@ -2851,12 +2853,16 @@ function fieldExplicitNullTyped(
 }
 
 // The null legacy's `nullread` arm writes for identifier read `ix` at its destination
-// (`nullReadDstOwnOf`); NULL_READ_STORED where its storage read is that null; else -1.
+// (`nullReadDstOwnOf`); NULL_READ_STORED where its storage read is that null; else -1. A shared
+// cell's read respelling such a name takes its destination's null the same way.
 const NULL_READ_STORED = 0 - 2
 function nullReadOwnAt(ix: i32): i32 {
   const sl = unwrapParen(ix)
   if sl < 0 || sl >= P.nodes.length { return -1 }
   const n = nodeAt(sl)
+  if n is Index && idxCellReadIsNull(sl, ibFnIx) {
+    return nullReadDstOwnOf(sl, ibFnIx)
+  }
   if !(n is Ident) || !identReadsNull(sl, ibFnIx) { return -1 }
   if exprPrePathWhy(ix, ibFnIx) != "" { return -1 }
   const own = nullReadDstOwnOf(sl, ibFnIx)
@@ -8436,6 +8442,7 @@ function printStmt(b: i32[], c: Call, ix: i32) {
     irBNode(b, { efRhs: { pnV: e, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
     return 0
   }
+  if arm == "boxNull" { return printBoxNull(b, c.callArgs[0], ix) }
   if arm == "nulRefNiche" { return printNulRefNiche(b, c.callArgs[0], ix) }
   const want = printArmRep(arm)
   if want == "" { return skip("print " + arm) }
@@ -8471,6 +8478,25 @@ function printStmt(b: i32[], c: Call, ix: i32) {
     ibNoValue,
     ix,
   )
+  return 0
+}
+
+// A `print` of a box an `is` chain narrowed to `null` (`boxNull`): the argument read at its
+// storage, the box, printed along the union arm it takes there with the plan's null arm pinned, as
+// `emitCallCorePrint` writes it.
+function printBoxNull(b: i32[], arg: i32, ix: i32) {
+  const mark = storageReadEnter(arg)
+  const was = printPlanPinNull(true)
+  const inner = printArmOf(arg, ibFnIx)
+  const v = if inner == "union" { irBExpr(b, arg) } else { irBMiss("print boxNull arm " + inner) }
+  printPlanPinNull(was)
+  storageReadLeave(mark)
+  if ibMiss != "" { return 0 }
+  const vr = irBOpRep(v)
+  if !(repNodeAt(vr) is RBox) && !boxedNullable(vr) {
+    return skip("print operand rep")
+  }
+  irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
   return 0
 }
 
