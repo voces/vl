@@ -6705,7 +6705,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   // A callee with a hidden environment parameter takes a null one before its arguments, and a
   // lifted one its captures next; one that captures through its environment stays legacy's.
   const env = envSlotShift(inst) > 0
-  const caps = if cloLifted(pos) { liftCaps(pos) } else { [] }
+  const caps = if cloLifted(pos) { liftCaps(b, pos, ix) } else { [] }
   if ibMiss != "" { return missRhs("callee captures") }
   // A lifted callee that assigns a capture hands it back after its result (D3664).
   const wb = liftWriteBacks(pos, caps)
@@ -7039,8 +7039,9 @@ function loopCapVar(fe: i32, name: string): i32 {
 }
 
 // The captures lifted function `pos` takes after its environment, each a parameter, a binding or
-// a lifted capture of the function being built, read in order; a miss names any other.
-function liftCaps(pos: i32): Opnd[] {
+// a lifted capture of the function being built, or a capture its environment holds, read in
+// order at call `ix`; a miss names any other.
+function liftCaps(b: i32[], pos: i32, ix: i32): Opnd[] {
   const out: Opnd[] = []
   for name in captureNamesOf(pos) {
     const p = paramIndexOf(ibFnIx, name)
@@ -7054,13 +7055,23 @@ function liftCaps(pos: i32): Opnd[] {
     }
     const d = if p < 0 && lv < 0 { liftCapDecl(pos, name) } else { -1 }
     let v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if lv >= 0 { lv } else if d >= 0 { irBDeclVar(d) } else { -1 }
-    // A capture of this frame passes on as this frame reads it: a lifted frame's own parameter.
-    // An environment field would be written ahead of the callee's null environment, so it misses.
+    // A capture of this frame passes on as this frame reads it: a lifted frame's own parameter,
+    // or a field of its environment read at the callee's rep (a cell or another rep misses).
     if v < 0 && captureSlotOf(name, ibFnIx) >= 0 {
       const self = fnStmtsPosOf(ibFnIx)
+      // The environment read is a temp ahead of the callee's null environment; it has no effect.
       if !cloLifted(self) {
-        irBMiss("callee captures env")
-        return out
+        const cr = capRepOf(self, name)
+        if cr < 0 || cr != capRepOf(pos, name) || capCellTargetOf(name) >= 0 {
+          irBMiss("callee captures env")
+          return out
+        }
+        const ct = capTyOf(self, name)
+        const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: -1 }
+        out.push(
+          irBLetTempTy(b, ev, ix, cr, if ct >= 0 { ct } else { repTyOf(cr) }),
+        )
+        continue
       }
       if (
         capRepOf(self, name) >= 0
