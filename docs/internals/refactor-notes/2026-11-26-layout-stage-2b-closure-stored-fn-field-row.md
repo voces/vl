@@ -25,7 +25,7 @@ and its field `r` met the row's `r` at another record: `object field coercion`.
 
 The second reads `structRowFnSlotLayout` (emit_shape_rows.vl), the field-code accessor stage 1
 set aside for its first caller. It answers 1 for a closure slot, 0 for a tagged id and -1
-otherwise. `variantRowFnSlotLayout` lands beside it.
+otherwise. Its variant twin waits for a caller.
 
 ## Tried and dropped
 
