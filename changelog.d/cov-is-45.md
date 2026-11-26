@@ -1,3 +1,3 @@
 ## Codegen, memory & runtime (Track B)
 
-- **IR builder:** a coalesce of nullable records into an annotated union is boxed at the union its destination holds, and an `is` over a list element tests the element's box; D17663 filed.
+- **D17663 closed:** a map cell written in an `is` branch, written again and tested for its member no longer builds invalid wasm under strict IR; the IR also boxes a coalesce of nullable records into an annotated union at the union its destination holds, and tests an `is` over a list element or map cell by its box.
