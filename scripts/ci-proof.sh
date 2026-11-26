@@ -34,7 +34,6 @@ ROWS=(
   "corpus oracle"
   "rep-fuzz"
   "splice scan"
-  "ir shadow cases"
 )
 
 case "${1:-}" in

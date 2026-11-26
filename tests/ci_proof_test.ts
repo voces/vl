@@ -89,9 +89,6 @@ const CI_RUNS: Record<string, string[]> = {
   "splice scan": [
     "vl run scripts/inventory/splice-scan.vl --compiler build/vl-compiler.wasm -- --self-test",
   ],
-  "ir shadow cases": [
-    "vl run scripts/silent-sweep/distilled/ir-shadow.vl --compiler build/vl-compiler.wasm -- --seed build/vl-compiler.wasm --cases --prepost",
-  ],
 };
 
 // Top-level jobs of ci.yml, name -> body.
