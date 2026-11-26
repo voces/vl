@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR claims a range loop inside an outer loop that is fully unrolled:** each copy reuses its slots' variables, so `for range slot` falls 8 → 0 on its programs (2 move on to `for in literal in an unrolled copy`). The loop-hoist safety memo now restarts when a list build region opens or closes. Before, the IR builder's earlier question left a stale "unsafe" for the lowering, which re-opened the list-header hoists in every copy: `bench/arrays/push-known-size` `-O3` read 2117 bytes where legacy writes 2034, and it now reads 2034. Claimed and claims-off output are byte-identical on every program in the class.
