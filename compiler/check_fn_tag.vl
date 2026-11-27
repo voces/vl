@@ -223,6 +223,7 @@ import { identFnDeclOf } from "./check_scopes"
 import { declIsExportedFn } from "./check_exp_obs"
 import {
   elabListParamSource,
+  fnTagFamilyOf,
   fnTagMembersWithin,
   fnTagRecHoldsListOfLists,
   fnTagSetCount,
@@ -833,15 +834,25 @@ function ftTryWith(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   ftP = ftRecNew()
   ftSubNeed = []
   ftAssume = [s]
+  ftForcedIds = false
   let ok = ftPlan(rootIx, s, calls, mint)
+  let famIn = false
   let q = 0
-  while ok && q < ftSubNeed.length {
-    const o = ftSubNeed[q]
-    if !i32ListHas(ftAssume, o) && !fnTagSetIsTagged(o) {
-      ftAssume.push(o)
-      ok = ftPlan(rootIx, o, calls, mint)
+  while ok && (q < ftSubNeed.length || (ftForcedIds && !famIn)) {
+    // A plan a member forced to ids (one not filling a closure bundle), its own or a subset's,
+    // plans the family whole: no value may flow from a closure holder into an id holder.
+    if ftForcedIds && !famIn {
+      famIn = true
+      ftSubNeedFamily(s)
     }
-    q = q + 1
+    if q < ftSubNeed.length {
+      const o = ftSubNeed[q]
+      if !i32ListHas(ftAssume, o) && !fnTagSetIsTagged(o) {
+        ftAssume.push(o)
+        ok = ftPlan(rootIx, o, calls, mint)
+      }
+      q = q + 1
+    }
   }
   ftAssume = []
   if !ok || !ftPlLeafTysFill() { return 0 }
@@ -1524,7 +1535,10 @@ function ftReturnedPastSet(pd: i32, s: i32): boolean {
   // A parameter called and handed back returns each call's own argument, so its id stays in the
   // set that call's argument is of.
   const hc = handBackCalledWiderIx(fd, -1, s)
-  if hc >= 0 && fn.fnParams[hc] == pd { return false }
+  if hc >= 0 && fn.fnParams[hc] == pd {
+    ftForcedIds = true
+    return false
+  }
   const vs: i32[] = []
   collectRetValues(fn.fnBody, vs)
   for v in vs {
@@ -2907,6 +2921,7 @@ function ftNodeOk(
         && handBackCalledWiderIx(-1, x, s) >= 0
         && (fnTagCallSetOf(x) == s || ftIsS(hc, s))
       ) {
+        ftForcedIds = true
         return ftNodeOk(hc, x, s, ds, leaves, ids)
       }
       if fnTagCallSetOf(x) == s { return true }
@@ -6978,4 +6993,38 @@ function ftCalledParamSigs(dn: FuncDecl, par: i32): i32[][] {
     }
   }
   return out
+}
+
+// Whether the plan in progress took a value as an id because a member of its set's family does
+// not fill a closure bundle (`handBackCalledWiderIx`).
+let ftForcedIds = false
+
+// Queues each set of `s`'s family that no other set of it holds whole; the subsets its own plan
+// reaches as leaves.
+function ftSubNeedFamily(s: i32) {
+  const fam = fnTagFamilyOf(s)
+  for o in fam {
+    if (
+      o != s
+      && !fnTagSetIsTagged(o)
+      && !i32ListHas(ftSubNeed, o)
+      && !ftFamHeldWhole(o, fam)
+    ) {
+      ftSubNeed.push(o)
+    }
+  }
+}
+
+// Whether some other set of family `fam` holds every member of set `o`.
+function ftFamHeldWhole(o: i32, fam: i32[]): boolean {
+  for k in fam {
+    if (
+      k != o
+      && fnTagMembers(k).length > fnTagMembers(o).length
+      && fnTagMembersWithin(o, k)
+    ) {
+      return true
+    }
+  }
+  return false
 }
