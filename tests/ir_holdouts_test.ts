@@ -39,12 +39,15 @@ Deno.test("holdouts: rows are <program> <unit> <class> <owner>, sorted, unique, 
 });
 
 Deno.test("holdouts: a new row names a program this branch adds", async () => {
-  const base = Deno.env.get("HOLDOUTS_BASE") ?? "origin/master";
+  const ref = Deno.env.get("HOLDOUTS_BASE") ?? "origin/master";
   const git = async (...args: string[]): Promise<{ ok: boolean; out: string }> => {
     const r = await new Deno.Command("git", { args, cwd: ROOT, stdout: "piped", stderr: "null" })
       .output();
     return { ok: r.success, out: new TextDecoder().decode(r.stdout) };
   };
+  // The fork point, not the tip: a row master deleted after this tree was cut is not one it adds.
+  const mb = await git("merge-base", "HEAD", ref);
+  const base = mb.ok && mb.out.trim() !== "" ? mb.out.trim() : ref;
   // Probed with commands that exit 0 or 1, never git's 128, which a harness reads as a death.
   const has = (await git("rev-parse", "--verify", "--quiet", `${base}^{commit}`)).ok &&
     (await git("ls-tree", "--name-only", base, "--", HOLDOUTS_PATH)).out.trim() !== "";

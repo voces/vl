@@ -249,6 +249,7 @@ import {
   recFieldsWiden,
   recHeapOf,
   recHeapsNote,
+  recHoleHeapsNote,
   recNullFieldsAlike,
   recRetag,
   recRowRetag,
@@ -4171,6 +4172,69 @@ function cellTakesClosure(d: i32, v: i32, src: Opnd): boolean {
 export function irBDeclVar(d: i32): i32 {
   const known = ibDeclVar[d] ?? -1
   if known >= 0 { return known }
+  const st = bindingStorage(d, ibFnIx, false)
+  if st.stMiss != "" {
+    irBMiss(st.stMiss)
+    return -1
+  }
+  if letLitUndeclaredRow(d) && st.stRow < -1 { ibDeclRowSeen = true }
+  const v = declVarAt(d, st.stRep, st.stTy)
+  if v >= 0 && st.stRow >= 0 { irVarRowNote(ib, v, st.stRow, st.stRep) }
+  return v
+}
+
+// Where a place's value is stored (`storageOf`): its rep, its type, and the struct row it is laid
+// out at (-1 for none, -2 for a binding held at its type's own rep); a miss names why there is none.
+export type Storage = { stRep: i32, stTy: i32, stRow: i32, stMiss: string }
+
+// A place a value is stored in: a binding (a local of frame `spFrame`, or a module global where
+// `spGlobal`), a struct row's field target, the result a returned expression is built at in the
+// function being built, or the elements of a list expression.
+export type SpBinding = { spBinding: i32, spFrame: i32, spGlobal: boolean }
+export type SpField = { spFieldRow: i32, spFieldIx: i32 }
+export type SpReturned = { spReturned: i32 }
+export type SpElem = { spElemOf: i32 }
+export type StorePlace = SpBinding | SpField | SpReturned | SpElem
+
+// The storage of place `p`, the one answer every reader of a place's rep takes.
+function storageOf(p: StorePlace): Storage {
+  return match p {
+    SpBinding => if p.spGlobal { globalStorage(p.spBinding) } else { localStorage(p.spBinding) }
+    SpField => rowStorage(sFieldTgtStructIdx(p.spFieldRow, p.spFieldIx))
+    SpReturned => rowStorage(retLitRow(p.spReturned))
+    SpElem => rowStorage(listElemStructRow(p.spElemOf))
+  }
+}
+
+// `storageOf` binding `d`: a module global's cell where `global`, else a local of the frame being
+// built (`frame`, -1 for the start body).
+function bindingStorage(d: i32, frame: i32, global: boolean): Storage {
+  const p: StorePlace = { spBinding: d, spFrame: frame, spGlobal: global }
+  return storageOf(p)
+}
+
+function storageMiss(why: string): Storage {
+  const s: Storage = { stRep: -1, stTy: -1, stRow: -1, stMiss: why }
+  return s
+}
+
+function storageAt(rep: i32, ty: i32, row: i32): Storage {
+  const s: Storage = { stRep: rep, stTy: ty, stRow: row, stMiss: "" }
+  return s
+}
+
+// The storage of struct row `si`: its stored type's rep (`rowRep`), or a miss where it has none.
+function rowStorage(si: i32): Storage {
+  if si < 0 { return storageMiss("storage row") }
+  const r = rowRep(si)
+  if r < 0 { return storageMiss("storage row rep") }
+  return storageAt(r, repTyOf(r), si)
+}
+
+// The storage of local binding `d` in the frame being built: a returned record's holder, a map
+// held at its slot's map, a binding legacy's cell holds as an atom, or one held at a row its read
+// type does not record; else its type's own rep (row -2).
+function localStorage(d: i32): Storage {
   // Legacy holds a binding of a returned record whole as that record (`letCellKind`), `| null`
   // beside it where its type holds null (`holderHeldRecordTy`), and one holding a single member
   // of it as that member's closure (`holderMemberTy`).
@@ -4183,12 +4247,10 @@ export function irBDeclVar(d: i32): i32 {
   const ty = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
   const rep = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(rep, ty) {
-    irBMiss("local rep " + repWhat(rep))
-    return -1
+    return storageMiss("local rep " + repWhat(rep))
   }
   if irTyHeldOpen(ty, rep) && !irFnBuiltOnce(ib) {
-    irBMiss("open local type")
-    return -1
+    return storageMiss("open local type")
   }
   // Legacy's cell for a binding it holds as the atom is the id, whatever its type's own rep.
   if (
@@ -4206,27 +4268,21 @@ export function irBDeclVar(d: i32): i32 {
     const at = if atom0 { at0 } else if sf >= 0 { sf } else { letAsgAtomTy(d) }
     const ar = if at >= 0 { repNodeOfTy(heldTy(at)) } else { -1 }
     if ar >= 0 && (repNodeAt(ar) is RAtom || atomNullable(ar)) {
-      return declVarAt(d, ar, heldTy(at))
+      return storageAt(ar, heldTy(at), -1)
     }
-    irBMiss("atom cell local rep")
-    return -1
+    return storageMiss("atom cell local rep")
   }
   const lt = declRowLetTy(d, rep)
-  if lt >= 0 { return declVarAt(d, repNodeOfTy(lt), lt) }
+  if lt >= 0 { return storageAt(repNodeOfTy(lt), lt, -1) }
   const sm = slotMapHeldTy(d, ty)
-  if sm >= 0 { return declVarAt(d, repNodeOfTy(sm), sm) }
+  if sm >= 0 { return storageAt(repNodeOfTy(sm), sm, -1) }
   const rl = rowlessLetTy(d, ty, rep)
-  if rl >= 0 { return declVarAt(d, repNodeOfTy(rl), rl) }
+  if rl >= 0 { return storageAt(repNodeOfTy(rl), rl, -1) }
   const sl = slotListRowTy(d, rep)
-  if sl >= 0 { return declVarAt(d, repNodeOfTy(sl), sl) }
+  if sl >= 0 { return storageAt(repNodeOfTy(sl), sl, -1) }
   const er = elemRowLetTy(d, rep)
-  if er >= 0 {
-    const ev = declVarAt(d, repNodeOfTy(er), er)
-    if ev >= 0 { irVarRowNote(ib, ev, elemRowOfLet(d), repNodeOfTy(er)) }
-    return ev
-  }
-  if letLitUndeclaredRow(d) { ibDeclRowSeen = true }
-  return declVarAt(d, rep, ty)
+  if er >= 0 { return storageAt(repNodeOfTy(er), er, elemRowOfLet(d)) }
+  return storageAt(rep, ty, -2)
 }
 
 // Whether the list place `arr` names, a `let` a non-empty literal builds (the lists
@@ -6951,16 +7007,24 @@ function litSetBaseIsStr(ty: i32): boolean {
 function globalRep(g: i32, d: i32): i32 {
   const noted = irGlobalRepOf(ib, g)
   if noted >= 0 { return noted }
+  const st = bindingStorage(d, -1, true)
+  if st.stMiss != "" || g < 0 { return -1 }
+  globalNoteAt(g, d, st.stRep)
+  if globalHolderTy(d) >= 0 { ib.irGlobalHeld[g] = true }
+  return st.stRep
+}
+
+// The storage of module global `d` before a build notes its cell: a holder of a returned record
+// at that record (`| null` beside it for a `nulstruct` cell), else the cell its type, storage row
+// and atom plan give (`openCellRep`, `cellAtStorageRow`, `atomCellRep`), at its storage-row type.
+function globalStorage(d: i32): Storage {
   const ht = globalHolderTy(d)
   // A holder's cell beside `null` (cell kind `nulstruct`) is the record's nullable.
   const ct = if ht >= 0 && globalCellKind(d) == "nulstruct" { nullableRecordTyOf(ht) } else { ht }
   const r0 = globalTyRep(if ht >= 0 { ct } else { globalHeldTy(d) })
   const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, openCellRep(d, r0))) } else { r0 }
-  if r >= 0 {
-    globalNoteAt(g, d, r)
-    if ht >= 0 { ib.irGlobalHeld[g] = true }
-  }
-  return r
+  if r < 0 { return storageMiss("global rep") }
+  return storageAt(r, globalStoreTy(d, r), -1)
 }
 
 // Global `d`'s cell where its type has no rep (a list whose element nothing fixes, a scalar read
@@ -9816,7 +9880,7 @@ function printUnionIf(b: i32[], arg: i32): Opnd {
   return deliver(b, arg, repNodeOfTy(ty), -1)
 }
 
-// `__trap__(msg?)`: its message streamed as a string `print` streams one, then `unreachable`, as
+// `__trap__(msg?)`: its message streamed as `print` streams it, then `unreachable`, as
 // `emitCallCoreTrap` writes them.
 function trapStmt(b: i32[], c: Call, ix: i32) {
   if c.callArgs.length > 1 { return skip("trap arguments") }
@@ -9825,16 +9889,27 @@ function trapStmt(b: i32[], c: Call, ix: i32) {
     return skip("trap in a never function")
   }
   if c.callArgs.length == 1 {
-    if printArmOf(c.callArgs[0], ibFnIx) != "str" {
-      return skip("trap message")
-    }
-    const v = irBExpr(b, c.callArgs[0])
+    const why = trapMessage(b, c.callArgs[0], ix)
     if ibMiss != "" { return 0 }
-    if repPrim(irBOpRep(v)) != "str" { return skip("trap message rep") }
-    irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+    if why != "" { return skip(why) }
   }
   irBNode(b, { tpWhy: 0 }, -1, ibNoValue, ix)
   return 0
+}
+
+// Streams trap `ix`'s message `arg` as `print` streams it: a string, or a literal-union atom
+// decoded to its member's text (`emitCallCoreTrap`). Answers why it does not, or "".
+function trapMessage(b: i32[], arg: i32, ix: i32): string {
+  const arm = printArmOf(arg, ibFnIx)
+  if arm != "str" && arm != "atom" { return "trap message" }
+  const asg = if arm == "atom" { asgAtomRep(arg) } else { -1 }
+  const v = if asg >= 0 { deliver(b, arg, asg, -1) } else if arm == "atom" { exprAt(b, arg, true) } else { irBExpr(b, arg) }
+  if ibMiss != "" { return "trap message" }
+  const vr = irBOpRep(v)
+  const ok = if arm == "atom" { repNodeAt(vr) is RAtom } else { repPrim(vr) == "str" }
+  if !ok { return "trap message rep" }
+  irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+  return ""
 }
 
 // `__trap__(msg?)` read as a value: its message streamed, then legacy's `unreachable` for the
@@ -9842,13 +9917,9 @@ function trapStmt(b: i32[], c: Call, ix: i32) {
 function trapCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callArgs.length > 1 { return missRhs("trap arguments") }
   if c.callArgs.length == 1 {
-    if printArmOf(c.callArgs[0], ibFnIx) != "str" {
-      return missRhs("trap message")
-    }
-    const v = irBExpr(b, c.callArgs[0])
-    if ibMiss != "" { return missRhs("trap message") }
-    if repPrim(irBOpRep(v)) != "str" { return missRhs("trap message rep") }
-    irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+    const why = trapMessage(b, c.callArgs[0], ix)
+    if ibMiss != "" { return missRhs(ibMiss) }
+    if why != "" { return missRhs(why) }
   }
   const r: Rhs = { dnAt: ix, dnPad: callEndsNever(ix) }
   return r
@@ -10752,17 +10823,22 @@ function structEqSide(b: i32[], ix: i32, staged: boolean): Opnd[] {
   if !staged && refListReadPlain(ix, ibFnIx) {
     const nd = nodeAt(ix)
     if !(nd is Index) { return [irBMiss("record compare place operand")] }
-    const v = irBExpr(b, nd.idxArr)
-    if ibMiss != "" { return [v] }
-    const recv = structEqVarOpnd(v) && b.length == at
-      || structEqPlaceRead(b, at, v, nd.idxArr)
+    // A receiver or index the compare cannot re-read at each field is held in a local of its own.
+    const v0 = irBExpr(b, nd.idxArr)
+    if ibMiss != "" { return [v0] }
+    const recv = structEqVarOpnd(v0) && b.length == at
+      || structEqPlaceRead(b, at, v0, nd.idxArr)
+    const v = if recv { v0 } else { heldInLocal(b, v0, nd.idxArr) }
     const mid = b.length
-    const i = irBExpr(b, nd.idxIndex)
-    if ibMiss != "" { return [i] }
-    const idx = i is OImm
-      || structEqVarOpnd(i) && b.length == mid
-      || structEqPlaceRead(b, mid, i, nd.idxIndex)
-    if !recv || !idx { return [irBMiss("record compare element place")] }
+    const i0 = irBExpr(b, nd.idxIndex)
+    if ibMiss != "" { return [i0] }
+    const idx = i0 is OImm
+      || structEqVarOpnd(i0) && b.length == mid
+      || structEqPlaceRead(b, mid, i0, nd.idxIndex)
+    const i = if idx { i0 } else { heldInLocal(b, i0, nd.idxIndex) }
+    if !recv && !structEqVarOpnd(v) || !idx && !structEqVarOpnd(i) {
+      return [irBMiss("record compare element place")]
+    }
     return [v, i]
   }
   const o = irBExpr(b, ix)
@@ -22169,6 +22245,7 @@ function convertRetag(
 function holeRetagNoted(src: i32, dst: i32, clo: boolean): boolean {
   noteRecHeaps(src)
   noteRecHeaps(dst)
+  recHoleHeapsNote(ib, src, dst)
   return listRetagHole(ib, src, dst) || clo && cloHoleRetag(ib, src, dst)
 }
 
