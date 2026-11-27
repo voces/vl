@@ -166,6 +166,7 @@ import {
   substTyDeep,
   substTyDeepOf,
   tyProvesNonNull,
+  widenLitTy,
 } from "./check_relate_core"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
 import {
@@ -18305,6 +18306,73 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
   return 1
 }
 
+// Call `n` (node `ix`) straight through an element of a list literal written in place, whose
+// function elements the check left open and whose arguments are closed values: each element is
+// instanced at the argument types, and the literal and callee typed at that one signature.
+// 1 when it typed the callee, 0 when none applies, -1 on a failure.
+function monoInlineListCallAt(n: Call, ix: i32, ctx: i32): i32 {
+  const cx = unwrapParen(n.callFn)
+  const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
+  if !(cn is Index) { return 0 }
+  const lx = unwrapParen(cn.idxArr)
+  const lit = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  if (
+    !(lit is ArrayLit)
+    || lit.arrElems.length == 0
+    || !monoTyOpen(nodeTyIxOf(cx))
+  ) {
+    return 0
+  }
+  const pts: i32[] = []
+  for a in n.callArgs {
+    const at = widenLitTy(nodeTyIxOf(unwrapParen(a)))
+    if at < 0 || at >= T.tys.length || monoTyOpen(at) || tyAt(at) is TyFunc {
+      return 0
+    }
+    pts.push(at)
+  }
+  const hN: string[] = []
+  const hT: i32[] = []
+  monoOneInstHoleBinds(hN, hT)
+  let ft = -1
+  for el in lit.arrElems {
+    const fx = if nodeAt(el) is Spread { -1 } else { elabOpenFnArgDecl(el) }
+    const f = if fx >= 0 { nodeAt(fx) } else { null }
+    if (
+      !(f is FuncDecl)
+      || f.fnTyParams.length > 0
+      || f.fnParams.length != pts.length
+    ) {
+      return 0
+    }
+    for p in f.fnParams {
+      const pn = nodeAt(p)
+      if !(pn is Param) || pn.parType >= 0 { return 0 }
+    }
+    const r = monoFnDeclRetAtUnder(fx, pts, hN, hT)
+    if r < 0 { return 0 }
+    const et = mkFuncTy(pts, r)
+    if !monoTyClosedFn(et) || (ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft)) {
+      return 0
+    }
+    ft = et
+  }
+  for el in lit.arrElems {
+    if monoLamLitTakeTys(el, ctx, [], ft) != 0 {
+      return emitFailAt(
+        "emitProgram: a lambda this call reaches through a list cannot take the call's function type",
+        el,
+      )
+    }
+    if monoCoerceFnValueName(el, ctx, ft) < 0 { return -1 }
+    if monoTyOpen(nodeTyIxOf(el)) { nodeTyRecord(el, ft) }
+  }
+  nodeTyRecord(lx, mkArrayTy(ft))
+  nodeTyRecord(cx, ft)
+  if monoTyOpen(nodeTyIxOf(ix)) { nodeTyRecord(ix, monoFnTyRet(ft)) }
+  return 1
+}
+
 // `monoOpenCallAtElems` where a parameter takes a tagged set: each element is its own instance
 // at the rows' types, keyed by the set as a direct call's is. 1 when it typed the callee, else 0.
 function monoElemsAtSet(
@@ -23536,6 +23604,10 @@ function monoWalk(ix: i32, ctx: i32) {
         || monoForInlineGenElems(n.callFn, ctx)
       ) {
         elemsTyped = monoOpenCallAtElems(n, ix, ctx)
+        if elemsTyped < 0 { return -1 }
+      }
+      if elemsTyped == 0 {
+        elemsTyped = monoInlineListCallAt(n, ix, ctx)
         if elemsTyped < 0 { return -1 }
       }
       if n.callFn < 0 { return 0 }
