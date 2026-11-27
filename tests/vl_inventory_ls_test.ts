@@ -384,6 +384,30 @@ Deno.test({
         "D23\n",
         "  skipped D21 — cited by a commit on origin/master or under tests/\n  skipped D22 — cited by a commit on origin/master or under tests/\n",
       );
+      // A reservation pushed after this clone last fetched is seen: --next fetches origin itself.
+      await git(src, ["checkout", "-q", "-b", "lane-late"]);
+      await Deno.mkdir(`${src}/${inv}/reserved`, { recursive: true });
+      await Deno.writeTextFile(
+        `${src}/${inv}/reserved/D23-D24.md`,
+        "D23-D24  late  2026-11-27\n",
+      );
+      await git(src, ["add", "-A"]);
+      await git(src, ["commit", "-q", "-m", "lane-late"]);
+      await git(src, ["checkout", "-q", "master"]);
+      const late = await ls(co, ["--next"]);
+      if (late.code !== 0 || late.out !== "D25\n") {
+        throw new Error(
+          `--next past a reservation pushed since the last fetch: want D25, got ${late.code} ${late.out}${late.err}`,
+        );
+      }
+      // A fetch that fails is an error, not a stale answer.
+      await git(co, ["remote", "set-url", "origin", `${dir}/no-such-remote`]);
+      const dead = await ls(co, ["--next"]);
+      if (dead.code !== 1 || !dead.out.includes("git fetch origin failed")) {
+        throw new Error(
+          `--next with an unreachable origin: want exit 1 naming the fetch, got ${dead.code} ${dead.out}${dead.err}`,
+        );
+      }
       // Outside a git checkout there is no remote to ask: the first test's fixture covers that.
     } finally {
       await Deno.remove(dir, { recursive: true });
