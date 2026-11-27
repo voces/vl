@@ -3,7 +3,9 @@ import { msSetOfRow } from "./emit_union_registry"
 import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { boxAtomKindOfMemberTy } from "./emit_rep"
 import {
+  mapShapeOfTyPeeled,
   unionClosureArmTyOfTy,
+  unionHasMapArmSlot,
   unionHasRefArrayArmSlot,
 } from "./emit_union_atoms"
 import { refArrSlotTag, unionTyMemberTys } from "./emit_map_twins"
@@ -763,6 +765,7 @@ import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import {
   bundleRecordTyOf,
   elabArmSigAt,
+  elabFnWrapSigs,
   elabHasHolderRecords,
   elabHasRetRecords,
   elabInstTyAt,
@@ -4080,6 +4083,28 @@ function bindingStorage(d: i32, frame: i32, global: boolean): Storage {
   return storageOf(p)
 }
 
+// The fill of the `let x = null` hole an un-annotated `null`-typed binding `d` copies by name, as
+// legacy's slot holds the copy; -1 for any other binding.
+function boundCopyFillTy(d: i32, ty: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  if repPrim(repNodeOfTy(ty)) != "null" || !(nodeAt(dn.letInit) is Ident) {
+    return -1
+  }
+  const sd = identDeclOf(dn.letInit)
+  const sn = if sd >= 0 && sd < P.nodes.length { nodeAt(sd) } else { null }
+  if (
+    !(sn is LetDecl)
+    || sn.letType >= 0
+    || sn.letInit < 0
+    || !(nodeAt(sn.letInit) is NullLit)
+  ) {
+    return -1
+  }
+  const ft = letBindingUnionTy(sd, ibFnIx)
+  return if ft >= 0 { heldTy(ft) } else { -1 }
+}
+
 // A binding is held at what its initializer builds where today's decision `s` has no storage or
 // an open one; else `s`.
 function buildStorage(p: SpBinding, s: Storage): Storage {
@@ -4154,7 +4179,9 @@ function localStorage(d: i32): Storage {
   const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else if rb >= 0 { rb } else { heldTy(scopeTyAt(d, ibFnIx)) }
   // A map local is held as legacy stores it, its mv slot off its initializer (`mapSlotHeldTy`).
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  const ty = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
+  const ty1 = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
+  const fill = boundCopyFillTy(d, ty1)
+  const ty = if fill >= 0 { fill } else { ty1 }
   const rep = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(rep, ty) {
     // A list whose element nothing fixes is held at the list legacy declares its cell at.
@@ -7679,6 +7706,70 @@ function bundleChoiceRec(
   return o
 }
 
+// The record of closures at row `si`, of type `rty`, holding `sigs`, built from named function read
+// `arg` of one of them: its one closure in every field, typed at that field's signature.
+function bundleWrapBuild(
+  b: i32[],
+  arg: i32,
+  sigs: i32[],
+  si: i32,
+  rty: i32,
+): Opnd {
+  const rep = repNodeOfTy(rty)
+  const ks = repNodeKids(rep)
+  const an = nodeAt(arg)
+  const fe = if an is Ident { fnValueFeOf(an, sidOfNode(arg), arg, ibFnIx) } else { -1 }
+  const env: Opnd[] = if fe >= 0 && fnEnvIdxOf(fe) >= 0 { cloEnvOf(b, fe, arg) } else { [] }
+  if fe < 0 || ibMiss != "" || closureValueCoreWhy(fe) != "" {
+    return irBMiss("bundle argument closure")
+  }
+  let shaped = si >= 0
+    && si < sFieldCount.length
+    && si < sFieldStart.length
+    && repNodeAt(rep) is RRecord
+    && ks.length == sFieldCount[si]
+  const fields: Opnd[] = []
+  for _k in ks { fields.push({ ov: -1 }) }
+  const layout: i32[] = []
+  let fi = 0
+  while shaped && fi < sFieldCount[si] {
+    const nm = sFieldNames[sFieldStart[si] + fi]
+    let k = 0
+    while k < sigs.length && nm != "c" + i32ToStr(k) { k = k + 1 }
+    const kid = repRecordKidOf(rep, rty, nm)
+    if (
+      k >= sigs.length
+      || kid < 0
+      || kid >= ks.length
+      || repNodeOfTy(sigs[k]) != ks[kid]
+    ) {
+      shaped = false
+    } else {
+      fields[kid] = irBLetTempTy(
+        b,
+        { mcFn: fe, mcEnv: env, mcAt: arg },
+        arg,
+        ks[kid],
+        sigs[k],
+      )
+      layout.push(kid)
+    }
+    fi = fi + 1
+  }
+  if !shaped { return irBMiss("bundle argument row") }
+  const r: Rhs = {
+    mrFields: fields,
+    mrLayout: layout,
+    mrSrc: [],
+    mrAt: arg,
+    mrRow: si,
+    mrVariant: false,
+    mrBuiltRow: si,
+    mrSet: false,
+  }
+  return irBLetTempTy(b, r, arg, rep, rty)
+}
+
 // The record of closures at struct row `si`, of type `rty`, holding `sigs`, built from `arg`: the
 // closure of each signature's instance (`monoBundleFe`, or `monoBundleReadFe` for a function read)
 // in the row's field order, then the record, as `emitBundleArg` and `emitBundleReadArg` write it.
@@ -10225,7 +10316,11 @@ function mapSetValue(
   // decodes it (`atomToStr`).
   if arm == "atomStr" && mr is RMap { return deliver(b, val, mr.rmVal, -1) }
   // A hole lambda the map's record slot is written with is built as that record (D17572).
-  if mr is RMap && elabLamProducerSigs(unwrapParen(val)).length >= 2 {
+  if (
+    mr is RMap
+    && (elabLamProducerSigs(unwrapParen(val)).length >= 2
+      || elabFnWrapSigs(unwrapParen(val)).length >= 2)
+  ) {
     return deliver(b, val, mr.rmVal, -1)
   }
   if (
@@ -10402,7 +10497,7 @@ function oneTempAt(b: i32[], at: i32, o: Opnd): boolean {
 
 // Operand `l` of a fused read at node `ix`, which legacy's head reads twice, held in a local of its
 // own (the lowering's `ownedSlot`): a later operand's own fused `??` then finds no temp waiting.
-function heldInLocal(b: i32[], l: Opnd, ix: i32): Opnd {
+export function heldInLocal(b: i32[], l: Opnd, ix: i32): Opnd {
   if !(l is OVar) || l.ov < 0 || l.ov >= ib.irVars.length { return l }
   const v = irVarNew(ib, ib.irVars[l.ov].vRep, ib.irVars[l.ov].vTy, "local", -1)
   irBNode(b, { asDst: v, asSrc: l }, -1, ibNoValue, ix)
@@ -11420,6 +11515,17 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     if ibMiss != "" || lpn is RRecord { return rv }
     return irConvert(b, rv, dst, dstTy, du)
   }
+  // A named function written into a slot holding a record is that record: its closure at its own
+  // member, and at every other, which the checker leaves uncalled (D17700).
+  const wps = if ibMiss == "" && dst >= 0 && dn is Ident { elabFnWrapSigs(du) } else { [] }
+  const wpn = if wps.length >= 2 { repNodeAt(dst) } else { null }
+  const wpInner = if wpn is RNullable { repNodeAt(wpn.rnInner) } else { wpn }
+  if wpInner is RRecord {
+    const rt = bundleRecordTyOf(wps)
+    const rv = bundleWrapBuild(b, du, wps, bundleRecordRowOfSigs(wps), rt)
+    if ibMiss != "" || wpn is RRecord { return rv }
+    return irConvert(b, rv, dst, dstTy, du)
+  }
   // An assignment delivered at its place's atom is that atom's id, not the string its type reps.
   if ibMiss == "" && dst >= 0 && dn is BinExpr && asgAtomRep(du) == dst {
     return assignValue(b, dn, du, dst)
@@ -12057,6 +12163,14 @@ function boxPlanOfRep(rep: i32, unionTy: i32): HoleBox {
         vi = vi + 1
       }
       return ladder
+    }
+    // A map rides under its map arm's tag (`emitUnionMapArmBox`).
+    if (
+      repNodeAt(rep) is RMap
+      && unionHasMapArmSlot(unionTy, mapShapeOfTyPeeled(mt))
+    ) {
+      const mp: HoleBox = { hbArm: "map", hbKind: unionTy, hbSrc: -1 }
+      return mp
     }
     const k = boxAtomKindOfMemberTy(mt)
     if k >= 0 && k != 6 && k != 11 && irBAtomKindRep(k, rep) {
@@ -14465,7 +14579,10 @@ function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   }
   const r0 = irBOpRep(l0)
   // An operand at the `null` unit is null: read for its effects, then the default is the value.
-  if repPrim(r0) == "null" {
+  // So is a named local the checker narrows to `null` over storage a later write widens (D17205).
+  const deadNamed = ib.irVars[l0.ov].vKind != "temp"
+    && repPrim(exprRepOf(lu)) == "null"
+  if repPrim(r0) == "null" || deadNamed {
     if ib.irVars[l0.ov].vKind == "temp" {
       irBNode(b, { dpV: l0 }, -1, ibNoValue, ix)
     }
