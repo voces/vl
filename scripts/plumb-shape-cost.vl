@@ -1,8 +1,8 @@
 // The compile-cost ratchet on generated code: guest fuel, peak RSS and CPU of one
 // `vl build --names -O --import-memory` of each of two plumb-shaped units, against
-// `scripts/plumb-shape-baseline.json`. Bars: fuel +5%, RSS +10%, CPU +15% compile and +25%
-// `-O`, CPU graded only on the baseline's host from quiet runs; two rung facts (D2335, D2336)
-// must hold exactly. Detail: docs/internals/profiling-the-compiler.md §Guards.
+// `scripts/plumb-shape-baseline.json`. Bars: fuel +5%, live at compile end +5%, RSS +10%, CPU
+// +15% compile and +25% `-O`, CPU graded only on the baseline's host from quiet runs; two
+// rung facts (D2335, D2336) must hold exactly. Detail: profiling-the-compiler.md §Guards.
 //
 //     vl run scripts/plumb-shape-cost.vl -- [--check | --write-baseline | --samples] [--require-fuel]
 //
@@ -35,9 +35,12 @@ const UNIT_BYTES = 2000000
 const BUILD_TIMEOUT = 300
 const BAR_FUEL = 0.05
 const BAR_RSS = 0.10
-// Peak live after a collection still moves with when the runner's GC fires (+8.5% seen between
-// two runners), so its bar is its own.
-const BAR_LIVE = 0.10
+// The live set a collection forced at compile end leaves depends on the program alone, so it
+// shares fuel's bar. Peak live after the compile's own collections moves with when they fire,
+// so it is printed, not graded.
+const BAR_LIVE = 0.05
+// Peak live past compile-end live by more than this says the live set peaks before emit ends.
+const PEAK_PAST_END = 0.03
 const BAR_COMPILE_CPU = 0.15
 const BAR_OPT_CPU = 0.25
 const QUIET = 1.15
@@ -457,13 +460,23 @@ function gcOf(err: string): string | null {
   return null
 }
 
-// The peak live KiB in a `gcOf` reading, or null: the GC's own figure, which the runner's CPU
-// and memory do not move the way they move peak RSS.
+// The peak live KiB in a `gcOf` reading, or null: the largest live set the compile's own
+// collections left, which moves with when they fire.
 function liveKibOf(gc: string | null): f64 | null {
+  return kibAfter(gc, "peak live ")
+}
+
+// The live KiB a collection forced at compile end left, or null when the host prints none.
+function endLiveKibOf(gc: string | null): f64 | null {
+  return kibAfter(gc, "live at compile end: ")
+}
+
+// The number after `label` in a `gcOf` reading, or null.
+function kibAfter(gc: string | null, label: string): f64 | null {
   if gc == null { return null }
-  const at = gc.indexOf("peak live ")
+  const at = gc.indexOf(label)
   if at < 0 { return null }
-  const rest = gc.slice(at + 10, gc.length)
+  const rest = gc.slice(at + label.length, gc.length)
   const sp = rest.indexOf(" ")
   const n = parseI64(if sp < 0 { rest } else { rest.slice(0, sp) })
   if n == null { return null }
@@ -697,7 +710,8 @@ function measJson(m: Meas): string {
   const cpu = "\"compile_cpu\": \{comp}, \"opt_cpu\": \{opt}, \"control_cpu\": \{ctl}"
   const facts = "\"skip_ssa\": \{skip}, \"const_ifs\": \{ifs}"
   const live = numJson(liveKibOf(m.gc))
-  return "\"fuel\": \{fuel}, \"rss_mb\": \{rss}, \"peak_live_kib\": \{live}, \{cpu}, \"unit_sha\": \{sha}, \{facts}, \"wasm_opt\": \{wo}, \"cpu_host\": \{host}"
+  const endLive = numJson(endLiveKibOf(m.gc))
+  return "\"fuel\": \{fuel}, \"rss_mb\": \{rss}, \"peak_live_kib\": \{live}, \"end_live_kib\": \{endLive}, \{cpu}, \"unit_sha\": \{sha}, \{facts}, \"wasm_opt\": \{wo}, \"cpu_host\": \{host}"
 }
 
 const bad: string[] = []
@@ -802,7 +816,8 @@ function checkUnit(
     grade(tag + "fuel", fuel, numOf(b, "fuel"), BAR_FUEL, "")
   }
   // Peak RSS follows the runner's GC trigger, so it is graded only on the baseline's CPU, as
-  // CPU time is; peak live, the GC's own figure, is the guard on every runner.
+  // CPU time is; live at compile end, the GC's own figure at a fixed point, is the guard on
+  // every runner.
   const rss = m.rss
   if rss == null {
     gradeSkip(tag + "peak RSS", "no " + TIME + " to read rusage with")
@@ -815,17 +830,30 @@ function checkUnit(
   } else {
     grade(tag + "peak RSS", rss, numOf(b, "rss_mb"), BAR_RSS, " MB")
   }
-  const live = liveKibOf(m.gc)
-  const bl = field(b, "peak_live_kib")
+  const live = endLiveKibOf(m.gc)
+  const bl = field(b, "end_live_kib")
   if live == null {
-    gradeSkip(tag + "peak live", "this host prints no GC stats line")
+    gradeSkip(
+      tag + "end live",
+      "this host prints no compile-end live set (rebuild scripts/vl-host)",
+    )
   } else if !(bl is f64) {
     gradeSkip(
-      tag + "peak live",
+      tag + "end live",
       "the baseline has none; write it with --write-baseline",
     )
   } else {
-    grade(tag + "peak live", live, bl, BAR_LIVE, " KiB")
+    grade(tag + "end live", live, bl, BAR_LIVE, " KiB")
+  }
+  const peak = liveKibOf(m.gc)
+  if peak != null {
+    const label = padEnd(tag + "peak live", 15, " ")
+    print("  \{label} \{commas(pyFixed(peak, 2))} KiB, not graded")
+    if live != null && peak > live * (1.0 + PEAK_PAST_END) {
+      print(
+        "  \{label} above end live by over 3%: the live set peaks before emit ends here",
+      )
+    }
   }
   if !skips && !requireFuel {
     gradeSkip(
