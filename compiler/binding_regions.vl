@@ -1,0 +1,213 @@
+// The regions of a `let` binding: the stretches of its declaring block that a whole reassignment
+// at that block's own level starts. No value written before such a statement reaches a read after
+// it, so each region can hold its value at its own type. A binding a nested function reads has
+// one region: the function may run on either side of the reassignment.
+import {
+  ArrayLit,
+  BinExpr,
+  Block,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  P,
+  nodeAt,
+  nodeChildren,
+} from "./ast"
+import { ctnRootStmts, letDeclFn } from "./check_decl_scan"
+import { nodePos } from "./fmt_util"
+import { nodeTyIsFnList } from "./check_node_tys"
+import { identDeclOf } from "./symbols"
+
+// The `let` that statement `stmt`, at index `pos` of block statements `sibs`, starts a new
+// region of: `stmt` is `x = …` for a `let x` declared earlier in `sibs` that no function in
+// `sibs` or `fns` (the program's functions, for a module binding) reads. -1 otherwise.
+export function regionSplitOf(
+  stmt: i32,
+  sibs: i32[],
+  pos: i32,
+  fns: i32[],
+): i32 {
+  const d = regionSplitRaw(stmt, sibs, pos, fns)
+  return if d >= 0 && (regionUsed[d] ?? false) { d } else { -1 }
+}
+
+// `regionSplitOf` before asking whether the binding uses its regions (`regionsUse`).
+function regionSplitRaw(stmt: i32, sibs: i32[], pos: i32, fns: i32[]): i32 {
+  if stmt < 0 || stmt >= P.nodes.length || pos < 0 || pos >= sibs.length {
+    return -1
+  }
+  const n = nodeAt(stmt)
+  if !(n is BinExpr) || n.binOp != "=" || n.binCompound != "" { return -1 }
+  if !(nodeAt(n.binLeft) is Ident) { return -1 }
+  const d = identDeclOf(n.binLeft)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const ld = nodeAt(d)
+  if !(ld is LetDecl) || ld.letKw != "let" { return -1 }
+  // A list of functions rebound to a fresh list literal: only its element signature can differ.
+  if !fnListLit(ld.letInit) || !fnListLit(n.binRight) { return -1 }
+  let declared = false
+  let k = 0
+  while k < pos {
+    if sibs[k] == d { declared = true }
+    k = k + 1
+  }
+  if !declared { return -1 }
+  for s in sibs {
+    if fnReadsDecl(s, d, false) { return -1 }
+  }
+  for f in fns {
+    if fnReadsDecl(f, d, false) { return -1 }
+  }
+  return d
+}
+
+// Whether `x` is a list literal whose type is a list of functions.
+function fnListLit(x: i32): boolean {
+  return x >= 0
+    && x < P.nodes.length
+    && nodeAt(x) is ArrayLit
+    && nodeTyIsFnList(x)
+}
+
+// Whether a function under node `ix` (or `ix` itself when `inFn`) reads declaration `d`.
+function fnReadsDecl(ix: i32, d: i32, inFn: boolean): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  const f = inFn || n is FuncDecl
+  if f && n is Ident && identDeclOf(ix) == d { return true }
+  for c in nodeChildren(ix) {
+    if fnReadsDecl(c, d, f) { return true }
+  }
+  return false
+}
+
+// By `let`, the statements that start its later regions and, for each, the start offset of the
+// statement after it (-1 when it is its block's last); filled on first ask, emptied per compile.
+let regionStarts: {[i32]: i32[]} = Map()
+let regionAfter: {[i32]: i32[]} = Map()
+// The bindings held per region: those whose one value the elaboration cannot close (`regionsUse`).
+let regionUsed: {[i32]: boolean} = Map()
+
+export function regionsReset() {
+  regionStarts = Map()
+  regionAfter = Map()
+  regionUsed = Map()
+  return 0
+}
+
+// The module `let`s with a statement that could start a region of them (`regionSplitOf` before
+// `regionsUse`), in program order; `fns` the program's functions.
+export function regionCandidates(fns: i32[]): i32[] {
+  const out: i32[] = []
+  for st in ctnRootStmts {
+    const n = if st >= 0 && st < P.nodes.length { nodeAt(st) } else { null }
+    if (
+      n is LetDecl
+      && n.letKw == "let"
+      && n.letType < 0
+      && fnListLit(n.letInit)
+      && regionStartsOf(st, fns).length > 0
+    ) {
+      out.push(st)
+    }
+  }
+  return out
+}
+
+// Whether `let` `d` is held per region (`regionsUse`).
+export function regionUsedOf(d: i32): boolean { return regionUsed[d] ?? false }
+
+// Holds `let` `d` per region from here on (`on`), or as one value again: a reassignment that
+// splits a binding held per region starts a value of its own.
+export function regionsUse(d: i32, on: boolean) {
+  regionUsed[d] = on
+  return 0
+}
+
+// The statement starting the region of `let` `d` that occurrence `x` lies in: the last split of
+// `d` (`regionSplitOf`) whose own left side is `x` or which ends before `x`; -1 for `d`'s first
+// region. The split's right side still reads the region before it.
+export function regionStartAt(d: i32, x: i32, fns: i32[]): i32 {
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return -1 }
+  if !(regionUsed[d] ?? false) { return -1 }
+  if !regionStarts.has(d) { regionsNote(d, fns) }
+  const ss = regionStarts[d] ?? []
+  const af = regionAfter[d] ?? []
+  const xp = nodePos(x)
+  let at = -1
+  let i = 0
+  while i < ss.length && i < af.length {
+    const sn = nodeAt(ss[i])
+    if sn is BinExpr && sn.binLeft == x { return ss[i] }
+    if af[i] >= 0 && xp >= af[i] { at = ss[i] }
+    i = i + 1
+  }
+  return at
+}
+
+// The statements starting `let` `d`'s later regions, in order (`regionSplitOf`).
+export function regionStartsOf(d: i32, fns: i32[]): i32[] {
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return [] }
+  if !regionStarts.has(d) { regionsNote(d, fns) }
+  return regionStarts[d] ?? []
+}
+
+// Notes `d`'s region starts for `regionStartAt`.
+function regionsNote(d: i32, fns: i32[]) {
+  const ss: i32[] = []
+  const af: i32[] = []
+  const fx = letDeclFn.get(d) ?? -1
+  const fd = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+  const sibs = if fd is FuncDecl { blockHolding(fd.fnBody, d) } else { ctnRootStmts }
+  const fs = if fd is FuncDecl { [] } else { fns }
+  let k = 0
+  while k < sibs.length {
+    if regionSplitRaw(sibs[k], sibs, k, fs) == d {
+      ss.push(sibs[k])
+      af.push(if k + 1 < sibs.length { nodePos(sibs[k + 1]) } else { -1 })
+    }
+    k = k + 1
+  }
+  regionStarts[d] = ss
+  regionAfter[d] = af
+  return 0
+}
+
+// Whether assignment `w` starts a region of the `let` it writes (`regionSplitOf`), found from
+// the binding's own declaring block: a block of its function's body, or the module's statements.
+// `fns` are the program's functions, read for a module binding.
+export function asgStartsRegion(w: i32, fns: i32[]): boolean {
+  if w < 0 || w >= P.nodes.length { return false }
+  const n = nodeAt(w)
+  if !(n is BinExpr) { return false }
+  const d = identDeclOf(n.binLeft)
+  if d < 0 || d >= P.nodes.length { return false }
+  const fx = letDeclFn.get(d) ?? -1
+  const fd = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+  const sibs = if fd is FuncDecl { blockHolding(fd.fnBody, d) } else { ctnRootStmts }
+  let pos = -1
+  let k = 0
+  while k < sibs.length {
+    if sibs[k] == w { pos = k }
+    k = k + 1
+  }
+  if pos < 0 { return false }
+  return regionSplitOf(w, sibs, pos, if fd is FuncDecl { [] } else { fns }) == d
+}
+
+// The statements of the block under `ix` that holds statement `s` directly; [] when none does.
+function blockHolding(ix: i32, s: i32): i32[] {
+  const none: i32[] = []
+  if ix < 0 || ix >= P.nodes.length { return none }
+  const n = nodeAt(ix)
+  if n is Block {
+    for t in n.blkStmts {
+      if t == s { return n.blkStmts }
+    }
+  }
+  for c in nodeChildren(ix) {
+    const got = blockHolding(c, s)
+    if got.length > 0 { return got }
+  }
+  return none
+}

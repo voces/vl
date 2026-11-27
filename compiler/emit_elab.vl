@@ -2,6 +2,13 @@
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
+import {
+  regionCandidates,
+  regionStartAt,
+  regionStartsOf,
+  regionUsedOf,
+  regionsUse,
+} from "./binding_regions"
 import { recHoleIdentityArg } from "./check_hole_identity"
 import { emitFail } from "./emit_bytes"
 import {
@@ -11905,6 +11912,7 @@ export function elabRun() {
     }
     r = r + 1
   }
+  elabRegionsDecide()
   elabUnboundKeyDrop()
   elabCellPeers()
   elabNestedPerEncl()
@@ -15308,10 +15316,21 @@ function elabSlotFacts() {
         } else {
           // The values written decide first; the classes close what they leave open.
           const ft = eplHolderTy(ix, -1)
+          // A `let` held per region (`elabRegionsDecide`): each later region a holder of its own.
+          const rss = if n is LetDecl && regionUsedOf(ix) { regionStartsOf(ix, fnStmts) } else { [] }
+          const rts: i32[] = [ft]
+          for rs in rss { rts.push(eplHolderTy(rs, -1)) }
           if ft >= 0 {
             elabSlotTys[elabSlotKey(ix, -1)] = ft
           } else {
             elabSlotUnfacted.push(ix)
+          }
+          let ri = 0
+          while ri < rss.length && ri + 1 < rts.length {
+            if rts[ri + 1] >= 0 {
+              elabSlotTys[elabSlotKey(rss[ri], -1)] = rts[ri + 1]
+            }
+            ri = ri + 1
           }
         }
       }
@@ -15347,6 +15366,45 @@ function elabSlotFacts() {
   }
   elabSlotInstFacts(inst, instFn)
   return 0
+}
+
+// Decides, before the passes that read the classes, which module list `let`s are held per region
+// (`elabRegionTys`).
+function elabRegionsDecide() {
+  for ix in regionCandidates(fnStmts) {
+    elabRegionTys(ix, regionStartsOf(ix, fnStmts), eplHolderTy(ix, -1))
+  }
+  return 0
+}
+
+// The type of each region of list `let` `d` (its first, then each of `rss`'s; -1 where one stays
+// open), held per region (`regionsUse`) where its first region holds a function of a closed
+// signature other than one-value type `ft0`'s element, or a later region closes at another type;
+// else [] with `d` held as one value.
+function elabRegionTys(d: i32, rss: i32[], ft0: i32): i32[] {
+  const a = if ft0 >= 0 && ft0 < T.tys.length { tyAt(ft0) } else { null }
+  const e0 = if a is TyArray { tyElemOf(a) } else { -1 }
+  if e0 < 0 { return [] }
+  regionsUse(d, true)
+  eplStaleAt()
+  const out: i32[] = [eplHolderTy(d, -1)]
+  let apart = false
+  for m in eplMembersStar(eplChild(eplRoot(d), "e")) {
+    const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+    const mt = if mn is FuncDecl && mn.fnTyParams.length == 0 { nodeTyIxOf(m) } else { -1 }
+    if mt >= 0 && !tyHasTyVar(mt) && !tySameSealed(mt, e0) { apart = true }
+  }
+  for rs in rss {
+    const rt = eplHolderTy(rs, -1)
+    if rt >= 0 && !tySameSealed(rt, ft0) { apart = true }
+    out.push(rt)
+  }
+  if !apart {
+    regionsUse(d, false)
+    eplStaleAt()
+    return []
+  }
+  return out
 }
 
 // Builds each call of a maker, pinned by its call, whose binding or argument slot hands its value
@@ -22043,7 +22101,9 @@ function eplPlaceOf(x0: i32, depth: i32): i32 {
   if n is Ident {
     const d = eplDeclOf(x)
     if d >= 0 && d < P.nodes.length && !(nodeAt(d) is FuncDecl) {
-      return eplRoot(d)
+      // A `let` read or written in a later region of it is that region's value (`regionStartAt`).
+      const rs = if nodeAt(d) is LetDecl { regionStartAt(d, x, fnStmts) } else { -1 }
+      return eplRoot(if rs >= 0 { rs } else { d })
     }
     const p = eplRoot(x)
     if p >= 0 && d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
