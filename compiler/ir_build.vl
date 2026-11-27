@@ -981,6 +981,7 @@ import {
   cloSigPosOfKey,
   cloSigTypeIdxAt,
   fnCheckedRetTy,
+  fnInMonoInstance,
   globalIndexOfSid,
 } from "./emit_fn_ret_kinds"
 import { declOrigOf, identDeclOf, nodeSrc, sidOfNode } from "./symbols"
@@ -4518,15 +4519,49 @@ function declRowLetTy(d: i32, rep: i32): i32 {
 }
 
 // Whether local `v`, declared at `d` and not yet used, takes its initializer's rep `built` as its
-// storage row, the D14434 binding column's (`letBindTy`), as legacy's cell does; `v` is retyped.
+// storage: the D14434 binding column's row (`letBindTy`), as legacy's cell does, or a list a
+// `const` is held at as built (`builtHeldTy`); `v` is retyped.
 function localStoredAt(v: i32, d: i32, built: i32): boolean {
   const bt = heldTy(letBindTy(d, ibFnIx))
-  const st = if bt >= 0 && repNodeOfTy(bt) == built { bt } else { localSlotRecordTy(d, built) }
+  const st0 = if bt >= 0 && repNodeOfTy(bt) == built { bt } else { localSlotRecordTy(d, built) }
+  const st = if st0 >= 0 { st0 } else { builtHeldTy(v, d, built) }
   if st < 0 { return false }
   ib.irVars[v].vRep = built
   ib.irVars[v].vTy = st
   ibDeclRowSeen = true
   return true
+}
+
+// The type a `const` `d` is held at where its initializer is built as a list at `built` that its
+// variable `v`'s rep takes by no `irConvert` case: a value that cannot be rebuilt at the binding,
+// so the binding is its build. -1 otherwise, or inside an instance, whose locals the template's share.
+function builtHeldTy(v: i32, d: i32, built: i32): i32 {
+  if v < 0 || v >= ib.irVars.length { return -1 }
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(n is LetDecl) || n.letKw != "const" || !(repNodeAt(built) is RList) {
+    return -1
+  }
+  if fnInPinnedInstance(ibFnIx) || fnInMonoInstance(ibFnIx) { return -1 }
+  const o: Opnd = { oiRep: built, oiBits: 0 }
+  if convertKindOf(o, ib.irVars[v].vRep, ib.irVars[v].vTy, n.letInit) >= 0 {
+    return -1
+  }
+  const t = repTyOf(built)
+  return if t >= 0 && !irTyHeldOpen(t, built) { t } else { -1 }
+}
+
+// Whether `const` `d`'s variable `v` is held at its build (`builtHeldTy`), its type's rep not its own.
+function builtHeldVar(d: i32, v: i32): boolean {
+  if v < 0 || v >= ib.irVars.length { return false }
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(n is LetDecl)
+    || n.letKw != "const"
+    || !(repNodeAt(ib.irVars[v].vRep) is RList)
+  ) {
+    return false
+  }
+  return repNodeOfTy(heldTy(scopeTyAt(d, ibFnIx))) != ib.irVars[v].vRep
 }
 
 // Whether local `v`, not yet used, takes record value `o` laid out at its struct row (`irOpRow`)
@@ -6794,6 +6829,8 @@ function narrowedLocalRead(
   if rowlessReadTyOfVar(ix, v) == ib.irVars[v].vTy { return o }
   // A map local held at its slot's map (`slotMapHeldTy`) reads as it is stored.
   if slotMapHeldVar(identDeclOf(ix), v) { return o }
+  // So does a `const` held at its build (`builtHeldTy`).
+  if builtHeldVar(identDeclOf(ix), v) { return o }
   // A nullable record local held at a row its narrowed read's record does not record reads past
   // its null at that row.
   const pn = storedPastNullTy(ix, v, rep)
