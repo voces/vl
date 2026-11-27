@@ -13513,3 +13513,15 @@ a named set under `distilled/named/`:
    never a converting copy. COV-UNION.
 3. Monomorphizer argument type, 219: I8-PREP. Capture binding, 46: START-2. Ref valtype and the map
    pair, 96: COV-IS.
+
+## A never-written container's open element is pinned by typed reads; an index read supplies no shape (2026-11-27, coordinator ruling)
+
+A container that nothing writes (`const c = []`, `Map()`) has an open element type. A read that
+supplies a type pins it: a `??` default, a comparison with a typed operand, a typed destination or
+argument (D17734, F1). The read-only default applies once, at the program's end, after every pin
+(one bank, one settle point), never at an intermediate alias.
+An index or member read alone (`c[0][0]`, `c[0].length`) supplies no shape: `x[0]` may be a list, an
+i32-keyed map or a string, and choosing one would be a guessed default rather than a pin. Such a
+program is a design refusal whose message names the fix (annotate the container).
+A binding of a fresh literal that is never written as a whole takes the type of its one whole
+destination where the literal fits it (F2); a reassigned binding keeps its widened type.
