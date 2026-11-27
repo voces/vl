@@ -45,7 +45,6 @@ import {
   nodeTyIntWidth,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
-  nodeTyIsNulBool,
   nodeTyIsNulLitUnion,
   nodeTyIsNullType,
   nodeTyIsNullable,
@@ -418,9 +417,7 @@ import {
   aTy,
   armFieldElemSame,
   armFieldNames,
-  armPreludeBlocks,
   arrLitMint,
-  atomStageSlot,
   callRefDepth,
   capCountTbl,
   capNamesFlat,
@@ -587,11 +584,8 @@ import {
   loopContDepth,
   loopContLabel,
   mIntMonoArmUsed,
-  mapKeysBase,
   mapScratchBase,
-  mapValsBase,
   markFnAddrTaken,
-  mfScratchBase,
   mkArrTy,
   mkListTy,
   monoCloCoerceFe,
@@ -613,7 +607,6 @@ import {
   pkKindOfRow,
   pkRowOfKind,
   pkRowOfWrap,
-  pushScratchBase,
   rlBackIdx,
   rlElemHeap,
   rlElemName,
@@ -636,7 +629,6 @@ import {
   sTy,
   startStmts,
   strCatSlotIx,
-  strPushScratchBase,
   svDstOn,
   svPairOn,
   svPairs,
@@ -1155,7 +1147,7 @@ import {
   tyRefArrElemOf,
   unMemRefArrArmSlot,
 } from "./emit_map_value_slots"
-import { refPushScratchBaseFor, scopePop, scopePush } from "./emit_mv_slots"
+import { scopePop, scopePush } from "./emit_mv_slots"
 import {
   globalLetOfSid,
   ifJoinArmsAllStrLit,
@@ -1260,6 +1252,7 @@ import {
   asExprNumFallible,
   asExprNumSrcName,
   asExprNumTgtName,
+  atomStageScr,
   callRefNestSlot,
   cloEqScr,
   coalCallScr,
@@ -1269,6 +1262,7 @@ import {
   fnMvValStashLocal,
   fnMvValsBkLocal,
   fnMvValsOutLocal,
+  i32PushScr,
   intMinMaxStashSlot,
   lcatScr,
   leqIScr,
@@ -1280,16 +1274,21 @@ import {
   listIdxWrapSlot,
   mapI32KeyLocal,
   mapI64KeyLocal,
+  mapKeysScr,
   mapScr,
+  mapValsScr,
   memReadCheckerAtomKind,
   mfDstLocalFor,
+  mfScr,
   mfSrcLocalFor,
   nulRefNichePayloadTy,
   numCastStashSlot,
   optRecvScr,
   reboxScr,
+  refPushScr,
   scratchSlot,
   sharedFieldRecvSlot,
+  strPushScr,
   strScr,
   unionAsBoxSlot,
   unionHasAtomK,
@@ -1405,7 +1404,6 @@ import {
 import {
   armPreludeBindChain,
   declSlotPinned,
-  firstLocalDeclIn,
   rvPairOf,
   spreadGroupSlotIdOf,
   spreadSlotIdOf,
@@ -1554,7 +1552,6 @@ import {
   nullOwnAt,
   nullOwnOfTy,
   nullRetPlanOf,
-  optGuardCallOf,
   scalarKindWidens,
   setHasNullAtom,
   unionResidualSoloKindOfSet,
@@ -1633,7 +1630,6 @@ import {
 } from "./emit_plan_union"
 import {
   deliveredAsNulAtom,
-  ifJoinDropsNulAtom,
   ifJoinPlanOf,
   nulStrReppedNulLitPlace,
   strReppedLitUnionAt,
@@ -7431,19 +7427,14 @@ export function emitOptLeafTail(exprIx: i32, fnIx: i32): i32 {
 // The string a family stores for an atom `?.` leaf, decoded to the atom through the stage slot
 // the reservation scan claims for the leaf (`optLeafDecodesStr`). 0, or -1 failed.
 function optLeafStrDecode(exprIx: i32, fnIx: i32): i32 {
-  if !fnUses.atomStage {
-    return emitFail(
-      "emitProgram: an atom `?.` leaf's string decode has no staging slot",
-    )
-  }
   const texts = tyLitMemberTexts(nonNullTy(nodeTyAt(exprIx, fnIx)))
   if texts.length == 0 {
     return emitFail(
       "emitProgram: an atom `?.` leaf's string decode has no members",
     )
   }
-  fbLocalSet(atomStageSlot)
-  return emitStagedStrToAtomChain(texts, 0, atomStageSlot, fnIx)
+  fbLocalSet(atomStageScr())
+  return emitStagedStrToAtomChain(texts, 0, atomStageScr(), fnIx)
 }
 
 // The list wrapper heap type a value-union list atom of kind `k` rides in the box's `anyref`
@@ -7897,7 +7888,7 @@ export function elseLessUnionIfWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
   if unionArmTagClash(unionTy) != "" { return "tag clash" }
   if callIsNever(ix) { return "never" }
   if unionCoerceIfArmOf(ix, fnIx) != "value" { return "not value arm" }
-  return ifShapeWhyOf(ix, fnIx, false)
+  return ifIntMatchWhy(ix, fnIx)
 }
 
 // Why a value `if` with an `else`, delivered into union `unionTy`'s box, is not written arm by arm
@@ -7910,7 +7901,7 @@ export function unionIfAtDstWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
   if unionArmTagClash(unionTy) != "" { return "tag clash" }
   if callIsNever(ix) { return "never" }
   if unionCoerceIfArmOf(ix, fnIx) != "value" { return "not value arm" }
-  return ifShapeWhyOf(ix, fnIx, true)
+  return ifIntMatchWhy(ix, fnIx)
 }
 
 // Coerce an expression into a union-box position whose wasm rep is `(ref $uBox)` — a call
@@ -12324,8 +12315,8 @@ export function mapKeysFrameOf(recvIx: i32, fnIx: i32): MapListFrame {
   // typed per rep — an integer frame's own out/src slots for an integer-keyed map.
   let keysWrap = -1
   let keysBack = -1
-  let outBackL = mapKeysBase + 0
-  let keysBackL = mapKeysBase + 1
+  let outBackL = mapKeysScr() + 0
+  let keysBackL = mapKeysScr() + 1
   if keyK == MAP_KEY_I32 {
     keysWrap = lTy()
     keysBack = aTy()
@@ -12347,10 +12338,10 @@ export function mapKeysFrameOf(recvIx: i32, fnIx: i32): MapListFrame {
     mqBack: keysBack,
     mqOut: outBackL,
     mqSrc: keysBackL,
-    mqLive: mapKeysBase + 2,
-    mqI: mapKeysBase + 3,
-    mqJ: mapKeysBase + 4,
-    mqCount: mapKeysBase + 5,
+    mqLive: mapKeysScr() + 2,
+    mqI: mapKeysScr() + 3,
+    mqJ: mapKeysScr() + 4,
+    mqCount: mapKeysScr() + 5,
   }
   return q
 }
@@ -12431,21 +12422,21 @@ export function mapValuesAreKeys(recvIx: i32, fnIx: i32): boolean {
 }
 
 // `emitMapValues`'s frame for map receiver `recvIx`, no Set: the vals list. A mono map's frame is its
-// own `mapValsBase`; an mv map's is its slot's out and source with the keys frame's live and cursors.
+// own `mapValsScr()`; an mv map's is its slot's out and source with the keys frame's live and cursors.
 export function mapValsFrameOf(recvIx: i32, fnIx: i32): MapListFrame {
   const shape = mapShapeOfExpr(recvIx, fnIx)
   const mapTy = mapTypeIdxOf(shape)
   const valsWrap = mvValsWrapOf(shape)
   const valsBack = mvValsBackOf(shape)
   const mono = shape < 0
-  const base = if mono { mapValsBase } else { mapKeysBase }
+  const base = if mono { mapValsScr() } else { mapKeysScr() }
   const q: MapListFrame = {
     mqMapTy: mapTy,
     mqField: 1,
     mqWrap: valsWrap,
     mqBack: valsBack,
-    mqOut: if mono { mapValsBase + 0 } else { fnMvValsOutLocal(shape) },
-    mqSrc: if mono { mapValsBase + 1 } else { fnMvValsBkLocal(shape) },
+    mqOut: if mono { mapValsScr() + 0 } else { fnMvValsOutLocal(shape) },
+    mqSrc: if mono { mapValsScr() + 1 } else { fnMvValsBkLocal(shape) },
     mqLive: base + 2,
     mqI: base + 3,
     mqJ: base + 4,
@@ -15906,6 +15897,9 @@ export function strInPlaceMode(binIx: i32, fnIx: i32): i32 {
 }
 
 function strInPlaceModeOf(binIx: i32, fnIx: i32, ask: boolean): i32 {
+  // Both modes need a string chain on the right; any other assignment scans nothing.
+  const a = nodeAt(binIx)
+  if !(a is BinExpr) || !exprIsStrConcat(a.binRight, fnIx) { return 0 }
   saScanFor(fnIx)
   if strAccAppendOk(binIx, fnIx) { return -1 }
   return strSiteArmsAt(binIx, fnIx, ask)
@@ -19200,7 +19194,7 @@ export function fbRefIfOpenType(kind: VKind, slot: i32, nul: boolean) {
 }
 
 // The block valtype `emitIfExpr` writes the value `if` at `ifIx` at, `ifJoinPlanOf`'s, classified
-// with its arms' prelude locals bound as `ifExprPlainWhy` binds them; every link takes it.
+// with its arms' prelude locals bound; every link takes it.
 export function ifExprJoinVt(ifIx: i32, fnIx: i32): i32 {
   const scoped = armPreludeScopeOpen(ifIx)
   const p = ifJoinPlanOf(ifIx, fnIx)
@@ -19208,90 +19202,12 @@ export function ifExprJoinVt(ifIx: i32, fnIx: i32): i32 {
   return p.ijVt
 }
 
-// Why the value `if` at `ifIx` has no shape `emitIfExprAs` writes with one value per arm, or "": no
-// `else`, an arm with no lone value, an unwalked prelude, a guard call, or an integer switch.
-export function ifExprShapeWhy(ifIx: i32, fnIx: i32): string {
-  return ifShapeWhyOf(ifIx, fnIx, true)
-}
-
-// `ifExprShapeWhy`, an else-less `if` passing where `needElse` is false: its missing arm is then
-// the join's own null, which the union and reference rungs write (`emitUnionIfValueLink`,
-// `emitIfExprRefLink`).
-function ifShapeWhyOf(ifIx: i32, fnIx: i32, needElse: boolean): string {
-  if ifIx < 0 || ifIx >= P.nodes.length { return "node" }
-  const n = nodeAt(ifIx)
-  if !(n is IfStmt) || n.ifCond < 0 { return "no else" }
-  const noElse = n.ifElse < 0
-  if noElse && needElse { return "no else" }
-  // An `else if` is the chain's next link, which `emitIfExprAsLink` writes into this one's frame.
-  const elseArm = !noElse && !(nodeAt(n.ifElse) is IfStmt)
-  if !ifArmHasValue(n.ifThen) || elseArm && !ifArmHasValue(n.ifElse) {
-    return "arm not lone"
-  }
-  // A prelude local the collect pass did not allocate is legacy's refusal (`emitIfArmOpen`).
-  if (
-    armPreludeUnwalkedDecl(n.ifThen) >= 0
-    || elseArm && armPreludeUnwalkedDecl(n.ifElse) >= 0
-  ) {
-    return "arm prelude unwalked"
-  }
-  if optGuardCallOf(ifIx, fnIx) >= 0 { return "optional guard" }
-  // An integer `match` whose `br_table` plan has an `else` is the table; one with no plan is written
-  // as the plain chain (`emitIntSwitch` declines), whatever its scrutinee.
-  if intMatchHeadAt(ifIx) {
-    const p = intSwitchPlanOf(ifIx, fnIx)
-    if p != null && p.ispElse >= 0 { return "int match" }
-  }
-  return ""
-}
-
-// Why the if-expression at `ifIx` is off `emitIfExpr`'s plain scalar path, or "": its shape
-// (`ifExprShapeWhy`), then its join rung (an atom join is plain), a static `is` or literal-true
-// condition, a prelude, or v128.
-export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
-  const sw = ifShapeWhyOf(ifIx, fnIx, false)
-  if sw != "" { return sw }
-  // Classified as `emitIfExpr` classifies it, with the arms' prelude locals bound.
-  const scoped = armPreludeScopeOpen(ifIx)
-  const p = ifJoinPlanOf(ifIx, fnIx)
-  if scoped { scopePop() }
-  const h = nodeAt(ifIx)
-  // An else-less link is the null of the union box, the reference, or an i32 niche.
-  const nicheArm = p.ijArm == "atom" || p.ijArm == "scalar"
-  const ownNull = p.ijArm == "union"
-    || p.ijArm == "ref"
-    || nicheArm && ifNoElseNicheOf(ifIx) != 0
-  if h is IfStmt && h.ifElse < 0 && !ownNull { return "no else" }
-  const rung = match p.ijArm {
-    "null" => "null join"
-    "atom" => ""
-    "union" => "union"
-    "ref" => ""
-    "scalar" => ""
-  }
-  if rung != "" { return rung }
-  // An atom join is `emitIfExprAs` at i32, each arm its value in the atom context.
-  if p.ijArm == "atom" {
-    return if ifJoinDropsNulAtom(ifIx, fnIx, "atom") { "string drops null atom" } else { "" }
-  }
-  const rk = p.ijRef.rjKind
-  // A join at a record's own row is legacy's reference join, a narrowed arm unboxed in its arm.
-  if p.ijArm == "ref" && rk != null && joinKindIsRecord(rk) {
-    return "ref " + rk
-  }
-  // A union join with no render name takes a later rung in legacy; the IR lowers no union join.
-  if exprUnion(ifIx, fnIx) { return "union" }
-  if rk != null { return "ref " + rk }
-  if ifJoinDropsNulAtom(ifIx, fnIx, "scalar") {
-    return "string drops null atom"
-  }
-  return ""
-}
-
-// Whether `blockIx` is a block whose last statement is its value, after any prelude.
-function ifArmHasValue(blockIx: i32): boolean {
-  if blockIx < 0 || blockIx >= P.nodes.length { return false }
-  return nodeAt(blockIx) is Block && ifArmValueExpr(blockIx) >= 0
+// "int match" for a dense integer `match` whose `br_table` plan has an `else`, which the IR
+// writes as a table only at a scalar join; "" for any other `if`.
+export function ifIntMatchWhy(ifIx: i32, fnIx: i32): string {
+  if !intMatchHeadAt(ifIx) { return "" }
+  const p = intSwitchPlanOf(ifIx, fnIx)
+  return if p != null && p.ispElse >= 0 { "int match" } else { "" }
 }
 
 // Whether any arm of the if-expression at `ifIx` binds a local its tail could name; when so,
@@ -19316,17 +19232,6 @@ function callIsMethodAt(ix: i32): boolean {
 // An if-expression arm is a block whose value is its last statement; every statement
 // before it is the prelude, which is what lets a binding arm sit in value position (the
 // desugared `match u { A{a} => a }` shape). `emitIfArmOpen` pushes the frame and lowers the prelude; the caller emits the value and closes with `emitIfArmClose`, split in two because each arm emitter lowers the value differently while the prelude and frame are shared.
-
-// The first node of the arm block at `blockIx` that binds a local no pass allocated, or -1: an
-// arm the collect pass walked, one whose prelude declares nothing, or one with no prelude (its
-// lone value's own nested arms are their `if`'s to walk) lowers.
-export function armPreludeUnwalkedDecl(blockIx: i32): i32 {
-  if blockIx < 0 { return -1 }
-  const b = nodeAt(blockIx)
-  if b is Block && b.blkStmts.length <= 1 { return -1 }
-  if armPreludeBlocks[blockIx] ?? false { return -1 }
-  return firstLocalDeclIn(blockIx)
-}
 
 // How one arm of a ref-typed join at `kind`/`slot` delivers its value: `plain` is the value as
 // itself, `recover` the same under `ref.as_non_null`, `unbox` a narrowed arm's box recovered at
@@ -19376,14 +19281,6 @@ export function refIfArmOf(
     return "nestedIf"
   }
   return "noValue"
-}
-
-// The sentinel an else-less link of `emitIfExprAs` writes for its missing arm, the one a bare
-// `null` takes there: 2 at `boolean | null`, -1 at a nullable literal union, else 0, since a
-// bare number has no spare value.
-export function ifNoElseNicheOf(ifIx: i32): i32 {
-  if nodeTyIsNulBool(ifIx) { return 2 }
-  return if nodeTyIsNulLitUnion(ifIx) { 0 - 1 } else { 0 }
 }
 
 // One link of `emitIfExprAs`: 0 or -1 as that function returns, or 1 when the else is another `if`
@@ -24248,7 +24145,7 @@ function listOpRecvNarrowedUnion(objIx: i32, name: string, fnIx: i32) {
 // read in place; a `.push` reads `base`..`base+2` regardless, so the ref frame is reserved for the first group only.
 export function listOpStageBase(base: i32, refSlot: i32): i32 {
   if refSlot < 0 { return base }
-  return refPushScratchBaseFor(refSlot)
+  return refPushScr(refSlot)
 }
 
 // The local list-op receiver `objIx` already is, -1 when it is staged, -3 when a push would land
@@ -24708,7 +24605,7 @@ export function popRefPlanOf(callIx: i32, fnIx: i32): PopPlan | null {
       pqEk: null,
       pqWrap: rlWrapIdx[rslot],
       pqBack: rlBackIdx[rslot],
-      pqBase: pushScratchBase,
+      pqBase: -1,
       pqRefSlot: rslot,
       pqElemRef: true,
     }
@@ -24721,7 +24618,7 @@ export function popRefPlanOf(callIx: i32, fnIx: i32): PopPlan | null {
     pqEk: null,
     pqWrap: mkListTy(),
     pqBack: mkArrTy(),
-    pqBase: strPushScratchBase,
+    pqBase: strPushScr(false),
     pqRefSlot: -1,
     pqElemRef: true,
   }
@@ -24966,7 +24863,6 @@ export function clearPlanOf(callIx: i32, fnIx: i32): ClearPlan {
   }
   const p = clRefused("")
   p.clRecv = callee.memObj
-  p.clBase = pushScratchBase
   if isRef {
     if !rlRowsMinted() {
       return clRefused(
@@ -24994,9 +24890,10 @@ export function clearPlanOf(callIx: i32, fnIx: i32): ClearPlan {
     )
   } else if isStr {
     p.clWrap = mkListTy()
-    p.clBase = strPushScratchBase
+    p.clBase = strPushScr(false)
   } else {
     p.clWrap = lTy()
+    p.clBase = i32PushScr()
   }
   return p
 }
@@ -25308,7 +25205,7 @@ export function mapFilterPlanOf(callIx: i32, fnIx: i32): MfPlan {
   if mfDstTysOf(resK, dstSlot, callIx, p.mfDst) < 0 { return mfRefused("-") }
   p.mfSrcL = mfSrcLocalFor(recvK, p.mfSrc.srcSlot)
   p.mfDstL = mfDstLocalFor(resK, dstSlot)
-  if !fnUses.mapFilter || p.mfSrcL < 0 || p.mfDstL < 0 {
+  if p.mfSrcL < 0 || p.mfDstL < 0 {
     return mfRefused("emitProgram: .map/.filter scratch frame not reserved")
   }
   p.mfSrc.srcNulUnit = mfNulUnitToRef(callee.memObj, c.callArgs[0], cbFe, fnIx)
@@ -25350,9 +25247,9 @@ export function mfLoopTail(p: MfPlan, cL: i32) {
   const resK = p.mfResK
   const dstSlot = p.mfDstSlot
   const sig = p.mfSig
-  const iL = mfScratchBase
-  const nL = mfScratchBase + 1
-  const jL = mfScratchBase + 2
+  const iL = mfScr()
+  const nL = mfScr() + 1
+  const jL = mfScr() + 2
   mfNulUnit = p.mfSrc.srcNulUnit
   fbLocalSet(cL)
   // n = src.len
@@ -26641,7 +26538,7 @@ export function arrSlicePlanOf(callIx: i32, fnIx: i32): SlicePlan {
   }
   p.slSrcL = mfSrcLocalFor(recvK, srcSlot)
   p.slDstL = mfDstLocalFor(recvK, srcSlot)
-  if !fnUses.mapFilter || p.slSrcL < 0 || p.slDstL < 0 {
+  if p.slSrcL < 0 || p.slDstL < 0 {
     return slRefused("emitProgram: .slice scratch frame not reserved")
   }
   p.slRecv = callee.memObj
@@ -26668,9 +26565,9 @@ export function arrSliceTail(p: SlicePlan): i32 {
   // The `.map`/`.filter` frame's first 3 slots are i32 (i, n, j); slot +3 is a
   // closure ref. So slice has THREE i32 temps: `startL`, `endL`, and `auxL` which
   // holds the length during clamping then is reused for the out length.
-  const startL = mfScratchBase + 0
-  const endL = mfScratchBase + 1
-  const auxL = mfScratchBase + 2
+  const startL = mfScr() + 0
+  const endL = mfScr() + 1
+  const auxL = mfScr() + 2
   if p.slTwo { fbLocalSet(endL) }
   fbLocalSet(startL)
   fbLocalSet(srcL)
@@ -30295,13 +30192,8 @@ export function strToAtomWideTail(ix: i32): i32 {
 // After a `staged` value's raw string: the value parked in the stage slot, then the tower over
 // it (`emitStagedStrToAtomChain`). 0, or -1 failed.
 export function strToAtomStagedTail(ix: i32, fnIx: i32): i32 {
-  if !fnUses.atomStage {
-    return emitFail(
-      "emitProgram: literal-union atom narrowing needs a re-readable receiver",
-    )
-  }
-  fbLocalSet(atomStageSlot)
-  return emitStagedStrToAtomChain(strToAtomTexts(ix), 0, atomStageSlot, fnIx)
+  fbLocalSet(atomStageScr())
+  return emitStagedStrToAtomChain(strToAtomTexts(ix), 0, atomStageScr(), fnIx)
 }
 
 // The `sole` narrowing of node `ix`: its one member's interned id; the place is not read.
