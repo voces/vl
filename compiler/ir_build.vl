@@ -14353,7 +14353,12 @@ function spreadSrcBuild(
 function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const ty = outTyOf(ix, rep)
   if ibTyOpen(ty, rep) { return irBMiss("open temp type") }
-  const l0 = irBExpr(b, n.binLeft)
+  // A value `if` operand at a record result is built at that record's nullable (D3389): its
+  // literal arms are then the result's records, which a delivery at another row would copy.
+  const lu = unwrapParen(n.binLeft)
+  const lif = if repNodeAt(rep) is RRecord && lu >= 0 && lu < P.nodes.length { nodeAt(lu) } else { null }
+  const lnt = if lif is IfStmt && ty >= 0 && !irTyOpen(ty) { nullableTyOf(ty) } else { -1 }
+  const l0 = if lif is IfStmt && lnt >= 0 && exprRepOf(lu) != repNodeOfTy(lnt) { ifExprAt(b, lif, lu, repNodeOfTy(lnt), lnt) } else { irBExpr(b, n.binLeft) }
   if ibMiss != "" { return l0 }
   if !(l0 is OVar) || l0.ov < 0 || l0.ov >= ib.irVars.length {
     return irBMiss("coalesce operand")
@@ -14385,6 +14390,34 @@ function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const l = if named || again { l0 } else { heldAtRep(b, l0, n.binLeft) }
   const c = testNull(b, l, ix)
   if ibMiss != "" { return c }
+  // A list operand the context holds at its own storage (a generic instance's pinned list) is the
+  // result there, its default built at it (legacy's stored join): a list converted element-wise
+  // would be a copy, apart from the operand it is.
+  const ln = repNodeAt(irBOpRep(l))
+  const want = if ln is RNullable { ln.rnInner } else { -1 }
+  const ct = heldTy(ctxTyAt(ix, ibFnIx))
+  const stored = want >= 0
+    && want != rep
+    && repNodeAt(want) is RList
+    && repNodeAt(rep) is RList
+    && ct >= 0
+    && repNodeOfTy(ct) == want
+  if stored { return coalArms(b, n, ix, want, ct, l, c, again) }
+  return coalArms(b, n, ix, rep, ty, l, c, again)
+}
+
+// `coalNative`'s join at result rep `rep` typed `ty`, past operand `l`'s null test `c`: the
+// default delivered in the null arm, `l` past its null in the other (read `again` where named).
+function coalArms(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  ty: i32,
+  l: Opnd,
+  c: Opnd,
+  again: boolean,
+): Opnd {
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
   if !coalNeverDefault(nb, n.binRight, rep, t) {
