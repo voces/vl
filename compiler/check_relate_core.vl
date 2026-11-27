@@ -608,7 +608,9 @@ import {
 } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
 import {
+  CW_OCC_USE,
   CW_UP_CALLEE,
+  CW_UP_LETINIT,
   covarRootName,
   cwBindingOf,
   cwBindingWrittenValues,
@@ -622,7 +624,9 @@ import {
   cwFramedNode,
   cwGetRecv,
   cwHeldFnOf,
+  cwIxBuild,
   cwIxCovers,
+  cwIxKind,
   cwIxNode,
   cwIxUp,
   cwIxUpKind,
@@ -11113,6 +11117,70 @@ function bgWidensDeclaredParam(have: i32, atIx: i32): boolean {
     return false
   }
   return tyAt(have) is TyVar && tyParamOfInnermostBody(have)
+}
+
+// Generic function `fd`'s flows between its own type parameters through a binding, as pairs
+// `[F, G, ...]`: a parameter declared `G` that initialises a `let` annotated `F`. A value of `G`
+// is then held as an `F` (T9.3), so a call binds both to one function set.
+function bgTyParamFlows(fd: i32): string[] {
+  const out: string[] = []
+  if fd < 0 || fd >= P.nodes.length { return out }
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) || f.fnTyParams.length < 2 { return out }
+  cwIxBuild()
+  for px in f.fnParams {
+    const pn = nodeAt(px)
+    const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+    if pt is TypeRef && strListHas(f.fnTyParams, pt.tyName) {
+      const k = cwKeyOfDecl(px)
+      const ow = if k >= 0 { cwOccWalk(k) } else { cwOccWalk(-1) }
+      while k >= 0 && cwOccNext(ow) {
+        const u = cwIxNode[ow.row]
+        if (
+          cwIxKind[ow.row] == CW_OCC_USE
+          && cwIxCovers(u)
+          && cwIxUpKind[u] == CW_UP_LETINIT
+        ) {
+          const ld = nodeAt(cwIxUp[u])
+          const lt = if ld is LetDecl && ld.letType >= 0 { nodeAt(ld.letType) } else { null }
+          if (
+            lt is TypeRef
+            && lt.tyName != pt.tyName
+            && strListHas(f.fnTyParams, lt.tyName)
+          ) {
+            out.push(lt.tyName)
+            out.push(pt.tyName)
+          }
+        }
+      }
+    }
+  }
+  return out
+}
+
+// The bindings each flow `bgTyParamFlows` finds in callee `fd` asks for, pushed to `oN`/`oT`:
+// both type parameters at the union of the function sets the call's arguments bound them to, as
+// two arguments of one parameter join. Pushes nothing where no flow joins two sets.
+export function bindGenFlowJoins(
+  fd: i32,
+  bNames: string[],
+  bTys: i32[],
+  oN: string[],
+  oT: i32[],
+) {
+  const fl = bgTyParamFlows(fd)
+  let i = 0
+  while i + 1 < fl.length {
+    const a = bindOf(bNames, bTys, fl[i])
+    const b = bindOf(bNames, bTys, fl[i + 1])
+    if a >= 0 && b >= 0 && bgJoinsSets(a, b) {
+      const j = elabFnJoinDeepTy(a, a, b)
+      oN.push(fl[i])
+      oT.push(j)
+    }
+    i = i + 2
+  }
+  return 0
 }
 
 // Generic call-site binding, deep: walks an expected parameter type against the argument's
