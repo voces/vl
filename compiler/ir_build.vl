@@ -2047,16 +2047,36 @@ function isVariantRow(b: i32[], n: IsExpr, ix: i32, rep: i32, vi: i32): Opnd {
     const z: Opnd = { oiRep: rep, oiBits: 0 }
     return z
   }
-  // A chain staged into the shared slot (a receiver no re-readable place) stays legacy's.
-  if arm == "chain" && !unionEqOperandOk(n.isObj) {
-    return irBMiss("is variant row chain staged")
-  }
   if arm != "plainTag" && arm != "discrim" && arm != "chain" {
     return irBMiss("is variant row " + arm)
   }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
-  const v = irBExpr(b, n.isObj)
+  let v = irBExpr(b, n.isObj)
   if ibMiss != "" { return v }
+  // The discriminant and the chain cast a box, so a boxed nullable (its null a tag, its ref never
+  // null) is read at its box; and they read the receiver again, so a temp (a call, say) is held
+  // once in a local they read.
+  const vn = repNodeAt(irBOpRep(v))
+  if (
+    (arm == "discrim" || arm == "chain")
+    && vn is RNullable
+    && vn.rnDisc == 4
+    && repNodeAt(vn.rnInner) is RBox
+  ) {
+    const rc: Rhs = { rcV: v, rcAt: unwrapParen(n.isObj), rcNn: 1 }
+    v = irBLetTempTy(b, rc, ix, vn.rnInner, repTyOf(vn.rnInner))
+  }
+  if (
+    (arm == "discrim" || arm == "chain")
+    && v is OVar
+    && v.ov >= 0
+    && ib.irVars[v.ov].vKind == "temp"
+  ) {
+    const lv = irVarNew(ib, irBOpRep(v), ib.irVars[v.ov].vTy, "local", -1)
+    irBNode(b, { asDst: lv, asSrc: v }, -1, ibNoValue, n.isObj)
+    const lo: Opnd = { ov: lv }
+    v = lo
+  }
   if arm == "discrim" {
     // Read once per literal, so a variable; the cast to the arm's heap needs a non-null box.
     if !(v is OVar) || !(repNodeAt(irBOpRep(v)) is RBox) {
@@ -2888,15 +2908,15 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   const memTa = ta == "memStruct" || ta == "memVariant" || ta == "memNarrow"
   const tag = if ta == "identBox" || ta == "box" || memTa { isArmTagOf(ix, n, ibFnIx) } else if vi >= 0 && vi < uTags.length { uTags[vi] } else { -1 }
   storageReadLeave(mark)
-  // Any other rung is the ordinary one, its receiver read at the storage legacy marks.
-  if arm != "armTag" && arm != "variant" {
+  // Any other rung is the ordinary one, its receiver read at the storage legacy marks, as is a
+  // variant with no plain tag, whose row or chain the ordinary rung tests.
+  if arm != "armTag" && (arm != "variant" || tag < 0) {
     if arm == "notIs" { return irBMiss("is storage rung") }
     const om = storageReadEnter(n.isObj)
     const o = isRung(b, n, ix, rep, arm)
     storageReadLeave(om)
     return o
   }
-  if arm == "variant" && tag < 0 { return irBMiss("is variant shape") }
   if ta == "tagAbsent" { return isTagAbsentTest(rep) }
   if ta == "boxLitSet" {
     const lm = storageReadEnter(n.isObj)
