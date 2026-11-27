@@ -4778,9 +4778,9 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
     const ut = repTyOf(rep)
     const us = if ut >= 0 && !irTyOpen(ut) { structIndexOfTy(ut) } else { -1 }
     if us < 0 || repNodeOfTy(ut) != rep { return irBMiss("if record join row") }
-    return refIfLink(b, n, ix, rep, ut, kind, us, false)
+    return refIfLink(b, n, ix, rep, ut, kind, us, false, false)
   }
-  return refIfLink(b, n, ix, jr, ty, kind, rj.rjSlot, false)
+  return refIfLink(b, n, ix, jr, ty, kind, rj.rjSlot, false, false)
 }
 
 // A `null`-typed value `if`, as legacy's `emitAllNullIf` writes it: the `if` for its effects alone,
@@ -5021,6 +5021,7 @@ function refIfLink(
   kind: VKind,
   slot: i32,
   nulAcc: boolean,
+  nested: boolean,
 ): Opnd {
   const own = ifLinkYieldsNull(ix, ibFnIx)
   const nul = nulAcc || own
@@ -5040,7 +5041,7 @@ function refIfLink(
   if dk == 0 {
     irBNode(thenB, { tpWhy: 0 }, -1, ibNoValue, n.ifThen)
   } else {
-    thenB = refIfArm(n.ifThen, t, rep, kind, slot, nul)
+    thenB = refIfArm(n.ifThen, t, rep, kind, slot, nul, nested)
   }
   if ibMiss != "" { return irBMiss("ref if arm") }
   let elseB: i32[] = []
@@ -5050,14 +5051,24 @@ function refIfLink(
     const z = repTemp(elseB, { jnKind: kind, jnSlot: slot }, ix, rep)
     irBNode(elseB, { asDst: t, asSrc: z }, -1, ibNoValue, ix)
   } else if en is IfStmt {
-    const inner = refIfLink(elseB, en, n.ifElse, rep, ty, kind, slot, nul)
+    const inner = refIfLink(
+      elseB,
+      en,
+      n.ifElse,
+      rep,
+      ty,
+      kind,
+      slot,
+      nul,
+      nested,
+    )
     if ibMiss != "" { return inner }
     irBNode(elseB, { asDst: t, asSrc: inner }, -1, ibNoValue, n.ifElse)
   } else if valueIfLitTrue(n.ifCond) || dk == 1 {
     // Legacy writes a dead `else` as `unreachable` (`emitDeadValueArm`).
     irBNode(elseB, { tpWhy: 0 }, -1, ibNoValue, n.ifElse)
   } else {
-    elseB = refIfArm(n.ifElse, t, rep, kind, slot, nul)
+    elseB = refIfArm(n.ifElse, t, rep, kind, slot, nul, nested)
   }
   if ibMiss != "" { return irBMiss("ref if arm") }
   irBNode(
@@ -5091,11 +5102,6 @@ function ifArmWiderWrite(blockIx: i32): boolean {
     && asgValueArmOf(tv, ibFnIx) == "widerRow"
 }
 
-// One arm of `ifRefExpr`: its value as itself at `rep`, an atom decoded to it, or the join's null,
-// written to out `t`.
-// Whether `refIfArm` is building the arms of a value `if` nested as an arm.
-let ibNestedLink = false
-
 // The plain record row an object literal `ix` of a nested link is built at for join rep `dst`, or
 // -1: its arm is legacy's own (`struct` or `variant`), its pre-path clear.
 function nestedLitRow(ix: i32, dst: i32): i32 {
@@ -5111,6 +5117,8 @@ function nestedLitRow(ix: i32, dst: i32): i32 {
   return if own >= 0 { own } else { structRowOfRecordTy(ty) }
 }
 
+// One arm of `ifRefExpr`: its value as itself at `rep`, an atom decoded to it, or the join's null,
+// written to out `t`; `nested` where the arm is a link of a value `if` nested as an arm.
 function refIfArm(
   blockIx: i32,
   t: i32,
@@ -5118,6 +5126,7 @@ function refIfArm(
   kind: VKind,
   slot: i32,
   nul: boolean,
+  nested: boolean,
 ): i32[] {
   const body: i32[] = []
   const arm0 = refIfArmOf(blockIx, ibFnIx, kind, slot, nul)
@@ -5160,8 +5169,6 @@ function refIfArm(
   // `else if` link is.
   const tn = if arm == "plain" && tv >= 0 { nodeAt(unwrapParen(tv)) } else { null }
   if tn is IfStmt && tn.ifElse >= 0 && exprPrePathWhy(tv, ibFnIx) == "" {
-    const was = ibNestedLink
-    ibNestedLink = true
     const inner = refIfLink(
       body,
       tn,
@@ -5171,8 +5178,8 @@ function refIfArm(
       kind,
       slot,
       nul,
+      true,
     )
-    ibNestedLink = was
     if ibMiss == "" {
       irBNode(body, { asDst: t, asSrc: inner }, -1, ibNoValue, blockIx)
     }
@@ -5186,7 +5193,6 @@ function refIfArm(
   // A plain arm whose own rep is not the join's and no retag reaches it is delivered at the
   // join's rep, its widening, box or conversion written in the arm.
   const er = if arm == "plain" && lt < 0 && tv >= 0 { exprRepOf(tv) } else { -1 }
-  const nested = ibNestedLink
   const toJoin = er >= 0
     && er != rep
     && !holeRetagNoted(er, rep, true)
@@ -5194,7 +5200,7 @@ function refIfArm(
   // A literal of a nested link, which legacy's planner arms as its own variant, is built at the
   // join's plain record row all the same.
   const nrow = if toJoin && nested { nestedLitRow(tv, rep) } else { -1 }
-  const built = if nrow >= 0 { objLitAt(body, unwrapParen(tv), rep, repTyOf(rep), nrow, false) } else if toJoin { builtAt(body, tv, rep, repTyOf(rep)) } else if lt >= 0 { objLitAt(
+  const built = if nrow >= 0 { objLitAt(body, unwrapParen(tv), rep, repTyOf(rep), nrow, false) } else if toJoin { deliver(body, tv, rep, repTyOf(rep)) } else if lt >= 0 { objLitAt(
     body,
     unwrapParen(tv),
     rep,
