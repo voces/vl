@@ -51,7 +51,7 @@ import {
 } from "./check_capture_rows"
 import { crNoNames } from "./check_capture_walks"
 import { nodeTyOf } from "./check_node_tys"
-import { memberDeclOf } from "./symbols"
+import { identDeclOf, memberDeclOf } from "./symbols"
 import { crTyHasFn, crTyIsScalar } from "./tyquery"
 import { tyIsHole } from "./check_types"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
@@ -617,6 +617,8 @@ export function fnWriteFreePaths(fnIx: i32): WeSet {
   if fd is FuncDecl {
     const bound: string[] = []
     fnBoundNames(fnIx, bound)
+    const own: {[i32]: boolean} = Map()
+    weSubtreeInto(fnIx, own)
     const depth = weOpen.length
     const lowBefore = weLow
     const provMark = weProvKeys.length
@@ -626,7 +628,7 @@ export function fnWriteFreePaths(fnIx: i32): WeSet {
     weRoots.push(fd.fnBody)
     const into = weAccNew(true)
     let acc = weOpaqueSet
-    if weScanFree(into, fd.fnBody, bound) { acc = weSetOf(into) }
+    if weScanFree(into, fd.fnBody, bound, own) { acc = weSetOf(into) }
     weRoots.pop()
     crAskPop()
     weOpen.pop()
@@ -641,9 +643,43 @@ export function fnWriteFreePaths(fnIx: i32): WeSet {
   return weOpaqueSet
 }
 
+// Every node of the subtree at `ix`, into `out`.
+function weSubtreeInto(ix: i32, out: {[i32]: boolean}) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  out[ix] = true
+  for k in nodeChildren(ix) { weSubtreeInto(k, out) }
+  return 0
+}
+
+// Whether a write to place `lhs` stays inside the function whose nodes are `own`: its root name's
+// declaration is one of them, or, for a root the binder resolved to none, the name is bound there.
+function weWriteIsLocal(
+  lhs: i32,
+  key: string,
+  bound: string[],
+  own: {[i32]: boolean},
+) {
+  let r = lhs
+  while r >= 0 && r < P.nodes.length {
+    const n = nodeAt(r)
+    if n is Member { r = n.memObj }
+    else if n is Index { r = n.idxArr }
+    else if n is Paren { r = n.parInner }
+    else { break }
+  }
+  const d = if r >= 0 && r < P.nodes.length && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
+  if d >= 0 { return own[d] ?? false }
+  return strListHas(bound, placeRootOf(key))
+}
+
 // Add the free-variable place keys a subtree writes, composing a nested known callee's own free
 // writes; false when an opaque nested callee makes the whole answer opaque.
-function weScanFree(acc: WeAcc, ix: i32, bound: string[]): boolean {
+function weScanFree(
+  acc: WeAcc,
+  ix: i32,
+  bound: string[],
+  own: {[i32]: boolean},
+): boolean {
   if ix < 0 || ix >= P.nodes.length { return true }
   const n = nodeAt(ix)
   if n is BinExpr {
@@ -651,7 +687,7 @@ function weScanFree(acc: WeAcc, ix: i32, bound: string[]): boolean {
       // A bare free name counts too: rebinding `g` replaces every place below it.
       const k = placeKeyOf(n.binLeft)
       if k != "" {
-        if !strListHas(bound, placeRootOf(k)) { weAccPart(acc, k) }
+        if !weWriteIsLocal(n.binLeft, k, bound, own) { weAccPart(acc, k) }
       }
     }
   } else if n is Call {
@@ -668,7 +704,7 @@ function weScanFree(acc: WeAcc, ix: i32, bound: string[]): boolean {
     const kids = nodeSpineChildren(cur)
     let i = 0
     while i < kids.length {
-      if !weScanFree(acc, kids[i], bound) { return false }
+      if !weScanFree(acc, kids[i], bound, own) { return false }
       i = i + 1
     }
     cur = elseIfLink(cur)

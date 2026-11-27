@@ -46,7 +46,13 @@ import {
   luOvLocalLeave,
   optLeafArmOf,
 } from "./wasmEmit"
-import { atomPayloadTail, pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
+import {
+  atomPayloadTail,
+  cloDeclConstTail,
+  pushRecvCastOn,
+  pushRecvCastSet,
+  tagIdBoxTail,
+} from "./wasmEmit"
 import {
   armSiteRecv,
   capCellTargetOf,
@@ -183,6 +189,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RCloTag,
   RClosureEq,
   RCoalAtomStr,
   RCoalStr,
@@ -273,6 +280,7 @@ import {
   RStrToAtom,
   RStrToAtomStaged,
   RStructEq,
+  RTagClo,
   RTagIs,
   RTagOf,
   RTagStash,
@@ -356,6 +364,7 @@ import {
   fbI32WrapI64,
   fbI64Const,
   fbIf,
+  fbIfRef,
   fbIfRefNul,
   fbLocalGet,
   fbLocalIsUnsetRef,
@@ -932,6 +941,7 @@ import {
   bankedRowsDrop,
   callRefDepth,
   cloCellIdx,
+  cloStructIdx,
   ctrlDepth,
   dfeCallee,
   emitFnSpanEnd,
@@ -1707,6 +1717,8 @@ function rhs(r: Rhs, tail: boolean) {
       strToAtomStagedTail(r.zsAt, lw.irAt)
     }
     RMakeClo => makeClo(r)
+    RTagClo => tagClo(r)
+    RCloTag => cloTag(r)
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
     RInitProgress => irLMiss("init progress as a value")
@@ -2069,6 +2081,83 @@ function makeClo(r: RMakeClo) {
   }
   if nodeAt(r.mcAt) is Ident && readOwesNonNullRecover(r.mcAt, lw.irAt) {
     fbRefAsNonNull()
+  }
+  return 0
+}
+
+// `RTagClo`: a valued `if` per member, testing the id against the member's, each arm its closure;
+// the last member's test guards a trap. A boxed id's null is the closure's, tested first. A
+// `br_table` over dense ids would replace the chain.
+function tagClo(r: RTagClo) {
+  // The builder holds the id in a variable, so each test reads it again.
+  leaf()
+  const id: Opnd = r.tcV
+  if r.tcBox {
+    irLOpnd(id)
+    nulTestBoxTagTail(false)
+    fbIfRefNul(cloStructIdx, true)
+    fbRefNull(cloStructIdx)
+    fbElse()
+  }
+  for d in r.tcFns {
+    irLOpnd(id)
+    if r.tcBox { emitUnionUnboxTail(1) }
+    fbI32Const(d)
+    fbI32Bin(70) // 0x46 i32.eq
+    if r.tcBox { fbIfRefNul(cloStructIdx, true) } else { fbIfRef(cloStructIdx) }
+    emitClosureValueCore(fnStmtsPosOf(d), lw.irAt)
+    fbElse()
+  }
+  fbUnreachable()
+  return tagChainEnd(r.tcFns.length + (if r.tcBox { 1 } else { 0 }))
+}
+
+// `RCloTag`: a valued `if` per member, testing the closure's identity field against the
+// member's, each arm its id; the last member's test guards a trap. A nullable closure's null is
+// tested first, and a boxed result boxes each id.
+function cloTag(r: RCloTag) {
+  // The builder holds the closure in a variable; a nullable one's tag is boxed (the verifier's).
+  leaf()
+  const c: Opnd = r.ckV
+  if r.ckNul {
+    irLOpnd(c)
+    fbRefIsNull()
+    cloTagIfOpen(true)
+    nulNoneBoxHead()
+    fbRefNullNone()
+    nulNoneBoxTail()
+    fbElse()
+  }
+  for d in r.ckFns {
+    irLOpnd(c)
+    fbStructGet(cloStructIdx, 2)
+    cloDeclConstTail(fnStmtsPosOf(d))
+    fbI32Bin(70) // 0x46 i32.eq
+    cloTagIfOpen(r.ckBox)
+    if r.ckBox { tagIdBoxTail(d) } else { fbI32Const(d) }
+    fbElse()
+  }
+  fbUnreachable()
+  return tagChainEnd(r.ckFns.length + (if r.ckNul { 1 } else { 0 }))
+}
+
+// A valued `if` yielding a tagged id: the `i32 | null` box with `box`, else the i32.
+function cloTagIfOpen(box: boolean) {
+  if box {
+    fbOpenIf()
+    fbValtype("union", -1)
+  } else {
+    fbIf(127)
+  }
+  return 0
+}
+
+// Closes `n` nested valued `if`s.
+function tagChainEnd(n: i32) {
+  let k = 0
+  while k < n {
+    fbEnd()
+    k = k + 1
   }
   return 0
 }
@@ -6090,7 +6179,7 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       setField(n, lw.irNodeAt[id])
       irLSettle(pending)
     }
-    SIntSwitch => intSwitch(n, pending, tail)
+    SIntSwitch => intSwitch(n, pending, tail, lw.irNodeAt[id] ?? -1)
     SCellSet | SSwitch => irLMiss("statement outside I1")
   }
   return 0
@@ -6205,17 +6294,22 @@ function optFieldIs(r: ROptRead) {
 // An integer switch as `emitIntSwitch` writes it: the outer frame, the default's, one per arm,
 // the index less its low value (a 64-bit one range-tested onto the default), the `br_table`, then
 // each arm and a branch past the rest, and the else. A tail chain's arms are in tail position.
-function intSwitch(n: SIntSwitch, pending: i32[], tail: boolean) {
+function intSwitch(n: SIntSwitch, pending: i32[], tail: boolean, at: i32) {
   // A valued switch's outer frame is typed by its out, which each arm leaves for its branch.
   const t = n.isOut
   if t >= lw.irVars.length { return irLMiss("valued switch out") }
-  const vt = if t >= 0 { valtypeOf(lw.irVars[t].vRep) } else { 64 }
-  if vt < 0 { return irLMiss("valued switch rep") }
-  irLSettle(pending)
+  // Values staged before the switch, which its operand does not read, stay on the stack beneath
+  // its frame and follow it in definition order, as a valued `if`'s do.
+  const roots = stageLead(n.isOn, pending)
+  if lwMiss != "" { return 0 }
+  lwSeq = []
+  while pending.length > 0 { pending.pop() }
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length
   const m = n.isArms.length
   const span = n.isTable.length - 1
   const lo = n.isLo
-  fbBlock(vt)
+  if !switchFrameOpen(t, at) { return 0 }
   lwFrames.push(-1)
   const endDepth = ctrlDepth
   let k = 0
@@ -6253,11 +6347,47 @@ function intSwitch(n: SIntSwitch, pending: i32[], tail: boolean) {
   body(n.isElse, armTail, t, false)
   fbEnd()
   lwFrames.pop()
+  lwFloor = lwFloors.pop() ?? 0
+  for r in roots { pending.push(r) }
   if t >= 0 {
     livePush(t)
     pending.push(t)
   }
   return 0
+}
+
+// Opens a switch's outer frame at the type its out `t` is held at, as a valued `if` opens: a plain
+// valtype, an atom's `i32`, the union box, or the reference join at `at`'s row. False on a miss.
+function switchFrameOpen(t: i32, at: i32): boolean {
+  if t < 0 {
+    fbBlock(64)
+    return true
+  }
+  const rep = lw.irVars[t].vRep
+  const rr = repNodeAt(rep)
+  const vt = valtypeOf(rep)
+  if vt >= 0 {
+    fbBlock(vt)
+    return true
+  }
+  if rr is RAtom || rr is RNullable && rr.rnDisc == 3 || repBoolNiche(rep) {
+    fbBlock(127)
+    return true
+  }
+  if rr is RBox || rr is RNullable && rr.rnDisc == 4 {
+    fbOpenBlock()
+    fbValtype("union", -1)
+    return true
+  }
+  const rj = if at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
+  const rk = rj.rjKind
+  if rk != null {
+    fbOpenBlock()
+    fbRefIfOpenType(rk, rj.rjSlot, ifLinkYieldsNull(at, lw.irAt))
+    return true
+  }
+  irLMiss("valued switch rep")
+  return false
 }
 
 // What `ifOpen` did with a node: not an `if`, wrote all of it, or opened its `else` (a plain or a
