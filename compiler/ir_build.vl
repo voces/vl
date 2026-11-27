@@ -9,6 +9,7 @@ import {
   listFitShadowReadsRow,
   listFitShadowSameTy,
   listFitShadowTyOf,
+  nulUnitPlaceReadAt,
   optRecvHoleTyped,
   spreadGroupConverts,
 } from "./wasmEmit"
@@ -14281,7 +14282,9 @@ function nulNoneEffect(b: i32[], x: i32, ix: i32, sink: Opnd[] | null): Opnd {
   }
   // An element read is dropped as it is stored (`buildIndex`'s `nulDropped`).
   const em = if n is Index { storageReadEnter(u) } else { storageReadEnter(-1) }
-  const v = irBExpr(b, u)
+  // A null-unit place read is read for its effect alone, and a call of a function returning only
+  // `null` is run at its own result: either's null is dropped with it.
+  const v = if nulUnitPlaceReadAt(u, ibFnIx) { exprAtPre(b, u, false, "") } else if n is Call { nulNoneCallRun(b, n, u) } else { irBExpr(b, u) }
   storageReadLeave(em)
   if ibMiss != "" { return v }
   if sink == null {
@@ -14290,6 +14293,22 @@ function nulNoneEffect(b: i32[], x: i32, ix: i32, sink: Opnd[] | null): Opnd {
     sink.push(v)
   }
   return none
+}
+
+// Call `n` at node `u` built for its effect: a direct call of a function whose every value is
+// `null` (`nulNoneCallee`) at its own result rep, any other call as itself.
+function nulNoneCallRun(b: i32[], n: Call, u: i32): Opnd {
+  const cf = if n.callFn >= 0 { nodeAt(n.callFn) } else { null }
+  const d = if cf is Ident { identDeclOf(n.callFn) } else { -1 }
+  const pos = if cf is Ident && d >= 0 && nodeAt(d) is FuncDecl { userFnCallTarget(n, cf, ibFnIx) } else { -1 }
+  if !nulNoneCallee(pos) { return irBExpr(b, u) }
+  const rhs = callRhs(b, n, u)
+  if ibMiss != "" { return irBMiss("call") }
+  if !(rhs is RCall) { return irBMiss("null-typed call") }
+  const si = irSigOf(ib, rhs.caCallee)
+  if si < 0 { return irBMiss("null-typed call signature") }
+  const sr = ib.irSigRet[si]
+  return irBLetTempTy(b, rhs, u, sr, repTyOf(sr))
 }
 
 // Node `x` built as itself at the `??`'s rep `rep`, or the miss arm `arm` names.
@@ -18358,7 +18377,8 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   if nulStore && repPrim(ln.rlsElem) != "null" {
     return skip("store null unit sentinel rep")
   }
-  const x0 = if nulStore { nulSentinelStore(b, n.binRight, er) } else if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
+  // Every value a `null[]` element takes is its sentinel, the value read for its effects.
+  const x0 = if nulStore || repPrim(ln.rlsElem) == "null" { nulSentinelStore(b, n.binRight, er) } else if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
   if ibMiss != "" { return 0 }
   // A value at another rep goes into the element's slot through the one converter.
   const x = if irBOpRep(x0) != er { irConvertStored(b, x0, er, repTyOf(er), n.binRight) } else { x0 }
@@ -18508,7 +18528,7 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
     return skip("field store box from a box")
   }
   const at = b.length
-  const x0 = deliver(b, n.binRight, dst, siteTy)
+  const x0 = if va == "nulnone" { nulUnitSlotValue(b, n.binRight, dst) } else { deliver(b, n.binRight, dst, siteTy) }
   if ibMiss != "" { return 0 }
   // A sub-word field (`repSubWord`) takes a plain i32, which `struct.set` truncates.
   const subWord = repSubWord(dst) && repPrim(irBOpRep(x0)) == "i32"
@@ -18530,14 +18550,31 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   return 0
 }
 
+// A `null`-unit value `x` into a slot at the `null` unit `dst`: `x` read for its effects, then the
+// slot's one value, the bottom ref.
+function nulUnitSlotValue(b: i32[], x: i32, dst: i32): Opnd {
+  const effs: Opnd[] = []
+  const e = nulNoneEffect(b, x, x, effs)
+  if ibMiss != "" { return e }
+  const nul = repTemp(b, { nuAt: x, nuOwn: NULL_OWN_NONE, nuRead: [] }, x, dst)
+  if ibMiss != "" || effs.length == 0 { return nul }
+  return irBLetTempTy(
+    b,
+    { aeEff: effs, aeV: nul, aeAt: x },
+    x,
+    dst,
+    repTyOf(dst),
+  )
+}
+
 // The field store value arms whose write is the value delivered at the field's rep: the bare
 // value, the box (`emitUnionBoxOwed`, the hole box plan), the widenings (`emitWidened`), an atom's
 // decode to its string (`emitAtomToStr`, which `emitStrValue` writes for an atom) and a nullable
 // record's value where `emitArmDelivery` owes no unbox (`fieldStore` checks that).
 function fieldStoreValueDelivers(va: FieldStoreValArm): boolean {
   return match va {
-    "plain" | "box" | "f64" | "i64" | "f32" | "atomToStr" | "strValue" | "armDelivery" => true
-    "noKind" | "nulnone" | "unencodable" => false
+    "plain" | "box" | "f64" | "i64" | "f32" | "atomToStr" | "strValue" | "armDelivery" | "nulnone" => true
+    "noKind" | "unencodable" => false
   }
 }
 
@@ -18551,8 +18588,10 @@ function fieldStoreRepFits(va: FieldStoreValArm, dst: i32): boolean {
     "f32" => repPrim(dst) == "f32"
     "atomToStr" => repPrim(dst) == "str"
     "strValue" => repPrim(dst) == "str" || strNullable(dst)
+    // A `null`-unit value into the field's `null` slot, whose one value is the bottom ref.
+    "nulnone" => repPrim(dst) == "null"
     "plain" | "armDelivery" => true
-    "noKind" | "nulnone" | "unencodable" => false
+    "noKind" | "unencodable" => false
   }
 }
 
