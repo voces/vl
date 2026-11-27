@@ -1,3 +1,10 @@
+import {
+  irInlineCalls,
+  irInlineReset,
+  irIsLeaf,
+  irLeafNote,
+  irMemFoldAdds,
+} from "./ir_inline"
 import { luAlikeMemberTyOf } from "./emit_base"
 import { coerceTakesAtomAsStr } from "./emit_plan_union"
 import { msSetOfRow } from "./emit_union_registry"
@@ -421,7 +428,6 @@ import {
   letStoresGenericAliasCore,
   listFitIsPlanOf,
   listOpRecvHeldPlan,
-  lowMemFoldsCallee,
   luForWalkElemTy,
   luForWalkPlanOf,
   lvTailAssigns,
@@ -951,6 +957,7 @@ import {
   globalIndexOfSid,
 } from "./emit_fn_ret_kinds"
 import { declOrigOf, identDeclOf, nodeSrc, sidOfNode } from "./symbols"
+import { regionSplitOf } from "./binding_regions"
 import { memOffsetLexValue } from "./check_intrinsics"
 import {
   charLitCp,
@@ -1180,6 +1187,8 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   if softRefused("") { return declineRefused(emitSoftMsg) }
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen { return false }
+  irInlineCalls(ib)
+  irMemFoldAdds(ib)
   if verifierRefused("this function") { return false }
   const why = irLowerClaim(ib, globalCtxOf(fnPos), fnPos, out)
   if why != "" {
@@ -1189,6 +1198,7 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   }
   declUnit = -1
   count("claimed")
+  irLeafNote(fnPos, ib)
   return true
 }
 
@@ -1248,6 +1258,7 @@ function claimStart(
 
 // Starts a compile's report.
 export function irShadowBegin() {
+  irInlineReset()
   ibRowKey = []
   ibRowN = []
   claimScopeOpen = false
@@ -1369,42 +1380,19 @@ function alikeTagOf(n: IsExpr, mt: i32): i32 {
   if mr < 0 { return -2 }
   if vr == mr { return -1 }
   if !(repNodeAt(vr) is RBox) { return -2 }
-  const p = boxPlanOfRep(mr, repTyOf(vr))
-  if p.hbKind < 0 { return -2 }
-  // Only the plans that box a member under its own tag name one; any other plan is no list
-  // member's, so the test is the ordinary one.
-  return match p.hbArm {
-    "atom" => scalarTagOfKind(p.hbKind)
-    "refList" => p.hbKind
-    "rec" => if p.hbKind < uTags.length { uTags[p.hbKind] } else { -2 }
-    "null" |
-      "pass" |
-      "memberBox" |
-      "atomList" |
-      "lit" |
-      "atomStr" |
-      "atomAsStr" |
-      "nulNiche" |
-      "nulBool" |
-      "obj" |
-      "recCopy" |
-      "numRebox" |
-      "narrowBox" |
-      "armLit" |
-      "mapScalar" |
-      "mapBox" |
-      "map" |
-      "nulMap" |
-      "clo" |
-      "retag" |
-      "wideRetag" |
-      "ladder" => -2
-  }
+  const t = memberBoxTagOf(mr, vr)
+  return if t >= 0 { t } else { -2 }
 }
 
 // The alike test `ix` along `alikeTagOf`'s answer `tag`: the receiver read, then true, or its box
 // tag against `tag`.
 function alikeTest(b: i32[], n: IsExpr, ix: i32, rep: i32, tag: i32): Opnd {
+  // An always-true test of an effect-free receiver reads nothing: a read built only to be dropped
+  // would stand on the stack below the condition that consumes the constant (D17730).
+  if tag < 0 && exprEffectFree(n.isObj) {
+    const t0: Opnd = { oiRep: rep, oiBits: 1 }
+    return t0
+  }
   const v = irBExpr(b, n.isObj)
   if ibMiss != "" { return v }
   if tag < 0 {
@@ -5890,6 +5878,12 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   ) {
     return nullUnitTemp(b, ix, rep, [])
   }
+  // A module `let` past a reassignment that began a region of it (`startStmt`) is that region's.
+  const rgv = if dn is LetDecl && g >= 0 && ibFnIx < 0 { ibDeclVar[d] ?? -1 } else { -1 }
+  if rgv >= 0 {
+    const ro: Opnd = { ov: rgv }
+    return irConvert(b, ro, rep, heldTy(exprTyOf(ix)), ix)
+  }
   if dn is LetDecl && g >= 0 {
     // Legacy stores a map cell at its binding's storage type (`letCellSlot`'s `letMapShapeOfTy`,
     // `letBindTy`), so in a build that has not noted the cell, a read typed there reads it as is.
@@ -7984,7 +7978,6 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   if envSlotShift(inst) > 1 + caps.length {
     return missRhs("callee environment")
   }
-  if lowMemFoldsCallee(pos) { return missRhs("low-memory accessor") }
   const callee = nodeAt(inst)
   const args: Opnd[] = []
   if callee is FuncDecl {
@@ -8093,6 +8086,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       return missRhs("short-circuit argument after a capture")
     }
   }
+  if irIsLeaf(pos) { ib.irCallsLeaf = true }
   const r: Rhs = {
     caCallee: pos,
     caArgs: args,
@@ -9451,7 +9445,7 @@ function simdMemRhs(b: i32[], c: Call, ix: i32, row: i32): Rhs {
     }
     "rest" => args.push(irBExpr(b, ap.maRest))
     "fold" => args.push(foldAddrRead(b, c))
-    "bad" | "lma" | "wide" => {
+    "bad" | "wide" => {
       return missRhs("simd memory address " + ap.maArm)
     }
   }
@@ -10453,6 +10447,10 @@ function mapSetValue(
     && arm != "boolNulNone"
     && !(nul && mr is RMap)
   ) {
+    // A record into a record-valued map is built at the map's value rep where it is fresh.
+    if mr is RMap && repNodeAt(mr.rmVal) is RRecord {
+      return builtAt(b, val, mr.rmVal, mvValTyIxAt(sh))
+    }
     return irBExpr(b, val)
   }
   if !(mr is RMap) { return irBMiss("map store receiver rep") }
@@ -11608,7 +11606,11 @@ function deliverFresh(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd | null {
 function freshLitAt(ix: i32, dst: i32): boolean {
   const u = unwrapParen(ix)
   if u < 0 || u >= P.nodes.length || !(nodeAt(u) is ObjLit) { return false }
-  if objLitArmOf(u, ibFnIx) != "struct" || exprRepOf(u) == dst { return false }
+  // A literal adopted at a union arm's variant row is fresh for a plain record destination too:
+  // it is built at the destination's row, whatever rep its adoption names.
+  const arm = objLitArmOf(u, ibFnIx)
+  if arm != "struct" && arm != "variant" { return false }
+  if arm == "struct" && exprRepOf(u) == dst { return false }
   const d = repNodeAt(dst)
   return d is RRecord && !d.rrVariant && exprPrePathWhy(u, ibFnIx) == ""
 }
@@ -13998,7 +14000,7 @@ function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
     "rest" => args.push(irBExpr(b, ap.maRest))
     "fold" => args.push(foldAddrRead(b, c))
     "wide" => args.push(wideAddrRead(b, ap.maRest))
-    "bad" | "lma" => {
+    "bad" => {
       return missRhs("memory address " + ap.maArm)
     }
   }
@@ -14039,6 +14041,7 @@ function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
     mmBase: p.mxBase,
     mmPrim: p.mxPrim,
     mmName: name,
+    mmOffAdd: 0,
   }
   return r
 }
@@ -14093,7 +14096,7 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
     "rest" => args.push(irBExpr(b, ap.maRest))
     "fold" => args.push(foldAddrRead(b, c))
     "wide" => args.push(wideAddrRead(b, ap.maRest))
-    "bad" | "lma" => {
+    "bad" => {
       return missRhs("memory address " + ap.maArm)
     }
   }
@@ -17949,7 +17952,8 @@ function optFieldTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   if !(m is OptMember) { return irBMiss("is optional field node") }
   const base = unwrapParen(m.omObj)
   if base < 0 || base >= P.nodes.length || nodeAt(base) is OptMember {
-    return irBMiss("is optional field chain")
+    const oc = if base >= 0 && base < P.nodes.length { optChainTest(b, n, ix, rep) } else { null }
+    return oc ?? irBMiss("is optional field chain")
   }
   if optChainStagesRecv(om) || optChainStagesRecv(m.omObj) {
     return irBMiss("is optional field staged")
@@ -17965,6 +17969,63 @@ function optFieldTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("is optional field base")
   }
   return irBLetTemp(b, { orV: v, orAt: ix, orTag: tag }, ix, rep)
+}
+
+// `o?.g?.f is K` over a nested chain: the chain read as a value, then tested by its rep, the
+// null test inverted where its present value is held at `K`'s rep, else `K`'s box tag; null
+// where the rep answers neither.
+function optChainTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd | null {
+  const kr = repNodeOfTy(isArmPatTy(ix, n, ibFnIx))
+  const vr = exprRepOf(unwrapParen(n.isObj))
+  const vn = repNodeAt(vr)
+  const tag = if vn is RBox { memberBoxTagOf(kr, vr) } else { -1 }
+  const nul = vn is RNullable && vn.rnInner == kr
+  if kr < 0 || rep != ibBool || !nul && tag < 0 { return null }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  if nul {
+    return irBLetTemp(
+      b,
+      { ntV: v, ntInvert: true, ntAt: ix, ntByRep: true },
+      ix,
+      rep,
+    )
+  }
+  return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// The box tag member rep `kr` boxes under in box rep `vr` (`boxPlanOfRep`), where the plan names
+// a member's own tag, or -1: every member stored alike shares it.
+function memberBoxTagOf(kr: i32, vr: i32): i32 {
+  const p = boxPlanOfRep(kr, repTyOf(vr))
+  if p.hbKind < 0 { return -1 }
+  return match p.hbArm {
+    "atom" => scalarTagOfKind(p.hbKind)
+    "refList" => p.hbKind
+    "rec" => if p.hbKind < uTags.length { uTags[p.hbKind] } else { -1 }
+    "null" |
+      "pass" |
+      "memberBox" |
+      "atomList" |
+      "lit" |
+      "atomStr" |
+      "atomAsStr" |
+      "nulNiche" |
+      "nulBool" |
+      "obj" |
+      "recCopy" |
+      "numRebox" |
+      "narrowBox" |
+      "armLit" |
+      "mapScalar" |
+      "mapBox" |
+      "map" |
+      "nulMap" |
+      "clo" |
+      "retag" |
+      "wideRetag" |
+      "ladder" => -1
+  }
 }
 
 // A `?.` off a receiver only ever `null` that writes nothing for its effect (a name or a bare
@@ -18184,6 +18245,48 @@ function cellNullBeside(t: i32, rep: i32): boolean {
   const tr = repNodeOfTy(heldTy(exprTyOf(t)))
   if atomNullable(tr) && repPrim(rep) == "str" { return false }
   return repNodeAt(tr) is RNullable && !(repNodeAt(rep) is RNullable)
+}
+
+// Whether value `x` stored at a new region of a binding held at rep `cur` (type `curTy`) needs a
+// variable of its own: its own type's rep is not `cur`, and has no `irConvert` case into it.
+function regionTakesOwnVar(x: i32, cur: i32, curTy: i32): boolean {
+  const ty = heldTy(nodeTyAt(x, ibFnIx))
+  const r = repNodeOfTy(ty)
+  if r < 0 || r == cur || !valueRep(r, ty) || irTyHeldOpen(ty, r) {
+    return false
+  }
+  const o: Opnd = { oiRep: r, oiBits: 0 }
+  return convertKindOf(o, cur, curTy, x) < 0
+}
+
+// The start body's statement `stmt`, at index `pos` of `order`: a region of a module `let` begun
+// apart (`regionStart`) where it splits one, else the statement as usual.
+function startStmt(b: i32[], stmt: i32, order: i32[], pos: i32) {
+  const rd = regionSplitOf(stmt, order, pos, fnStmts)
+  const n = nodeAt(stmt)
+  if rd >= 0 && n is BinExpr {
+    const known = ibDeclVar[rd] ?? -1
+    const st = bindingStorage(rd, -1, true)
+    const cur = if known >= 0 { ib.irVars[known].vRep } else { st.stRep }
+    const curTy = if known >= 0 { ib.irVars[known].vTy } else { st.stTy }
+    if st.stMiss == "" && regionTakesOwnVar(n.binRight, cur, curTy) {
+      return regionStart(b, n, stmt, rd)
+    }
+  }
+  return stmtNode(b, stmt, NO_SIBS, -1)
+}
+
+// The statement `n` (`d = x`) starting a new region of `d`: `x` built at its own type into a
+// variable of its own, which every later read of `d` in this block takes.
+function regionStart(b: i32[], n: BinExpr, ix: i32, d: i32): i32 {
+  const ty = heldTy(nodeTyAt(n.binRight, ibFnIx))
+  const r = repNodeOfTy(ty)
+  const val = deliver(b, n.binRight, r, ty)
+  if ibMiss != "" { return 0 }
+  const v = irVarNew(ib, r, ty, "local", -1)
+  irBNode(b, { asDst: v, asSrc: val }, -1, ibNoValue, ix)
+  ibDeclVar[d] = v
+  return 0
 }
 
 // Whether `x` is a number, boolean, string or `null` literal, whose value a second build repeats.
@@ -20080,6 +20183,16 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     return 0
   }
   if n is BinExpr && n.binOp == "=" {
+    // A reassignment that starts a region of its binding (`regionSplitOf`) holds its value apart.
+    const rd = if pos >= 0 { regionSplitOf(ix, sibs, pos, []) } else { -1 }
+    const rv = if rd >= 0 { irBDeclVar(rd) } else { -1 }
+    if (
+      rv >= 0
+      && rv < ib.irVars.length
+      && regionTakesOwnVar(n.binRight, ib.irVars[rv].vRep, ib.irVars[rv].vTy)
+    ) {
+      return regionStart(b, n, ix, rd)
+    }
     assign(b, n, ix)
     return 0
   }
@@ -21180,7 +21293,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
     // A global whose initializer runs elsewhere writes only its progress (`startIrOrder`).
     const gi = if orderGi[i] <= -2 { -2 - orderGi[i] } else { orderGi[i] }
     if orderGi[i] >= 0 { globalInit(top, orderGi[i], order[i]) }
-    else if orderGi[i] == -1 { stmtNode(top, order[i], NO_SIBS, -1) }
+    else if orderGi[i] == -1 { startStmt(top, order[i], order, i) }
     if ibMiss != "" { return ibMiss }
     // Legacy advances the read-before-init progress cell after each item where a guarded global
     // settles (`emitInitProgressAt`), before it banks the item's row.
