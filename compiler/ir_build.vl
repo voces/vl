@@ -59,7 +59,14 @@ import {
   lbPlanAdd,
   lbPlanDrop,
 } from "./emit_bytes"
-import { cloLiftLetFe, cloLifted } from "./emit_lift"
+import {
+  cloLiftLetFe,
+  cloLiftWriteCapAt,
+  cloLiftWriteCount,
+  cloLiftWriteSlot,
+  cloLifted,
+} from "./ir_lift"
+import { cloLiftCalleeOf } from "./ir_lift_scan"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import {
   sigKeyRetIsVoid,
@@ -146,6 +153,7 @@ import {
   blockTailIsDead,
   callIsNever,
   condLitTrue,
+  fnNameIsLambda,
   hasNamedArgs,
   i32ToStr,
   isBareBlockIf,
@@ -372,7 +380,6 @@ import {
   clearPlanOf,
   clearRecvIsList,
   cloCellReaches,
-  cloLiftCalleeOf,
   closureValueCoreWhy,
   closureValueIsGeneric,
   closureValueWhy,
@@ -820,6 +827,7 @@ import {
   catWidenSideOfBin,
   cbIdentNamesFn,
   cloSigKeyExt,
+  coalLeftNarrowedFromUnion,
   declaredIndexAt,
   envSlotShift,
   exprIsClosure,
@@ -907,9 +915,6 @@ import {
   LBK_UNION,
   VKind,
   cboxReadsCell,
-  cloLiftWriteCapAt,
-  cloLiftWriteCount,
-  cloLiftWriteSlot,
   coalLinkChainOf,
   emitSoftAt,
   emitSoftFail,
@@ -999,6 +1004,7 @@ import {
 import { isVoidTy, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
+  fnHasUnannotatedParam,
   listGetIdxReReadable,
   optChainStagesRecv,
   optRecvReReadable,
@@ -3580,7 +3586,10 @@ function openCallValue(b: i32[], n: Call, ix: i32): Opnd {
   ) {
     return repMissAt(ix, miss)
   }
-  const rhs = callRhs(b, n, ix)
+  // A call through a `const` bound to a lambda that captures nothing, whose closure call has no
+  // rep, is the direct call of that lambda, at its signature's rep: the binding holds no other.
+  const kl = constLambdaCallee(n, ix)
+  const rhs = if kl >= 0 { directCallAt(b, n, ix, kl) } else { callRhs(b, n, ix) }
   if ibMiss != "" { return irBMiss("call") }
   // A closure call is at the scalar its key's result names, as legacy's `call_ref` leaves it.
   if rhs is RCallRef && !rhs.crNever && !rhs.crVoid {
@@ -7715,6 +7724,38 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("binding call misfit")
   }
   return directCallAt(b, c, ix, pos)
+}
+
+// The lambda `constLambdaPos` names for call `n` at `ix` through a binding the lift does not take
+// and whose closure key names no scalar result; -1 for any other call.
+function constLambdaCallee(n: Call, ix: i32): i32 {
+  if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return -1 }
+  const d = identDeclOf(n.callFn)
+  if d < 0 || cloLiftCalleeOf(n.callFn, ibFnIx) >= 0 { return -1 }
+  if keyScalarRep(sigKeyRetKind(callRefPlainKey(ix, ibFnIx))) >= 0 { return -1 }
+  return constLambdaPos(d)
+}
+
+// The `fnStmts` slot of the lambda `const` declaration `d` binds, when the lambda captures
+// nothing, declares no type parameter and annotates every parameter; -1 for any other binding.
+function constLambdaPos(d: i32): i32 {
+  const ld = nodeAt(d)
+  if !(ld is LetDecl) || ld.letKw != "const" || ld.letInit < 0 { return -1 }
+  const init = unwrapParen(ld.letInit)
+  if init < 0 || !(nodeAt(init) is FuncDecl) { return -1 }
+  const fd = nodeAt(init)
+  if (
+    !(fd is FuncDecl)
+    || fd.fnTyParams.length > 0
+    || !fnNameIsLambda(fd.fnName)
+  ) {
+    return -1
+  }
+  const pos = fnStmtsPosOf(init)
+  if pos < 0 || captureCountOf(pos) > 0 || fnHasUnannotatedParam(pos) {
+    return -1
+  }
+  return pos
 }
 
 // Call `c` with named arguments, as `emitCallCoreUserFn` sends it to `emitDirectCall`: a name
@@ -15603,6 +15644,9 @@ function mapGetOrFused(n: BinExpr, ix: i32): boolean {
   if lhsIx < 0 { return false }
   const rd = nodeAt(lhsIx)
   if !(rd is Index) { return false }
+  // A read the checker narrowed out of a union value (`is`, `!= null`) holds a smaller union than
+  // the slot the fused read writes; it is the IR's own `??` over the narrowed read.
+  if coalLeftNarrowedFromUnion(n, ibFnIx) { return false }
   const rk = coalResultKindOf(ix, ibFnIx)
   const arm = mapGetOrArmOf(rd.idxArr, n.binRight, ibFnIx, rk)
   if (
@@ -15814,6 +15858,7 @@ function mapGetAt(
   // record member no plan reads is the box read whole, then narrowed; legacy writes it through
   // `emitExpr`, which banks the read's row whatever row a caller expecting the box passed.
   let narrowTo = -1
+  let nicheTo = -1
   // A literal-set member a union box holds as its string is unboxed to that string
   // (`emitUnionUnboxTail` at the string kind), read as the string it is.
   let strMember = false
@@ -15840,6 +15885,19 @@ function mapGetAt(
       "nonNull" => false
     }
     if box < 0 && !repOk && !whole && repNodeAt(rep) is RRecord {
+      narrowTo = rep
+    }
+    // One narrowed to a literal set's `K | null` its box holds: the box read whole, then its
+    // niche read (`RNicheRead`), as a narrowed place prints (`nulLitNicheRead`).
+    if (
+      box < 0
+      && !repOk
+      && !whole
+      && na == "none"
+      && atomNullable(rep)
+      && heldAsBox(m.rmVal)
+    ) {
+      nicheTo = rep
       narrowTo = rep
     }
     if (box >= 0 || !repOk) && narrowTo < 0 {
@@ -15889,6 +15947,14 @@ function mapGetAt(
     }
     const wv = irBLetTempTy(b, wr, ix, m.rmVal, repTyOf(m.rmVal))
     if ibMiss != "" { return wv }
+    if nicheTo >= 0 {
+      return irBLetTemp(
+        b,
+        { nrV: wv, nrAt: ix, nrKind: NICHE_NUL_LIT, nrRow: false },
+        ix,
+        nicheTo,
+      )
+    }
     return irBLetTemp(
       b,
       { bnV: wv, bnAt: ix, bnRep: narrowTo, bnAtom: -1, bnCon: -1 },

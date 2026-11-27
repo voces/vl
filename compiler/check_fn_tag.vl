@@ -1,3 +1,4 @@
+import { quietEnterFlat, quietLeaveFlat } from "./check_cursor"
 import {
   setBindHandedSets,
   setBindParamDeclsOf,
@@ -24,6 +25,7 @@ import {
   recAsgFnWidenedTy,
   recEnclosingFn,
   recFnFieldsWiden,
+  recRetLitOfSoleCall,
   recordBoxTy,
   repStampHeldRead,
 } from "./check_fit_rules"
@@ -125,6 +127,7 @@ import { rcwInferredRetTy } from "./check_rcw"
 import {
   ftArgIsParam,
   ftParamOnlyCalledAt,
+  holeLamRetAt,
   holeSetFitsRetAt,
   holeSetRetDiffersAt,
   holeSetSplitsAt,
@@ -134,6 +137,7 @@ import {
 import { fieldStorageEq } from "./check_ty_relate"
 import {
   T,
+  TY_I32,
   TY_VOID,
   TyArray,
   TyErr,
@@ -147,6 +151,7 @@ import {
   TyUnion,
   TyVar,
   mkArrayTy,
+  mkFuncTy,
   tyAt,
   tyElemOf,
   tyElemOpen,
@@ -220,8 +225,8 @@ import {
   elabListParamSource,
   fnTagMembersWithin,
   fnTagRecHoldsListOfLists,
+  fnTagSetCount,
   fnTagSetSplits,
-  fnTagWiderSetHasOneSig,
   handBackCalledArgOf,
   handBackCalledIx,
 } from "./check_elab_cap"
@@ -1518,10 +1523,8 @@ function ftReturnedPastSet(pd: i32, s: i32): boolean {
   if !(fn is FuncDecl) || fn.fnBody < 0 || ftRetCarries(fd, s) { return false }
   // A parameter called and handed back returns each call's own argument, so its id stays in the
   // set that call's argument is of.
-  const hc = handBackCalledIx(fn)
-  if hc >= 0 && fn.fnParams[hc] == pd && fnTagWiderSetHasOneSig(s) {
-    return false
-  }
+  const hc = handBackCalledWiderIx(fd, -1, s)
+  if hc >= 0 && fn.fnParams[hc] == pd { return false }
   const vs: i32[] = []
   collectRetValues(fn.fnBody, vs)
   for v in vs {
@@ -2901,7 +2904,7 @@ function ftNodeOk(
       const hc = handBackCalledArgOf(x)
       if (
         hc >= 0
-        && fnTagWiderSetHasOneSig(s)
+        && handBackCalledWiderIx(-1, x, s) >= 0
         && (fnTagCallSetOf(x) == s || ftIsS(hc, s))
       ) {
         return ftNodeOk(hc, x, s, ds, leaves, ids)
@@ -5165,6 +5168,11 @@ function ftHolderCoerced(x: i32, s: i32): boolean {
     const init = cwSoleReadInit(x)
     return init >= 0 && ftHolderCoerced(init, s)
   }
+  // A function's one call holds what the literal it alone returns holds.
+  if n is Call {
+    const rl = recRetLitOfSoleCall(x)
+    return rl >= 0 && ftHolderCoerced(rl, s)
+  }
   // An annotated binding of such a literal, and a write of one, hold what the literal holds.
   if n is LetDecl {
     return n.letType >= 0
@@ -6853,4 +6861,121 @@ function ftLiteralArg(x: i32): boolean {
   const v = parenPeelIx(x)
   const n = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
   return n is ArrayLit || n is ObjLit
+}
+
+// The parameter of callee `d` (or of the one `call` names, for `d` -1) handed back though also
+// called (`handBackCalledIx`), where its argument's set (`st`, or for -1 the set of `call`'s
+// argument) lies in a wider set some member of which does not fill the closure bundle of that
+// parameter's call signatures (`fnTagMemberFillsRecord`): the family takes ids; -1 otherwise.
+export function handBackCalledWiderIx(d: i32, call: i32, st: i32): i32 {
+  const cx = parenPeelIx(call)
+  const c = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { nodeAt(0) }
+  const dd = if d >= 0 { d } else if c is Call { identFnDeclOf(parenPeelIx(c.callFn)) } else { -1 }
+  const dn = if dd >= 0 && dd < P.nodes.length { nodeAt(dd) } else { nodeAt(0) }
+  if !(dn is FuncDecl) || dn.fnBody < 0 { return -1 }
+  const i = handBackCalledIx(dn)
+  if i < 0 { return -1 }
+  const as = if st >= 0 { st } else if c is Call && i < c.callArgs.length { fnTagSetOfTy(nodeTyIxOf(c.callArgs[i])) } else { -1 }
+  if as < 0 { return -1 }
+  const pts = ftCalledParamSigs(dn, dn.fnParams[i])
+  const ms = fnTagMembers(as)
+  if pts.length == 0 || ms.length == 0 { return -1 }
+  // The bundle's results: the argument set's own at each signature.
+  const rets: i32[] = []
+  for p in pts {
+    const r = ftMemberRetAt(ms[0], p)
+    if r < 0 { return -1 }
+    rets.push(r)
+  }
+  let k = 0
+  while k < fnTagSetCount() {
+    if (
+      k != as
+      && fnTagMembers(k).length > ms.length
+      && fnTagMembersWithin(as, k)
+    ) {
+      for m in fnTagMembers(k) {
+        if !fnTagMemberFillsRecord(m, pts, rets) { return i }
+      }
+    }
+    k = k + 1
+  }
+  return -1
+}
+
+// Whether member `d` fills a closure bundle of one closure per parameter tuple of `pts`, each
+// returning its `rets` entry: a declared signature at each tuple, or a hole member whose body
+// gives that result there. A generic member is instanced per tuple, so it fills.
+export function fnTagMemberFillsRecord(
+  d: i32,
+  pts: i32[][],
+  rets: i32[],
+): boolean {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) { return false }
+  if dn.fnTyParams.length > 0 { return true }
+  let k = 0
+  while k < pts.length && k < rets.length {
+    const r = ftMemberRetAt(d, pts[k])
+    if r < 0 || !tySame(r, rets[k]) { return false }
+    k = k + 1
+  }
+  return true
+}
+
+// The result function `d` gives at parameter types `pt`: its declared type's where that takes
+// exactly `pt`, else, for a hole member, its body's there (`holeLamRetAt`); -1 where neither.
+function ftMemberRetAt(d: i32, pt: i32[]): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) || dn.fnParams.length != pt.length { return -1 }
+  let holes = false
+  for p in dn.fnParams {
+    const pn = nodeAt(p)
+    if !(pn is Param) || pn.parType < 0 { holes = true }
+  }
+  if !holes {
+    const t = nodeTyIxOf(d)
+    const f = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    if !(f is TyFunc) || f.fnParamTypes.length != pt.length { return -1 }
+    let j = 0
+    while j < pt.length {
+      if !tySame(f.fnParamTypes[j], pt[j]) { return -1 }
+      j = j + 1
+    }
+    return f.fnRet
+  }
+  const noN: string[] = []
+  const noT: i32[] = []
+  // A read-only ask: a body that does not type at `pt` reports nothing here.
+  const q = quietEnterFlat()
+  const r = holeLamRetAt(d, mkFuncTy(pt, TY_I32), noN, noT)
+  quietLeaveFlat(q)
+  return if r >= 0 && !tyHasTyVar(r) { r } else { -1 }
+}
+
+// The argument types of each call through parameter `par` in `dn`'s body, a tuple per call with
+// every argument closed; [] where one is open.
+function ftCalledParamSigs(dn: FuncDecl, par: i32): i32[][] {
+  const out: i32[][] = []
+  const todo: i32[] = [dn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is Call {
+        const cf = parenPeelIx(n.callFn)
+        if cf >= 0 && nodeAt(cf) is Ident && identDeclOf(cf) == par {
+          const tup: i32[] = []
+          for a in n.callArgs {
+            const t = nodeTyIxOf(a)
+            if t < 0 || tyHasTyVar(t) { return [] }
+            tup.push(t)
+          }
+          out.push(tup)
+        }
+      }
+      for k in nodeChildren(x) { todo.push(k) }
+    }
+  }
+  return out
 }
