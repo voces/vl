@@ -1556,7 +1556,6 @@ import {
   nullOwnAt,
   nullOwnOfTy,
   nullRetPlanOf,
-  optGuardCallOf,
   scalarKindWidens,
   setHasNullAtom,
   unionResidualSoloKindOfSet,
@@ -1635,7 +1634,6 @@ import {
 } from "./emit_plan_union"
 import {
   deliveredAsNulAtom,
-  ifJoinDropsNulAtom,
   ifJoinPlanOf,
   nulStrReppedNulLitPlace,
   strReppedLitUnionAt,
@@ -7910,7 +7908,7 @@ export function elseLessUnionIfWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
   if unionArmTagClash(unionTy) != "" { return "tag clash" }
   if callIsNever(ix) { return "never" }
   if unionCoerceIfArmOf(ix, fnIx) != "value" { return "not value arm" }
-  return ifShapeWhyOf(ix, fnIx, false)
+  return ifIntMatchWhy(ix, fnIx)
 }
 
 // Why a value `if` with an `else`, delivered into union `unionTy`'s box, is not written arm by arm
@@ -7923,7 +7921,7 @@ export function unionIfAtDstWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
   if unionArmTagClash(unionTy) != "" { return "tag clash" }
   if callIsNever(ix) { return "never" }
   if unionCoerceIfArmOf(ix, fnIx) != "value" { return "not value arm" }
-  return ifShapeWhyOf(ix, fnIx, true)
+  return ifIntMatchWhy(ix, fnIx)
 }
 
 // Coerce an expression into a union-box position whose wasm rep is `(ref $uBox)` — a call
@@ -19213,7 +19211,7 @@ export function fbRefIfOpenType(kind: VKind, slot: i32, nul: boolean) {
 }
 
 // The block valtype `emitIfExpr` writes the value `if` at `ifIx` at, `ifJoinPlanOf`'s, classified
-// with its arms' prelude locals bound as `ifExprPlainWhy` binds them; every link takes it.
+// with its arms' prelude locals bound; every link takes it.
 export function ifExprJoinVt(ifIx: i32, fnIx: i32): i32 {
   const scoped = armPreludeScopeOpen(ifIx)
   const p = ifJoinPlanOf(ifIx, fnIx)
@@ -19221,90 +19219,12 @@ export function ifExprJoinVt(ifIx: i32, fnIx: i32): i32 {
   return p.ijVt
 }
 
-// Why the value `if` at `ifIx` has no shape `emitIfExprAs` writes with one value per arm, or "": no
-// `else`, an arm with no lone value, an unwalked prelude, a guard call, or an integer switch.
-export function ifExprShapeWhy(ifIx: i32, fnIx: i32): string {
-  return ifShapeWhyOf(ifIx, fnIx, true)
-}
-
-// `ifExprShapeWhy`, an else-less `if` passing where `needElse` is false: its missing arm is then
-// the join's own null, which the union and reference rungs write (`emitUnionIfValueLink`,
-// `emitIfExprRefLink`).
-function ifShapeWhyOf(ifIx: i32, fnIx: i32, needElse: boolean): string {
-  if ifIx < 0 || ifIx >= P.nodes.length { return "node" }
-  const n = nodeAt(ifIx)
-  if !(n is IfStmt) || n.ifCond < 0 { return "no else" }
-  const noElse = n.ifElse < 0
-  if noElse && needElse { return "no else" }
-  // An `else if` is the chain's next link, which `emitIfExprAsLink` writes into this one's frame.
-  const elseArm = !noElse && !(nodeAt(n.ifElse) is IfStmt)
-  if !ifArmHasValue(n.ifThen) || elseArm && !ifArmHasValue(n.ifElse) {
-    return "arm not lone"
-  }
-  // A prelude local the collect pass did not allocate is legacy's refusal (`emitIfArmOpen`).
-  if (
-    armPreludeUnwalkedDecl(n.ifThen) >= 0
-    || elseArm && armPreludeUnwalkedDecl(n.ifElse) >= 0
-  ) {
-    return "arm prelude unwalked"
-  }
-  if optGuardCallOf(ifIx, fnIx) >= 0 { return "optional guard" }
-  // An integer `match` whose `br_table` plan has an `else` is the table; one with no plan is written
-  // as the plain chain (`emitIntSwitch` declines), whatever its scrutinee.
-  if intMatchHeadAt(ifIx) {
-    const p = intSwitchPlanOf(ifIx, fnIx)
-    if p != null && p.ispElse >= 0 { return "int match" }
-  }
-  return ""
-}
-
-// Why the if-expression at `ifIx` is off `emitIfExpr`'s plain scalar path, or "": its shape
-// (`ifExprShapeWhy`), then its join rung (an atom join is plain), a static `is` or literal-true
-// condition, a prelude, or v128.
-export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
-  const sw = ifShapeWhyOf(ifIx, fnIx, false)
-  if sw != "" { return sw }
-  // Classified as `emitIfExpr` classifies it, with the arms' prelude locals bound.
-  const scoped = armPreludeScopeOpen(ifIx)
-  const p = ifJoinPlanOf(ifIx, fnIx)
-  if scoped { scopePop() }
-  const h = nodeAt(ifIx)
-  // An else-less link is the null of the union box, the reference, or an i32 niche.
-  const nicheArm = p.ijArm == "atom" || p.ijArm == "scalar"
-  const ownNull = p.ijArm == "union"
-    || p.ijArm == "ref"
-    || nicheArm && ifNoElseNicheOf(ifIx) != 0
-  if h is IfStmt && h.ifElse < 0 && !ownNull { return "no else" }
-  const rung = match p.ijArm {
-    "null" => "null join"
-    "atom" => ""
-    "union" => "union"
-    "ref" => ""
-    "scalar" => ""
-  }
-  if rung != "" { return rung }
-  // An atom join is `emitIfExprAs` at i32, each arm its value in the atom context.
-  if p.ijArm == "atom" {
-    return if ifJoinDropsNulAtom(ifIx, fnIx, "atom") { "string drops null atom" } else { "" }
-  }
-  const rk = p.ijRef.rjKind
-  // A join at a record's own row is legacy's reference join, a narrowed arm unboxed in its arm.
-  if p.ijArm == "ref" && rk != null && joinKindIsRecord(rk) {
-    return "ref " + rk
-  }
-  // A union join with no render name takes a later rung in legacy; the IR lowers no union join.
-  if exprUnion(ifIx, fnIx) { return "union" }
-  if rk != null { return "ref " + rk }
-  if ifJoinDropsNulAtom(ifIx, fnIx, "scalar") {
-    return "string drops null atom"
-  }
-  return ""
-}
-
-// Whether `blockIx` is a block whose last statement is its value, after any prelude.
-function ifArmHasValue(blockIx: i32): boolean {
-  if blockIx < 0 || blockIx >= P.nodes.length { return false }
-  return nodeAt(blockIx) is Block && ifArmValueExpr(blockIx) >= 0
+// "int match" for a dense integer `match` whose `br_table` plan has an `else`, which the IR
+// writes as a table only at a scalar join; "" for any other `if`.
+export function ifIntMatchWhy(ifIx: i32, fnIx: i32): string {
+  if !intMatchHeadAt(ifIx) { return "" }
+  const p = intSwitchPlanOf(ifIx, fnIx)
+  return if p != null && p.ispElse >= 0 { "int match" } else { "" }
 }
 
 // Whether any arm of the if-expression at `ifIx` binds a local its tail could name; when so,
@@ -19329,17 +19249,6 @@ function callIsMethodAt(ix: i32): boolean {
 // An if-expression arm is a block whose value is its last statement; every statement
 // before it is the prelude, which is what lets a binding arm sit in value position (the
 // desugared `match u { A{a} => a }` shape). `emitIfArmOpen` pushes the frame and lowers the prelude; the caller emits the value and closes with `emitIfArmClose`, split in two because each arm emitter lowers the value differently while the prelude and frame are shared.
-
-// The first node of the arm block at `blockIx` that binds a local no pass allocated, or -1: an
-// arm the collect pass walked, one whose prelude declares nothing, or one with no prelude (its
-// lone value's own nested arms are their `if`'s to walk) lowers.
-export function armPreludeUnwalkedDecl(blockIx: i32): i32 {
-  if blockIx < 0 { return -1 }
-  const b = nodeAt(blockIx)
-  if b is Block && b.blkStmts.length <= 1 { return -1 }
-  if armPreludeBlocks[blockIx] ?? false { return -1 }
-  return firstLocalDeclIn(blockIx)
-}
 
 // How one arm of a ref-typed join at `kind`/`slot` delivers its value: `plain` is the value as
 // itself, `recover` the same under `ref.as_non_null`, `unbox` a narrowed arm's box recovered at
@@ -19389,14 +19298,6 @@ export function refIfArmOf(
     return "nestedIf"
   }
   return "noValue"
-}
-
-// The sentinel an else-less link of `emitIfExprAs` writes for its missing arm, the one a bare
-// `null` takes there: 2 at `boolean | null`, -1 at a nullable literal union, else 0, since a
-// bare number has no spare value.
-export function ifNoElseNicheOf(ifIx: i32): i32 {
-  if nodeTyIsNulBool(ifIx) { return 2 }
-  return if nodeTyIsNulLitUnion(ifIx) { 0 - 1 } else { 0 }
 }
 
 // One link of `emitIfExprAs`: 0 or -1 as that function returns, or 1 when the else is another `if`

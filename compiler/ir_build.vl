@@ -1,4 +1,3 @@
-import { intMatchHeadAt } from "./check_match_heads"
 import { nullableRecordTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import { printPlanPinNull } from "./emit_union_registry"
 import {
@@ -421,11 +420,9 @@ import {
   idxStoreOtherWhy,
   idxStoreSiteBoxes,
   ifExprJoinVt,
-  ifExprPlainWhy,
-  ifExprShapeWhy,
+  ifIntMatchWhy,
   ifExprSwitchMay,
   ifLinkExhausts,
-  ifNoElseNicheOf,
   ifThenIsDead,
   ifWritesElse,
   intSwitchMayLower,
@@ -4664,9 +4661,9 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
   if gv >= 0 { return deliver(b, gv, rep0, ty0) }
   // A dense integer `match` is one `br_table` whose arms carry the value, where its plan has an
   // `else` and the join is one valtype; off that, it waits for the IR's own switch.
-  if intMatchHeadAt(ix0) {
+  if ifIntMatchWhy(ix0, ibFnIx) != "" {
     const p = intSwitchPlanOf(ix0, ibFnIx)
-    if p != null && p.ispElse >= 0 {
+    if p != null {
       if (
         ty0 < 0
         && ifExprSwitchMay(ix0)
@@ -4684,8 +4681,12 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
     const arm = ifJoinPlanOf(ix0, ibFnIx).ijArm
     if arm == "null" { return nullJoinIf(b, n0, ix0, rep0) }
     const rj = ifRefJoinOf(ix0, ibFnIx)
-    if arm == "ref" && rj.rjKind != null { return ifRefExpr(b, n0, ix0, rep0, rj) }
-    if arm == "union" || exprUnion(ix0, ibFnIx) { return unionIfExpr(b, n0, ix0, rep0) }
+    if arm == "ref" && rj.rjKind != null {
+      return ifRefExpr(b, n0, ix0, rep0, rj)
+    }
+    if arm == "union" || exprUnion(ix0, ibFnIx) {
+      return unionIfExpr(b, n0, ix0, rep0)
+    }
   }
   return ifValueJoin(b, n0, ix0, rep0, ty0)
 }
@@ -4728,12 +4729,6 @@ function ifValueJoin(b: i32[], n: IfStmt, ix: i32, rep: i32, ty0: i32): Opnd {
   irBNode(b, sIf(c, thenB, elseB, t, true), ty, rep, ix)
   const o: Opnd = { ov: t }
   return o
-}
-
-// Whether the atom hook writes `ix` as a join built at its destination (`emitIfExprAs`).
-function atomJoinHookAt(ix: i32): boolean {
-  const a = atomHookArmOf(ix, ibFnIx, false)
-  return a == "litJoin" || a == "perArmJoin"
 }
 
 // A value `if` joined at a reference (legacy's `emitIfExprRef`): one link whose arms each write
@@ -4880,13 +4875,14 @@ function unionIfLink(
   uty: i32,
   atDst: boolean,
 ): Opnd {
-  // Legacy writes every link at the head's box; the lowering opens a link at its own join, or,
-  // written into a box destination (`atDst`, `unionIfAtDstWhy`), at that box whatever its join.
-  const pw = ifExprPlainWhy(ix, ibFnIx)
-  if !atDst && pw != "union" {
-    return irBMiss(
-      if pw == "" { "union if chain join" } else { "union if " + pw },
-    )
+  // Every link opens at its own join, or, written into a box destination (`atDst`,
+  // `unionIfAtDstWhy`), at that box whatever its join.
+  if (
+    !atDst
+    && ifJoinPlanOf(ix, ibFnIx).ijArm != "union"
+    && !exprUnion(ix, ibFnIx)
+  ) {
+    return irBMiss("union if chain join")
   }
   const cat = b.length
   const c = irBExpr(b, n.ifCond)
@@ -5130,7 +5126,7 @@ function refIfArm(
   }
   // A narrowed read of a union is its box, recovered at the join's record in the arm (D17026).
   if arm == "unbox" {
-    const u = if armUnboxOwed(tv, rep) { armUnboxTemp(body, tv, rep, repTyOf(rep), false) } else if recordArmsUnboxOwed(tv, rep) { recordArmsUnboxTemp(body, tv, rep, repTyOf(rep)) } else { irBMiss("ref if arm unbox shape") }
+    const u = if armUnboxOwed(tv, rep) { armUnboxTemp(body, tv, rep, repTyOf(rep), false) } else if recordArmsUnboxOwed(tv, rep) { recordArmsUnboxTemp(body, tv, rep, repTyOf(rep)) } else { deliver(body, tv, rep, repTyOf(rep)) }
     if ibMiss == "" && irBOpRep(u) != rep { irBMiss("ref if arm unbox rep") }
     if ibMiss == "" {
       irBNode(body, { asDst: t, asSrc: u }, -1, ibNoValue, blockIx)
@@ -5436,12 +5432,6 @@ function armPrelude(body: i32[], blockIx: i32) {
     i = i + 1
   }
   return 0
-}
-
-// Whether value-`if` arm `blockIx` is a block with statements before its value.
-function armHasPrelude(blockIx: i32): boolean {
-  const blk = nodeAt(blockIx)
-  return blk is Block && blk.blkStmts.length > 1
 }
 
 // `a && b` / `a || b`: a local the two arms of an `if` write.
