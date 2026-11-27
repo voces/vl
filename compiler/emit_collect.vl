@@ -238,7 +238,6 @@ import {
   declStructIndexBuild,
   declStructNodeOf,
   fnLetOfRead,
-  listIsTestedIdent,
   monoAnnHasTyParam,
   nameIsClosureArrayTy,
   nodeIsTypeDecl,
@@ -368,7 +367,6 @@ import {
   fnPosIndexDrop,
   fnPosNoteSlotWrite,
   fnStmts,
-  fnUses,
   fnValUsed,
   gCellIdx,
   gFoldAt,
@@ -626,7 +624,6 @@ import {
   cloRetValSlot,
   cloSigKeyExt,
   exactOperandTyOf,
-  exprMap,
   fieldValueFeOf,
   fnIndexOfNode,
   fnRetCaptureRow,
@@ -645,14 +642,10 @@ import {
   letCellSlot,
   listRowOfExpr,
   mapCtorOpenInstTy,
-  mapShapeOfExpr,
   mapUnionResultRow,
   mfCallbackFe,
   mfListResultElemTy,
   mfNulRecResultElemTy,
-  mfRecvKindOf,
-  mfResultKindOf,
-  mfResultSlotOf,
   objVariantName,
   objVariantNameCtx,
   pinnedValTyOf,
@@ -669,7 +662,6 @@ import {
 import { fieldCodeOfTy } from "./emit_field_codes"
 import { fieldStoreTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import { cloSigPosOfKey } from "./emit_fn_ret_kinds"
-import { callIsMemberPopKind, callIsPushKind } from "./emit_fn_scans"
 import { initJoinsWiderRecord } from "./emit_join_records"
 
 import { isScalarBackedListRep, rlElemListRepAt } from "./emit_list_rep"
@@ -711,7 +703,6 @@ import {
   markLoopVarIter,
   markLoopVarSlot,
   markPairVarIter,
-  recordRefPushSlot,
 } from "./emit_local_slots"
 import {
   retStructRowIndex,
@@ -828,7 +819,6 @@ import {
   variantRowFieldsMatch,
   variantRowOrMint,
 } from "./emit_union_atoms"
-import { mfRecordDst, mfRecordSrc } from "./emit_union_casts"
 import {
   sRowPushCheck,
   unRowOfTyKey,
@@ -3349,454 +3339,6 @@ function checkExprI32(exprIx: i32) {
     }
     // Every other initializer is i32 as far as this check sees.
     CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  return 0
-}
-
-// Collect every distinct ref-list slot a `.push`, `.pop` or `.clear` in the block at `blockIx`
-// needs a typed scratch frame for into `fnRefPushSlots`. Statement-level pushes go ahead of
-// every slot found inside an expression, since that order is the frame order; one walk finds
-// both, so each `if` arm is narrowed once.
-export function collectRefSlots(blockIx: i32, fnIx: i32) {
-  refSlotsStmtPush = []
-  refSlotsExpr = []
-  refSlotsBuffering = true
-  collectMemberPopRefSlots(blockIx, fnIx)
-  refSlotsBuffering = false
-  let i = 0
-  while i < refSlotsStmtPush.length {
-    recordRefPushSlot(refSlotsStmtPush[i])
-    i = i + 1
-  }
-  i = 0
-  while i < refSlotsExpr.length {
-    recordRefPushSlot(refSlotsExpr[i])
-    i = i + 1
-  }
-  refSlotsStmtPush = []
-  refSlotsExpr = []
-  return 0
-}
-
-// The slots `collectRefSlots` holds back until its walk ends, and whether one is running; a
-// standalone `collectMemberPopRefSlotsExpr` records straight into `fnRefPushSlots`.
-let refSlotsStmtPush: i32[] = []
-let refSlotsExpr: i32[] = []
-let refSlotsBuffering = false
-
-function refSlotNote(slot: i32) {
-  if refSlotsBuffering {
-    refSlotsExpr.push(slot)
-    return 0
-  }
-  return recordRefPushSlot(slot)
-}
-
-// The slots a ref-list `.push` statement at `stmtIx` reserves, held for `collectRefSlots`.
-function noteStmtPushSlots(stmtIx: i32, fnIx: i32) {
-  if !callIsPushKind(stmtIx, fnIx, "ref") { return 0 }
-  const s = nodeAt(stmtIx)
-  if s is Call && s.callFn >= 0 {
-    const callee = nodeAt(s.callFn)
-    if callee is Member {
-      refSlotsStmtPush.push(refListSlotOfExpr(callee.memObj, fnIx))
-      refSlotsStmtPush.push(fitPushSlotOf(callee.memObj))
-    }
-  }
-  return 0
-}
-
-// The frame of the `K[]` an `is K[]` arm pushes onto in place of its receiver, whose own list
-// holds another element (D4962): its row is the receiver's checked type's. -1 when none.
-function fitPushSlotOf(recv: i32): i32 {
-  const o = nodeAt(unwrapParen(recv))
-  if !(o is Ident) || !listIsTestedIdent(unwrapParen(recv)) { return -1 }
-  const t = nodeTyIxOf(recv)
-  if t < 0 || t >= T.tys.length { return -1 }
-  const a = tyAt(t)
-  if !(a is TyArray) { return -1 }
-  return rlSlotOfTy(tyElemOf(a))
-}
-
-// Record the ref-list table slot of every Member-receiver ref-list `.pop` in expression `exprIx`
-// into `fnRefPushSlots`, so its typed scratch frame is reserved, descending value positions,
-// since a `.pop` is a value.
-export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return 0 }
-  const e = nodeAt(exprIx)
-  match e {
-    Call => {
-      // D1592 — a ref-list `.push` in value position needs the same typed frame as the `.pop`
-      // beside it. `fnUses.refPush` is inert in `fbBeginFunc`, where ref frames come from
-      // `fnRefPushSlots`, so teaching only the kind bits reserves nothing here.
-      if (
-        callIsMemberPopKind(exprIx, fnIx, "ref")
-        || callIsPushKind(exprIx, fnIx, "ref")
-      ) {
-        if e.callFn >= 0 {
-          const callee = nodeAt(e.callFn)
-          if callee is Member {
-            refSlotNote(refListSlotOfExpr(callee.memObj, fnIx))
-            refSlotNote(fitPushSlotOf(callee.memObj))
-          }
-        }
-      }
-      const args = e.callArgs
-      let i = 0
-      while i < args.length {
-        collectMemberPopRefSlotsExpr(args[i], fnIx)
-        i = i + 1
-      }
-      return 0
-    }
-    BinExpr => {
-      collectMemberPopRefSlotsExpr(e.binLeft, fnIx)
-      collectMemberPopRefSlotsExpr(e.binRight, fnIx)
-      return 0
-    }
-    Member => {
-      return collectMemberPopRefSlotsExpr(e.memObj, fnIx)
-    }
-    OptMember => {
-      return collectMemberPopRefSlotsExpr(e.omObj, fnIx)
-    }
-    Index => {
-      collectMemberPopRefSlotsExpr(e.idxArr, fnIx)
-      collectMemberPopRefSlotsExpr(e.idxIndex, fnIx)
-      return 0
-    }
-    Unary => {
-      return collectMemberPopRefSlotsExpr(e.unArg, fnIx)
-    }
-    Paren => {
-      return collectMemberPopRefSlotsExpr(e.parInner, fnIx)
-    }
-    // The node set below is the one `exprHasScratch` (emit_query.vl) carries: a ref-list
-    // `.pop` in an `is` guard, an `as` operand, an array-literal element, an object-literal field
-    // value or an if-expression arm records its slot here. `fnUses.refPush` is inert in
-    // `fbBeginFunc`, so without this the frame is never reserved and the build fails.
-    IsExpr => {
-      return collectMemberPopRefSlotsExpr(isExprKid(e), fnIx)
-    }
-    AsExpr => {
-      return collectMemberPopRefSlotsExpr(e.asObj, fnIx)
-    }
-    IfStmt => {
-      return collectMemberPopRefSlotsIf(exprIx, fnIx)
-    }
-    ObjLit => {
-      const fs = e.objFields
-      let fi = 0
-      while fi < fs.length {
-        const f = nodeAt(fs[fi])
-        if f is FieldInit { collectMemberPopRefSlotsExpr(f.fiValue, fnIx) }
-        fi = fi + 1
-      }
-      return 0
-    }
-    // A spread's source is an operand like any other (D2334).
-    Spread => {
-      return collectMemberPopRefSlotsExpr(e.spdArg, fnIx)
-    }
-    ArrayLit => {
-      const es = e.arrElems
-      let ei = 0
-      while ei < es.length {
-        collectMemberPopRefSlotsExpr(es[ei], fnIx)
-        ei = ei + 1
-      }
-      return 0
-    }
-    // No other node holds a value position a pop can sit in.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ForRange | ForIn | MatchExpr | ImportDecl | LoopVar => {}
-  }
-  return 0
-}
-
-// `collectRefSlots`'s walk of the block at `blockIx`: statements, let-inits, returns and loop
-// headers, into `if` arms and loop bodies.
-function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
-  const b = nodeAt(blockIx)
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const s = nodeAt(stmts[i])
-      if s is LetDecl {
-        collectMemberPopRefSlotsExpr(s.letInit, fnIx)
-      } else if s is RetStmt {
-        collectMemberPopRefSlotsExpr(s.retArg, fnIx)
-      } else if s is IfStmt {
-        collectMemberPopRefSlotsIf(stmts[i], fnIx)
-      } else if s is WhileStmt {
-        collectMemberPopRefSlotsExpr(s.whileCond, fnIx)
-        collectMemberPopRefSlots(s.whileBody, fnIx)
-      } else if s is ForIn {
-        collectMemberPopRefSlotsExpr(s.fiIter, fnIx)
-        collectMemberPopRefSlots(s.fiBody, fnIx)
-      } else if s is ForRange {
-        collectMemberPopRefSlotsExpr(s.frFrom, fnIx)
-        collectMemberPopRefSlotsExpr(s.frTo, fnIx)
-        collectMemberPopRefSlotsExpr(s.frStep, fnIx)
-        collectMemberPopRefSlots(s.frBody, fnIx)
-      } else {
-        // Bare expression statement — a fall-through, not only the `BinExpr` and `Call` shapes.
-        // See `blockHasScratch`.
-        noteStmtPushSlots(stmts[i], fnIx)
-        collectMemberPopRefSlotsExpr(stmts[i], fnIx)
-      }
-      i = i + 1
-    }
-  }
-  return 0
-}
-
-// Collect Member-receiver ref-list `.pop` slots from every arm of the `if` chain, condition
-// included: `if b.xs.pop() != null { … }` holding the function's only ref-list `.pop` would
-// otherwise record no slot and emit against a local the vector never declared. `startScanIf`
-// (emit_sections.vl) hand-scans a top-level `if`'s condition for the scalar bits, not for this.
-function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-  let cur = ifIx
-  while cur >= 0 {
-    const s = nodeAt(cur)
-    cur = -1
-    if s is IfStmt {
-      collectMemberPopRefSlotsExpr(s.ifCond, fnIx)
-      // Each arm is walked under its own narrowing, as `emitStmt` lowers it: an arm scanned
-      // without its pin classifies a receiver as its whole union, and `.push`, `.pop` and
-      // `.clear` find no row at emit time (D1823).
-      collectMemberPopRefSlots(s.ifThen, fnIx)
-      if s.ifElse >= 0 {
-        if nodeAt(s.ifElse) is IfStmt {
-          cur = s.ifElse
-        } else {
-          collectMemberPopRefSlots(s.ifElse, fnIx)
-        }
-      }
-    }
-  }
-  return 0
-}
-
-// Whether checker type `ty` is a map or a union of maps: an `is`-narrowed arm of the union
-// reads as its member at emit time, though not to `exprMap` here.
-function tyIsMapOrMapUnion(ty: i32): boolean {
-  if tyIsMap(ty) { return true }
-  if ty < 0 || ty >= T.tys.length { return false }
-  const t = tyAt(ty)
-  if !(t is TyUnion) || t.uMembers.length == 0 { return false }
-  for m in t.uMembers {
-    if !tyIsMap(m) { return false }
-  }
-  return true
-}
-
-// Walk the statement or expression tree at `ix`, recording every `.map` and `.filter` call over
-// a list receiver into the scratch-frame requirement lists above and setting `fnUses.mapFilter`.
-// Walks every statement and expression kind; a nested `FuncDecl` is not descended, since its own
-// body's sites are detected when that lifted function is emitted.
-export function mfScan(ix: i32, fnIx: i32) {
-  if ix < 0 { return 0 }
-  const n = nodeAt(ix)
-  match n {
-    Call => {
-      if n.callFn >= 0 {
-        const callee = nodeAt(n.callFn)
-        if callee is Member {
-          if callee.memProp == "map" || callee.memProp == "filter" {
-            if n.callArgs.length == 1 {
-              const rk = mfRecvKindOf(callee.memObj, fnIx)
-              if rk != null {
-                fnUses.mapFilter = true
-                let slot = -1
-                if rk == "reflist" {
-                  slot = refListSlotOfExpr(callee.memObj, fnIx)
-                }
-                if rk == "u8list" { slot = exprPackedRow(callee.memObj, fnIx) }
-                mfRecordSrc(rk, slot)
-                const resK = mfResultKindOf(ix, fnIx)
-                if resK != null { mfRecordDst(resK, mfResultSlotOf(ix, fnIx)) }
-              }
-            }
-          }
-          // `xs.slice(start, end?)` builds a new list of the same element type, so it reserves the
-          // same source wrapper and destination backing scratch locals a `.filter` does.
-          // `emitArrSlice` reads the source through `srcL` and writes the range into a fresh `dstL`.
-          if callee.memProp == "slice" {
-            if n.callArgs.length == 1 || n.callArgs.length == 2 {
-              const rk = mfRecvKindOf(callee.memObj, fnIx)
-              if rk != null {
-                fnUses.mapFilter = true
-                let slot = -1
-                if rk == "reflist" {
-                  slot = refListSlotOfExpr(callee.memObj, fnIx)
-                }
-                if rk == "u8list" { slot = exprPackedRow(callee.memObj, fnIx) }
-                mfRecordSrc(rk, slot)
-                mfRecordDst(rk, slot)
-              }
-            }
-          }
-          // `m.keys()` builds a fresh LIVE-key string list — reserve its 6-slot frame.
-          if callee.memProp == "keys" {
-            if (
-              exprMap(callee.memObj, fnIx)
-              || tyIsMapOrMapUnion(nodeTyAt(callee.memObj, fnIx))
-            ) {
-              fnUses.mapKeys = true
-            }
-          }
-          // `m.values()` builds a fresh live-value list. A mono map uses the self-contained
-          // `mapValsBase` frame; an mv-slot map uses its per-slot output backing (`fnMvValsOutLocal`)
-          // plus the key-list frame for live, i, j and count.
-          if callee.memProp == "values" {
-            if exprMap(callee.memObj, fnIx) {
-              const vsh = mapShapeOfExpr(callee.memObj, fnIx)
-              if vsh == -1 {
-                fnUses.mapVals = true
-              } else if vsh == -4 || vsh == -6 {
-                // The i32-keyed map's values are the mono i32 list — the same self-contained
-                // `mapValsBase` frame the string-keyed mono map uses.
-                fnUses.mapVals = true
-              } else if vsh == -5 || vsh == -7 || vsh == -2 {
-                // A `Set`'s `.values()` are its keys, so the bound form is built by the key-list
-                // path and needs that frame, at either key rep. A Set's shape is neither the mono
-                // `-1` nor an mv slot, so the arms either side of this one both miss it.
-                fnUses.mapKeys = true
-              } else if vsh >= 0 {
-                fnUses.mapVals = true
-                fnUses.mapKeys = true
-              }
-            } else if tyIsMapOrMapUnion(nodeTyAt(callee.memObj, fnIx)) {
-              // An `is`-narrowed arm of a union of maps, whose shape is not read here.
-              fnUses.mapVals = true
-              fnUses.mapKeys = true
-            }
-          }
-        }
-      }
-      mfScan(n.callFn, fnIx)
-      const args = n.callArgs
-      let i = 0
-      while i < args.length {
-        mfScan(args[i], fnIx)
-        i = i + 1
-      }
-      return 0
-    }
-    Block => {
-      const stmts = n.blkStmts
-      let i = 0
-      while i < stmts.length {
-        mfScan(stmts[i], fnIx)
-        i = i + 1
-      }
-      return 0
-    }
-    LetDecl => {
-      if n.letInit >= 0 { mfScan(n.letInit, fnIx) }
-      return 0
-    }
-    RetStmt => {
-      if n.retArg >= 0 { mfScan(n.retArg, fnIx) }
-      return 0
-    }
-    IfStmt => {
-      // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-      let cur = ix
-      while cur >= 0 {
-        const c = nodeAt(cur)
-        cur = -1
-        if c is IfStmt {
-          mfScan(c.ifCond, fnIx)
-          // A dead arm is not lowered, so it reserves no scratch frame.
-          if !isDeadArm(c.ifThen) { mfScan(c.ifThen, fnIx) }
-          if c.ifElse >= 0 {
-            if nodeAt(c.ifElse) is IfStmt { cur = c.ifElse }
-            else if !isDeadArm(c.ifElse) { mfScan(c.ifElse, fnIx) }
-          }
-        }
-      }
-      return 0
-    }
-    WhileStmt => {
-      mfScan(n.whileCond, fnIx)
-      mfScan(n.whileBody, fnIx)
-      return 0
-    }
-    ForRange => {
-      mfScan(n.frFrom, fnIx)
-      mfScan(n.frTo, fnIx)
-      if n.frStep >= 0 { mfScan(n.frStep, fnIx) }
-      mfScan(n.frBody, fnIx)
-      return 0
-    }
-    ForIn => {
-      mfScan(n.fiIter, fnIx)
-      mfScan(n.fiBody, fnIx)
-      return 0
-    }
-    BinExpr => {
-      mfScan(n.binLeft, fnIx)
-      mfScan(n.binRight, fnIx)
-      return 0
-    }
-    Unary => {
-      return mfScan(n.unArg, fnIx)
-    }
-    Paren => {
-      return mfScan(n.parInner, fnIx)
-    }
-    Member => {
-      return mfScan(n.memObj, fnIx)
-    }
-    // The `?.` receiver, walked like the `.` one above (D1667).
-    OptMember => {
-      return mfScan(n.omObj, fnIx)
-    }
-    Index => {
-      mfScan(n.idxArr, fnIx)
-      mfScan(n.idxIndex, fnIx)
-      return 0
-    }
-    // A test's or a conversion's operand, and a match's scrutinee and arm bodies, are evaluated
-    // in place (D10351).
-    IsExpr => {
-      return mfScan(n.isObj, fnIx)
-    }
-    AsExpr => {
-      return mfScan(n.asObj, fnIx)
-    }
-    MatchExpr => {
-      mfScan(n.matchScrut, fnIx)
-      for b in n.matchBodies { mfScan(b, fnIx) }
-      return 0
-    }
-    ObjLit => {
-      const fields = n.objFields
-      let i = 0
-      while i < fields.length {
-        const f = nodeAt(fields[i])
-        if f is FieldInit { mfScan(f.fiValue, fnIx) }
-        i = i + 1
-      }
-      return 0
-    }
-    ArrayLit => {
-      const elems = n.arrElems
-      let i = 0
-      while i < elems.length {
-        mfScan(elems[i], fnIx)
-        i = i + 1
-      }
-      return 0
-    }
-    Spread => {
-      return mfScan(n.spdArg, fnIx)
-    }
-    // No other node holds a list builder.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ImportDecl | LoopVar => {}
   }
   return 0
 }
