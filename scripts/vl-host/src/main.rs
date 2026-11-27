@@ -11928,8 +11928,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // from (D1578). The instance is read only on that failure path, and a module the engine
     // refuses is never stored in the compile cache, so a hit never needs one.
     let reads_session = (low_memory.is_some_and(|n| n > HEAP_BASE_DEFAULT) && link.heap.is_none())
-        || (link.import_memory && link.heap.is_none() && link.shared_pages.is_none())
-        || gc_stats;
+        || (link.import_memory && link.heap.is_none() && link.shared_pages.is_none());
     // Keyed on the values staged, never on a filtered argv: flags are scanned anywhere, so
     // `-o --names` both names the output and turns names on.
     let staged = format!(
