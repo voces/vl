@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Lane self-merge gate: prints LAND-OK <sha> only when the PR head is green, mergeable, and the
 # tree master+PR would produce typechecks and, where master's compiler/ moved since the PR's merge
-# base, builds and passes the IR shadow rows. Usage: scripts/land-check.sh <pr-number>
+# base, builds and keeps every distilled cell running. Usage: scripts/land-check.sh <pr-number>
 set -euo pipefail
 pr=$1
 root=$(git rev-parse --show-toplevel); cd "$root"
@@ -45,11 +45,10 @@ excerpt() { { grep -E "$1" "$2" || tail -n 10 "$2"; } | head -10 | sed 's/^/  /'
 if printf '%s\n' "$out" | grep -q "Found 0 errors"; then
   # Two PRs green against an older master can still meet in the merged compiler. Where master's
   # compiler/ moved after the PR's merge base, the merged tree's compiler is built with this seed
-  # and graded on the cheap IR rows: the shadow over tests/cases and the shadow suite.
+  # and graded on the distilled corpus, which reds on a lost run or a holdout no longer refused.
   base=$(git merge-base origin/master "$sha")
   if ! git diff --quiet "$base" origin/master -- compiler/; then
-    command -v deno > /dev/null || { echo "LAND-NO: deno not found (needed for the IR shadow suite)"; exit 1; }
-    # A worktree, since the shadow lists its programs with `git ls-files`; removed on exit.
+    # A worktree, so the corpus and its baseline are the merged tree's; removed on exit.
     t="$d/tree"
     git worktree add -q --detach "$t" "$(git commit-tree "$tree" -p origin/master -m land-check)"
     trap 'git worktree remove --force "$t" 2>/dev/null; rm -rf "$d"' EXIT
@@ -62,15 +61,10 @@ if printf '%s\n' "$out" | grep -q "Found 0 errors"; then
       exit 1
     fi
     if ! (cd "$t" && VL_STD="$t/std" timeout 900 scripts/vl-host/target/release/vl run \
-        scripts/silent-sweep/distilled/ir-shadow.vl --compiler build/vl-compiler.wasm -- \
-        --seed build/vl-compiler.wasm --cases --prepost > "$d/shadow.log" 2>&1); then
-      echo "LAND-NO: the merged tree's IR shadow over tests/cases reds:"
-      excerpt 'rose|fail rule|above' "$d/shadow.log"
-      exit 1
-    fi
-    if ! (cd "$t" && timeout 600 deno test -A --no-check tests/vl_ir_shadow_test.ts > "$d/suite.log" 2>&1); then
-      echo "LAND-NO: the merged tree's IR shadow suite reds:"
-      excerpt 'FAILED|error: ' "$d/suite.log"
+        scripts/silent-sweep/distilled/regress.vl --compiler build/vl-compiler.wasm -- \
+        build/vl-compiler.wasm > "$d/distilled.log" 2>&1); then
+      echo "LAND-NO: the merged tree's compiler loses a distilled run:"
+      excerpt 'REGRESSION|HOLDOUT|->' "$d/distilled.log"
       exit 1
     fi
   fi
