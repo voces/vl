@@ -14277,8 +14277,17 @@ function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const l = if named || again { l0 } else { heldAtRep(b, l0, n.binLeft) }
   const c = testNull(b, l, ix)
   if ibMiss != "" { return c }
-  // A map's out is laid out at its rep's own shape, which the `??`'s type may key apart.
-  const t = irVarNew(ib, rep, if repNodeAt(rep) is RMap { repTyOf(rep) } else { ty }, "local", -1)
+  // A map's or a packed list's out is laid out at its rep's own shape, which the `??`'s type may
+  // key apart.
+  const rn = repNodeAt(rep)
+  const ownShape = rn is RMap || rn is RList && repSubWord(rn.rlsElem)
+  const t = irVarNew(
+    ib,
+    rep,
+    if ownShape { repTyOf(rep) } else { ty },
+    "local",
+    -1,
+  )
   const nb: i32[] = []
   if !coalNeverDefault(nb, n.binRight, rep, t) {
     const d0 = deliver(nb, n.binRight, rep, ty)
@@ -14425,6 +14434,11 @@ function coalesce(
     return coalNative(b, n, ix, rep)
   }
   if arm == "popOr" { return coalPopOr(b, n, ix, rep) }
+  // A fused list read writes its element's rep alone; a wider result (a chain's nullable inner
+  // link) is the IR's own `??` over the read.
+  if arm == "listGetOr" && !listGetOrAtElem(n, rep) {
+    return coalNative(b, n, ix, rep)
+  }
   if arm == "listGetOr" { return coalListGetOr(b, n, ix, rep) }
   // A map read joining a union is legacy's synthesized null-test `if` (`coalNullTestIf`), built
   // as the valued `if` it is.
@@ -15954,6 +15968,17 @@ function mapGetStoredTy(ix: i32, sh: i32, rep: i32, val: i32): i32 {
   const nt = nullableTyOf(vt)
   const nn = repNodeAt(repNodeOfTy(nt))
   return if nn is RNullable && nn.rnDisc == 1 && nn.rnInner == val { nt } else { -1 }
+}
+
+// Whether `l.get(i) ?? d`'s result rep `rep` is the element rep of `l`'s list, which the fused read
+// writes.
+function listGetOrAtElem(n: BinExpr, rep: i32): boolean {
+  const c = nodeAt(unwrapParen(n.binLeft))
+  if !(c is Call) || c.callFn < 0 { return false }
+  const m = nodeAt(c.callFn)
+  if !(m is Member) { return false }
+  const ln = repNodeAt(exprRepOf(m.memObj))
+  return ln is RList && ln.rlsElem == rep
 }
 
 // Whether `l ?? d` over map read `l` is one the probe's fused read writes (`mapGetOr`'s arms);
