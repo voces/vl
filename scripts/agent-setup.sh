@@ -76,11 +76,11 @@ host_check() {
   echo "agent-setup: host rebuilt into this worktree's own target (remove the worktree to drop it)"
 }
 
-# The disassembler `ir-identity.sh` reads a listed divergence with: without it each reads as a differ.
+# The disassembler a codegen fix is graded with (CLAUDE.md, Disassembly), which `which` cannot find.
 disasm_check() {
   [ -x node_modules/.bin/wasm-dis ] && return 0
-  echo "agent-setup: node_modules/.bin/wasm-dis is not executable here, so ir-identity cannot read" >&2
-  echo "  a listed divergence; link it: ln -s \"$MAIN/node_modules\" node_modules" >&2
+  echo "agent-setup: node_modules/.bin/wasm-dis is not executable here, so no module can be disassembled;" >&2
+  echo "  link it: ln -s \"$MAIN/node_modules\" node_modules" >&2
   return 1
 }
 

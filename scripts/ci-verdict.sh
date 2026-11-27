@@ -26,7 +26,7 @@ MODES=${MODES:-inherit tree}
 INHERIT_EXEMPT=""
 CI_YML=${CI_YML:-.github/workflows/ci.yml}
 # The jobs a `tree` verdict skips on master; each must have passed on the PR's run.
-TREE_SKIPS="ci-native ci-release-shape checks checks-suites ci-distilled ci-witnesses ci-ir-identity ci-i8-sweep ci-embed-seed"
+TREE_SKIPS="ci-native ci-release-shape checks checks-suites ci-distilled ci-witnesses ci-i8-sweep ci-embed-seed"
 WAIT=${VERDICT_WAIT:-180}
 POLL=${VERDICT_POLL:-15}
 

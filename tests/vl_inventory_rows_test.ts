@@ -446,6 +446,8 @@ const SHAPE_SPECIMENS: Array<[string, boolean, string]> = [
 const WANT_SPECIMENS: Array<[string, boolean, number, string]> = [
   ["one line", true, 1, "Want:\n\n    4\n"],
   ["several lines", true, 1, "Want:\n\n    4\n    x\n"],
+  // A block pinned mechanically from a master run is labelled so, and reads as a `Want:`.
+  ["a pinned-from-master label", true, 1, "Want (pinned from master 379a43721359):\n\n    4\n"],
   ["a label with no block", false, 1, "Want:\n\nprose\n"],
   // `Repro`'s lead-in may wrap onto prose; `Want`'s may not, so prose then a block is no block.
   ["prose between label and block", false, 1, "Want:\nprose\n\n    4\n"],
