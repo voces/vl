@@ -23816,12 +23816,15 @@ export function elabHeldFnLitStamps() {
   while g < P.nodes.length {
     const n = nodeAt(g)
     if (
-      (n is ArrayLit || n is ObjLit)
+      (n is ArrayLit || n is ObjLit || n is IfStmt || n is MatchExpr)
       && tyOpenFnLists(nodeRepTyIxOf(g), []) == 1
     ) {
       const ks = elabEnclosingKeys(g)
-      const ht = if ks.length == 1 && ks[0] == -1 { elabHeldValTy(g, -1) } else { -1 }
+      const top = ks.length == 1 && ks[0] == -1
+      const ht = if top { elabHeldValTy(g, -1) } else { -1 }
+      const ut = if top && ht < 0 { elabUncalledFnsClosed(nodeRepTyIxOf(g), []) } else { -1 }
       if ht >= 0 { repStampNode(g, ht) }
+      else if ut >= 0 { repStampNode(g, ut) }
     }
     g = g + 1
   }
@@ -23866,4 +23869,55 @@ function tyOpenFnLists(t: i32, seen: i32[]): i32 {
       return 0
     }
   }
+}
+
+// `t` with each open function a list holds closed at its uncalled default (`elabHoleFnUncalled`,
+// D9100), where no call through a set reaches any member it carries; -1 where one is reached or
+// an open part is no function. `seen` holds the types on the walk, so a recursive type is no answer.
+function elabUncalledFnsClosed(t: i32, seen: i32[]): i32 {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return -1 }
+  if !tyHasTyVar(t) { return t }
+  const x = tyAt(t)
+  const path = seen.slice(0)
+  path.push(t)
+  match x {
+    TyFunc => {
+      const s = fnTagSetOfTy(t)
+      if s >= 0 && fnSetCalledWithAny(fnTagMembers(s)) { return -1 }
+      return elabHoleFnUncalled(t)
+    }
+    TyArray => {
+      const e = elabUncalledFnsClosed(tyElemOf(x), path)
+      return if e < 0 { -1 } else { mkArrayTy(e) }
+    }
+    TyNullable => {
+      const i = elabUncalledFnsClosed(x.nInner, path)
+      return if i < 0 { -1 } else { mkNullableTy(i) }
+    }
+    TyObj => {
+      const tys: i32[] = []
+      for ft in x.objFieldTypes {
+        const c = elabUncalledFnsClosed(ft, path)
+        if c < 0 { return -1 }
+        tys.push(c)
+      }
+      return mkObjTy(x.objFieldNames, tys)
+    }
+    // A map, union or bare variable left open is not a function's closure.
+    TyMap | TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => {
+      return -1
+    }
+  }
+}
+
+// `elabHoleFnClosed` for a function open only at inference holes: the D9100 default a closure
+// nothing calls is laid out at; -1 where a declared type parameter keeps it open.
+function elabHoleFnUncalled(t: i32): i32 {
+  const f = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if !(f is TyFunc) { return -1 }
+  for p in f.fnParamTypes {
+    if tyHasTyVar(p) && !tyHasInferHole(p) { return -1 }
+  }
+  if tyHasTyVar(f.fnRet) && !tyHasInferHole(f.fnRet) { return -1 }
+  return elabHoleFnClosed(t)
 }
