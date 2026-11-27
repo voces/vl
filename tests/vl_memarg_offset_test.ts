@@ -514,6 +514,44 @@ Deno.test({
   }),
 });
 
+// A trap stays a trap: an inlined accessor's access past the end of memory traps as the call did,
+// at every rung, its address folded or not; the plain build shows the call inlined.
+Deno.test({
+  name: "memarg offset: an inlined accessor's out-of-bounds access still traps",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-memarg-inl-trap-" });
+    try {
+      Deno.writeTextFileSync(`${dir}/rt.vl`, RT + "\n");
+      const end = "(__memory_size__() as i64 * 65536 - 16)";
+      const progs: [string, string][] = [
+        ["load", `function rd(p: i64): i64 { return ld64(p + 32) }\nprint(rd(${end}))`],
+        ["store", `function wr(p: i64) { st64(p + 32, 7 as i64) }\nwr(${end})\nprint(0)`],
+      ];
+      for (const [name, body] of progs) {
+        Deno.writeTextFileSync(`${dir}/${name}.vl`, `${RT_IMPORT}\n${body}\n`);
+        // Inlined, one function holds both the address's add and the access itself.
+        const plain = bodies(await dis(dir, name, []));
+        const op = name === "load" ? "i64.load" : "i64.store";
+        if (!plain.split("(func ").some((f) => f.includes("i64.add") && f.includes(op))) {
+          throw new Error(`${name}: the accessor call was not inlined:\n${plain}`);
+        }
+        for (const rung of [[], ["-O"], ["-O", "--low-memory-unused=65536"]]) {
+          const out = `${dir}/${name}${rung.join("")}.wasm`;
+          const [bc, bo] = await vl(["build", `${dir}/${name}.vl`, "-o", out, "--compiler", COMPILER, ...rung]);
+          if (bc !== 0) throw new Error(`${name} build ${rung}: ${bo}`);
+          const [rc, ro] = await vl(["run", out]);
+          if (rc === 0 || !ro.includes("out of bounds memory access")) {
+            throw new Error(`${name} ${rung}: want the bounds trap, got exit ${rc}:\n${ro}`);
+          }
+        }
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
+
 // The refusals name a base the user can pass: a multiple of 8, and never a `--heap-base=` the
 // command line did not carry.
 Deno.test({

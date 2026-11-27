@@ -1282,7 +1282,7 @@ export function irLOpnd(o: Opnd) {
         if !tempDefined(v) { return irLMiss("temp used before its definition") }
         if !takeUse(v) { return irLMiss("non-stack temp: used twice") }
         tempOpenNote(v)
-        tempRhsWrite(v)
+        if lw.irInlOwn < 0 { tempRhsWrite(v) } else { tempRhsWriteInl(v) }
         lwSeq.push(v)
         return 0
       }
@@ -3699,7 +3699,7 @@ function memAccess(r: RMemAccess) {
     return irLMiss("memory access plan")
   }
   addrOpnds(r.mmArgs, ap)
-  return memAccessTail(p, ap.maOff)
+  return memAccessTail(p, ap.maOff + r.mmOffAdd)
 }
 
 // The address plan of memory call `c` (`base` declared operands) over the fold rows the builder
@@ -6236,7 +6236,11 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       }
       // A store leaves nothing; a discarded load leaves its value, which legacy drops.
       if r is RMemAccess {
+        // An inlined copy lowers under the function it was built in.
+        const was = lw.irAt
+        if lw.irInlOwn >= 0 { lw.irAt = inlAtOf(lw.irInlEff[id] ?? -1) }
         memAccess(r)
+        lw.irAt = was
         irLSettle(pending)
         if r.mmArgs.length == 1 { fbDrop() }
         return 0
@@ -6783,6 +6787,19 @@ function liveCountIn(vs: i32[]): i32 {
 }
 
 // Writes temp `v`'s definition, a `.push` receiver's with its list payload cast strict.
+// Temp `v`'s definition written where an inlined copy may be among them: each lowers under the
+// function it was built in.
+function tempRhsWriteInl(v: i32) {
+  const was = lw.irAt
+  lw.irAt = inlAtOf(lw.irInlTemp[v] ?? -1)
+  tempRhsWrite(v)
+  lw.irAt = was
+  return 0
+}
+
+// The function index a node lowers under: its copy's callee `at`, or the function's own for -1.
+function inlAtOf(at: i32): i32 { return if at >= 0 { at } else { lw.irInlOwn } }
+
 function tempRhsWrite(v: i32) {
   // Only the receiver's own global read leaves its recover out, never a read beneath it.
   const r0 = tempRhs(v)
@@ -6804,7 +6821,7 @@ function stageRoot(v: i32) {
   // It lands above the roots staged before it, as legacy writes the operands in turn.
   lwPushing = true
   tempOpenNote(v)
-  tempRhsWrite(v)
+  if lw.irInlOwn < 0 { tempRhsWrite(v) } else { tempRhsWriteInl(v) }
   lwPushing = false
   return livePush(v)
 }
