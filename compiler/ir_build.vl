@@ -5118,7 +5118,13 @@ function refIfArm(
   const tn0 = if tv0 >= 0 { nodeAt(unwrapParen(tv0)) } else { null }
   const copyLink = tn0 is IfStmt && tn0.ifElse >= 0 && repNodeAt(rep) is RRecord
   const arm = if arm0 == "noValue" && ifArmWiderWrite(blockIx) || copyLink { "plain" } else { arm0 }
-  if arm != "plain" && arm != "atomStr" && arm != "null" && arm != "unbox" {
+  if (
+    arm != "plain"
+    && arm != "atomStr"
+    && arm != "null"
+    && arm != "unbox"
+    && arm != "nestedIf"
+  ) {
     irBMiss("ref if arm " + arm)
     return body
   }
@@ -5147,9 +5153,14 @@ function refIfArm(
     return body
   }
   // A value `if` nested as the arm is the next link of the join, built at the join's rep as an
-  // `else if` link is.
-  const tn = if arm == "plain" && tv >= 0 { nodeAt(unwrapParen(tv)) } else { null }
-  if tn is IfStmt && tn.ifElse >= 0 && exprPrePathWhy(tv, ibFnIx) == "" {
+  // `else if` link is; an else-less one (`nestedIf`) yields the join's null where it misses.
+  const nif = arm == "nestedIf"
+  const tn = if (arm == "plain" || nif) && tv >= 0 { nodeAt(unwrapParen(tv)) } else { null }
+  if (
+    tn is IfStmt
+    && (tn.ifElse >= 0 || nif)
+    && exprPrePathWhy(tv, ibFnIx) == ""
+  ) {
     const inner = refIfLink(
       body,
       tn,
@@ -5164,6 +5175,10 @@ function refIfArm(
     if ibMiss == "" {
       irBNode(body, { asDst: t, asSrc: inner }, -1, ibNoValue, blockIx)
     }
+    return body
+  }
+  if nif {
+    irBMiss("ref if arm nestedIf pre-path")
     return body
   }
   // An atom arm in a `string` join decodes to its member string (`emitAtomToStr`), from the atom
@@ -5270,10 +5285,12 @@ function letIfSinkLink(b: i32[], ifIx: i32, v: i32, vr: i32, uty: i32) {
       ifIx,
     )
   } else if nodeAt(n.ifElse) is IfStmt {
+    // An `else if` whose own join adapts a scalar is one value, delivered as the arm.
     if ifJoinAdaptsScalar(n.ifElse, ibFnIx) {
-      return skip("declaration if per arm scalar link")
+      sinkPutArm(elseB, n.ifElse, v, vr, uty, n.ifElse)
+    } else {
+      letIfSinkLink(elseB, n.ifElse, v, vr, uty)
     }
-    letIfSinkLink(elseB, n.ifElse, v, vr, uty)
   } else {
     for x in letIfSinkBody(n.ifElse, v, vr, uty) { elseB.push(x) }
   }
@@ -5313,20 +5330,25 @@ function letIfSinkBody(blockIx: i32, v: i32, vr: i32, uty: i32): i32[] {
     }
     return body
   }
+  sinkPutArm(body, tv, v, vr, uty, blockIx)
+  return body
+}
+
+// Arm value `tv` boxed at `v`'s union `uty` (`armBoxDeliver`) and put into the sink pair at `at`.
+function sinkPutArm(body: i32[], tv: i32, v: i32, vr: i32, uty: i32, at: i32) {
   const x = armBoxDeliver(body, tv, vr, uty)
   if ibMiss == "" && irBOpRep(x) != vr {
-    skip("declaration if per arm coercion")
+    return skip("declaration if per arm coercion")
   }
-  if ibMiss == "" {
-    irBNode(
-      body,
-      { srOp: "sink.put", srHeap: -1, srArgs: [x], srImm: v },
-      -1,
-      ibNoValue,
-      blockIx,
-    )
-  }
-  return body
+  if ibMiss != "" { return 0 }
+  irBNode(
+    body,
+    { srOp: "sink.put", srHeap: -1, srArgs: [x], srImm: v },
+    -1,
+    ibNoValue,
+    at,
+  )
+  return 0
 }
 
 // The null `own` (`NULL_OWN_*`) written into `v` at `at`.
@@ -5355,10 +5377,12 @@ function letIfArmLink(
   if n.ifElse < 0 {
     nullInto(elseB, ifIx, v, vr, own)
   } else if nodeAt(n.ifElse) is IfStmt {
+    // An `else if` whose own join adapts a scalar is one value, delivered as the arm.
     if ifJoinAdaptsScalar(n.ifElse, ibFnIx) {
-      return skip("declaration if per arm scalar link")
+      storeArm(elseB, n.ifElse, v, vr, uty, n.ifElse)
+    } else {
+      letIfArmLink(elseB, n.ifElse, v, vr, own, uty)
     }
-    letIfArmLink(elseB, n.ifElse, v, vr, own, uty)
   } else {
     for x in letIfArmBody(n.ifElse, v, vr, uty) { elseB.push(x) }
   }
@@ -5388,14 +5412,19 @@ function letIfArmBody(blockIx: i32, v: i32, vr: i32, uty: i32): i32[] {
     }
     return body
   }
+  storeArm(body, tv, v, vr, uty, blockIx)
+  return body
+}
+
+// Arm value `tv` delivered into `v` (`armBoxDeliver`) and stored there at `at`.
+function storeArm(body: i32[], tv: i32, v: i32, vr: i32, uty: i32, at: i32) {
   const x = armBoxDeliver(body, tv, vr, uty)
   if ibMiss == "" && irBOpRep(x) != vr {
-    skip("declaration if per arm coercion")
+    return skip("declaration if per arm coercion")
   }
-  if ibMiss == "" {
-    irBNode(body, { asDst: v, asSrc: x }, -1, ibNoValue, blockIx)
-  }
-  return body
+  if ibMiss != "" { return 0 }
+  irBNode(body, { asDst: v, asSrc: x }, -1, ibNoValue, at)
+  return 0
 }
 
 // Whether body `b` ends in a temp's definition, an operand still waiting to be read.
