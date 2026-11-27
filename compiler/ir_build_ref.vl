@@ -93,7 +93,6 @@ import {
   irListCatHook,
   irListEqHook,
   irMemberHook,
-  irNodeInShadow,
   irOpenMemberRepHook,
   irStrBinHook,
   irUnionEqHook,
@@ -101,6 +100,7 @@ import {
   mapGetBare,
   recBuiltReadTy,
   recvReadsAgain,
+  rowSameFieldNames,
   storedReadOf,
   strPartAt,
 } from "./ir_build"
@@ -157,7 +157,6 @@ import {
   armSiteRepHolds,
   eqRouteOf,
   idxArmOf,
-  irNodeInShadowHook,
   listCatRouteOf,
   listElemStaysNullable,
   listEqRouteOf,
@@ -203,16 +202,6 @@ import {
 } from "./emit_classify"
 import { exprIsStrEq, exprIsStrOrder } from "./emit_fn_scans"
 import { strReppedLitUnionAt } from "./emit_plan_if_join"
-
-// The corrupt mode that drops every bounds check, rule 8's failing control, and the mode armed.
-const CORRUPT_DROP_BOUNDS = 5
-let refCorrupt = 0
-
-// Arms corrupt mode `k` for the list builder (0 none), as `irShadowCorrupt` does for the shadow.
-export function irRefCorrupt(k: i32) {
-  refCorrupt = k
-  return 0
-}
 
 // Whether rep `r` is a reference value this slice admits: a string or a list of any element.
 // A list is an opaque ref here; each read, write and walk over it decides its own arm.
@@ -426,9 +415,7 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
     && !refUnboxedAt(n, ix, fnIx, rep)
   const ixTy = nodeTyAt(n.idxIndex, fnIx)
   if repPrim(repNodeOfTy(ixTy)) != "i32" { return irBMiss("index rep") }
-  if refCorrupt != CORRUPT_DROP_BOUNDS {
-    irBNode(b, { bcV: v, bcIx: i }, -1, irBNoValue(), ix)
-  }
+  irBNode(b, { bcV: v, bcIx: i }, -1, irBNoValue(), ix)
   const stRead = isStorageRead(ix)
   const r: Rhs = { lgV: v, lgIx: i, lgAt: ix, lgStored: stRead, lgAgain: false }
   // A read whose receiver and index are each an immediate, a variable, or a temp whose read is
@@ -914,9 +901,9 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     if nullBox && letListElement(n.memObj) {
       return irBMiss("box field of a let list's element")
     }
-    const rv = irBExpr(b, n.memObj)
-    if missed(rv) { return rv }
-    if byRow && irOpRow(irBFn(), rv) < 0 {
+    const rv0 = irBExpr(b, n.memObj)
+    if missed(rv0) { return rv0 }
+    if byRow && irOpRow(irBFn(), rv0) < 0 {
       // A `null` unit field holds that null on any row, so the read is the null, its receiver read.
       if repPrim(rep) == "null" && repPrim(kr) == "null" {
         return irBLetTempTy(
@@ -929,6 +916,23 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
       }
       return irBMiss("member record with no row")
     }
+    // A receiver the checker narrowed past `null`, held at the nullable of a record of its field
+    // names (its storage row's build, D2933), is recovered first.
+    const rvn = repNodeAt(irBOpRep(rv0))
+    const rin = if rvn is RNullable && repNodeAt(rvn.rnInner) is RRecord { rvn.rnInner } else { -1 }
+    const rec = rin >= 0
+      && !(repNodeAt(r) is RNullable)
+      && rowSameFieldNames(
+      structIndexOfExpr(n.memObj, fnIx),
+      repTyOf(rin),
+    )
+    const rv = if rec { irBLetTempTy(
+      b,
+      { rcV: rv0, rcAt: n.memObj, rcNn: 1 },
+      n.memObj,
+      rin,
+      repTyOf(rin),
+    ) } else { rv0 }
     // The row the read's record value is laid out at: the receiver row's field target.
     const tgRow = irBRowFieldTarget(rv, n.memProp)
     // A receiver held at its storage row (D14426) reads that row's field, where it holds the read's
@@ -1195,7 +1199,6 @@ export function irRefInstall() {
   irListCatHook = listCatOf
   irLowerListHook = irLowerRefList
   irLowerEffectHook = irLowerRefEffect
-  irNodeInShadowHook = irNodeInShadow
   irLowerListSetHook = irLowerRefListSet
   irLowerBoundsHook = irLowerRefBounds
   irLoopOpenHook = irLowerRefLoopOpen
@@ -1211,7 +1214,14 @@ function storedRowKid(n: Member, sr: i32, fnIx: i32): i32 {
   // A receiver whose own type has no row (`structIndexOfExpr` -1) is only ever held at its storage
   // row, so that row's field of the name is the one it reads.
   const si = structIndexOfExpr(n.memObj, fnIx)
-  if si >= 0 && !repStructRowIsOrTwin(repTyOf(sr), si) { return -1 }
+  // …or, apart from the receiver's own row, a row of its field names the record solve built it at.
+  if (
+    si >= 0
+    && !repStructRowIsOrTwin(repTyOf(sr), si)
+    && !rowSameFieldNames(si, repTyOf(sr))
+  ) {
+    return -1
+  }
   return repRecordKidOf(sr, repTyOf(sr), n.memProp)
 }
 

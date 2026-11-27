@@ -904,7 +904,7 @@ roughly 32k lines are what those reach.
 5. the module record and assembler.
 
 Function coverage continues alongside: the next doors are `is guard`, `map read inline` and
-`index ref`. The driver census (`scripts/ir-driver-census.sh`) is the measure of each stage, by
+`index ref`. The driver census (`scripts/ir-driver-census.sh`, deleted after I8 with the shadow modes it drove) is the measure of each stage, by
 the drivers it moves from hit-with-claiming-off to hit-with-claiming-on 0.
 
 ### 10.2 The legacy-to-IR door: a precondition for shipping through it (2026-11-19)
@@ -1036,7 +1036,7 @@ every miss it covered becomes a refusal: a clause-2 violation, whatever the corp
 **The rule.** A legacy emitter deletes before I8 only if no miss can reach it once it is gone:
 - **Leaf tails, op ladders and decisions may delete early.** These write bytes from values, or
   decide without writing, and never emit a subexpression (role `value` or `decide` in
-  `scripts/ir-driver-census.sh`). Deleting one requires every legacy caller to route through the
+  `scripts/ir-driver-census.sh`, since deleted). Deleting one requires every legacy caller to route through the
   shared arm (§10's two seams) and the driver census to show it unhit with claiming on. §5.2's
   deletion rule applies unchanged.
 - **An emitter whose operands are arbitrary expressions deletes only at I8.** It calls `emitExpr`
