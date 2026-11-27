@@ -9701,13 +9701,19 @@ function mapIterRhs(b: i32[], m: Member, ix: i32): Rhs {
   if ibMiss != "" { return missRhs("method operand") }
   const temp = v is OVar && v.ov >= 0 && ib.irVars[v.ov].vKind == "temp"
   const again = temp && recvReadsAgain(unwrapParen(m.memObj))
-  if !(v is OVar) || b.length != at && !temp {
+  // A receiver built into a local of its own (a `??`'s or a valued `if`'s out) is read from it
+  // each step, as a variable is.
+  const own = v is OVar
+    && !temp
+    && v.ov >= 0
+    && ib.irVars[v.ov].vKind == "local"
+  if !(v is OVar) || b.length != at && !temp && !own {
     return missRhs("map iter receiver")
   }
   if !(repNodeAt(irBOpRep(v)) is RMap) {
     return missRhs("map iter receiver rep")
   }
-  const once = temp && !again
+  const once = temp && !again || own && b.length != at
   const r: Rhs = {
     miV: v,
     miAt: ix,
@@ -11204,6 +11210,7 @@ function callOfPureArgs(ix: i32): boolean {
 // `emitScalarMapReadOtherEq` writes it: the operand and the probe in source order.
 function scalarMapEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const p = scalarMapEqPlanOf(n, ibFnIx)
+  if p.smArm == "pair" || p.smArm == "box" { return nulScalarEq(b, n, ix, rep) }
   if p.smArm != "read" { return irBMiss("scalar map compare " + p.smArm) }
   const k = p.smKind
   if k != 0 && k != 1 && k != 3 && k != 4 && k != 5 {
@@ -11242,6 +11249,73 @@ function scalarMapEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     mqAt: ix,
   }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// `==`/`!=` over two nullable scalars (two scalar map reads, or one against a `V | null` value),
+// each built once in source order: equal when both are null, or both present and equal.
+function nulScalarEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  if rep != ibBool { return irBMiss("nullable scalar compare rep") }
+  const l = heldAtRep(b, irBExpr(b, n.binLeft), n.binLeft)
+  if ibMiss != "" { return l }
+  const r = heldAtRep(b, irBExpr(b, n.binRight), n.binRight)
+  if ibMiss != "" { return r }
+  const ne = n.binOp == "!="
+  const t = irVarNew(ib, ibBool, TY_BOOL, "local", -1)
+  // `l` null: the result is whether `r` is too.
+  const nb: i32[] = []
+  const cr = testNull(nb, r, ix)
+  if ibMiss != "" { return cr }
+  const both = if ne { irBLetTemp(nb, { poOp: "not", poArgs: [cr] }, ix, ibBool) } else { cr }
+  irBNode(nb, { asDst: t, asSrc: both }, -1, ibNoValue, ix)
+  // `l` present: unequal to a null `r`, else the values' compare.
+  const ti = irVarNew(ib, ibBool, TY_BOOL, "local", -1)
+  const rn: i32[] = []
+  const miss: Opnd = { oiRep: ibBool, oiBits: if ne { 1 } else { 0 } }
+  irBNode(rn, { asDst: ti, asSrc: miss }, -1, ibNoValue, ix)
+  const vb: i32[] = []
+  const lv = readNonNull(vb, l, ix)
+  const rv = readNonNull(vb, r, ix)
+  if ibMiss != "" { return lv }
+  if irBOpRep(lv) != irBOpRep(rv) {
+    return irBMiss("nullable scalar compare kinds")
+  }
+  const eq = irBLetTemp(
+    vb,
+    { poOp: if ne { "ne" } else { "eq" }, poArgs: [lv, rv] },
+    ix,
+    ibBool,
+  )
+  irBNode(vb, { asDst: ti, asSrc: eq }, -1, ibNoValue, ix)
+  const pb: i32[] = []
+  const cr2 = testNull(pb, r, ix)
+  nulScalarIf(pb, cr2, rn, vb, ti, ix)
+  const tio: Opnd = { ov: ti }
+  irBNode(pb, { asDst: t, asSrc: tio }, -1, ibNoValue, ix)
+  const cl = testNull(b, l, ix)
+  if ibMiss != "" { return cl }
+  nulScalarIf(b, cl, nb, pb, t, ix)
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// `if c { th } else { el }`, each arm ending by writing boolean local `t`.
+function nulScalarIf(b: i32[], c: Opnd, th: i32[], el: i32[], t: i32, ix: i32) {
+  irBNode(
+    b,
+    {
+      siCond: c,
+      siThen: th,
+      siElse: el,
+      siOut: t,
+      siElseKw: true,
+      siJoin: noRefJoin(),
+      siJoinNul: false,
+      siAtDst: false,
+    },
+    TY_BOOL,
+    ibBool,
+    ix,
+  )
 }
 
 // A scalar map compare's operand of kind `k` (an i32, a boolean, an i64, f64 or f32), read in
@@ -12171,12 +12245,12 @@ function boxPlanOfRep(rep: i32, unionTy: i32): HoleBox {
       }
       return ladder
     }
-    // A map rides under its map arm's tag (`emitUnionMapArmBox`).
+    // A map rides under its map arm's tag (`emitUnionMapArmBox`), the member `hbSrc` naming its shape.
     if (
       repNodeAt(rep) is RMap
       && unionHasMapArmSlot(unionTy, mapShapeOfTyPeeled(mt))
     ) {
-      const mp: HoleBox = { hbArm: "map", hbKind: unionTy, hbSrc: -1 }
+      const mp: HoleBox = { hbArm: "map", hbKind: unionTy, hbSrc: mt }
       return mp
     }
     const k = boxAtomKindOfMemberTy(mt)
@@ -13788,10 +13862,15 @@ function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
   ) {
     return missRhs("memory access short-circuit operand")
   }
-  // The address is an i32; a store's value is already at its width's prim, which legacy's
-  // widening then leaves as it stands.
+  // The address is an i32; a store's value is delivered at its width's prim, a narrower number
+  // widened into it as the checker permits.
+  const wt = if p.mxPrim == "i64" { irTyI64() } else if p.mxPrim == "f64" { irTyF64() } else { -1 }
+  if p.mxBase == 2 && wt >= 0 && repPrim(irBOpRep(args[1])) != p.mxPrim {
+    args[1] = irConvert(b, args[1], repNodeOfTy(wt), wt, ixs[1])
+  }
   if (
-    repPrim(irBOpRep(args[0])) != "i32"
+    ibMiss != ""
+    || repPrim(irBOpRep(args[0])) != "i32"
     || p.mxBase == 2 && repPrim(irBOpRep(args[1])) != p.mxPrim
   ) {
     return missRhs("memory access operand coercion")
@@ -21049,7 +21128,7 @@ function globalInitVariant(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     && recRetag(irBOpRep(v0), rep)
     && exprPrePathWhy(init, ibFnIx) == "") { repTemp(b, { rgV: v0 }, init, rep) } else { v0 }
   if ibMiss == "" && irBOpRep(v) != rep {
-    return irBMiss("global initializer variant coercion")
+    return irConvertStored(b, v, rep, ty, init)
   }
   return v
 }
