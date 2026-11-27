@@ -242,6 +242,7 @@ import {
 import {
   boxListRetag,
   boxMapRetag,
+  boxRetag,
   cloHoleRetag,
   irNodeEndsPath,
   listRetag,
@@ -5869,6 +5870,8 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       }
       const so = globalStoredRead(b, g, ix, cellRep, sto.stTy)
       if ibMiss != "" { return so }
+      // An atom cell read where its string is owed is decoded, as a local atom cell's read is.
+      if atomAtStr(cellRep, rep) { return widenTo(b, so, ix, rep, -1) }
       return irConvert(b, so, rep, heldTy(exprTyOf(ix)), ix)
     }
     if stored {
@@ -5905,9 +5908,12 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       return repTemp(b, { rgV: held }, ix, rep)
     }
     if atomId {
-      // The id is read at the binding's own type, whose rep is the cell's.
-      const at = heldTy(letBindTy(d, -1))
-      if repNodeOfTy(at) != cellRep { return irBMiss("global read coercion") }
+      // The id is read at the binding's own type where its rep is the cell's, else at the type
+      // its storage holds (`storageOf`).
+      const at0 = heldTy(letBindTy(d, -1))
+      const ast = bindingStorage(d, -1, true)
+      const at = if repNodeOfTy(at0) == cellRep { at0 } else if ast.stMiss == "" && ast.stRep == cellRep { ast.stTy } else { -1 }
+      if at < 0 { return irBMiss("global read coercion") }
       return irBLetTempTy(b, gr, ix, cellRep, at)
     }
     if member { return irBLetTempTy(b, gr, ix, cellRep, gh) }
@@ -7005,6 +7011,19 @@ function globalStorage(d: i32): Storage {
   const r0 = globalTyRep(if ht >= 0 { ct } else { globalHeldTy(d) })
   const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, openCellRep(d, r0))) } else { r0 }
   if r < 0 { return storageMiss("global rep") }
+  // A global legacy's cell holds as the atom is held at the type that cell holds, as a local's is.
+  const at = if ht < 0
+    && globalCellKind(d) == "i32"
+    && repPrim(r) == "str"
+    && letBindIsAtom(d, -1) { letAtomCellTy(d, -1) } else { -1 }
+  const ar = if at >= 0 { repNodeOfTy(heldTy(at)) } else { -1 }
+  if (
+    ar >= 0
+    && (repNodeAt(ar) is RAtom || atomNullable(ar))
+    && repTyOf(ar) >= 0
+  ) {
+    return storageAt(ar, repTyOf(ar), -1)
+  }
   // A list global whose storage row is another list, a wider record's, is held at that row.
   const bt = if ht < 0 && repNodeAt(r) is RList { heldTy(letBindTy(d, -1)) } else { -1 }
   const br = if bt >= 0 { globalTyRep(bt) } else { -1 }
@@ -7107,6 +7126,15 @@ function globalStoreTy(d: i32, rep: i32): i32 {
   if (
     repNodeAt(rep) is RAtom
     && atomCellRep(d, repNodeOfTy(ht)) == rep
+    && repTyOf(rep) >= 0
+  ) {
+    return repTyOf(rep)
+  }
+  // So is a cell legacy holds as the atom of a literal-bound binding (`letBindIsAtom`).
+  if (
+    (repNodeAt(rep) is RAtom || atomNullable(rep))
+    && globalCellKind(d) == "i32"
+    && letBindIsAtom(d, -1)
     && repTyOf(rep) >= 0
   ) {
     return repTyOf(rep)
@@ -11143,16 +11171,6 @@ function unionElemValue(b: i32[], e: i32): Opnd {
   return irBExpr(b, e)
 }
 
-// Whether `ix` is a list literal with a record literal among its elements.
-function listLitHoldsObjLit(ix: i32): boolean {
-  const n = nodeAt(unwrapParen(ix))
-  if !(n is ArrayLit) { return false }
-  for e in n.arrElems {
-    if nodeAt(unwrapParen(e)) is ObjLit { return true }
-  }
-  return false
-}
-
 // Whether rep `r` is a record or a nullable record.
 function recordRepOrNull(r: i32): boolean {
   const n = repNodeAt(r)
@@ -11225,6 +11243,15 @@ function nullBindingCall(ix: i32): boolean {
 
 // The value of `ix` delivered at rep `dst`: as built, or widened where legacy widens it, through
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
+// Whether `??` `n`'s default reads a binding holding a returned record whole at rep `dst`: the
+// `??` is that record, built there rather than at its own open type.
+function coalDefaultHoldsAt(n: BinExpr, dst: i32): boolean {
+  const r = unwrapParen(n.binRight)
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return false }
+  const ht = holderRecordTy(identDeclOf(r), ibFnIx)
+  return ht >= 0 && repNodeOfTy(ht) == dst
+}
+
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // A reference an assignment used as a value stores is captured at the rep its store holds it.
@@ -11278,7 +11305,7 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     && dst >= 0
     && dn is BinExpr
     && dn.binOp == "??"
-    && exprRepOf(du) < 0
+    && (exprRepOf(du) < 0 || coalDefaultHoldsAt(dn, dst))
   ) {
     // At a box, a map read's `??` is built at the map's value rep and boxed as that member.
     const lr = nodeAt(unwrapParen(dn.binLeft))
@@ -15947,6 +15974,10 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, repIn: i32): Opnd {
   }
   // Held at the storage row it is read from, typed at that row's record (`mapReadStoredRep`).
   if rep != repIn { return irBLetTempTy(b, r, ix, rep, mapReadStoredTy(ix)) }
+  // A read built at a destination's record, not its own type's rep, is typed at that record.
+  if repNodeAt(rep) is RRecord && repNodeOfTy(nodeTyAt(ix, ibFnIx)) != rep {
+    return irBLetTempTy(b, r, ix, rep, repTyOf(rep))
+  }
   return irBLetTemp(b, r, ix, rep)
 }
 
@@ -16704,8 +16735,10 @@ function lambdaArmFe(a: i32): i32 {
 function tagArm(b: i32[], a: i32, rep: i32, ty: i32): Opnd {
   const kind = repSigKindOfTy(ty)
   const fu = if kind != null && tagDispatchBoxes(kind) && !boxOwedAt(a, ibFnIx) { ty } else { -1 }
-  const fe = lambdaArmFe(a)
   const ac = nodeAt(a)
+  // A member's call is a direct call of its instance, a lambda's or the function legacy resolves at
+  // this instance, whose result rep its signature gives, not the arm node's stamp.
+  const fe = if lambdaArmFe(a) >= 0 { lambdaArmFe(a) } else { namedArmFe(a) }
   if fe >= 0 && ac is Call {
     const r = directCallAt(b, ac, a, fe)
     if ibMiss != "" { return irBMiss(ibMiss) }
@@ -16714,14 +16747,34 @@ function tagArm(b: i32[], a: i32, rep: i32, ty: i32): Opnd {
     if si < 0 { return irBMiss("tag dispatch arm coercion") }
     const sr = ib.irSigRet[si]
     if sr == rep { return irBLetTempTy(b, r, a, rep, ty) }
-    if fu < 0 { return irBMiss("tag dispatch arm coercion") }
     const lv = irBLetTempTy(b, r, a, sr, instTyOrSelf(exprTyOf(a), ibFnIx))
+    if fu < 0 { return tagArmConverted(b, lv, a, rep, ty) }
     return tagArmBoxed(b, lv, a, rep, fu)
   }
   const v = deliver(b, a, rep, fu)
   if ibMiss != "" || irBOpRep(v) == rep { return v }
-  if fu < 0 { return irBMiss("tag dispatch arm coercion") }
+  if fu < 0 { return tagArmConverted(b, v, a, rep, ty) }
   return tagArmBoxed(b, v, a, rep, fu)
+}
+
+// Arm value `v` of arm `a` at another rep than the call's `rep` (type `ty`), with no box planned
+// for it: delivered by the converter, as a value into a cell of one rep is.
+function tagArmConverted(b: i32[], v: Opnd, a: i32, rep: i32, ty: i32): Opnd {
+  const c = irConvertStored(b, v, rep, ty, a)
+  if ibMiss == "" && irBOpRep(c) != rep {
+    return irBMiss("tag dispatch arm coercion")
+  }
+  return c
+}
+
+// The instance a named member's dispatch arm call `a` resolves to here (`userFnCallTarget`), or -1.
+function namedArmFe(a: i32): i32 {
+  const ac = nodeAt(a)
+  if !(ac is Call) || ac.callFn < 0 { return -1 }
+  const cf = nodeAt(ac.callFn)
+  if !(cf is Ident) { return -1 }
+  const t = userFnCallTarget(ac, cf, ibFnIx)
+  return if t >= 0 && t < fnStmts.length { t } else { -1 }
 }
 
 // Arm value `v` of arm `a` boxed into union `uTy` at rep `rep`.
@@ -18485,8 +18538,10 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
     return skip("store of a map entry write")
   }
   const t = nodeAt(n.binLeft)
-  if t is Index { return elemStore(b, n, t, ix) }
-  if t is Member { return fieldStore(b, n, t, ix) }
+  // A parenthesised element or field target is that target.
+  const pt = nodeAt(unwrapParen(n.binLeft))
+  if pt is Index { return elemStore(b, n, pt, ix) }
+  if pt is Member { return fieldStore(b, n, pt, ix) }
   if !(t is Ident) { return skip("assignment target") }
   const d = identDeclOf(n.binLeft)
   const w = if d >= 0 { localIndexOf(ibFnIx, n.binLeft) } else { -1 }
@@ -18616,11 +18671,6 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   // Legacy writes an unstamped unit into a `null[]` as its sentinel, apart from the value's emit.
   const nulStore = idxStoreNullUnitUnstamped(t.idxArr, n.binRight, ibFnIx)
   const site = idxStoreSiteBoxes(st, n.binRight, ibFnIx)
-  // A nested list's literal holding a record literal: legacy banks the store's element-read row from
-  // its receiver, the lowering from the record's own read, so the rows disagree.
-  if st.nestSlot >= 0 && listLitHoldsObjLit(n.binRight) {
-    return skip("store element record literal")
-  }
   const vat = b.length
   const v = irBExpr(b, t.idxArr)
   const at = b.length
@@ -18743,12 +18793,13 @@ function narrowedRecvVariant(ix: i32): i32 {
 // store tail (`fieldStoreArmOf`'s `struct` arm, `fieldStoreValueArmOf`); a variant's, the record
 // a variant receiver is or a box narrowed to one yields (`variantParam`, `narrowVariant`).
 function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
-  const arm = fieldStoreArmOf(n.binLeft, ibFnIx)
+  const lhs = unwrapParen(n.binLeft)
+  const arm = fieldStoreArmOf(lhs, ibFnIx)
   if arm == "shared" { return sharedFieldStore(b, n, t, ix) }
   if arm != "struct" && arm != "variantParam" && arm != "narrowVariant" {
     return skip("field store " + arm)
   }
-  const sf = if arm == "struct" { fieldStoreStructAt(n.binLeft, ibFnIx) } else if arm == "variantParam" { fieldStoreVariantAt(n.binLeft, ibFnIx) } else { fieldStoreNarrowedAt(n.binLeft, ibFnIx) }
+  const sf = if arm == "struct" { fieldStoreStructAt(lhs, ibFnIx) } else if arm == "variantParam" { fieldStoreVariantAt(lhs, ibFnIx) } else { fieldStoreNarrowedAt(lhs, ibFnIx) }
   if sf.length != 2 { return skip("field store shape") }
   // The receiver's narrowed read casts to the variant its own read picks; the store's `struct.set`
   // writes `sf[0]`'s heap, so the two must name one variant.
@@ -22104,6 +22155,7 @@ function convertRetag(
 ): boolean {
   const ok = listRetag(src, dst)
     || boxListRetag(src, dst)
+    || boxRetag(src, dst)
     || mapRetag(src, dst)
     || cloListUndeclaredTakes(src, dst)
     || holeRetagNoted(src, dst, clo && !(repNodeAt(src) is RRecord))
@@ -22111,7 +22163,13 @@ function convertRetag(
     || recRetagNoted(src, dst, at)
     || recValRetagNoted(v, dst)
     || recNullFieldsNoted(src, dst)
-  return ok && exprPrePathWhy(at, ibFnIx) == ""
+  return ok && (exprPrePathWhy(at, ibFnIx) == "" || boxTwinRetag(src, dst, at))
+}
+
+// Whether a box at node `at` whose coercion is a map twin's retag is the box at `dst` as it
+// stands: layout-twin maps share one tag (`mapSlotTag`), so the coercion moves no bits.
+function boxTwinRetag(src: i32, dst: i32, at: i32): boolean {
+  return boxRetag(src, dst) && coerceKindAt(at, ibFnIx) == "mapRetag"
 }
 
 // Whether rep `src` is `dst` as it stands, a list (`listRetagHole`) or, with `clo`, any value
