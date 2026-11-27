@@ -3371,6 +3371,16 @@ export function readNonNull(b: i32[], v: Opnd, at: i32): Opnd {
       repTyOf(n.rnInner),
     )
   }
+  // A boxed nullable of several arms is its box past the null ref, as a nullable ref is.
+  if n.rnDisc == 4 {
+    return irBLetTempTy(
+      b,
+      { rcV: v, rcAt: at, rcNn: 1 },
+      at,
+      n.rnInner,
+      repTyOf(n.rnInner),
+    )
+  }
   return repTemp(b, { rgV: v }, at, n.rnInner)
 }
 
@@ -14238,7 +14248,11 @@ function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !(l0 is OVar) || l0.ov < 0 || l0.ov >= ib.irVars.length {
     return irBMiss("coalesce operand")
   }
-  const l = if ib.irVars[l0.ov].vKind == "temp" { heldInLocal(b, l0, ix) } else { l0 }
+  // Read twice (its test, then its present value): held in a local unless a named variable, as a
+  // temp or a valued `if`'s out on the stack (an inner `??`) is read once.
+  const named = nodeAt(unwrapParen(n.binLeft)) is Ident
+    && ib.irVars[l0.ov].vKind != "temp"
+  const l = if named { l0 } else { heldInLocal(b, l0, ix) }
   const c = testNull(b, l, ix)
   if ibMiss != "" { return c }
   const t = irVarNew(ib, rep, ty, "local", -1)
@@ -14252,7 +14266,8 @@ function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
   }
   const pb: i32[] = []
-  const nn = readNonNull(pb, l, ix)
+  // An operand already at a nullable result's rep (`(a ?? b) ?? c`'s inner) is that result present.
+  const nn = if irBOpRep(l) == rep { l } else { readNonNull(pb, l, ix) }
   if ibMiss != "" { return nn }
   // A closure apart from the result's only in openness, or a value standing at the result's rep
   // as it is (`retagsAsStands`), goes in retagged, as a list element does.
@@ -14261,7 +14276,12 @@ function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     && repNodeAt(nr) is RClosure
     && repNodeAt(rep) is RClosure
     && holeRetagNoted(nr, rep, true)
-  const nv = if holed || nr != rep && retagsAsStands(nr, rep, n.binLeft) { repTemp(pb, { rgV: nn }, ix, rep) } else { nn }
+  // An atom present at a string result is decoded to its member's text (`RAtomStr`), by the
+  // operand's own decode, which names its `null`, and read past that null.
+  const dec = repNodeAt(nr) is RAtom && repPrim(rep) == "str"
+  const snt = nullableTyOf(TY_STR)
+  const ds = if dec { repTempTy(pb, { sxV: nn, sxAt: n.binLeft }, ix, repNodeOfTy(snt), snt) } else { nn }
+  const nv = if dec { readNonNull(pb, ds, ix) } else if holed || nr != rep && retagsAsStands(nr, rep, n.binLeft) { repTemp(pb, { rgV: nn }, ix, rep) } else { nn }
   // Converted as the operand's value: a box plan is the operand's (`boxTempIn` at its node).
   const x = if irBOpRep(nv) != rep { irConvert(pb, nv, rep, ty, n.binLeft) } else { nv }
   if ibMiss != "" { return x }
@@ -14277,7 +14297,7 @@ function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
       siOut: t,
       siElseKw: true,
       siJoin: j,
-      siJoinNul: j.rjKind != null && refNullable(rep),
+      siJoinNul: j.rjKind != null && (refNullable(rep) || boxedNullable(rep)),
       siAtDst: false,
     },
     ty,
@@ -14393,6 +14413,7 @@ function coalesce(
   if arm == "mapScalarJoin" { return coalMapScalarJoin(b, n, ix, rep) }
   if arm == "boxRuntime" { return coalBoxRuntime(b, n, ix, rep) }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
+  if !mapGetOrFused(n, ix) { return coalNative(b, n, ix, rep) }
   return mapGetOr(b, n, ix, rep)
 }
 
@@ -15869,6 +15890,34 @@ function mapGetStoredTy(ix: i32, sh: i32, rep: i32, val: i32): i32 {
   const nt = nullableTyOf(vt)
   const nn = repNodeAt(repNodeOfTy(nt))
   return if nn is RNullable && nn.rnDisc == 1 && nn.rnInner == val { nt } else { -1 }
+}
+
+// Whether `l ?? d` over map read `l` is one the probe's fused read writes (`mapGetOr`'s arms);
+// any other is the IR's own `??` (`coalNative`), a read at its nullable value then its test.
+function mapGetOrFused(n: BinExpr, ix: i32): boolean {
+  const lhsIx = unwrapParen(n.binLeft)
+  if lhsIx < 0 { return false }
+  const rd = nodeAt(lhsIx)
+  if !(rd is Index) { return false }
+  const rk = coalResultKindOf(ix, ibFnIx)
+  const arm = mapGetOrArmOf(rd.idxArr, n.binRight, ibFnIx, rk)
+  if (
+    arm == "scalarBox"
+    || arm == "helper"
+    || arm == "i32"
+    || arm == "atom"
+    || arm == "sentinel"
+    || arm == "widen"
+  ) {
+    return true
+  }
+  if arm != "mv" { return false }
+  if mapGetOrMvPlain(rd.idxArr, n.binRight, ibFnIx) { return true }
+  const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
+  const uq = mapGetOrUnionScalarPlanOf(sh, n.binRight, rk)
+  if uq != null && uq.muKind >= 0 { return true }
+  return mapGetOrNicheStash(rd.idxArr, n.binRight, ibFnIx)
+    || mapGetOrUnionBoxOf(sh, n.binRight)
 }
 
 // `g[k] ?? d` along legacy's helper route, its plain `i32` read or its plain mv slot read
