@@ -47,8 +47,14 @@ import {
   irRhsOpnds,
   irVarNew,
 } from "./ir"
+import { Call, nodeAt } from "./ast"
 import { emitFail } from "./emit_bytes"
-import { memLowFoldFits } from "./wasmEmit"
+import {
+  memAccessPlanOf,
+  memAddrPlanWith,
+  memLowFoldFits,
+  memLowWrapped,
+} from "./wasmEmit"
 
 // The most nodes a leaf may hold.
 const IL_MAX_NODES = 12
@@ -130,6 +136,7 @@ function leafRebuild(r: Rhs, ops: Opnd[]): Rhs {
       mmBase: r.mmBase,
       mmPrim: r.mmPrim,
       mmName: r.mmName,
+      mmOffAdd: r.mmOffAdd,
     }
     return m
   }
@@ -560,4 +567,175 @@ function copyRhs(cp: IlCopy, r: Rhs): Rhs {
     }
   }
   return leafRebuild(r, out)
+}
+
+// Under the low-memory promise, moves the immediate terms of each memory access's address into
+// its memarg offset: an address that is a temp add of an immediate, under an i64 wrap or at i32.
+// The two forms differ only where the add wraps past 2^32, whose address is then below the
+// constant and so below `gLowMemUnused`, an access the promise excludes (`memLowFoldK`).
+export function irMemFoldAdds(f: IrFn): i32 {
+  if !memLowFoldFits(0) { return 0 }
+  let n = 0
+  const bodies: i32[][] = [f.irBody]
+  const pos: i32[] = []
+  let k = 0
+  while k < bodies.length {
+    n = n + foldBody(f, bodies[k])
+    for id in bodies[k] { irPushBodies(f, id, bodies, pos) }
+    k = k + 1
+  }
+  return n
+}
+
+// The memory access node `id` of `f` writes, or null.
+function accessOf(f: IrFn, id: i32): RMemAccess | null {
+  const r = stmtRhs(f.irNodes[id])
+  return if r is RMemAccess { r } else { null }
+}
+
+// The function index temp `v` of `f` lowers under: an inlined copy's callee, else `f`'s own.
+function tempAt(f: IrFn, v: i32): i32 {
+  const at = f.irInlTemp[v] ?? -1
+  return if at >= 0 { at } else { f.irAt }
+}
+
+// Folds the accesses of body `b` in place; answers how many.
+function foldBody(f: IrFn, b: i32[]): i32 {
+  const bd = bodyOf(f, b)
+  let n = 0
+  const drop: {[i32]: boolean} = Map()
+  let j = 0
+  while j < b.length {
+    if foldAt(f, bd, j, drop) { n = n + 1 }
+    j = j + 1
+  }
+  if n == 0 { return 0 }
+  const out: i32[] = []
+  j = 0
+  while j < b.length {
+    if !(drop[j] ?? false) { out.push(b[j]) }
+    j = j + 1
+  }
+  while b.length > 0 { b.pop() }
+  for id in out { b.push(id) }
+  return n
+}
+
+// The let of `b` at or before `limit` defining temp `v` of `f` as an add of an immediate: its index,
+// or -1.
+function addImmAt(f: IrFn, bd: IlBody, v: i32, limit: i32): i32 {
+  if v < 0 || v >= f.irVars.length || f.irVars[v].vKind != "temp" { return -1 }
+  const j = defIndex(bd, v, limit)
+  if j < 0 { return -1 }
+  const n = f.irNodes[bd.ibB[j]]
+  if n is SLet {
+    const r = n.lRhs
+    if r is RPrimOp {
+      if r.poOp == "add" && r.poArgs.length == 2 && addImmK(r) > 0 { return j }
+    }
+  }
+  return -1
+}
+
+// The positive immediate of add `r`, or -1.
+function addImmK(r: RPrimOp): i64 {
+  const a = r.poArgs[0]
+  const c = r.poArgs[1]
+  if c is OImm && !(a is OImm) && c.oiBits > 0 { return c.oiBits }
+  if a is OImm && !(c is OImm) && a.oiBits > 0 { return a.oiBits }
+  return -1
+}
+
+// The operand of add `r` that is not its immediate.
+function addRest(r: RPrimOp): Opnd {
+  const c = r.poArgs[1]
+  return if c is OImm { r.poArgs[0] } else { c }
+}
+
+// Folds the access at `b[j]` when its address is such an add; true when it did, the adds' lets
+// marked in `drop`.
+function foldAt(f: IrFn, bd: IlBody, j: i32, drop: {[i32]: boolean}): boolean {
+  const b = bd.ibB
+  const id = b[j]
+  const r = accessOf(f, id)
+  if r == null || r.mmArgs.length == 0 { return false }
+  const a0 = r.mmArgs[0]
+  if !(a0 is OVar) { return false }
+  // The add's operand: under an i64 wrap's cast, or the address itself at i32.
+  let castJ = -1
+  let top = a0.ov
+  const ja = defIndex(bd, a0.ov, j - 1)
+  if ja >= 0 {
+    const an = f.irNodes[b[ja]]
+    if an is SLet {
+      const ar = an.lRhs
+      if ar is RNumCast {
+        const cv = ar.ncV
+        if !(cv is OVar) || memLowWrapped(ar.ncAt, tempAt(f, a0.ov)) < 0 {
+          return false
+        }
+        castJ = ja
+        top = cv.ov
+      }
+    }
+  }
+  const limit = if castJ >= 0 { castJ - 1 } else { j - 1 }
+  let at = addImmAt(f, bd, top, limit)
+  if at < 0 { return false }
+  let k: i64 = 0
+  let rest: Opnd = a0
+  const marks: i32[] = []
+  while at >= 0 {
+    const an = f.irNodes[b[at]]
+    if !(an is SLet) { return false }
+    const ar = an.lRhs
+    if !(ar is RPrimOp) { return false }
+    k = k + addImmK(ar)
+    if !memLowFoldFits(k) { return false }
+    marks.push(at)
+    rest = addRest(ar)
+    at = if rest is OVar { addImmAt(f, bd, rest.ov, at - 1) } else { -1 }
+  }
+  // The planned offset, as the access's lowering will take it.
+  const c = nodeAt(r.mmAt)
+  if !(c is Call) { return false }
+  const ap = memAddrPlanWith(
+    c,
+    memAccessPlanOf(r.mmName).mxBase,
+    tempAt(f, a0.ov),
+    { mfDecl: [], mfSlot: [], mfK: [] },
+  )
+  if ap.maArm != "rest" && ap.maArm != "wide" { return false }
+  if !memLowFoldFits(ap.maOff + r.mmOffAdd + k) { return false }
+  for m in marks { drop[m] = true }
+  if castJ >= 0 {
+    const cn = f.irNodes[b[castJ]]
+    if cn is SLet {
+      const cr = cn.lRhs
+      if cr is RNumCast {
+        f.irNodes[b[castJ]] = {
+          lDst: cn.lDst,
+          lRhs: { ncV: rest, ncAt: cr.ncAt, ncMiss: cr.ncMiss },
+        }
+      }
+    }
+  }
+  const args: Opnd[] = []
+  for x in r.mmArgs { args.push(x) }
+  if castJ < 0 { args[0] = rest }
+  const nr: Rhs = {
+    mmArgs: args,
+    mmAt: r.mmAt,
+    mmBase: r.mmBase,
+    mmPrim: r.mmPrim,
+    mmName: r.mmName,
+    mmOffAdd: r.mmOffAdd + k,
+  }
+  const n = f.irNodes[id]
+  if n is SLet {
+    f.irNodes[id] = { lDst: n.lDst, lRhs: nr }
+  } else {
+    f.irNodes[id] = { efRhs: nr }
+  }
+  return true
 }
