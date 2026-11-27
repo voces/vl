@@ -43,8 +43,10 @@ const ROWS: Record<string, string> = {
   D3: "### D3 — a loud row\n**loud emit reject**\n",
   D7: "### D7 — a negated status\n**not closed by D2**\n",
   D4: "### D4 — a trap\n**loads then traps**\n",
-  D5: "### D5 — a design close\n**now a loud check reject, closed by lane x**\n",
-  D6: "### D6 — a half fixed\n**loud emit reject · lane y fixed the other half**\n",
+  D5:
+    "### D5 — a design close\n**now a loud check reject, closed by lane x**\n",
+  D6:
+    "### D6 — a half fixed\n**loud emit reject · lane y fixed the other half**\n",
 };
 
 const check = (
@@ -230,16 +232,27 @@ Deno.test({
 // has landed (an id in it is filed on master). A filed row is taken with or without a reservation.
 const git = async (cwd: string, args: string[]) => {
   const { code, stderr } = await new Deno.Command("git", {
-    args: ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=master", ...args],
+    args: [
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "-c",
+      "init.defaultBranch=master",
+      ...args,
+    ],
     cwd,
     stdout: "null",
     stderr: "piped",
   }).output();
-  if (code !== 0) throw new Error(`git ${args.join(" ")}: ${dec.decode(stderr)}`);
+  if (code !== 0) {
+    throw new Error(`git ${args.join(" ")}: ${dec.decode(stderr)}`);
+  }
 };
 
 Deno.test({
-  name: "inventory ls: --next and --reserve skip ids an unmerged remote branch claims",
+  name:
+    "inventory ls: --next and --reserve skip ids an unmerged remote branch claims",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_inv_ls_remote_" });
@@ -260,24 +273,39 @@ Deno.test({
       const inv = "docs/internals/inventory";
       await Deno.mkdir(`${src}/${inv}/reserved`, { recursive: true });
       await Deno.mkdir(`${src}/docs/internals/inventory-2`);
-      await Deno.writeTextFile(`${src}/docs/internals/inventory-2/D1.md`, "### D1 — a row\n**closed**\n");
+      await Deno.writeTextFile(
+        `${src}/docs/internals/inventory-2/D1.md`,
+        "### D1 — a row\n**closed**\n",
+      );
       for (const id of ["D2", "D5", "D10"]) {
-        await Deno.writeTextFile(`${src}/${inv}/${id}.md`, `### ${id} — a row\n**closed**\n`);
+        await Deno.writeTextFile(
+          `${src}/${inv}/${id}.md`,
+          `### ${id} — a row\n**closed**\n`,
+        );
       }
       await git(dir, ["init", "-q", src]);
       await git(src, ["add", "-A"]);
       await git(src, ["commit", "-q", "-m", "master"]);
       // A live branch: a reservation and a row past master's top.
       await git(src, ["checkout", "-q", "-b", "lane-x"]);
-      await Deno.writeTextFile(`${src}/${inv}/reserved/D11-D12.md`, "D11-D12  x  2026-11-15\n");
-      await Deno.writeTextFile(`${src}/${inv}/D13.md`, "### D13 — a row\n**open**\n");
+      await Deno.writeTextFile(
+        `${src}/${inv}/reserved/D11-D12.md`,
+        "D11-D12  x  2026-11-15\n",
+      );
+      await Deno.writeTextFile(
+        `${src}/${inv}/D13.md`,
+        "### D13 — a row\n**open**\n",
+      );
       await git(src, ["add", "-A"]);
       await git(src, ["commit", "-q", "-m", "lane-x"]);
       // A landed branch: its reservation holds D5, which master files.
       await git(src, ["checkout", "-q", "master"]);
       await git(src, ["checkout", "-q", "-b", "lane-old"]);
       await Deno.mkdir(`${src}/${inv}/reserved`, { recursive: true });
-      await Deno.writeTextFile(`${src}/${inv}/reserved/D5-D9.md`, "D5-D9  old  2026-11-01\n");
+      await Deno.writeTextFile(
+        `${src}/${inv}/reserved/D5-D9.md`,
+        "D5-D9  old  2026-11-01\n",
+      );
       await git(src, ["add", "-A"]);
       await git(src, ["commit", "-q", "-m", "lane-old"]);
       await git(src, ["checkout", "-q", "master"]);
@@ -310,7 +338,10 @@ Deno.test({
         "ls.vl: D9-D11 overlaps D10, already filed\n",
       );
       // Master files a row after the clone, with no reservation: once fetched, it is taken.
-      await Deno.writeTextFile(`${src}/${inv}/D20.md`, "### D20 — a row\n**closed**\n");
+      await Deno.writeTextFile(
+        `${src}/${inv}/D20.md`,
+        "### D20 — a row\n**closed**\n",
+      );
       await git(src, ["add", "-A"]);
       await git(src, ["commit", "-q", "-m", "master files D20"]);
       await git(co, ["fetch", "-q"]);
@@ -325,6 +356,33 @@ Deno.test({
         await ls(co, ["--reserve", "D19-D21", "me"]),
         1,
         "ls.vl: D19-D21 overlaps D20, already filed\n",
+      );
+      // An id a merged commit cites stays used though no row files it (a row filed, then dropped).
+      await git(src, [
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "file D21, then drop its row",
+      ]);
+      await git(co, ["fetch", "-q"]);
+      check(
+        "--next past an id a commit on origin/master cites",
+        await ls(co, ["--next"]),
+        0,
+        "D22\n",
+        "  skipped D21 — cited by a commit on origin/master or under tests/\n",
+      );
+      // So does one a test under tests/ cites.
+      await Deno.mkdir(`${co}/tests`, { recursive: true });
+      await Deno.writeTextFile(`${co}/tests/pin.ts`, "// pins D22\n");
+      await git(co, ["add", "tests/pin.ts"]);
+      check(
+        "--next past an id a test cites",
+        await ls(co, ["--next"]),
+        0,
+        "D23\n",
+        "  skipped D21 — cited by a commit on origin/master or under tests/\n  skipped D22 — cited by a commit on origin/master or under tests/\n",
       );
       // Outside a git checkout there is no remote to ask: the first test's fixture covers that.
     } finally {
