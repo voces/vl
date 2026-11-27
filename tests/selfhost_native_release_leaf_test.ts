@@ -7,7 +7,8 @@
 // survives `-O` (or `-O3`), and the program's output is unchanged. A timing cannot be gated.
 //
 // The CONTROL runs a bare binaryen `-O` and must find the calls kept: otherwise a fixture
-// binaryen would inline anyway passes whether or not the host passes the size.
+// binaryen would inline anyway passes whether or not the host passes the size. It grades the
+// helpers the plain module still calls, since the IR inliner copies the rest in every build.
 //
 // The second test is plumb PL-053's shape (DECISIONS.md, "`-O` inlines a fast path"): a
 // NaN-exact float helper, an operation plus a branch to an out-of-line `nan32`, is inlined at
@@ -110,9 +111,19 @@ Deno.test({
       if (opt.code !== 0) {
         throw new Error(`control wasm-opt failed: ${opt.err.trim()}`);
       }
+      // The IR inliner copies a helper it can into its callers in every build, so the control
+      // grades the helpers the plain module still calls, and at least one must remain.
+      const plainDis = await run(WASM_DIS, [plain, ...features]);
+      const called = HELPERS.filter((h) => helperCalls(plainDis.out).includes(h));
+      if (called.length === 0) {
+        throw new Error(
+          "CONTROL — the plain build already copies every helper, so this fixture no longer\n" +
+            "  exercises the host's inline size; give a helper a shape the IR inliner keeps as a call",
+        );
+      }
       const dis = await run(WASM_DIS, [`${tmp}/c.wasm`, ...features]);
       const kept = new Set(helperCalls(dis.out));
-      const missing = HELPERS.filter((h) => !kept.has(h));
+      const missing = called.filter((h) => !kept.has(h));
       if (missing.length !== 0) {
         throw new Error(
           `CONTROL — a bare -O already inlines ${

@@ -18,18 +18,43 @@ import {
   RNumWiden,
   RPrimOp,
   Rhs,
+  SArmSite,
+  SArmWrite,
+  SAssign,
+  SBlock,
+  SBoundsCheck,
+  SBr,
+  SCellSet,
+  SCoalBox,
+  SDrop,
   SEffect,
+  SForIn,
+  SGlobalSet,
+  SIf,
+  SIntSwitch,
   SLet,
+  SListSet,
+  SLoop,
+  SRangeLoop,
+  SRawOp,
   SReturn,
+  SSetField,
+  SSwitch,
+  STrap,
   irFnBuiltOnce,
   irNodeNew,
   irPushBodies,
+  irRhsOpnds,
   irVarNew,
 } from "./ir"
 import { Call, nodeAt } from "./ast"
-import { MEM_OFFSET_MAX } from "./check_intrinsics"
-import { gLowMemUnused } from "./emit_state"
-import { memAccessPlanOf, memAddrPlanWith, memLowWrapped } from "./wasmEmit"
+import { emitFail } from "./emit_bytes"
+import {
+  memAccessPlanOf,
+  memAddrPlanWith,
+  memLowFoldFits,
+  memLowWrapped,
+} from "./wasmEmit"
 
 // The most nodes a leaf may hold.
 const IL_MAX_NODES = 12
@@ -39,22 +64,18 @@ const IL_MAX_NODES = 12
 let ilLeaf: {[i32]: IrFn} = Map()
 let ilRoot: {[i32]: i32} = Map()
 let ilCount = 0
-// Whether the function being built calls a leaf (`irLeafCallNote`), so `irInlineCalls` walks it.
-let ilCalled = false
 
 // Forgets every leaf, at a compile's start.
 export function irInlineReset() {
   ilLeaf = Map()
   ilRoot = Map()
   ilCount = 0
-  ilCalled = false
   return 0
 }
 
-// Notes a direct call of `fnStmts` slot `pos` built into the function being built.
-export function irLeafCallNote(pos: i32) {
-  if ilCount > 0 && ilLeaf.has(pos) { ilCalled = true }
-  return 0
+// Whether `fnStmts` slot `pos` is a leaf claimed so far.
+export function irIsLeaf(pos: i32): boolean {
+  return ilCount > 0 && ilLeaf.has(pos)
 }
 
 // Keeps function `f`, just claimed at `fnStmts` slot `pos`, when it is a leaf.
@@ -68,17 +89,21 @@ export function irLeafNote(pos: i32, f: IrFn) {
   return 0
 }
 
+// Why right side `r` is outside the leaf whitelist, or "" for a numeric cast with no miss operand,
+// a widening, a primitive op or a memory access.
+function leafWhy(r: Rhs): string {
+  if r is RNumCast {
+    return if r.ncMiss is OVar && r.ncMiss.ov < 0 { "" } else { "a cast with a miss operand" }
+  }
+  if r is RNumWiden || r is RPrimOp || r is RMemAccess { return "" }
+  return "a right side outside the leaf whitelist"
+}
+
 // The operands whitelisted right side `r` reads, in the order its lowering reads them; null for a
 // right side outside the whitelist.
 function leafOpnds(r: Rhs): Opnd[] | null {
-  if r is RNumCast {
-    if !(r.ncMiss is OVar && r.ncMiss.ov < 0) { return null }
-    return [r.ncV]
-  }
-  if r is RNumWiden { return [r.nwV] }
-  if r is RPrimOp { return r.poArgs }
-  if r is RMemAccess { return r.mmArgs }
-  return null
+  if leafWhy(r) != "" { return null }
+  return irRhsOpnds(r)
 }
 
 // Right side `r` with operand `k` of `leafOpnds` replaced by `ops[k]`.
@@ -106,6 +131,9 @@ function leafRebuild(r: Rhs, ops: Opnd[]): Rhs {
     }
     return m
   }
+  emitFail(
+    "emitProgram: internal: the inliner copied a right side outside its whitelist",
+  )
   return r
 }
 
@@ -136,9 +164,7 @@ function leafRoot(f: IrFn): i32 {
   let k = 0
   while k < b.length - 1 {
     const n = f.irNodes[b[k]]
-    if !(n is SLet) { return -1 }
-    const os = leafOpnds(n.lRhs)
-    if os == null { return -1 }
+    if !(n is SLet) || leafOpnds(n.lRhs) == null { return -1 }
     k = k + 1
   }
   const end = f.irNodes[last]
@@ -146,9 +172,7 @@ function leafRoot(f: IrFn): i32 {
     if !end.rtHas || !(end.rtV is OVar) || !leafTemp(f, end.rtV.ov) {
       return -1
     }
-  } else if end is SEffect {
-    if !(end.efRhs is RMemAccess) { return -1 }
-  } else {
+  } else if !(stmtRhs(end) is RMemAccess) || end is SLet {
     return -1
   }
   leafReads(f, last, reads)
@@ -202,17 +226,42 @@ function leafDef(f: IrFn, v: i32): i32 {
 // The right side of leaf node `id`: a let's, an effect's, or a return's temp's definition.
 function leafRhs(f: IrFn, id: i32): Rhs {
   const n = f.irNodes[id]
-  if n is SLet { return n.lRhs }
-  if n is SEffect { return n.efRhs }
   if n is SReturn {
     const o = n.rtV
-    if o is OVar {
-      const d = leafDef(f, o.ov)
-      if d >= 0 { return leafRhs(f, d) }
-    }
+    const d = if o is OVar { leafDef(f, o.ov) } else { -1 }
+    if d >= 0 { return leafRhs(f, d) }
   }
   const none: Rhs = { poOp: "add", poArgs: [] }
-  return none
+  return stmtRhs(n) ?? none
+}
+
+// The right side statement `n` writes: a let's or an effect's; null for every other statement.
+function stmtRhs(n: IrNode): Rhs | null {
+  return match n {
+    SLet => n.lRhs
+    SEffect => n.efRhs
+    SArmSite |
+      SArmWrite |
+      SAssign |
+      SBlock |
+      SBoundsCheck |
+      SBr |
+      SCellSet |
+      SCoalBox |
+      SDrop |
+      SForIn |
+      SGlobalSet |
+      SIf |
+      SIntSwitch |
+      SListSet |
+      SLoop |
+      SRangeLoop |
+      SRawOp |
+      SReturn |
+      SSetField |
+      SSwitch |
+      STrap => null
+  }
 }
 
 // The node holding leaf end `root`'s value: its effect, or its returned temp's let.
@@ -246,9 +295,7 @@ type IlCopy = { icF: IrFn, icArgs: {[i32]: Opnd}, icTemp: {[i32]: i32} }
 
 // Replaces each direct call of a leaf in `f` by a copy of the leaf; answers how many.
 export function irInlineCalls(f: IrFn): i32 {
-  const called = ilCalled
-  ilCalled = false
-  if f.irAt < 0 || !called { return 0 }
+  if f.irAt < 0 || !f.irCallsLeaf { return 0 }
   let n = 0
   const bodies: i32[][] = [f.irBody]
   const pos: i32[] = []
@@ -263,15 +310,8 @@ export function irInlineCalls(f: IrFn): i32 {
 
 // The call a statement makes, when it is a let or effect of a direct call.
 function stmtCall(n: IrNode): RCall | null {
-  if n is SLet {
-    const r = n.lRhs
-    if r is RCall { return r }
-  }
-  if n is SEffect {
-    const r = n.efRhs
-    if r is RCall { return r }
-  }
-  return null
+  const r = stmtRhs(n)
+  return if r is RCall { r } else { null }
 }
 
 // Copies the leaf calls of body `b` of `f` in place; answers how many.
@@ -305,6 +345,24 @@ function defIndex(f: IrFn, b: i32[], v: i32, limit: i32): i32 {
     j = j - 1
   }
   return -1
+}
+
+// Whether the temp defined at `b[j]` of `f` is a let of whitelisted right sides down to its
+// variables and immediates, so its definition is written where it is read.
+function lazyTemp(f: IrFn, b: i32[], j: i32): boolean {
+  if j < 0 { return false }
+  const n = f.irNodes[b[j]]
+  if !(n is SLet) { return false }
+  const os = leafOpnds(n.lRhs)
+  if os == null { return false }
+  for o in os {
+    if o is OVar {
+      if o.ov >= 0 && o.ov < f.irVars.length && f.irVars[o.ov].vKind == "temp" {
+        if !lazyTemp(f, b, defIndex(f, b, o.ov, j - 1)) { return false }
+      }
+    }
+  }
+  return true
 }
 
 // Copies the leaf call at `b[i]`, when it is one: true when it did.
@@ -346,20 +404,24 @@ function inlineAt(f: IrFn, b: i32[], i: i32): boolean {
   const reads: i32[] = []
   leafReads(g, root, reads)
   let last = -1
+  let copied = false
   for v in reads {
     if g.irVars[v].vKind == "param" {
       const a = cp.icArgs[v] ?? null
       if a is OVar {
-        if (
-          a.ov >= 0
-          && a.ov < f.irVars.length
-          && f.irVars[a.ov].vKind == "temp"
-        ) {
-          const j = defIndex(f, b, a.ov, i - 1)
-          if j < 0 || j <= last { return false }
-          last = j
+        const kind = if a.ov >= 0 && a.ov < f.irVars.length { f.irVars[a.ov].vKind } else { "" }
+        const j = if kind == "temp" { defIndex(f, b, a.ov, i - 1) } else { -1 }
+        if kind == "temp" && (j < 0 || j <= last) { return false }
+        // An argument read after a copy is written after it, so it must be one the lowering
+        // writes where it is read: a parameter, or a lazy temp, never a value staged on the stack
+        // ahead of the copy, as a valued `if`'s out variable is.
+        if copied && kind != "param" && !(kind == "temp" && lazyTemp(f, b, j)) {
+          return false
         }
+        if j >= 0 { last = j }
       }
+    } else {
+      copied = true
     }
   }
   // Placement: after the latest argument temp read before each copy.
@@ -403,7 +465,7 @@ function inlineAt(f: IrFn, b: i32[], i: i32): boolean {
     }
   }
   f.irInlOwn = f.irAt
-  // The end takes the call's own node, so its spans and tail marks stay where they were.
+  // The end takes the call's own node, so its spans and tail marks keep pointing at it.
   const endRhs = copyRhs(cp, leafRhs(g, root))
   if cn is SLet {
     f.irNodes[callId] = { lDst: cn.lDst, lRhs: endRhs }
@@ -486,7 +548,7 @@ function copyRhs(cp: IlCopy, r: Rhs): Rhs {
 // The two forms differ only where the add wraps past 2^32, whose address is then below the
 // constant and so below `gLowMemUnused`, an access the promise excludes (`memLowFoldK`).
 export function irMemFoldAdds(f: IrFn): i32 {
-  if gLowMemUnused <= 0 { return 0 }
+  if !memLowFoldFits(0) { return 0 }
   let n = 0
   const bodies: i32[][] = [f.irBody]
   const pos: i32[] = []
@@ -501,16 +563,8 @@ export function irMemFoldAdds(f: IrFn): i32 {
 
 // The memory access node `id` of `f` writes, or null.
 function accessOf(f: IrFn, id: i32): RMemAccess | null {
-  const n = f.irNodes[id]
-  if n is SLet {
-    const r = n.lRhs
-    if r is RMemAccess { return r }
-  }
-  if n is SEffect {
-    const r = n.efRhs
-    if r is RMemAccess { return r }
-  }
-  return null
+  const r = stmtRhs(f.irNodes[id])
+  return if r is RMemAccess { r } else { null }
 }
 
 // The function index temp `v` of `f` lowers under: an inlined copy's callee, else `f`'s own.
@@ -609,7 +663,7 @@ function foldAt(f: IrFn, b: i32[], j: i32, drop: {[i32]: boolean}): boolean {
     const ar = an.lRhs
     if !(ar is RPrimOp) { return false }
     k = k + addImmK(ar)
-    if k > MEM_OFFSET_MAX { return false }
+    if !memLowFoldFits(k) { return false }
     marks.push(at)
     rest = addRest(ar)
     at = if rest is OVar { addImmAt(f, b, rest.ov, at - 1) } else { -1 }
@@ -624,8 +678,7 @@ function foldAt(f: IrFn, b: i32[], j: i32, drop: {[i32]: boolean}): boolean {
     { mfDecl: [], mfSlot: [], mfK: [] },
   )
   if ap.maArm != "rest" && ap.maArm != "wide" { return false }
-  const off: i64 = ap.maOff + r.mmOffAdd + k
-  if off >= gLowMemUnused || off > MEM_OFFSET_MAX { return false }
+  if !memLowFoldFits(ap.maOff + r.mmOffAdd + k) { return false }
   for m in marks { drop[m] = true }
   if castJ >= 0 {
     const cn = f.irNodes[b[castJ]]
