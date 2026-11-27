@@ -11,9 +11,10 @@
 // run on its date carries `<!-- paths-as-of: <date> -->` instead, next to a note naming
 // what replaced each tool. No assertion library, per CLAUDE.md.
 
-// History by construction: the changelog, the one-file-per-row inventories (each row's
-// witness and record are dated), and the Python-removal ledger, which names planned ports.
-const SKIP_FILE = [/^CHANGELOG\.md$/, /^docs\/internals\/inventory(-2)?\/D[^/]*\.md$/, /^docs\/internals\/python-removal\.md$/];
+// History by construction: the changelog and its pending entries, the one-file-per-row inventories
+// (each row's witness and record are dated), the dated refactor notes, and the Python-removal
+// ledger, which names planned ports.
+const SKIP_FILE = [/^CHANGELOG\.md$/, /^changelog\.d\/[^/]*\.md$/, /^docs\/internals\/refactor-notes\/\d{4}-[^/]*\.md$/, /^docs\/internals\/inventory(-2)?\/D[^/]*\.md$/, /^docs\/internals\/python-removal\.md$/];
 const SKIP_DIR = new Set([".git", ".claude", "node_modules", "target", "build", "reference", "cells", "named"]);
 const MENTION = /(?<![A-Za-z0-9_./-])scripts\/[A-Za-z0-9_./*{},<>-]*[A-Za-z0-9_*}>]/g;
 // A glob or a placeholder (`scripts/p7-*`, `named/d199_*.vl`, `<name>`) names a family, not a file.

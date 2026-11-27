@@ -3408,6 +3408,17 @@ function elabReadRowsStamp(k: i32) {
       if (elabCapRep[ix] ?? -1) < 0 { elabCapRep[ix] = rows[j] }
     }
   }
+  // A call returning such a read, or its own hole parameter given one, returns at the row.
+  for ix in elabCapTy.keys() {
+    const cn = nodeAt(ix)
+    if cn is Call && (elabWalkReadRows[ix] ?? -1) < 0 {
+      const r = elabCallReadRow(cn)
+      if r >= 0 {
+        elabWalkReadRows[ix] = r
+        if (elabCapRep[ix] ?? -1) < 0 { elabCapRep[ix] = r }
+      }
+    }
+  }
   // A record literal holding such a read is built with that field at the row.
   for ix in elabCapTy.keys() {
     const ln = nodeAt(ix)
@@ -3431,6 +3442,36 @@ function elabReadRowsStamp(k: i32) {
     if moved { elabCapRep[ix] = mkObjTy(lo.objFieldNames, fts) }
   }
   return 0
+}
+
+// The one row every value call `c`'s callee returns is stamped at (`elabWalkReadRows`): a read the
+// walk stamps, or a read of the callee's own un-annotated parameter whose argument is one; -1
+// otherwise. The callee is a named function or a binding of a lambda.
+function elabCallReadRow(c: Call): i32 {
+  const cf = parenPeelIx(c.callFn)
+  if cf < 0 || !(nodeAt(cf) is Ident) { return -1 }
+  const d = identDeclOf(cf)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const fx = if dn is LetDecl && dn.letType < 0 { parenPeelIx(dn.letInit) } else { d }
+  const fd = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+  if !(fd is FuncDecl) || fd.fnRet >= 0 { return -1 }
+  const vals: i32[] = []
+  a20RetWalk(fd.fnBody, true, vals)
+  let row = -1
+  for v in vals {
+    const pv = parenPeelIx(v)
+    let r = if pv >= 0 { elabWalkReadRows[pv] ?? -1 } else { -1 }
+    if r < 0 {
+      const i = if pv >= 0 && nodeAt(pv) is Ident { i32ListIndexOf(fd.fnParams, identDeclOf(pv)) } else { -1 }
+      const pn = if i >= 0 { nodeAt(fd.fnParams[i]) } else { null }
+      if pn is Param && pn.parType < 0 && i < c.callArgs.length {
+        r = elabWalkReadRows[parenPeelIx(c.callArgs[i])] ?? -1
+      }
+    }
+    if r < 0 || row >= 0 && r != row { return -1 }
+    row = r
+  }
+  return row
 }
 
 // Walks key `k`, with `k` the key every hole row its walk banks records.
@@ -19038,19 +19079,6 @@ export function elabSrcDecl(d: i32): i32 {
 // to, innermost last: a lambda arm's instance is the row's per frame, which only the emitter reads.
 const elabArmStageAt: i32[] = []
 const elabArmStageFe: i32[] = []
-
-// Answers `elabArmFeOf` for arm callee `at` with slot `fe` until the matching pop.
-export function elabArmStagePush(at: i32, fe: i32) {
-  elabArmStageAt.push(at)
-  elabArmStageFe.push(fe)
-  return 0
-}
-
-export function elabArmStagePop() {
-  elabArmStageAt.pop()
-  elabArmStageFe.pop()
-  return 0
-}
 
 // The closed signature dispatch arm call `call` calls its lambda at in frame `fnIx`: its arguments'
 // types to its own; -1 where one does not close. The arm's callee keeps the lambda's open type.

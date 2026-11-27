@@ -122,6 +122,17 @@ Deno.test("ir-identity --compare-errors: a witness refused for another reason re
   }
 });
 
+Deno.test("ir-identity --compare-errors: the same refusal at another position, or a holdout's, is informational", () => {
+  const moved = { ...ERRORS, "t/e1.vl": { rc: 1, err: "t/e1.vl:7:1: undeclared identifier 'x'" } };
+  const held = { ...ERRORS, "t/e1.vl": { rc: 1, err: "t/e1.vl:2:3: the compiler cannot yet lower this statement (c)" } };
+  for (const side of [moved, held]) {
+    const r = compare("--compare-errors", side, ERRORS);
+    if (r.code !== 0 || !r.text.includes("refusal text t/e1.vl (informational:")) {
+      throw new Error(`want t/e1.vl informational, got exit ${r.code}:\n${r.text}`);
+    }
+  }
+});
+
 Deno.test("ir-identity --compare-errors: under the byte gate, a witness both seeds build to other bytes reds", () => {
   const r = compare("--compare-errors", { ...ERRORS, "t/e3.vl": { rc: 0, wasm: "other" } }, ERRORS, "", true);
   if (r.code !== 1 || !r.text.includes("DIFF t/e3.vl\n")) {

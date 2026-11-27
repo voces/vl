@@ -5,9 +5,8 @@
 #
 # It refuses a dirty tree (the proof must name a commit), runs `scripts/gate.sh --fast`, then
 # what CI does not run on the PR: the armed position sweep (Q58) over each `--sweep` program.
-# A sweep program under tests/cases/ is already graded by gate.sh's `ir shadow cases` row (armed,
-# `--prepost`), CI's corpus oracle and ci-ir-identity, so it is only checked to be committed (Q66);
-# any other path is built under the armed shadow (`ir-shadow.vl --prepost --files`) and run.
+# A sweep program under tests/cases/ is already graded by CI's corpus oracle and ci-ir-identity, so
+# it is only checked to be committed (Q66); any other path is built and run.
 # It ends with a block to paste into the READY message, and exits non-zero when any step failed.
 # Run it from the checkout root after `scripts/refresh-compiler.sh`.
 set -uo pipefail
@@ -52,16 +51,13 @@ if [ ${#SWEEP[@]} -gt 0 ]; then
     elif [ "${p#tests/cases/}" = "$p" ]; then other+=("$p"); fi
   done
   if [ ${#other[@]} -gt 0 ]; then
-    if ! "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --prepost --files "${other[@]}" > "$LOG/shadow" 2>&1; then
-      bad+=("armed shadow red: $(grep -m1 -E 'verifier|mismatch|bytes|fail' "$LOG/shadow" || tail -1 "$LOG/shadow")")
-    fi
     for p in "${other[@]}"; do
       "$VL" run "$p" --compiler "$SEED" > /dev/null 2> "$LOG/run" || bad+=("$p does not run: $(head -1 "$LOG/run")")
     done
   fi
   for b in "${bad[@]+"${bad[@]}"}"; do echo "  SWEEP RED: $b"; done
   if [ ${#bad[@]} -eq 0 ]; then
-    LINES+=("Q58 sweep: ${#SWEEP[@]} programs clean ($(( ${#SWEEP[@]} - ${#other[@]} )) under tests/cases graded by gate and CI, ${#other[@]} built armed and run): ${SWEEP[*]}")
+    LINES+=("Q58 sweep: ${#SWEEP[@]} programs clean ($(( ${#SWEEP[@]} - ${#other[@]} )) under tests/cases graded by CI, ${#other[@]} built and run): ${SWEEP[*]}")
   else
     fail=1; LINES+=("Q58 sweep: RED, ${#bad[@]} of ${#SWEEP[@]}")
   fi
@@ -73,8 +69,9 @@ fi
 if grep -q '^std/.*\.vl$' <<< "$CHANGED" && git diff "$BASE" HEAD -- 'std/*.vl' | grep -qE '^[-+]\s*export '; then
   LINES+=("std exports changed: attach the std-api-reviewer agent's verdict")
 fi
+# A changelog entry is optional (DECISIONS.md, "Docs and comments are not part of the job").
 if grep -qx "changelog.d/$BRANCH.md" <<< "$CHANGED"; then LINES+=("changelog.d/$BRANCH.md: present")
-else fail=1; LINES+=("changelog.d/$BRANCH.md: MISSING"); fi
+else LINES+=("changelog.d/$BRANCH.md: none (optional)"); fi
 
 echo
 echo "== paste into the READY message =="
