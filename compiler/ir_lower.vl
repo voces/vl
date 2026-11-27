@@ -1108,18 +1108,14 @@ function repLocalValtype(r: i32, ty: i32): u8[] {
   }
   // A nullable record whose type names no interned row (a lambda's record result) is held at its
   // rep's own struct heap (`recHeapOf`, as the lowering notes it), nullable.
-  const rn = repNodeAt(r)
-  const rowless = d.rdNul == 1
-    && (k == "struct" || k == "nulstruct")
-    && (d.rdSlot < 0 || d.rdSlot >= sHeapIdx.length)
-  if rowless && rn is RNullable && repNodeAt(rn.rnInner) is RRecord {
-    const h = lw.irRecHeap[rn.rnInner] ?? recHeapOf(rn.rnInner)
-    if h >= 0 {
-      const p1 = wTarget(out)
-      fbRefNullValtype(h)
-      wTarget(p1)
-      return out
-    }
+  const h = rowlessRecHeap(r, ty)
+  if h >= 0 {
+    // Nullable even for a record that is never null: a join's out is set inside its arms, which
+    // wasm's set-before-get rule refuses for a non-null local; its reads recover it (`irLOpnd`).
+    const p1 = wTarget(out)
+    fbRefNullValtype(h)
+    wTarget(p1)
+    return out
   }
   // A nullable reference (its null the bottom ref) is held at its nullable valtype.
   const prev = wTarget(out)
@@ -1133,6 +1129,28 @@ function repLocalValtype(r: i32, ty: i32): u8[] {
 }
 
 // Whether variable `v` is a local (no parameter) held at a boxed nullable (discipline 4).
+// The struct heap a record rep `r`, plain or nullable, is held on where its type `ty` names no
+// interned row (a lambda's or a hole's record), from the rep (`recHeapOf`); else -1.
+function rowlessRecHeap(r: i32, ty: i32): i32 {
+  const d = repOfTy(if ty >= 0 { ty } else { repTyOf(r) })
+  const k = d.rdKind
+  if k != "struct" && k != "nulstruct" { return -1 }
+  if d.rdSlot >= 0 && d.rdSlot < sHeapIdx.length { return -1 }
+  const rn = repNodeAt(r)
+  const rec = if rn is RNullable { rn.rnInner } else { r }
+  if !(repNodeAt(rec) is RRecord) { return -1 }
+  return lw.irRecHeap[rec] ?? recHeapOf(rec)
+}
+
+// Whether variable `v` is a plain record local held nullable at its rep's heap (`rowlessRecHeap`).
+function rowlessRecLocal(v: i32): boolean {
+  if v < 0 || v >= lw.irVars.length || lw.irVars[v].vKind == "param" {
+    return false
+  }
+  const r = lw.irVars[v].vRep
+  return repNodeAt(r) is RRecord && rowlessRecHeap(r, lw.irVars[v].vTy) >= 0
+}
+
 function boxNulLocal(v: i32): boolean {
   if v < 0 || v >= lw.irVars.length || lw.irVars[v].vKind == "param" {
     return false
@@ -1216,7 +1234,7 @@ export function irLOpnd(o: Opnd) {
       if !urLocalRead(s) { fbLocalGet(s) }
       // A boxed nullable's local is declared nullable for its default; its value, a box whose
       // null is a tag, never is, and every other place holds it non-null.
-      if boxNulLocal(v) { fbRefAsNonNull() }
+      if boxNulLocal(v) || rowlessRecLocal(v) { fbRefAsNonNull() }
       // An arm-site payload standing for an element read banks that read's row (`emitIndexBanked`).
       const pk = lwPayloadVars.length - 1
       if pk >= 0 && v == lwPayloadVars[pk] && lwPayloadRows[pk] >= 0 {
