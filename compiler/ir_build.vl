@@ -4200,19 +4200,35 @@ function bindingStorage(d: i32, frame: i32, global: boolean): Storage {
   return storageOf(p)
 }
 
-// A binding today's decision `s` has no storage for is held at its initializer's own type, the
-// rep the value it is built from has; else `s`.
+// A binding is held at what its initializer builds where today's decision `s` has no storage or
+// an open one; else `s`.
 function buildStorage(p: SpBinding, s: Storage): Storage {
-  if s.stMiss == "" { return s }
   const d = p.spBinding
   const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(n is LetDecl) || n.letInit < 0 { return s }
-  const ty = heldTy(nodeTyAt(n.letInit, p.spFrame))
+  // A `let` holds every value written to it, so only a missing answer is its build's.
+  if s.stMiss == "" && (n.letKw != "const" || !irTyHeldOpen(s.stTy, s.stRep)) {
+    return s
+  }
+  const ty = initBuildTy(n.letInit, p.spFrame)
   const rep = repNodeOfTy(ty)
   if ty < 0 || isVoidTy(ty) || !valueRep(rep, ty) || irTyHeldOpen(ty, rep) {
     return s
   }
   return storageAt(rep, ty, -2)
+}
+
+// The type initializer `x` builds: a non-empty list literal whose elements share one type is a
+// list of that type, as its element reads are; else its own type.
+function initBuildTy(x: i32, frame: i32): i32 {
+  const own = heldTy(nodeTyAt(x, frame))
+  const lit = nodeAt(unwrapParen(x))
+  if !(lit is ArrayLit) || lit.arrElems.length == 0 { return own }
+  const et = heldTy(nodeTyAt(lit.arrElems[0], frame))
+  for e in lit.arrElems {
+    if nodeAt(e) is Spread || heldTy(nodeTyAt(e, frame)) != et { return own }
+  }
+  return if et >= 0 { listTyOfElem(et) } else { own }
 }
 
 function storageMiss(why: string): Storage {
@@ -5919,7 +5935,16 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       ib.irReadAgain[ix] = rc
       return irBLetTempTy(b, rc, ix, repNodeOfTy(pn), pn)
     }
-    if declined { return irBMiss("global read coercion") }
+    // Any other cell held at its storage is read there, then delivered by `irConvert`.
+    if declined {
+      const sto = bindingStorage(d, -1, true)
+      if sto.stMiss != "" || sto.stRep != cellRep {
+        return irBMiss("global read coercion")
+      }
+      const so = globalStoredRead(b, g, ix, cellRep, sto.stTy)
+      if ibMiss != "" { return so }
+      return irConvert(b, so, rep, heldTy(exprTyOf(ix)), ix)
+    }
     if stored {
       return globalStoredRead(b, g, ix, cellRep, heldTy(letBindTy(d, -1)))
     }
@@ -7052,6 +7077,12 @@ function globalStorage(d: i32): Storage {
   const r0 = globalTyRep(if ht >= 0 { ct } else { globalHeldTy(d) })
   const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, openCellRep(d, r0))) } else { r0 }
   if r < 0 { return storageMiss("global rep") }
+  // A list global whose storage row is another list, a wider record's, is held at that row.
+  const bt = if ht < 0 && repNodeAt(r) is RList { heldTy(letBindTy(d, -1)) } else { -1 }
+  const br = if bt >= 0 { globalTyRep(bt) } else { -1 }
+  if br >= 0 && br != r && repNodeAt(br) is RList {
+    return storageAt(br, bt, -1)
+  }
   return storageAt(r, globalStoreTy(d, r), -1)
 }
 
@@ -21775,7 +21806,9 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     return av
   }
   const noted = irGlobalRepOf(ib, gi)
-  const rep = if noted >= 0 { noted } else { openCellRep(gst, globalTyRep(globalHeldTy(gst))) }
+  // The cell's rep is its storage (`storageOf`), the build where the binding holds one.
+  const st = bindingStorage(gst, -1, true)
+  const rep = if noted >= 0 { noted } else if st.stMiss == "" { st.stRep } else { openCellRep(gst, globalTyRep(globalHeldTy(gst))) }
   if rep < 0 { return irBMiss("global initializer rep") }
   // A list literal whose binding's storage row (`letBindTy`, D14434) is another list, a wider
   // record's, is built at that row, which the cell then stores, in the start body as in a constant.
