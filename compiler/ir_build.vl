@@ -1496,7 +1496,6 @@ let ibDeclRowSeen = false
 let ibFnPos = -1
 // The returned record literal the result-row rule declined for a nested field at another rep of
 // its row, so the return's miss names that case; -1 when none.
-let ibRetNestedTwin = -1
 let ibMiss = ""
 // The innermost statement whose build set `ibMiss`, or -1.
 let ibMissAt = -1
@@ -11228,8 +11227,10 @@ function freshLitAt(ix: i32, dst: i32): boolean {
 // -1 where the slot names none, `ix` is not fresh, or it is already laid out at `st`.
 function freshRowAt(ix: i32, dst: i32, st: i32): i32 {
   if st < 0 || !freshLitAt(ix, dst) { return -1 }
-  // A literal already laid out at its slot's row is built as it stands.
-  return if objLitLayoutRowOf(unwrapParen(ix), ibFnIx) == st { -1 } else { st }
+  // A literal already laid out at its slot's row, at that row's own rep, is built as it stands.
+  const at = objLitLayoutRowOf(unwrapParen(ix), ibFnIx) == st
+    && rowRep(st) == dst
+  return if at { -1 } else { st }
 }
 
 // The struct row `deliverFresh` builds `ix` at for plain record rep `dst`, or -1: an object literal
@@ -20014,14 +20015,6 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     )
     const built = if rlr >= 0 { objLitAt(b, unwrapParen(n.retArg), ib.irRetRep, ib.irRetTy, rlr, false) } else { retCloAt(b, n.retArg) ?? retDelivered(b, n.retArg) }
     if ibMiss != "" { return 0 }
-    // A returned literal whose nested field sits at another rep of its row (D17385).
-    if (
-      ibRetNestedTwin >= 0
-      && ibRetNestedTwin == unwrapParen(n.retArg)
-      && convertKindOf(built, ib.irRetRep, ib.irRetTy, n.retArg) < 0
-    ) {
-      return skip("return coercion nested twin")
-    }
     const v = irConvert(b, built, ib.irRetRep, ib.irRetTy, n.retArg)
     if ibMiss != "" { return 0 }
     irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, ix)
@@ -20201,10 +20194,7 @@ function retDelivered(b: i32[], arg: i32): Opnd {
       && ibFnPos < fRetStructIdx.length
       && fRetKind[ibFnPos] == "struct") { fRetStructIdx[ibFnPos] } else { structIndexOfTy(ib.irRetTy) }
     if row >= 0 && row == rs {
-      if retLitFieldsAtTheirReps(ux, r, ib.irRetTy, row) {
-        return objLitAt(b, ux, r, ib.irRetTy, row, false)
-      }
-      ibRetNestedTwin = ux
+      return objLitAt(b, ux, r, ib.irRetTy, row, false)
     }
   }
   const v = deliver(b, arg, r, fu)
@@ -20212,28 +20202,6 @@ function retDelivered(b: i32[], arg: i32): Opnd {
     return boxTempIn(b, v, arg, r, -1, fu)
   }
   return retRecover(b, v, arg)
-}
-
-// Whether each struct literal among record literal `ix`'s field values (at row `row` of rep `r`,
-// type `ty`) is built at its field's own rep, or that rep's inner where the field is nullable: a
-// nested literal at another rep of the same row would take a retag the result does not owe.
-function retLitFieldsAtTheirReps(ix: i32, r: i32, ty: i32, row: i32): boolean {
-  const ks = repNodeKids(r)
-  let i = 0
-  while i < sFieldCount[row] {
-    const name = sFieldNames[sFieldStart[row] + i]
-    const v = unwrapParen(objFieldVal(ix, name))
-    if v >= 0 && nodeAt(v) is ObjLit && objLitArmOf(v, ibFnIx) == "struct" {
-      const k = repRecordKidOf(r, ty, name)
-      if k < 0 || k >= ks.length { return false }
-      const kn = repNodeAt(ks[k])
-      const want = if kn is RNullable { kn.rnInner } else { ks[k] }
-      const vr = sFieldRowRep(objLitLayoutRowOf(v, ibFnIx))
-      if vr < 0 || vr != want { return false }
-    }
-    i = i + 1
-  }
-  return true
 }
 
 // The struct row the result of this function is declared at (`fRetStructIdx`), where returned
@@ -20277,13 +20245,6 @@ function tagIdIntoClosure(valIx: i32, dst: i32): boolean {
     return false
   }
   return cloValueFeOf(u) >= 0
-}
-
-// The rep a struct literal laid out at row `row` is built at: the row's recorded type's, or -1.
-function sFieldRowRep(row: i32): i32 {
-  if row < 0 || row >= sTyIx.length { return -1 }
-  const rt = rowStoredTy(row)
-  return if rt >= 0 && rowTyBuildsAt(rt, row) { repNodeOfTy(rt) } else { -1 }
 }
 
 // Returned value `v` of `arg` at the result's rep where legacy's plain return writes a
@@ -20484,7 +20445,6 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ib.irEndPad = fnFallThroughPadOf(fnIx)
   ibFnIx = fnIx
   ibFnPos = fnPos
-  ibRetNestedTwin = -1
   ibDeclRowSeen = false
   ibCalleeParamAt = Map()
   ibCalleeParamFn = Map()
@@ -20832,7 +20792,6 @@ function ibRestore(f: IbFrame) {
   ib = f.bfIb
   ibFnIx = f.bfFnIx
   ibFnPos = f.bfFnPos
-  ibRetNestedTwin = -1
   ibDeclRowSeen = f.bfDeclRowSeen
   ibMiss = f.bfMiss
   ibMisses = f.bfMisses
@@ -21292,7 +21251,6 @@ function buildThunk(fe: i32): string {
   ib.irThunk = true
   ibFnIx = -1
   ibFnPos = -1
-  ibRetNestedTwin = -1
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
@@ -21425,7 +21383,6 @@ function buildEqHelp(si: i32): string {
   ib.irHelper = true
   ibFnIx = -1
   ibFnPos = -1
-  ibRetNestedTwin = -1
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
@@ -21531,7 +21488,6 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ib.irPoolFill = poolFill
   ibFnIx = -1
   ibFnPos = -1
-  ibRetNestedTwin = -1
   ibMiss = ""
   ibMissAt = -1
   ibStubRhs = -1
