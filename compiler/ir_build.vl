@@ -1390,24 +1390,31 @@ function isNumLit(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   if repPrim(irBOpRep(v)) == null {
     return irBMiss("is numeric literal operand rep")
   }
-  if !pl.nlOnce && pl.nlTexts.length > 1 {
+  let rv = v
+  // An immediate is written again per member as it stands.
+  if !pl.nlOnce && pl.nlTexts.length > 1 && !(v is OImm) {
     if !(v is OVar) || v.ov < 0 {
       return irBMiss("is numeric literal receiver")
     }
+    // Read once per member, so a temp the receiver cannot read again is held once in a local.
     if (
       ib.irVars[v.ov].vKind == "temp"
       && !recvReadsAgain(unwrapParen(n.isObj))
     ) {
-      return irBMiss("is numeric literal receiver")
+      const lv = irVarNew(ib, irBOpRep(v), ib.irVars[v.ov].vTy, "local", -1)
+      irBNode(b, { asDst: lv, asSrc: v }, -1, ibNoValue, n.isObj)
+      const lo: Opnd = { ov: lv }
+      rv = lo
     }
   }
-  return irBLetTemp(b, { niV: v, niAt: ix }, ix, rep)
+  return irBLetTemp(b, { niV: rv, niAt: ix }, ix, rep)
 }
 
 // `x is "lit"` on the `litMember` rung, as `emitLitMemberEq` writes it: the one string literal's
 // compare, which the literal arms' member test writes the same way. A number literal is a miss.
 function isLitMember(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
-  if !litMemberIsString(ix) { return irBMiss("is literal member number") }
+  // A number literal over a box compares the box's numeric arm and then its payload (`numBox`).
+  if !litMemberIsString(ix) { return isLitArmsTest(b, n, ix, rep, "numBox") }
   return isLitArmsTest(b, n, ix, rep, "memberEq")
 }
 
@@ -2022,16 +2029,36 @@ function isVariantRow(b: i32[], n: IsExpr, ix: i32, rep: i32, vi: i32): Opnd {
     const z: Opnd = { oiRep: rep, oiBits: 0 }
     return z
   }
-  // A chain staged into the shared slot (a receiver no re-readable place) stays legacy's.
-  if arm == "chain" && !unionEqOperandOk(n.isObj) {
-    return irBMiss("is variant row chain staged")
-  }
   if arm != "plainTag" && arm != "discrim" && arm != "chain" {
     return irBMiss("is variant row " + arm)
   }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
-  const v = irBExpr(b, n.isObj)
+  let v = irBExpr(b, n.isObj)
   if ibMiss != "" { return v }
+  // The discriminant and the chain cast a box, so a boxed nullable (its null a tag, its ref never
+  // null) is read at its box; and they read the receiver again, so a temp (a call, say) is held
+  // once in a local they read.
+  const vn = repNodeAt(irBOpRep(v))
+  if (
+    (arm == "discrim" || arm == "chain")
+    && vn is RNullable
+    && vn.rnDisc == 4
+    && repNodeAt(vn.rnInner) is RBox
+  ) {
+    const rc: Rhs = { rcV: v, rcAt: unwrapParen(n.isObj), rcNn: 1 }
+    v = irBLetTempTy(b, rc, ix, vn.rnInner, repTyOf(vn.rnInner))
+  }
+  if (
+    (arm == "discrim" || arm == "chain")
+    && v is OVar
+    && v.ov >= 0
+    && ib.irVars[v.ov].vKind == "temp"
+  ) {
+    const lv = irVarNew(ib, irBOpRep(v), ib.irVars[v.ov].vTy, "local", -1)
+    irBNode(b, { asDst: lv, asSrc: v }, -1, ibNoValue, n.isObj)
+    const lo: Opnd = { ov: lv }
+    v = lo
+  }
   if arm == "discrim" {
     // Read once per literal, so a variable; the cast to the arm's heap needs a non-null box.
     if !(v is OVar) || !(repNodeAt(irBOpRep(v)) is RBox) {
@@ -2863,15 +2890,15 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   const memTa = ta == "memStruct" || ta == "memVariant" || ta == "memNarrow"
   const tag = if ta == "identBox" || ta == "box" || memTa { isArmTagOf(ix, n, ibFnIx) } else if vi >= 0 && vi < uTags.length { uTags[vi] } else { -1 }
   storageReadLeave(mark)
-  // Any other rung is the ordinary one, its receiver read at the storage legacy marks.
-  if arm != "armTag" && arm != "variant" {
+  // Any other rung is the ordinary one, its receiver read at the storage legacy marks, as is a
+  // variant with no plain tag, whose row or chain the ordinary rung tests.
+  if arm != "armTag" && (arm != "variant" || tag < 0) {
     if arm == "notIs" { return irBMiss("is storage rung") }
     const om = storageReadEnter(n.isObj)
     const o = isRung(b, n, ix, rep, arm)
     storageReadLeave(om)
     return o
   }
-  if arm == "variant" && tag < 0 { return irBMiss("is variant shape") }
   if ta == "tagAbsent" { return isTagAbsentTest(rep) }
   if ta == "boxLitSet" {
     const lm = storageReadEnter(n.isObj)
@@ -14234,17 +14261,29 @@ function spreadLit(
   const at = b.length
   const srcs: Opnd[] = []
   const starts: i32[] = []
+  const done: i32[] = []
   let g = 0
   while g < grps.length {
     starts.push(b.length)
-    const v0 = spreadSrcBuild(b, p, g, grps[g], ix, rep)
+    const lit = unwrapParen(grps[g])
+    const fresh = i32ListHas(conv, g) && lit >= 0 && nodeAt(lit) is ArrayLit
+    const v0 = spreadSrcBuild(
+      b,
+      p,
+      g,
+      grps[g],
+      ix,
+      rep,
+      if fresh { lb } else { null },
+    )
+    if fresh && ibMiss == "" && irBOpRep(v0) == rep { done.push(g) }
     if ibMiss != "" { return v0 }
     // A source list whose rep is the literal's twin, or apart only in a hole, is the same list
     // retagged: the plan copies its elements raw, at one kind.
     const v = if irBOpRep(v0) != rep
       && (listRetag(irBOpRep(v0), rep) || holeRetagNoted(irBOpRep(v0), rep, true)) { repTemp(b, { rgV: v0 }, grps[g], rep) } else { v0 }
     // A converted group reaches the tail as a list at its own element rep, which the tail converts.
-    if i32ListHas(conv, g) && irBOpRep(v) == rep {
+    if i32ListHas(conv, g) && irBOpRep(v) == rep && !i32ListHas(done, g) {
       return irBMiss("array spread conversion")
     }
     if (
@@ -14286,6 +14325,7 @@ function spreadLit(
     spAt: ix,
     spBoxRow: -1,
     spOwn: atOwn,
+    spDone: done,
   }
   // A minted literal (a variadic push's run) has no checker type; it holds its build's. A literal
   // held at its laid-out row is typed at that row's list (`outTyOf`).
@@ -14373,6 +14413,7 @@ function spreadBoxedLit(
     spAt: ix,
     spBoxRow: row,
     spOwn: [],
+    spDone: [],
   }
   return irBLetTempTy(b, r, ix, lrep, lt)
 }
@@ -14416,6 +14457,7 @@ function spreadSrcBuild(
   src: i32,
   ix: i32,
   rep: i32,
+  atDest: ListBuild | null,
 ): Opnd {
   const lit = unwrapParen(src)
   if lit < 0 { return irBMiss("array spread source") }
@@ -14430,7 +14472,7 @@ function spreadSrcBuild(
     if lrep < 0 { return irBMiss("array spread literal source rep") }
     return arrayLit(b, ln, lit, lrep, tb, ba.baTy)
   }
-  const gb: ListBuild = { lbKind: p.spGroupKinds[g], lbSlot: p.spGroupRows[g] }
+  const gb: ListBuild = if atDest != null { atDest } else { { lbKind: p.spGroupKinds[g], lbSlot: p.spGroupRows[g] } }
   return arrayLit(b, ln, lit, rep, gb, exprTyOf(ix))
 }
 
@@ -16596,7 +16638,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     }
     // `-` and `~` over a `never` operand are legacy's i32, at the operand's own i32 (D14420).
     const unv = exprTyOf(n.unArg) == TY_NEVER
-    if unv && n.unOp == "!" { return irBMiss("not over a never operand") }
+    // `!` over a `never` operand never yields: the operand runs, then the dead value at `rep`.
+    if unv && n.unOp == "!" {
+      const na = irBExpr(b, n.unArg)
+      if ibMiss != "" { return na }
+      irBNode(b, { dpV: na }, -1, ibNoValue, ix)
+      return irBLetTemp(b, { dnAt: ix, dnPad: false }, ix, rep)
+    }
     // `-` over a two-base literal set is `0 - x` at `i64`, its box converted there first.
     if !unv && n.unOp == "-" && negIsLitSet(n.unArg, ibFnIx) {
       return litSetNeg(b, n, ix, rep)
