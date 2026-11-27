@@ -14,9 +14,10 @@ import {
   elabSpecSlotOfKey,
   idCanon,
   idSlotHeldTy,
+  idSlotTaggedTy,
 } from "./elab_fn_id"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
-import { recEnclosingFn } from "./check_fit_rules"
+import { recEnclosingFn, recRetSoleCall } from "./check_fit_rules"
 import {
   elabReadNames,
   mfrChainFns,
@@ -14504,6 +14505,7 @@ function monoHeldReadsBuiltAt(stored: i32[][], t: i32): boolean {
   for st in stored {
     const x = unwrapParen(st[0])
     const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if !monoWholeReadHeldAt(x, st[1], t) { return false }
     if n is ObjLit {
       for fx in n.objFields {
         const f = nodeAt(fx)
@@ -14530,6 +14532,24 @@ function monoHeldReadsBuiltAt(stored: i32[][], t: i32): boolean {
     }
   }
   return true
+}
+
+// Whether list element `x` of frame `ctx`, where it is an existing record (a binding read, or a
+// plain function's result), is held at record type `t`: the pin re-types neither, so the list
+// takes its elements' layout. A generic's result is its instance's literal, built at the pin.
+function monoWholeReadHeldAt(x: i32, ctx: i32, t: i32): boolean {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if n is Ident {
+    const rt = monoClosedReadTy(x, ctx, false)
+    return rt >= 0 && tySameSealed(rt, t)
+  }
+  const cf = if n is Call { n.callFn } else { -1 }
+  if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return true }
+  const fd = identFnDeclOf(cf)
+  const fn = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) || fn.fnTyParams.length > 0 { return true }
+  const ct = nodeTyIxOf(x)
+  return ct >= 0 && (!monoTyOpen(ct) || tySameSealed(ct, t))
 }
 
 // Records the list literal of record literals `rx` the un-annotated function `fnIx` returns, by
@@ -15213,6 +15233,32 @@ function monoPinReturnedObj(rx: i32, ctx: i32) {
   const rt = idSlotHeldTy(lx, ht, "L" + i32ToStr(lx))
   if rt >= 0 { return monoRecordObjLitAt(lx, rt, ctx) }
   monoObjLitFieldsPin(lx, ctx)
+  return 0
+}
+
+// Types the record literal initialising `let` `d` (declared at `at`) and each one re-pointed into
+// it at the binding's slot where only tagged sets' leaves change (`idSlotTaggedTy` keyed
+// `B<decl>`): a literal of a smaller set is built at the binding's ids, as the binding is held.
+function monoPinLetRecordLits(d: LetDecl, at: i32, ctx: i32) {
+  if monoFrameIsGenericInstance(ctx) { return 0 }
+  const lits: i32[] = []
+  const li = unwrapParen(d.letInit)
+  if li >= 0 && nodeAt(li) is ObjLit { lits.push(li) }
+  for w in monoWritesOf("n:", at) {
+    const wn = nodeAt(w)
+    const v = if wn is BinExpr { unwrapParen(wn.binRight) } else { -1 }
+    if v >= 0 && nodeAt(v) is ObjLit { lits.push(v) }
+  }
+  if lits.length < 2 { return 0 }
+  for lx in lits {
+    const rt = idSlotTaggedTy(
+      lx,
+      elabHeldValTy(lx, ctx),
+      nodeTyIxOf(lx),
+      "B" + i32ToStr(at),
+    )
+    if rt >= 0 { monoRecordObjLitAt(lx, rt, ctx) }
+  }
   return 0
 }
 
@@ -23838,6 +23884,7 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
   if n.letType < 0 {
     if monoPinListElems(n, ix, ctx) < 0 { return -1 }
   }
+  if n.letType < 0 && n.letKw == "let" { monoPinLetRecordLits(n, ix, ctx) }
   if n.letType < 0 && n.letInit >= 0 && nodeAt(n.letInit) is ObjLit {
     if n.letKw == "const" {
       if monoPinRecordFields(n, ix, ctx) < 0 { return -1 }
@@ -25572,7 +25619,12 @@ function monoRetFnListTy(x: i32, ctx: i32): i32 {
   const l = nodeAt(x)
   const it = monoFrameInstTmpl(ctx)
   const tmpl = if it[0] == ctx { it[1] } else { -1 }
-  const jt = if l is ArrayLit { elabRetTaggedJoinTy(x, ctx, tmpl) } else { -1 }
+  // A result and the literal it returns share one layout: with one call site, the destination's
+  // (D15900); with several, the joined result (D15226).
+  const away = l is ArrayLit
+    && recRetSoleCall(x) != x
+    && nodeRepTyIxOf(x) != nodeTyIxOf(x)
+  const jt = if l is ArrayLit && !away { elabRetTaggedJoinTy(x, ctx, tmpl) } else { -1 }
   if jt >= 0 {
     monoRecordJoinedLit(x, jt, ctx, 0)
     return monoListElemTy(jt)

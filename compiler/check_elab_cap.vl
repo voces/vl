@@ -103,6 +103,7 @@ import {
   Param,
   Paren,
   Program,
+  RetStmt,
   TypeRef,
   annTsOf,
   declExported,
@@ -2558,7 +2559,9 @@ function fnWriteLeavesAt(
   if cwSlotWrittenValues(cwKeyOfDecl(bd), path, vals, ats) < 0 { return -1 }
   let et = -1
   for v in vals {
-    if cwFnValueDeclOf(v) == d && !i32ListHas(out, v) {
+    // A call handing back its argument through a parameter it also calls writes that argument.
+    const wd = if cwFnValueDeclOf(v) >= 0 { cwFnValueDeclOf(v) } else { cwFnValueDeclOf(handBackCalledArgOf(v)) }
+    if wd == d && !i32ListHas(out, v) {
       if !fnWriteOnlyInto(v, s, path) { return -2 }
       out.push(v)
       et = elem
@@ -6000,4 +6003,74 @@ export function elabParamCopyOf(d: i32, fn: FuncDecl): i32 {
     cur = src
   }
   return -1
+}
+
+// The parameter every value `dn` returns reads where its every other read is the callee of a
+// call whose arguments do not read it; -1 otherwise. The tag plan's hand-back, not the checker's
+// (`handBackIx`), whose typing of those calls reads a parameter only returned.
+export function handBackCalledIx(dn: FuncDecl): i32 {
+  const vs = hbcReturnedValues(dn.fnBody)
+  let at = -1
+  for v in vs {
+    const x = parenPeelIx(v)
+    const i = if x >= 0 && nodeAt(x) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(x)) } else { -1 }
+    if i < 0 || at >= 0 && i != at { return -1 }
+    at = i
+  }
+  if at < 0 { return -1 }
+  const par = dn.fnParams[at]
+  const rets: i32[] = []
+  for v in vs { rets.push(parenPeelIx(v)) }
+  const todo: i32[] = [dn.fnBody]
+  const up: i32[] = [-1]
+  let called = false
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = up.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == par && !i32ListHas(rets, x) {
+        const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        if !(pn is Call) || parenPeelIx(pn.callFn) != x { return -1 }
+        called = true
+      }
+      for k in nodeChildren(x) {
+        todo.push(k)
+        up.push(x)
+      }
+    }
+  }
+  return if called { at } else { -1 }
+}
+
+// The argument call `x` hands back through a parameter its callee also calls
+// (`handBackCalledIx`), else -1.
+export function handBackCalledArgOf(x: i32): i32 {
+  const px = parenPeelIx(x)
+  const c = if px >= 0 && px < P.nodes.length { nodeAt(px) } else { nodeAt(0) }
+  if !(c is Call) { return -1 }
+  const d = identFnDeclOf(parenPeelIx(c.callFn))
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
+  const i = if dn is FuncDecl && dn.fnBody >= 0 { handBackCalledIx(dn) } else { -1 }
+  return if i >= 0 && i < c.callArgs.length { c.callArgs[i] } else { -1 }
+}
+
+// The values the `return` statements under `body` return, nested functions' excluded; [] where
+// one returns nothing.
+function hbcReturnedValues(body: i32): i32[] {
+  const out: i32[] = []
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is RetStmt {
+        if n.retArg < 0 { return [] }
+        out.push(n.retArg)
+      }
+      if !(n is FuncDecl) || x == body {
+        for k in nodeChildren(x) { todo.push(k) }
+      }
+    }
+  }
+  return out
 }
