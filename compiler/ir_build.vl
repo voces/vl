@@ -673,6 +673,7 @@ import {
   recCopyRowAt,
 } from "./emit_plan_coerce"
 import {
+  EmptyFitArmsPlan,
   EmptyFitPlan,
   NarrowedMapReadArm,
   arrElemNulSent,
@@ -680,7 +681,6 @@ import {
   coalDeadJoinIfOf,
   coalHoleMapIfOf,
   coalNullTestIf,
-  emptyFitArmsPlain,
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fnFallThroughPadOf,
@@ -1567,7 +1567,7 @@ function isEmptyFit(
   p: EmptyFitPlan,
 ): Opnd {
   if p.efArm == "union" { return isEmptyFitArms(b, n, ix, rep, p) }
-  const fit = if p.efArm == "shadow" { fitShadowVar(n, ix, p) } else { -1 }
+  const fit = if p.efArm == "shadow" { fitShadowVar(n, ix, p.efRecvTy, p.efDepth) } else { -1 }
   if ibMiss != "" { return irBMiss(ibMiss) }
   if p.efArm != "loop" && fit < 0 { return irBMiss("is empty fit " + p.efArm) }
   if p.efRepWhy != "" { return irBMiss("is empty fit rep") }
@@ -1584,12 +1584,12 @@ function isEmptyFit(
 // receiver local, made at the first such test in build order, which is legacy's emit order. Its
 // slot is the scratch local the lowering's store allocates. A pushing arm or a closure's
 // capture is a miss.
-function fitShadowVar(n: IsExpr, ix: i32, p: EmptyFitPlan): i32 {
+function fitShadowVar(n: IsExpr, ix: i32, recvTy: i32, depth: i32): i32 {
   const r = unwrapParen(n.isObj)
   if r < 0 || r >= P.nodes.length { return -1 }
   const rn = nodeAt(r)
   if !(rn is Ident) { return -1 }
-  const pl = listFitShadowPlanOf(ix, p.efRecvTy, p.efDepth, ibFnIx)
+  const pl = listFitShadowPlanOf(ix, recvTy, depth, ibFnIx)
   if pl < 0 {
     irBMiss("is empty fit shadow refused")
     return -1
@@ -1797,20 +1797,31 @@ function isEmptyFitArms(
   p: EmptyFitPlan,
 ): Opnd {
   const ap = emptyFitArmsPlanOf(ix, ibFnIx, p.efRecvTy)
-  if !ap.eaBoxed { return irBMiss("is empty fit nullable") }
-  if !emptyFitArmsPlain(ap) { return irBMiss("is empty fit union") }
+  // A row whose narrowed region reads its arm's list reads the arm's empty `K[]`, the shadow a
+  // bare receiver's test stores (`fitShadowVar`), stored before the rows.
+  const sd = if ap.eaWhy == "" { emptyFitShadowDepth(ap) } else { -1 }
+  const fit = if sd >= 0 { fitShadowVar(n, ix, p.efRecvTy, sd) } else { -1 }
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  if ap.eaWhy != "" || ap.eaRepWhy != "" || sd >= 0 && fit < 0 {
+    return irBMiss("is empty fit union")
+  }
   if rep != ibBool { return irBMiss("is result rep") }
   const v = irBExpr(b, n.isObj)
   if ibMiss != "" { return v }
-  if (
-    !(v is OVar)
-    || v.ov < 0
-    || ib.irVars[v.ov].vKind == "temp"
-    || !(repNodeAt(irBOpRep(v)) is RBox)
-  ) {
+  const vn = repNodeAt(irBOpRep(v))
+  const recvOk = if ap.eaBoxed { vn is RBox } else { vn is RNullable && repNodeAt(vn.rnInner) is RList }
+  if (!(v is OVar) || v.ov < 0 || ib.irVars[v.ov].vKind == "temp" || !recvOk) {
     return irBMiss("is empty fit receiver")
   }
-  return irBLetTemp(b, { lfV: v, lfAt: ix }, ix, rep)
+  return irBLetTemp(b, { lfV: v, lfAt: ix, lfFit: fit }, ix, rep)
+}
+
+// The depth of the first row of `p` whose region reads its arm's list, or -1 where none does.
+function emptyFitShadowDepth(p: EmptyFitArmsPlan): i32 {
+  for r in p.eaRows {
+    if r.erShadow { return r.erDepth }
+  }
+  return -1
 }
 
 // The variable a staged `is` receiver is read from while its rungs build (`isStagedTest`), or -1.
@@ -6302,9 +6313,16 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     && !boxed
     && rowTy < 0
     && !capCellListSame(fe, name, cr, rep)
+    && !capRecordListHeld(cr, rep)
   ) {
     return irBMiss("capture binding")
   }
+  const listHeld = cr != rep
+    && !narrowed
+    && !holed
+    && !boxed
+    && rowTy < 0
+    && capRecordListHeld(cr, rep)
   if rowTy >= 0 { return capturedAsHeld(b, fe, name, ix, cr, rowTy) }
   // The capture is held at its binding's type, or a walk variable's (`capLoopTyOf`), whose rep
   // must be the one it is read at first.
@@ -6334,8 +6352,12 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     if unbox { return captureUnbox(b, own, ix, rep, ak) }
     return captureRecover(b, own, ix, rep, na)
   }
-  const v = liftCapVar(fe, name, if unbox { -1 } else { rep })
-  const held = if atOwn { cr } else { rep }
+  const v = liftCapVar(
+    fe,
+    name,
+    if unbox { -1 } else if listHeld { cr } else { rep },
+  )
+  const held = if atOwn || listHeld { cr } else { rep }
   if v < 0 || ib.irVars[v].vRep != held { return irBMiss("capture binding") }
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
@@ -6489,6 +6511,19 @@ function captureRecover(
     return irBLetTempTy(b, r, ix, rep, recoveredReadTyOf(heldTy(exprTyOf(ix))))
   }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// Whether a capture held at list `cr` of records (or of such lists) is read as it is held where
+// its read asks for list `rep` of the same nesting at another row, as a local's read of its build
+// is (`builtHeldTy`).
+function capRecordListHeld(cr: i32, rep: i32): boolean {
+  const a = repNodeAt(cr)
+  const w = repNodeAt(rep)
+  if !(a is RList) || !(w is RList) { return false }
+  if repNodeAt(a.rlsElem) is RRecord && repNodeAt(w.rlsElem) is RRecord {
+    return true
+  }
+  return capRecordListHeld(a.rlsElem, w.rlsElem)
 }
 
 // Whether capture `name` of `fe`, held at list `cr`, is the list `rep` a read asks for: legacy's
