@@ -77,9 +77,9 @@ Why: [evidence](docs/internals/working-rules-evidence.md#disk).
 * **Byte identity is not a gate** (coordinator ruling, 2026-11-26); behaviour is, through each
   program's pinned output (the corpus oracle, the distilled corpus, the filed witnesses, the
   probes) and ready-check's sweep. A case that prints carries `@run`: `@log` alone is unread.
-* **The I8 holdouts** (`scripts/ir-i8-census/holdouts.tsv`): every program the IR does not claim
+* **The I8 holdouts** (`scripts/ir-i8-census/holdouts/`, one file per program): every program the IR does not claim
   yet, graded in every grader as an expected `cannot yet lower` refusal. The list only shrinks
-  (`tests/ir_holdouts_test.ts`); a holdout that is no longer refused reds until its line is
+  (`tests/ir_holdouts_test.ts`); a holdout that is no longer refused reds until its file is
   deleted, and a program off the list that stops running is a veto. A holdout family is closed by
   one general IR change the coordinator rules on first, never one claim per class (owner ruling,
   2026-11-26, DECISIONS.md).
