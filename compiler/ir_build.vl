@@ -9701,13 +9701,19 @@ function mapIterRhs(b: i32[], m: Member, ix: i32): Rhs {
   if ibMiss != "" { return missRhs("method operand") }
   const temp = v is OVar && v.ov >= 0 && ib.irVars[v.ov].vKind == "temp"
   const again = temp && recvReadsAgain(unwrapParen(m.memObj))
-  if !(v is OVar) || b.length != at && !temp {
+  // A receiver built into a local of its own (a `??`'s or a valued `if`'s out) is read from it
+  // each step, as a variable is.
+  const own = v is OVar
+    && !temp
+    && v.ov >= 0
+    && ib.irVars[v.ov].vKind == "local"
+  if !(v is OVar) || b.length != at && !temp && !own {
     return missRhs("map iter receiver")
   }
   if !(repNodeAt(irBOpRep(v)) is RMap) {
     return missRhs("map iter receiver rep")
   }
-  const once = temp && !again
+  const once = temp && !again || own && b.length != at
   const r: Rhs = {
     miV: v,
     miAt: ix,
@@ -13874,10 +13880,15 @@ function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
   ) {
     return missRhs("memory access short-circuit operand")
   }
-  // The address is an i32; a store's value is already at its width's prim, which legacy's
-  // widening then leaves as it stands.
+  // The address is an i32; a store's value is delivered at its width's prim, a narrower number
+  // widened into it as the checker permits.
+  const wt = if p.mxPrim == "i64" { irTyI64() } else if p.mxPrim == "f64" { irTyF64() } else { -1 }
+  if p.mxBase == 2 && wt >= 0 && repPrim(irBOpRep(args[1])) != p.mxPrim {
+    args[1] = irConvert(b, args[1], repNodeOfTy(wt), wt, ixs[1])
+  }
   if (
-    repPrim(irBOpRep(args[0])) != "i32"
+    ibMiss != ""
+    || repPrim(irBOpRep(args[0])) != "i32"
     || p.mxBase == 2 && repPrim(irBOpRep(args[1])) != p.mxPrim
   ) {
     return missRhs("memory access operand coercion")
@@ -21135,7 +21146,7 @@ function globalInitVariant(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     && recRetag(irBOpRep(v0), rep)
     && exprPrePathWhy(init, ibFnIx) == "") { repTemp(b, { rgV: v0 }, init, rep) } else { v0 }
   if ibMiss == "" && irBOpRep(v) != rep {
-    return irBMiss("global initializer variant coercion")
+    return irConvertStored(b, v, rep, ty, init)
   }
   return v
 }

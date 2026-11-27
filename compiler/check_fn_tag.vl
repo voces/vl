@@ -87,6 +87,7 @@ import {
   fnCloCoerceNote,
   fnCloCoerceSetNote,
   nodeCtxTyIxOf,
+  nodeRepStamped,
   nodeRepTyIxOf,
 } from "./check_core_state"
 import {
@@ -2522,14 +2523,23 @@ function ftLitAtClosed(x: i32, s: i32): boolean {
   if x < 0 || x >= P.nodes.length { return false }
   const n = nodeAt(x)
   if !(n is ArrayLit) || n.arrElems.length == 0 { return false }
-  // The binding's annotation, not the literal's own type, is where the records are built, and it
-  // must hold no set decided with `s`.
+  // The type the record solve stamped it at, else its binding's annotation, is where the records
+  // are built, not the literal's own type, and it must hold no set decided with `s`.
   cwIxBuild()
-  if !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_LETINIT { return false }
-  const b = cwIxUp[x]
-  const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { null }
-  if !(bn is LetDecl) || bn.letType < 0 || ftTyHoldsDecided(nodeTyIxOf(b), s) {
-    return false
+  const rep = ftLitStampedAt(x)
+  if rep >= 0 {
+    if ftTyHoldsDecided(rep, s) { return false }
+  } else {
+    if !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_LETINIT { return false }
+    const b = cwIxUp[x]
+    const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { null }
+    if (
+      !(bn is LetDecl)
+      || bn.letType < 0
+      || ftTyHoldsDecided(nodeTyIxOf(b), s)
+    ) {
+      return false
+    }
   }
   for e in n.arrElems {
     const o = nodeAt(e)
@@ -2562,12 +2572,16 @@ function ftLitAtClosed(x: i32, s: i32): boolean {
 
 // The record a record literal `x` is built at, bound by an annotated binding directly or as an
 // element of one list literal (`const ys: R[] = [{ f: m }]`, or the annotation a lone use gives
-// it), or -1 (D15338). A list of lists of such records is not built at its closures yet.
+// it), or stamped there by the record solve, or -1 (D15338). A list of lists of such records is
+// built at its closures only where the inner list is stamped.
 function ftLitAnnotAt(x: i32): i32 {
   cwIxBuild()
   let cur = x
   let depth = 0
   while depth < 2 {
+    // A literal stamped at another type is built at it, its elements at its element type.
+    const st = ftLitStampedAt(cur)
+    if st >= 0 { return ftTyElemDepth(st, depth) }
     if cur < 0 || !cwIxCovers(cur) { return -1 }
     const up = cwIxUp[cur]
     if up < 0 || up >= P.nodes.length { return -1 }
@@ -2580,21 +2594,53 @@ function ftLitAnnotAt(x: i32): i32 {
       && un is LetDecl
       && un.letType >= 0
     ) {
-      let t = nodeTyIxOf(up)
-      let k = 0
-      while k < depth {
-        if t < 0 || t >= T.tys.length { return -1 }
-        const tt = tyAt(t)
-        if !(tt is TyArray) { return -1 }
-        t = tyElemOf(tt)
-        k = k + 1
-      }
-      return t
+      return ftTyElemDepth(nodeTyIxOf(up), depth)
     } else {
       return -1
     }
   }
   return -1
+}
+
+// The type list literal `x` is built at when the record solve stamped it at a type other than its
+// own, or -1. A record literal's stamp is its shared row, whose fields this decision chooses
+// (D15641). A hole parameter's instance is keyed after the check, so a literal handed to one is
+// built at that instance's row, not the check's stamp.
+function ftLitStampedAt(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length || !nodeRepStamped(x) { return -1 }
+  if !(nodeAt(x) is ArrayLit) { return -1 }
+  if ftLitInHoleArg(x) { return -1 }
+  const r = nodeRepTyIxOf(x)
+  return if r != nodeTyIxOf(x) && !tySame(r, nodeTyIxOf(x)) { r } else { -1 }
+}
+
+// Whether literal `x`, or a list or record literal it is nested in, is handed to a hole parameter.
+function ftLitInHoleArg(x: i32): boolean {
+  cwIxBuild()
+  let c = x
+  let up = if cwIxCovers(c) { cwIxParent[c] } else { -1 }
+  while up >= 0 && up < P.nodes.length {
+    const un = nodeAt(up)
+    if !(un is ArrayLit || un is ObjLit || un is FieldInit) { break }
+    c = up
+    up = if cwIxCovers(c) { cwIxParent[c] } else { -1 }
+  }
+  const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+  return un is Call && un.callFn != c && ftHoleArg(un, c)
+}
+
+// The element type `depth` lists into type `t`, or -1 when `t` is not nested that deep.
+function ftTyElemDepth(t: i32, depth: i32): i32 {
+  let r = t
+  let k = 0
+  while k < depth {
+    if r < 0 || r >= T.tys.length { return -1 }
+    const rt = tyAt(r)
+    if !(rt is TyArray) { return -1 }
+    r = tyElemOf(rt)
+    k = k + 1
+  }
+  return r
 }
 
 // Whether `x` is a call handing back one of its arguments (`ftHandBackArg`), the initialiser of
