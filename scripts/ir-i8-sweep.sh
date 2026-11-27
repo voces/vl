@@ -256,7 +256,9 @@ VL
       END {
         n = FNR
         for (i = 1; i <= n; i++) if (i in del) {
-          j = i; while (j <= n && !(j > i && line[j] ~ /^}/)) { gone[j] = 1; j++ } ; gone[j] = 1
+          # A one-line function balances its braces on its header line.
+          t = line[i]; o = gsub(/\{/, "", t); c = gsub(/\}/, "", t)
+          if (o > 0 && o == c) { gone[i] = 1 } else { j = i; while (j <= n && !(j > i && line[j] ~ /^}/)) { gone[j] = 1; j++ } ; gone[j] = 1 }
           k = i - 1; while (k >= 1 && line[k] ~ /^\/\//) { gone[k] = 1; k-- }
         }
         for (i = 1; i <= n; i++) if (!(i in gone)) print line[i]
