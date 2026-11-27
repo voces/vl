@@ -7,7 +7,7 @@
 # <census-out> is census.sh's directory and <sweep-out> is `ir-i8-sweep.sh keep --out`'s, both on
 # the same tree. Rows: pop, program, first stub, unit, class, owner; a program with no census row
 # gets `-` for unit and class. A class is the miss with any `: detail` dropped, and every fallback
-# row is `claim fell back`. A class's owner is its mechanism family's (`family()` below) unless the
+# row is `claim fell back`. A class's owner is its mechanism family's (family.awk) unless the
 # registry names it; a `program:<path>` registry line overrides that for the program,
 # `program:<path>@<unit>` for one unit, and `fallback:<reason>` for a fallback whose reason (after
 # its last `emitProgram: `) it names. The summary line goes to stderr, with deltas against `--prev`.
@@ -24,11 +24,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 OWNERS=$(dirname "$0")/owners.tsv
+FAM=$(cat "$(dirname "$0")/family.awk")
 T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
 
 # Each unclaimed unit, keyed by its program's checkout-relative path (witnesses keep `wit/...`).
-cat "$CEN"/*.rows | awk -F'\t' -v w="$CEN/" '$3 ~ /^(fnu |claim fell back)/ {
+# A refusal a claim met is its unit's `fnr` (refused as expected) or `fnu` row, not a unit apart.
+cat "$CEN"/*.rows | awk -F'\t' -v w="$CEN/" '$3 ~ /^claim fell back: [a-z ]*a legacy helper refused in `/ && $3 !~ /^claim fell back: const cell / { next }
+  $3 ~ /^(fnu |claim fell back)/ {
   p = $1; sub(w, "", p); u = $3; c = $3
   if (u ~ /^fnu /) { sub(/^fnu /, "", u); sub(/ \|.*/, "", u); sub(/^[^|]*\| /, "", c) }
   else { u = "(fallback)"; sub(/^claim fell back: /, "", c) }
@@ -59,21 +62,11 @@ done < "$SW/failing.tsv"
   printf '# I8 red list%s: ir-i8-sweep (keep list) joined with the I8 census on one seed (red.sh).\n' \
     "${SHA:+ on master $SHA}"
   printf '# pop\tprogram\tfirst stub\tunit\tclass\towner\n'
-  awk -F'\t' -v OFS='\t' '
+  awk -F'\t' -v OFS='\t' "$FAM"'
     function cls(u, c) { if (u == "(fallback)") return "claim fell back"; sub(/: .*/, "", c); return c }
     # A fallback is keyed by its reason too: the text after its last `emitProgram: `, else after
     # `claim fell back: `, so the registry can route one reason apart from the class.
     function why(c) { if (match(c, /.*emitProgram: /)) return substr(c, RLENGTH + 1); sub(/^claim fell back: /, "", c); return c }
-    # The owner of a class the registry does not name, by its mechanism family (coordinator, 2026-11-26).
-    function family(k) {
-      if (k ~ /^convert /) return "COV-CALL"
-      if (k ~ /^local rep /) return "COV-START"
-      if (k ~ /^(is|box) /) return "COV-IS"
-      if (k ~ /(^|[ -])(coalesce|short-circuit|compare)( |$)/) return "COV-UNION"
-      if (k ~ /(^|[ -])(lambda|closure)( |$)/) return "COV-CLOS"
-      if (k ~ /^(global|if|assignment|operand) /) return "START-2"
-      return "CENSUS"
-    }
     FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF >= 2) own[$1] = $2; next }
     FILENAME == ARGV[2] { r[$1] = r[$1] $2 "\t" $3 "\n"; next }
     {

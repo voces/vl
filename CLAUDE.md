@@ -5,11 +5,11 @@ Repo-wide RULES only. The measurements and incidents behind each rule are in
 same headings. Subsystem detail lives in `docs/internals/`; `ROADMAP.md` owns the forward plan,
 `CHANGELOG.md` the shipped work, `DECISIONS.md` the non-obvious rationale.
 
-A refactor measurement goes in a new dated file under `docs/internals/refactor-notes/`, never into
-`architecture-target-2026-10.md`. **A PR adds only its own refactor note; the orchestrator folds
-notes into architecture-target's Status and the notes index.** That way lanes never conflict on a shared line.
-Likewise **a PR never edits `CHANGELOG.md`: it adds one `changelog.d/<branch>.md`** (`changelog.d/README.md`);
-the orchestrator folds them with `scripts/changelog-fold.vl`.
+A refactor note and a `changelog.d/<branch>.md` entry are **optional** (DECISIONS.md, "Docs and
+comments are not part of the job"). A refactor note, when written, is a new dated file under
+`docs/internals/refactor-notes/`, never `architecture-target-2026-10.md`. **A PR never edits
+`CHANGELOG.md`**; the orchestrator folds whatever `changelog.d/` entries and notes exist
+(`scripts/changelog-fold.vl`), so lanes never conflict on a shared line.
 
 ## Rulings — nothing waits on the owner
 
@@ -74,10 +74,14 @@ Why: [evidence](docs/internals/working-rules-evidence.md#disk).
 * What earns a place in the gate: `docs/internals/testing-strategy.md` — a check stays while it
   catches a breakage nothing else catches (kill matrix, `scripts/kill-matrix/`); a redundant one is
   deleted with its intent folded into a survivor.
-* **`scripts/gate.sh --fast` runs `tests/vl_ir_shadow_test.ts` on the tree's seed** (the full gate
-  runs it in `ci-native`), so a stale IR shadow expectation reds before the queue; no lane runs it
-  by hand. Its byte mismatches are informational: **byte identity is not a gate** (coordinator
-  ruling, 2026-11-26); behaviour parity is, through `ci-ir-identity` and ready-check's sweep.
+* **Byte identity is not a gate** (coordinator ruling, 2026-11-26); behaviour parity is, through
+  `ci-ir-identity` and ready-check's sweep.
+* **The I8 holdouts** (`scripts/ir-i8-census/holdouts.tsv`): every program the IR does not claim
+  yet, graded in every grader as an expected `cannot yet lower` refusal. The list only shrinks
+  (`tests/ir_holdouts_test.ts`); a holdout that is no longer refused reds until its line is
+  deleted, and a program off the list that stops running is a veto. A holdout family is closed by
+  one general IR change the coordinator rules on first, never one claim per class (owner ruling,
+  2026-11-26, DECISIONS.md).
 * **`scripts/gate.sh` runs the whole ladder and is the thing to run.** The full gate refuses inside
   `.claude/worktrees/` (override `GATE_IN_WORKTREE=1`) because the merge queue gates every PR;
   `--fast` runs anywhere. Fan-out caps: `GATE_MAX_PAR`, `GATE_MEM_BUDGET_MB`; WALL >> CPU in its
@@ -132,9 +136,6 @@ The parts:
   `scripts/self-compile-ledger.txt` (fuel, commit, PR, mechanism); a baseline the ledger's last line
   does not name reds. The coordinator rules on a drift refresh; past **+3%** cumulative it first
   attributes the rise to PRs by measurement and names that in the line (`merge-queue.md` §Fuel drift).
-* **Self-compile IR misses are gated:** `vl run scripts/self-ir-misses.vl -- --check` against
-  `scripts/self-ir-misses-baseline.txt` (0): a compiler function the IR builder misses reds; cover
-  it. `--write-baseline` only lowers the count.
 * **Late demands are gated:** `vl run scripts/late-demands.vl -- --check` against
   `scripts/late-demands-baseline.txt`. A rise fails; a fall passes and is named, and the PR that
   earned it runs `--write-baseline`, **written from a FIXPOINT seed** (refresh until a second

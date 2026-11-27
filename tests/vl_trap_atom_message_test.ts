@@ -7,6 +7,7 @@
 //
 // @test-timing native
 
+import { holdoutCheck } from "./support/holdouts.ts";
 import { COMPILER, exists, ROOT, seedEnv, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -19,7 +20,7 @@ Deno.test({
   name: "__trap__ of a literal-union atom prints its member text",
   ignore: !ENABLED,
   fn: async () => {
-    const { code, stdout } = await new Deno.Command(VL, {
+    const { code, stdout, stderr } = await new Deno.Command(VL, {
       args: [
         "run",
         `${ROOT}/tests/cases/traps/trap-atom-message.vl`,
@@ -38,6 +39,15 @@ Deno.test({
       clearEnv: true,
     }).output();
     const out = new TextDecoder().decode(stdout);
+    const held = holdoutCheck(
+      "tests/cases/traps/trap-atom-message.vl",
+      code !== 0,
+      new TextDecoder().decode(stderr),
+    );
+    if (held !== null) {
+      if (held !== "") throw new Error(held);
+      return;
+    }
     if (code === 0) {
       throw new Error(`want a trap, got exit 0; stdout ${JSON.stringify(out)}`);
     }
