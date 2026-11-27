@@ -7132,7 +7132,16 @@ function globalHeldTy(d: i32): i32 {
   const ht = globalHolderTy(d)
   if ht >= 0 { return ht }
   const rb = letRecBuiltTy(d, -1)
-  return if rb >= 0 { rb } else { scopeTyAt(d, -1) }
+  if rb >= 0 { return rb }
+  // A join of `null` and a read of a record the solve builds elsewhere is held at that build's
+  // nullable (`letBindTy`), as its arms are built.
+  const st = scopeTyAt(d, -1)
+  const dn = nodeAt(d)
+  const iv = if dn is LetDecl && dn.letInit >= 0 { nodeAt(unwrapParen(dn.letInit)) } else { null }
+  const lb = if iv is IfStmt { heldTy(letBindTy(d, -1)) } else { -1 }
+  const ln = if lb >= 0 && lb != st && !irTyOpen(lb) { repNodeAt(repNodeOfTy(lb)) } else { null }
+  const held = ln is RNullable && repNodeAt(ln.rnInner) is RRecord
+  return if held { lb } else { st }
 }
 
 // The type a module binding `d` holds a returned record at, as `irBDeclVar` holds a local's: the
@@ -13670,8 +13679,8 @@ function ifArmLeaves(n: IfStmt, out: i32[]): boolean {
   return true
 }
 
-// Value `if` `ix` of `null` and object literals already built at record `R`, delivered at `R | null`
-// rep `dst`: the `if` built there, its arms as they stand.
+// Value `if` `ix` of `null`, object literals already built at record `R` and other reads, delivered
+// at `R | null` rep `dst`: the `if` built there, each arm going in as a value into its join does.
 function recIfAtDst(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd | null {
   const u = unwrapParen(ix)
   const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
@@ -13687,11 +13696,15 @@ function recIfAtDst(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd | null {
   let nul = false
   for l in leaves {
     const ln = nodeAt(l)
-    if ln is ObjLit {
-      if exprRepOf(l) != rec { return null }
-      any = true
-    } else if ln is NullLit {
+    if ln is NullLit {
       nul = true
+    } else if (
+      ln is ObjLit && exprRepOf(l) == rec
+      || !(ln is ObjLit)
+        && repNodeAt(exprRepOf(l)) is RRecord
+        && exprPrePathWhy(l, ibFnIx) == ""
+    ) {
+      any = true
     } else {
       return null
     }
