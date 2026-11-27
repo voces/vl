@@ -46,7 +46,13 @@ import {
   luOvLocalLeave,
   optLeafArmOf,
 } from "./wasmEmit"
-import { atomPayloadTail, pushRecvCastOn, pushRecvCastSet } from "./wasmEmit"
+import {
+  atomPayloadTail,
+  cloDeclConstTail,
+  pushRecvCastOn,
+  pushRecvCastSet,
+  tagIdBoxTail,
+} from "./wasmEmit"
 import {
   armSiteRecv,
   capCellTargetOf,
@@ -183,6 +189,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RCloTag,
   RClosureEq,
   RCoalAtomStr,
   RCoalStr,
@@ -273,6 +280,7 @@ import {
   RStrToAtom,
   RStrToAtomStaged,
   RStructEq,
+  RTagClo,
   RTagIs,
   RTagOf,
   RTagStash,
@@ -356,6 +364,7 @@ import {
   fbI32WrapI64,
   fbI64Const,
   fbIf,
+  fbIfRef,
   fbIfRefNul,
   fbLocalGet,
   fbLocalIsUnsetRef,
@@ -932,6 +941,7 @@ import {
   bankedRowsDrop,
   callRefDepth,
   cloCellIdx,
+  cloStructIdx,
   ctrlDepth,
   dfeCallee,
   emitFnSpanEnd,
@@ -1707,6 +1717,8 @@ function rhs(r: Rhs, tail: boolean) {
       strToAtomStagedTail(r.zsAt, lw.irAt)
     }
     RMakeClo => makeClo(r)
+    RTagClo => tagClo(r)
+    RCloTag => cloTag(r)
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
     RInitProgress => irLMiss("init progress as a value")
@@ -2069,6 +2081,83 @@ function makeClo(r: RMakeClo) {
   }
   if nodeAt(r.mcAt) is Ident && readOwesNonNullRecover(r.mcAt, lw.irAt) {
     fbRefAsNonNull()
+  }
+  return 0
+}
+
+// `RTagClo`: a valued `if` per member, testing the id against the member's, each arm its closure;
+// the last member's test guards a trap. A boxed id's null is the closure's, tested first. A
+// `br_table` over dense ids would replace the chain.
+function tagClo(r: RTagClo) {
+  // The builder holds the id in a variable, so each test reads it again.
+  leaf()
+  const id: Opnd = r.tcV
+  if r.tcBox {
+    irLOpnd(id)
+    nulTestBoxTagTail(false)
+    fbIfRefNul(cloStructIdx, true)
+    fbRefNull(cloStructIdx)
+    fbElse()
+  }
+  for d in r.tcFns {
+    irLOpnd(id)
+    if r.tcBox { emitUnionUnboxTail(1) }
+    fbI32Const(d)
+    fbI32Bin(70) // 0x46 i32.eq
+    if r.tcBox { fbIfRefNul(cloStructIdx, true) } else { fbIfRef(cloStructIdx) }
+    emitClosureValueCore(fnStmtsPosOf(d), lw.irAt)
+    fbElse()
+  }
+  fbUnreachable()
+  return tagChainEnd(r.tcFns.length + (if r.tcBox { 1 } else { 0 }))
+}
+
+// `RCloTag`: a valued `if` per member, testing the closure's identity field against the
+// member's, each arm its id; the last member's test guards a trap. A nullable closure's null is
+// tested first, and a boxed result boxes each id.
+function cloTag(r: RCloTag) {
+  // The builder holds the closure in a variable; a nullable one's tag is boxed (the verifier's).
+  leaf()
+  const c: Opnd = r.ckV
+  if r.ckNul {
+    irLOpnd(c)
+    fbRefIsNull()
+    cloTagIfOpen(true)
+    nulNoneBoxHead()
+    fbRefNullNone()
+    nulNoneBoxTail()
+    fbElse()
+  }
+  for d in r.ckFns {
+    irLOpnd(c)
+    fbStructGet(cloStructIdx, 2)
+    cloDeclConstTail(fnStmtsPosOf(d))
+    fbI32Bin(70) // 0x46 i32.eq
+    cloTagIfOpen(r.ckBox)
+    if r.ckBox { tagIdBoxTail(d) } else { fbI32Const(d) }
+    fbElse()
+  }
+  fbUnreachable()
+  return tagChainEnd(r.ckFns.length + (if r.ckNul { 1 } else { 0 }))
+}
+
+// A valued `if` yielding a tagged id: the `i32 | null` box with `box`, else the i32.
+function cloTagIfOpen(box: boolean) {
+  if box {
+    fbOpenIf()
+    fbValtype("union", -1)
+  } else {
+    fbIf(127)
+  }
+  return 0
+}
+
+// Closes `n` nested valued `if`s.
+function tagChainEnd(n: i32) {
+  let k = 0
+  while k < n {
+    fbEnd()
+    k = k + 1
   }
   return 0
 }
