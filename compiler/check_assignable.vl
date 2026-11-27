@@ -284,6 +284,7 @@ import {
   rcwPend,
   recAdForce,
   recPendHeldInit,
+  recRetSoleCall,
   recordCopySafe,
   recordCtxTy,
   recordListCopy,
@@ -489,6 +490,7 @@ import {
   dstAdmitsF64,
   fnTyHasHole,
   numKindMask,
+  recFnValueLeaves,
 } from "./check_type_shape"
 import {
   PrimName,
@@ -2379,6 +2381,9 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       ) {
         return true
       }
+      // A fresh record, or list of them, holding a set where the destination closes the
+      // function fields is copied field by field there (D17764).
+      if fvaRecFnCopy(srcExpr, srcTy, dstTy) { return true }
       noteRefListView(srcExpr, srcTy, dstTy)
       recordListCopy(srcExpr, srcTy, dstTy)
       // D2060 — the record twin: a field widened by this delivery is shared with the source,
@@ -4696,6 +4701,100 @@ function fvaListBuiltAt(site: i32, de: i32): boolean {
   const r = nodeRepTyIxOf(v)
   const ra = if r >= 0 && r < T.tys.length { tyAt(r) } else { null }
   return ra is TyArray && tySame(tyElemOf(ra), de)
+}
+
+// A call `site` of record type `srcTy` whose function field holds a set or a hole function,
+// delivered to `dstTy` whose same field is a closed function type: `site` becomes `{ f: site.f }`,
+// a copy whose field is coerced there. Only a call of an
+// un-annotated function returning nothing but literals, with another call site, is fresh: one
+// call site builds the literal at its destination (D15900), and no other handle sees the copy.
+export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
+  if site < 0 || srcTy < 0 || dstTy < 0 || inferQuiet || monoRecheckDepth > 0 {
+    return false
+  }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length || fvaListCopyAt(site) {
+    return false
+  }
+  const sx = parenPeelIx(site)
+  const sn = nodeAt(sx)
+  if (
+    !(sn is Call)
+    || sn.callFn < 0
+    || sn.callFn >= P.nodes.length
+    || !(nodeAt(sn.callFn) is Ident)
+  ) {
+    return false
+  }
+  const fd = identFnDeclOf(sn.callFn)
+  const fn = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) || fn.fnRet >= 0 { return false }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length == 0 { return false }
+  for lf in leaves {
+    const l = parenPeelIx(lf)
+    const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+    if !(ln is ObjLit || ln is ArrayLit) || recRetSoleCall(l) != l {
+      return false
+    }
+  }
+  const sa = tyAt(nonNullTy(srcTy))
+  const da = tyAt(nonNullTy(dstTy))
+  const list = sa is TyArray && da is TyArray
+  const sr = if sa is TyArray { tyElemOf(sa) } else { nonNullTy(srcTy) }
+  const dr = if da is TyArray { tyElemOf(da) } else { nonNullTy(dstTy) }
+  if sr < 0 || dr < 0 || sr >= T.tys.length || dr >= T.tys.length {
+    return false
+  }
+  if list != (da is TyArray) || !fvaRecFieldsClose(sr, dr) { return false }
+  // A list's copy would go through `.map`, which does not yet coerce a set's field at its
+  // lambda's result (D17764); a record of one field is copied without one.
+  const dro = tyAt(dr)
+  if list || !(dro is TyObj) || dro.objFieldNames.length != 1 { return false }
+  const pos = nodePos(site)
+  const siteNode = nodeAt(site)
+  const moved = addNode(siteNode)
+  adoptNodeTok(moved, site)
+  const nm = dro.objFieldNames[0]
+  const rd = luAt(mkMember(moved, nm, pos), site)
+  const fs: i32[] = []
+  fs.push(luAt(mkFieldInit(nm, rd, pos), site))
+  const lit: Node = { objFields: fs, pos: pos }
+  arenaSetNode(site, lit)
+  fvaListCopyNote(site)
+  luGrow()
+  checkNodeHook(site)
+  return true
+}
+
+// Whether record `src` holds a set or hole function at a field record `dst` declares a closed
+// function type, the two records' field names alike.
+function fvaRecFieldsClose(src: i32, dst: i32): boolean {
+  const so = tyAt(src)
+  const d = tyAt(dst)
+  if (
+    !(so is TyObj)
+    || !(d is TyObj)
+    || so.objFieldNames.length != d.objFieldNames.length
+  ) {
+    return false
+  }
+  let any = false
+  let i = 0
+  while i < d.objFieldNames.length {
+    const k = strListIndexOf(so.objFieldNames, d.objFieldNames[i])
+    if k < 0 { return false }
+    const st = so.objFieldTypes[k]
+    const dt = d.objFieldTypes[i]
+    const dft = if dt >= 0 && dt < T.tys.length { tyAt(dt) } else { null }
+    const held = st >= 0
+      && st < T.tys.length
+      && (fnTagSetValueOfTy(st)
+      || fnTagSetOfTy(st) >= 0
+      || tyHasHole(st))
+    if dft is TyFunc && !tyHasHole(dt) && held && !tySame(st, dt) { any = true }
+    i = i + 1
+  }
+  return any
 }
 
 // Set while `fvaAdaptEnclosing` lets an adapter name the enclosing generic's type parameters.
