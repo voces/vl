@@ -51,10 +51,7 @@ if (GATED && !ENABLED) {
 }
 
 /** The rows whose flag is genuinely never reset on the start-fn side. */
-const OPEN = new Map([
-  ["fnUses.packedPush", "D1006"],
-  ["fnUses.mapVals", "D1007"],
-]);
+const OPEN = new Map<string, string>([]);
 
 const audit = async (
   args: string[],
