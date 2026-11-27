@@ -1771,8 +1771,9 @@ export function elabLateAt(i: i32, j: i32): i32 {
   return if i >= 0 && i < elabLateList.length && j >= 0 && j < elabLateList[i].length { elabLateList[i][j] } else { 0 }
 }
 
-function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
+function elabEnqueue(decl: i32, names0: string[], tys1: i32[], from: i32): i32 {
   if decl < 0 || !(nodeAt(decl) is FuncDecl) { return -1 }
+  const tys0 = elabHandBackDefaultTys(decl, names0, tys1)
   const names: string[] = []
   const tys: i32[] = []
   if !elabCanon(decl, names0, tys0, names, tys) { return -1 }
@@ -1836,6 +1837,75 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   ekDone.push(false)
   ekReach.push([])
   return k
+}
+
+// Binding `names`/`tys` of `decl` with the hole of the parameter it only hands back, where that
+// hole binds an open set of hole functions, closed at the members' default (`elabHoleSetDefaultTy`):
+// the call is keyed at its own argument, never at another call's signature.
+function elabHandBackDefaultTys(decl: i32, names: string[], tys: i32[]): i32[] {
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) || dn.fnBody < 0 { return tys }
+  const hb = elabHandBackIx(decl, dn)
+  const hp = if hb >= 0 && hb < dn.fnParams.length { nodeAt(dn.fnParams[hb]) } else { null }
+  if !(hp is Param) || hp.parType >= 0 { return tys }
+  let out = tys
+  let j = 0
+  while j < names.length && j < tys.length {
+    if elabParamNameOf(decl, names[j]) == hp.parName {
+      const c = elabHoleSetDefaultTy(tys[j])
+      if c != tys[j] {
+        if out == tys { out = tys.slice(0, tys.length) }
+        out[j] = c
+      }
+    }
+    j = j + 1
+  }
+  return out
+}
+
+// Function type `t` carrying a set of hole functions none of which has an instance, its signature
+// still open, closed at the members' default (each parameter hole at `i32`) with the same set;
+// else `t`.
+function elabHoleSetDefaultTy(t: i32): i32 {
+  if t < 0 || t >= T.tys.length || !tyHasTyVar(t) { return t }
+  const f = tyAt(t)
+  const ms = if f is TyFunc { elabFnSetOf(t) } else { [] }
+  if !(f is TyFunc) || ms.length == 0 { return t }
+  for m in ms {
+    if !elabIsHoleFn(m) || elabHasInstance(m) || elabCallsOwnParam(m) {
+      return t
+    }
+  }
+  const names: string[] = []
+  const tys: i32[] = []
+  for pt in f.fnParamTypes { bindGenWalk(pt, TY_I32, names, tys) }
+  const closed = substTyDeep(t, names, tys)
+  if closed < 0 || tyHasTyVar(closed) { return t }
+  return elabFnSetTyMint(closed, ms)
+}
+
+// Whether function `m`'s body calls one of its own parameters, which its `i32` default cannot be.
+function elabCallsOwnParam(m: i32): boolean {
+  const dn = nodeAt(m)
+  if !(dn is FuncDecl) || dn.fnBody < 0 { return false }
+  const todo: i32[] = [dn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x < 0 || x >= P.nodes.length { continue }
+    const n = nodeAt(x)
+    if n is Call {
+      const c = parenPeelIx(n.callFn)
+      if (
+        c >= 0
+        && nodeAt(c) is Ident
+        && i32ListHas(dn.fnParams, identDeclOf(c))
+      ) {
+        return true
+      }
+    }
+    for k in nodeChildren(x) { todo.push(k) }
+  }
+  return false
 }
 
 // Enqueues at the root the default instance (each parameter hole at `i32`) of each hole function
@@ -4156,14 +4226,10 @@ function elabDeliverParams(v: i32, pts: i32[], seen: i32[]) {
       const rets: i32[] = []
       a20RetWalk(dn.fnBody, true, rets)
       for r in rets {
-        // A returned parameter is this call's argument. Every other value the parameter is passed
-        // is instanced too, as a guess: another call's value, whose body need not check here.
+        // A returned parameter is this call's argument; another call's argument is its own call's.
         const a = elabRetParamArg(pn, dn, r)
         if a >= 0 {
           elabDeliverParams(a, pts, outer)
-          elabGuessing = true
-          elabDeliverParams(r, pts, seen)
-          elabGuessing = false
         } else {
           elabDeliverParams(r, pts, seen)
         }
