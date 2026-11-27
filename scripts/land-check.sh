@@ -28,8 +28,13 @@ for try in 1 2 3 4 5 6; do
 done
 bad=$(gh api "repos/voces/vl/commits/$sha/check-runs" --paginate \
   -q '.check_runs[] | select(.status != "completed" or (.conclusion != "success" and .conclusion != "skipped")) | .name')
-n=$(gh api "repos/voces/vl/commits/$sha/check-runs" -q '.total_count')
-[ "$n" -ge 20 ] || { echo "LAND-NO: only $n check runs on $sha (CI not started or partial)"; exit 1; }
+# CI has run to its end on this head: the jobs its paths trigger are the ones its workflow run
+# holds, so the run, not a fixed count, says whether CI is partial or not yet started.
+runs=$(gh api "repos/voces/vl/actions/runs?head_sha=$sha&event=pull_request" --paginate \
+  -q '.workflow_runs[] | select(.name == "CI") | .status + " " + (.conclusion // "none")')
+[ -n "$runs" ] || { echo "LAND-NO: no CI workflow run on $sha (not started, or a merge conflict)"; exit 1; }
+! printf '%s\n' "$runs" | grep -vqx 'completed success' \
+  || { echo "LAND-NO: CI on $sha is not a completed success:"; printf '%s\n' "$runs"; exit 1; }
 [ -z "$bad" ] || { echo "LAND-NO: checks not green on $sha:"; echo "$bad"; exit 1; }
 [ "$state" = clean ] || [ "$state" = unstable ] || { echo "LAND-NO: mergeable_state=$state"; exit 1; }
 git fetch -q origin master "refs/pull/$pr/head"
