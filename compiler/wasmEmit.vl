@@ -75,7 +75,6 @@ import {
   litRepTyAt,
   luOvEnter,
   luOvLeave,
-  luOvOn,
   readNarrowedStoreAt,
   storageReadEnter,
   storageReadLeave,
@@ -907,7 +906,6 @@ import {
   exprIsStrConcat,
   exprListRep,
   exprMap,
-  exprNulBool,
   exprNulClosure,
   exprNulKind,
   exprNulLitUnion,
@@ -1353,7 +1351,6 @@ import {
   msIsValueUnion,
   msMemberValKindsOf,
   msSetCarriesLitUnionArm,
-  nodeTyIsNulScalarBox,
   nodeTyMapKeyIsLitUnion,
   nulAtomTyMemoReset,
   nullBoxTag,
@@ -1532,7 +1529,6 @@ import {
   coalRetypedDeadJoinTy,
   coalSoleStmt,
   coalStashResidualKind,
-  coalStashTy,
   coalValUnionResidualKind,
   deadNullTestOperand,
   isListGetCall,
@@ -32410,24 +32406,6 @@ function coalJoinDefaultBoxes(joinTy: i32, defIx: i32, fnIx: i32): boolean {
   return exprVariantIndex(defIx, fnIx) >= 0
 }
 
-// Why the joining `l ?? d` over a nullable reference of heap `heapIx` is refused, or "": its union
-// has no row, no arm for the value's own type, or no arm for the default, or the function reserves
-// no stash for the operand.
-export function coalNulRefJoinWhy(e: BinExpr, heapIx: i32, fnIx: i32): string {
-  // The union the join's result boxes into is the one its default is delivered into
-  // (`boxDstNameAt`).
-  if boxDstNameAt(e.binRight, fnIx) == "" {
-    return "emitProgram: `??` joins a nullable value into a union the checker recorded no row for"
-  }
-  if coalNulRefJoinTag(e, heapIx, fnIx) < 0 {
-    return "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type"
-  }
-  if !coalJoinDefaultBoxes(boxDstTyOf(e.binRight, fnIx), e.binRight, fnIx) {
-    return "emitProgram: `??` default names no arm of the union its result is"
-  }
-  return ""
-}
-
 // The tag the present arm of a joining `l ?? d` boxes the operand of heap `heapIx` under.
 export function coalNulRefJoinTag(e: BinExpr, heapIx: i32, fnIx: i32): i32 {
   return coalNicheBoxTag(
@@ -32557,21 +32535,6 @@ export function coalNulRefHeapOf(
     // Their own lowerings: the `boolean | null` and atom niches, and the string core at `sTy()`.
     "nulBoolJoin" | "nulBool" | "litUnion" | "nulAtomStr" | "str" => -1
   }
-}
-
-// Whether `l ?? d` past `coalBoxArmOf`'s boxed arms reaches the nullable-reference rungs with no
-// arm between: a name, or a call that is no `boolean | null` or `string | null` niche
-// (`emitCoalesceCallNiche`), neither a field read nor a `?.` chain.
-export function coalNulRefRungReached(
-  e: BinExpr,
-  lhsIx: i32,
-  fnIx: i32,
-): boolean {
-  const l = nodeAt(lhsIx)
-  if l is Ident { return true }
-  return l is Call
-    && !exprNulBool(e.binLeft, fnIx)
-    && !exprNullableString(e.binLeft, fnIx)
 }
 
 // The `br_on_non_null` core of `l ?? d` along `coalNulRefHeapOf`'s heap `nrHeap`, its block shape
@@ -32849,16 +32812,6 @@ function coalLinkTyAt(link: i32, src: i32, fnIx: i32) {
   nodeTyRecord(link, nodeTyAt(src, fnIx))
 }
 
-// Whether a `closed` `??` (`coalArmOf`) widens its atom left operand to the `??`'s own rep, which
-// is no atom: the member string, or the box of a join with another type (D16530).
-export function coalClosedWidensAtom(
-  lhsIx: i32,
-  exprIx: i32,
-  fnIx: i32,
-): boolean {
-  return exprIsLitAtom(lhsIx, fnIx) && !exprIsLitAtom(exprIx, fnIx)
-}
-
 // `a ?? b ?? d` parses left-associative (`(a ?? b) ?? d`); `??` is associative, so the chain
 // re-associates to `a ?? (b ?? d)`, each left operand again a plain place. Mints and types the two
 // links for chain `e` (at `exprIx`) in function `fnIx`; returns the outer one, -1 for no chain.
@@ -32898,19 +32851,6 @@ function coalChainMint(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
 // The links `coalChainsPrime` minted for each chain ahead of the bodies: chain node to
 // `[fnIx, outer link, ...]`.
 let coalChainPre: {[i32]: i32[]} = Map()
-
-// The outer link minted ahead of the bodies for chain `exprIx` in function `fnIx`, or -1: it has
-// none, or a per-arm read override is active, under which the lowering mints its own.
-export function coalChainLinkOf(exprIx: i32, fnIx: i32): i32 {
-  if luOvOn != 0 { return -1 }
-  const rs = coalChainPre.get(exprIx) ?? []
-  let i = 0
-  while i + 1 < rs.length {
-    if rs[i] == fnIx { return rs[i + 1] }
-    i = i + 2
-  }
-  return -1
-}
 
 // Forgets the links minted for an earlier module's bodies.
 export function coalChainsReset() {
@@ -33166,24 +33106,6 @@ export function coalBoxEnd(
 // stash, a record field's union box (`coalFieldPlanOf`), else the optional chains and the rest.
 export type CoalNextArm = "nulRefs" | "callBool" | "callStr" | "field" | "opt"
 
-export function coalNextArmOf(
-  e: BinExpr,
-  lhsIx: i32,
-  exprIx: i32,
-  fnIx: i32,
-): CoalNextArm {
-  if coalNulRefRungReached(e, lhsIx, fnIx) { return "nulRefs" }
-  const lhs = nodeAt(lhsIx)
-  const cTy = coalStashTy(lhsIx)
-  const stashed = lhs is Call
-    || ((lhs is AsExpr || lhs is IfStmt)
-    && (tyIsNulValueUnionBox(cTy) || nodeTyIsNulScalarBox(lhsIx)))
-  if stashed && exprNulBool(e.binLeft, fnIx) { return "callBool" }
-  if stashed && exprNullableString(e.binLeft, fnIx) { return "callStr" }
-  const fp = coalFieldPlanOf(e, lhsIx, exprIx, fnIx)
-  return if lhs is Member && fp.cfArm != "none" { "field" } else { "opt" }
-}
-
 // The variant row the receiver of the field read `memIx` is narrowed to when that receiver is
 // a union box, or -1: the pairing `emitMem` reads through `emitNarrowedMem`.
 function coalNarrowedBoxArm(memIx: i32, fnIx: i32): i32 {
@@ -33259,16 +33181,6 @@ export function coalFieldPlanOfOpt(
   const lhs = nodeAt(lhsIx)
   if !(lhs is OptMember) || si < 0 { return coalFieldPlanNone() }
   return coalFieldPlanAt(e, lhsIx, lhs.omObj, lhs.omProp, -1, si, exprIx, fnIx)
-}
-
-// Whether `p?.f` (node `lhsIx`) reads a receiver the template typed with a type variable, which
-// an instance may hold at a concrete record (`coalFieldPlanOfOpt`).
-export function optRecvHoleTyped(lhsIx: i32): boolean {
-  if lhsIx < 0 || lhsIx >= P.nodes.length { return false }
-  const m = nodeAt(lhsIx)
-  if !(m is OptMember) { return false }
-  const recv = unwrapParen(m.omObj)
-  return recv >= 0 && recv < P.nodes.length && tyHasTyVar(nodeTyIxOf(recv))
 }
 
 function coalFieldPlanNone(): CoalFieldPlan {
@@ -33646,12 +33558,6 @@ export function optMapFieldHit(p: OptMapFieldPlan) {
   return 0
 }
 
-// Whether `emitCoalesceOptMember` passes `l ?? d` on to the nullable-reference rungs: its arm is
-// `next`, which an operand that is no `?.` always is.
-export function coalOptPassesToNulRefs(lhsIx: i32, fnIx: i32): boolean {
-  return coalOptArmOf(lhsIx, fnIx) == "next"
-}
-
 // Which arm `emitCoalesceOptMember` writes `p?.f ?? d` (`lhsIx`) along, in its order: a struct-
 // valued map's fused field read, a nullable record's or union arm's field, a nested chain's
 // leaf, a ref list's fused `.get` field, a call with no callee (`badCall`), else the next rungs.
@@ -33785,18 +33691,6 @@ export function coalNulRefsHeapOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     "mapHeap" => mapTypeIdxOf(coalNulMapShape(e, fnIx))
     "boxStash" | "pinnedCellIf" | "atomJoinIf" | "numJoinIf" | "armIf" | "boxFieldScalar" | "cellIf" | "atomJoinStash" | "none" => -1
   }
-}
-
-// Whether `l ?? d` on the `mapHeap` arm yields its default's wider map type (D15050's join), whose
-// shape is the operand's own map heap, so the core's block holds the result as it stands.
-export function coalNulMapJoinStoresAlike(
-  e: BinExpr,
-  exprIx: i32,
-  fnIx: i32,
-): boolean {
-  if coalNulRefsArmOf(e, exprIx, fnIx) != "mapHeap" { return false }
-  const js = mapShapeOfExpr(exprIx, fnIx)
-  return js != -3 && mapTypeIdxOf(js) == coalNulRefsHeapOf(e, exprIx, fnIx)
 }
 
 // The map shape a nullable map `l ?? d` reads, or -3 where it has none.
