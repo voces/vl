@@ -1,8 +1,7 @@
-// `$VL_IR_REQUIRE_CLAIM=1`: a function or start body the IR does not claim fails the build instead
-// of lowering through legacy. `$VL_IR_STRICT=1` cannot see such a unit, since a clean fallback
-// builds and runs. The decline is driven by `$VL_TEST_CLAIM_REFUSAL=1` (every claim refuses before
-// its body lowers), so the test does not depend on an open coverage gap; the control is the same
-// program with every claim taken. No assertion library, per CLAUDE.md.
+// A function or start body the IR does not claim fails the build: there is no other lowering, so
+// `$VL_IR_REQUIRE_CLAIM=1` changes nothing. The decline is driven by `$VL_TEST_CLAIM_REFUSAL=1`
+// (every claim refuses before its body lowers), so the test does not depend on an open coverage
+// gap; the control is the same program with every claim taken. No assertion library, per CLAUDE.md.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary + seed.
 //
@@ -52,28 +51,23 @@ const run = async (env: Record<string, string>): Promise<Res> => {
 };
 
 Deno.test({
-  name: "ir-require-claim: a declined unit fails, and only under the switch",
+  name: "ir-require-claim: a declined unit fails, with or without the switch",
   ignore: !ENABLED,
   fn: async () => {
     const declined = { VL_TEST_CLAIM_REFUSAL: "1" };
-    // Precondition: a declined unit builds through legacy and runs, which is what the switch refuses.
-    const fallback = await run(declined);
-    if (fallback.code !== 0 || fallback.out.trim() !== "3") {
-      throw new Error(
-        `want the legacy fallback to run and print 3, got rc ${fallback.code}: ${fallback.out}${fallback.err}`,
-      );
-    }
-    const refused = await run({ ...declined, VL_IR_REQUIRE_CLAIM: "1" });
-    if (refused.code === 0) {
-      throw new Error(
-        `want a declined unit refused under VL_IR_REQUIRE_CLAIM, got rc 0: ${refused.out}`,
-      );
-    }
-    // A claim that met a refusal fails with that refusal, verbatim; a miss would name the switch.
-    if (!refused.err.includes("test claim refusal before the body")) {
-      throw new Error(
-        `want the claim's own refusal, got: ${refused.err}`,
-      );
+    for (const sw of ["", "1"]) {
+      const r = await run({ ...declined, VL_IR_REQUIRE_CLAIM: sw });
+      if (r.code === 0) {
+        throw new Error(
+          `VL_IR_REQUIRE_CLAIM="${sw}": want a declined unit refused, got rc 0: ${r.out}`,
+        );
+      }
+      // A claim that met a refusal fails with that refusal, verbatim.
+      if (!r.err.includes("test claim refusal before the body")) {
+        throw new Error(
+          `VL_IR_REQUIRE_CLAIM="${sw}": want the claim's own refusal, got: ${r.err}`,
+        );
+      }
     }
   },
 });
