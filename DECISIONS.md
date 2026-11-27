@@ -11704,7 +11704,7 @@ emitted wherever it later meets the union. If the distance ever bites, that is t
 
 A literal delivered at an annotation of its own record type has been delivered, so the arm pass
 does not adopt it: `const xs: {r: null}[] = [{ r: null }]` beside `Circle` keeps `{r: null}`'s own
-row. An annotated type keeps its declared layout (coordinator ruling, 2026-11-27, D17738; unfiled: D17738 — filed with the D17728 PR).
+row. An annotated type keeps its declared layout (coordinator ruling, 2026-11-27, D17738).
 
 ## A value-fit list is not delivered at an instance (application of ruling (c), D4981, D5003)
 
