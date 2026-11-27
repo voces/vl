@@ -7109,6 +7109,9 @@ function elabResultScanReset() {
   elabSlotUnionAts = []
   elabSlotUnionCalls = []
   elabSlotUnionPicks = []
+  elabSlotUnionReaders = Map()
+  elabUnionCallMembers = Map()
+  elabUnionCallSlot = Map()
   return 0
 }
 
@@ -7976,12 +7979,19 @@ function elabSlotUnionNote(d: i32, vals: i32[]): i32 {
   if recs.length < 2 { return 0 }
   const global = elabEnclosingFn(d) == -1
     && (dn.letKw == "const" || !cwDeclAssigned(d))
+  const readers: i32[] = []
+  const rcalls: i32[] = []
   const ow = cwOccWalk(d)
   while cwOccNext(ow) {
     const k = cwIxKind[ow.row]
     const u = cwIxNode[ow.row]
     if k == CW_OCC_USE {
-      if !elabSlotUnionUseOk(u, global) { return 0 }
+      if (
+        !elabSlotUnionUseOk(u, global)
+        && !elabSlotUnionReadOk(u, recs, readers, rcalls)
+      ) {
+        return 0
+      }
     } else if k != CW_OCC_BIND && k != CW_OCC_ASG {
       return 0
     }
@@ -7990,6 +8000,14 @@ function elabSlotUnionNote(d: i32, vals: i32[]): i32 {
     elabRecTable.push(r)
     ats.push(elabRecTable.length - 1)
   }
+  // Each read's `const` holds the union; each call through it takes, per record, its member.
+  for g in readers { elabSlotUnionReaders[g] = elabSlotUnionDecl.length }
+  for t in rcalls {
+    const ms: i32[] = []
+    for r in recs { ms.push(elabCallSigMember(t, r)) }
+    elabUnionCallMembers[t] = ms
+    elabUnionCallSlot[t] = elabSlotUnionDecl.length
+  }
   elabSlotUnionDecl.push(d)
   elabSlotUnionAts.push(ats)
   elabSlotUnionCalls.push(calls)
@@ -7997,6 +8015,85 @@ function elabSlotUnionNote(d: i32, vals: i32[]): i32 {
   elabAnyRetRecord = true
   for v in vals { elabTriplePut(elabResKeeps, elabSlotValueCall(v), -1, 1) }
   return 0
+}
+
+// Whether use `u` of a map whose value slot is a union of records is an index or `get` read initialising a
+// `const` read in its own frame only by a null test or a call at a signature each of `recs` has a
+// member for; the `const` joins `readers` and its calls `calls`.
+function elabSlotUnionReadOk(
+  u: i32,
+  recs: i32[][],
+  readers: i32[],
+  calls: i32[],
+): boolean {
+  if !cwIxCovers(u) || cwUseInOtherFrame(u) || cwIxUpKind[u] != CW_UP_OBJ {
+    return false
+  }
+  // The read is an index, or a `get` call: the node whose value the `const` is initialised with.
+  const m0 = cwIxUp[u]
+  const mn = nodeAt(m0)
+  const getCall = mn is Member
+    && mn.memProp == "get"
+    && cwIxCovers(m0)
+    && cwIxUpKind[m0] == CW_UP_CALLEE
+  const m = if getCall { cwIxUp[m0] } else { m0 }
+  if !(mn is Index) && !getCall { return false }
+  if !cwIxCovers(m) || cwIxUpKind[m] != CW_UP_LETINIT { return false }
+  const g = cwIxUp[m]
+  const gn = nodeAt(g)
+  if !(gn is LetDecl) || gn.letKw != "const" || gn.letType >= 0 { return false }
+  const mine: i32[] = []
+  const gw = cwOccWalk(g)
+  while cwOccNext(gw) {
+    const k = cwIxKind[gw.row]
+    const x = cwIxNode[gw.row]
+    let t = -1
+    if k == CW_OCC_CALL {
+      t = x
+    } else if k == CW_OCC_USE {
+      if cwUseInOtherFrame(x) || !cwIxCovers(x) { return false }
+      if cwIxUpKind[x] == CW_UP_CMP { continue }
+      if cwIxUpKind[x] != CW_UP_CALLEE { return false }
+      t = cwIxUp[x]
+    } else if k == CW_OCC_BIND {
+      continue
+    } else {
+      return false
+    }
+    for r in recs {
+      if elabCallSigMember(t, r) < 0 { return false }
+    }
+    mine.push(t)
+  }
+  readers.push(g)
+  for t in mine { calls.push(t) }
+  return true
+}
+
+// Per `const` initialised with a read of a union-of-records map, that map's index in
+// `elabSlotUnionDecl`; per call through such a `const`, its member in each record.
+let elabSlotUnionReaders: {[i32]: i32} = Map()
+let elabUnionCallMembers: {[i32]: i32[]} = Map()
+let elabUnionCallSlot: {[i32]: i32} = Map()
+
+// The `const` bindings initialised with a read of union-of-records map `i`.
+export function elabSlotUnionReadersAt(i: i32): i32[] {
+  const out: i32[] = []
+  for g in elabSlotUnionReaders.keys() {
+    if (elabSlotUnionReaders.get(g) ?? -1) == i { out.push(g) }
+  }
+  return out
+}
+
+// The member call `t` through such a binding takes in each record, in the map's record order.
+export function elabUnionCallMembersOf(t: i32): i32[] {
+  return elabUnionCallMembers.get(t) ?? []
+}
+
+// The records, in the same order, that call `t` through a union-of-records binding chooses among.
+export function elabUnionCallRecsOf(t: i32): i32[][] {
+  const i = elabUnionCallSlot.get(t) ?? -1
+  return if i >= 0 { elabSlotUnionRecsAt(i) } else { [] }
 }
 
 // Whether use `u` of a map whose value slot is a union of records reads no value: a store's
