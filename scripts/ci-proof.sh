@@ -34,6 +34,7 @@ ROWS=(
   "corpus oracle"
   "rep-fuzz"
   "splice scan"
+  "ir debt"
 )
 
 case "${1:-}" in
