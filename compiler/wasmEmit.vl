@@ -420,7 +420,6 @@ import {
   armFieldNames,
   armPreludeBlocks,
   arrLitMint,
-  arrNewScratchBase,
   atomStageSlot,
   callRefDepth,
   capCountTbl,
@@ -439,8 +438,6 @@ import {
   coalDeadJoinIfs,
   coalLinkChains,
   coalNullTestIfs,
-  coalesceCallBoolSlot,
-  coalesceCallSlot,
   ctrlDepth,
   curBuf,
   emitCurFnPos,
@@ -577,11 +574,9 @@ import {
   listFitStoodTy,
   listGetDepth,
   listGetIdxOwner,
-  listGetIdxSlot,
   listGetIdxStagedIx,
   listGetIdxStagedSet,
   listGetRecvOwner,
-  listGetRecvSlot,
   listGetRecvStagedIx,
   listGetRecvStagedSet,
   listIdxScratchBase,
@@ -612,7 +607,6 @@ import {
   mvValKindAt,
   mvValName,
   mvValRep,
-  optRecvSlot,
   optRecvStagedIx,
   optRecvStagedSet,
   pkElemNameOfRow,
@@ -667,7 +661,6 @@ import {
   uVariants,
   unionSinkBase,
   variantHeap,
-  variantReboxSlot,
   variantRowOf,
 } from "./emit_state"
 import {
@@ -1260,6 +1253,7 @@ import {
 import {
   SCRATCH_BY_BOTH,
   SCRATCH_BY_KEY,
+  arrNewScr,
   asExprHoleNumOpt,
   asExprHoleNumSad,
   asExprNumCastDomain,
@@ -1268,6 +1262,7 @@ import {
   asExprNumTgtName,
   callRefNestSlot,
   cloEqScr,
+  coalCallScr,
   coalFieldRecvSlot,
   fcpSpillStashSlot,
   fnMvMapRefLocal,
@@ -1280,6 +1275,7 @@ import {
   leqRScr,
   leqSScr,
   leqgScr,
+  listGetScr,
   listIdxKindOf,
   listIdxWrapSlot,
   mapI32KeyLocal,
@@ -1290,6 +1286,8 @@ import {
   mfSrcLocalFor,
   nulRefNichePayloadTy,
   numCastStashSlot,
+  optRecvScr,
+  reboxScr,
   scratchSlot,
   sharedFieldRecvSlot,
   strScr,
@@ -2672,7 +2670,7 @@ export function variantCopyReReads(exprIx: i32, vi: i32, fnIx: i32): boolean {
 
 // A fresh record at the heap `dHeap`, whose fields are `dNames` at the flat field rows `dFieldRows`, built from
 // the record `exprIx` evaluates to at struct row `ssi`: field by field, each number converted
-// (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`,
+// (`i32` into `i64`). A source that cannot be re-read is evaluated once into `reboxScr()`,
 // already on the stack where `built`. `dRow` is the destination's struct row, or -1 for a variant row.
 function emitRecCopy(
   exprIx: i32,
@@ -2738,7 +2736,7 @@ function rcElemNone(): RcElem {
 
 let rcElem: RcElem = rcElemNone()
 
-// The value `exprIx` a copy reads, re-read or from `variantReboxSlot`, then each step of the path.
+// The value `exprIx` a copy reads, re-read or from `reboxScr()`, then each step of the path.
 function rcReadSource(
   _exprIx: i32,
   sHeap: i32,
@@ -2766,7 +2764,7 @@ function rcReadSource(
       return -1
     }
   } else {
-    fbLocalGet(variantReboxSlot)
+    fbLocalGet(reboxScr())
     fbRefCast(sHeap)
   }
   let k = 0
@@ -2913,7 +2911,7 @@ function rcHasNested(
 
 // Whether a copy of `exprIx` at source row `ssi` into `dNames`/`dFieldRows` re-reads its source
 // per field: a pure source, or a single field with no nested record. Otherwise it reads the value
-// once, into `variantReboxSlot`.
+// once, into `reboxScr()`.
 function rcReReadable(
   exprIx: i32,
   ssi: i32,
@@ -2952,11 +2950,6 @@ function emitRecCopyFields(
     )
   }
   if !reReadable {
-    if !fnUses.variantRebox {
-      return emitFail(
-        "emitProgram: a multi-field record from a call is copied with no scratch slot reserved",
-      )
-    }
     if (
       !built
       && emitFail(
@@ -2966,7 +2959,7 @@ function emitRecCopyFields(
     ) {
       return -1
     }
-    fbLocalSet(variantReboxSlot)
+    fbLocalSet(reboxScr())
   }
   rcElem.pathHeap = []
   rcElem.pathField = []
@@ -6858,7 +6851,7 @@ export function narrowedMemTail(vi: i32, idx: i32, memIx: i32, fnIx: i32) {
   return 0
 }
 
-// Is the `?.` chain base at `exprIx` the one currently staged in `optRecvSlot`?
+// Is the `?.` chain base at `exprIx` the one currently staged in `optRecvScr()`?
 export function optRecvStagedAt(exprIx: i32): boolean {
   if optRecvStagedIx < 0 { return false }
   return optRecvStagedIx == unwrapParen(exprIx)
@@ -6900,14 +6893,14 @@ function optRecvStageRestore(sv: i32[]) {
 
 // A staged `?.` receiver's value into its stash, kept on the stack.
 export function optRecvStashTee() {
-  fbLocalTee(optRecvSlot)
+  fbLocalTee(optRecvScr())
   return 0
 }
 
 // A staged `?.` receiver `exprIx` read back from its stash, cast (`asRef`) to its record's heap.
 // 0, or -1 for a receiver with no struct row.
 export function optRecvStashGet(exprIx: i32, fnIx: i32, asRef: boolean): i32 {
-  fbLocalGet(optRecvSlot)
+  fbLocalGet(optRecvScr())
   if !asRef { return 0 }
   return optRecvStashCast(exprIx, fnIx)
 }
@@ -7158,13 +7151,13 @@ function listGetStageMark(callIx: i32) {
 // The index stash of the `.get` at the current staging depth: depth 1's eager slot, a deeper
 // one's own lazy slot (code 54).
 function listGetIdxSlotNow(): i32 {
-  if listGetDepth <= 1 { return listGetIdxSlot }
+  if listGetDepth <= 1 { return listGetScr() }
   return scratchSlot(54, "list", listGetDepth, SCRATCH_BY_KEY)
 }
 
 // The receiver stash of the `.get` at the current staging depth (code 55 past depth 1).
 function listGetRecvSlotNow(): i32 {
-  if listGetDepth <= 1 { return listGetRecvSlot }
+  if listGetDepth <= 1 { return (listGetScr() + 1) }
   return scratchSlot(55, "list", listGetDepth, SCRATCH_BY_KEY)
 }
 
@@ -7201,9 +7194,6 @@ function emitListGetIdx(idxIx: i32, fnIx: i32) {
     }
     fbLocalGet(listGetIdxSlotNow())
     return 0
-  }
-  if !fnUses.listGet {
-    return emitFailAt("emitProgram: `.get` operand stash not reserved", idxIx)
   }
   if (
     emitFail(
@@ -7260,9 +7250,6 @@ function emitListGetRecv(objIx: i32, fnIx: i32, heap: i32) {
     }
     fbLocalGet(listGetRecvSlotNow())
   } else {
-    if !fnUses.listGet {
-      return emitFailAt("emitProgram: `.get` operand stash not reserved", objIx)
-    }
     if (
       emitFail(
         "emitProgram: internal: emitListGetRecv reached emitExpr, which the IR never takes",
@@ -32353,7 +32340,7 @@ export function arrNewPlanOf(callIx: i32, fill: i32, fnIx: i32): ArrNewPlan {
 // After an array-intrinsic site's length: the length stashed in the site's scratch slot, which a
 // site inside another site's fill takes one of its own depth for (D2333). Returns the slot.
 export function arrNewLenStash(): i32 {
-  let slot = arrNewScratchBase
+  let slot = arrNewScr()
   if arrNewFillDepth > 0 { slot = widenTmpSlot(0 - 1000 - arrNewFillDepth) }
   fbLocalSet(slot)
   return slot
@@ -32675,7 +32662,6 @@ export function coalNulRefJoinWhy(e: BinExpr, heapIx: i32, fnIx: i32): string {
   if !coalJoinDefaultBoxes(boxDstTyOf(e.binRight, fnIx), e.binRight, fnIx) {
     return "emitProgram: `??` default names no arm of the union its result is"
   }
-  if !fnUses.optRecv { return "emitProgram: `??` operand stash not reserved" }
   return ""
 }
 
@@ -32692,7 +32678,7 @@ export function coalNulRefJoinTag(e: BinExpr, heapIx: i32, fnIx: i32): i32 {
 // The head of a joining `l ?? d` once the operand is on the stack: staged in the `?.` receiver
 // slot, which the box arm reads back (D1714), its null test, and the `if` at the box.
 export function coalNulRefJoinOpen() {
-  fbLocalTee(optRecvSlot)
+  fbLocalTee(optRecvScr())
   fbRefIsNull()
   fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
 }
@@ -32701,7 +32687,7 @@ export function coalNulRefJoinOpen() {
 export function coalNulRefJoinPresent(tag: i32) {
   fbElse() // 0x05 else — present → the staged ref, boxed under its own arm's tag
   fbI32Rel(RS_TAG, tag)
-  fbLocalGet(optRecvSlot)
+  fbLocalGet(optRecvScr())
   fbStructNew(uBoxIdx) // { tag, the niche's own ref }
 }
 
@@ -33217,8 +33203,8 @@ function coalChainsWalk(ix: i32, fnIx: i32) {
 // default fills when the cell is `sent`.
 export function coalNicheOpen(sent: i32, reEval: boolean) {
   if !reEval {
-    fbLocalSet(coalesceCallBoolSlot)
-    fbLocalGet(coalesceCallBoolSlot)
+    fbLocalSet((coalCallScr() + 2))
+    fbLocalGet((coalCallScr() + 2))
   }
   fbI32Const(sent)
   fbI32Bin(70) // i32.eq
@@ -33228,7 +33214,7 @@ export function coalNicheOpen(sent: i32, reEval: boolean) {
 // A niche cell's present arm: the stashed operand unless `reEval`, whose caller re-reads it.
 export function coalNicheElse(reEval: boolean) {
   fbElse()
-  if !reEval { fbLocalGet(coalesceCallBoolSlot) }
+  if !reEval { fbLocalGet((coalCallScr() + 2)) }
 }
 
 // The local boxed `??` arm `arm` stashes its operand's box in, taken before the box is written,
@@ -33236,7 +33222,7 @@ export function coalNicheElse(reEval: boolean) {
 // for an operand that cannot be re-read, and -1 for a binding, re-read in place.
 export function coalBoxSlot(arm: CoalBoxArm): i32 {
   if arm == "elem" { return sharedFieldRecvSlot() }
-  if arm == "callBox" || arm == "callScalar" { return coalesceCallSlot }
+  if arm == "callBox" || arm == "callScalar" { return coalCallScr() }
   if arm == "valBox" || arm == "valScalar" { return -1 }
   // `boolPop`, `valNoKind`, `callNoKind` and `next` are no boxed arm.
   return emitFail("coalBoxSlot: `??` arm " + arm + " reads no box")

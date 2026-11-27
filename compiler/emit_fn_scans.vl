@@ -83,11 +83,6 @@ import {
   tyNulInnerTy,
   tyPrimNameOf,
 } from "./check_types"
-import {
-  listGetStagesOperand,
-  optChainStagesRecv,
-  recordFitIsStagesRecv,
-} from "./emit_atom_kinds"
 import { nulCloFlag, unwrapParen } from "./emit_base"
 import {
   fnStmtsPosOf,
@@ -101,7 +96,6 @@ import {
   catListKindOfExpr,
   catSameKind,
   catWidenSide,
-  coalesceNicheJoinsToBox,
   exprF32Array,
   exprF64Array,
   exprI64Array,
@@ -120,7 +114,6 @@ import {
   exprRefArray,
   exprString,
   exprStringArray,
-  exprStruct,
   exprU8Array,
   exprUnion,
   exprVariantIndex,
@@ -162,11 +155,7 @@ import {
   retValueExitCount,
   vtKindOfType,
 } from "./emit_nullable_rets"
-import {
-  exprReReadable,
-  tyArmPathIsMap,
-  tyArmPathIsMapList,
-} from "./emit_obj_lit_fits"
+import { tyArmPathIsMap, tyArmPathIsMapList } from "./emit_obj_lit_fits"
 import { ifArmValueExpr, paramTypeNodeOfRead } from "./emit_query"
 import { rlSlotIsKindList } from "./emit_ref_list_kinds"
 import {
@@ -179,19 +168,13 @@ import {
   rlElemKindAt,
   valueBoxOfTy,
 } from "./emit_rep"
-import {
-  coalesceChainLeftmost,
-  coalesceResultIsBox,
-  unionDeclTyIxOfExpr,
-  unionTyIxOfIdentAt,
-} from "./emit_start_block"
+import { unionDeclTyIxOfExpr, unionTyIxOfIdentAt } from "./emit_start_block"
 import {
   LBK_REF,
   RLK_I32_LIST,
   fRetKind,
   pkPushBit,
   rlElemTyIx,
-  sFieldCount,
   sHeapIdx,
   uDeclared,
   variantRowOf,
@@ -1018,188 +1001,10 @@ export function callSpillsFcpArg(ix: i32): boolean {
   return !(a is Ident)
 }
 
-// True if the expression at `exprIx` is a multi-field struct-returning call — a
-// non-re-readable source, since a call can't be re-evaluated per field — whose result
-// shape must be re-boxed into a variant-box union arm, the one case
-// `emitStructExprAsVariantBox` stashes in `variantReboxSlot`. Drives that slot's reservation.
-function exprIsMultiFieldReboxCall(exprIx: i32, fnIx: i32): boolean {
-  const inner = unwrapParen(exprIx)
-  if inner < 0 { return false }
-  const n = nodeAt(inner)
-  if !(n is Call) { return false }
-  if !exprStruct(inner, fnIx) { return false }
-  const ssi = structIndexOfExpr(inner, fnIx)
-  // `structIndexOfExpr` can return a variant index (its own heap table) for a variant-
-  // returning call, not a struct-table index. Bounded to the struct table so it's never
-  // misused as one — a variant-returning call never reboxes; it builds the variant directly.
-  if ssi < 0 || ssi >= sFieldCount.length { return false }
-  if sFieldCount[ssi] <= 1 { return false }
-  return structIdxHasReboxVariant(ssi)
-}
-
-// Does the single node at `ix` need the stash `want` names?
-function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
-  match want {
-    "rebox" => {
-      // A delivery copying a record it cannot re-read stages it in the same slot (`emitRecCopy`).
-      if recCopyTyOf(ix) >= 0 && !exprReReadable(unwrapParen(ix)) {
-        return true
-      }
-      // A list of records copied element by element stages each element there.
-      if listCopyTyOf(ix) >= 0 && listRecCopies > 0 { return true }
-      return exprIsMultiFieldReboxCall(ix, fnIx)
-    }
-    "optrecv" => {
-      if optChainStagesRecv(ix) { return true }
-      // A record-fit `is` over a receiver that is not a re-readable place stages it here too.
-      if recordFitIsStagesRecv(ix) { return true }
-      // The `??` niche join stages its operand in the SAME slot: it evaluates the nullable ref
-      // once, tests it and reads it back on the non-null path (D1714). Sharing the reservation
-      // is sound because the two never stage inside one another — a `?.` operand of a joining
-      // `??` has finished with its own base by the time the join tees over it.
-      if coalesceNicheJoinsToBox(ix, fnIx) { return true }
-      // A left-nested chain is re-associated at emit time, so any link may become a niche
-      // join the original nodes do not show; a boxed chain reserves the slot for all of them.
-      if !coalesceResultIsBox(ix, fnIx) { return false }
-      const cj = nodeAt(ix)
-      if cj is BinExpr {
-        return coalesceChainLeftmost(cj.binLeft) != unwrapParen(cj.binLeft)
-      }
-      return false
-    }
-    "listget" => {
-      return listGetStagesOperand(ix)
-    }
-  }
-}
-
 // The stash bits `blockStashMisses` takes and returns: 1 is "rebox", 2 "optrecv", 4 "listget".
 export const stashRebox = 1
 export const stashOptRecv = 2
 export const stashListGet = 4
-
-// Clears from `rem` each stash bit the single node at `ix` needs.
-function stashMissAt(ix: i32, fnIx: i32, rem: i32): i32 {
-  let r = rem
-  if (r & stashRebox) != 0 && stashHitAt(ix, fnIx, "rebox") {
-    r = r - stashRebox
-  }
-  if (r & stashOptRecv) != 0 && stashHitAt(ix, fnIx, "optrecv") {
-    r = r - stashOptRecv
-  }
-  if (r & stashListGet) != 0 && stashHitAt(ix, fnIx, "listget") {
-    r = r - stashListGet
-  }
-  return r
-}
-
-// The stash bits of `rem` no node in the tree at `ix` needs; a cleared bit means the function
-// reserves that slot. One walk answers all three, and a bit stops being asked once it clears.
-// Walks every statement and expression kind; under-reserving the rebox slot fails loudly and
-// the `?.` one is invalid wasm, so the walk over-approximates for both.
-export function blockStashMisses(ix: i32, fnIx: i32, rem: i32): i32 {
-  if ix < 0 || rem == 0 { return rem }
-  let r = stashMissAt(ix, fnIx, rem)
-  if r == 0 { return 0 }
-  const n = nodeAt(ix)
-  match n {
-    Call => {
-      r = blockStashMisses(n.callFn, fnIx, r)
-      const args = n.callArgs
-      let i = 0
-      while i < args.length && r != 0 {
-        r = blockStashMisses(args[i], fnIx, r)
-        i = i + 1
-      }
-    }
-    Block => {
-      const stmts = n.blkStmts
-      let i = 0
-      while i < stmts.length && r != 0 {
-        r = blockStashMisses(stmts[i], fnIx, r)
-        i = i + 1
-      }
-    }
-    LetDecl => {
-      r = blockStashMisses(n.letInit, fnIx, r)
-    }
-    RetStmt => {
-      r = blockStashMisses(n.retArg, fnIx, r)
-    }
-    IfStmt => {
-      r = blockStashMisses(n.ifCond, fnIx, r)
-      r = blockStashMisses(n.ifThen, fnIx, r)
-      // A tail call, so a long else-if chain costs no stack (D1990).
-      return blockStashMisses(n.ifElse, fnIx, r)
-    }
-    WhileStmt => {
-      r = blockStashMisses(n.whileCond, fnIx, r)
-      r = blockStashMisses(n.whileBody, fnIx, r)
-    }
-    ForRange => {
-      r = blockStashMisses(n.frFrom, fnIx, r)
-      r = blockStashMisses(n.frTo, fnIx, r)
-      r = blockStashMisses(n.frStep, fnIx, r)
-      r = blockStashMisses(n.frBody, fnIx, r)
-    }
-    ForIn => {
-      r = blockStashMisses(n.fiIter, fnIx, r)
-      r = blockStashMisses(n.fiBody, fnIx, r)
-    }
-    BinExpr => {
-      r = blockStashMisses(n.binLeft, fnIx, r)
-      r = blockStashMisses(n.binRight, fnIx, r)
-    }
-    Unary => {
-      r = blockStashMisses(n.unArg, fnIx, r)
-    }
-    Paren => {
-      r = blockStashMisses(n.parInner, fnIx, r)
-    }
-    IsExpr => {
-      r = blockStashMisses(isExprKid(n), fnIx, r)
-    }
-    AsExpr => {
-      r = blockStashMisses(n.asObj, fnIx, r)
-    }
-    Member => {
-      r = blockStashMisses(n.memObj, fnIx, r)
-    }
-    // A `?.` RECEIVER is lowered exactly as a `.` one is, so a stash needed under it belongs
-    // to the enclosing frame (D1667).
-    OptMember => {
-      r = blockStashMisses(n.omObj, fnIx, r)
-    }
-    Index => {
-      r = blockStashMisses(n.idxArr, fnIx, r)
-      r = blockStashMisses(n.idxIndex, fnIx, r)
-    }
-    ObjLit => {
-      const fields = n.objFields
-      let i = 0
-      while i < fields.length && r != 0 {
-        const f = nodeAt(fields[i])
-        if f is FieldInit { r = blockStashMisses(f.fiValue, fnIx, r) }
-        i = i + 1
-      }
-    }
-    // A spread's source is an operand like any other (D2334).
-    Spread => {
-      r = blockStashMisses(n.spdArg, fnIx, r)
-    }
-    ArrayLit => {
-      const elems = n.arrElems
-      let i = 0
-      while i < elems.length && r != 0 {
-        r = blockStashMisses(elems[i], fnIx, r)
-        i = i + 1
-      }
-    }
-    // Any other node holds no sub-tree this walk descends into.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl | LoopVar => {}
-  }
-  return r
-}
 
 // True if `stmtIx` ends an arm of a valued join: a tail value, or a `never` call, whose
 // `unreachable` satisfies any destination (D1972). `stmtIsTailValue` alone declines the call,
