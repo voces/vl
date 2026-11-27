@@ -13448,8 +13448,8 @@ issue #10525) proposes an order. Adopted now:
   `fn_ret_shadow.vl` is live.
 - **Spill a temp to a local** when it would otherwise be consumed out of legacy's byte order. Byte
   identity is not a gate (2026-11-26), so the stage nodes that exist only to keep that order go.
-  First the holdout population that refuses on stage or order is counted, which says how much this
-  buys.
+  Measured by CENSUS at d14b8a57: 0 lowering-side and 2 builder-side holdout programs refuse on
+  stage or order, so this is deferred to the IR-pass phase, where it is a pass prerequisite.
 - **Ratchet** the AST-backed `Rhs` kinds and the `irBMiss`/`missRhs`/`irLMiss` sites, so that a
   holdout close does not add a one-function `Rhs` kind. Either count may only fall.
 - **A verifier failure reads as an internal error**, not as `cannot yet lower`.
