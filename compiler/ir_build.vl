@@ -5468,6 +5468,22 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return o
 }
 
+// The one number arm of union rep `rep` (a box's, or a boxed nullable's inner), or -1 where it
+// holds none or several.
+function litNumArmRep(rep: i32): i32 {
+  const n = repNodeAt(rep)
+  const arms = if n is RNullable { [n.rnInner] } else if n is RBox { n.rbArms } else { [] }
+  let one = -1
+  for a in arms {
+    const k = repPrim(a) ?? ""
+    if k == "i32" || k == "i64" || k == "f32" || k == "f64" {
+      if one >= 0 { return -1 }
+      one = a
+    }
+  }
+  return one
+}
+
 // Number literal `n` at `ix` as an immediate at rep `rep`, where its own width is that rep's.
 function numLit(n: NumLit, ix: i32, rep: i32): Opnd {
   const k: string = repPrim(rep) ?? ""
@@ -6346,6 +6362,10 @@ function capTyOf(fe: i32, name: string): i32 {
   // holds the local (`holderMemberTy`).
   const hm = if nodeAt(d) is LetDecl && (elabHasRetRecords() || bundleAnyNoted()) { holderMemberTy(d, frame) } else { -1 }
   if hm >= 0 && !irTyOpen(hm) { return hm }
+  // A `let` stored as another record, arm or list than its own type (`letBindTy`) is captured as
+  // what its cell holds.
+  const lb = if nodeAt(d) is LetDecl { heldTy(letBindTy(d, frame)) } else { -1 }
+  if lb >= 0 && lb != ty && !irTyOpen(lb) { return lb }
   // An instance's parameter carries its key's annotation; its source's tells a hole parameter.
   const sd = nodeSrc[d] ?? d
   const pd = if sd >= 0 && sd < P.nodes.length { nodeAt(sd) } else { null }
@@ -10028,6 +10048,10 @@ function mapSetValue(
   if !(mr is RMap) { return irBMiss("map store receiver rep") }
   // A `null` into an atom- or `boolean | null`-valued map is that value's sentinel, as legacy
   // writes it (`-1`, `2`: `emitNullOwn`'s).
+  // A `null`-valued map holds every value as its i32 sentinel, as a `null[]` does.
+  if arm == "boolNull" && repPrim(mr.rmVal) == "null" {
+    return nulSentinelStore(b, val, repNodeOfTy(TY_I32))
+  }
   if arm == "atomNull" || arm == "boolNull" {
     const own = if arm == "atomNull" { NULL_OWN_ATOM } else { NULL_OWN_BOOL }
     if !nullOwnRepFits(own, mr.rmVal) {
@@ -11178,6 +11202,8 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
       TY_NEVER,
     )
   }
+  const fl = if ibMiss == "" && dst >= 0 { freshListAt(b, ix, dst, dstTy) } else { null }
+  if fl != null { return fl }
   // A `??` whose own type has no rep (a link legacy mints) is built at the destination's rep, as
   // legacy writes it at the kind its consumer asks.
   const du = unwrapParen(ix)
@@ -13490,6 +13516,58 @@ function listCopyStmt(b: i32[], n: Call, ix: i32): i32 {
   return 0
 }
 
+// List literal `ix` built at the list `dst` (type `dstTy`) it is delivered into, where that list's
+// element is the nullable of the literal's own: each element goes in as a nullable does. Null where
+// it is not such a literal.
+function freshListAt(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd | null {
+  const u = unwrapParen(ix)
+  const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if (
+    !(n is ArrayLit)
+    || n.arrElems.length == 0
+    || exprPrePathWhy(u, ibFnIx) != ""
+  ) {
+    return null
+  }
+  const lb = arrLitListBuild(u, ibFnIx)
+  if arrLitArmOf(u, ibFnIx, lb) == "spread" { return null }
+  const abt = arrLitBuiltTyOf(u, ibFnIx)
+  if (
+    abt < 0
+    || irTyOpen(abt)
+    || !elemsGoNullableInto(n.arrElems, dst, repNodeOfTy(abt))
+  ) {
+    return null
+  }
+  return arrayLit(
+    b,
+    n,
+    u,
+    dst,
+    lb,
+    if dstTy >= 0 { dstTy } else { repTyOf(dst) },
+  )
+}
+
+// Whether list rep `dst`, apart from the built list `src`, holds a nullable element each of
+// `elems` goes into by an `irConvert` case from its own rep.
+function elemsGoNullableInto(elems: i32[], dst: i32, src: i32): boolean {
+  const d = repNodeAt(dst)
+  if dst == src || !(d is RList) || !(repNodeAt(d.rlsElem) is RNullable) {
+    return false
+  }
+  for e in elems {
+    const v: Opnd = { oiRep: exprRepOf(e), oiBits: 0 }
+    if (
+      irBOpRep(v) < 0
+      || irBOpRep(v) != d.rlsElem && convertKindOf(v, d.rlsElem, -1, e) < 0
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
 // A list literal along legacy's short build (`arrLitArmOf`, `arrLitShortWhy`): an i32, f64, i64, f32,
 // string, packed, v128 or plain ref list, each element delivered at the list's element rep. Every other
 // arm is a named miss.
@@ -13579,6 +13657,7 @@ function arrayLit(
   const ep = repPrim(er) ?? ""
   const forIter = arrLitIsForIter(ix)
     && (ep == "i32" || ep == "i64" || ep == "f32" || ep == "f64")
+  const chunked = arm == "ref" && n.arrElems.length > allocLitChunk()
   for e in n.arrElems {
     const at = b.length
     starts.push(at)
@@ -13613,18 +13692,19 @@ function arrayLit(
     if irBOpRep(vc) != er { return irBMiss("array element coercion") }
     // An element written before a valued `if` is staged below it, as a call's argument is; the
     // check runs over the element's conversion too, whose nodes may write one.
-    if elems.length > 0 && !irBStageLeads(b, at, starts, elems, n.arrElems) {
+    if (
+      !chunked
+      && elems.length > 0
+      && !irBStageLeads(b, at, starts, elems, n.arrElems)
+    ) {
       return irBMiss("short-circuit array element after another")
     }
     elems.push(vc)
   }
-  // A chunked ref list writes each chunk's flush between its elements, which a valued `if`'s out,
-  // waiting on the stack below the elements after it, cannot cross.
-  if (
-    arm == "ref"
-    && starts.length > allocLitChunk()
-    && ifBelowLeadHas(b, starts[0], b.length)
-  ) {
+  // A chunked ref list writes each chunk's flush between its elements, which no value may wait on
+  // the stack across: an element holding a statement is held in a local, and those before it
+  // spilled (`holdCallOperands`).
+  if chunked && !holdCallOperands(b, starts, elems, n.arrElems) {
     return irBMiss("chunked list valued element")
   }
   const r: Rhs = {
@@ -16757,6 +16837,18 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   }
   if rep < 0 {
     return repMissAt(ix, "rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
+  }
+  // A signed literal an instance's pin stamps at a union (`dstRetypeLitArgs`) is built at the
+  // union's one number arm and boxed under it.
+  const litArm = if isSignedNumLit(ix) { litNumArmRep(rep) } else { -1 }
+  if litArm >= 0 {
+    return irConvert(
+      b,
+      signedLitAt(unwrapParen(ix), litArm),
+      rep,
+      nodeTyAt(ix, ibFnIx),
+      ix,
+    )
   }
   if n is NumLit { return numLit(n, ix, rep) }
   if n is BoolLit {

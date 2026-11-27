@@ -8,9 +8,11 @@ import { f32Bytes, f64Bytes, gIeeeOverflow } from "./emit_bignum"
 import { relCopy, relNote, relTrim } from "./emit_reloc"
 import { i32ListHas } from "./listutil"
 import {
+  ARRNEW_FRAME,
   ByteChunk,
   ByteRope,
   CLOEQ_FRAME,
+  COALCALL_FRAME,
   FC_CLOSURE,
   FC_F32,
   FC_F32_LIST,
@@ -51,21 +53,20 @@ import {
   LEQI_FRAME,
   LEQR_FRAME,
   LEQS_FRAME,
+  LISTGET_FRAME,
   ListKind,
   MAP_FRAME,
+  OPTRECV_FRAME,
   PK_I16,
   PK_I8,
+  REBOX_FRAME,
   STR_FRAME,
   VKind,
   W,
   aTy,
-  arrNewScratchBase,
   atomStageSlot,
   callRefDepth,
   cloStructIdx,
-  coalesceCallBoolSlot,
-  coalesceCallSlot,
-  coalesceCallStrSlot,
   ctrlDepth,
   curBuf,
   dfeCallee,
@@ -123,11 +124,9 @@ import {
   listFitStoodTy,
   listGetDepth,
   listGetIdxOwner,
-  listGetIdxSlot,
   listGetIdxStagedIx,
   listGetIdxStagedSet,
   listGetRecvOwner,
-  listGetRecvSlot,
   listGetRecvStagedIx,
   listGetRecvStagedSet,
   listIdxScratchBase,
@@ -156,7 +155,6 @@ import {
   mvValKindAt,
   mvValRep,
   mvValStructIdx,
-  optRecvSlot,
   optRecvStagedIx,
   optRecvStagedSet,
   pkBackTy,
@@ -183,7 +181,6 @@ import {
   unionSinkBase,
   v128PushScratchBase,
   variantHeap,
-  variantReboxSlot,
   variantRowOf,
 } from "./emit_state"
 
@@ -1622,25 +1619,6 @@ function fbReserveCollectionFrames() {
 // `fbBeginFunc`'s single-purpose stash slots, each appended after every earlier frame so a
 // function that does not use it keeps the layout it had; the staged markers start unset.
 function fbReserveStashSlots() {
-  // Array-intrinsic frame (1 i32 slot — the staged runtime length `n` of an
-  // `__array_new__`/`__array_new_default__` allocation), appended after every
-  // existing frame so layouts without it are untouched.
-  arrNewScratchBase = fbScratchCur
-  if fnUses.arrNew { fbReserve(1) }
-  // Call-LHS `??` stash, appended after every existing frame so layouts without it are
-  // untouched: a `(ref $uBoxIdx)` box slot, then a `(ref null $sTypeIdx)` string|null
-  // slot, then an i32 boolean|null slot — one per rep the call result may take.
-  coalesceCallSlot = fbScratchCur
-  if fnUses.coalesceCall { fbReserve(1) }
-  coalesceCallStrSlot = fbScratchCur
-  if fnUses.coalesceCall { fbReserve(1) }
-  coalesceCallBoolSlot = fbScratchCur
-  if fnUses.coalesceCall { fbReserve(1) }
-  // Variant-rebox stash (1 `(ref null struct)` slot, appended after every eager frame):
-  // holds a multi-field CALL result once so `emitStructExprAsVariantBox` re-reads each of
-  // its fields to rebuild the arm's variant struct. Off ⇒ zero slots ⇒ layout untouched.
-  variantReboxSlot = fbScratchCur
-  if fnUses.variantRebox { fbReserve(1) }
   // Union-box sink frame (2 slots: i32 tag, then anyref payload), appended after every
   // eager frame so layouts without it are untouched. Reserved from the prediction
   // (`fbUsesSinkPair`) since a `local.set` in the body needs the index before the body
@@ -1653,17 +1631,6 @@ function fbReserveStashSlots() {
   // scan bit, so the self-hosted compiler reserves nothing).
   atomStageSlot = fbScratchCur
   if fnUses.atomStage { fbReserve(1) }
-  // D1671 — the `?.` receiver stash (1 slot, `(ref null struct)`), appended after
-  // the atom-narrow slot so every earlier base is unchanged in a module whose `?.` receivers are
-  // all re-readable places, which is every module the compiler compiles of itself.
-  optRecvSlot = fbScratchCur
-  if fnUses.optRecv { fbReserve(1) }
-  // D1677 — the `.get` operand stash (2 slots: the i32 index, then a `(ref null struct)` for
-  // the list wrapper), appended after `optRecvSlot` so every earlier base is unchanged in a
-  // module whose `.get` operands are all re-readable places.
-  listGetIdxSlot = fbScratchCur
-  listGetRecvSlot = fbScratchCur + 1
-  if fnUses.listGet { fbReserve(2) }
   // Nothing is staged as a frame opens: the marker is set and restored around one chain's
   // lowering, and a failed emission must not carry a dead index into the next function.
   optRecvStagedIx = -1
@@ -2059,6 +2026,24 @@ function fbStrFrameSlotRun(j: i32) {
   return fbI32Run()
 }
 
+// A single-purpose stash slot of row code `code`: the array-intrinsic length; the call-LHS `??`
+// stash's box, `string | null` and `boolean | null` (an i32 where the module mints no such heap,
+// D3995); the variant-rebox and `?.` stashes and the `.get` wrapper as any struct, and the index.
+function fbStashSlotRun(code: i32) {
+  if code == COALCALL_FRAME {
+    if uDeclared { return fbRefRun(uBoxIdx) }
+    return fbI32Run()
+  }
+  if code == COALCALL_FRAME + 1 {
+    if strTrioMinted() { return fbRefNullRun(sTy()) }
+    return fbI32Run()
+  }
+  if code == REBOX_FRAME || code == OPTRECV_FRAME || code == LISTGET_FRAME + 1 {
+    return fbStructNullRun()
+  }
+  return fbI32Run()
+}
+
 // Slot `j` of the map frame (`mapScr`), in slot order: mapRef, keyRef, curRef, slot, cap, entry,
 // keysBk, valsBk, chr, hcur, idxBk, rslot, liveBk, hashBk, and valSet, the mono set's value stash.
 function fbMapFrameSlotRun(j: i32) {
@@ -2179,23 +2164,6 @@ function fbEmitPushMapFrames() {
 // The ref-valued map, list-compare, closure-equality and single-slot staging frames of
 // `fbEmitLocalsVec`, through the address-fold slots that end the eager frames.
 function fbEmitStagingFrames() {
-  fbFrameAt(arrNewScratchBase, "array-intrinsic")
-  // Array-intrinsic frame (1 i32 slot — the staged allocation length).
-  if fnUses.arrNew { fbI32Run() }
-  fbFrameAt(coalesceCallSlot, "call-LHS `??`")
-  // Call-LHS `??` stash (3 slots, appended LAST): the `(ref $uBoxIdx)` box, the
-  // `(ref null $sTypeIdx)` string|null niche, then the i32 boolean|null niche.
-  // A slot whose heap type this module does not mint holds an i32 instead: nothing stores the box
-  // or the string there, and an unminted index names a type of the previous program (D3995).
-  if fnUses.coalesceCall {
-    if uDeclared { fbRefRun(uBoxIdx) } else { fbI32Run() }
-    if strTrioMinted() { fbRefNullRun(sTy()) } else { fbI32Run() }
-    fbI32Run()
-  }
-  fbFrameAt(variantReboxSlot, "variant-rebox")
-  // Variant-rebox stash: one `(ref null struct)` slot (holds any plain-struct source ref;
-  // recovered by `ref.cast (ref $plainStruct)` at each field re-read).
-  if fnUses.variantRebox { fbStructNullRun() }
   fbFrameAt(unionSinkBase, "union-box sink")
   // Union-box sink frame: the i32 tag, then the `anyref` payload — the two operands of
   // the box's single `struct.new`, in the field order it pops them.
@@ -2207,17 +2175,6 @@ function fbEmitStagingFrames() {
   // The atom-narrow staging slot — likewise non-null, `local.set` before every read.
   if fnUses.atomStage {
     if strTrioMinted() { fbRefRun(sTy()) } else { fbI32Run() }
-  }
-  fbFrameAt(optRecvSlot, "`?.` receiver stash")
-  // The `?.` receiver stash: any struct row, so the abstract `structref` — nullable,
-  // because a `?.` receiver is exactly the value whose null-ness is being tested.
-  if fnUses.optRecv { fbStructNullRun() }
-  fbFrameAt(listGetIdxSlot, "`.get` operand stash")
-  // The `.get` operand stash, in `fbBeginFunc`'s order: the i32 index, then the list wrapper
-  // as the abstract `structref` — any list kind, recovered by `ref.cast` at each re-read.
-  if fnUses.listGet {
-    fbI32Run()
-    fbStructNullRun()
   }
   fbFrameAt(maFoldScratchBase, "declaration-time address fold")
   // One i32 run per declaration-time address-fold scratch slot — `fnMemAddrFoldCount` of
@@ -2281,6 +2238,8 @@ export function fbLazyListSlotRun(lix: i32) {
     fbStrFrameSlotRun(liBack[lix] - STR_FRAME)
   } else if liBack[lix] >= MAP_FRAME && liBack[lix] < MAP_FRAME + 15 {
     fbMapFrameSlotRun(liBack[lix] - MAP_FRAME)
+  } else if liBack[lix] >= ARRNEW_FRAME && liBack[lix] < LISTGET_FRAME + 2 {
+    fbStashSlotRun(liBack[lix])
   } else if liBack[lix] == CLOEQ_FRAME || liBack[lix] == CLOEQ_FRAME + 1 {
     fbRefRun(cloStructIdx)
   } else if liBack[lix] >= LEQI_FRAME && liBack[lix] < LEQG_FRAME + 4 {
