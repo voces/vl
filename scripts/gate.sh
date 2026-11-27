@@ -373,6 +373,9 @@ run "inventory refs"           deno test --preload tests/support/signal_guard.ts
 run "capability probes"        bash -c "\"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --live-sites --compiler \"$SEED\" && \"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --floor --compiler \"$SEED\""
 run "conflict markers"        deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_no_conflict_markers_test.ts
 run "splice scan"              bash -c "\"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\""
+# THE IR'S DEBT: the AST-backed `Rhs` kinds and the builder/lowering miss sites may only fall
+# (engineering review 2026-11-27); a fall passes and the PR that earned it runs --write-baseline.
+run "ir debt"                  "$VL" run scripts/ir-debt.vl --compiler "$SEED" -- --check
 # ON MASTER the same run also requires the committed baseline to describe the committed seed
 # exactly (`--verify-fresh`: exit 1 when any cell moved, after the runs-lost check). A branch
 # is SUPPOSED to disagree with it — that disagreement is the change being measured. On master
