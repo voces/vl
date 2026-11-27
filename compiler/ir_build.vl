@@ -4203,7 +4203,7 @@ export type StorePlace = SpBinding | SpField | SpReturned | SpElem
 // The storage of place `p`, the one answer every reader of a place's rep takes.
 function storageOf(p: StorePlace): Storage {
   return match p {
-    SpBinding => if p.spGlobal { globalStorage(p.spBinding) } else { localStorage(p.spBinding) }
+    SpBinding => buildStorage(p, if p.spGlobal { globalStorage(p.spBinding) } else { localStorage(p.spBinding) })
     SpField => rowStorage(sFieldTgtStructIdx(p.spFieldRow, p.spFieldIx))
     SpReturned => rowStorage(retLitRow(p.spReturned))
     SpElem => rowStorage(listElemStructRow(p.spElemOf))
@@ -4215,6 +4215,19 @@ function storageOf(p: StorePlace): Storage {
 function bindingStorage(d: i32, frame: i32, global: boolean): Storage {
   const p: StorePlace = { spBinding: d, spFrame: frame, spGlobal: global }
   return storageOf(p)
+}
+
+// A binding today's decision `s` has no storage for is held at its initializer's own type, the
+// rep the value it is built from has; else `s`.
+function buildStorage(p: SpBinding, s: Storage): Storage {
+  if s.stMiss == "" { return s }
+  const d = p.spBinding
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(n is LetDecl) || n.letInit < 0 { return s }
+  const ty = heldTy(nodeTyAt(n.letInit, p.spFrame))
+  const rep = repNodeOfTy(ty)
+  if ty < 0 || isVoidTy(ty) || !valueRep(rep, ty) || irTyHeldOpen(ty, rep) { return s }
+  return storageAt(rep, ty, -2)
 }
 
 function storageMiss(why: string): Storage {
@@ -18038,6 +18051,8 @@ function assignValueGo(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   // A value narrower than its cell is re-read at the cell's rep, then narrowed back by the one
   // opcode legacy writes (`asgReadUnwidenOp`).
   const uw = asgReadUnwidenOp(ix, ibFnIx)
+  // A cell that holds `null` beside a value its assignment's type does not: the value stored.
+  if uw < 0 && cellNullBeside(n.binLeft, rep) { return assignValueHeld(b, n, ix, rep) }
   const t = nodeAt(n.binLeft)
   if !(t is Ident || t is Member || t is Index) {
     return irBMiss("assignment value target")
@@ -18076,10 +18091,13 @@ function assignValueGo(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   ) {
     return irBLetTemp(b, { rgV: w }, ix, rep)
   }
-  if ibMiss == "" && irBOpRep(w) != rep {
-    return irBMiss("assignment value re-read rep")
-  }
-  return w
+  if ibMiss != "" || irBOpRep(w) == rep { return w }
+  return irConvert(b, w, rep, heldTy(nodeTyAt(ix, ibFnIx)), ix)
+}
+
+// Whether target `t`'s read is nullable where rep `rep` is not.
+function cellNullBeside(t: i32, rep: i32): boolean {
+  return repNodeAt(repNodeOfTy(heldTy(exprTyOf(t)))) is RNullable && !(repNodeAt(rep) is RNullable)
 }
 
 // Whether `x` is a number, boolean, string or `null` literal, whose value a second build repeats.
