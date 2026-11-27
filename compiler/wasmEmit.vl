@@ -740,6 +740,7 @@ import {
   fbStructGet,
   fbStructNew,
   fbStructSet,
+  fbTakeLocalGet,
   fbUnreachable,
   fbV128ConstZero,
   fbValtype,
@@ -784,6 +785,7 @@ import {
   wLen,
   wNegateConstFrom,
   wPeekBack,
+  wPos,
   wTarget,
   wU8,
   wULEB,
@@ -13861,10 +13863,10 @@ function arrLitDataPut(ins: u8[], form: i32, out: u8[]): i32 {
 // past `len`. A list whose backing this module never typed keeps the older `select` to -1.
 export function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
   const back = listBackOfWrap(lTy)
+  const ix = listIdxStash(wrapSlot)
   if back >= 0 {
-    fbLocalSet(listIdxScratchBase)
     fbLocalSet(wrapSlot)
-    fbLocalGet(listIdxScratchBase)
+    fbLocalGet(ix)
     fbLocalGet(wrapSlot)
     fbStructGet(lTy, 1) // field 1: len
     fbI32Bin(79) // 0x4f i32.ge_u
@@ -13873,21 +13875,31 @@ export function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
     fbEnd()
     fbLocalGet(wrapSlot)
     fbStructGet(lTy, 0) // field 0: backing
-    fbLocalGet(listIdxScratchBase)
+    fbLocalGet(ix)
     return 0
   }
-  fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
-  fbLocalSet(wrapSlot)           // 0x21 local.set — stash the wrapper ref
+  fbLocalSet(wrapSlot) // 0x21 local.set — stash the wrapper ref
   fbLocalGet(wrapSlot)
-  fbStructGet(lTy, 0)            // field 0: backing
-  fbLocalGet(listIdxScratchBase)
-  fbI32Const(-1)                 // the out-of-range replacement index
-  fbLocalGet(listIdxScratchBase)
+  fbStructGet(lTy, 0)  // field 0: backing
+  fbLocalGet(ix)
+  fbI32Const(-1)       // the out-of-range replacement index
+  fbLocalGet(ix)
   fbLocalGet(wrapSlot)
-  fbStructGet(lTy, 1)            // field 1: len
-  fbI32Bin(73)                   // 0x49 i32.lt_u
-  fbSelect()                     // → i if in-bounds else -1
+  fbStructGet(lTy, 1)  // field 1: len
+  fbI32Bin(73)         // 0x49 i32.lt_u
+  fbSelect()           // → i if in-bounds else -1
   return 0
+}
+
+// The local `emitListIdxGuard` reads the index from, taking it off the stack: the local an
+// index just read with `local.get` came from, since the guard writes only `wrapSlot`, else the
+// index stash.
+function listIdxStash(wrapSlot: i32): i32 {
+  const x = fbTakeLocalGet()
+  if x >= 0 && x != wrapSlot { return x }
+  if x >= 0 { fbLocalGet(x) }
+  fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
+  return listIdxScratchBase
 }
 
 // The backing array type of list wrapper `w`, or -1 when no list this module built has it.
@@ -17512,12 +17524,12 @@ function emitChainRootElem(rootIx: i32, fnIx: i32, place: EqRootPlace): i32 {
       "emitProgram: internal: an element compare root is no plain ref list read",
     )
   }
-  const from = curBuf.length
+  const from = wPos()
   if refListReadAt(nd, rootIx, fnIx, place) < 0 { return -1 }
   if idxRowsOn() && curBuf.length > from {
     place.epRows.push(rootIx)
     place.epRows.push(from)
-    place.epRows.push(curBuf.length)
+    place.epRows.push(wPos())
   }
   return 0
 }

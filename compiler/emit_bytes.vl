@@ -110,6 +110,8 @@ import {
   fbLastOp,
   fbNnElideEnd,
   fbNnElideGen,
+  fbPosEnd,
+  fbPosGen,
   fbRunsWritten,
   fbScratchCur,
   fitGrowFn,
@@ -344,7 +346,22 @@ export function wU8(b: i32) {
 }
 // How many bytes the current buffer holds — the cursor a PEEPHOLE needs to describe
 // the instruction it is about to rewrite.
-export function wLen() { return curBuf.length }
+export function wLen() { return wPos() }
+// The current buffer's length as an offset the caller keeps, noted so that `fbTakeLocalGet`
+// never unwrites a byte a kept offset points past.
+export function wPos(): i32 {
+  const n = curBuf.length
+  if fbPosGen != curBufGen || fbPosEnd < n {
+    fbPosGen = curBufGen
+    fbPosEnd = n
+  }
+  return n
+}
+// Forgets the instruction just written, for a caller that keeps an offset over its bytes.
+export function fbLastForget() {
+  fbLastEnd = -1
+  return 0
+}
 // The byte `back` positions from the END of the current buffer (`0` = the last one),
 // or `-1` when the buffer is shorter than that. Reading past the start is a question,
 // not an error: a peephole asks it precisely to find out whether its pattern fits.
@@ -573,8 +590,26 @@ export function fbLocalGet(i: i32) {
   }
   wU8(OP_LOCAL_GET) // 0x20 local.get
   wULEB(i)
-  if fbLocalIsUnsetRef(i - fbFrameParams) { fbRefAsNonNull() }
-  return 0
+  if fbLocalIsUnsetRef(i - fbFrameParams) {
+    fbRefAsNonNull()
+    return 0
+  }
+  return fbLastNote(OP_LOCAL_GET, i)
+}
+// Unwrites the instruction just written when it is a plain `local.get`, returning its local, for
+// a stash that reads that local in place of a copy it would make; -1, unwriting nothing, else.
+export function fbTakeLocalGet(): i32 {
+  const i = fbLastArg
+  if !fbLastIs(OP_LOCAL_GET, i) { return -1 }
+  const at = fbLastEnd - ulebLen(i) - 1
+  if curBuf[at] != OP_LOCAL_GET || fbPosGen == curBufGen && fbPosEnd > at {
+    emitFail(
+      "emitProgram: internal: a kept offset points into a `local.get` an index stash unwrites",
+    )
+    return -1
+  }
+  wDropBack(ulebLen(i) + 1)
+  return i
 }
 export function fbLocalSet(i: i32) {
   wU8(OP_LOCAL_SET) // 0x21 local.set
@@ -585,7 +620,7 @@ export function fbLocalSet(i: i32) {
 // null itself, reads it next; `fbStructGet` checks that it does (`fbNnElideDone`).
 export function fbNnElideNote() {
   fbNnElideGen = curBufGen
-  fbNnElideEnd = curBuf.length
+  fbNnElideEnd = wPos()
   return 0
 }
 
@@ -1219,7 +1254,7 @@ export function fbStructNew(heapIdx: i32) {
   wULEB(heapIdx)
   // Leave the return sink's cursor on a UNION-box construction (see `uBoxNewEnd`): the
   // rewrite is legal only while this instruction is still the last one written.
-  if heapIdx == uBoxIdx { uBoxNewEnd = curBuf.length }
+  if heapIdx == uBoxIdx { uBoxNewEnd = wPos() }
   return 0
 }
 // ── string header accessors ───────────────────────────────────────────────────
