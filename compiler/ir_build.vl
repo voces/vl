@@ -244,6 +244,7 @@ import {
   recFieldsWiden,
   recHeapOf,
   recHeapsNote,
+  recHoleHeapsNote,
   recNullFieldsAlike,
   recRetag,
   recRowRetag,
@@ -359,6 +360,7 @@ import {
   callRefSplitKind,
   callStmtDispatches,
   callStmtIdentDrops,
+  calleeTypedDead,
   capturedArgArmOf,
   clearPlanOf,
   clearRecvIsList,
@@ -7337,6 +7339,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     }
     return numIntrRhs(b, c, cf, ix)
   }
+  // A call through a binding this instance types `null`, which no closure route takes, is the
+  // dead branch legacy's `emitCallCoreUserFn` writes as `unreachable` (D3197).
+  if nullBindingCall(ix) { return { dnAt: ix, dnPad: callEndsNever(ix) } }
   // A binding holding a lambda-lifted function is a direct call of it; any other, a closure's.
   const lf = if d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) { cloLiftCalleeOf(c.callFn, ibFnIx) } else { -1 }
   if lf < 0 && d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) {
@@ -7970,6 +7975,7 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   if !(repNodeAt(frep) is RClosure) {
     return missRhs("captured call closure rep")
   }
+  const fAt = b.length
   const env = cloEnvOf(b, pos, ix)
   if ibMiss != "" { return missRhs(ibMiss) }
   const f = irBLetTempTy(
@@ -7984,7 +7990,9 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   if !(callee is FuncDecl) || callee.fnParams.length != c.callArgs.length {
     return missRhs("argument count")
   }
-  const args: Opnd[] = []
+  const ops: Opnd[] = [f]
+  const starts: i32[] = [fAt]
+  const ixs: i32[] = [c.callFn]
   let i = 0
   while i < c.callArgs.length {
     if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
@@ -7999,19 +8007,31 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     if arm != "plain" && !delivers {
       return missRhs("captured call argument " + arm)
     }
-    const at = b.length
+    starts.push(b.length)
+    ixs.push(c.callArgs[i])
     const a = if delivers { deliver(b, c.callArgs[i], dst, pty) } else { irBExpr(b, c.callArgs[i]) }
     if ibMiss != "" { return missRhs("argument") }
-    if ifBelowLead(b, at, "short-circuit closure argument") {
-      return missRhs("short-circuit closure argument")
-    }
     if irBOpRep(a) != dst { return missRhs("captured call argument rep") }
-    args.push(a)
+    ops.push(a)
     i = i + 1
   }
+  // The closure is read after its arguments (`call_ref`), so each operand is spilled, not staged.
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      ops,
+      ixs,
+      false,
+      "short-circuit closure argument",
+    )
+  ) {
+    return missRhs("short-circuit closure argument")
+  }
+  const args = ops.slice(1, ops.length)
   const isVoid = sigKeyRetIsVoid(cloSigKeyExt(pos))
   const r: Rhs = {
-    crFn: f,
+    crFn: ops[0],
     crSig: sig,
     crArgs: args,
     crVoid: isVoid,
@@ -8784,6 +8804,106 @@ export function ifBelowLead(b: i32[], at: i32, why: string): boolean {
   return ifBelowLeadIn(b, at, b.length, why)
 }
 
+// Operands `args` of an n-ary node, `j` built into `b` from `starts[j]`: where a later one holds a
+// statement, the earlier are staged below it (`irBStageLeads`), or spilled to locals where `stack`
+// is false (the node reads operands again) or no stage holds; false, with miss `why`, where neither
+// can be. The first operand has nothing written before it.
+function irBStageOperands(
+  b: i32[],
+  starts: i32[],
+  args: Opnd[],
+  ixs: i32[],
+  stack: boolean,
+  why: string,
+): boolean {
+  // Each operand's start is kept as its first node, which nodes inserted before it do not move.
+  const ids: i32[] = []
+  let m = args.length - 1
+  while ids.length < args.length { ids.push(-1) }
+  while m >= 0 {
+    const end = if m + 1 < starts.length { starts[m + 1] } else { b.length }
+    ids[m] = if starts[m] < end { b[starts[m]] } else if m + 1 < args.length { ids[m + 1] } else { -1 }
+    m = m - 1
+  }
+  let j = 1
+  while j < args.length {
+    const at = operandAt(b, ids[j])
+    const end = if j + 1 < args.length { operandAt(b, ids[j + 1]) } else { b.length }
+    if ifBelowLeadHas(b, at, end) {
+      const n0 = b.length
+      const lead = args.slice(0, j)
+      const ls: i32[] = []
+      let k = 0
+      while k < j {
+        ls.push(operandAt(b, ids[k]))
+        k = k + 1
+      }
+      const li = ixs.slice(0, j)
+      const staged = stack
+        && !coalBoxFrom(b, at, false)
+        && !receiverStageFrom(b, at)
+        && irBStageLeads(b, at, ls, lead, li)
+      if !staged && (ibMiss != "" || !irBSpillLeads(b, at, lead, li)) {
+        if ibMiss == "" { irBMiss(why) }
+        return false
+      }
+      k = 0
+      while k < j {
+        args[k] = lead[k]
+        k = k + 1
+      }
+      // A node that reads its operands again reads this one from a local, set where it ends, so
+      // no value the statement leaves on the stack waits under a later read.
+      if !stack && !heldOperand(b, end + b.length - n0, args, ixs, j, why) {
+        return false
+      }
+    }
+    j = j + 1
+  }
+  return true
+}
+
+// Where operand start `id` (its first node, or -1 for the end) stands in `b` now.
+function operandAt(b: i32[], id: i32): i32 {
+  if id < 0 { return b.length }
+  let i = 0
+  while i < b.length && b[i] != id { i = i + 1 }
+  return i
+}
+
+// Operand `j` of `args` set into a local of its own at position `pos` of `b`, read from there.
+function heldOperand(
+  b: i32[],
+  pos: i32,
+  args: Opnd[],
+  ixs: i32[],
+  j: i32,
+  why: string,
+): boolean {
+  const a = args[j]
+  if !(a is OVar) || a.ov < 0 || a.ov >= ib.irVars.length {
+    irBMiss(why)
+    return false
+  }
+  const lv = irVarNew(
+    ib,
+    ib.irVars[a.ov].vRep,
+    ib.irVars[a.ov].vTy,
+    "local",
+    -1,
+  )
+  const one: i32[] = []
+  irBNode(one, { asDst: lv, asSrc: a }, -1, ibNoValue, ixs[j])
+  if ibMiss != "" || one.length != 1 {
+    irBMiss(why)
+    return false
+  }
+  insertAt(b, pos, one[0])
+  const o: Opnd = { ov: lv }
+  args[j] = o
+  return true
+}
+
 // `ifBelowLead` over the operands built into `b` from `at` up to `to`.
 function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
   if !ifBelowLeadHas(b, at, to) { return false }
@@ -8885,8 +9005,9 @@ function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
 function simdMemRhs(b: i32[], c: Call, ix: i32, row: i32): Rhs {
   const base = simdMemBase(row)
   const ap = irBAddrPlan(c, base)
-  const at = b.length
   const args: Opnd[] = []
+  const starts: i32[] = [b.length]
+  const ixs: i32[] = [if ap.maArm == "rest" { ap.maRest } else { ix }]
   match ap.maArm {
     "const" => {
       const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
@@ -8898,9 +9019,22 @@ function simdMemRhs(b: i32[], c: Call, ix: i32, row: i32): Rhs {
       return missRhs("simd memory address " + ap.maArm)
     }
   }
-  if base == 2 { args.push(irBExpr(b, memCallArg(c, 2, 1))) }
+  if base == 2 {
+    starts.push(b.length)
+    ixs.push(memCallArg(c, 2, 1))
+    args.push(irBExpr(b, memCallArg(c, 2, 1)))
+  }
   if ibMiss != "" { return missRhs("simd memory operand") }
-  if ifBelowLead(b, at, "simd memory short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      ixs,
+      true,
+      "simd memory short-circuit operand",
+    )
+  ) {
     return missRhs("simd memory short-circuit operand")
   }
   if (
@@ -8926,20 +9060,25 @@ function simdRhs(b: i32[], c: Call, ix: i32): Rhs {
   const row = simdCallRow(c)
   if row < 0 { return missRhs("simd row") }
   if simdRowIsMem(row) { return simdMemRhs(b, c, ix, row) }
-  const at = b.length
   const args: Opnd[] = []
   const want: string[] = []
+  const starts: i32[] = []
+  const ixs: i32[] = []
   let i = 0
   while i < c.callArgs.length {
     const p = simdOperandPrim(row, i)
     if p != "" {
+      starts.push(b.length)
+      ixs.push(c.callArgs[i])
       args.push(irBExpr(b, c.callArgs[i]))
       want.push(p)
     }
     i = i + 1
   }
   if ibMiss != "" { return missRhs("simd operand") }
-  if ifBelowLead(b, at, "simd short-circuit operand") {
+  if (
+    !irBStageOperands(b, starts, args, ixs, true, "simd short-circuit operand")
+  ) {
     return missRhs("simd short-circuit operand")
   }
   i = 0
@@ -8964,11 +9103,23 @@ function simdRhs(b: i32[], c: Call, ix: i32): Rhs {
 function hostCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const pl = hostCallPlanOf(c)
   if pl.hpFail != "" || pl.hpImport < 0 { return missRhs("host call plan") }
-  const at = b.length
   const args: Opnd[] = []
-  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  const starts: i32[] = []
+  for a in c.callArgs {
+    starts.push(b.length)
+    args.push(irBExpr(b, a))
+  }
   if ibMiss != "" { return missRhs("host call operand") }
-  if ifBelowLead(b, at, "host call short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      c.callArgs,
+      true,
+      "host call short-circuit operand",
+    )
+  ) {
     return missRhs("host call short-circuit operand")
   }
   let i = 0
@@ -8992,11 +9143,23 @@ function hostCallRhs(b: i32[], c: Call, ix: i32): Rhs {
 // call of the reserved `__log__` import.
 function logCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callArgs.length != 2 { return missRhs("log arguments") }
-  const at = b.length
   const args: Opnd[] = []
-  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  const starts: i32[] = []
+  for a in c.callArgs {
+    starts.push(b.length)
+    args.push(irBExpr(b, a))
+  }
   if ibMiss != "" { return missRhs("log operand") }
-  if ifBelowLead(b, at, "log short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      c.callArgs,
+      true,
+      "log short-circuit operand",
+    )
+  ) {
     return missRhs("log short-circuit operand")
   }
   for a in args {
@@ -9015,11 +9178,23 @@ function logCallRhs(b: i32[], c: Call, ix: i32): Rhs {
 // (a byte list, then two i32s), then the helper call (`strFromBytesTail`).
 function strFromBytesRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callArgs.length != 3 { return missRhs("byte string arguments") }
-  const at = b.length
   const args: Opnd[] = []
-  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  const starts: i32[] = []
+  for a in c.callArgs {
+    starts.push(b.length)
+    args.push(irBExpr(b, a))
+  }
   if ibMiss != "" { return missRhs("byte string operand") }
-  if ifBelowLead(b, at, "byte string short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      c.callArgs,
+      true,
+      "byte string short-circuit operand",
+    )
+  ) {
     return missRhs("byte string short-circuit operand")
   }
   const sl = repNodeAt(irBOpRep(args[0]))
@@ -9588,7 +9763,7 @@ function printUnionIf(b: i32[], arg: i32): Opnd {
   return deliver(b, arg, repNodeOfTy(ty), -1)
 }
 
-// `__trap__(msg?)`: its message streamed as a string `print` streams one, then `unreachable`, as
+// `__trap__(msg?)`: its message streamed as `print` streams it, then `unreachable`, as
 // `emitCallCoreTrap` writes them.
 function trapStmt(b: i32[], c: Call, ix: i32) {
   if c.callArgs.length > 1 { return skip("trap arguments") }
@@ -9597,16 +9772,27 @@ function trapStmt(b: i32[], c: Call, ix: i32) {
     return skip("trap in a never function")
   }
   if c.callArgs.length == 1 {
-    if printArmOf(c.callArgs[0], ibFnIx) != "str" {
-      return skip("trap message")
-    }
-    const v = irBExpr(b, c.callArgs[0])
+    const why = trapMessage(b, c.callArgs[0], ix)
     if ibMiss != "" { return 0 }
-    if repPrim(irBOpRep(v)) != "str" { return skip("trap message rep") }
-    irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+    if why != "" { return skip(why) }
   }
   irBNode(b, { tpWhy: 0 }, -1, ibNoValue, ix)
   return 0
+}
+
+// Streams trap `ix`'s message `arg` as `print` streams it: a string, or a literal-union atom
+// decoded to its member's text (`emitCallCoreTrap`). Answers why it does not, or "".
+function trapMessage(b: i32[], arg: i32, ix: i32): string {
+  const arm = printArmOf(arg, ibFnIx)
+  if arm != "str" && arm != "atom" { return "trap message" }
+  const asg = if arm == "atom" { asgAtomRep(arg) } else { -1 }
+  const v = if asg >= 0 { deliver(b, arg, asg, -1) } else if arm == "atom" { exprAt(b, arg, true) } else { irBExpr(b, arg) }
+  if ibMiss != "" { return "trap message" }
+  const vr = irBOpRep(v)
+  const ok = if arm == "atom" { repNodeAt(vr) is RAtom } else { repPrim(vr) == "str" }
+  if !ok { return "trap message rep" }
+  irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+  return ""
 }
 
 // `__trap__(msg?)` read as a value: its message streamed, then legacy's `unreachable` for the
@@ -9614,13 +9800,9 @@ function trapStmt(b: i32[], c: Call, ix: i32) {
 function trapCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callArgs.length > 1 { return missRhs("trap arguments") }
   if c.callArgs.length == 1 {
-    if printArmOf(c.callArgs[0], ibFnIx) != "str" {
-      return missRhs("trap message")
-    }
-    const v = irBExpr(b, c.callArgs[0])
-    if ibMiss != "" { return missRhs("trap message") }
-    if repPrim(irBOpRep(v)) != "str" { return missRhs("trap message rep") }
-    irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+    const why = trapMessage(b, c.callArgs[0], ix)
+    if ibMiss != "" { return missRhs(ibMiss) }
+    if why != "" { return missRhs(why) }
   }
   const r: Rhs = { dnAt: ix, dnPad: callEndsNever(ix) }
   return r
@@ -10872,6 +11054,23 @@ function recordRepOrNull(r: i32): boolean {
   return n is RRecord || n is RNullable && repNodeAt(n.rnInner) is RRecord
 }
 
+// Whether `ix` is a call of a name this instance types `null` that no closure route or function
+// takes: legacy's `emitCallCoreUserFn` writes it as `unreachable`.
+function nullBindingCall(ix: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const c = nodeAt(u)
+  if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) {
+    return false
+  }
+  const cf = nodeAt(c.callFn)
+  if !(cf is Ident) { return false }
+  return calleeTypedDead(c, ibFnIx)
+    && nodeTyAt(c.callFn, ibFnIx) != TY_NEVER
+    && userFnCallTarget(c, cf, ibFnIx) < 0
+    && !userFnCallRoutesRef(c, cf, ibFnIx, -1)
+}
+
 // The value of `ix` delivered at rep `dst`: as built, or widened where legacy widens it, through
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
@@ -10880,6 +11079,17 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // writes no conversion after it.
   if ibMiss == "" && dst >= 0 && exprReadsDeadNever(ix, ibFnIx) {
     return deadNeverTemp(b, ix, dst)
+  }
+  // So is a dead call through a name typed `null` (`nullBindingCall`), built at the destination.
+  if ibMiss == "" && dst >= 0 && nullBindingCall(ix) {
+    const u = unwrapParen(ix)
+    return irBLetTempTy(
+      b,
+      { dnAt: u, dnPad: callEndsNever(u) },
+      u,
+      dst,
+      TY_NEVER,
+    )
   }
   // A `??` whose own type has no rep (a link legacy mints) is built at the destination's rep, as
   // legacy writes it at the kind its consumer asks.
@@ -12889,17 +13099,32 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   const boxTy = arrNewFillBoxTy(ix, fill, ibFnIx)
   const ln = repNodeAt(rep)
   if !(ln is RList) { return irBMiss("array new rep") }
-  const at = b.length
-  const len = irBExpr(b, n.callArgs[0])
+  const lenAt = b.length
+  const len0 = irBExpr(b, n.callArgs[0])
+  const fillAt = b.length
   // The fill is delivered at the element rep, as a literal element of the same value is; one
   // legacy boxes is boxed at its union (`arrNewFillBoxTy`), as a union element is.
   // Otherwise at the element rep's own type, so a fill already boxed at that union passes as is.
   const et = repTyOf(ln.rlsElem)
   // A `null[]`'s fill is its i32 storage's sentinel, as an element store writes it.
   const nulFill = repPrim(ln.rlsElem) == "null"
-  const v = if nulFill { nulSentinelStore(b, fill, repNodeOfTy(TY_I32)) } else if boxTy >= 0 { boxTempIn(b, unionElemValue(b, fill), fill, ln.rlsElem, -1, boxTy) } else { deliver(b, fill, ln.rlsElem, et) }
-  if ibMiss != "" { return v }
-  if ifBelowLead(b, at, "array new short-circuit operand") { return v }
+  const v0 = if nulFill { nulSentinelStore(b, fill, repNodeOfTy(TY_I32)) } else if boxTy >= 0 { boxTempIn(b, unionElemValue(b, fill), fill, ln.rlsElem, -1, boxTy) } else { deliver(b, fill, ln.rlsElem, et) }
+  if ibMiss != "" { return v0 }
+  const ops: Opnd[] = [len0, v0]
+  if (
+    !irBStageOperands(
+      b,
+      [lenAt, fillAt],
+      ops,
+      n.callArgs,
+      false,
+      "array new short-circuit operand",
+    )
+  ) {
+    return v0
+  }
+  const len = ops[0]
+  const v = ops[1]
   if repPrim(irBOpRep(len)) != "i32" {
     return irBMiss("array new length coercion")
   }
@@ -12913,11 +13138,23 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
 // operands as they stand, then the arm's instruction. A plan legacy refuses is a named miss.
 function memOpRhs(b: i32[], c: Call, ix: i32): Rhs {
   if memOpPlanOf(c).moFail != "" { return missRhs("memory op plan") }
-  const at = b.length
   const args: Opnd[] = []
-  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  const starts: i32[] = []
+  for a in c.callArgs {
+    starts.push(b.length)
+    args.push(irBExpr(b, a))
+  }
   if ibMiss != "" { return missRhs("memory op operand") }
-  if ifBelowLead(b, at, "memory op short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      c.callArgs,
+      true,
+      "memory op short-circuit operand",
+    )
+  ) {
     return missRhs("memory op short-circuit operand")
   }
   for o in args {
@@ -12981,8 +13218,9 @@ function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
   const p = memAccessPlanOf(name)
   if p.mxOp < 0 || p.mxAlign < 0 { return missRhs("memory access width") }
   const ap = irBAddrPlan(c, p.mxBase)
-  const at = b.length
   const args: Opnd[] = []
+  const starts: i32[] = [b.length]
+  const ixs: i32[] = [if ap.maArm == "rest" { ap.maRest } else { ix }]
   match ap.maArm {
     "const" => {
       const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
@@ -12994,9 +13232,22 @@ function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
       return missRhs("memory address " + ap.maArm)
     }
   }
-  if p.mxBase == 2 { args.push(irBExpr(b, memCallArg(c, 2, 1))) }
+  if p.mxBase == 2 {
+    starts.push(b.length)
+    ixs.push(memCallArg(c, 2, 1))
+    args.push(irBExpr(b, memCallArg(c, 2, 1)))
+  }
   if ibMiss != "" { return missRhs("memory access operand") }
-  if ifBelowLead(b, at, "memory access short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      ixs,
+      true,
+      "memory access short-circuit operand",
+    )
+  ) {
     return missRhs("memory access short-circuit operand")
   }
   // The address is an i32; a store's value is already at its width's prim, which legacy's
@@ -13055,7 +13306,8 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
     return r
   }
   const ap = irBAddrPlan(c, pl.apBase)
-  const at = b.length
+  const starts: i32[] = [b.length]
+  const ixs: i32[] = [if ap.maArm == "rest" { ap.maRest } else { ix }]
   match ap.maArm {
     "const" => {
       const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
@@ -13069,11 +13321,15 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
   }
   let k = 1
   while k < pl.apBase {
+    starts.push(b.length)
+    ixs.push(memCallArg(c, pl.apBase, k))
     args.push(irBExpr(b, memCallArg(c, pl.apBase, k)))
     k = k + 1
   }
   if ibMiss != "" { return missRhs("atomic operand") }
-  if ifBelowLead(b, at, "atomic short-circuit operand") {
+  if (
+    !irBStageOperands(b, starts, args, ixs, true, "atomic short-circuit operand")
+  ) {
     return missRhs("atomic short-circuit operand")
   }
   if repPrim(irBOpRep(args[0])) != "i32" {
@@ -13121,11 +13377,25 @@ function truncSatRhs(b: i32[], c: Call, ix: i32): Rhs {
 function listCopyStmt(b: i32[], n: Call, ix: i32): i32 {
   if n.callArgs.length != 5 { return skip("list copy arguments") }
   if arrCopyPlanOf(ix, ibFnIx).acWhy != "" { return skip("list copy refused") }
-  const at = b.length
   const args: Opnd[] = []
-  for a in n.callArgs { args.push(irBExpr(b, a)) }
+  const starts: i32[] = []
+  for a in n.callArgs {
+    starts.push(b.length)
+    args.push(irBExpr(b, a))
+  }
   if ibMiss != "" { return 0 }
-  if ifBelowLead(b, at, "list copy short-circuit operand") { return 0 }
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      n.callArgs,
+      false,
+      "list copy short-circuit operand",
+    )
+  ) {
+    return 0
+  }
   const dl = irBOpRep(args[0])
   if !(repNodeAt(dl) is RList) || irBOpRep(args[2]) != dl {
     return skip("list copy list rep")
@@ -13403,8 +13673,10 @@ function spreadLit(
   }
   const at = b.length
   const srcs: Opnd[] = []
+  const starts: i32[] = []
   let g = 0
   while g < grps.length {
+    starts.push(b.length)
     const v0 = spreadSrcBuild(b, p, g, grps[g], ix, rep)
     if ibMiss != "" { return v0 }
     // A source list whose rep is the literal's twin, or apart only in a hole, is the same list
@@ -13434,7 +13706,18 @@ function spreadLit(
     }
     ib.irSpreadPair[b[at]] = nt
   }
-  if ifBelowLead(b, at, "array spread short-circuit operand") { return srcs[0] }
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      srcs,
+      grps,
+      false,
+      "array spread short-circuit operand",
+    )
+  ) {
+    return srcs[0]
+  }
   const r: Rhs = {
     spSrcs: srcs,
     spGroups: grps,
@@ -13491,8 +13774,10 @@ function spreadBoxedLit(
   }
   const at = b.length
   const srcs: Opnd[] = []
+  const starts: i32[] = []
   let g = 0
   while g < grps.length {
+    starts.push(b.length)
     const v = spreadBoxedGroup(b, grps[g], isSrc[g], row, lrep, lt)
     if ibMiss != "" { return v }
     srcs.push(v)
@@ -13508,7 +13793,18 @@ function spreadBoxedLit(
     }
     ib.irSpreadPair[b[at]] = nt
   }
-  if ifBelowLead(b, at, "array spread short-circuit operand") { return srcs[0] }
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      srcs,
+      grps,
+      false,
+      "array spread short-circuit operand",
+    )
+  ) {
+    return srcs[0]
+  }
   const r: Rhs = {
     spSrcs: srcs,
     spGroups: grps,
@@ -13809,11 +14105,8 @@ function nulNoneEffect(b: i32[], x: i32, ix: i32, sink: Opnd[] | null): Opnd {
   if u < 0 { return irBMiss("coalesce nulnone effect") }
   const n = nodeAt(u)
   if n is IfStmt {
-    // A void `if` leaves no value a sink's reader could drop in order, so it is written here; with
-    // no temp waiting below it, that is where legacy writes it too.
-    if sink != null && endsInTemp(b) {
-      return irBMiss("coalesce nulnone effect if")
-    }
+    // A void `if` leaves no value a sink's reader could drop in order, so it is written here, a
+    // statement any temp waiting below it is staged under.
     ifForEffect(b, n, u)
     return none
   }
@@ -14030,14 +14323,14 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   // An if-expression operand is built inside the block, where legacy writes it (`nulStr`).
   if nodeAt(lhsIx) is IfStmt { return coalNulStr(b, n, ix, rep, false) }
   const lat = b.length
-  const l = irBExpr(b, n.binLeft)
-  if ibMiss != "" { return l }
-  // Legacy writes the operand inside the coalesce's block, above which a valued `if` cannot sit,
-  // nor an inner `??`, whose out stays on the stack as one's does.
-  if valuedIfFrom(b, lat) { return irBMiss("coalesce of a valued if") }
-  if coalBoxFrom(b, lat, true) || coalBoxFrom(b, lat, false) {
-    return irBMiss("coalesce string operand holds a ??")
-  }
+  const l0 = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l0 }
+  // The operand is written inside the coalesce's block, above which a valued `if` cannot sit, nor
+  // an inner `??`, whose out stays on the stack as one's does: such an operand is held in a local.
+  const spill = valuedIfFrom(b, lat)
+    || coalBoxFrom(b, lat, true)
+    || coalBoxFrom(b, lat, false)
+  const l = if spill { heldInLocal(b, l0, ix) } else { l0 }
   if !strNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
   const nul = coalesceNulStrStaysNullable(ix, ibFnIx)
   const want = if nul { irBOpRep(l) } else { strInnerOf(irBOpRep(l)) }
@@ -21631,6 +21924,7 @@ function convertRetag(
 function holeRetagNoted(src: i32, dst: i32, clo: boolean): boolean {
   noteRecHeaps(src)
   noteRecHeaps(dst)
+  recHoleHeapsNote(ib, src, dst)
   return listRetagHole(ib, src, dst) || clo && cloHoleRetag(ib, src, dst)
 }
 
