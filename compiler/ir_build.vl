@@ -1474,9 +1474,8 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
         isArmOf(ix, ibFnIx, isArmRank(arm) + 1, false),
       )
     }
-    if p < 0 { return irBMiss("is record fit refused") }
-    if p == 2 { return irBMiss("is record fit staged") }
-    if rep != ibBool { return irBMiss("is result rep") }
+    const why = if p < 0 { "is record fit refused" } else if p == 2 { "is record fit staged" } else if rep != ibBool { "is result rep" } else { "" }
+    if why != "" { return irBMiss(why) }
     const v = irBExpr(b, n.isObj)
     if ibMiss != "" { return v }
     // Legacy's field tests re-read it, so a variable (`fitRecvReadHook`).
@@ -1494,8 +1493,11 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
         isArmOf(ix, ibFnIx, isArmRank(arm) + 1, false),
       )
     }
-    if p.lftOk < 0 { return irBMiss("is list fit refused") }
-    if rep != ibBool { return irBMiss("is result rep") }
+    if p.lftOk < 0 || rep != ibBool {
+      return irBMiss(
+        if p.lftOk < 0 { "is list fit refused" } else { "is result rep" },
+      )
+    }
     const v = irBExpr(b, n.isObj)
     if ibMiss != "" { return v }
     return irBLetTemp(b, { lsV: v, lsAt: ix }, ix, rep)
@@ -1520,8 +1522,10 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   if ta == "softTwin" && emitSoftFail {
     mapSoftTwinTagFail(n.isObj, isArmPatTy(ix, n, ibFnIx), ibFnIx, ix)
   }
-  if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
-  if rep != ibBool { return irBMiss("is result rep") }
+  const plain = isBoxGuardPlain(ix, ibFnIx)
+  if !plain || rep != ibBool {
+    return irBMiss(if !plain { "is guard" } else { "is result rep" })
+  }
   if ta == "lacks" {
     const lv = irBExpr(b, n.isObj)
     if ibMiss != "" { return lv }
@@ -1567,10 +1571,8 @@ function isEmptyFit(
 ): Opnd {
   if p.efArm == "union" { return isEmptyFitArms(b, n, ix, rep, p) }
   const fit = if p.efArm == "shadow" { fitShadowVar(n, ix, p) } else { -1 }
-  if ibMiss != "" { return irBMiss(ibMiss) }
-  if p.efArm != "loop" && fit < 0 { return irBMiss("is empty fit " + p.efArm) }
-  if p.efRepWhy != "" { return irBMiss("is empty fit rep") }
-  if rep != ibBool { return irBMiss("is result rep") }
+  const why = if ibMiss != "" { ibMiss } else if p.efArm != "loop" && fit < 0 { "is empty fit " + p.efArm } else if p.efRepWhy != "" { "is empty fit rep" } else if rep != ibBool { "is result rep" } else { "" }
+  if why != "" { return irBMiss(why) }
   const v = irBExpr(b, n.isObj)
   if ibMiss != "" { return v }
   if !(repNodeAt(irBOpRep(v)) is RList) {
@@ -16154,13 +16156,13 @@ function tagSetCloKey(arms: i32[]): string {
 // the call's type, as `tagDispatch` joins its arms.
 function unionRecCall(b: i32[], ix: i32): Opnd {
   const c = nodeAt(ix)
-  if !(c is Call) { return irBMiss("union record call node") }
   const t = nodeSrc[ix] ?? ix
   const ms = elabUnionCallMembersOf(t)
   const recs = elabUnionCallRecsOf(t)
-  if ms.length != recs.length { return irBMiss("union record call members") }
   const ty = heldTy(nodeTyAt(ix, ibFnIx))
-  if irTyOpen(ty) { return irBMiss("open temp type") }
+  if !(c is Call) || ms.length != recs.length || irTyOpen(ty) {
+    return irBMiss("union record call node")
+  }
   const rep = repNodeOfTy(ty)
   // The callee is read as its binding holds it, the box of the union, whatever its narrowing.
   const cx = unwrapParen(c.callFn)
@@ -16226,22 +16228,23 @@ function unionRecArm(
 ): Opnd {
   const rty = bundleRecordTyOf(sigs)
   const row = bundleRecordRowOfSigs(sigs)
-  const fi = if row >= 0 && m >= 0 { sFieldIndex(row, "c" + i32ToStr(m)) } else { -1 }
+  const fi = if row >= 0 && row < sHeapIdx.length && m >= 0 { sFieldIndex(row, "c" + i32ToStr(m)) } else { -1 }
   const key = if m >= 0 && m < sigs.length { recMemberCallKey(ix, ibFnIx, sigs[m]) } else { "" }
-  if fi < 0 || key == "" { return irBMiss("union record member") }
+  const cn = if key == "" { null } else { repNodeAt(repNodeOfTy(sigs[m])) }
+  if fi < 0 || !(cn is RClosure) || cn.rcVoid {
+    return irBMiss("union record member")
+  }
   const u = unboxRecArm(b, f, repNodeOfTy(rty), ix)
   if ibMiss != "" { return u }
   const fr = irBLetTempTy(
     b,
-    { rmbV: u, rmbRow: row, rmbField: fi },
+    { rmbV: u, rmbHeap: sHeapIdx[row], rmbField: fi },
     ix,
     repNodeOfTy(sigs[m]),
     sigs[m],
   )
-  const cn = repNodeAt(repNodeOfTy(sigs[m]))
-  if !(cn is RClosure) || cn.rcVoid { return irBMiss("union record member") }
   const r = closureCallAt(b, c, ix, key, fr)
-  if ibMiss != "" { return irBMiss(ibMiss) }
+  if ibMiss != "" { return fr }
   const v = irBLetTempTy(b, r, ix, cn.rcRet, repTyOf(cn.rcRet))
   if irBOpRep(v) == rep { return v }
   return irConvert(b, v, rep, ty, ix)
