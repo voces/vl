@@ -215,6 +215,13 @@ const ST = "export let g: i32 | null = 1\n" +
   "let hh: () => void = () => { print(0) }\n" +
   "export function reg(h: () => void): void { hh = h }\n" +
   "export function poke(): void { hh() }\n";
+// G holds the hook itself, so the call inside the narrowing asks nothing of a declaration
+// outside G: only the writer closure sees the importer's writer.
+const NARROW_HOOK = 'import { g } from "./st"\n' +
+  "let hk: () => void = () => { print(0) }\n" +
+  "export function setHk(h: () => void): void { hk = h }\n" +
+  "export function f(): i32 {\n  if g != null {\n    hk()\n    const k = g\n" +
+  "    const j = k ?? 0\n    return j\n  }\n  return 0\n}\n";
 const NARROW = 'import { g, poke } from "./st"\n' +
   "export function f(): i32 {\n  if g != null {\n    poke()\n    const k = g\n" +
   "    const j = k ?? 0\n    return j\n  }\n  return 0\n}\n";
@@ -468,14 +475,16 @@ const CASES: Case[] = [
   {
     name: "a callback an importer registers writes a global G narrows across a call",
     graph: {
-      "main.vl": 'import { f } from "./lib"\nimport { g, reg } from "./st"\n' +
-        "function w9(): void { g = null }\nreg(w9)\nprint(f())\n",
-      "lib.vl": NARROW,
+      "main.vl": 'import { f, setHk } from "./lib"\nimport { g } from "./st"\n' +
+        "function w9(): void { g = null }\nsetHk(w9)\nprint(f())\n",
+      "lib.vl": NARROW_HOOK,
       "st.vl": ST,
     },
     target: "lib.vl",
     want: "writer",
-    mask: NO_WRITER,
+    // The hook's targets include main's writer, so reading its summary also asks about a
+    // declaration outside G: the asks guard declines it too.
+    mask: NO_WRITER | NO_ASKS,
   },
   {
     name: "a callback that writes nothing G asked about is served",
