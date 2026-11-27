@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The post-I8 fleet scoreboard: holdouts per owner (scripts/ir-i8-census/holdouts.tsv, one
+# The post-I8 fleet scoreboard: holdouts per owner (`cat scripts/ir-i8-census/holdouts/*.tsv`, one
 # `program\tunit\tclass\towner` row per program) as a markdown table, each owner's delta against an
 # earlier list when one is given, and with --red, the red list's programs no holdout names (each
 # one a CI red after the cutover; this must read 0) and the file holdouts it no longer names. A red row's witness `wit/<inv>/D<id>/w.vl` is
