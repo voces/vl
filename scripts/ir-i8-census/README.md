@@ -19,6 +19,8 @@ conflicts with another PR on a shared line.
   the capability probes track, not unclaimed, so no I8 count includes it. Any other refusal is `fnu`.
 - `convert-board.sh <red.tsv | holdouts.tsv> [<prev>]`: layer 3's one number, the convert-shaped units (each `convert A -> B`
   by rep pair, plus the local rep compares `convert-shaped.txt` and a scan name), with its delta.
+- `census-failing.sh <census-out>`: after I8, the red list's failing programs straight from the census (a program
+  meeting the refusal it expects left out), in failing.tsv's shape for red.sh.
 - `holdouts-board.sh <holdouts.tsv> [<prev>] [--red <red.tsv>]`: holdouts per owner with deltas, and the red
   programs no holdout names (must be 0); the hourly summary's post-I8 headline.
 - `scoreboard.sh <red.tsv> [<prev>]`: units and classes per owner as a markdown table, with deltas; the
