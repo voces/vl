@@ -2954,6 +2954,71 @@ export function cloHoleRetag(f: IrFn, src: i32, dst: i32): boolean {
   return repFillsHole(f, src, dst, false) || repFillsHole(f, dst, src, false)
 }
 
+// Notes, for each record of hole rep `dst` that has no heap, the heap of the record of `src` that
+// fills it, walking both alike: a record with an open field has no row of its own, so the value
+// stands on its filler's. A second filler on another heap leaves it with none (`irRecHeapNoteOne`).
+export function recHoleHeapsNote(f: IrFn, src: i32, dst: i32) {
+  return holeHeapsNoteIn(f, src, dst, false)
+}
+
+// `recHoleHeapsNote` under a closure (`inClo`), where a field may be left unknown.
+function holeHeapsNoteIn(f: IrFn, src: i32, dst: i32, inClo: boolean) {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if src == dst || a == null || d == null { return 0 }
+  match d {
+    RList => if a is RList { holeHeapsNoteIn(f, a.rlsElem, d.rlsElem, inClo) }
+    RNullable => if a is RNullable { holeHeapsNoteIn(f, a.rnInner, d.rnInner, inClo) }
+    RMap => if a is RMap { holeHeapsNoteIn(f, a.rmVal, d.rmVal, inClo) }
+    RClosure => if a is RClosure && a.rcParams.length == d.rcParams.length {
+      let i = 0
+      while i < d.rcParams.length {
+        holeHeapsNoteIn(f, a.rcParams[i], d.rcParams[i], true)
+        i = i + 1
+      }
+      holeHeapsNoteIn(f, a.rcRet, d.rcRet, true)
+    }
+    RRecord => if a is RRecord && recHoleFilledBy(f, src, dst, inClo) { irRecHeapNoteOne(f, dst, irRecHeapOf(f, src)) }
+    RAtom |
+      RBox |
+      RNoValue |
+      RPrim |
+      RRaw |
+      RUnsup => 0
+  }
+  return 0
+}
+
+// Whether record `src`, on a noted heap, fills record hole `dst`, which has none: one variant flag,
+// the same field names, and each field filling its hole, records among them noted first.
+function recHoleFilledBy(f: IrFn, src: i32, dst: i32, inClo: boolean): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if !(a is RRecord) || !(d is RRecord) || a.rrVariant != d.rrVariant {
+    return false
+  }
+  if (
+    irRecHeapOf(f, src) < 0
+    || irRecHeapOf(f, dst) != -1
+    || recHeapOf(dst) >= 0
+  ) {
+    return false
+  }
+  const na = repRecordFieldNames(src)
+  const nd = repRecordFieldNames(dst)
+  if na.length != nd.length || a.rrFields.length != d.rrFields.length {
+    return false
+  }
+  let i = 0
+  while i < nd.length && i < d.rrFields.length {
+    if na[i] != nd[i] { return false }
+    holeHeapsNoteIn(f, a.rrFields[i], d.rrFields[i], inClo)
+    if !repFillsHole(f, a.rrFields[i], d.rrFields[i], inClo) { return false }
+    i = i + 1
+  }
+  return true
+}
+
 // Whether rep `src` is `dst`, or `dst` with parts of a closure (`inClo`) left unknown.
 function repFillsHole(f: IrFn, src: i32, dst: i32, inClo: boolean): boolean {
   if src == dst { return true }

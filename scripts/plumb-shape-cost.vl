@@ -35,6 +35,9 @@ const UNIT_BYTES = 2000000
 const BUILD_TIMEOUT = 300
 const BAR_FUEL = 0.05
 const BAR_RSS = 0.10
+// Peak live after a collection still moves with when the runner's GC fires (+8.5% seen between
+// two runners), so its bar is its own.
+const BAR_LIVE = 0.10
 const BAR_COMPILE_CPU = 0.15
 const BAR_OPT_CPU = 0.25
 const QUIET = 1.15
@@ -454,6 +457,19 @@ function gcOf(err: string): string | null {
   return null
 }
 
+// The peak live KiB in a `gcOf` reading, or null: the GC's own figure, which the runner's CPU
+// and memory do not move the way they move peak RSS.
+function liveKibOf(gc: string | null): f64 | null {
+  if gc == null { return null }
+  const at = gc.indexOf("peak live ")
+  if at < 0 { return null }
+  const rest = gc.slice(at + 10, gc.length)
+  const sp = rest.indexOf(" ")
+  const n = parseI64(if sp < 0 { rest } else { rest.slice(0, sp) })
+  if n == null { return null }
+  return n as! f64
+}
+
 function makeTemp(): string {
   const p = spawn("mktemp", mktempDirArgs("plumb-shape."))
   if p.code != 0 { die("plumb-shape: mktemp -d failed: " + p.err, 1) }
@@ -680,7 +696,8 @@ function measJson(m: Meas): string {
   const host = jsonStr(m.host)
   const cpu = "\"compile_cpu\": \{comp}, \"opt_cpu\": \{opt}, \"control_cpu\": \{ctl}"
   const facts = "\"skip_ssa\": \{skip}, \"const_ifs\": \{ifs}"
-  return "\"fuel\": \{fuel}, \"rss_mb\": \{rss}, \{cpu}, \"unit_sha\": \{sha}, \{facts}, \"wasm_opt\": \{wo}, \"cpu_host\": \{host}"
+  const live = numJson(liveKibOf(m.gc))
+  return "\"fuel\": \{fuel}, \"rss_mb\": \{rss}, \"peak_live_kib\": \{live}, \{cpu}, \"unit_sha\": \{sha}, \{facts}, \"wasm_opt\": \{wo}, \"cpu_host\": \{host}"
 }
 
 const bad: string[] = []
@@ -784,11 +801,31 @@ function checkUnit(
   } else {
     grade(tag + "fuel", fuel, numOf(b, "fuel"), BAR_FUEL, "")
   }
+  // Peak RSS follows the runner's GC trigger, so it is graded only on the baseline's CPU, as
+  // CPU time is; peak live, the GC's own figure, is the guard on every runner.
   const rss = m.rss
   if rss == null {
     gradeSkip(tag + "peak RSS", "no " + TIME + " to read rusage with")
+  } else if !sameHost {
+    const there = pyOptStr(strOf(base, "cpu_host"))
+    gradeSkip(
+      tag + "peak RSS",
+      "CPU is `\{cpuModel()}`, the baseline's `\{there}`",
+    )
   } else {
     grade(tag + "peak RSS", rss, numOf(b, "rss_mb"), BAR_RSS, " MB")
+  }
+  const live = liveKibOf(m.gc)
+  const bl = field(b, "peak_live_kib")
+  if live == null {
+    gradeSkip(tag + "peak live", "this host prints no GC stats line")
+  } else if !(bl is f64) {
+    gradeSkip(
+      tag + "peak live",
+      "the baseline has none; write it with --write-baseline",
+    )
+  } else {
+    grade(tag + "peak live", live, bl, BAR_LIVE, " KiB")
   }
   if !skips && !requireFuel {
     gradeSkip(
