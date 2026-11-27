@@ -7,7 +7,7 @@ import { checkTailArmsAgainst } from "./check_fn_decl"
 import { noteOpenUnionRows } from "./check_hole_links"
 import { openMemberRows } from "./check_leaf_steps"
 import { HD_ITER1, HD_ITER2, gnotRecordBase } from "./check_hole_pins"
-import { strListHas, strListIndexOf } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import { exprIsCollCtorCall } from "./check_list_origin"
 import {
   nodeTyIx,
@@ -371,7 +371,7 @@ import {
   noteValBindLambda,
   recordDeadTest,
 } from "./check_side_rows"
-import { redunTypedReadLets } from "./check_state"
+import { redunAdoptedAnnots, redunTypedReadLets } from "./check_state"
 import { symDecl, symNameIsMinted } from "./check_sym_occ"
 import { nomBaseTyIx } from "./check_ty_rep"
 import {
@@ -407,11 +407,11 @@ import {
   tyHasHole,
   tyHasInferHole,
   tyIsHole,
-  tyMayHoldFn,
   tyIsNewtypeBrand,
   tyIsStructBearingUnion,
   tyKeyOf,
   tyKeyOpen,
+  tyMayHoldFn,
   tyPinKey,
   tyPinVal,
   tySame,
@@ -439,6 +439,7 @@ import {
   isNullTy,
   isStringTy,
   isVoidTy,
+  primNameOf,
   tyHasTyVar,
   tyHoldsHole,
   tyMentionsVoid,
@@ -520,48 +521,97 @@ function letAdoptedDestTy(d: i32): i32 {
     i = i + 1
   }
   const n = nodeAt(d)
-  if t >= 0 && n is LetDecl && !litFieldsWithin(parenPeelIx(n.letInit), t, 0) { return -1 }
+  if t >= 0 && n is LetDecl && !litFieldsWithin(parenPeelIx(n.letInit), t, 0) {
+    return -1
+  }
+  if t >= 0 {
+    for tr in trs {
+      if !i32ListHas(redunAdoptedAnnots, tr) { redunAdoptedAnnots.push(tr) }
+    }
+  }
   return t
 }
 
 // Whether every field literal `x` sets, at any depth, is one destination type `t` declares: a
 // literal with a field its destination drops keeps its own shape, which width subtyping delivers.
 function litFieldsWithin(x: i32, t: i32, depth: i32): boolean {
-  if x < 0 || x >= P.nodes.length || t < 0 || t >= T.tys.length || depth > 16 { return true }
+  if x < 0 || x >= P.nodes.length || t < 0 || t >= T.tys.length || depth > 16 {
+    return true
+  }
   const n = nodeAt(x)
   const c = tyAt(t)
   if n is ObjLit {
     if !(c is TyObj) { return false }
     for f in n.objFields {
       const fi = nodeAt(f)
-      if !(fi is FieldInit) || !strListHas(c.objFieldNames, fi.fiName) { return false }
+      if !(fi is FieldInit) || !strListHas(c.objFieldNames, fi.fiName) {
+        return false
+      }
       const ft = objFieldType(c, fi.fiName)
-      if !litFieldsWithin(parenPeelIx(fi.fiValue), ft, depth + 1) { return false }
+      if !litFieldsWithin(parenPeelIx(fi.fiValue), ft, depth + 1) {
+        return false
+      }
     }
     return true
   }
   if n is ArrayLit {
     if !(c is TyArray) { return false }
     for e in n.arrElems {
-      if !litFieldsWithin(parenPeelIx(e), tyElemOf(c), depth + 1) { return false }
+      if !litFieldsWithin(parenPeelIx(e), tyElemOf(c), depth + 1) {
+        return false
+      }
     }
   }
   return true
 }
 
-// Whether a binding may be built at destination type `t`: one type, not a nullable or a union
-// of shapes, whose arms the returned-binding rows choose, and holding no function, which a
-// function's own delivery pins. A union of literals is one type.
+// Whether a binding may be built at destination type `t`: one type at every depth, not a
+// nullable or a union of shapes, whose arms the returned-binding rows choose, and holding no
+// function, which a function's own delivery pins. A leaf is a literal union or a type a literal
+// is built at without a widening, which a container never takes implicitly; one leaf at least
+// narrows the literal's own type (a literal union, `f32`), or the binding is that type already.
 function destAdopts(t: i32): boolean {
   if t < 0 || t >= T.tys.length || tyMayHoldFn(t) { return false }
+  const seen: i32[] = []
+  const nar: i32[] = []
+  return destAdoptsIn(t, seen, nar) && nar.length > 0
+}
+
+function destAdoptsIn(t: i32, seen: i32[], nar: i32[]): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  if i32ListHas(seen, t) { return true }
+  seen.push(t)
   const c = tyAt(t)
   if c is TyNullable { return false }
   if c is TyUnion {
     for m in c.uMembers {
       if !(tyAt(m) is TyLit) { return false }
     }
+    nar.push(t)
+    return true
   }
-  return true
+  if c is TyLit {
+    nar.push(t)
+    return true
+  }
+  if c is TyObj {
+    for ft in c.objFieldTypes {
+      if !destAdoptsIn(ft, seen, nar) { return false }
+    }
+    return true
+  }
+  if c is TyArray { return destAdoptsIn(tyElemOf(c), seen, nar) }
+  if c is TyMap {
+    return destAdoptsIn(tyKeyOf(c), seen, nar)
+      && destAdoptsIn(tyValOf(c), seen, nar)
+  }
+  const pn = primNameOf(t)
+  if pn == "f32" { nar.push(t) }
+  return pn == "i32"
+    || pn == "f64"
+    || pn == "f32"
+    || pn == "string"
+    || pn == "boolean"
 }
 
 // Type `t` projected down `path` (`e` an element, `f:name` a field, `/`-joined), or -1.
@@ -1099,6 +1149,7 @@ function letDeclInitVerdicts(
   // seed the annotation supplied (an un-annotated lambda param) — comparing then would be circular (D1442).
   if (
     annot >= 0
+    && n.letType >= 0
     && initTy >= 0
     && n.letInit >= 0
     && cbSeedUsed == seedMark
