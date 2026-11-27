@@ -492,6 +492,7 @@ import {
   rangePartialCopies,
   recCopyReReads,
   recCopyReadsOnce,
+  recMemberCallKey,
   recordFitPlanOf,
   recvReadsListPayload,
   refIfArmOf,
@@ -773,6 +774,8 @@ import {
   elabMakerLamOf,
   elabSpreadNote,
   elabStoreMemberOf,
+  elabUnionCallMembersOf,
+  elabUnionCallRecsOf,
   isStorageRead,
   luOvEnter,
   luOvLeave,
@@ -985,7 +988,7 @@ import {
   parseI32,
   parseI64Pair,
 } from "./emit_bignum"
-import { isVoidTy, tyMapValOf } from "./tyquery"
+import { isVoidTy, tyMapValOf, tyStepRet } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
   listGetIdxReReadable,
@@ -16041,6 +16044,108 @@ function tagSetCloKey(arms: i32[]): string {
   return key
 }
 
+// A call through a binding holding a union of bundle records (D17573): the callee's box, then a
+// valued `if` per record but the last, each the record's member called at its key and delivered at
+// the call's type, as `tagDispatch` joins its arms.
+function unionRecCall(b: i32[], ix: i32): Opnd {
+  const c = nodeAt(ix)
+  if !(c is Call) { return irBMiss("union record call node") }
+  const t = nodeSrc[ix] ?? ix
+  const ms = elabUnionCallMembersOf(t)
+  const recs = elabUnionCallRecsOf(t)
+  if ms.length != recs.length { return irBMiss("union record call members") }
+  const ty = heldTy(nodeTyAt(ix, ibFnIx))
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const rep = repNodeOfTy(ty)
+  // The callee is read as its binding holds it, the box of the union, whatever its narrowing.
+  const cx = unwrapParen(c.callFn)
+  const bv = boundVarOf(cx)
+  const bo: Opnd = { ov: bv }
+  const d = identDeclOf(cx)
+  const gi = if bv < 0 && d >= 0 { globalIndexOfSid(sidOfNode(cx)) } else { -1 }
+  const f0 = if bv >= 0 { bo } else if gi >= 0 { globalStoredRead(b, gi, cx, globalRep(gi, d), heldTy(letBindTy(d, -1))) } else { irBExpr(b, c.callFn) }
+  if ibMiss != "" { return f0 }
+  // Each arm reads the box again, so a read other than the binding's variable is stashed first.
+  const fv = if bv >= 0 { bv } else { irVarNew(ib, irBOpRep(f0), repTyOf(irBOpRep(f0)), "local", -1) }
+  if bv < 0 { irBNode(b, { asDst: fv, asSrc: f0 }, -1, ibNoValue, ix) }
+  const f: Opnd = { ov: fv }
+  const bs: i32[][] = []
+  const conds: Opnd[] = []
+  const outs: i32[] = []
+  const thens: i32[][] = []
+  let cb = b
+  let k = 0
+  while k < recs.length - 1 {
+    const cv = testRecArm(cb, f, repNodeOfTy(bundleRecordTyOf(recs[k])), ix)
+    const o = irVarNew(ib, rep, ty, "local", -1)
+    const th: i32[] = []
+    const v = unionRecArm(th, c, ix, f, recs[k], ms[k], rep, ty)
+    if ibMiss != "" { return v }
+    irBNode(th, { asDst: o, asSrc: v }, -1, ibNoValue, ix)
+    bs.push(cb)
+    conds.push(cv)
+    outs.push(o)
+    thens.push(th)
+    cb = []
+    k = k + 1
+  }
+  const last = recs.length - 1
+  const lv = unionRecArm(cb, c, ix, f, recs[last], ms[last], rep, ty)
+  if ibMiss != "" { return lv }
+  irBNode(cb, { asDst: outs[last - 1], asSrc: lv }, -1, ibNoValue, ix)
+  let elseB = cb
+  let j = last - 1
+  while j >= 0 {
+    irBNode(bs[j], sIf(conds[j], thens[j], elseB, outs[j], true), ty, rep, ix)
+    if j == 0 { break }
+    const inner: Opnd = { ov: outs[j] }
+    irBNode(bs[j], { asDst: outs[j - 1], asSrc: inner }, -1, ibNoValue, ix)
+    elseB = bs[j]
+    j = j - 1
+  }
+  const o0: Opnd = { ov: outs[0] }
+  return o0
+}
+
+// One arm of `unionRecCall`: box `f` read at record `sigs`, its member `m` taken and called, the
+// result at rep `rep` and type `ty`.
+function unionRecArm(
+  b: i32[],
+  c: Call,
+  ix: i32,
+  f: Opnd,
+  sigs: i32[],
+  m: i32,
+  rep: i32,
+  ty: i32,
+): Opnd {
+  const rty = bundleRecordTyOf(sigs)
+  const row = bundleRecordRowOfSigs(sigs)
+  const fi = if row >= 0 && m >= 0 { sFieldIndex(row, "c" + i32ToStr(m)) } else { -1 }
+  const key = if m >= 0 && m < sigs.length { recMemberCallKey(ix, ibFnIx, sigs[m]) } else { "" }
+  if fi < 0 || key == "" { return irBMiss("union record member") }
+  const u = unboxRecArm(b, f, repNodeOfTy(rty), ix)
+  if ibMiss != "" { return u }
+  const fr = irBLetTempTy(
+    b,
+    { rmbV: u, rmbRow: row, rmbField: fi },
+    ix,
+    repNodeOfTy(sigs[m]),
+    sigs[m],
+  )
+  const r = closureCallAt(b, c, ix, key, fr)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  const v = irBLetTempTy(
+    b,
+    r,
+    ix,
+    repNodeOfTy(tyStepRet(sigs[m])),
+    tyStepRet(sigs[m]),
+  )
+  if irBOpRep(v) == rep { return v }
+  return irConvert(b, v, rep, ty, ix)
+}
+
 // A call through a tagged function set, as `emitFnTagDispatch` writes it: the callee's set id kept,
 // then a valued `if` per member but the last, which takes the final `else`. Each arm is its call,
 // delivered at the call's rep. A lambda arm, which legacy stages at its instance, and a result
@@ -16638,6 +16743,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   if pre == "pre-path dead never" { return deadNeverTemp(b, ix, -1) }
   if pre == "pre-path tag leaf" { return tagLeaf(ix) }
   if pre == "pre-path tag dispatch" { return tagDispatch(b, ix) }
+  if pre == "" && elabUnionCallMembersOf(nodeSrc[ix] ?? ix).length >= 2 {
+    return unionRecCall(b, ix)
+  }
   if pre == "pre-path null unit read" { return nulUnitPlaceRead(b, ix, cell) }
   if pre == "pre-path nul atom niche" { return nulLitNicheRead(b, ix) }
   if pre == "pre-path niche read" { return placeNicheRead(b, ix) }
