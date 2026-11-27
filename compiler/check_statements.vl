@@ -30,12 +30,15 @@ import {
   IsExpr,
   LetDecl,
   Node,
+  BoolLit,
+  NumLit,
   ObjLit,
   OptMember,
   P,
   Param,
   Paren,
   RetStmt,
+  StrLit,
   TypeRef,
   Unary,
   WhileStmt,
@@ -358,10 +361,12 @@ import {
   T,
   TY_BOOL,
   TY_ERR,
+  TY_F64,
   TY_I32,
   TY_NEVER,
   TY_NULL,
   TY_OPEN,
+  TY_STR,
   TY_VOID,
   TyArray,
   TyErr,
@@ -403,11 +408,13 @@ import {
   cwFollowEnd,
   cwLetUnwritten,
   cwLoopVarTypedLet,
+  cwMapReadCoalDefault,
   cwMapReadTypedLet,
   cwSoleReadInit,
   fnDeclIx,
 } from "./check_write_scan"
 import { identDeclOf, identFromDecl, identRedirect } from "./symbols"
+import { numLexIsFloat } from "./emit_bignum"
 import {
   isNeverTy,
   isNullTy,
@@ -1824,6 +1831,34 @@ function typedReadLetTy(dl: i32): i32 {
   return t
 }
 
+// The type a `??` default `x` supplies, read off its spelling: a string, number or boolean
+// literal, a read of an annotated `let`, or a record literal of such fields; -1 for any other.
+export function coalDefaultTy(x: i32, depth: i32): i32 {
+  if x < 0 || x >= P.nodes.length || depth <= 0 { return -1 }
+  const e = nodeAt(x)
+  return match e {
+    Paren => coalDefaultTy(e.parInner, depth)
+    StrLit => TY_STR
+    BoolLit => TY_BOOL
+    NumLit => if numLexIsFloat(e.numText) { TY_F64 } else { TY_I32 }
+    Ident => typedReadLetTy(identDeclOf(x))
+    ObjLit => {
+      const names: string[] = []
+      const tys: i32[] = []
+      for f in e.objFields {
+        const fn = nodeAt(f)
+        if !(fn is FieldInit) { return -1 }
+        const ft = coalDefaultTy(fn.fiValue, depth - 1)
+        if ft < 0 { return -1 }
+        names.push(fn.fiName)
+        tys.push(ft)
+      }
+      if names.length == 0 { -1 } else { mkObjTy(names, tys) }
+    }
+    _ => -1
+  }
+}
+
 // Pins the open key and value of read-only map or set `bound`, bound by `let` `ix`, to the type
 // the annotated `let` a key or value read is delivered to names (`cwMapReadTypedLet`), before the
 // declaration default settles what stays open (DECISIONS.md "No default type").
@@ -1836,6 +1871,11 @@ function mapPinFromTypedReads(bound: i32, ix: i32) {
     if vt >= 0 {
       tyPinVal(t, vt)
       redunTypedReadLets.push(dl)
+    } else {
+      // With no write, every value read answers its `??` default, so the default's type is the
+      // value type (D17734).
+      const ct = coalDefaultTy(cwMapReadCoalDefault(ix), 4)
+      if ct >= 0 { tyPinVal(t, ct) }
     }
   }
   if tyKeyOpen(t) {
