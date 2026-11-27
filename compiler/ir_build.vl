@@ -4692,24 +4692,52 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
 }
 
 // The join itself: the condition, a temp at `rep` of the value's type (`ty0`, else the node's),
-// then each arm's value delivered into it.
-function ifValueJoin(b: i32[], n: IfStmt, ix: i32, rep: i32, ty0: i32): Opnd {
-  const cat = b.length
-  const c = irBExpr(b, n.ifCond)
-  if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
-  // A decided `is` writes the arm it rules out as `unreachable`, never lowering a value typed at a
-  // type the pin excludes; a literal `true` rules out its `else` block.
-  const dk = if c is OImm && bareConstIs(c, n.ifCond, b, cat) { if c.oiBits != 0 { 1 } else { 0 } } else { -1 }
-  const ty = if ty0 >= 0 { ty0 } else { byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)) }
-  if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
-  const t = irVarNew(ib, rep, ty, "local", -1)
-  let thenB: i32[] = []
-  if dk == 0 {
-    irBNode(thenB, { tpWhy: 0 }, -1, ibNoValue, n.ifThen)
-  } else {
-    thenB = ifArmAt(n.ifThen, t, rep, ty)
+// then each arm's value delivered into it. An `else` whose value is a link this join would build
+// the same way is built along the spine, not through `deliver` (D1990).
+function ifValueJoin(b: i32[], n0: IfStmt, ix0: i32, rep: i32, ty0: i32): Opnd {
+  const bs: i32[][] = []
+  const ixs: i32[] = []
+  const conds: Opnd[] = []
+  const outs: i32[] = []
+  const thens: i32[][] = []
+  let cb = b
+  let n = n0
+  let ix = ix0
+  let ty = -1
+  let dk = -1
+  while true {
+    const cat = cb.length
+    const c = irBExpr(cb, n.ifCond)
+    if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+    // A decided `is` writes the arm it rules out as `unreachable`, never lowering a value typed at a
+    // type the pin excludes; a literal `true` rules out its `else` block.
+    dk = if c is OImm && bareConstIs(c, n.ifCond, cb, cat) { if c.oiBits != 0 { 1 } else { 0 } } else { -1 }
+    if ix == ix0 {
+      ty = if ty0 >= 0 { ty0 } else { byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)) }
+      if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
+    }
+    const t = irVarNew(ib, rep, ty, "local", -1)
+    let thenB: i32[] = []
+    if dk == 0 {
+      irBNode(thenB, { tpWhy: 0 }, -1, ibNoValue, n.ifThen)
+    } else {
+      thenB = ifArmAt(n.ifThen, t, rep, ty)
+    }
+    if ibMiss != "" { return irBMiss(ibMiss) }
+    bs.push(cb)
+    ixs.push(ix)
+    conds.push(c)
+    outs.push(t)
+    thens.push(thenB)
+    const nx = if dk == 1 || valueIfLitTrue(n.ifCond) { -1 } else { spineLinkOf(n.ifElse, rep, ty) }
+    if nx < 0 { break }
+    const nn = nodeAt(nx)
+    if !(nn is IfStmt) { break }
+    cb = []
+    n = nn
+    ix = nx
   }
-  if ibMiss != "" { return irBMiss(ibMiss) }
+  let k = bs.length - 1
   let elseB: i32[] = []
   if n.ifElse >= 0 && (dk == 1 || valueIfLitTrue(n.ifCond)) {
     irBNode(elseB, { tpWhy: 0 }, -1, ibNoValue, n.ifElse)
@@ -4721,14 +4749,56 @@ function ifValueJoin(b: i32[], n: IfStmt, ix: i32, rep: i32, ty0: i32): Opnd {
       rep,
     )
     if ibMiss != "" { return irBMiss(ibMiss) }
-    irBNode(elseB, { asDst: t, asSrc: nv }, -1, ibNoValue, ix)
+    irBNode(elseB, { asDst: outs[k], asSrc: nv }, -1, ibNoValue, ix)
   } else {
-    elseB = ifArmAt(n.ifElse, t, rep, ty)
+    elseB = ifArmAt(n.ifElse, outs[k], rep, ty)
   }
   if ibMiss != "" { return irBMiss(ibMiss) }
-  irBNode(b, sIf(c, thenB, elseB, t, true), ty, rep, ix)
-  const o: Opnd = { ov: t }
+  // Innermost first: link `k` is written into its block, which is link `k - 1`'s `else`, and
+  // its out is that link's value.
+  while k >= 0 {
+    irBNode(
+      bs[k],
+      sIf(conds[k], thens[k], elseB, outs[k], true),
+      ty,
+      rep,
+      ixs[k],
+    )
+    if k == 0 { break }
+    const inner: Opnd = { ov: outs[k] }
+    irBNode(bs[k], { asDst: outs[k - 1], asSrc: inner }, -1, ibNoValue, ixs[k])
+    elseB = bs[k]
+    k = k - 1
+  }
+  const o: Opnd = { ov: outs[0] }
   return o
+}
+
+// The `if` an `else` (`elseIx`) holds as its whole value, where `deliver` would build it as this
+// join builds a link: no prelude, no hook of its own, a scalar or atom join at `rep` and type `ty`;
+// else -1.
+function spineLinkOf(elseIx: i32, rep: i32, ty: i32): i32 {
+  if elseIx < 0 || elseIx >= P.nodes.length { return -1 }
+  const en = nodeAt(elseIx)
+  let tv = elseIx
+  if en is Block {
+    if en.blkStmts.length != 1 { return -1 }
+    tv = ifArmValueExpr(elseIx)
+  } else if !(en is IfStmt) {
+    return -1
+  }
+  if tv < 0 || tv >= P.nodes.length || !(nodeAt(tv) is IfStmt) { return -1 }
+  if (ibAsgCapWant[tv] ?? false) || exprReadsDeadNever(tv, ibFnIx) { return -1 }
+  if exprPrePathWhy(tv, ibFnIx) != "" || optGuardCallOf(tv, ibFnIx) >= 0 {
+    return -1
+  }
+  if ifIntMatchWhy(tv, ibFnIx) != "" || exprUnion(tv, ibFnIx) { return -1 }
+  const arm = ifJoinPlanOf(tv, ibFnIx).ijArm
+  if arm != "scalar" && arm != "atom" || exprRepOf(tv) != rep { return -1 }
+  if byteHeld(rowlessRecordTy(tv, nodeTyAt(tv, ibFnIx), rep)) != ty {
+    return -1
+  }
+  return tv
 }
 
 // A value `if` joined at a reference (legacy's `emitIfExprRef`): one link whose arms each write
