@@ -139,6 +139,7 @@ import {
   blockTailIsDead,
   callIsNever,
   condLitTrue,
+  fnNameIsLambda,
   hasNamedArgs,
   i32ToStr,
   isBareBlockIf,
@@ -993,6 +994,7 @@ import {
 import { isVoidTy, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
+  fnHasUnannotatedParam,
   listGetIdxReReadable,
   optChainStagesRecv,
   optRecvReReadable,
@@ -7683,6 +7685,10 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if nullBindingCall(ix) { return { dnAt: ix, dnPad: callEndsNever(ix) } }
   // A binding holding a lambda-lifted function is a direct call of it; any other, a closure's.
   const lf = if d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) { cloLiftCalleeOf(c.callFn, ibFnIx) } else { -1 }
+  // A `const` bound to a lambda that captures nothing, in any frame, is a direct call of the
+  // lambda's function, at its signature's rep: the binding can hold no other function.
+  const kl = if lf < 0 && d >= 0 { constLambdaPos(d) } else { -1 }
+  if kl >= 0 { return directCallAt(b, c, ix, kl) }
   if lf < 0 && d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) {
     if bundleParamOfRead(c.callFn, ibFnIx) >= 0 {
       return bundleCallRhs(b, c, ix)
@@ -7705,6 +7711,28 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("binding call misfit")
   }
   return directCallAt(b, c, ix, pos)
+}
+
+// The `fnStmts` slot of the lambda `const` declaration `d` binds, when the lambda captures
+// nothing, declares no type parameter and annotates every parameter; -1 for any other binding.
+function constLambdaPos(d: i32): i32 {
+  const ld = nodeAt(d)
+  if !(ld is LetDecl) || ld.letKw != "const" || ld.letInit < 0 { return -1 }
+  const init = unwrapParen(ld.letInit)
+  if init < 0 || !(nodeAt(init) is FuncDecl) { return -1 }
+  const fd = nodeAt(init)
+  if (
+    !(fd is FuncDecl)
+    || fd.fnTyParams.length > 0
+    || !fnNameIsLambda(fd.fnName)
+  ) {
+    return -1
+  }
+  const pos = fnStmtsPosOf(init)
+  if pos < 0 || captureCountOf(pos) > 0 || fnHasUnannotatedParam(pos) {
+    return -1
+  }
+  return pos
 }
 
 // Call `c` with named arguments, as `emitCallCoreUserFn` sends it to `emitDirectCall`: a name
