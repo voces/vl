@@ -13,7 +13,7 @@ const ARM_FILES = ["compiler/ir.vl", "compiler/ir_verify.vl", "compiler/ir_lower
 const UNIONS = ["Rhs", "IrNode"];
 const SETS = [
   "klOpnd", "klPushRecv", "klVarKind", "klMapOp", "klStrOp", "klIrNode", "klPrimOp",
-  "klRhs", "klIrFamily", "klRawOp", "klRawEff",
+  "klRhs", "klRawOp", "klRawEff",
 ];
 // The sets kept in sorted order, as the unions they mirror are. The others mirror a string
 // union whose declared order `scripts/ladder-sets.vl` holds them to.

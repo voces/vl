@@ -7,9 +7,9 @@
 set -euo pipefail
 D=${1:?usage: probe-patch.sh <compiler-dir>}
 awk '
-  /^  if built != "" \|\| repNodeGen\(\) != gen \|\| !claimable\(\) \{ return false \}$/ {
-    print "  if built != \"\" || repNodeGen() != gen || !claimable() {"
-    print "    count(\"fnu \" + ib.irName + \" | \" + (if built != \"\" { built } else { \"not claimable\" }))"
+  /^  if built != "" \|\| repNodeGen\(\) != gen \{ return false \}$/ {
+    print "  if built != \"\" || repNodeGen() != gen {"
+    print "    count(\"fnu \" + ib.irName + \" | \" + (if built != \"\" { built } else { \"rep epoch moved\" }))"
     print "    return false"
     print "  }"
     a = 1; next
