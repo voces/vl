@@ -13462,3 +13462,20 @@ is untracked now; the rest waits.
 Why: the owner's direction after I8 is to burn the holdouts down by generalizing the IR. The
 adopted items remove legacy constraints that the IR no longer needs, and they make the IR passes
 of the next phase possible. The deferred items are that next phase.
+
+## A tagged function set has one rep, chosen per set (2026-11-27, coordinator ruling)
+
+COV-CLOS measured (master 3a8246bd): the id-vs-closure choice for a tagged function set is made at
+about 240 emitter sites, the IR inherits it, and TAGCLO/CLOTAG convert between the two where they
+meet. A closure call is cheaper from two members up (call_indirect against the id's per-arm
+compare chain) for 59 to 143 bytes of module size, and a capture-free closure allocates nothing.
+
+Ruled: choose the rep once per SET. A set whose every call is at one signature is a closure at every
+position. A set with a member called at two or more instance types is an id at every position, and
+an annotated closure destination takes the set's adapter. One per-set query replaces the per-site
+decisions, and a binding and its read can no longer disagree (the for-in narrowed-read class).
+First the multi-signature sets are counted with an emitter-side counter, then the query lands, then
+the sites move to it.
+
+Why: the owner's direction after I8 is to generalize the IR and the compiler. This takes a
+decision made at 240 places down to one, and makes the two converters unnecessary for most sets.
