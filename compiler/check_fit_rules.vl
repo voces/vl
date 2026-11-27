@@ -3380,29 +3380,41 @@ function recNullWidenedAt(
   }
   const o = tyAt(own)
   const d = tyAt(dst)
-  if o is TyObj && d is TyObj {
-    let i = 0
-    while i < o.objFieldNames.length {
-      const of = o.objFieldTypes[i]
-      const df = objFieldType(d, o.objFieldNames[i])
-      if df < 0 { return false }
-      if !fieldStorageEq(of, df) {
-        const inner = nullableInnerOrNone(df)
-        const at = if inner < 0 { df } else { inner }
-        if (
-          !fieldStorageEq(of, at)
-          && !(of == TY_NULL && inner >= 0)
-          && !(stored && of == TY_I32 && at == TY_I64)
-          && !recNullWidenedAt(of, at, stored, depth - 1)
-        ) {
-          return false
-        }
-      }
-      i = i + 1
+  match o {
+    // A list of such records is widened as its element is.
+    TyArray => {
+      const de = tyArrayElemIx(dst)
+      return d is TyArray
+        && recNullWidenedAt(tyElemOf(o), de, stored, depth - 1)
     }
-    return true
+    TyObj => {
+      if !(d is TyObj) { return false }
+      let i = 0
+      while i < o.objFieldNames.length {
+        const of = o.objFieldTypes[i]
+        const df = objFieldType(d, o.objFieldNames[i])
+        if df < 0 { return false }
+        if !fieldStorageEq(of, df) {
+          const inner = nullableInnerOrNone(df)
+          const at = if inner < 0 { df } else { inner }
+          if (
+            !fieldStorageEq(of, at)
+            && !(of == TY_NULL && inner >= 0)
+            && !(stored && of == TY_I32 && at == TY_I64)
+            && !recNullWidenedAt(of, at, stored, depth - 1)
+          ) {
+            return false
+          }
+        }
+        i = i + 1
+      }
+      return true
+    }
+    // No other type is a record or a list of one.
+    TyPrim | TyErr | TyFunc | TyNullable | TyMap | TyVar | TyLit | TyNeg | TyUnion => {
+      return false
+    }
   }
-  return false
 }
 
 // Whether `x` is the object of a field read that is not a method's callee.
@@ -7181,7 +7193,13 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       }
       return 0
     }
-    if bn is Call && recAdParamListArgs(b, nonNulTyOf(dstTy)) { return 0 }
+    if bn is Call && recAdParamListArgs(b, nonNulTyOf(dstTy)) {
+      // A binding holding the read holds what those arguments brought: the destination's record.
+      if recAdHeldDepth > 0 && recListArgsStamped(b) {
+        repStamp(p, nonNulTyOf(dstTy))
+      }
+      return 0
+    }
     // An element of an inferred function's list is delivered as that list is.
     if (
       bn is Call
@@ -7384,6 +7402,21 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     recAdNoteFields(p, d)
   }
   return 0
+}
+
+// Whether call `call` has a list literal argument and every one is stamped as built.
+function recListArgsStamped(call: i32): boolean {
+  const c = nodeAt(call)
+  if !(c is Call) { return false }
+  let n = 0
+  for a in c.callArgs {
+    const u = parenPeelIx(a)
+    if u >= 0 && nodeAt(u) is ArrayLit {
+      if !nodeRepStamped(u) { return false }
+      n = n + 1
+    }
+  }
+  return n > 0
 }
 
 // A call to a generic declared to return `T[]`: an element of its result can only be a value one
