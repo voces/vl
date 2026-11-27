@@ -418,8 +418,6 @@ import {
   idxCellReadIsNull,
   idxStoreNullUnitUnstamped,
   idxStoreSiteBoxes,
-  ifExprJoinVt,
-  ifExprSwitchMay,
   ifIntMatchWhy,
   ifLinkExhausts,
   ifThenIsDead,
@@ -818,7 +816,6 @@ import {
 import {
   armSiteReads,
   armSiteRecv,
-  asgLitUnionMemberReRead,
   asgReReadEnter,
   asgReReadLeave,
   asgReReadOf,
@@ -2932,7 +2929,7 @@ function fieldPlainWhy(
   if arm == "variant" {
     const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
     if va == "nulnone" {
-      return nulNoneFieldWhy("object variant field nulnone", valIx, dst)
+      return nulNoneFieldWhy("object variant field nulnone", dst)
     }
     if !variantArmFits(va, dst) { return "object variant field " + va }
     // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
@@ -2959,9 +2956,7 @@ function fieldPlainWhy(
     if !nullOwnRepFits(own, dst) { return "object field explicitNull rep" }
     return ""
   }
-  if fa == "nulnone" {
-    return nulNoneFieldWhy("object field nulnone", valIx, dst)
-  }
+  if fa == "nulnone" { return nulNoneFieldWhy("object field nulnone", dst) }
   // A bundle holder's read is the member the field's closure takes (`fieldHolderPick`).
   if fa == "holder" && repNodeAt(dst) is RClosure { return "" }
   if fa == "nulStrAtom" && strNullable(dst) { return "" }
@@ -2999,10 +2994,9 @@ function fieldExplicitNullOwn(
   return fieldNullOwnOf(row, fi)
 }
 
-// Why a `null` unit field's value `valIx` is not its slot's null alone (`emitNulNoneForEffect`
-// writes nothing for it), or "": a value that runs for effect stays `why`.
-function nulNoneFieldWhy(why: string, valIx: i32, dst: i32): string {
-  if !nulNoneWritesNothing(valIx) { return why }
+// Why a `null` unit field's value cannot go into field rep `dst`, or "": the value is
+// delivered, a place read for its effects (`nulUnitPlaceRead`), then the field holds `dst`'s null.
+function nulNoneFieldWhy(why: string, dst: i32): string {
   if !nullOwnRepFits(NULL_OWN_NONE, dst) { return why + " rep" }
   return ""
 }
@@ -4684,21 +4678,11 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
   // An optional call's guard whose receiver this instance closes with no `null` is its call alone.
   const gv = optGuardCallOf(ix0, ibFnIx)
   if gv >= 0 { return deliver(b, gv, rep0, ty0) }
-  // A dense integer `match` is one `br_table` whose arms carry the value, where its plan has an
-  // `else` and the join is one valtype; off that, it waits for the IR's own switch.
+  // A dense integer `match` whose plan has an `else` is one `br_table`, each arm's value delivered
+  // into the switch's out at the join's rep, whatever that rep is.
   if ifIntMatchWhy(ix0, ibFnIx) != "" {
     const p = intSwitchPlanOf(ix0, ibFnIx)
-    if p != null {
-      if (
-        ty0 < 0
-        && ifExprSwitchMay(ix0)
-        && valtypeOf(rep0) >= 0
-        && valtypeOf(rep0) == ifExprJoinVt(ix0, ibFnIx)
-      ) {
-        return valuedSwitch(b, ix0, p, rep0)
-      }
-      return irBMiss("expression if int match")
-    }
+    if p != null { return valuedSwitch(b, ix0, p, rep0, ty0) }
   }
   // The join plan picks the join's rep and how each arm is written there: the null unit, a
   // reference at the join's row, a union's box, else a temp at the value's own rep.
@@ -5486,13 +5470,8 @@ function widerNumListAt(ix: i32, dst: i32): i32 {
   return if sk >= 0 && dk >= 3 && sk != dk { lr } else { -1 }
 }
 
-// The body of value-`if` arm `blockIx`: its one value, delivered at `rep`, written to out `t`. A
-// direct `else if` the chain does not walk as a link is its own value.
-function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
-  return ifArmAt(blockIx, t, rep, -1)
-}
-
-// `ifArm` with its value delivered at type `ty` where that is not -1: the join temp's own.
+// The body of value-`if` arm `blockIx`: its one value, delivered at `rep` and type `ty` (where
+// that is not -1), written to out `t`. A direct `else if` the chain does not walk is its own value.
 function ifArmAt(blockIx: i32, t: i32, rep: i32, ty: i32): i32[] {
   const body: i32[] = []
   armPrelude(body, blockIx)
@@ -17123,16 +17102,6 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       return irBLetTemp(b, { aeEff: effs, aeV: t, aeAt: ix }, ix, rep)
     }
     if n.binOp == "??" { return coalesce(b, n, ix, rep, cell) }
-    // Legacy declares a string compare's locals for a side the checker typed `string` and holds as
-    // an atom, which no IR compare route declares; it misses rather than move those bytes.
-    // Legacy compares such an assignment's re-read atom by its own fold, which no IR compare
-    // route writes.
-    if (
-      (n.binOp == "==" || n.binOp == "!=")
-      && (asgMemberReReadAt(n.binLeft) || asgMemberReReadAt(n.binRight))
-    ) {
-      return irBMiss("assignment-value atom re-read as a compare operand")
-    }
     // A union box against a concrete operand is legacy's union compare, by legacy's own route.
     if (
       (n.binOp == "==" || n.binOp == "!=")
@@ -18280,13 +18249,6 @@ function assignValueNullLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("assignment value nullLit rep")
   }
   return repTemp(b, { nuAt: lit, nuOwn: own, nuRead: [] }, ix, rep)
-}
-
-// Whether `ix`, under any parentheses, is an assignment storing one member of a literal-union
-// place, which legacy yields as the re-read atom (`asgLitUnionMemberReRead`).
-function asgMemberReReadAt(ix: i32): boolean {
-  const x = unwrapParen(ix)
-  return x >= 0 && asgLitUnionMemberReRead(x, ibFnIx)
 }
 
 // Whether the re-read of assignment target `ix` is seated: a global, or a local already held at a
@@ -19512,7 +19474,21 @@ function elseStmts(e: i32): i32[] {
   return [e]
 }
 
-// Whether `on`, built into `b` from `n0` on, is a switch operand legacy reads again: a place's
+// The switch operand `on` for scrutinee `at`, built into `b` from `n0` on, as one the table reads
+// again: itself when that is a place's variable or a constant, else a local bound to it once.
+function switchOperand(b: i32[], n0: i32, on: Opnd, at: i32): Opnd {
+  if intSwitchOn(b, n0, on) { return on }
+  const ty = nodeTyAt(at, ibFnIx)
+  if ty < 0 || irTyHeldOpen(ty, irBOpRep(on)) {
+    return irBMiss("int switch scrutinee type")
+  }
+  const v = irVarNew(ib, irBOpRep(on), ty, "local", -1)
+  irBNode(b, { asDst: v, asSrc: on }, -1, ibNoValue, at)
+  const o: Opnd = { ov: v }
+  return o
+}
+
+// Whether `on`, built into `b` from `n0` on, is a switch operand read again as it is: a place's
 // variable (no temp), or the constant an unrolled range copy reads its variable as.
 function intSwitchOn(b: i32[], n0: i32, on: Opnd): boolean {
   if b.length != n0 { return false }
@@ -19523,17 +19499,24 @@ function intSwitchOn(b: i32[], n0: i32, on: Opnd): boolean {
 
 // The valued integer `match` at `ix` that `p` plans: each arm and the else writes its value at
 // `rep` into the out the frame carries, as `ifArm` writes a value `if`'s.
-function valuedSwitch(b: i32[], ix: i32, p: IntSwitchPlan, rep: i32): Opnd {
+function valuedSwitch(
+  b: i32[],
+  ix: i32,
+  p: IntSwitchPlan,
+  rep: i32,
+  ty0: i32,
+): Opnd {
   const n0 = b.length
-  const on = irBExpr(b, p.ispOn)
+  const on0 = irBExpr(b, p.ispOn)
+  if ibMiss != "" { return on0 }
+  const on = switchOperand(b, n0, on0, p.ispOn)
   if ibMiss != "" { return on }
-  if !intSwitchOn(b, n0, on) { return irBMiss("int switch scrutinee") }
-  const ty = byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep))
+  const ty = if ty0 >= 0 { ty0 } else { byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)) }
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const arms: i32[][] = []
-  for th in p.ispThens { arms.push(ifArm(th, t, rep)) }
-  const els = ifArm(p.ispElse, t, rep)
+  for th in p.ispThens { arms.push(ifArmAt(th, t, rep, ty)) }
+  const els = ifArmAt(p.ispElse, t, rep, ty)
   if ibMiss != "" { return irBMiss("if arm") }
   const sn: SIntSwitch = {
     isTail: false,
@@ -19555,9 +19538,10 @@ function valuedSwitch(b: i32[], ix: i32, p: IntSwitchPlan, rep: i32): Opnd {
 // last value (`tailArm`); a statement chain's are statement lists, as `emitSwitchArm` writes them.
 function intSwitch(b: i32[], ix: i32, p: IntSwitchPlan, tail: boolean) {
   const n0 = b.length
-  const on = irBExpr(b, p.ispOn)
+  const on0 = irBExpr(b, p.ispOn)
   if ibMiss != "" { return 0 }
-  if !intSwitchOn(b, n0, on) { return skip("int switch scrutinee") }
+  const on = switchOperand(b, n0, on0, p.ispOn)
+  if ibMiss != "" { return 0 }
   const arms: i32[][] = []
   for t in p.ispThens {
     arms.push(if tail { tailArm(t) } else { bodyOf(elseStmts(t)) })
@@ -22392,9 +22376,8 @@ function nulSentinelElem(b: i32[], e: i32, er: i32): Opnd {
   if repPrim(er) != "i32" { return irBMiss("array null sentinel rep") }
   const two: Opnd = { oiRep: er, oiBits: 2 }
   if nodeAt(unwrapParen(e)) is NullLit { return two }
-  const v = irBExpr(b, e)
-  if ibMiss != "" { return v }
-  return irBLetTempTy(b, { aeEff: [v], aeV: two, aeAt: e }, e, er, TY_I32)
+  // Any other element is read for its effects, as a store's value is (`nulSentinelStore`).
+  return nulSentinelStore(b, e, er)
 }
 
 // Whether element `e` of a `null[]` literal is that list's null: legacy's own test
