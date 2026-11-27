@@ -21,8 +21,7 @@ READY #<pr> <full 40-char head sha>
 
 The sha is the head the lane proved. A READY with no PR number, or a short sha, is sent back. After
 a master merge the lane sends a new READY with the new sha, and says whether the resolution was
-mechanical (lists, imports) and so proved by `scripts/gate.sh --fast` plus
-`scripts/ir-identity.sh --cases <seed>` alone.
+mechanical (lists, imports) and so proved by `scripts/gate.sh --fast` alone.
 
 ## Who may merge on what
 
@@ -44,14 +43,9 @@ mechanical (lists, imports) and so proved by `scripts/gate.sh --fast` plus
    declarations with distinct heads (coordinator ruling, 2026-11-21), checks each resolved file
    with `vl fmt --check`, and refuses any other, naming the hunk, so that PR goes back to its lane.
 3. **Gate the candidate**: `scripts/gate.sh` (in the queue's worktree, the one place
-   `GATE_IN_WORKTREE=1` is set), then `scripts/ir-identity.sh --cases <seed>` on the seed the gate
-   built. Read both by exit code.
-   When the batch changes `compiler/`, also run `scripts/ir-identity.sh --claimless <seed>` on that
-   seed, once per batch. It compares the distilled cells and the inventory witnesses filed `runs`
-   under the shipped compiler and a `CLAIMED`-empty one. Any differ is a veto: a claim shipped bytes
-   legacy would not have written (ir-design §5.2, the claim rule).
-   Since Q18 the verifier runs `--cases` and `--claimless` on the merged tree instead; the queue
-   runs the gate.
+   `GATE_IN_WORKTREE=1` is set), read by its exit code. Behaviour is graded by each program's pinned
+   output (the corpus oracle, the distilled corpus, the filed witnesses, the probes), all in the gate
+   and in CI; the claimless comparison retired with legacy (ir-i8-cutover §8).
 4. **Squash-merge** each PR with `expectedHeadSha` set to the full head sha that was gated, so a
    push after the gate cannot ride on it.
 
@@ -67,9 +61,8 @@ batch means the remaining subset is gated again before it merges.
 For lanes:
 
 - **R1.** A clean merge of master needs no re-check.
-- **R2.** A mechanical resolution (lists, imports) is proved by `scripts/gate.sh --fast` plus
-  `ir-identity.sh --cases` alone.
-- **R3.** `--claimless` runs once per functional change, not per master merge.
+- **R2.** A mechanical resolution (lists, imports) is proved by `scripts/gate.sh --fast` alone.
+- **R3.** Retired with `--claimless` (ir-i8-cutover §8).
 - **R4.** A stack is proved once, at its top.
 - **R5.** One owner per blocker class; the coordinator assigns it.
 - **R6.** An OK'd PR waiting only on a waived re-proof counts as READY.
@@ -151,7 +144,7 @@ For the queue:
 - **Q13.** Never edit a log in place while a job appends to it. `sed -i` swaps the inode, the job's
   later output goes to the deleted copy, and the gate's reading is lost (BL3 had to be re-gated).
   Give each train attempt its own log (queue practice).
-- **Q14.** A 0-differ `--claimless` covers only the shapes its cells hold. D17048, a claimed
+- **Q14.** (Retired with `ci-ir-identity`, 2026-11-27: no claimless compiler is left to compare against) A 0-differ `--claimless` covers only the shapes its cells hold. D17048, a claimed
   narrowed box-field read shipping invalid wasm since #9259, never reached a cell. So a soundness
   fix adds its witness as a tests/cases program that runs and prints, and the queue asks for a run
   proof, not a byte argument, on any admission that reads a value at another rep without a
@@ -174,7 +167,7 @@ For the queue:
   base→head and shows that claimed-vs-claimless at head differ 0. (2) R10 pre-review is
   non-blocking: a lane proves in parallel and redoes the work if the queue objects. (3) A train
   takes every READY PR, and is split only when a step fails (this replaces Q2's 6-to-8 size).
-- **Q18.** The queue no longer runs `ir-identity.sh --cases` or `--claimless` per train. The
+- **Q18.** (Retired with `ci-ir-identity`, 2026-11-27: no `--cases` or `--claimless` run is left) The queue no longer runs `ir-identity.sh --cases` or `--claimless` per train. The
   verifier proves both on the merged tree, and the queue keeps the full gate. A second verifier
   (IR-V2) takes alternate trains (coordinator ruling, 2026-11-22).
 - **Q19.** Verifier self-test cases are keyed by string id, not by position: positional `want`
@@ -208,7 +201,7 @@ For the queue:
   and the distilled corpus. On 2026-11-22 #9599's list missed
   `scripts/capability-probes/numeric-as-exact-trio.vl` and #9596's missed 33 tests/cases programs;
   the verifier's union grading caught both before merge (queue practice).
-- **Q27.** A lane's READY quotes the "fail under both" counts of `ir-identity.sh --cases` (68) and
+- **Q27.** (Retired with `ci-ir-identity`, 2026-11-27: `ir-identity.sh` is deleted) A lane's READY quotes the "fail under both" counts of `ir-identity.sh --cases` (68) and
   `--names` (3267) against master's. A rise means legacy itself broke, as IR-N9's
   `directArgSeedsOf` split did (68 → 71) before its lane caught it (queue practice).
 - **Q28.** A train's docs overlay of master's `docs/internals/inventory` (Q22) adds only the rows
@@ -233,7 +226,7 @@ For the queue:
 - **Q34.** The self-compile fuel attribution line is needed only past the +1% gate. A phase-state
   rise from test-only constructors in a negative self-test is accepted with `--write-baseline` and
   named in the PR body (#9650) (coordinator ruling, 2026-11-23).
-- **Q35.** A shadow mismatch row may rise with a filed row when claimed bytes equal claimless
+- **Q35.** (Retired with `ci-ir-identity`, 2026-11-27: no claimless bytes are left) A shadow mismatch row may rise with a filed row when claimed bytes equal claimless
   bytes for the affected programs; the row need not be "unclaimed". The case is the
   `ir-closure-record-family` lane's row D17060 (coordinator ruling, 2026-11-23).
 - **Q36.** Before every squash, check whether it would re-add a `changelog.d` entry that
@@ -298,7 +291,7 @@ For the queue:
 - **Q53.** When a lower PR in a train stack needs a fix that touches only docs, each affected train
   is rebuilt as `<train>2` = `<train>1` plus only that fix. The verifier's proof on `<train>1`
   carries over and only the affected test is rerun on `<train>2`. When the fix touches code, the
-  verifier also reruns `gate.sh --fast`, the affected test and `ir-identity.sh --cases` on
+  verifier also reruns `gate.sh --fast` and the affected test on
   `<train>2` (queue practice).
 - **Q54.** A READY whose natural stack position sits above a red train is branched from the last
   green train instead. The squash check compares against master with that train's own base, so the
@@ -316,15 +309,15 @@ For the queue:
 - **Q58.** Every READY that adds or widens an IR claim carries an armed position sweep: the
   claimed value as a call argument (at a scalar and at a union parameter), a nested call argument,
   a concat operand, an interpolation hole, a `return`, a `let`/`const` initializer, an `if` arm, a
-  `??` operand and a record field. Each program builds under `VL_IR_SHADOW=6`, runs, and is
-  identical to `ir-identity.sh --claimless`; the READY names the sweep's paths and the verifier
-  re-runs it. A red position is pinned; a red already on master is filed as a clause-1 row and
+  `??` operand and a record field. Each program runs and prints its pinned output (under
+  `tests/cases`, `@run` with its `@log` lines, which the corpus oracle grades); the READY names the
+  sweep's paths and the verifier re-runs it (amended when `ci-ir-identity` retired, 2026-11-27). A red position is pinned; a red already on master is filed as a clause-1 row and
   fixed express. Trains in flight on 2026-11-24 were held to the earlier bar (coordinator ruling,
   2026-11-24). Grading (queue ruling, coordinator-approved, 2026-11-24, BROADCAST #24): "matched"
   means no covered function mismatches or fails the verifier. A position function uncovered under
-  both seeds, in a class the PR does not touch, is not red when the program runs and is
-  claimless-identical, and the note names that class. A position that fails to run, or differs
-  from claimless, is always red and is filed clause-1, whoever owns its class.
+  both seeds, in a class the PR does not touch, is not red when the program runs and prints its
+  pin, and the note names that class. A position that fails to run, or differs from its pin, is
+  always red and is filed clause-1, whoever owns its class.
 - **Q59.** A verifier may make a stated one-line control edit (a failing control for a probe) only
   in an isolated `git archive` scratch build, never in the worktree or `build/`; it `cmp`s `build/`
   before and after and deletes the scratch build (queue ruling, 2026-11-24).
@@ -346,8 +339,8 @@ For the queue:
 - **Q65.** A short pass after a change to inventory rows, tests or `scripts/inventory/` runs ci-native's inventory tests (`tests/vl_inventory_rows_test.ts`, `tests/vl_inventory_refs_test.ts`), not `gate.sh --fast` alone: a fast-only short pass left master red on a row's wording (queue ruling, 2026-11-24; fixed by #9861). Before squashing a PR that adds a row, the queue checks master for a stale `unfiled: D<id>` marker naming it (#9897, after #9882 landed D17108 under #9878's marker).
 - **Q66.** Every program a Q58 sweep or a witness reads is committed in the PR, never only in a scratchpad (queue ruling, 2026-11-24, BROADCAST #25).
 - **Q67.** A census or legacy A/B builds each arm in a tree at its own commit with that tree's own fixpoint seed: `scripts/ir-only-census.vl` builds from the working tree's `compiler/`, so a file-swapped base arm measures the wrong compiler. `scripts/ir-only-census-ab.sh` does this (queue ruling, 2026-11-24, BROADCAST #26).
-- **Q68.** A verifier grades on a host whose `scripts/vl-host` matches the train's own tree and quotes its sha256; `scripts/ir-parity.vl` runs `$VL`, so check it. A host built before `c0cbdab7` lacks the claims-off fallback, and one built before `6bf25409` (#9888) lacks the soft-refusal note; a train containing either commit is graded on a host built from a tree containing it, a train that lacks it on its own tree's host (queue rulings, 2026-11-24, BROADCASTS #27 and #30).
-- **Q69.** A reading of a claimless face names the claimless compiler's sha256 and the commit of the tree it was built in, with `git status --short compiler` clean: a claimless compiler built on a fix branch, read as master's, opened a false G3 express (coordinator ruling, 2026-11-24, BROADCAST #29).
+- **Q68.** (Amended when `ci-ir-identity` retired, 2026-11-27: `ir-parity.vl` is deleted; the host rule stands for every other tool.) A verifier grades on a host whose `scripts/vl-host` matches the train's own tree and quotes its sha256; `scripts/ir-parity.vl` runs `$VL`, so check it. A host built before `c0cbdab7` lacks the claims-off fallback, and one built before `6bf25409` (#9888) lacks the soft-refusal note; a train containing either commit is graded on a host built from a tree containing it, a train that lacks it on its own tree's host (queue rulings, 2026-11-24, BROADCASTS #27 and #30).
+- **Q69.** (Retired with `ci-ir-identity`, 2026-11-27: no claimless face is left) A reading of a claimless face names the claimless compiler's sha256 and the commit of the tree it was built in, with `git status --short compiler` clean: a claimless compiler built on a fix branch, read as master's, opened a false G3 express (coordinator ruling, 2026-11-24, BROADCAST #29).
 - **Q70.** Each active lane files new inventory rows only from its own reserved range (`docs/internals/inventory/reserved/`, 20 ids each, ids 17140 to 17479, #9893) and asks the queue for another when it runs out: ids raced four times in ten minutes before the ranges (coordinator directive, 2026-11-24, BROADCAST #28).
 - **Q71.** A row whose filed witness falls back to legacy (a `runs` witness the claims run builds) lands with its line in `scripts/silent-sweep/distilled/claims-fallbacks.txt` (retired at I8 with `ir claims`) in the same PR (queue rule, after #9910's row reddened `ir claims`, fixed by #9913).
 
@@ -387,51 +380,16 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 - a `--names` build that is not the plain build plus custom sections;
 - a parallel predicate mirror, unless legacy consumes it or an agreement check is armed;
 - a new dead export;
-- any differ under `ir-identity.sh --claimless` or `--cases`;
-- a claimed module that fails validation under `$VL_IR_STRICT=1`, or any differ in the gate row
-  `ir claim refusals` (`ir-parity.vl --pop refusals`);
-- a red in the gate row `ir claim cross` (`ir-parity.vl --cross`): a shipped build that fails, or
-  runs otherwise, where the claimless build runs clean;
+- a pinned output that changes: a corpus oracle `log mismatch` or `@trap` miss, a distilled
+  `runs but wrong value`, a witness `wrong_output`, a probe that stops printing its value;
+- a module that fails validation (rc 70);
 - a shipping door that bypasses `claimable()` (ir-design §10.2).
 
 ## A chosen divergence (Q57)
 
-Q57 (coordinator ruling) lets an IR lane write bytes legacy would not, when matching legacy would
-cost more than about two hours. The queue or the coordinator acks the divergence and its cost
-before the lane relies on it. Byte identity cannot prove such a function, so behaviour does:
-
-- The lane adds one line per diverging function to `scripts/ir-divergence-baseline.txt` (retired at I8):
-  `<program>\t<function>\t<mechanism>\t<PR>`, the function as a `--names` build spells it
-  (`f@1`), `<module>` for anything outside the function bodies.
-- `scripts/ir-identity.sh` then prints `expected divergence <program> (<functions>)` for that
-  program and passes it, but only when every function whose body differs is listed for it. An
-  unlisted function or program still reds as `DIFF`.
-- The armed shadow no longer grades bytes (coordinator ruling, 2026-11-26: byte identity is not a
-  gate). `ir-shadow.vl` prints a byte mismatch as informational unless `$IR_SHADOW_BYTES=1`, and
-  `tests/vl_ir_shadow_test.ts`'s row files pass one, listed or not. Any non-bytes row (a verifier
-  failure, spans, order) still reds.
-- `vl run scripts/ir-parity.vl` is the proof. It builds each program with the IR on (the seed) and
-  off (the `CLAIMED`-empty twin), runs both, and compares stdout, exit code and trap message.
-  Any `differs` or one-sided `build-fails` reds. A byte differ the baseline does not list reds only
-  without `--behaviour-only`; every gate row passes that flag or `--cross` (2026-11-26 ruling).
-  A listed divergence must still behave alike.
-- The READY quotes the parity summary line over the three default populations (distilled cells,
-  `tests/cases`, capability probes), with the diverging programs among them, or `--files`
-  naming them when no population holds one. It also quotes `ir-identity.sh --cases` showing the
-  `expected divergence` rows.
-
-**`legacy-wrong` (ruling O3).** Where legacy's emitter is wrong and the IR is right, the lane does
-not fix legacy: it lists each diverging function with a mechanism that starts `legacy-wrong:`
-(`<program>\t<function>\tlegacy-wrong: <what legacy gets wrong>\t<PR>`). `ir-identity.sh` and the
-armed shadow pass it as they pass any listed divergence, and `ir-identity.sh` also passes the
-program when the claims seed builds it and the claimless one refuses. `ir-parity.vl` does not
-compare it with IR off: it runs the IR-on build alone and passes when that run meets the program's
-expected output, its `// @log` lines (a `// @trap` as any trap, `// @run` as a clean run) or, for
-an inventory row passed to `--files` as its `.md`, the row's `Want:`. A listed program with no
-expected output reds. The READY quotes `ir-parity.vl --files <program>` with its `legacy-wrong
-meeting expected output` count.
-
-The queue's vetoes are unchanged: an unlisted differ under `ir-identity.sh` is still a veto.
+Retired at I8 (ir-i8-cutover §8): with legacy's emitter deleted there is nothing for a claim to
+diverge from, so the divergence baseline, `ir-identity.sh` and `ir-parity.vl` went with it. A
+program's behaviour is its pinned output, graded as the vetoes above say.
 
 ## Folds
 

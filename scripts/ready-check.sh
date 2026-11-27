@@ -5,8 +5,8 @@
 #
 # It refuses a dirty tree (the proof must name a commit), runs `scripts/gate.sh --fast`, then
 # what CI does not run on the PR: the armed position sweep (Q58) over each `--sweep` program.
-# A sweep program under tests/cases/ is already graded by CI's corpus oracle and ci-ir-identity, so
-# it is only checked to be committed (Q66); any other path is built and run.
+# A sweep program under tests/cases/ is graded by CI's corpus oracle, so it is only checked to be
+# committed (Q66) and in run mode (`@run`/`@trap`); any other path is built and run.
 # It ends with a block to paste into the READY message, and exits non-zero when any step failed.
 # Run it from the checkout root after `scripts/refresh-compiler.sh`.
 set -uo pipefail
@@ -48,7 +48,10 @@ if [ ${#SWEEP[@]} -gt 0 ]; then
   bad=() other=()
   for p in "${SWEEP[@]}"; do
     if ! git ls-files --error-unmatch "$p" > /dev/null 2>&1; then bad+=("$p (not committed, Q66)")
-    elif [ "${p#tests/cases/}" = "$p" ]; then other+=("$p"); fi
+    elif [ "${p#tests/cases/}" = "$p" ]; then other+=("$p")
+    elif ! grep -qE '^\s*// @(run|trap|no-instantiate)\b' "$p"; then
+      bad+=("$p is a check-mode case, which the corpus oracle never builds: add @run and its @log lines")
+    fi
   done
   if [ ${#other[@]} -gt 0 ]; then
     for p in "${other[@]}"; do
