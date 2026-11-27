@@ -382,8 +382,7 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 - a new dead export;
 - a pinned output that changes: a corpus oracle `log mismatch` or `@trap` miss, a distilled
   `runs but wrong value`, a witness `wrong_output`, a probe that stops printing its value;
-- a module that fails validation (rc 70);
-- a shipping door that bypasses `claimable()` (ir-design §10.2).
+- a module that fails validation (rc 70).
 
 ## A chosen divergence (Q57)
 
