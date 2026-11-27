@@ -1030,14 +1030,14 @@ const CASES: Case[] = [
       'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
   {
-    // The builder's declaring statement is an input: a leaf that becomes an element read of an
-    // aliased list is kept, where a literal leaf is built at the destination. An element of the
-    // list literal's own binding is built there too (D15930), so the read goes through an alias.
+    // The builder's declaring statement is an input: a leaf that becomes an element read of a
+    // reassigned list is kept, where a literal leaf is built at the destination. An element of a
+    // list only literals and aliases hold is built there (D15930), so the list is reassigned.
     name: "lib's builder leaf becomes an element read",
     want: "decline",
     why: "fresh",
     from: "{ return { f: 4 } }",
-    to: "{ const t = [{ f: 4 }]; const u = t; return u[0] }",
+    to: "{ let t = [{ f: 4 }]; const u = t; t = u; return t[0] }",
     libUses: "export function mk() { return { f: 4 } }\n",
     uses:
       'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
