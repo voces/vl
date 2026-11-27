@@ -1,3 +1,4 @@
+import { mapShapeOfTyPeeled } from "./emit_union_atoms"
 import { blockHasContinueFor } from "./emit_query"
 // The IR lowering (ir-design-2026-11.md §1.6): a claimed function's IR is lowered to a code
 // entry, beside its statement spans. A temp goes back onto the stack at its one use, which holds
@@ -22,7 +23,14 @@ import {
   mapRecvTyIn,
 } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
-import { repNodeOfTy, repOfTy, repTyOf, slotRowTyOf } from "./emit_rep"
+import {
+  RPrim,
+  RepDesc,
+  repNodeOfTy,
+  repOfTy,
+  repTyOf,
+  slotRowTyOf,
+} from "./emit_rep"
 import { luOvEnter, luOvLeave } from "./emit_elab"
 import {
   armIndexWriteArmsOf,
@@ -833,7 +841,13 @@ import {
   spreadPlanOf,
   spreadWrapIdx,
 } from "./emit_plan_list"
-import { emitFail, fbOpenIf, fbValtype, fbValtypeNullable } from "./emit_bytes"
+import {
+  emitFail,
+  fbOpenIf,
+  fbRefNullValtype,
+  fbValtype,
+  fbValtypeNullable,
+} from "./emit_bytes"
 import {
   variantDiscrimFieldNeeded,
   variantFieldLitLexes,
@@ -1061,7 +1075,7 @@ function ownedSlot(v: i32): i32 {
   if v < 0 || v >= lw.irVars.length || lw.irVars[v].vKind != "local" {
     return -1
   }
-  const vt = repLocalValtype(lw.irVars[v].vRep)
+  const vt = repLocalValtype(lw.irVars[v].vRep, lw.irVars[v].vTy)
   if vt.length == 0 { return -1 }
   const s = irOnceSlotAt(vt, v + 1)
   while lwOwnedSlots.length <= v { lwOwnedSlots.push(-1) }
@@ -1069,13 +1083,22 @@ function ownedSlot(v: i32): i32 {
   return s
 }
 
-// The valtype bytes legacy's `fbValtype` declares a non-null value of rep `r` at, a ref list's or a
-// closure's as `refRepValtype` keys it, a nullable reference's or boxed nullable's at its nullable
-// valtype, an i32-sentinel or atom nullable's at i32; none for one with no kind, or a ref list or
-// closure that keys no shape.
-function repLocalValtype(r: i32): u8[] {
+// Whether node `ix` is a `??`.
+function coalNodeAt(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = nodeAt(unwrapParen(ix))
+  return e is BinExpr && e.binOp == "??"
+}
+
+// The valtype bytes a value of rep `r` (typed `ty` where given, whose row its rep may not name) is
+// declared at: a ref list's or closure's as `refRepValtype` keys it, a nullable reference's or
+// boxed nullable's nullable, an i32 niche's i32; none for one with no kind or no keyed shape.
+function repLocalValtype(r: i32, ty: i32): u8[] {
   const out: u8[] = []
-  const d = repOfTy(repTyOf(r))
+  // A record type naming no row reads the rep's own type, which may (a binding's type is the
+  // checker's, its rep the row it is built at).
+  const d0 = repOfTy(if ty >= 0 { ty } else { repTyOf(r) })
+  const d = if ty >= 0 && recSlotMissing(d0) { repOfTy(repTyOf(r)) } else { d0 }
   const k = d.rdKind
   // An i32-sentinel (discipline 2) or atom (3) nullable is its i32 cell, null a value of it.
   if k != null && (d.rdNul == 2 || d.rdNul == 3) {
@@ -1087,18 +1110,102 @@ function repLocalValtype(r: i32): u8[] {
   // A boxed nullable (discipline 4) is its union box's nullable ref, as legacy declares it.
   const boxNul = d.rdNul == 4 && k == "union"
   if k == null || d.rdNul != 0 && d.rdNul != 1 && !boxNul { return out }
-  if k == "reflist" || k == "closure" {
-    return if d.rdNul == 0 { refRepValtype(r) } else { out }
+  if k == "reflist" || k == "closure" || k == "nulreflist" {
+    if d.rdNul == 0 { return refRepValtype(r) }
+    // A nullable one is its inner's valtype, nullable (`(ref $h)` becomes `(ref null $h)`).
+    const rn = repNodeAt(r)
+    if d.rdNul != 1 || !(rn is RNullable) { return out }
+    const inner = refRepValtype(rn.rnInner)
+    if inner.length == 0 || inner[0] != 100 { return out }
+    inner[0] = 99
+    return inner
   }
+  // A nullable record whose type names no interned row (a lambda's record result) is held at its
+  // rep's own struct heap (`recHeapOf`, as the lowering notes it), nullable.
+  const h = rowlessRecHeap(r, ty)
+  if h >= 0 {
+    // Nullable even for a record that is never null: a join's out is set inside its arms, which
+    // wasm's set-before-get rule refuses for a non-null local; its reads recover it (`irLOpnd`).
+    const p1 = wTarget(out)
+    fbRefNullValtype(h)
+    wTarget(p1)
+    return out
+  }
+  // A map is held at the shape its own type declares (`mapShapeOfTyPeeled`), which its rep's
+  // description does not carry: no slot is the base string-keyed map, another shape's struct.
+  const mt = if ty >= 0 { ty } else { repTyOf(r) }
+  const ms = if k == "map" || k == "nulmap" { mapShapeOfTyPeeled(mt) } else { -3 }
+  // A map whose type names no shape declares nothing, which its caller refuses, rather than the
+  // base struct, which is the shape of no other map.
+  if (k == "map" || k == "nulmap") && ms == -3 { return out }
+  // A packed list is held at its element width's row, which its rep names (`packedRowOfRep`).
+  const pr = if k == "u8list" || k == "nulu8list" { packedRowOfRep(r) } else { -1 }
+  const slot = if ms != -3 { ms } else if pr >= 0 { pr } else { d.rdSlot }
   // A nullable reference (its null the bottom ref) is held at its nullable valtype.
   const prev = wTarget(out)
   if d.rdNul == 1 || boxNul {
-    fbValtypeNullable(k, d.rdSlot)
+    fbValtypeNullable(k, slot)
   } else {
-    fbValtype(k, d.rdSlot)
+    fbValtype(k, slot)
   }
   wTarget(prev)
   return out
+}
+
+// Whether variable `v` is a local (no parameter) held at a boxed nullable (discipline 4).
+// The struct heap a record rep `r`, plain or nullable, is held on where its type `ty` names no
+// interned row (a lambda's or a hole's record), from the rep (`recHeapOf`); else -1.
+// Whether descriptor `d` is a record's whose slot names no interned row.
+function recSlotMissing(d: RepDesc): boolean {
+  const k = d.rdKind
+  return (k == "struct"
+    || k == "nulstruct"
+    || k == "variant"
+    || k == "nulvariant")
+    && (d.rdSlot < 0 || d.rdSlot >= sHeapIdx.length)
+}
+
+function rowlessRecHeap(r: i32, ty: i32): i32 {
+  const d0 = repOfTy(if ty >= 0 { ty } else { repTyOf(r) })
+  const d = if ty >= 0 && recSlotMissing(d0) { repOfTy(repTyOf(r)) } else { d0 }
+  const k = d.rdKind
+  if k != "struct" && k != "nulstruct" && k != "variant" && k != "nulvariant" {
+    return -1
+  }
+  if d.rdSlot >= 0 && d.rdSlot < sHeapIdx.length { return -1 }
+  const rn = repNodeAt(r)
+  const rec = if rn is RNullable { rn.rnInner } else { r }
+  if !(repNodeAt(rec) is RRecord) { return -1 }
+  return lw.irRecHeap[rec] ?? recHeapOf(rec)
+}
+
+// Whether variable `v` is a plain record local held nullable at its rep's heap (`rowlessRecHeap`).
+function rowlessRecLocal(v: i32): boolean {
+  if v < 0 || v >= lw.irVars.length || lw.irVars[v].vKind == "param" {
+    return false
+  }
+  // A declared slot is the local legacy declares at its row; only one the IR mints is held so.
+  if lw.irVars[v].vSlot >= 0 { return false }
+  const r = lw.irVars[v].vRep
+  return repNodeAt(r) is RRecord && rowlessRecHeap(r, lw.irVars[v].vTy) >= 0
+}
+
+function boxNulLocal(v: i32): boolean {
+  if v < 0 || v >= lw.irVars.length || lw.irVars[v].vKind == "param" {
+    return false
+  }
+  const n = repNodeAt(lw.irVars[v].vRep)
+  return n is RNullable && n.rnDisc == 4
+}
+
+// The packed row a sub-word list rep `r`, plain or nullable, is stored at (its element's
+// `rpPacked`), or -1.
+function packedRowOfRep(r: i32): i32 {
+  const n = repNodeAt(r)
+  const l = if n is RNullable { repNodeAt(n.rnInner) } else { n }
+  if !(l is RList) { return -1 }
+  const p = repNodeAt(l.rlsElem)
+  return if p is RPrim && p.rpK == "u8" { p.rpPacked } else { -1 }
 }
 
 function tempDefined(v: i32): boolean {
@@ -1174,6 +1281,9 @@ export function irLOpnd(o: Opnd) {
       const rf = lwBuf.length
       // A range loop copy's variable reads as legacy's copy reads it (`urLocalRead`).
       if !urLocalRead(s) { fbLocalGet(s) }
+      // A boxed nullable's local is declared nullable for its default; its value, a box whose
+      // null is a tag, never is, and every other place holds it non-null.
+      if boxNulLocal(v) || rowlessRecLocal(v) { fbRefAsNonNull() }
       // An arm-site payload standing for an element read banks that read's row (`emitIndexBanked`).
       const pk = lwPayloadVars.length - 1
       if pk >= 0 && v == lwPayloadVars[pk] && lwPayloadRows[pk] >= 0 {
@@ -2280,7 +2390,8 @@ function nulTestOpArm(r: RNulTest): NulTestArm | null {
 // `RNulTest`: the operand, then legacy's tail for the arm `nulTestArmOf` names: the atom
 // sentinel's compare, a nullable ref's `ref.is_null`, or a union box's null tag compare.
 function nulTestOp(r: RNulTest) {
-  const arm0 = nulTestOpArm(r)
+  // A test built from its value alone (`testNull`) goes by that value's rep.
+  const arm0 = if r.ntByRep { repNulTestArm(opRepOf(r.ntV)) } else { nulTestOpArm(r) }
   if arm0 == null { return irLMiss("null test node") }
   // An optional chain built once as its value is tested at that value's own rep.
   const arm = if arm0 == "optChain" { repNulTestArm(opRepOf(r.ntV)) } else { arm0 }
@@ -2346,8 +2457,9 @@ function listEmpty(r: RListEmpty) {
 // a `memberEq` the `litMember` rung writes as its one member's compare (`emitLitMemberEq`).
 function litArmsPlanHolds(r: RLitArms, n: IsExpr): boolean {
   if litIsArmOf(r.liAt, n, lw.irAt) == r.liArm { return true }
-  if r.liArm == "numBox" && isArmOf(r.liAt, lw.irAt, 0, false) == "floatLits" {
-    return true
+  if r.liArm == "numBox" {
+    const ia = isArmOf(r.liAt, lw.irAt, 0, false)
+    if ia == "floatLits" || ia == "litMember" { return true }
   }
   if r.liArm == "boxLits" && isArmOf(r.liAt, lw.irAt, 0, false) == "armTag" {
     return tagIsArmOf(r.liAt, n, lw.irAt) == "boxLitSet"
@@ -2380,7 +2492,7 @@ function litArmsAt(r: RLitArms) {
   // A receiver waiting on the stack (a valued `if`'s out) is stored first, before any arm opens a
   // block over it, and each read is the slot's.
   const o = r.liV
-  const vt = if o is OVar && o.ov >= 0 && o.ov < lwStackVal.length && lwStackVal[o.ov] { repLocalValtype(lw.irVars[o.ov].vRep) } else { [] }
+  const vt = if o is OVar && o.ov >= 0 && o.ov < lwStackVal.length && lwStackVal[o.ov] { repLocalValtype(lw.irVars[o.ov].vRep, lw.irVars[o.ov].vTy) } else { [] }
   if vt.length > 0 {
     irLOpnd(o)
     litRecvSlot = irOnceSlot(vt)
@@ -3841,6 +3953,8 @@ function spreadList(r: RSpread) {
   if p.spWhy != "" || p.spSrcs.length != r.spSrcs.length {
     return irLMiss("spread plan")
   }
+  // A group the builder built at the literal's own kind is copied as it stands, not converted.
+  for d in r.spDone { p.spSrcKinds[d] = p.spKind }
   // The pair is asked where legacy's arm asks it, before the groups, so a first ask mints in order.
   const wrap = spreadWrapIdx(p.spKind, p.spRow)
   const back = spreadBackIdx(p.spKind, p.spRow)
@@ -6689,9 +6803,25 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     && at >= 0
     && nodeAt(unwrapParen(at)) is Call
   const decided = n.siJoin.rjKind != null
-  const rj = if vt < 0 && !refOut && !strOut && !boxOut && decided { n.siJoin } else if vt < 0 && !refOut && !strOut && !boxOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
+  const rj = if vt < 0 && !refOut && !strOut && !boxOut && decided { n.siJoin } else if vt < 0 && !refOut && !strOut && !boxOut && at >= 0 && !coalNodeAt(at) { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
   const rk = rj.rjKind
-  if vt < 0 && !refOut && !strOut && !boxOut && rk == null {
+  // A `??`'s join keyed by its rep alone (a ref list's or a closure's shape) opens at the out's
+  // own valtype (`coalNative`).
+  const ownVt = if vt < 0
+    && !refOut
+    && !strOut
+    && !boxOut
+    && rk == null
+    && at >= 0
+    && coalNodeAt(at) { repLocalValtype(lw.irVars[t].vRep, lw.irVars[t].vTy) } else { [] }
+  if (
+    vt < 0
+    && !refOut
+    && !strOut
+    && !boxOut
+    && rk == null
+    && ownVt.length == 0
+  ) {
     irLMiss("valued if rep")
     return IF_DONE
   }
@@ -6720,6 +6850,13 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
       rj.rjSlot,
       if decided { n.siJoinNul } else { ifLinkYieldsNull(at, lw.irAt) },
     )
+  } else if ownVt.length > 0 {
+    fbOpenIf()
+    // A plain record's out is held nullable (`rowlessRecHeap`), but the `if` yields it non-null.
+    if ownVt[0] == 99 && !(repNodeAt(lw.irVars[t].vRep) is RNullable) {
+      ownVt[0] = 100
+    }
+    for x in ownVt { wU8(x) }
   } else {
     fbIf(vt)
   }
