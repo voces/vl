@@ -1,7 +1,8 @@
-// The I8 holdout list (scripts/ir-i8-census/holdouts.tsv) is well formed and only shrinks: every
-// row names a program that exists, rows are sorted and unique, and a row the base branch's list
-// lacks fails, unless that list has no rows yet (the cutover seeds it). The graders hold each
-// row to its refusal. Reads files only. No assertion library, per CLAUDE.md.
+// The I8 holdout list (scripts/ir-i8-census/holdouts.tsv) is well formed and grows only by a
+// discovered gap: every row names a program that exists, rows are sorted and unique, and a row the
+// base branch's list lacks fails unless its program's file is new in this branch (a program on the
+// base that stops running is a regression). The graders hold each row to its refusal. No
+// assertion library, per CLAUDE.md.
 
 import { HOLDOUTS_PATH } from "./support/holdouts.ts";
 
@@ -37,7 +38,7 @@ Deno.test("holdouts: rows are <program> <unit> <class> <owner>, sorted, unique, 
   }
 });
 
-Deno.test("holdouts: no row the base branch's list lacks", async () => {
+Deno.test("holdouts: a new row names a program this branch adds", async () => {
   const base = Deno.env.get("HOLDOUTS_BASE") ?? "origin/master";
   const git = async (...args: string[]): Promise<{ ok: boolean; out: string }> => {
     const r = await new Deno.Command("git", { args, cwd: ROOT, stdout: "piped", stderr: "null" })
@@ -55,11 +56,15 @@ Deno.test("holdouts: no row the base branch's list lacks", async () => {
   const was = new Set(rowsOf(baseText).map((l) => l.split("\t")[0]));
   if (was.size === 0) return;
   const added = here.map((l) => l.split("\t")[0]).filter((p) => !was.has(p));
-  if (added.length) {
+  const onBase: string[] = [];
+  for (const p of added) {
+    const file = p.split("#")[0];
+    if ((await git("ls-tree", "--name-only", base, "--", file)).out.trim() !== "") onBase.push(p);
+  }
+  if (onBase.length) {
     throw new Error(
-      `want no new holdout (the list only shrinks), got ${added.length}:\n  ${
-        added.join("\n  ")
-      }`,
+      `want a new holdout only for a program this branch adds (one on ${base} that stops running ` +
+        `is a regression), got ${onBase.length}:\n  ${onBase.join("\n  ")}`,
     );
   }
 });
