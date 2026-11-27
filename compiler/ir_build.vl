@@ -3332,11 +3332,12 @@ export function testNull(b: i32[], v: Opnd, at: i32): Opnd {
   if !(n is RBox) && !(n is RNullable && n.rnDisc >= 1 && n.rnDisc <= 4) {
     return irBMiss("null test of " + repWhat(r))
   }
-  return irBLetTemp(
+  return irBLetTempTy(
     b,
     { ntV: v, ntInvert: false, ntAt: at, ntByRep: true },
     at,
     ibBool,
+    TY_BOOL,
   )
 }
 
@@ -14234,7 +14235,16 @@ function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const pb: i32[] = []
   const nn = readNonNull(pb, l, ix)
   if ibMiss != "" { return nn }
-  const x = irConvert(pb, nn, rep, ty, ix)
+  // A closure apart from the result's only in openness, or a value standing at the result's rep
+  // as it is (`retagsAsStands`), goes in retagged, as a list element does.
+  const nr = irBOpRep(nn)
+  const holed = nr != rep
+    && repNodeAt(nr) is RClosure
+    && repNodeAt(rep) is RClosure
+    && holeRetagNoted(nr, rep, true)
+  const nv = if holed || nr != rep && retagsAsStands(nr, rep, n.binLeft) { repTemp(pb, { rgV: nn }, ix, rep) } else { nn }
+  // Converted as the operand's value: a box plan is the operand's (`boxTempIn` at its node).
+  const x = if irBOpRep(nv) != rep { irConvert(pb, nv, rep, ty, n.binLeft) } else { nv }
   if ibMiss != "" { return x }
   if irBOpRep(x) != rep { return irBMiss("coalesce present rep") }
   irBNode(pb, { asDst: t, asSrc: x }, -1, ibNoValue, ix)
@@ -14281,33 +14291,6 @@ function coalJoinOf(rep: i32, ty: i32): RefJoin {
   // A record names its row by its type where its rep's own description names none.
   const slot = if k == "struct" && d.rdSlot < 0 && ty >= 0 { structIndexOfTy(ty) } else { d.rdSlot }
   return { rjKind: k, rjSlot: slot }
-}
-
-// Stand-in for COV-IS's `testNull(b, v, at)`: whether `v` is null, by its rep's discipline
-// (`RNulTest` at a `??`, whose arm the lowering reads off `v`'s rep).
-function testNull(b: i32[], v: Opnd, at: i32): Opnd {
-  return irBLetTempTy(
-    b,
-    { ntV: v, ntInvert: false, ntAt: at },
-    at,
-    ibBool,
-    TY_BOOL,
-  )
-}
-
-// Stand-in for COV-IS's `readNonNull(b, v, at)`: `v` past its null at its inner rep: a nullable
-// reference's `ref.as_non_null`, a sentinel or atom niche's value as it stands. A box is theirs.
-function readNonNull(b: i32[], v: Opnd, at: i32): Opnd {
-  const vn = repNodeAt(irBOpRep(v))
-  if !(vn is RNullable) { return irBMiss("coalesce present read") }
-  if vn.rnDisc == 1 {
-    const r: Rhs = { rcV: v, rcAt: at, rcNn: 1 }
-    return irBLetTempTy(b, r, at, vn.rnInner, repTyOf(vn.rnInner))
-  }
-  if vn.rnDisc == 2 || vn.rnDisc == 3 {
-    return repTemp(b, { rgV: v }, at, vn.rnInner)
-  }
-  return irBMiss("coalesce present read box")
 }
 
 // `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.
