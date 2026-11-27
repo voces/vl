@@ -418,8 +418,6 @@ import {
   idxCellReadIsNull,
   idxStoreNullUnitUnstamped,
   idxStoreSiteBoxes,
-  ifExprJoinVt,
-  ifExprSwitchMay,
   ifIntMatchWhy,
   ifLinkExhausts,
   ifThenIsDead,
@@ -4684,21 +4682,11 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
   // An optional call's guard whose receiver this instance closes with no `null` is its call alone.
   const gv = optGuardCallOf(ix0, ibFnIx)
   if gv >= 0 { return deliver(b, gv, rep0, ty0) }
-  // A dense integer `match` is one `br_table` whose arms carry the value, where its plan has an
-  // `else` and the join is one valtype; off that, it waits for the IR's own switch.
+  // A dense integer `match` whose plan has an `else` is one `br_table`, each arm's value delivered
+  // into the switch's out at the join's rep, whatever that rep is.
   if ifIntMatchWhy(ix0, ibFnIx) != "" {
     const p = intSwitchPlanOf(ix0, ibFnIx)
-    if p != null {
-      if (
-        ty0 < 0
-        && ifExprSwitchMay(ix0)
-        && valtypeOf(rep0) >= 0
-        && valtypeOf(rep0) == ifExprJoinVt(ix0, ibFnIx)
-      ) {
-        return valuedSwitch(b, ix0, p, rep0)
-      }
-      return irBMiss("expression if int match")
-    }
+    if p != null { return valuedSwitch(b, ix0, p, rep0, ty0) }
   }
   // The join plan picks the join's rep and how each arm is written there: the null unit, a
   // reference at the join's row, a union's box, else a temp at the value's own rep.
@@ -5486,13 +5474,8 @@ function widerNumListAt(ix: i32, dst: i32): i32 {
   return if sk >= 0 && dk >= 3 && sk != dk { lr } else { -1 }
 }
 
-// The body of value-`if` arm `blockIx`: its one value, delivered at `rep`, written to out `t`. A
-// direct `else if` the chain does not walk as a link is its own value.
-function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
-  return ifArmAt(blockIx, t, rep, -1)
-}
-
-// `ifArm` with its value delivered at type `ty` where that is not -1: the join temp's own.
+// The body of value-`if` arm `blockIx`: its one value, delivered at `rep` and type `ty` (where
+// that is not -1), written to out `t`. A direct `else if` the chain does not walk is its own value.
 function ifArmAt(blockIx: i32, t: i32, rep: i32, ty: i32): i32[] {
   const body: i32[] = []
   armPrelude(body, blockIx)
@@ -19512,7 +19495,21 @@ function elseStmts(e: i32): i32[] {
   return [e]
 }
 
-// Whether `on`, built into `b` from `n0` on, is a switch operand legacy reads again: a place's
+// The switch operand `on` for scrutinee `at`, built into `b` from `n0` on, as one the table reads
+// again: itself when that is a place's variable or a constant, else a local bound to it once.
+function switchOperand(b: i32[], n0: i32, on: Opnd, at: i32): Opnd {
+  if intSwitchOn(b, n0, on) { return on }
+  const ty = nodeTyAt(at, ibFnIx)
+  if ty < 0 || irTyHeldOpen(ty, irBOpRep(on)) {
+    return irBMiss("int switch scrutinee type")
+  }
+  const v = irVarNew(ib, irBOpRep(on), ty, "local", -1)
+  irBNode(b, { asDst: v, asSrc: on }, -1, ibNoValue, at)
+  const o: Opnd = { ov: v }
+  return o
+}
+
+// Whether `on`, built into `b` from `n0` on, is a switch operand read again as it is: a place's
 // variable (no temp), or the constant an unrolled range copy reads its variable as.
 function intSwitchOn(b: i32[], n0: i32, on: Opnd): boolean {
   if b.length != n0 { return false }
@@ -19523,17 +19520,24 @@ function intSwitchOn(b: i32[], n0: i32, on: Opnd): boolean {
 
 // The valued integer `match` at `ix` that `p` plans: each arm and the else writes its value at
 // `rep` into the out the frame carries, as `ifArm` writes a value `if`'s.
-function valuedSwitch(b: i32[], ix: i32, p: IntSwitchPlan, rep: i32): Opnd {
+function valuedSwitch(
+  b: i32[],
+  ix: i32,
+  p: IntSwitchPlan,
+  rep: i32,
+  ty0: i32,
+): Opnd {
   const n0 = b.length
-  const on = irBExpr(b, p.ispOn)
+  const on0 = irBExpr(b, p.ispOn)
+  if ibMiss != "" { return on0 }
+  const on = switchOperand(b, n0, on0, p.ispOn)
   if ibMiss != "" { return on }
-  if !intSwitchOn(b, n0, on) { return irBMiss("int switch scrutinee") }
-  const ty = byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep))
+  const ty = if ty0 >= 0 { ty0 } else { byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)) }
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const arms: i32[][] = []
-  for th in p.ispThens { arms.push(ifArm(th, t, rep)) }
-  const els = ifArm(p.ispElse, t, rep)
+  for th in p.ispThens { arms.push(ifArmAt(th, t, rep, ty)) }
+  const els = ifArmAt(p.ispElse, t, rep, ty)
   if ibMiss != "" { return irBMiss("if arm") }
   const sn: SIntSwitch = {
     isTail: false,
@@ -19555,9 +19559,10 @@ function valuedSwitch(b: i32[], ix: i32, p: IntSwitchPlan, rep: i32): Opnd {
 // last value (`tailArm`); a statement chain's are statement lists, as `emitSwitchArm` writes them.
 function intSwitch(b: i32[], ix: i32, p: IntSwitchPlan, tail: boolean) {
   const n0 = b.length
-  const on = irBExpr(b, p.ispOn)
+  const on0 = irBExpr(b, p.ispOn)
   if ibMiss != "" { return 0 }
-  if !intSwitchOn(b, n0, on) { return skip("int switch scrutinee") }
+  const on = switchOperand(b, n0, on0, p.ispOn)
+  if ibMiss != "" { return 0 }
   const arms: i32[][] = []
   for t in p.ispThens {
     arms.push(if tail { tailArm(t) } else { bodyOf(elseStmts(t)) })
