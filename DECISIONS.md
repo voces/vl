@@ -13470,7 +13470,12 @@ about 240 emitter sites, the IR inherits it, and TAGCLO/CLOTAG convert between t
 meet. A closure call is cheaper from two members up (call_indirect against the id's per-arm
 compare chain) for 59 to 143 bytes of module size, and a capture-free closure allocates nothing.
 
-Ruled: choose the rep once per SET. A set whose every call is at one signature is a closure at every
+Refined the same day after COV-CLOS read check_fn_tag: a per-set bit already exists
+(`fnTagged`). What crosses is a VALUE moving between positions whose types carry different sets. So
+the decision is made once per FLOW-CONNECTED FAMILY of sets (union-find over the check's delivery
+graph), and a hole parameter's set is per call, not the union of every call's argument set (D17723).
+
+Ruled: choose the rep once per family. A set whose every call is at one signature is a closure at every
 position. A set with a member called at two or more instance types is an id at every position, and
 an annotated closure destination takes the set's adapter. One per-set query replaces the per-site
 decisions, and a binding and its read can no longer disagree (the for-in narrowed-read class).
