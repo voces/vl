@@ -13499,3 +13499,17 @@ Ruled:
   coalescing, then peepholes.** Before writing a pass, check whether the redundant locals come
   from specific lowering patterns that could emit stack-friendly code directly. Where a lowering
   fix is cheap it is the better answer.
+
+## After the holdouts: the census's loud emit rejects, by refusal site (2026-11-27, coordinator ruling)
+
+CENSUS's discovery pass at c9fa306d (250,238 cells): 0 runs → not-runs and 0 → silent against the
+morning seed. 3,358 cells refuse loudly at emit, which legacy also refused. They are the next
+burn-down, queued by refusal site (counted by IR miss, not message), with each group's witnesses kept as
+a named set under `distilled/named/`:
+
+1. Verifier ICEs, 48 (rules 3 and 2): first, as builder soundness bugs. COV-CALL.
+2. `convert list -> list`, 2,941: one mechanism, a nested list literal built at its inferred element
+   rep and then delivered to a declared list type. The fix is to build the literal at its destination,
+   never a converting copy. COV-UNION.
+3. Monomorphizer argument type, 219: I8-PREP. Capture binding, 46: START-2. Ref valtype and the map
+   pair, 96: COV-IS.
