@@ -86,7 +86,8 @@ and says so.
   default first heap, and the two can disagree: D16553 measured both.
 * **Fuel is not CPU.** Guest fuel counts instructions and leaves out collection, so a change
   that adds a copying collection or grows the live set costs more CPU than its fuel says, and a
-  cut of cheap loops saves less. `VL_GC_STATS=1` prints the collection count and peak live set.
+  cut of cheap loops saves less. `VL_GC_STATS=1` prints the collection count and peak live set,
+  and `vl build` adds the live set at compile end.
 * **A guest profile is not a timer at this size.** Two profiles of the same L2 build differed
   by about 6% in sample count; use it to say where time goes, not how much a change saved.
 
@@ -770,6 +771,14 @@ A map `.delete` anywhere in compiler/*.vl reserves the map delete family for eve
     The gate therefore prices the compiler's memory, not the grow policy: RSS under the
     shipped policy is not graded here
     (`docs/internals/refactor-notes/2026-11-11-ci-cost-rss-gc-growth.md`).
+  * **Live at compile end, +5%.** Under `VL_GC_STATS=1`, `vl build` forces one collection of
+    the compiler's store once the compile returns and prints the live set it left (`live at
+    compile end`). That is the compile's retained memory at a fixed point, so it does not move
+    with when the compile's own collections fire: the main unit read 143,195 KiB at every first
+    heap from 32M to 2G, where `peak live after a collection` read 135,439–142,830 KiB (52, 6
+    and 1 collections). On these units the live set peaks at the end of emit, so this is also
+    the peak; the script prints peak live ungraded beside it, and says so when peak live exceeds
+    end live by over 3%, which would mean the peak came earlier.
   * **CPU, +15% compile / +25% `wasm-opt`.** The least of three runs, graded only on the
     baseline's machine and only from runs whose control read within 15% of its
     baseline. Under `--check` a timed build runs only after a quiet control, and none runs
