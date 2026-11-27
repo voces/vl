@@ -22,8 +22,17 @@ import {
   CW_DST_ELEM,
   CW_DST_VAL,
   CW_DST_WHOLE,
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  cwIxBuild,
+  cwIxKind,
+  cwIxNode,
   cwLetWritesStraight,
+  cwOccNext,
+  cwOccWalk,
 } from "./check_write_scan"
+import { a20RetWalk } from "./check_nj_gate"
+import { recFreshMapDeclOf } from "./check_rec_fresh"
 import {
   declareSlot,
   fnWriteAliasNote,
@@ -1417,11 +1426,51 @@ export function freshContainerExpr(ix: i32): boolean {
 // parameters it hands back (`handBackIx`, `handBackShared`), and each of their arguments is fresh.
 function freshCallResult(c: Call): boolean {
   const back = handedBackParams(calleeNamesDecl(c.callFn))
-  if back.length == 0 { return false }
+  if back.length == 0 { return freshReturnsOnly(calleeNamesDecl(c.callFn)) }
   for i in back {
     if i >= c.callArgs.length { return false }
     if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
     if !freshContainerExpr(c.callArgs[i]) { return false }
+  }
+  return true
+}
+
+// Whether un-annotated function `d` returns only a container it makes: a fresh one, or a local
+// holding just its empty `Map()` that nothing but those returns reads. False for any other.
+function freshReturnsOnly(d: i32): boolean {
+  const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(f is FuncDecl)
+    || f.fnRet >= 0
+    || f.fnTyParams.length > 0
+    || f.fnBody < 0
+  ) {
+    return false
+  }
+  const rv: i32[] = []
+  a20RetWalk(f.fnBody, true, rv)
+  if rv.length == 0 { return false }
+  const reads: i32[] = []
+  for v in rv { reads.push(parenPeelIx(v)) }
+  for v in reads {
+    if v < 0 { return false }
+    if freshContainerExpr(v) { continue }
+    const b = if nodeAt(v) is Ident { recFreshMapDeclOf(v) } else { -1 }
+    if b < 0 || !cwReadOnlyAt(b, reads) { return false }
+  }
+  return true
+}
+
+// Whether every occurrence of binding `b` past its declaration is a read among `reads`.
+function cwReadOnlyAt(b: i32, reads: i32[]): boolean {
+  cwIxBuild()
+  const ow = cwOccWalk(b)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_BIND { continue }
+    if cwIxKind[r] != CW_OCC_USE || !i32ListHas(reads, cwIxNode[r]) {
+      return false
+    }
   }
   return true
 }
