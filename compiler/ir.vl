@@ -259,6 +259,8 @@ export type RSpread = {
   // The groups each a list at its own rep: one the plan converts to the literal's element kind
   // (`spreadGroupStash`), or one at its own sub row, whose element the row's is a supertype of.
   spOwn: i32[],
+  // The groups the plan would convert that the builder built at the literal's own kind already.
+  spDone: i32[],
 }
 // `__array_new__(lnLen, lnFill)` at call node `lnAt`, written by legacy's stash and tail.
 export type RListNew = { lnLen: Opnd, lnFill: Opnd, lnAt: i32 }
@@ -378,7 +380,12 @@ export type RJoinNull = { jnKind: VKind, jnSlot: i32 }
 export type RNulNicheEq = { neL: Opnd, neR: Opnd, neR2: Opnd, neAt: i32 }
 // `ntV`, a `K | null`, a nullable reference or a union box, tested against `null` at compare node `ntAt`; `ntInvert` for `!=`, as the
 // binary dispatch hands it to legacy's null test (`binNulTestOf`).
-export type RNulTest = { ntV: Opnd, ntInvert: boolean, ntAt: i32 }
+export type RNulTest = {
+  ntV: Opnd,
+  ntInvert: boolean,
+  ntAt: i32,
+  ntByRep: boolean,
+}
 // The `==` (or, with `aeNe`, `!=`) of two atoms at `aeAt`. `aeStatic` 1 or 2: that side is one
 // string literal, its id from its lexeme (an unread immediate, else evaluated and dropped); 0 two
 // atom values; 3 two literal sides folded to a constant; 4 a literal left side whose id `aeL` is
@@ -729,6 +736,9 @@ export type RHandPick = { hpV: Opnd, hpAt: i32, hpArg: i32, hpI: i32 }
 // Member `hkM` of the bundle holder record `hkV` that read `hkArg` names, as legacy's
 // `bundleMemberPickOf` picks it: an annotated binding's (`typedHolderMember`) or a field's.
 export type RHolderPick = { hkV: Opnd, hkM: i32, hkArg: i32 }
+// Field `rmbField` of the record `rmbV` holds under heap type `rmbHeap`: a member read by its
+// rep's layout, with no node to re-read.
+export type RRecMember = { rmbV: Opnd, rmbHeap: i32, rmbField: i32 }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
 // reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing. `tag64`
@@ -839,6 +849,7 @@ export type Rhs = RAfterEffects
   | RRawOp
   | RRecCopyPure
   | RRecDown
+  | RRecMember
   | RRecordFitIs
   | RRecover
   | RRel
@@ -1659,6 +1670,7 @@ export function irNodeEndsPath(n: IrNode): boolean {
       RRawOp |
       RRecCopyPure |
       RRecDown |
+      RRecMember |
       RRecordFitIs |
       RRecover |
       RRel |
@@ -2057,189 +2069,10 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RResultPick => [r.rkV]
     RHandPick => [r.hpV]
     RHolderPick => [r.hkV]
+    RRecMember => [r.rmbV]
     RRawOp => r.rwArgs
     RRel => []
     RStage => [r.sgV]
-  }
-}
-
-// `f` as text: a header naming each variable's kind and rep, then the body, one node a line.
-// The construct family a cutover slice switches to the IR's bytes as one unit (design §10):
-// scalar arithmetic, control flow, direct calls, globals, list access, map reads, memory and SIMD
-// intrinsics, and the constructs no slice owns yet. `start` is no node's: it claims the start body.
-export type IrFamily = "scalar"
-  | "control"
-  | "call"
-  | "global"
-  | "list"
-  | "map"
-  | "box"
-  | "record"
-  | "closure"
-  | "start"
-  | "raw"
-  | "mem"
-  | "other"
-
-export function irNodeFamily(n: IrNode): IrFamily {
-  return match n {
-    SLet => irRhsFamily(n.lRhs)
-    SEffect => irRhsFamily(n.efRhs)
-    SAssign |
-      SBlock |
-      SBr |
-      SDrop |
-      SForIn |
-      SIf |
-      SIntSwitch |
-      SLoop |
-      SRangeLoop |
-      SReturn |
-      STrap => "control"
-    SArmSite | SArmWrite => "box"
-    SCoalBox => match n.cbArm {
-      "popOr" | "listGetOr" => "list"
-      "nulRef" | "boxStash" | "boxRuntime" | "nulAtomJoin" => "box"
-      "litUnion" | "nulBool" | "boxFieldScalar" | "nulStr" | "asProp" | "nulBoolJoin" => "box"
-      "fieldBox" | "fieldVal" | "optLeaf" | "optBoxLeaf" | "optRecLeaf" => "record"
-      "mapIndexGetOr" | "optMapField" => "map"
-      "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
-    }
-    SGlobalSet => "global"
-    SBoundsCheck | SListSet => "list"
-    SSetField => "record"
-    SCellSet | SSwitch => "other"
-    SRawOp => "raw"
-  }
-}
-
-export function irRhsFamily(r: Rhs): IrFamily {
-  return match r {
-    RAfterEffects |
-      RAsTail |
-      RAsgParked |
-      RAsgUnwiden |
-      RAtomEq |
-      RAtomSole |
-      RAtomStr |
-      RAtomWide |
-      RClosureEq |
-      RCoalAtomStr |
-      RCoalStr |
-      RDeadNever |
-      RDeadNullTest |
-      REqHelp |
-      RHoleOptBox |
-      RIdentityEq |
-      RIsStaged |
-      RJoinNull |
-      RLitArms |
-      RNulNicheEq |
-      RNulTest |
-      RNullOf |
-      RNumCast |
-      RNumIntr |
-      RNumIs |
-      RNumUnionBin |
-      RNumUnionConvert |
-      RNumWiden |
-      RPrimOp |
-      RRecover |
-      RRetNull |
-      RRetag |
-      RStrToAtom |
-      RStrToAtomStaged |
-      RStructEq |
-      RTagIs |
-      RTagStash |
-      RToBox |
-      RUnionConcreteEq |
-      RUnionEq |
-      RUnionNumCrossEq |
-      RUnionStage |
-      RUnionStagedEq |
-      RUnionVariantEq => "scalar"
-    RCall |
-      RCallHost |
-      RPrint |
-      RPrintOpen => "call"
-    RGlobalGet | RInitProgress => "global"
-    RCoerce |
-      RListCat |
-      RListClear |
-      RListCopy |
-      RListEmpty |
-      RListEmptyArms |
-      RListEq |
-      RListFitIs |
-      RListGet |
-      RListIsAcross |
-      RListLen |
-      RListNew |
-      RListNewDefault |
-      RListPop |
-      RListPush |
-      RListPushMany |
-      RListSlice |
-      RListStage |
-      RMakeList |
-      RMapFilter |
-      RMapFilterHead |
-      RSpread |
-      RStrOp => "list"
-    RMapClear |
-      RMapDelete |
-      RMapEq |
-      RMapGet |
-      RMapGetOr |
-      RMapHas |
-      RMapIter |
-      RMapNew |
-      RMapOp |
-      RMapSet => "map"
-    RArmUnbox |
-      RAsUnion |
-      RBoxField |
-      RBoxNarrow |
-      RCast |
-      RNicheRead |
-      RNulNoneBox |
-      RSharedFieldSet |
-      RSharedRead |
-      RTest => "box"
-    RRecordFitIs => "record"
-    RVariantChain => "box"
-    RVariantDiscrim => "box"
-    RFieldNull |
-      RGetField |
-      RMakeRec |
-      ROptRead |
-      RRecCopyPure |
-      RRecDown |
-      RStashSet => "record"
-    RBundlePick |
-      RCallRef |
-      RCallRefHead |
-      RCloTag |
-      REnvDrop |
-      REnvGet |
-      RHandPick |
-      RHolderPick |
-      RMakeClo |
-      RResultPick |
-      RTagClo => "closure"
-    RCellGet |
-      RCellNew |
-      RFnId |
-      RTagOf => "other"
-    RAtomic |
-      RMaFoldInit |
-      RMemAccess |
-      RMemOp |
-      RSimd |
-      RTruncSat => "mem"
-    RRawOp | RRel => "raw"
-    RStage => "scalar"
   }
 }
 
@@ -2416,6 +2249,46 @@ export function boxListRetag(src: i32, dst: i32): boolean {
   const ed = repNodeAt(d.rlsElem)
   if ea is RBox { return ed is RBox }
   return ea is RNullable && ea.rnDisc == 4 && ed is RNullable && ed.rnDisc == 4
+}
+
+// Whether a union box at rep `src` is one at rep `dst` as it stands: one box heap whose tags are
+// program-global, so a box whose every arm is an arm of `dst` (and whose null `dst` admits) is
+// already that box. A twin arm under another tag is no retag.
+export function boxRetag(src: i32, dst: i32): boolean {
+  if src == dst || !boxOrBoxedNullable(src) || !boxOrBoxedNullable(dst) {
+    return false
+  }
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if a is RNullable && !(d is RNullable) { return false }
+  const da = boxArmsOf(dst)
+  for x in boxArmsOf(src) {
+    if !i32ListHas(da, x) { return false }
+  }
+  return true
+}
+
+// The member reps a box or boxed nullable at rep `r` holds, its null aside; any other rep holds
+// none.
+function boxArmsOf(r: i32): i32[] {
+  const n = repNodeAt(r)
+  if n == null { return [] }
+  return match n {
+    RBox => n.rbArms
+    RNullable => {
+      const i = repNodeAt(n.rnInner)
+      if i is RBox { i.rbArms } else { [n.rnInner] }
+    }
+    RAtom |
+      RClosure |
+      RList |
+      RMap |
+      RNoValue |
+      RPrim |
+      RRaw |
+      RRecord |
+      RUnsup => []
+  }
 }
 
 // Whether a map at rep `src` and one at rep `dst` hold union boxes as values, a box or a boxed

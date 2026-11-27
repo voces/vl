@@ -389,6 +389,7 @@ import {
   elabSlotTyAt,
   elabThroughMemberAt,
   elabUnboundTpTy,
+  fnSetTyKeep,
   isStorageRead,
   litRepTyAt,
   litRepUnionAt,
@@ -3013,7 +3014,7 @@ export function holderRecordSigs(d: i32, fnIx: i32): i32[] {
     !elabHasHolderRecords()
     || d < 0
     || d >= P.nodes.length
-    || !(nodeAt(d) is LetDecl)
+    || !(nodeAt(d) is LetDecl || nodeAt(d) is LoopVar)
   ) {
     return []
   }
@@ -3321,7 +3322,7 @@ export function asgYieldsNulHole(asgIx: i32, fnIx: i32): boolean {
   const ty = nodeTyIxOf(asgIx)
   if ty < 0 { return false }
   const t = tyAt(ty)
-  return t is TyNullable && t.nInner < 0
+  return t is TyNullable && t.nInner < 0 || tyIsNullUnit(ty)
 }
 
 // The width of the checker's type of assignment `asgIx` when its value is its right side's
@@ -5081,6 +5082,21 @@ export function spreadLitSrcRowName(arrIx: i32, fnIx: i32): string {
 // `ty | null`, for the emitter's own reads of a nullable it does not name.
 export function nullableTyOf(ty: i32): i32 { return mkNullableTy(ty) }
 
+// `t` closing open type `ct`, nullable where `ct` is, and so for a list's elements: a pin names
+// the value's type, not whether it can be null (a map read's miss stays `| null`, D17725).
+export function tyKeepNullOf(ct: i32, t: i32): i32 {
+  if ct < 0 || ct >= T.tys.length || t < 0 || t >= T.tys.length { return t }
+  const c = tyAt(ct)
+  const o = tyAt(t)
+  if c is TyArray && o is TyArray {
+    const e = tyKeepNullOf(tyElemOf(c), tyElemOf(o))
+    return if e == tyElemOf(o) { t } else { mkArrayTy(e) }
+  }
+  const k = fnSetTyKeep(ct, t)
+  if !(c is TyNullable) { return k }
+  return if k >= 0 && k < T.tys.length && tyAt(k) is TyNullable { k } else { mkNullableTy(k) }
+}
+
 // `elem[]`, for the emitter's own list of a row element it does not name.
 export function listTyOfElem(elem: i32): i32 { return mkArrayTy(elem) }
 
@@ -6050,7 +6066,13 @@ export function instanceOperandTyOf(exprIx: i32, fnIx: i32): i32 {
 // The kind a `for`'s loop variable binds at in `fnIx`: the rep of the element its iterable's type
 // yields there (a map's key, a string's code unit). Null where the iterable binds no element.
 export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
-  return repSigKindOfTy(forInBindTy(forInIterTyAt(iterIx, fnIx), false))
+  const k = repSigKindOfTy(forInBindTy(forInIterTyAt(iterIx, fnIx), false))
+  // A `.values()` walk over a vals slot holding a bundle's record binds that record (D17094).
+  if k == "closure" {
+    const mvs = forInMapValsSlot(iterIx, fnIx)
+    if mvs >= 0 && mvValIsRecord(mvs) { return "struct" }
+  }
+  return k
 }
 
 // The kind of the value a `for` over `iterIx` walks in `fnIx`: the iterable's own rep when that is a
@@ -9834,7 +9856,8 @@ function structIndexOfJoinStore(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   }
   if e.binOp != "??" { return -1 }
   if coalesceResultIsBox(exprIx, fnIx) { return -2 }
-  const ls = structIndexOfExpr(e.binLeft, fnIx)
+  // A left the checker narrows to `null` is dead: its storage's row is not the result's (D17205).
+  const ls = if tyIsNullUnit(nodeTyAt(e.binLeft, fnIx)) { -1 } else { structIndexOfExpr(e.binLeft, fnIx) }
   if ls >= 0 { return ls }
   const rs = structIndexOfExpr(e.binRight, fnIx)
   return if rs >= 0 { rs } else { -2 }

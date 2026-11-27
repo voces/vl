@@ -83,6 +83,7 @@ import {
   cloStructIdx,
   ctrlDepth,
   curBuf,
+  curBufGen,
   dfeCallee,
   dfeOn,
   emitCurFnIx,
@@ -103,6 +104,14 @@ import {
   fbEagerScratch,
   fbFrameLocals,
   fbFrameParams,
+  fbLastArg,
+  fbLastEnd,
+  fbLastGen,
+  fbLastOp,
+  fbNnElideEnd,
+  fbNnElideGen,
+  fbPosEnd,
+  fbPosGen,
   fbRunsWritten,
   fbScratchCur,
   fitGrowFn,
@@ -119,6 +128,7 @@ import {
   fl64Ty,
   fnMemAddrFoldCount,
   fnUses,
+  gOptimized,
   ia64Ty,
   il64Ty,
   isSBackTy,
@@ -326,6 +336,7 @@ export function wValRef(ht: i32, nul: boolean) {
 export function wTarget(buf: u8[]) {
   const prev = curBuf
   curBuf = buf
+  curBufGen = curBufGen + 1
   return prev
 }
 // Append one byte (low 8 bits) to the current buffer.
@@ -335,7 +346,22 @@ export function wU8(b: i32) {
 }
 // How many bytes the current buffer holds — the cursor a PEEPHOLE needs to describe
 // the instruction it is about to rewrite.
-export function wLen() { return curBuf.length }
+export function wLen() { return wPos() }
+// The current buffer's length as an offset the caller keeps, noted so that `fbTakeLocalGet`
+// never unwrites a byte a kept offset points past.
+export function wPos(): i32 {
+  const n = curBuf.length
+  if fbPosGen != curBufGen || fbPosEnd < n {
+    fbPosGen = curBufGen
+    fbPosEnd = n
+  }
+  return n
+}
+// Forgets the instruction just written, for a caller that keeps an offset over its bytes.
+export function fbLastForget() {
+  fbLastEnd = -1
+  return 0
+}
 // The byte `back` positions from the END of the current buffer (`0` = the last one),
 // or `-1` when the buffer is shorter than that. Reading past the start is a question,
 // not an error: a peephole asks it precisely to find out whether its pattern fits.
@@ -369,6 +395,7 @@ export function wDropBack(n: i32) {
     curBuf.pop()
     k = k - 1
   }
+  if curBuf.length < fbLastEnd { fbLastEnd = -1 }
   return relTrim()
 }
 // Append every byte of `bs` in order to the current buffer.
@@ -550,15 +577,98 @@ export function ropeAt(r: ByteRope, i: i32): i32 {
 // ── control flow / locals / consts (the universal base — Phase B) ─────────────
 // local.get / local.set / local.tee: 0x20/0x21/0x22 <localidx-uleb>.
 export function fbLocalGet(i: i32) {
+  // A read of the local the last instruction set is that set's `local.tee`, rewritten in place:
+  // the two encodings are the same length, so no recorded position moves.
+  if (
+    fbLastIs(OP_LOCAL_SET, i)
+    && curBuf[fbLastEnd - ulebLen(i) - 1] == OP_LOCAL_SET
+  ) {
+    curBuf[fbLastEnd - ulebLen(i) - 1] = OP_LOCAL_TEE
+    fbLastEnd = -1
+    if fbLocalIsUnsetRef(i - fbFrameParams) { fbRefAsNonNull() }
+    return 0
+  }
   wU8(OP_LOCAL_GET) // 0x20 local.get
   wULEB(i)
-  if fbLocalIsUnsetRef(i - fbFrameParams) { fbRefAsNonNull() }
-  return 0
+  if fbLocalIsUnsetRef(i - fbFrameParams) {
+    fbRefAsNonNull()
+    return 0
+  }
+  return fbLastNote(OP_LOCAL_GET, i)
+}
+// Unwrites the instruction just written when it is a plain `local.get`, returning its local, for
+// a stash that reads that local in place of a copy it would make; -1, unwriting nothing, else.
+export function fbTakeLocalGet(): i32 {
+  const i = fbLastArg
+  if !fbLastIs(OP_LOCAL_GET, i) { return -1 }
+  const at = fbLastEnd - ulebLen(i) - 1
+  if curBuf[at] != OP_LOCAL_GET || fbPosGen == curBufGen && fbPosEnd > at {
+    emitFail(
+      "emitProgram: internal: a kept offset points into a `local.get` an index stash unwrites",
+    )
+    return -1
+  }
+  wDropBack(ulebLen(i) + 1)
+  return i
 }
 export function fbLocalSet(i: i32) {
   wU8(OP_LOCAL_SET) // 0x21 local.set
   wULEB(i)
+  return fbLastNote(OP_LOCAL_SET, i)
+}
+// Notes a receiver written without its non-null recover, since a `struct.get`, which traps on
+// null itself, reads it next; `fbStructGet` checks that it does (`fbNnElideDone`).
+export function fbNnElideNote() {
+  fbNnElideGen = curBufGen
+  fbNnElideEnd = wPos()
   return 0
+}
+
+// Drops a pending `fbNnElideNote`, for a read whose lowering missed before its `struct.get`.
+export function fbNnElideClear() {
+  fbNnElideEnd = -1
+  return 0
+}
+
+// Fails when the `struct.get` after a recover `fbNnElideNote` left out is missing.
+export function fbNnElideDone() {
+  if fbNnElideEnd < 0 { return 0 }
+  fbNnElideEnd = -1
+  emitFail("emitProgram: internal: an elided recover reached no struct.get")
+  return 0
+}
+
+// Whether the writer's peepholes run: not in a build `-O` optimises next, whose passes match the
+// shapes they would rewrite (binaryen's loop hoisting, `optMultivalue`) and do the rewrite too.
+function fbPeepholes(): boolean { return gOptimized == 0 }
+
+// Records the instruction just written, opcode `op` with argument `arg`, as the buffer's last.
+function fbLastNote(op: i32, arg: i32) {
+  fbLastGen = curBufGen
+  fbLastEnd = curBuf.length
+  fbLastOp = op
+  fbLastArg = arg
+  return 0
+}
+
+// Whether the current buffer still ends with the instruction `fbLastNote` recorded as `op` `arg`.
+function fbLastIs(op: i32, arg: i32): boolean {
+  return fbPeepholes()
+    && fbLastOp == op
+    && fbLastArg == arg
+    && fbLastEnd == curBuf.length
+    && fbLastGen == curBufGen
+    && fbLastEnd > 0
+}
+// The number of bytes `wULEB(v)` writes for a non-negative `v`.
+function ulebLen(v: i32): i32 {
+  let n = 1
+  let x = v >> 7
+  while x != 0 {
+    n = n + 1
+    x = x >> 7
+  }
+  return n
 }
 // `local.tee i` — store the stack top into local `i` and LEAVE it on the stack, i.e.
 // `local.set` + `local.get` in one opcode. For a value that is both consumed here and
@@ -1076,14 +1186,44 @@ export function fbReturnCall(fnIdx: i32) {
 }
 // i32.eqz: 0x45 (used for `!a` and the while-condition inversion).
 export function fbI32Eqz() {
+  // The test of an integer comparison the last instruction made is the inverse comparison,
+  // rewritten in place. A float comparison keeps its `eqz`: NaN fails both it and its inverse.
+  const inv = intCmpInverse(fbLastOp)
+  if inv >= 0 && fbLastIs(fbLastOp, -1) && curBuf[fbLastEnd - 1] == fbLastOp {
+    curBuf[fbLastEnd - 1] = inv
+    fbLastEnd = -1
+    return 0
+  }
   wU8(OP_I32_EQZ) // 0x45 i32.eqz
   return 0
+}
+
+// The opcode of the integer comparison that is false exactly where `op` is true (`eq` and `ne`,
+// `lt` and `ge`, `gt` and `le`, at i32 and i64, signed and unsigned); -1 for any other opcode.
+function intCmpInverse(op: i32): i32 {
+  if op >= 0x46 && op <= 0x4f { return cmpInverseFrom(op, 0x46) }
+  if op >= 0x51 && op <= 0x5a { return cmpInverseFrom(op, 0x51) }
+  return -1
+}
+
+// `intCmpInverse` within one width's ten comparisons, which start at `base` in the order eq, ne,
+// lt_s, lt_u, gt_s, gt_u, le_s, le_u, ge_s, ge_u.
+function cmpInverseFrom(op: i32, base: i32): i32 {
+  const k = op - base
+  if k == 0 { return base + 1 }
+  if k == 1 { return base }
+  // lt (2, 3) and ge (8, 9); gt (4, 5) and le (6, 7).
+  if k == 2 || k == 3 { return op + 6 }
+  if k == 8 || k == 9 { return op - 6 }
+  if k == 4 || k == 5 { return op + 2 }
+  return op - 2
 }
 // One single-byte arithmetic or comparison opcode, at any scalar width. The byte is resolved
 // by `primOpcode` or `lexOpcode` (`ir.vl`); this just writes it.
 export function fbI32Bin(op: i32) {
+  if op == OP_I32_EQZ { return fbI32Eqz() }
   wU8(op)
-  return 0
+  return fbLastNote(op, -1)
 }
 // An i64 key's pair tag: the top 32 bits of `key * 2^64/phi`. Two keys that differ only in their
 // high 32 bits always get different tags (the constant's low half is odd), and the tag is then
@@ -1114,7 +1254,7 @@ export function fbStructNew(heapIdx: i32) {
   wULEB(heapIdx)
   // Leave the return sink's cursor on a UNION-box construction (see `uBoxNewEnd`): the
   // rewrite is legal only while this instruction is still the last one written.
-  if heapIdx == uBoxIdx { uBoxNewEnd = curBuf.length }
+  if heapIdx == uBoxIdx { uBoxNewEnd = wPos() }
   return 0
 }
 // ── string header accessors ───────────────────────────────────────────────────
@@ -1161,6 +1301,14 @@ export function packedStorageOf(heapIdx: i32, field: i32): i32 {
 }
 
 export function fbStructGet(heapIdx: i32, field: i32) {
+  if fbNnElideEnd >= 0 {
+    if fbNnElideEnd != curBuf.length || fbNnElideGen != curBufGen {
+      emitFail(
+        "emitProgram: internal: an elided recover is not followed by its struct.get",
+      )
+    }
+    fbNnElideEnd = -1
+  }
   wU8(GC_PREFIX) // 0xfb GC prefix
   const pk = packedFields[heapIdx * 65536 + field] ?? 0
   wU8(if pk == 0 { GC_STRUCT_GET } else { pk % 16 }) // struct.get, or a packed field's read

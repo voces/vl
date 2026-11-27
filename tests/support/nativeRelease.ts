@@ -304,7 +304,9 @@ export const LOOP_TABLE: Array<{
   // `bsearch`, `run` and start are BYTE-IDENTICAL; the eight loops that left are the six string
   // and UTF-8 helpers above, now `unreachable` stubs. So the `none` count is scoped to what the
   // program can reach, and the wrong-axis firings above can no longer recur. `-O`/`-O3` unchanged.
-  { fixture: "binsearch-probe", none: [3, 0, 6], O: [3, 3, 3], O3: [3, 3, 3] },
+  // `none` 3,0,6 -> 3,0,3 when a plain build began writing a set read straight back as one
+  // `local.tee`: no loop rotates, and three locals the loops carried are now tee'd stack values.
+  { fixture: "binsearch-probe", none: [3, 0, 3], O: [3, 3, 3], O3: [3, 3, 3] },
 ];
 
 // ── THE BENCHMARK SHAPE PINS ────────────────────────────────────────────────

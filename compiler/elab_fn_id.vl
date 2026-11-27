@@ -47,27 +47,21 @@ import {
 } from "./check_types"
 import { nodeTyFrozenOf } from "./check_node_tys"
 import { cwIxBuild, cwSlotPath } from "./check_write_scan"
-import { recEnclosingFn } from "./check_fit_rules"
 import { tyHasTyVar } from "./tyquery"
 import { identDeclOf, nodeSrc } from "./symbols"
 import { wrDstDecl } from "./check_decl_scan"
 import { valueTailSplit } from "./check_num_adopt"
-import { elabFnSetTy, fnTagged } from "./check_fn_tag_facts"
+import { elabFnSetTy, fnSetRep } from "./check_fn_tag_facts"
 import { elabFnSetOf, elabFnSetTyMint } from "./check_elab_cap"
 import { parenPeelIx } from "./check_places"
 import {
-  elabHeldValTy,
   elabIdentityTy,
-  elabSlotTyAt,
   elabSpecBaseOf,
-  elabSpecChildCount,
   elabSpecDeclAt,
   elabSpecDeclsOf,
   elabSpecInst,
-  elabSpecMintedCount,
   elabSpecParamsOf,
 } from "./emit_elab"
-import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 
 // Each `let` node's written values, built once per compile from `wrDstDecl`.
 let idWrites: {[i32]: i32[]} = Map()
@@ -77,7 +71,6 @@ const idLetBusy: {[i32]: boolean} = Map()
 // Each specialization decision's call and the argument-keyed instance it reached (-1 for none).
 let idSpecCalls: i32[] = []
 let idSpecKeys: i32[] = []
-let idSpecGroups: string[] = []
 
 // The first source node of the copies `x` descends from; `x` itself when it is no copy.
 export function idCanon(x: i32): i32 {
@@ -207,29 +200,15 @@ export function elabFnIdReset() {
   idLetMemo = Map()
   idSlotsBuilt = false
   idSlotW = []
-  idSlotWKey = []
-  idSlotWTy = []
-  idSlotWPos = []
-  idSlotWTop = []
-  idSlotWHolder = []
-  idSlotWSteps = []
   idSlotSets = Map()
   idSlotOpen = Map()
   return 0
 }
 
-// Each function-typed write into a slot (a list element, a record field, a map value): the value
-// node, its slot's key, the slot's checked type and the write's position kind.
+// Each function-typed write into a slot (a list element, a record field, a map value): its value
+// node.
 let idSlotsBuilt = false
 let idSlotW: i32[] = []
-let idSlotWKey: string[] = []
-let idSlotWTy: i32[] = []
-let idSlotWPos: string[] = []
-// Per write: the outermost node above it (a literal or the value itself), its binding (-1 for
-// none) and the steps from that node down to the write.
-let idSlotWTop: i32[] = []
-let idSlotWHolder: i32[] = []
-let idSlotWSteps: string[][] = []
 // Per slot key, the union of its writes' sets, and whether some write may be any function.
 let idSlotSets: {[string]: i32[]} = Map()
 let idSlotOpen: {[string]: boolean} = Map()
@@ -270,16 +249,9 @@ function idStepTy(t0: i32, st: string): i32 {
   return -1
 }
 
-function idSlotAdd(w: i32, ty: i32, pos: string) {
+function idSlotAdd(w: i32, ty: i32, _pos: string) {
   if !idFnTy(ty) { return 0 }
   idSlotW.push(w)
-  idSlotWTy.push(ty)
-  idSlotWPos.push(pos)
-  idSlotWKey.push("")
-  idSlotWTop.push(-1)
-  idSlotWHolder.push(-1)
-  const none: string[] = []
-  idSlotWSteps.push(none)
   return 0
 }
 
@@ -310,26 +282,18 @@ function idSlotKeyOfWrite(i: i32): string {
     guard = guard + 1
   }
   let k = ""
-  const steps: string[] = []
   const d = idTopHolder[u] ?? -1
   if d >= 0 {
     k = "B" + i32ToStr(idCanon(d))
-    for st in idTopPath[u] ?? [] {
-      k = k + "/" + st
-      steps.push(st)
-    }
+    for st in idTopPath[u] ?? [] { k = k + "/" + st }
   } else {
     k = "L" + i32ToStr(u)
   }
   let j = rev.length - 1
   while j >= 0 {
     k = k + "/" + rev[j]
-    steps.push(rev[j])
     j = j - 1
   }
-  idSlotWTop[i] = u
-  idSlotWHolder[i] = d
-  idSlotWSteps[i] = steps
   return k
 }
 
@@ -396,7 +360,6 @@ export function idSlotsBuild() {
   let i = 0
   while i < idSlotW.length {
     const key = idSlotKeyOfWrite(i)
-    idSlotWKey[i] = key
     const w = idSlotW[i]
     const none: i32[] = []
     const s = if nodeAt(w) is Spread { none } else { idSetOf(w, 0) }
@@ -405,40 +368,6 @@ export function idSlotsBuild() {
     i = i + 1
   }
   return 0
-}
-
-export function idSlotWriteCount(): i32 {
-  idSlotsBuild()
-  return idSlotW.length
-}
-
-// The value node, slot key, slot type and position kind of slot write `i`.
-export function idSlotWriteAt(i: i32): i32 { return idSlotW[i] }
-export function idSlotWriteKey(i: i32): string { return idSlotWKey[i] }
-export function idSlotWriteTy(i: i32): i32 { return idSlotWTy[i] }
-export function idSlotWritePos(i: i32): string { return idSlotWPos[i] }
-
-// The closed type the slot of write `i` is held at in its enclosing function's frame: the binding's
-// slot fact, or the held type of the outermost literal, walked down the steps; -1 for none.
-export function idSlotWriteHeldTy(i: i32): i32 {
-  const w = idSlotW[i]
-  const f = recEnclosingFn(w)
-  const d = idSlotWHolder[i]
-  const steps = idSlotWSteps[i]
-  let t = -1
-  if d >= 0 {
-    t = elabSlotTyAt(d, [], f)
-  } else {
-    const u = idSlotWTop[i]
-    if u == w { return -1 }
-    t = elabHeldValTy(u, f)
-  }
-  let j = 0
-  while j < steps.length && t >= 0 {
-    t = idStepTy(t, steps[j])
-    j = j + 1
-  }
-  return t
 }
 
 // The functions slot `key` may hold, ascending: the union of its writes' sets; [] where some
@@ -531,14 +460,6 @@ export function idWritesOf(bd: i32): i32[] {
   return idWrites[bd] ?? []
 }
 
-// Every `let` node some value is written to.
-export function idWrittenLets(): i32[] {
-  idWritesBuild()
-  const out: i32[] = []
-  for bd in idWrites.keys() { out.push(bd) }
-  return out
-}
-
 // The type value `x` holds in frame `fnIx` with its identity: `elabIdentityTy`'s, and for a
 // concrete function type carrying no set, that signature carrying `x`'s `Fn#d` set (`idSetOf`).
 // It prints as the structural type; it is that type unchanged where the set is open.
@@ -555,7 +476,6 @@ export function elabIdentityFnTy(x: i32, fnIx: i32): i32 {
 export function elabSpecReset() {
   idSpecCalls = []
   idSpecKeys = []
-  idSpecGroups = []
   idSpecSlots = Map()
   return 0
 }
@@ -567,7 +487,7 @@ export function elabSpecArgDecl(ax: i32, fnIx: i32): i32 {
   const t = elabIdentityFnTy(ax, fnIx)
   if t >= 0 {
     const sid = elabFnSetTy[t] ?? -1
-    if sid >= 0 && (fnTagged[sid] ?? false) { return -2 }
+    if fnSetRep(sid) == "id" { return -2 }
   }
   const s = if t < 0 || tyHasTyVar(t) { idSetOf(ax, 0) } else { elabFnSetOf(t) }
   if s.length != 1 { return -1 }
@@ -603,17 +523,9 @@ export function elabSpecDemand(
   if why == "" && base < -1 { why = "nobase" }
   const k = if why == "" { elabSpecInst(decl, base, fnIx, ps, ds) } else { -1 }
   if why == "" && k < 0 { why = "nokey" }
-  idShadowRow("speckey " + (if why == "" { "keyed" } else { why }))
   idSpecCalls.push(call)
   idSpecKeys.push(k)
-  idSpecGroups.push("")
   return idSpecCalls.length - 1
-}
-
-// Names the instance mono gave decision `i` (`elabSpecDemand`'s answer): its registry key or slot.
-export function elabSpecMonoGroup(i: i32, g: string) {
-  if i >= 0 && i < idSpecGroups.length { idSpecGroups[i] = g }
-  return 0
 }
 
 // The (S1) map: per decision, the slot of mono's instance for it.
@@ -650,52 +562,6 @@ function idDeclNamed(d: i32, name: string): boolean {
   if d < 0 || d >= P.nodes.length { return false }
   const n = nodeAt(d)
   return n is FuncDecl && n.fnName == name
-}
-
-// One `specgroup` row once mono has run: its distinct instances over the keyed decisions, the
-// elaboration's, and the distinct pairs; the grouping agrees exactly when all three are equal.
-export function elabSpecGroupRow() {
-  if idShadowModeOf() == 0 { return 0 }
-  const mono: {[string]: boolean} = Map()
-  const elab: {[i32]: boolean} = Map()
-  const pairs: {[string]: boolean} = Map()
-  let nm = 0
-  let ne = 0
-  let np = 0
-  let i = 0
-  while i < idSpecGroups.length && i < idSpecKeys.length {
-    const k = idSpecKeys[i]
-    if k >= 0 {
-      const m = idSpecGroups[i]
-      if !(mono[m] ?? false) {
-        mono[m] = true
-        nm = nm + 1
-      }
-      if !(elab[k] ?? false) {
-        elab[k] = true
-        ne = ne + 1
-      }
-      const pk = m + "#" + i32ToStr(k)
-      if !(pairs[pk] ?? false) {
-        pairs[pk] = true
-        np = np + 1
-      }
-    }
-    i = i + 1
-  }
-  idShadowRow(
-    "specgroup mono="
-      + i32ToStr(nm)
-      + " elab="
-      + i32ToStr(ne)
-      + " pairs="
-      + i32ToStr(np)
-      + " minted="
-      + i32ToStr(elabSpecMintedCount())
-      + " children="
-      + i32ToStr(elabSpecChildCount()),
-  )
-  return 0
 }
 
 // The parameter position whose argument call `c` calls inside argument-keyed instance `k`: its
