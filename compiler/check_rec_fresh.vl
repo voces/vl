@@ -7,6 +7,7 @@ import {
   Block,
   BoolLit,
   Call,
+  FieldInit,
   FuncDecl,
   Ident,
   IfStmt,
@@ -41,15 +42,22 @@ import {
   CW_OCC_ASG,
   CW_OCC_BIND,
   CW_OCC_USE,
+  CW_UP_ARG,
   CW_UP_CMP,
+  CW_UP_ELEM,
+  CW_UP_FIELD,
   CW_UP_IS,
   CW_UP_LETINIT,
   CW_UP_OBJ,
+  CW_UP_RET,
+  cwFnDeclAt,
   cwIxBuild,
   cwIxCovers,
   cwIxKind,
   cwIxNode,
+  cwIxParent,
   cwIxUp,
+  cwIxUpAux,
   cwIxUpKind,
   cwKeyOfDecl,
   cwKeyOfRoot,
@@ -436,37 +444,137 @@ export function recPassLitDeclOf(at: i32): i32 {
   return -1
 }
 
-// The annotations every whole delivery of un-annotated binding `d` names, into `out`: `d` holds a
-// fresh literal, is never written as a whole, and every other use reads it (a field, a compare,
-// an `is`). False where any use is another form, so the binding keeps its own type.
-export function bindDestAnnots(d: i32, out: i32[]): boolean {
+// The annotations every whole delivery of un-annotated binding `d` names, into `out` with each
+// one's projection down to the binding's value in `paths` (`e` an element, `f:name` a field,
+// `/`-joined, outermost first). `d` holds a fresh literal, is never written as a whole, and every
+// other use reads it. False where any use is another form, so the binding keeps its own type.
+export function bindDestAnnots(d: i32, out: i32[], paths: string[]): boolean {
+  if !bindHoldsFresh(d) { return false }
+  return bindUseDests(d, "", out, paths, 0) && out.length > 0
+}
+
+// Whether `d` is an un-annotated `let`/`const` of a fresh literal never written as a whole.
+function bindHoldsFresh(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
   const dn = nodeAt(d)
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
   const iv = parenPeelIx(dn.letInit)
-  if iv < 0 || !bindFreshLit(nodeAt(iv)) { return false }
+  if iv < 0 || !bindFreshLit(nodeAt(iv)) && !bindMapCtor(iv) { return false }
   const k = cwKeyOfDecl(d)
-  if k < 0 || dn.letKw != "const" && recBindAssigned(k) { return false }
+  return k >= 0 && (dn.letKw == "const" || !recBindAssigned(k))
+}
+
+// The destinations of every whole use of binding `d`, whose value sits at `path` below them.
+function bindUseDests(
+  d: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+  depth: i32,
+): boolean {
+  if depth > 8 { return false }
+  const k = cwKeyOfDecl(d)
+  if k < 0 { return false }
   cwIxBuild()
   const ow = cwOccWalk(k)
   while cwOccNext(ow) {
     const r = ow.row
-    if cwIxKind[r] == CW_OCC_USE {
-      const u = cwIxNode[r]
-      if !cwIxCovers(u) { return false }
-      const uk = cwIxUpKind[u]
-      if uk == CW_UP_LETINIT {
-        const c = nodeAt(cwIxUp[u])
-        if !(c is LetDecl) || c.letType < 0 { return false }
-        out.push(c.letType)
-      } else if uk != CW_UP_OBJ && uk != CW_UP_CMP && uk != CW_UP_IS {
-        return false
-      }
-    } else if cwIxKind[r] != CW_OCC_ASG && cwIxKind[r] != CW_OCC_BIND {
+    const kind = cwIxKind[r]
+    if kind == CW_OCC_USE {
+      if !exprDests(cwIxNode[r], path, out, paths, depth) { return false }
+    } else if kind != CW_OCC_ASG && kind != CW_OCC_BIND {
       return false
     }
   }
-  return out.length > 0
+  return true
+}
+
+// The destinations value `x` (at `path` below them) is delivered to by its consumer; false for a
+// consumer no rule places.
+function exprDests(
+  x: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+  depth: i32,
+): boolean {
+  if !cwIxCovers(x) { return false }
+  const uk = cwIxUpKind[x]
+  const up = cwIxUp[x]
+  if uk == CW_UP_OBJ || uk == CW_UP_CMP || uk == CW_UP_IS { return true }
+  if uk == CW_UP_LETINIT {
+    const c = nodeAt(up)
+    if !(c is LetDecl) { return false }
+    if c.letType >= 0 { return destPush(c.letType, path, out, paths) }
+    // An un-annotated alias delivers where its own uses do.
+    if c.letKw != "const" && recBindAssigned(cwKeyOfDecl(up)) { return false }
+    return bindUseDests(up, path, out, paths, depth + 1)
+  }
+  if uk == CW_UP_ELEM {
+    return exprDests(up, destJoin("e", path), out, paths, depth + 1)
+  }
+  if uk == CW_UP_FIELD {
+    const fi = nodeAt(cwIxUpAux[x])
+    if !(fi is FieldInit) { return false }
+    return exprDests(
+      up,
+      destJoin("f:" + fi.fiName, path),
+      out,
+      paths,
+      depth + 1,
+    )
+  }
+  if uk == CW_UP_ARG {
+    const c = nodeAt(up)
+    if !(c is Call) || c.callFn < 0 || !(nodeAt(c.callFn) is Ident) {
+      return false
+    }
+    const fd = cwFnDeclAt(c.callFn)
+    const f = if fd >= 0 { nodeAt(fd) } else { null }
+    if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+    const a = cwIxUpAux[x]
+    if a < 0 || a >= f.fnParams.length { return false }
+    const pn = nodeAt(f.fnParams[a])
+    if !(pn is Param) || pn.parType < 0 || pn.parRest == 1 { return false }
+    return destPush(pn.parType, path, out, paths)
+  }
+  if uk == CW_UP_RET {
+    const f = destEnclosingFn(up)
+    if !(f is FuncDecl) || f.fnTyParams.length > 0 || f.fnRet < 0 {
+      return false
+    }
+    return destPush(f.fnRet, path, out, paths)
+  }
+  return false
+}
+
+function destPush(tr: i32, path: string, out: i32[], paths: string[]): boolean {
+  out.push(tr)
+  paths.push(path)
+  return true
+}
+
+function destJoin(step: string, path: string): string {
+  return if path == "" { step } else { step + "/" + path }
+}
+
+// The function declaration a `return` at `r` returns from, or null.
+function destEnclosingFn(r: i32): Node | null {
+  let x = r
+  let hops = 0
+  while x >= 0 && hops < 256 && cwIxCovers(x) {
+    const n = nodeAt(x)
+    if n is FuncDecl { return n }
+    x = cwIxParent[x]
+    hops = hops + 1
+  }
+  return null
+}
+
+// Whether node `x` is a bare `Map()`.
+function bindMapCtor(x: i32): boolean {
+  const n = nodeAt(x)
+  return n is Call && recMapCtorCall(n)
 }
 
 // Whether node `n` is a fresh literal a binding may hold at its destination's type.
