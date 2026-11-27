@@ -7553,6 +7553,9 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       return missRhs("argument count")
     }
     const starts: i32[] = []
+    // A hidden environment or captures are written ahead of the arguments, so no argument may leave
+    // a value on the stack under them: those are held in locals once all are built.
+    const leadsWritten = env || caps.length > 0
     let i = 0
     while i < cargs.length {
       const at = b.length
@@ -7640,7 +7643,7 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         false,
       ) } else if fu >= 0 && nodeAt(unwrapParen(cargs[i])) is NullLit { boxTempIn(b, { oiRep: ibNoValue, oiBits: 0 }, cargs[i], pr, -1, fu) } else { deliver(b, cargs[i], pr, fu) }
       if ibMiss != "" { return missRhs("argument") }
-      if i > 0 && !irBStageLeads(b, at, starts, args, cargs) {
+      if i > 0 && !leadsWritten && !irBStageLeads(b, at, starts, args, cargs) {
         return missRhs("short-circuit argument after another")
       }
       // A value its parameter takes as it stands or retagged is converted first (`irConvert`).
@@ -7653,6 +7656,9 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       if ibMiss != "" { return missRhs(ibMiss) }
       args.push(fa)
       i = i + 1
+    }
+    if leadsWritten && !holdCallOperands(b, starts, args, cargs) {
+      return missRhs("short-circuit argument after a capture")
     }
   }
   const r: Rhs = {
@@ -8888,6 +8894,46 @@ function irBStageOperands(
     j = j + 1
   }
   return true
+}
+
+// A call's arguments `args`, each built into `b` from `starts[j]`, where the call writes its own
+// leads first: the first argument holding a statement is held in a local, and later ones spilled
+// and held by `irBStageOperands`, so none leaves a value on the stack under those leads.
+function holdCallOperands(
+  b: i32[],
+  starts: i32[],
+  args: Opnd[],
+  ixs: i32[],
+): boolean {
+  if args.length == 0 || !ifBelowLeadHas(b, starts[0], b.length) { return true }
+  const end0 = if starts.length > 1 { starts[1] } else { b.length }
+  if ifBelowLeadHas(b, starts[0], end0) {
+    if (
+      !heldOperand(
+        b,
+        end0,
+        args,
+        ixs,
+        0,
+        "short-circuit argument after a capture",
+      )
+    ) {
+      return false
+    }
+    let k = 1
+    while k < starts.length {
+      starts[k] = starts[k] + 1
+      k = k + 1
+    }
+  }
+  return irBStageOperands(
+    b,
+    starts,
+    args,
+    ixs,
+    false,
+    "short-circuit argument after a capture",
+  )
 }
 
 // Where operand start `id` (its first node, or -1 for the end) stands in `b` now.
