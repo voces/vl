@@ -7185,6 +7185,8 @@ function elabResultScanReset() {
   elabLamProducers = []
   elabLamProducerAt = []
   elabFnWraps = Map()
+  elabGenReads = []
+  elabGenReadAt = []
   elabResPlainCalls = Map()
   elabAnyRetRecord = false
   elabArgRecs = Map()
@@ -7758,6 +7760,7 @@ function elabSlotRecordNote(c: i32) {
   // A hole lambda written into the slot is built as the record at its signatures (D17572).
   const lams: i32[] = []
   const wraps: i32[] = []
+  const gens: i32[] = []
   for v0 in vals {
     const lv = parenPeelIx(v0)
     const ln = if lv >= 0 && lv < P.nodes.length { nodeAt(lv) } else { null }
@@ -7774,6 +7777,11 @@ function elabSlotRecordNote(c: i32) {
     // its other members unreachable (D17700).
     if elabWrapFnOf(lv, rec) >= 0 {
       wraps.push(lv)
+      continue
+    }
+    // A named generic or hole-parameter function is instanced at each of the record's signatures.
+    if elabGenReadFnOf(lv) {
+      gens.push(lv)
       continue
     }
     const v = elabSlotValueCall(v0)
@@ -7938,7 +7946,11 @@ function elabSlotRecordNote(c: i32) {
   elabAnyRetRecord = true
   for v in vals {
     const pv = parenPeelIx(v)
-    if !i32ListHas(lams, pv) && !i32ListHas(wraps, pv) {
+    if (
+      !i32ListHas(lams, pv)
+      && !i32ListHas(wraps, pv)
+      && !i32ListHas(gens, pv)
+    ) {
       elabTriplePut(elabResKeeps, elabSlotValueCall(v), -1, 1)
     }
   }
@@ -7947,6 +7959,14 @@ function elabSlotRecordNote(c: i32) {
     elabLamProducerAt.push(at)
   }
   for w in wraps { elabFnWraps[w] = at }
+  for gr in gens {
+    elabGenReads.push(gr)
+    elabGenReadAt.push(at)
+    for sg in rec {
+      const sf = tyAt(sg)
+      if sf is TyFunc { elabEnqueueAtParams(identDeclOf(gr), sf.fnParamTypes) }
+    }
+  }
   for h in linked {
     elabHolderPut(h, -1, at)
     for t in elabResThrough.get(h) ?? [] {
@@ -9453,6 +9473,38 @@ let elabFnWraps: {[i32]: i32} = Map()
 export function elabFnWrapSigs(x: i32): i32[] {
   const r = elabFnWraps.get(nodeSrc[x] ?? x) ?? -1
   return if r >= 0 && r < elabRecTable.length { elabRecTable[r] } else { [] }
+}
+
+// Per read of a named generic or hole-parameter function stored into a slot holding a record, that
+// record (`elabRecTable`), each signature an instance of the function.
+let elabGenReads: i32[] = []
+let elabGenReadAt: i32[] = []
+
+// The record signatures named function read `x` is built as, one instance per signature; none for
+// any other node.
+export function elabGenReadSigs(x: i32): i32[] {
+  const at = i32ListIndexOf(elabGenReads, nodeSrc[x] ?? x)
+  const r = if at >= 0 { elabGenReadAt[at] } else { -1 }
+  return if r >= 0 && r < elabRecTable.length { elabRecTable[r] } else { [] }
+}
+
+// The reads `elabGenReadSigs` answers for, in noting order.
+export function elabGenReadList(): i32[] { return elabGenReads }
+
+// Whether `x` reads a named function in plain code that has type parameters or a hole parameter.
+function elabGenReadFnOf(x: i32): boolean {
+  if (
+    x < 0
+    || x >= P.nodes.length
+    || !(nodeAt(x) is Ident)
+    || !elabInPlainCode(x)
+  ) {
+    return false
+  }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) || dn.fnName == "" { return false }
+  return dn.fnTyParams.length > 0 || elabDeclHasHoleParam(d)
 }
 
 // The member of record `rec` named function read `x`'s closed signature is, where `x` names an
