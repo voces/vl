@@ -4185,7 +4185,9 @@ export function recLitPlaceBuiltTy(p: i32): i32 {
   // A list literal bound where its one read is delivered is delivered there: at a list of its
   // records with function fields closed, it is built there (D15900).
   const lit = p >= 0 && p < P.nodes.length && nodeAt(p) is ArrayLit
-  const q = if lit { recSoleReadOfInit(p, 0) } else { p }
+  const q0 = if lit { recSoleReadOfInit(p, 0) } else { p }
+  // So is one an un-annotated function returns as its only value, delivered where its one call is.
+  const q = if lit && q0 == p { recRetSoleCall(p) } else { q0 }
   const qd = if q != p { nodeCtxTyIxOf(q) } else { -1 }
   if qd >= 0 && recListFnFieldsWiden(nodeTyIxOf(p), qd) { return qd }
   const init = recAsgBindInit(q)
@@ -4554,6 +4556,54 @@ function recSoleReadOfInit(p: i32, depth: i32): i32 {
   tailValueLeaves(x, leaves)
   if !i32ListHas(leaves, p) { return p }
   return recSoleReadOfInit(u, depth + 1)
+}
+
+// The one call of the un-annotated function whose only returned value is `p`, where that call
+// initialises an annotated binding; else `p`.
+export function recRetSoleCall(p: i32): i32 {
+  cwIxBuild()
+  // A node minted past the index (an instance's copy) has no column to read.
+  if p < 0 || p >= cwIxCoveredLen() { return p }
+  const uk = cwIxUpKind[p]
+  if uk != CW_UP_RET && uk != CW_UP_TAIL { return p }
+  const fd = recEnclosingFn(p)
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnTyParams.length > 0 { return p }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length != 1 || cwPeelValue(leaves[0]) != p { return p }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length != 1 || sites[0] % 2 != 0 {
+    return p
+  }
+  // Only an annotated binding's initialiser names a build of its own.
+  const c = sites[0] / 2
+  if c < 0 || c >= cwIxCoveredLen() || cwIxUpKind[c] != CW_UP_LETINIT {
+    return p
+  }
+  const b = cwIxUp[c]
+  const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { null }
+  return if bn is LetDecl && bn.letType >= 0 { c } else { p }
+}
+
+// The list literal call `c` returns where `c` is the one call of an un-annotated function
+// returning only it (`recRetSoleCall`), or -1.
+export function recRetLitOfSoleCall(c: i32): i32 {
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if (
+    !(cn is Call)
+    || cn.callFn < 0
+    || cn.callFn >= P.nodes.length
+    || !(nodeAt(cn.callFn) is Ident)
+  ) {
+    return -1
+  }
+  const fd = identFnDeclOf(cn.callFn)
+  if fd < 0 || !(nodeAt(fd) is FuncDecl) { return -1 }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length != 1 { return -1 }
+  const l = cwPeelValue(leaves[0])
+  if l < 0 || l >= P.nodes.length || !(nodeAt(l) is ArrayLit) { return -1 }
+  return if recRetSoleCall(l) == c { l } else { -1 }
 }
 
 // Whether list `w` is list `own` of records whose function fields `w`'s close (`recFnFieldsWiden`).
