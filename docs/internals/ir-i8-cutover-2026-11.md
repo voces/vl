@@ -259,7 +259,7 @@ graded by exit code and validity: 316 of the 26,238 programs the job covers.
 
 **Status: carried out by the I8 PR**, which cut over before 100% coverage (owner ruling,
 2026-11-26, DECISIONS.md): the programs still unclaimed are the holdouts,
-`scripts/ir-i8-census/holdouts.tsv`, and step 1's "newly failing programs at zero" became "every
+`scripts/ir-i8-census/holdouts/` (one file per program), and step 1's "newly failing programs at zero" became "every
 newly failing program is a holdout". The coordinator ruled on 2026-11-25 that this checklist be kept as a plan. The I8 PR carries it out
 in one pass, in this order. Each step is one commit, and each commit is one mechanism.
 
