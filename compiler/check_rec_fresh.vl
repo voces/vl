@@ -43,6 +43,7 @@ import {
   CW_OCC_BIND,
   CW_OCC_USE,
   CW_UP_ARG,
+  CW_UP_ASG_RHS,
   CW_UP_CMP,
   CW_UP_ELEM,
   CW_UP_FIELD,
@@ -531,7 +532,9 @@ function exprDests(
     }
     const fd = cwFnDeclAt(c.callFn)
     const f = if fd >= 0 { nodeAt(fd) } else { null }
-    if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+    if !(f is FuncDecl) { return false }
+    // A generic parameter takes the argument at whatever it is: no destination of its own.
+    if f.fnTyParams.length > 0 { return true }
     const a = cwIxUpAux[x]
     if a < 0 || a >= f.fnParams.length { return false }
     const pn = nodeAt(f.fnParams[a])
@@ -539,13 +542,44 @@ function exprDests(
     return destPush(pn.parType, path, out, paths)
   }
   if uk == CW_UP_RET {
-    const f = destEnclosingFn(up)
-    if !(f is FuncDecl) || f.fnTyParams.length > 0 || f.fnRet < 0 {
-      return false
+    const fi = destEnclosingFn(up)
+    const f = if fi >= 0 { nodeAt(fi) } else { null }
+    if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+    if f.fnRet >= 0 { return destPush(f.fnRet, path, out, paths) }
+    // An inferred result is delivered where each call of the function is.
+    const sites: i32[] = []
+    if rcwCallSites(fi, sites) >= 0 { return false }
+    for e in sites {
+      const call = if e % 2 == 0 { cwIxUp[e / 2] } else { e / 2 }
+      if !exprDests(call, path, out, paths, depth + 1) { return false }
     }
-    return destPush(f.fnRet, path, out, paths)
+    return true
   }
+  if uk == CW_UP_ASG_RHS { return storeDests(up, path, out, paths, depth) }
   return false
+}
+
+// The destinations of the value assignment `at` stores into an element of a fresh container
+// binding (`c[k] = v`): that container's, at its element; false for any other assignment.
+function storeDests(
+  at: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+  depth: i32,
+): boolean {
+  const a = nodeAt(at)
+  if !(a is BinExpr) || a.binOp != "=" { return false }
+  const lhs = nodeAt(parenPeelIx(a.binLeft))
+  if !(lhs is Index) { return false }
+  const ri = parenPeelIx(lhs.idxArr)
+  if ri < 0 || !(nodeAt(ri) is Ident) { return false }
+  const cd = identDeclOf(ri)
+  if !bindHoldsFresh(cd) { return false }
+  const cn = nodeAt(cd)
+  if !(cn is LetDecl) { return false }
+  const step = if bindMapCtor(parenPeelIx(cn.letInit)) { "v" } else { "e" }
+  return bindUseDests(cd, destJoin(step, path), out, paths, depth + 1)
 }
 
 function destPush(tr: i32, path: string, out: i32[], paths: string[]): boolean {
@@ -558,17 +592,16 @@ function destJoin(step: string, path: string): string {
   return if path == "" { step } else { step + "/" + path }
 }
 
-// The function declaration a `return` at `r` returns from, or null.
-function destEnclosingFn(r: i32): Node | null {
+// The function declaration a `return` at `r` returns from, or -1.
+function destEnclosingFn(r: i32): i32 {
   let x = r
   let hops = 0
   while x >= 0 && hops < 256 && cwIxCovers(x) {
-    const n = nodeAt(x)
-    if n is FuncDecl { return n }
+    if nodeAt(x) is FuncDecl { return x }
     x = cwIxParent[x]
     hops = hops + 1
   }
-  return null
+  return -1
 }
 
 // Whether node `x` is a bare `Map()`.
