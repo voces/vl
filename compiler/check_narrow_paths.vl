@@ -88,6 +88,11 @@ import {
   crRows,
 } from "./check_capture_rows"
 import {
+  crFnWriteBuilt,
+  crFnWriteKeys,
+  crFnWriteSids,
+  crFnWriteWalk,
+  crKeyHit,
   crNoSlots,
   crOpOf,
   crwEnsure,
@@ -107,8 +112,14 @@ import {
 } from "./check_capture_walks"
 import { cwKeyOfDecl, cwPeel, fnDeclIx } from "./check_write_scan"
 import { memberDeclOf, sidLookup } from "./symbols"
-import { calleeNameOf } from "./check_callee"
-import { weUnresDrop } from "./check_write_effects"
+import { callFnValueDecls, calleeNameOf, opSiteDecls } from "./check_callee"
+import {
+  fnWriteFreePaths,
+  weCallDeclFnIx,
+  wePartTextOf,
+  weSummaryUnsettled,
+  weUnresDrop,
+} from "./check_write_effects"
 import { hdReadNullAsked, hdRowOf } from "./check_hole_pins"
 import { curFnDeclIx, inferQuiet } from "./check_cursor"
 import { noteMemCstr } from "./check_cstr_rows"
@@ -672,13 +683,51 @@ export function crCallReaches(callIx: i32, s: i32): boolean {
 }
 
 // A module binding narrowed inside a function can be written by any function of the program,
-// so the reachability rule is asked again with the whole module as the root (D2401).
+// so a call reaches it when a function it may run writes the name (`fnWriteFreePaths`, D2401).
+// An opaque callee, or a function value whose targets are unknown, may write it.
 function crGlobalReaches(callIx: i32, s: i32): boolean {
   if !crNameIsGlobal(s) { return false }
-  crRows.fnRoots.push(crRows.progRoot)
-  const r = crCallReachesInRoot(callIx, s)
-  crRows.fnRoots.pop()
-  return r
+  if callIx < 0 || callIx >= P.nodes.length { return false }
+  const nm = slotNameOf(s)
+  const cn = nodeAt(callIx)
+  if !(cn is Call) {
+    for x in opSiteDecls(callIx) {
+      if x < 0 || crFnWritesName(x, nm) { return true }
+    }
+    return false
+  }
+  const d = weCallDeclFnIx(cn, callIx)
+  if d >= 0 { return crFnWritesName(d, nm) }
+  if d == -2 {
+    for a in cn.callArgs {
+      if (
+        a >= 0
+        && a < P.nodes.length
+        && nodeAt(a) is FuncDecl
+        && crFnWritesName(a, nm)
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+  const ts = callFnValueDecls(cn)
+  if ts.length == 0 { return true }
+  for t in ts {
+    if crFnWritesName(t, nm) { return true }
+  }
+  return false
+}
+
+// Whether function `fnIx` may assign the free name `nm`, through its own body or a call.
+function crFnWritesName(fnIx: i32, nm: string): boolean {
+  if weSummaryUnsettled(fnIx) { return true }
+  const w = fnWriteFreePaths(fnIx)
+  if w.opaque { return true }
+  for p in w.parts {
+    if wePartTextOf(p) == nm { return true }
+  }
+  return false
 }
 
 // Whether slot `s`, under its narrowing layers, is declared outside every function body being
@@ -705,10 +754,12 @@ export function crMayBeWritten(s: i32): boolean {
   if declIsConst(s) { return false }
   if crInfoOf(s) > 0 { return true }
   if !crNameIsGlobal(s) { return false }
-  crRows.fnRoots.push(crRows.progRoot)
-  const info = crInfoOf(s)
-  crRows.fnRoots.pop()
-  return info > 0
+  crAskProg("w", s)
+  if !crFnWriteBuilt {
+    crFnWriteBuilt = true
+    crFnWriteWalk(crRows.progRoot, false)
+  }
+  return crKeyHit(crFnWriteKeys, crFnWriteSids, crSlotKey(s))
 }
 
 function crCallReachesInRoot(callIx: i32, s: i32): boolean {
