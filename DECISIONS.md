@@ -13484,3 +13484,18 @@ the sites move to it.
 
 Why: the owner's direction after I8 is to generalize the IR and the compiler. This takes a
 decision made at 240 places down to one, and makes the two converters unnecessary for most sets.
+
+## The first IR pass is local sinking; the seed is not run through wasm-opt (2026-11-27, coordinator ruling)
+
+COV-START measured binaryen's passes on the fixpoint seed (master ff4eea80). Nearly all of `-O`'s
+−10.6% L2 is the locals family: simplify-locals (mostly tee formation) plus coalesce-locals. The
+structural passes cost fuel, and constant folding and DCE are worth nothing on this code.
+
+Ruled:
+- **No interim `wasm-opt -O` on the working seed.** It would save about 10% guest work, but it
+  changes what "fixpoint" means in six scripts and every fuel baseline, and an IR locals pass
+  removes the same tax while also speeding up every VL program, not only the compiler.
+- **The first IR-to-IR pass is single-use local sinking, with tee formation, then copy
+  coalescing, then peepholes.** Before writing a pass, check whether the redundant locals come
+  from specific lowering patterns that could emit stack-friendly code directly. Where a lowering
+  fix is cheap it is the better answer.
