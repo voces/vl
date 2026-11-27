@@ -4207,16 +4207,6 @@ function buildStorage(p: SpBinding, s: Storage): Storage {
   const d = p.spBinding
   const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(n is LetDecl) || n.letInit < 0 { return s }
-  // A call is built at its callee's result, so a `const` of one is held there.
-  if (
-    s.stMiss == ""
-    && n.letKw == "const"
-    && !p.spGlobal
-    && p.spFrame == ibFnIx
-  ) {
-    const cs = callBuildStorage(n.letInit, s)
-    if cs.stMiss == "" { return cs }
-  }
   // A `let` holds every value written to it, so only a missing answer is its build's.
   if s.stMiss == "" && (n.letKw != "const" || !irTyHeldOpen(s.stTy, s.stRep)) {
     return s
@@ -4227,45 +4217,6 @@ function buildStorage(p: SpBinding, s: Storage): Storage {
     return s
   }
   return storageAt(rep, ty, -2)
-}
-
-// The storage of a direct call `x`'s result where it is a list the answer `s` takes by
-// no `irConvert` case: the callee's result rep, which the call is built at; else a miss.
-function callBuildStorage(x: i32, s: Storage): Storage {
-  // An instance's locals share the template's wasm locals, so a generic body keeps one storage.
-  if fnInPinnedInstance(ibFnIx) || fnInMonoInstance(ibFnIx) {
-    return storageMiss("instance body")
-  }
-  const u = unwrapParen(x)
-  const c = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
-  if !(c is Call) { return storageMiss("not a call") }
-  const f = if c.callFn >= 0 && c.callFn < P.nodes.length { nodeAt(c.callFn) } else { null }
-  const d = if f is Ident { identDeclOf(c.callFn) } else { -1 }
-  if !(f is Ident) || d < 0 || !(nodeAt(d) is FuncDecl) {
-    return storageMiss("not a direct call")
-  }
-  const pos = userFnCallTarget(c, f, ibFnIx)
-  const fd = if pos >= 0 && pos < fnStmts.length { fnStmts[pos] } else { -1 }
-  const fn = if fd >= 0 { nodeAt(fd) } else { null }
-  const rt = if fn is FuncDecl { resultTy(pos, fn.fnRet, fd) } else { -1 }
-  const sr = if rt >= 0 && !isVoidTy(rt) { repNodeOfTy(rt) } else { -1 }
-  if sr < 0 || sr == s.stRep || repStoresAs(s.stRep, sr) {
-    return storageMiss("call result")
-  }
-  if !(repNodeAt(sr) is RList) { return storageMiss("call result") }
-  const v: Opnd = { oiRep: sr, oiBits: 0 }
-  if convertKindOf(v, s.stRep, s.stTy, u) >= 0 {
-    return storageMiss("call result")
-  }
-  return storageAt(sr, rt, -2)
-}
-
-// Whether variable `v` of declaration `d` is a `const` held at its call's result.
-function callHeldVar(d: i32, v: i32): boolean {
-  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  if !(n is LetDecl) || n.letKw != "const" || n.letInit < 0 { return false }
-  const cs = callBuildStorage(n.letInit, localStorage(d))
-  return cs.stMiss == "" && cs.stRep == ib.irVars[v].vRep
 }
 
 // The type initializer `x` builds: a non-empty list literal whose elements share one type is a
@@ -4562,15 +4513,49 @@ function declRowLetTy(d: i32, rep: i32): i32 {
 }
 
 // Whether local `v`, declared at `d` and not yet used, takes its initializer's rep `built` as its
-// storage row, the D14434 binding column's (`letBindTy`), as legacy's cell does; `v` is retyped.
+// storage: the D14434 binding column's row (`letBindTy`), as legacy's cell does, or a list a
+// `const` is held at as built (`builtHeldTy`); `v` is retyped.
 function localStoredAt(v: i32, d: i32, built: i32): boolean {
   const bt = heldTy(letBindTy(d, ibFnIx))
-  const st = if bt >= 0 && repNodeOfTy(bt) == built { bt } else { localSlotRecordTy(d, built) }
+  const st0 = if bt >= 0 && repNodeOfTy(bt) == built { bt } else { localSlotRecordTy(d, built) }
+  const st = if st0 >= 0 { st0 } else { builtHeldTy(v, d, built) }
   if st < 0 { return false }
   ib.irVars[v].vRep = built
   ib.irVars[v].vTy = st
   ibDeclRowSeen = true
   return true
+}
+
+// The type a `const` `d` is held at where its initializer is built as a list at `built` that its
+// variable `v`'s rep takes by no `irConvert` case: a value that cannot be rebuilt at the binding,
+// so the binding is its build. -1 otherwise, or inside an instance, whose locals the template's share.
+function builtHeldTy(v: i32, d: i32, built: i32): i32 {
+  if v < 0 || v >= ib.irVars.length { return -1 }
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(n is LetDecl) || n.letKw != "const" || !(repNodeAt(built) is RList) {
+    return -1
+  }
+  if fnInPinnedInstance(ibFnIx) || fnInMonoInstance(ibFnIx) { return -1 }
+  const o: Opnd = { oiRep: built, oiBits: 0 }
+  if convertKindOf(o, ib.irVars[v].vRep, ib.irVars[v].vTy, n.letInit) >= 0 {
+    return -1
+  }
+  const t = repTyOf(built)
+  return if t >= 0 && !irTyHeldOpen(t, built) { t } else { -1 }
+}
+
+// Whether `const` `d`'s variable `v` is held at its build (`builtHeldTy`), its type's rep not its own.
+function builtHeldVar(d: i32, v: i32): boolean {
+  if v < 0 || v >= ib.irVars.length { return false }
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(n is LetDecl)
+    || n.letKw != "const"
+    || !(repNodeAt(ib.irVars[v].vRep) is RList)
+  ) {
+    return false
+  }
+  return repNodeOfTy(heldTy(scopeTyAt(d, ibFnIx))) != ib.irVars[v].vRep
 }
 
 // Whether local `v`, not yet used, takes record value `o` laid out at its struct row (`irOpRow`)
@@ -6869,8 +6854,8 @@ function narrowedLocalRead(
   if rowlessReadTyOfVar(ix, v) == ib.irVars[v].vTy { return o }
   // A map local held at its slot's map (`slotMapHeldTy`) reads as it is stored.
   if slotMapHeldVar(identDeclOf(ix), v) { return o }
-  // So does a `const` held at the result its call is built at (`callBuildStorage`).
-  if callHeldVar(identDeclOf(ix), v) { return o }
+  // So does a `const` held at its build (`builtHeldTy`).
+  if builtHeldVar(identDeclOf(ix), v) { return o }
   // A nullable record local held at a row its narrowed read's record does not record reads past
   // its null at that row.
   const pn = storedPastNullTy(ix, v, rep)
