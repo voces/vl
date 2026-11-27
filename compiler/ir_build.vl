@@ -4051,6 +4051,13 @@ function buildStorage(p: SpBinding, s: Storage): Storage {
   const d = p.spBinding
   const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(n is LetDecl) || n.letInit < 0 { return s }
+  // A list of calls whose results share one record rep is held at a list of that rep, the results
+  // as they stand (D17677).
+  const cr = if n.letKw == "const" { callListElemRep(unwrapParen(n.letInit)) } else { -1 }
+  const ct = if cr >= 0 { listTyOfElem(repTyOf(cr)) } else { -1 }
+  const cl = if ct >= 0 { repNodeOfTy(ct) } else { -1 }
+  const cn = if cl >= 0 { repNodeAt(cl) } else { null }
+  if cn is RList && cn.rlsElem == cr { return storageAt(cl, ct, -2) }
   // A `let` holds every value written to it, so only a missing answer is its build's.
   if s.stMiss == "" && (n.letKw != "const" || !irTyHeldOpen(s.stTy, s.stRep)) {
     return s
@@ -5908,6 +5915,8 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       }
       const so = globalStoredRead(b, g, ix, cellRep, sto.stTy)
       if ibMiss != "" { return so }
+      // A list of calls held at their results' list is read there by its index (D17677).
+      if callListHeld(ix) && ix == ibIdxRecvAt { return so }
       return irConvert(b, so, rep, heldTy(exprTyOf(ix)), ix)
     }
     if stored {
@@ -7044,6 +7053,8 @@ function globalStorage(d: i32): Storage {
   const r0 = globalTyRep(if ht >= 0 { ct } else { globalHeldTy(d) })
   const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, openCellRep(d, r0))) } else { r0 }
   if r < 0 { return storageMiss("global rep") }
+  const gn = nodeAt(d)
+  const iv = if ht < 0 && gn is LetDecl && gn.letInit >= 0 { nodeAt(unwrapParen(gn.letInit)) } else { null }
   // A list global whose storage row is another list, a wider record's, is held at that row.
   const bt = if ht < 0 && repNodeAt(r) is RList { heldTy(letBindTy(d, -1)) } else { -1 }
   const br = if bt >= 0 { globalTyRep(bt) } else { -1 }
@@ -7052,8 +7063,6 @@ function globalStorage(d: i32): Storage {
   }
   // So is a value `if` global of `null` and a read of a record the solve builds elsewhere, at that
   // build's nullable.
-  const gn = nodeAt(d)
-  const iv = if ht < 0 && gn is LetDecl && gn.letInit >= 0 { nodeAt(unwrapParen(gn.letInit)) } else { null }
   const nt = if iv is IfStmt { heldTy(letBindTy(d, -1)) } else { -1 }
   const nr = if nt >= 0 && !irTyOpen(nt) { globalTyRep(nt) } else { -1 }
   const nn = if nr >= 0 && nr != r { repNodeAt(nr) } else { null }
@@ -7061,6 +7070,81 @@ function globalStorage(d: i32): Storage {
     return storageAt(nr, nt, -1)
   }
   return storageAt(r, globalStoreTy(d, r), -1)
+}
+
+// The receiver an index read is building, or -1: a call-list global (`callListHeld`) is read there
+// at its storage.
+let ibIdxRecvAt = -1
+
+// Sets the receiver an index read is building to `x`, returning the one it replaces.
+export function idxRecvSwap(x: i32): i32 {
+  const r = ibIdxRecvAt
+  ibIdxRecvAt = x
+  return r
+}
+
+// Whether read `ix` names a `const` binding held at its calls' results' list (`callListElemRep`).
+export function callListHeld(ix: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is Ident) { return false }
+  const d = identDeclOf(u)
+  const dn = if d >= 0 { nodeAt(d) } else { null }
+  return dn is LetDecl
+    && dn.letKw == "const"
+    && dn.letInit >= 0
+    && callListElemRep(unwrapParen(dn.letInit)) >= 0
+}
+
+// The struct row every call's result in read `ix`'s call-list binding (`callListHeld`) is laid out
+// at, or -1 where they share none.
+export function callListRow(ix: i32): i32 {
+  if !callListHeld(ix) { return -1 }
+  const dn = nodeAt(identDeclOf(unwrapParen(ix)))
+  if !(dn is LetDecl) { return -1 }
+  const n = nodeAt(unwrapParen(dn.letInit))
+  if !(n is ArrayLit) { return -1 }
+  let one = -1
+  for e in n.arrElems {
+    const row = calleeResultRow(callPosOf(unwrapParen(e)))
+    if row < 0 || one >= 0 && row != one { return -1 }
+    one = row
+  }
+  return one
+}
+
+// The `fnStmts` slot a direct call `ix` of a declared function resolves to, or -1.
+function callPosOf(ix: i32): i32 {
+  const c = nodeAt(ix)
+  if !(c is Call) { return -1 }
+  const cf = if c.callFn >= 0 { nodeAt(c.callFn) } else { null }
+  const d = if cf is Ident { identDeclOf(c.callFn) } else { -1 }
+  return if cf is Ident && d >= 0 && nodeAt(d) is FuncDecl { userFnCallTarget(c, cf, ibFnIx) } else { -1 }
+}
+
+// Whether list literal `ix` of calls is built at list `rep`, whose element is its calls' one rep.
+function callListAt(ix: i32, rep: i32): boolean {
+  const ln = repNodeAt(rep)
+  const cr = callListElemRep(ix)
+  return cr >= 0 && ln is RList && ln.rlsElem == cr && exprRepOf(ix) != rep
+}
+
+// The one record rep every element of list literal `ix`, each a call, is built at; -1 for any other
+// literal. A maker's result is its record as it stands, so the list lays its elements out there.
+function callListElemRep(ix: i32): i32 {
+  const n = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+  if !(n is ArrayLit) || n.arrElems.length == 0 { return -1 }
+  let one = -1
+  for e in n.arrElems {
+    const c = nodeAt(unwrapParen(e))
+    if !(c is Call) { return -1 }
+    // The result rep the callee returns at, not the call's own type's.
+    const er = calleeResultRep(callPosOf(unwrapParen(e)))
+    if er < 0 || !(repNodeAt(er) is RRecord) || one >= 0 && er != one {
+      return -1
+    }
+    one = er
+  }
+  return one
 }
 
 // Global `d`'s cell where its type has no rep (a list whose element nothing fixes, a scalar read
@@ -7157,6 +7241,13 @@ function globalStoreTy(d: i32, rep: i32): i32 {
     && repTyOf(rep) >= 0
     && cellDeclStores(d, repNodeOfTy(ht), rep)
   ) {
+    return repTyOf(rep)
+  }
+  // So is a list of calls held at their results' list (D17677).
+  const gn = nodeAt(d)
+  const cr = if gn is LetDecl && gn.letKw == "const" && gn.letInit >= 0 && repNodeAt(rep) is RList { callListElemRep(unwrapParen(gn.letInit)) } else { -1 }
+  const rn = repNodeAt(rep)
+  if cr >= 0 && rn is RList && rn.rlsElem == cr && repTyOf(rep) >= 0 {
     return repTyOf(rep)
   }
   // A `Map()` cell held at its slot's map (`globalSlotMapTy`) is stored at that map.
@@ -7294,6 +7385,25 @@ function resultRep(pos: i32, ann: i32, d: i32): i32 {
   }
   const rt = resultTy(pos, ann, d)
   return if isVoidTy(rt) { repNodeOfTy(TY_NEVER) } else { repNodeOfTy(rt) }
+}
+
+// The result rep of the instance at `fnStmts` slot `pos` as a call to it returns, without
+// building one; -1 where it has none (a parameter or result with no value rep).
+export function calleeResultRep(pos: i32): i32 {
+  if !calleeSig(pos) { return -1 }
+  return ib.irSigRet[irSigOf(ib, pos)] ?? -1
+}
+
+// The struct row the instance at `fnStmts` slot `pos` lays its record result out at, where that
+// row's rep is the result's (`calleeResultRep`); -1 for none.
+export function calleeResultRow(pos: i32): i32 {
+  if pos < 0 || pos >= fRetKind.length || pos >= fRetStructIdx.length {
+    return -1
+  }
+  if fRetKind[pos] != "struct" { return -1 }
+  const si = fRetStructIdx[pos]
+  const rr = calleeResultRep(pos)
+  return if si >= 0 && rr >= 0 && rowRep(si) == rr { si } else { -1 }
 }
 
 // The parameter and result reps of `fnStmts` slot `pos`, noted in `ib`; false when one is not
@@ -21436,7 +21546,10 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   // record's, is built at that row, which the cell then stores, in the start body as in a constant.
   const bindRep = if noted < 0 { globalTyRep(letBindTy(gst, -1)) } else { -1 }
   const iu = unwrapParen(init)
-  const atBind = bindRep >= 0
+  // A list of calls held at their results' list is built there (D17677), not at the binding's row.
+  const atCalls = callListAt(iu, rep)
+  const atBind = !atCalls
+    && bindRep >= 0
     && bindRep != rep
     && repNodeAt(bindRep) is RList
     && iu >= 0
@@ -21450,6 +21563,13 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     bindRep,
     arrLitListBuild(iu, ibFnIx),
     heldTy(letBindTy(gst, -1)),
+  ) } else if atCalls { arrayLit(
+    b,
+    nodeAt(iu) as! ArrayLit,
+    iu,
+    rep,
+    arrLitListBuild(iu, ibFnIx),
+    repTyOf(rep),
   ) } else { deliver(b, init, rep, -1) }
   if ibMiss != "" { return d }
   // A record on the cell's own struct heap, or a declared subtype's, is stored retagged; so is a
