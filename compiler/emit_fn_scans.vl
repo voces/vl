@@ -55,7 +55,6 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
-  arithRegionSeen,
   callIsNever,
   isExprKid,
   nodeAt,
@@ -67,7 +66,6 @@ import {
   nodeEqCmpKind,
   nodeTyHasTyVar,
   nodeTyIsLitUnionAlias,
-  nodeTyIsMap,
   nodeTyIsNulLitUnion,
   nodeTyIxOf,
   nodeTyPrimName,
@@ -84,8 +82,6 @@ import {
   TyUnion,
   tyAt,
   tyIsLitUnion,
-  tyIsLitUnionOrLit,
-  tyIsNullableLitUnion,
   tyNulInnerTy,
   tyPrimNameOf,
 } from "./check_types"
@@ -107,16 +103,12 @@ import {
   catListKindOfExpr,
   catSameKind,
   catWidenSide,
-  cloCallSigKey,
   coalesceNicheJoinsToBox,
-  coalesceNulAtomToStr,
   exprF32Array,
   exprF64Array,
   exprI64Array,
   exprIsClosure,
   exprIsLitAtom,
-  exprIsStrConcat,
-  exprIsStrMethod,
   exprListRep,
   exprMap,
   exprNulClosure,
@@ -139,13 +131,9 @@ import {
   globalCellKind,
   globalLetOfRead,
   identIsEnvCapture,
-  ifJoinAtomMeetsString,
-  instanceReadTyOf,
   letBindIsAtom,
   listOpRepOf,
   localIndexOf,
-  luForWidensStr,
-  luIndexWidensStr,
   mapReadNarrowableSlot,
   mfRecvKindOf,
   nulVariantIdxOfExpr,
@@ -153,25 +141,17 @@ import {
   refListSlotOfExpr,
   stmtIsTailValue,
   structIndexOfExpr,
-  tyIsBareStrLit,
   unionArmKindRowsOfExpr,
   unionBoxTyIxOfExpr,
   unionNameOfExprRow,
   unionNameRowOfRead,
 } from "./emit_classify"
 import {
-  bcOpen,
-  bcSpineEnter,
-  bcSpineLeave,
-  sigParamTakesAtomStr,
-} from "./emit_closure_callee"
-import {
   LR_I32,
   LR_REF,
   LR_STR,
   eqRowOfVariant,
   eqgRepComparable,
-  retLitUnionInline,
   shapeHasCloField,
   unionArmsNeedCloEq,
 } from "./emit_eq_rows"
@@ -192,7 +172,6 @@ import {
   memberCallYieldsValue,
   nulScalarListBuildKind,
   retValueExitCount,
-  vtKindOfParam,
   vtKindOfType,
 } from "./emit_nullable_rets"
 import {
@@ -208,7 +187,6 @@ import {
   boxTagOfPrim,
   boxTagOfTy,
   msMemberValKindsOf,
-  nodeRepIs,
   nullValKind,
   rlElemKindAt,
   valueBoxOfTy,
@@ -216,7 +194,6 @@ import {
 import {
   coalesceChainLeftmost,
   coalesceResultIsBox,
-  coalesceResultUnionNameRow,
   unionDeclTyIxOfExpr,
   unionTyIxOfIdentAt,
 } from "./emit_start_block"
@@ -224,7 +201,6 @@ import {
   LBK_REF,
   RLK_I32_LIST,
   fRetKind,
-  fnStmts,
   fnUses,
   pkPushBit,
   rlElemTyIx,
@@ -251,12 +227,10 @@ import {
   msSetOfRow,
   msSetOfTy,
   msSetOfTyAny,
-  msSetTakesAtomAsStr,
   printNarrowKeepsBox,
   printNarrowLiveTys,
   printPlanNullPinned,
   printPlanPinNull,
-  tyDeclTakesAtomAsStr,
   tyTakesAtomAsStr,
   unRowHasMapArm,
   unionRowMemberCount,
@@ -570,118 +544,6 @@ function ifChainPushPopBits(ifIx: i32, fnIx: i32) {
   return bits
 }
 
-// A literal-union atom pushed into a `string[]` widens to its member string, which stages the
-// atom id in the string-op scratch frame — the emit's reservation side. The receiver test is
-// the list's element type and the value test is the value's rep, a pairing `emitPush`'s other
-// seeds do not make. Deliberately a superset: `(string | null)[]` takes an earlier arm.
-function pushWidensAtomToStr(callIx: i32, fnIx: i32) {
-  if gLitUnionUsed == 0 { return false }
-  const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return false }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      if callee.memProp == "push" {
-        if c.callArgs.length == 1 {
-          // A list of boxes that carry the atom as its string widens it the same way (D12466).
-          const re = tyStepElem(nodeTyAt(callee.memObj, fnIx))
-          const boxStr = re >= 0 && tyBoxTakesAtomAsStr(re)
-          if exprStringArray(callee.memObj, fnIx) || boxStr {
-            if exprIsLitAtom(c.callArgs[0], fnIx) { return true }
-          }
-        }
-      }
-    }
-  }
-  return false
-}
-
-// True if the `Call` at `callIx` passes a literal-union atom into a parameter that widens it to
-// a string — a `string` param, or a boxed union param with a litunion or `string` arm, whose
-// store lowers through `emitAtomToStr` exactly as the `string` param does. Over-approximating
-// only reserves a frame; with no atom argument nothing widens, so the callee is not resolved.
-function callWidensAtomToStr(callIx: i32, fnIx: i32) {
-  if gLitUnionUsed == 0 { return false }
-  const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return false }
-    if !argsHaveAtom(c.callArgs, fnIx) { return false }
-    const callee = nodeAt(c.callFn)
-    if callee is Ident {
-      const target = fnIndexOfNode(c.callFn)
-      if target >= 0 {
-        const cFn = nodeAt(fnStmts[target])
-        if cFn is FuncDecl {
-          const params = cFn.fnParams
-          let pi = 0
-          while pi < params.length {
-            if vtKindOfParam(params[pi]) == "str" { return true }
-            const pn = nodeAt(params[pi])
-            if pn is Param {
-              if tyDeclTakesAtomAsStr(nodeTyAt(params[pi], fnStmts[target])) {
-                return true
-              }
-            }
-            pi = pi + 1
-          }
-        }
-      }
-    }
-    // A function-value callee has no `FuncDecl` to read its parameters off, so the kinds come
-    // from the resolved `$fnsig` key — the same byte `emitCallRef`'s widening arm reads, so the
-    // scan and the handler cannot disagree about which positions widen. Without this leg the
-    // widening writes to a local the vector never declared.
-    const vkey = cloCallSigKey(callIx, fnIx)
-    if vkey != "" {
-      let vp = 0
-      while vp < c.callArgs.length {
-        // A box parameter may hold the atom as its string arm; the key names no union, so
-        // the frame is reserved for any box parameter.
-        if sigParamTakesAtomStr(vkey, vp) { return true }
-        vp = vp + 1
-      }
-    }
-  }
-  return false
-}
-
-// Is any of `args` a literal-union atom?
-function argsHaveAtom(args: i32[], fnIx: i32): boolean {
-  for a in args {
-    if exprIsLitAtom(a, fnIx) { return true }
-  }
-  return false
-}
-
-// True if the assignment at `binIx` writes a literal-union atom into a target that widens it to
-// a string — a `string`-typed lvalue, which `exprString` covers for a local, global or field
-// alike, or a boxed union lvalue with a litunion or `string` arm. Either way the atom widens to
-// its member string, riding the string-op scratch frame.
-function assignWidensAtomToStr(binIx: i32, fnIx: i32) {
-  if gLitUnionUsed == 0 { return false }
-  const a = nodeAt(binIx)
-  if a is BinExpr {
-    if a.binOp == "=" {
-      if exprIsLitAtom(a.binRight, fnIx) {
-        if exprString(a.binLeft, fnIx) { return true }
-        // The target's declared members keep a literal-union alias whole; its canonical ones
-        // reach an alias arm at any depth (D4041).
-        if tyDeclTakesAtomAsStr(nodeTyAt(a.binLeft, fnIx)) { return true }
-        if tyTakesAtomAsStr(nodeTyAt(a.binLeft, fnIx)) { return true }
-        // A string-valued map target (`m["k"] = <atom>`): `exprString`'s `Index` arm asks
-        // `exprStringArray(idxArr)`, which declines for a map receiver, so neither test above
-        // fires and the string-op scratch frame goes unreserved for the widen
-        // `emitMapSetValExpr` performs. Without it the string-op frame aliases `mapScratchBase`.
-        const at = nodeAt(unwrapParen(a.binLeft))
-        if at is Index {
-          if nodeTyIsMap(at.idxArr) { return true }
-        }
-      }
-    }
-  }
-  return false
-}
-
 // True if `initIx` is a literal-union atom read in a global initializer — an `Ident`
 // referencing another module global whose declared type is a literal union, or a call
 // returning a litunion alias. Gates the start function's `string`-global widening and its
@@ -725,152 +587,6 @@ export function globalInitWidensAtomToStr(letIx: i32) {
   return false
 }
 
-// True if the binding at `letIx` is annotated with a target that widens a literal-union atom
-// initializer to its member string, riding the string-op scratch frame: `: string`, a boxed
-// union with a litunion or `string` arm, and the array of one, whose literal elements each take
-// the same store. The array leg covers the element position `exprHasStrOp`'s ArrayLit arm misses.
-function letWidensAtomToStr(letIx: i32, fnIx: i32) {
-  if gLitUnionUsed == 0 { return false }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    // A binding with no initializer (a loop value's result binding) widens nothing here.
-    if d.letType >= 0 && d.letInit >= 0 {
-      // A lone literal annotation (`: "ww"`) reps as its string too.
-      const lt = nodeTyIxOf(d.letType)
-      if tyTakesAtomAsStr(lt) || tyIsBareStrLit(lt) {
-        if exprIsLitAtom(d.letInit, fnIx) { return true }
-      }
-      // A list annotation whose element union holds the atom as its string.
-      const elTy = tyStepElem(nodeTyIxOf(d.letType))
-      if elTy >= 0 && tyAt(elTy) is TyUnion && tyTakesAtomAsStr(elTy) {
-        if arrLitHasAtomElem(d.letInit, fnIx) { return true }
-      }
-    }
-  }
-  return false
-}
-
-// True if the expression at `ix` is an array literal with at least one literal-union atom
-// element. The element-position half of `letWidensAtomToStr`.
-function arrLitHasAtomElem(ix: i32, fnIx: i32) {
-  if ix < 0 { return false }
-  const e = nodeAt(unwrapParen(ix))
-  if e is ArrayLit {
-    const elems = e.arrElems
-    let i = 0
-    while i < elems.length {
-      if exprIsLitAtom(elems[i], fnIx) { return true }
-      i = i + 1
-    }
-  }
-  return false
-}
-
-// True if `retArgIx` is a literal-union atom returned from a function whose return type widens
-// it to a string — `string`, or a boxed union with a litunion or `string` arm. It widens at the
-// return, riding the string-op scratch frame. An inline literal-union return reps as a string
-// ref and so widens an atom operand; a named alias reps as the atom itself and must not.
-function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
-  if gLitUnionUsed == 0 { return false }
-  if retArgIx < 0 { return false }
-  if fnIx < 0 { return false }
-  const fn = nodeAt(fnIx)
-  if fn is FuncDecl {
-    if tyTakesAtomAsStr(nodeTyIxOf(fn.fnRet)) {
-      if exprIsLitAtom(retArgIx, fnIx) { return true }
-    }
-    // The inline literal-union return, mirroring the arm of the same name in
-    // `emitReturnValue`'s widen ladder. This is a reservation pass and that is an emit pass,
-    // and the two must claim the same set arm for arm, or the widen runs against unreserved
-    // locals. Reachable only through a monomorphized instance, whose element read is an atom.
-    if retLitUnionInline(fn.fnRet, fnIx) {
-      if exprIsLitAtom(retArgIx, fnIx) { return true }
-    }
-    // A lone string literal result is a string value, mirroring that ladder's arm (D7445).
-    if fn.fnRet >= 0 && tyIsBareStrLit(nodeTyIxOf(fn.fnRet)) {
-      if exprIsLitAtom(retArgIx, fnIx) { return true }
-    }
-    // The inferred-string dual, mirroring `emitReturnValue`'s widen: an un-annotated function
-    // whose recorded return is `string` — one path returning a member literal, another the
-    // atom — widens an atom return too, so reserve the frame.
-    if fn.fnRet < 0 && cloRetIsString(fnStmtsPosOf(fnIx)) {
-      if exprIsLitAtom(retArgIx, fnIx) { return true }
-    }
-    // An inferred union return holding the atom as its string (`K|i32`, D2952).
-    if (
-      fn.fnRet < 0
-      && tyTakesAtomAsStr(inferRetTyIxOf(inferRetFnKey(fnIx, fn.fnName)))
-    ) {
-      if exprIsLitAtom(retArgIx, fnIx) { return true }
-    }
-  }
-  return false
-}
-
-// The implicit-return twin of `retWidensAtomToStr`, and the reason the pair exists: a VL
-// function's value is its last statement, so `emitFuncBody` routes that statement through
-// `emitReturnExit` or `emitIfTail` and both reach the same `emitReturnValue` widen. The
-// reservation scan has to ask the atom-widening question in tail position too.
-function fnTailWidensAtomToStr(fnIx: i32) {
-  if gLitUnionUsed == 0 { return false }
-  if fnIx < 0 { return false }
-  const fn = nodeAt(fnIx)
-  if fn is FuncDecl {
-    const hit = tailBlockWidensAtomToStr(fn.fnBody, fnIx)
-    return hit
-  }
-  return false
-}
-
-// Mirrors `emitStmtsTail`: every statement but the last is an ordinary statement, walked here
-// only for the post-guard narrowing the tail value is classified under, exactly as the emit
-// loop does, and the last one is the block's value.
-function tailBlockWidensAtomToStr(blockIx: i32, fnIx: i32) {
-  if blockIx < 0 { return false }
-  const b = nodeAt(blockIx)
-  if b is Block {
-    const stmts = b.blkStmts
-    const n = stmts.length
-    if n == 0 { return false }
-    let i = 0
-    while i < n - 1 { i = i + 1 }
-    return tailStmtWidensAtomToStr(stmts[n - 1], fnIx)
-  }
-  return false
-}
-
-// Mirrors `emitStmtTail`: a tail `if` whose arms yield values recurses into both arms under the
-// same narrowing `emitIfTail` applies, an `else if` being a lone nested `IfStmt` still in tail
-// position; any other tail value statement widens exactly like a `return` of it.
-function tailStmtWidensAtomToStr(stmtIx: i32, fnIx: i32) {
-  if nodeAt(stmtIx) is IfStmt {
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990)..
-    let hit = false
-    let cur = stmtIx
-    while cur >= 0 {
-      const s = nodeAt(cur)
-      const at = cur
-      cur = -1
-      if s is IfStmt {
-        if lastStmtIsValueIf(at, fnIx) || elseLessNullableTail(at, fnIx) {
-          const hitThen = tailBlockWidensAtomToStr(s.ifThen, fnIx)
-          if hitThen {
-            hit = true
-          } else if s.ifElse >= 0 {
-            const els = nodeAt(s.ifElse)
-            if els is Block { hit = tailBlockWidensAtomToStr(s.ifElse, fnIx) }
-            else if els is IfStmt { cur = s.ifElse }
-            else { hit = tailStmtWidensAtomToStr(s.ifElse, fnIx) }
-          }
-        }
-      }
-    }
-    return hit
-  }
-  if !stmtIsTailValue(stmtIx, fnIx) { return false }
-  return retWidensAtomToStr(stmtIx, fnIx)
-}
-
 // True if `binIx` is `==`/`!=` whose operands are strings (string value-equality).
 export function exprIsStrEq(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
@@ -910,40 +626,6 @@ export function exprIsStrOrder(binIx: i32, fnIx: i32) {
 function strOrderOperandIsText(ix: i32, fnIx: i32) {
   if exprString(ix, fnIx) { return true }
   return exprIsLitAtom(ix, fnIx)
-}
-
-// True if `binIx` is a `==` or `!=` whose union-box value compare can hit the string arm — a
-// box compared against a string operand, or two boxes whose shared arms include `string`.
-// Those payload compares stage their operands in the string scratch frame, so it must be
-// reserved.
-function exprIsUnionStrEq(binIx: i32, fnIx: i32) {
-  const e = nodeAt(binIx)
-  if e is BinExpr {
-    if (e.binOp == "==" || e.binOp == "!=") && e.binIdent == 0 {
-      const lU = exprUnion(e.binLeft, fnIx)
-      const rU = exprUnion(e.binRight, fnIx)
-      if lU && rU {
-        return msSetHasPrimKind(
-          msSetOfTy(nodeTyAt(unwrapParen(e.binLeft), fnIx)),
-          2,
-        )
-          && msSetHasPrimKind(
-          msSetOfTy(nodeTyAt(unwrapParen(e.binRight), fnIx)),
-          2,
-        )
-      }
-      // A literal-union atom operand reaches the box's string arm too, by widening to its
-      // member string, which stages the id in this very frame. The handler and this scan have
-      // to claim the same operands or the frame is unreserved under a `local.set`.
-      if lU {
-        return exprString(e.binRight, fnIx) || exprIsLitAtom(e.binRight, fnIx)
-      }
-      if rU {
-        return exprString(e.binLeft, fnIx) || exprIsLitAtom(e.binLeft, fnIx)
-      }
-    }
-  }
-  return false
 }
 
 // ── the one row resolution for a `==`, in three namespaces ───────────────────
@@ -1017,15 +699,6 @@ function binEqSideRow(exprIx: i32, fnIx: i32): i32 {
     }
   }
   return variantRowOf(exprVariantIndex(exprIx, fnIx))
-}
-
-// True if `binIx` is a same-layout field-wise `==` or `!=` — over a standalone struct or over
-// a union arm, non-null or through the nullable niche. Its string and array field compares
-// stage operands in the string-op scratch frame, so it counts as a string op for reservation.
-function exprIsStructEq(binIx: i32, fnIx: i32) {
-  if binEqStructRow(binIx, fnIx) >= 0 { return true }
-  if binEqVariantRow(binIx, fnIx) >= 0 { return true }
-  return binEqNulVariantRow(binIx, fnIx) >= 0
 }
 
 // The list-op operand core of an expression: `"i32list"`, `"strlist"` or `"reflist"` (an
@@ -2368,20 +2041,6 @@ export function printUnionPlan(exprIx: i32, fnIx: i32, out: i32[]): boolean {
 export function printUnionArmsUnrenderable(exprIx: i32, fnIx: i32): boolean {
   const pk: i32[] = []
   return printUnionPlanCode(exprIx, fnIx, pk) < 0
-}
-
-// Does the print-union plan for `exprIx` carry a STRING arm? The reservation scan's half of
-// the pair above — a string arm streams through `emitPrintStrFromScratch`, which lives in
-// the str-op scratch frame.
-export function printUnionHasStrArm(exprIx: i32, fnIx: i32): boolean {
-  const pk: i32[] = []
-  if !printUnionPlan(exprIx, fnIx, pk) { return false }
-  let i = 0
-  while i < pk.length {
-    if pk[i] == 2 { return true }
-    i = i + 1
-  }
-  return false
 }
 
 // ── G8: map ops on a global struct-field map-array element ──────────────────────
