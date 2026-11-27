@@ -44,9 +44,10 @@ import {
   nodeChildren,
 } from "./ast"
 import { emitFail } from "./emit_bytes"
-import { listIsTestedName, unwrapParen } from "./emit_base"
+import { listIsTestedName, moduleLocalLetOfAt, unwrapParen } from "./emit_base"
 import {
   cloCellTarget,
+  emitRootIx,
   fnInstOrigin,
   fnNestUsed,
   fnParent,
@@ -66,12 +67,17 @@ import {
 // The lifted slot the callee `calleeIx` names when it reads a `const` bound to a
 // lambda-lifted function in frame `fnIx`, else -1.
 export function cloLiftCalleeOf(calleeIx: i32, fnIx: i32): i32 {
-  if fnIx < 0 || calleeIx < 0 || calleeIx >= P.nodes.length { return -1 }
+  if calleeIx < 0 || calleeIx >= P.nodes.length { return -1 }
   const callee = nodeAt(calleeIx)
   if !(callee is Ident) { return -1 }
   const li = identLetOfRead(calleeIx, fnIx)
   if li < 0 { return -1 }
-  return cloLiftLetFe(fnStmtsPosOf(fnIx), li)
+  return cloLiftLetFe(cloLiftFramePos(fnIx), li)
+}
+
+// The lift table's frame key for function `fnIx`: its slot, or -1 for the start body.
+export function cloLiftFramePos(fnIx: i32): i32 {
+  return if fnIx < 0 { -1 } else { fnStmtsPosOf(fnIx) }
 }
 
 // The candidate's name and the `const` binding it, as `clSyntax` last read them.
@@ -420,10 +426,13 @@ function clChainIsGeneric(pos: i32): boolean {
   return false
 }
 
-// The capture count when slot `fe` can be lifted, else -1.
+// The capture count when slot `fe` can be lifted, else -1. A module-scope lambda that captures
+// is declared in the start body, whose locals it takes as parameters like a function frame's.
 function cloLiftDecide(fe: i32): i32 {
   if fe >= fnParent.length { return -1 }
-  if fnParent[fe] < 0 { return -1 }
+  if fnParent[fe] < 0 && (emitRootIx < 0 || captureNamesOf(fe).length == 0) {
+    return -1
+  }
   if fnHasUnannotatedParam(fe) { return -1 }
   if clChainIsGeneric(fe) { return -1 }
   const n = clSyntax(fe)
@@ -458,12 +467,12 @@ function cloLiftDecide(fe: i32): i32 {
 function clSyntax(fe: i32): i32 {
   const host = fnParent[fe]
   const self = fnStmts[fe]
-  const hostNode = nodeAt(fnStmts[host])
-  if !(hostNode is FuncDecl) { return -1 }
+  const hostNode = if host >= 0 { nodeAt(fnStmts[host]) } else { null }
+  if host >= 0 && !(hostNode is FuncDecl) { return -1 }
   clName = ""
   clLet = -1
   let localFn = false
-  const hk = clIndexHost(host, hostNode)
+  const hk = if hostNode is FuncDecl { clIndexHost(host, hostNode) } else { clIndexRoot() }
   const selfNode = nodeAt(self)
   if lfBlockOf(fe) >= 0 {
     if selfNode is FuncDecl {
@@ -481,6 +490,14 @@ function clSyntax(fe: i32): i32 {
     }
   }
   if clName == "" { return -1 }
+  // In the start body the binding is a block's local, never a module global another unit reads.
+  if (
+    host < 0
+    && clLet >= 0
+    && moduleLocalLetOfAt(emitRootIx, clName, clLet + 1) != clLet
+  ) {
+    return -1
+  }
   const caps = captureNamesOf(fe)
   let ci = 0
   while ci < caps.length {
@@ -548,6 +565,15 @@ function clIndexHost(host: i32, hostNode: FuncDecl): string {
     pi = pi + 1
   }
   clIndexWalk(hk, hostNode.fnBody, -1, true)
+  return hk
+}
+
+// Indexes the start body, the program's top-level code, once as host -1.
+function clIndexRoot(): string {
+  const hk = "-1:"
+  if clhDone.has(-1) { return hk }
+  clhDone[-1] = true
+  clIndexWalk(hk, emitRootIx, -1, true)
   return hk
 }
 
