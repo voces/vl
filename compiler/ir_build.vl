@@ -83,6 +83,9 @@ import {
   omittedFieldNullNode,
   optLeafArmOf,
   recordArmsUnboxOwedAt,
+  tagSetMembersOfTy,
+  tagSetTyPast,
+  tyHasNull,
 } from "./wasmEmit"
 import {
   bundleAnyNoted,
@@ -15803,7 +15806,33 @@ function mapGetAt(
       narrowTo,
     )
   }
-  // Any other read is the map's value as stored, delivered at the read's rep by the one conversion.
+  // Any other read is the map's value as stored, delivered at the read's rep by the one conversion;
+  // a tagged id's nullable read crossing to a closure is first the id's `i32 | null` box, so a
+  // miss keeps its null.
+  const ownTy = mkNullableTy(TY_I32)
+  const own = repNodeOfTy(ownTy)
+  const ownK = if conv
+    && box < 0
+    && repPrim(m.rmVal) == "i32"
+    && tagCrossOf(own, rep) != TAG_CROSS_NONE
+    && tagCrossTyNullable(ix) { mapTyScalarBoxKind(repTyOf(mr)) } else { -1 }
+  if ownK >= 0 {
+    const br: Rhs = {
+      mtSym: rk.mkSym,
+      mtNonNull: rk.mkNonNull,
+      mtLoc: rk.mkLoc,
+      mtKey: rk.mkKey,
+      mtAt: ix,
+      mtBox: ownK,
+      mtRow: row,
+      mtTrap: trap,
+      mtPrint: -1,
+      mtWhole: whole,
+    }
+    const bv = irBLetTempTy(b, br, ix, own, ownTy)
+    if ibMiss != "" { return bv }
+    return irConvert(b, bv, rep, heldTy(nodeTyAt(ix, ibFnIx)), ix)
+  }
   if conv {
     const sv = irBLetTempTy(b, r, ix, m.rmVal, repTyOf(m.rmVal))
     if ibMiss != "" { return sv }
@@ -21584,6 +21613,9 @@ export function irConvert(
   if k == CONVERT_RETAG { return repTempTy(b, { rgV: v }, at, dst, dstTy) }
   if k == CONVERT_NICHE { return nicheInto(b, v, dst, at) }
   if k == CONVERT_BOX { return boxTempIn(b, v, at, dst, -1, dstTy) }
+  if k == CONVERT_TAGCLO || k == CONVERT_CLOTAG {
+    return tagCrossInto(b, v, dst, dstTy, at)
+  }
   if k == CONVERT_WIDEN {
     const w: Rhs = {
       nwV: v,
@@ -21623,8 +21655,14 @@ const CONVERT_RETAG = 1
 const CONVERT_NICHE = 2
 const CONVERT_BOX = 3
 const CONVERT_WIDEN = 4
+const CONVERT_TAGCLO = 5
+const CONVERT_CLOTAG = 6
 function convertKindOf(v: Opnd, dst: i32, dstTy: i32, at: i32): i32 {
   const src = irBOpRep(v)
+  if tagCrossTakes(v, dst, at) {
+    const tk = tagCrossOf(src, dst)
+    return if tk == TAG_CROSS_TO_CLO || tk == TAG_CROSS_BOX_TO_CLO { CONVERT_TAGCLO } else { CONVERT_CLOTAG }
+  }
   if cloNicheTakes(v, dst, at) { return CONVERT_NICHE }
   if src == dst || convertAsIs(src, dst, dstTy) { return CONVERT_AS_IS }
   const d = repNodeAt(dst)
@@ -21641,6 +21679,108 @@ function convertKindOf(v: Opnd, dst: i32, dstTy: i32, at: i32): i32 {
   return if heldAsBox(dst) && !heldAsBox(src) && dstTy >= 0 { CONVERT_BOX } else { -1 }
 }
 
+// How a tagged function set's value crosses between its id and its member's closure, by the reps
+// it leaves and arrives at (`tagCrossOf`); a nullable side is the id's `i32 | null` box or the
+// closure's niche, its null carried across.
+const TAG_CROSS_NONE = 0
+const TAG_CROSS_TO_CLO = 1
+const TAG_CROSS_BOX_TO_CLO = 2
+const TAG_CROSS_TO_ID = 3
+const TAG_CROSS_TO_BOX = 4
+const TAG_CROSS_NUL_TO_BOX = 5
+function tagCrossOf(src: i32, dst: i32): i32 {
+  const sClo = repNodeAt(src) is RClosure
+  const dClo = repNodeAt(dst) is RClosure
+  if repPrim(src) == "i32" && dClo { return TAG_CROSS_TO_CLO }
+  if tagIdBoxRep(src) && cloNicheRep(dst) { return TAG_CROSS_BOX_TO_CLO }
+  if sClo && repPrim(dst) == "i32" { return TAG_CROSS_TO_ID }
+  if sClo && tagIdBoxRep(dst) { return TAG_CROSS_TO_BOX }
+  if cloNicheRep(src) && tagIdBoxRep(dst) { return TAG_CROSS_NUL_TO_BOX }
+  return TAG_CROSS_NONE
+}
+
+// Whether rep `r` is the `i32 | null` box a nullable tagged id is stored as.
+function tagIdBoxRep(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RNullable && n.rnDisc == 4 && repPrim(n.rnInner) == "i32"
+}
+
+// Whether rep `r` is a closure's niche nullable.
+function cloNicheRep(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RNullable && n.rnDisc == 1 && repNodeAt(n.rnInner) is RClosure
+}
+
+// Whether value `v`, typed at `at`, crosses into rep `dst` (`tagCrossOf`) as a member of the
+// tagged set its type carries; into a closure, every member a function legacy writes as a value.
+function tagCrossTakes(v: Opnd, dst: i32, at: i32): boolean {
+  const k = tagCrossOf(irBOpRep(v), dst)
+  if k == TAG_CROSS_NONE { return false }
+  const ms = tagCloMembers(v, at)
+  if ms.length == 0 { return false }
+  // A plain id or closure has no null: a value typed nullable at it crosses only from its box.
+  if (k == TAG_CROSS_TO_CLO || k == TAG_CROSS_TO_ID) && tagCrossTyNullable(at) {
+    return false
+  }
+  if k == TAG_CROSS_TO_CLO || k == TAG_CROSS_BOX_TO_CLO {
+    for d in ms {
+      if closureValueCoreWhy(fnStmtsPosOf(d)) != "" { return false }
+    }
+  }
+  return true
+}
+
+// Whether the value at node `at` is typed nullable there.
+function tagCrossTyNullable(at: i32): boolean {
+  const u = if at >= 0 { unwrapParen(at) } else { -1 }
+  if u < 0 { return false }
+  const t = heldTy(nodeTyAt(u, ibFnIx))
+  return tyHasNull(t)
+}
+
+// The members of the tagged set value `v`'s type carries (`tagCloTy`), in id order.
+function tagCloMembers(v: Opnd, at: i32): i32[] {
+  return tagSetMembersOfTy(tagCloTy(v, at))
+}
+
+// Value `v`'s type past its null that carries a tagged set: its variable's, its node's, or for an
+// index read its container's element (a read's own type is a fresh one).
+function tagCloTy(v: Opnd, at: i32): i32 {
+  const vt = if v is OVar && v.ov >= 0 && v.ov < ib.irVars.length { tagSetTyPast(ib.irVars[v.ov].vTy, false) } else { -1 }
+  if vt >= 0 { return vt }
+  const u = if at >= 0 { unwrapParen(at) } else { -1 }
+  if u < 0 { return -1 }
+  const nt = tagSetTyPast(heldTy(nodeTyAt(u, ibFnIx)), false)
+  if nt >= 0 { return nt }
+  const n = nodeAt(u)
+  return if n is Index { tagSetTyPast(heldTy(nodeTyAt(n.idxArr, ibFnIx)), true) } else { -1 }
+}
+
+// Value `v` crossed into rep `dst` (`tagCrossOf`), held first in a local, which the lowering
+// reads once per member; the node names the type its members are the set of.
+function tagCrossInto(b: i32[], v: Opnd, dst: i32, dstTy: i32, at: i32): Opnd {
+  const k = tagCrossOf(irBOpRep(v), dst)
+  const st = tagCloTy(v, at)
+  const ms = tagSetMembersOfTy(st)
+  const nul = k == TAG_CROSS_BOX_TO_CLO || k == TAG_CROSS_NUL_TO_BOX
+  const held = v is OVar
+    && v.ov >= 0
+    && v.ov < ib.irVars.length
+    && ib.irVars[v.ov].vKind != "temp"
+  const t = if held { -1 } else { irVarNew(ib, irBOpRep(v), repTyOf(irBOpRep(v)), "local", -1) }
+  if t >= 0 { irBNode(b, { asDst: t, asSrc: v }, -1, ibNoValue, at) }
+  const o: Opnd = if t >= 0 { { ov: t } } else { v }
+  const toClo = k == TAG_CROSS_TO_CLO || k == TAG_CROSS_BOX_TO_CLO
+  const r: Rhs = if toClo { { tcV: o, tcFns: ms, tcTy: st, tcBox: nul } } else { { ckV: o, ckFns: ms, ckTy: st, ckNul: nul, ckBox: k != TAG_CROSS_TO_ID } }
+  return irBLetTempTy(
+    b,
+    r,
+    at,
+    dst,
+    if dstTy >= 0 { dstTy } else { repTyOf(dst) },
+  )
+}
+
 // Whether number kind `sk` widens to `dk` with no value lost: i32 into i64 or f64, f32 into f64.
 function numWidensExactly(sk: i32, dk: i32): boolean {
   return sk == 1 && (dk == 3 || dk == 4) || sk == 5 && dk == 4
@@ -21652,9 +21792,11 @@ function nicheIntoTakes(v: Opnd, dst: i32, at: i32): boolean {
   const dn = repNodeAt(dst)
   if !(dn is RNullable) || dn.rnDisc != 1 || irBOpRep(v) == dst { return false }
   if exprPrePathWhy(at, ibFnIx) != "" { return false }
+  const k = convertKindOf(v, dn.rnInner, repTyOf(dn.rnInner), at)
   return irBOpRep(v) == dn.rnInner
     || cloNicheTakes(v, dst, at)
-    || convertKindOf(v, dn.rnInner, repTyOf(dn.rnInner), at) == CONVERT_RETAG
+    || k == CONVERT_RETAG
+    || k == CONVERT_TAGCLO
 }
 
 // Value `v` retagged to niche nullable rep `dst`'s inner rep where it is apart, then into the niche.
@@ -21665,6 +21807,9 @@ function nicheInto(b: i32[], v: Opnd, dst: i32, at: i32): Opnd {
   }
   if repNodeAt(dn.rnInner) is RClosure && repNodeAt(irBOpRep(v)) is RClosure {
     return cloNicheRetag(b, v, dst, at)
+  }
+  if tagCrossTakes(v, dn.rnInner, at) {
+    return repTemp(b, { rgV: tagCrossInto(b, v, dn.rnInner, -1, at) }, at, dst)
   }
   const c = if irBOpRep(v) == dn.rnInner { v } else { repTemp(b, { rgV: v }, at, dn.rnInner) }
   return repTemp(b, { rgV: c }, at, dst)
