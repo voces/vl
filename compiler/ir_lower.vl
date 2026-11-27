@@ -380,6 +380,9 @@ import {
   fbLocalTee,
   fbLoop,
   fbMapTagOfI64,
+  fbNnElideClear,
+  fbNnElideDone,
+  fbNnElideNote,
   fbOpenBlock,
   fbRefAsNonNull,
   fbRefCast,
@@ -1012,6 +1015,11 @@ let lwMiss = ""
 let lwTempRhs: Rhs[] = []
 let lwTempDef: boolean[] = []
 let lwTempUsed: boolean[] = []
+// The receiver temp a field read is about to write, whose `struct.get` follows it directly, so a
+// global read it stands for owes no non-null recover (`getField`); -1 when none. `lwNnElideNow`
+// holds while that temp's own definition is written.
+let lwNnElideV = -1
+let lwNnElideNow = false
 // Locals a valued `if` left on the stack, read once as a temp is.
 let lwStackVal: boolean[] = []
 // Those values on the stack, not yet read, bottom first. A reader takes the lowest above
@@ -3092,8 +3100,12 @@ function getField(r: RGetField) {
   const rsi = recvStructRow(r.gfV, m.memProp)
   const ridx = if rsi >= 0 { sFieldIndex(rsi, m.memProp) } else { -1 }
   if ridx >= 0 && !r.gfStored && !memberBoxReadAt(r.gfAt, lw.irAt) {
+    // The receiver's `struct.get` follows it directly unless the read owes a recover first.
+    const v = r.gfV
+    if v is OVar && !memRecvOwesNonNull(r.gfAt, lw.irAt) { lwNnElideV = v.ov }
     irLOpnd(r.gfV)
-    return structFieldRead(rsi, ridx, r.gfAt)
+    lwNnElideV = -1
+    return nnElideDone(structFieldRead(rsi, ridx, r.gfAt))
   }
   // A read the builder built at its storage has its shape there.
   const sm = if r.gfStored { storageReadEnter(r.gfAt) } else { storageReadEnter(-1) }
@@ -3103,10 +3115,41 @@ function getField(r: RGetField) {
     return ifJoinField(r, m)
   }
   if fi < 0 { return irLMiss("field shape") }
+  const box = memberBoxReadAt(r.gfAt, lw.irAt)
+  const rv = r.gfV
+  if !box && !r.gfStored && rv is OVar && fieldTailOpensWithGet(r.gfAt, m) {
+    lwNnElideV = rv.ov
+  }
   irLOpnd(r.gfV)
+  lwNnElideV = -1
+  const rc = getFieldTail(r, m, box)
+  return nnElideDone(rc)
+}
+
+// Passes `rc` on, once a recover left out for the field read just written is consumed: a read
+// that missed wrote no `struct.get`, and the miss already refuses the claim.
+function nnElideDone(rc: i32): i32 {
+  if lwMiss != "" {
+    fbNnElideClear()
+    return rc
+  }
+  fbNnElideDone()
+  return rc
+}
+
+// Whether `fieldTailAt` writes the `struct.get` of a plain struct field first: no variant or
+// narrowed `V | null` receiver, and no recover the receiver owes before it.
+function fieldTailOpensWithGet(at: i32, m: Member): boolean {
+  const fnIx = lw.irAt
+  if exprVariantIndex(m.memObj, fnIx) >= 0 { return false }
+  return structFieldPlainOrAt(at, fnIx) >= 0 && !memRecvOwesNonNull(at, fnIx)
+}
+
+// `getField`'s tail past the receiver, for a read with no struct row of its own.
+function getFieldTail(r: RGetField, m: Member, box: boolean) {
   // A member record read the box plan passes as its field's box is lowered at its storage, as
   // the builder built it (`memberBoxTemp`).
-  if memberBoxReadAt(r.gfAt, lw.irAt) {
+  if box {
     const marks = memberBoxReadEnter(r.gfAt)
     const rc = fieldTail(r.gfAt, m)
     memberBoxReadLeave(marks)
@@ -3945,6 +3988,13 @@ function forLitElemAt(e: Opnd, x: i32, fnIx: i32) {
 
 // `RGlobalGet`: the global's read, then the recover its consumer owes.
 function globalGetRhs(r: RGlobalGet) {
+  // A receiver its `struct.get` reads next needs no recover: the read traps on null as the
+  // recover would (`getField`). The writer checks the `struct.get` does follow.
+  if lwNnElideNow {
+    lwNnElideNow = false
+    globalRead(r.ggSym, false)
+    return fbNnElideNote()
+  }
   globalRead(r.ggSym, r.ggNonNull)
   if r.ggNn > 0 { fbRefAsNonNull() }
   return 0
@@ -6732,7 +6782,14 @@ function liveCountIn(vs: i32[]): i32 {
 
 // Writes temp `v`'s definition, a `.push` receiver's with its list payload cast strict.
 function tempRhsWrite(v: i32) {
-  if !irPushRecvAt(lw, v) { return rhs(tempRhs(v), false) }
+  // Only the receiver's own global read leaves its recover out, never a read beneath it.
+  const r0 = tempRhs(v)
+  if v == lwNnElideV && r0 is RGlobalGet && !irPushRecvAt(lw, v) {
+    lwNnElideV = -1
+    lwNnElideNow = true
+    return globalGetRhs(r0)
+  }
+  if !irPushRecvAt(lw, v) { return rhs(r0, false) }
   const was = pushRecvCastOn()
   pushRecvCastSet(true)
   rhs(tempRhs(v), false)
@@ -7867,6 +7924,8 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwTempDef = []
   lwTempUsed = []
   lwStackVal = []
+  lwNnElideV = -1
+  lwNnElideNow = false
   lwLive = []
   lwLiveEnd = []
   lwFloor = 0
