@@ -15,7 +15,7 @@ OUT=${1:?usage: scripts/ir-i8-census/class-programs.sh <out-dir> [top]}
 TOP=${2:-0}
 mkdir -p "$OUT/classes"
 rm -f "$OUT"/classes/*.txt "$OUT/classes/index.tsv"
-for pop in self distilled cases probes witnesses scripts; do
+for pop in self distilled cases probes witnesses scripts harness; do
   [ -f "$OUT/$pop.rows" ] && awk -F'\t' -v pop="$pop" '{ print pop "\t" $0 }' "$OUT/$pop.rows"
 done | awk -F'\t' -v out="$OUT/classes" -v owners="$(dirname "$0")/owners.tsv" "$(cat "$(dirname "$0")/family.awk")"'
   BEGIN { famLoad(owners) }
