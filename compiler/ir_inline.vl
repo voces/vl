@@ -63,12 +63,14 @@ const IL_MAX_NODES = 12
 // how many there are.
 let ilLeaf: {[i32]: IrFn} = Map()
 let ilRoot: {[i32]: i32} = Map()
+let ilReads: {[i32]: i32[]} = Map()
 let ilCount = 0
 
 // Forgets every leaf, at a compile's start.
 export function irInlineReset() {
   ilLeaf = Map()
   ilRoot = Map()
+  ilReads = Map()
   ilCount = 0
   return 0
 }
@@ -85,6 +87,9 @@ export function irLeafNote(pos: i32, f: IrFn) {
   if r < 0 { return 0 }
   ilLeaf[pos] = f
   ilRoot[pos] = r
+  const reads: i32[] = []
+  leafReads(f, r, reads)
+  ilReads[pos] = reads
   ilCount = ilCount + 1
   return 0
 }
@@ -314,14 +319,49 @@ function stmtCall(n: IrNode): RCall | null {
   return if r is RCall { r } else { null }
 }
 
+// One body being rewritten: its statements as they stood, the index of each temp's let among
+// them, and the copies to insert before each index (`b.length` for the end).
+type IlBody = { ibB: i32[], ibDef: {[i32]: i32}, ibBefore: {[i32]: i32[]} }
+
+// The body record of `b` of `f`, its lets indexed once.
+function bodyOf(f: IrFn, b: i32[]): IlBody {
+  const d: {[i32]: i32} = Map()
+  let j = 0
+  while j < b.length {
+    const n = f.irNodes[b[j]]
+    if n is SLet { d[n.lDst] = j }
+    j = j + 1
+  }
+  return { ibB: b, ibDef: d, ibBefore: Map() }
+}
+
 // Copies the leaf calls of body `b` of `f` in place; answers how many.
 function inlineBody(f: IrFn, b: i32[]): i32 {
+  // The body is indexed at its first call of a leaf, and never when it holds none.
+  let bd: IlBody | null = null
   let n = 0
   let i = 0
   while i < b.length {
-    if inlineAt(f, b, i) { n = n + 1 }
+    const c = stmtCall(f.irNodes[b[i]])
+    if c != null && ilLeaf.has(c.caCallee) {
+      if bd == null { bd = bodyOf(f, b) }
+      if bd != null && inlineAt(f, bd, i) { n = n + 1 }
+    }
     i = i + 1
   }
+  if bd == null { return 0 }
+  if n == 0 { return 0 }
+  // The rebuilt body, the copies before the node they precede.
+  const out: i32[] = []
+  let j = 0
+  const before = bd.ibBefore
+  while j <= b.length {
+    for id in before[j] ?? [] { out.push(id) }
+    if j < b.length { out.push(b[j]) }
+    j = j + 1
+  }
+  while b.length > 0 { b.pop() }
+  for id in out { b.push(id) }
   return n
 }
 
@@ -334,31 +374,25 @@ function opRepIn(f: IrFn, o: Opnd): i32 {
   }
 }
 
-// The index in `b` of the let defining caller temp `v`, at or before `limit`; -1 for none.
-function defIndex(f: IrFn, b: i32[], v: i32, limit: i32): i32 {
-  let j = limit
-  while j >= 0 {
-    const n = f.irNodes[b[j]]
-    if n is SLet {
-      if n.lDst == v { return j }
-    }
-    j = j - 1
-  }
-  return -1
+// The index in body `bd` of the let defining caller temp `v`, when it is at or before `limit`;
+// -1 for none.
+function defIndex(bd: IlBody, v: i32, limit: i32): i32 {
+  const j = bd.ibDef[v] ?? -1
+  return if j <= limit { j } else { -1 }
 }
 
 // Whether the temp defined at `b[j]` of `f` is a let of whitelisted right sides down to its
 // variables and immediates, so its definition is written where it is read.
-function lazyTemp(f: IrFn, b: i32[], j: i32): boolean {
+function lazyTemp(f: IrFn, bd: IlBody, j: i32): boolean {
   if j < 0 { return false }
-  const n = f.irNodes[b[j]]
+  const n = f.irNodes[bd.ibB[j]]
   if !(n is SLet) { return false }
   const os = leafOpnds(n.lRhs)
   if os == null { return false }
   for o in os {
     if o is OVar {
       if o.ov >= 0 && o.ov < f.irVars.length && f.irVars[o.ov].vKind == "temp" {
-        if !lazyTemp(f, b, defIndex(f, b, o.ov, j - 1)) { return false }
+        if !lazyTemp(f, bd, defIndex(bd, o.ov, j - 1)) { return false }
       }
     }
   }
@@ -366,8 +400,8 @@ function lazyTemp(f: IrFn, b: i32[], j: i32): boolean {
 }
 
 // Copies the leaf call at `b[i]`, when it is one: true when it did.
-function inlineAt(f: IrFn, b: i32[], i: i32): boolean {
-  const callId = b[i]
+function inlineAt(f: IrFn, bd: IlBody, i: i32): boolean {
+  const callId = bd.ibB[i]
   const cn = f.irNodes[callId]
   const c = stmtCall(cn)
   if c == null { return false }
@@ -401,8 +435,7 @@ function inlineAt(f: IrFn, b: i32[], i: i32): boolean {
   }
   // The leaf's reads in lowering order: each argument temp anchors the copies after it, which
   // keeps the caller's pending temps in the order they are read.
-  const reads: i32[] = []
-  leafReads(g, root, reads)
+  const reads = ilReads[c.caCallee] ?? []
   let last = -1
   let copied = false
   for v in reads {
@@ -410,12 +443,16 @@ function inlineAt(f: IrFn, b: i32[], i: i32): boolean {
       const a = cp.icArgs[v] ?? null
       if a is OVar {
         const kind = if a.ov >= 0 && a.ov < f.irVars.length { f.irVars[a.ov].vKind } else { "" }
-        const j = if kind == "temp" { defIndex(f, b, a.ov, i - 1) } else { -1 }
+        const j = if kind == "temp" { defIndex(bd, a.ov, i - 1) } else { -1 }
         if kind == "temp" && (j < 0 || j <= last) { return false }
         // An argument read after a copy is written after it, so it must be one the lowering
         // writes where it is read: a parameter, or a lazy temp, never a value staged on the stack
         // ahead of the copy, as a valued `if`'s out variable is.
-        if copied && kind != "param" && !(kind == "temp" && lazyTemp(f, b, j)) {
+        if (
+          copied
+          && kind != "param"
+          && !(kind == "temp" && lazyTemp(f, bd, j))
+        ) {
           return false
         }
         if j >= 0 { last = j }
@@ -425,12 +462,6 @@ function inlineAt(f: IrFn, b: i32[], i: i32): boolean {
     }
   }
   // Placement: after the latest argument temp read before each copy.
-  const before: i32[][] = []
-  let q = 0
-  while q <= b.length {
-    before.push([])
-    q = q + 1
-  }
   let cursor = -1
   let firstArg = -1
   for v in reads {
@@ -442,7 +473,7 @@ function inlineAt(f: IrFn, b: i32[], i: i32): boolean {
           && a.ov < f.irVars.length
           && f.irVars[a.ov].vKind == "temp"
         ) {
-          cursor = defIndex(f, b, a.ov, i - 1)
+          cursor = defIndex(bd, a.ov, i - 1)
           if firstArg < 0 { firstArg = cursor }
         }
       }
@@ -460,8 +491,10 @@ function inlineAt(f: IrFn, b: i32[], i: i32): boolean {
       )
       f.irInlTemp[t] = g.irAt
       // A copy read before any argument temp goes just before the next one, or the call.
-      const at = if cursor >= 0 { cursor + 1 } else { nextArgIndex(f, b, cp, reads, v, i) }
-      before[at].push(id)
+      const at = if cursor >= 0 { cursor + 1 } else { nextArgIndex(f, bd, cp, reads, v, i) }
+      const list = bd.ibBefore[at] ?? []
+      list.push(id)
+      bd.ibBefore[at] = list
     }
   }
   f.irInlOwn = f.irAt
@@ -478,17 +511,6 @@ function inlineAt(f: IrFn, b: i32[], i: i32): boolean {
   const endDef = endNode(g, root)
   f.irNodeTy[callId] = g.irNodeTy[endDef]
   f.irNodeRep[callId] = g.irNodeRep[endDef]
-  // The rebuilt body, the copies before the node they precede.
-  const out: i32[] = []
-  let j = 0
-  while j < b.length {
-    for id in before[j] { out.push(id) }
-    out.push(b[j])
-    j = j + 1
-  }
-  for id in before[b.length] { out.push(id) }
-  while b.length > 0 { b.pop() }
-  for id in out { b.push(id) }
   return true
 }
 
@@ -496,7 +518,7 @@ function inlineAt(f: IrFn, b: i32[], i: i32): boolean {
 // the next argument temp `reads` reads after `v`, else the call at `i`.
 function nextArgIndex(
   f: IrFn,
-  b: i32[],
+  bd: IlBody,
   cp: IlCopy,
   reads: i32[],
   v: i32,
@@ -512,7 +534,7 @@ function nextArgIndex(
           && a.ov < f.irVars.length
           && f.irVars[a.ov].vKind == "temp"
         ) {
-          return defIndex(f, b, a.ov, i - 1)
+          return defIndex(bd, a.ov, i - 1)
         }
       }
     }
@@ -575,11 +597,12 @@ function tempAt(f: IrFn, v: i32): i32 {
 
 // Folds the accesses of body `b` in place; answers how many.
 function foldBody(f: IrFn, b: i32[]): i32 {
+  const bd = bodyOf(f, b)
   let n = 0
   const drop: {[i32]: boolean} = Map()
   let j = 0
   while j < b.length {
-    if foldAt(f, b, j, drop) { n = n + 1 }
+    if foldAt(f, bd, j, drop) { n = n + 1 }
     j = j + 1
   }
   if n == 0 { return 0 }
@@ -596,11 +619,11 @@ function foldBody(f: IrFn, b: i32[]): i32 {
 
 // The let of `b` at or before `limit` defining temp `v` of `f` as an add of an immediate: its index,
 // or -1.
-function addImmAt(f: IrFn, b: i32[], v: i32, limit: i32): i32 {
+function addImmAt(f: IrFn, bd: IlBody, v: i32, limit: i32): i32 {
   if v < 0 || v >= f.irVars.length || f.irVars[v].vKind != "temp" { return -1 }
-  const j = defIndex(f, b, v, limit)
+  const j = defIndex(bd, v, limit)
   if j < 0 { return -1 }
-  const n = f.irNodes[b[j]]
+  const n = f.irNodes[bd.ibB[j]]
   if n is SLet {
     const r = n.lRhs
     if r is RPrimOp {
@@ -627,7 +650,8 @@ function addRest(r: RPrimOp): Opnd {
 
 // Folds the access at `b[j]` when its address is such an add; true when it did, the adds' lets
 // marked in `drop`.
-function foldAt(f: IrFn, b: i32[], j: i32, drop: {[i32]: boolean}): boolean {
+function foldAt(f: IrFn, bd: IlBody, j: i32, drop: {[i32]: boolean}): boolean {
+  const b = bd.ibB
   const id = b[j]
   const r = accessOf(f, id)
   if r == null || r.mmArgs.length == 0 { return false }
@@ -636,7 +660,7 @@ function foldAt(f: IrFn, b: i32[], j: i32, drop: {[i32]: boolean}): boolean {
   // The add's operand: under an i64 wrap's cast, or the address itself at i32.
   let castJ = -1
   let top = a0.ov
-  const ja = defIndex(f, b, a0.ov, j - 1)
+  const ja = defIndex(bd, a0.ov, j - 1)
   if ja >= 0 {
     const an = f.irNodes[b[ja]]
     if an is SLet {
@@ -652,7 +676,7 @@ function foldAt(f: IrFn, b: i32[], j: i32, drop: {[i32]: boolean}): boolean {
     }
   }
   const limit = if castJ >= 0 { castJ - 1 } else { j - 1 }
-  let at = addImmAt(f, b, top, limit)
+  let at = addImmAt(f, bd, top, limit)
   if at < 0 { return false }
   let k: i64 = 0
   let rest: Opnd = a0
@@ -666,7 +690,7 @@ function foldAt(f: IrFn, b: i32[], j: i32, drop: {[i32]: boolean}): boolean {
     if !memLowFoldFits(k) { return false }
     marks.push(at)
     rest = addRest(ar)
-    at = if rest is OVar { addImmAt(f, b, rest.ov, at - 1) } else { -1 }
+    at = if rest is OVar { addImmAt(f, bd, rest.ov, at - 1) } else { -1 }
   }
   // The planned offset, as the access's lowering will take it.
   const c = nodeAt(r.mmAt)
