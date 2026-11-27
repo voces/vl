@@ -144,7 +144,6 @@ import {
   spreadArgOf,
 } from "./ast"
 import {
-  IrFamily,
   IrFn,
   IrNode,
   MapProbe,
@@ -212,7 +211,6 @@ import {
   irGlobalRepOf,
   irGlobalStoreNote,
   irGlobalStoreTyOf,
-  irNodeFamily,
   irNodeNew,
   irOpRow,
   irPushRecvNote,
@@ -1024,38 +1022,6 @@ let ibRowN: i32[] = []
 // them when the switch is on, so arming the guest sets nothing.
 export function irShadowArm(_on: i32) { return 0 }
 
-// The claimed families: a function built wholly of them ships the IR's bytes (design §10).
-const CLAIMED: IrFamily[] = [
-  "scalar", "control", "call", "global", "map", "list", "box", "record",
-  "closure", "start", "raw", "mem",
-]
-const ibClaimAll = false
-// Set while `irClaimFn` builds.
-let ibClaimBuild = false
-
-function familyClaimed(fam: IrFamily): boolean {
-  if ibClaimAll { return fam != "other" }
-  for c in CLAIMED {
-    if c == fam { return true }
-  }
-  return false
-}
-
-// Whether every node of the function just built is in a claimed family. A local or parameter of a
-// reference rep is the list family's.
-function claimable(): boolean {
-  if CLAIMED.length == 0 && !ibClaimAll { return false }
-  for n in ib.irNodes {
-    if !familyClaimed(irNodeFamily(n)) { return false }
-  }
-  for v in ib.irVars {
-    if v.vSlot >= 0 && !repIsScalar(v.vRep) && !familyClaimed("list") {
-      return false
-    }
-  }
-  return true
-}
-
 // The scope one claim seam opens: the soft-refusal state it replaces, restored when it closes, and
 // the atom table's mark, so a claim that falls back leaves what legacy then writes as legacy alone
 // would. Seams never nest: an inner claim that wrote inside an outer one that fell back would keep
@@ -1193,8 +1159,6 @@ function missAtOr(unit: i32): i32 {
 // this answers true, so legacy does not run.
 export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   declUnit = -1
-  // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
-  if CLAIMED.length == 0 && !ibClaimAll { return false }
   const s = claimScopeBegin()
   const ok = claimFn(fnIx, fnPos, out)
   claimScopeEnd(s, ok)
@@ -1204,13 +1168,11 @@ export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
 function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   const gen = repNodeGen()
   const minted = synthMintCount()
-  ibClaimBuild = true
   const built = build(fnIx, fnPos)
-  ibClaimBuild = false
   declinePending(fnIx, built, "this function")
   if softRefused("") { return declineRefused(emitSoftMsg) }
   if claimBuildMinted(minted) { return false }
-  if built != "" || repNodeGen() != gen || !claimable() { return false }
+  if built != "" || repNodeGen() != gen { return false }
   if verifierRefused("this function") { return false }
   const why = irLowerClaim(ib, globalCtxOf(fnPos), fnPos, out)
   if why != "" {
@@ -1231,9 +1193,6 @@ function claimBuildMinted(before: i32): boolean {
   return true
 }
 
-// Whether the start body may be claimed: the `start` family is.
-export function irStartClaimOn(): boolean { return familyClaimed("start") }
-
 // The claim seam for a start body (the single start, or an init function's, `poolFill` false),
 // before legacy writes it: built from `order` (an `orderGi` entry at or above 0 being that
 // global's initializer), and when every node is in a claimed family, the lowering writes its
@@ -1245,7 +1204,6 @@ export function irClaimStart(
   out: u8[],
 ): boolean {
   declUnit = -1
-  if !irStartClaimOn() { return false }
   const s = claimScopeBegin()
   const ok = claimStart(order, orderGi, poolFill, out)
   claimScopeEnd(s, ok)
@@ -1260,9 +1218,7 @@ function claimStart(
 ): boolean {
   const gen = repNodeGen()
   const minted = synthMintCount()
-  ibClaimBuild = true
   const built = buildStart(order, orderGi, poolFill)
-  ibClaimBuild = false
   declinePending(
     if order.length > 0 { order[0] } else { -1 },
     built,
@@ -1270,7 +1226,7 @@ function claimStart(
   )
   if softRefused("start ") { return declineRefused(emitSoftMsg) }
   if claimBuildMinted(minted) { return false }
-  if built != "" || repNodeGen() != gen || !claimable() { return false }
+  if built != "" || repNodeGen() != gen { return false }
   if verifierRefused("this top-level code") { return false }
   const why = irLowerClaim(ib, ibGlobalCtx(), -1, out)
   if why != "" {
@@ -3297,10 +3253,6 @@ function missRhs(why: string): Rhs {
 
 export function irBNode(b: i32[], n: IrNode, ty: i32, rep: i32, at: i32) {
   b.push(irNodeNew(ib, n, ty, rep, at))
-  // A claim's build ends at a node no claimed family holds: `claimable` would refuse it.
-  if ibClaimBuild && !familyClaimed(irNodeFamily(n)) {
-    irBMiss("unclaimed family")
-  }
   return 0
 }
 
@@ -5963,6 +5915,8 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       }
       const so = globalStoredRead(b, g, ix, cellRep, sto.stTy)
       if ibMiss != "" { return so }
+      // An atom cell read where its string is owed is decoded, as a local atom cell's read is.
+      if atomAtStr(cellRep, rep) { return widenTo(b, so, ix, rep, -1) }
       return irConvert(b, so, rep, heldTy(exprTyOf(ix)), ix)
     }
     if stored {
@@ -5999,9 +5953,12 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       return repTemp(b, { rgV: held }, ix, rep)
     }
     if atomId {
-      // The id is read at the binding's own type, whose rep is the cell's.
-      const at = heldTy(letBindTy(d, -1))
-      if repNodeOfTy(at) != cellRep { return irBMiss("global read coercion") }
+      // The id is read at the binding's own type where its rep is the cell's, else at the type
+      // its storage holds (`storageOf`).
+      const at0 = heldTy(letBindTy(d, -1))
+      const ast = bindingStorage(d, -1, true)
+      const at = if repNodeOfTy(at0) == cellRep { at0 } else if ast.stMiss == "" && ast.stRep == cellRep { ast.stTy } else { -1 }
+      if at < 0 { return irBMiss("global read coercion") }
       return irBLetTempTy(b, gr, ix, cellRep, at)
     }
     if member { return irBLetTempTy(b, gr, ix, cellRep, gh) }
@@ -7099,6 +7056,19 @@ function globalStorage(d: i32): Storage {
   const r0 = globalTyRep(if ht >= 0 { ct } else { globalHeldTy(d) })
   const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, openCellRep(d, r0))) } else { r0 }
   if r < 0 { return storageMiss("global rep") }
+  // A global legacy's cell holds as the atom is held at the type that cell holds, as a local's is.
+  const at = if ht < 0
+    && globalCellKind(d) == "i32"
+    && repPrim(r) == "str"
+    && letBindIsAtom(d, -1) { letAtomCellTy(d, -1) } else { -1 }
+  const ar = if at >= 0 { repNodeOfTy(heldTy(at)) } else { -1 }
+  if (
+    ar >= 0
+    && (repNodeAt(ar) is RAtom || atomNullable(ar))
+    && repTyOf(ar) >= 0
+  ) {
+    return storageAt(ar, repTyOf(ar), -1)
+  }
   // A list global whose storage row is another list, a wider record's, is held at that row.
   const bt = if ht < 0 && repNodeAt(r) is RList { heldTy(letBindTy(d, -1)) } else { -1 }
   const br = if bt >= 0 { globalTyRep(bt) } else { -1 }
@@ -7201,6 +7171,15 @@ function globalStoreTy(d: i32, rep: i32): i32 {
   if (
     repNodeAt(rep) is RAtom
     && atomCellRep(d, repNodeOfTy(ht)) == rep
+    && repTyOf(rep) >= 0
+  ) {
+    return repTyOf(rep)
+  }
+  // So is a cell legacy holds as the atom of a literal-bound binding (`letBindIsAtom`).
+  if (
+    (repNodeAt(rep) is RAtom || atomNullable(rep))
+    && globalCellKind(d) == "i32"
+    && letBindIsAtom(d, -1)
     && repTyOf(rep) >= 0
   ) {
     return repTyOf(rep)
@@ -13536,6 +13515,21 @@ function foldAddrRead(b: i32[], c: Call): Opnd {
   return a
 }
 
+// A `wide` arm's address: i64 node `rest` (the address without its folded constant) wrapped to
+// i32, as legacy writes `i32.wrap_i64` before the access that carries the constant as its offset.
+// The plan takes the arm only for an i64 operand, so the verifier holds the wrap's source.
+function wideAddrRead(b: i32[], rest: i32): Opnd {
+  const v = irBExpr(b, rest)
+  if ibMiss != "" { return v }
+  return irBLetTempTy(
+    b,
+    { nwV: v, nwSrc: 3, nwDst: 1, nwAt: rest },
+    rest,
+    repNodeOfTy(TY_I32),
+    TY_I32,
+  )
+}
+
 // A linear-memory load or store of an i32 as legacy's arm writes it (`memAccessPlanOf`): the
 // address along `memAddrPlanOf`'s `const` arm (an immediate 0) or `rest` arm (its node), then a
 // store's value. A widened store value and every other address arm are named misses.
@@ -13555,7 +13549,9 @@ function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
   const ap = irBAddrPlan(c, p.mxBase)
   const args: Opnd[] = []
   const starts: i32[] = [b.length]
-  const ixs: i32[] = [if ap.maArm == "rest" { ap.maRest } else { ix }]
+  const ixs: i32[] = [
+    if ap.maArm == "rest" || ap.maArm == "wide" { ap.maRest } else { ix },
+  ]
   match ap.maArm {
     "const" => {
       const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
@@ -13563,7 +13559,8 @@ function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
     }
     "rest" => args.push(irBExpr(b, ap.maRest))
     "fold" => args.push(foldAddrRead(b, c))
-    "bad" | "lma" | "wide" => {
+    "wide" => args.push(wideAddrRead(b, ap.maRest))
+    "bad" | "lma" => {
       return missRhs("memory address " + ap.maArm)
     }
   }
@@ -13642,7 +13639,9 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
   }
   const ap = irBAddrPlan(c, pl.apBase)
   const starts: i32[] = [b.length]
-  const ixs: i32[] = [if ap.maArm == "rest" { ap.maRest } else { ix }]
+  const ixs: i32[] = [
+    if ap.maArm == "rest" || ap.maArm == "wide" { ap.maRest } else { ix },
+  ]
   match ap.maArm {
     "const" => {
       const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
@@ -13650,7 +13649,8 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
     }
     "rest" => args.push(irBExpr(b, ap.maRest))
     "fold" => args.push(foldAddrRead(b, c))
-    "bad" | "lma" | "wide" => {
+    "wide" => args.push(wideAddrRead(b, ap.maRest))
+    "bad" | "lma" => {
       return missRhs("memory address " + ap.maArm)
     }
   }
@@ -20352,8 +20352,6 @@ function lowerNodeIn(
       return "local cell rep"
     }
   }
-  // A const cell ships as a function does: only when every node is in a claimed family.
-  if cellSt >= 0 && !probe && !claimable() { return "unclaimed family" }
   return irLowerFragment(ib, out, globalCtxNow(), fnPos, probe)
 }
 
@@ -20454,7 +20452,6 @@ function thunkRetTy(ty: i32, r: i32): i32 {
 // The claim seam for the thunk of `fe`, before legacy writes it: when it builds and every node is
 // in a claimed family, the lowering writes its code entry onto `out` and this answers true.
 export function irClaimThunk(fe: i32, out: u8[]): boolean {
-  if CLAIMED.length == 0 && !ibClaimAll { return false }
   const s = claimScopeBegin()
   const ok = claimThunk(fe, out)
   claimScopeEnd(s, ok)
@@ -20464,7 +20461,7 @@ export function irClaimThunk(fe: i32, out: u8[]): boolean {
 function claimThunk(fe: i32, out: u8[]): boolean {
   const built = buildThunk(fe)
   if softRefused("thunk ") { return false }
-  if built != "" || !claimable() { return false }
+  if built != "" { return false }
   if irBVerify(ib).vfRule != 0 { return thunkFellBack("verifier") }
   const why = irLowerHelper(ib, out)
   if why != "" { return thunkFellBack(why) }
@@ -20510,7 +20507,6 @@ function buildEqHelp(si: i32): string {
 // The claim seam for `__eq_<si>__`, in the frame `eqHelpFnCode` opened and before legacy writes
 // it: when it builds and every node is in a claimed family, its code entry goes onto `out`.
 export function irClaimEqHelp(si: i32, out: u8[]): boolean {
-  if CLAIMED.length == 0 && !ibClaimAll { return false }
   const s = claimScopeBegin()
   const ok = claimEqHelp(si, out)
   claimScopeEnd(s, ok)
@@ -20520,7 +20516,7 @@ export function irClaimEqHelp(si: i32, out: u8[]): boolean {
 function claimEqHelp(si: i32, out: u8[]): boolean {
   const built = buildEqHelp(si)
   if softRefused("eq helper ") { return false }
-  if built != "" || !claimable() { return false }
+  if built != "" { return false }
   if irBVerify(ib).vfRule != 0 { return eqHelpFellBack("verifier") }
   const why = irLowerEqHelper(ib, out)
   if why != "" { return eqHelpFellBack(why) }
