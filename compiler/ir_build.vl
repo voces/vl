@@ -1500,6 +1500,13 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   if arm == "litMember" { return isLitMember(b, n, ix, rep) }
   // A float box tested against integer literals is each member's box test or-ed, `numBox`'s.
   if arm == "floatLits" { return isLitArmsTest(b, n, ix, rep, "numBox") }
+  // `x?.f is null` is the optional read's own null test, by its rep (`testNull`).
+  if arm == "optNull" {
+    if rep != ibBool { return irBMiss("is result rep") }
+    const ov = irBExpr(b, n.isObj)
+    if ibMiss != "" { return ov }
+    return testNull(b, ov, ix)
+  }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   // Each rung's own answer, asked once: the arm tag's `tagIsArmOf`, the variant's plain row.
   const ta: TagIsArm = if arm == "armTag" { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
@@ -4083,6 +4090,28 @@ function bindingStorage(d: i32, frame: i32, global: boolean): Storage {
   return storageOf(p)
 }
 
+// The fill of the `let x = null` hole an un-annotated `null`-typed binding `d` copies by name, as
+// legacy's slot holds the copy; -1 for any other binding.
+function boundCopyFillTy(d: i32, ty: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  if repPrim(repNodeOfTy(ty)) != "null" || !(nodeAt(dn.letInit) is Ident) {
+    return -1
+  }
+  const sd = identDeclOf(dn.letInit)
+  const sn = if sd >= 0 && sd < P.nodes.length { nodeAt(sd) } else { null }
+  if (
+    !(sn is LetDecl)
+    || sn.letType >= 0
+    || sn.letInit < 0
+    || !(nodeAt(sn.letInit) is NullLit)
+  ) {
+    return -1
+  }
+  const ft = letBindingUnionTy(sd, ibFnIx)
+  return if ft >= 0 { heldTy(ft) } else { -1 }
+}
+
 // A binding is held at what its initializer builds where today's decision `s` has no storage or
 // an open one; else `s`.
 function buildStorage(p: SpBinding, s: Storage): Storage {
@@ -4157,7 +4186,9 @@ function localStorage(d: i32): Storage {
   const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else if rb >= 0 { rb } else { heldTy(scopeTyAt(d, ibFnIx)) }
   // A map local is held as legacy stores it, its mv slot off its initializer (`mapSlotHeldTy`).
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  const ty = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
+  const ty1 = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
+  const fill = boundCopyFillTy(d, ty1)
+  const ty = if fill >= 0 { fill } else { ty1 }
   const rep = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(rep, ty) {
     // A list whose element nothing fixes is held at the list legacy declares its cell at.
@@ -10473,7 +10504,7 @@ function oneTempAt(b: i32[], at: i32, o: Opnd): boolean {
 
 // Operand `l` of a fused read at node `ix`, which legacy's head reads twice, held in a local of its
 // own (the lowering's `ownedSlot`): a later operand's own fused `??` then finds no temp waiting.
-function heldInLocal(b: i32[], l: Opnd, ix: i32): Opnd {
+export function heldInLocal(b: i32[], l: Opnd, ix: i32): Opnd {
   if !(l is OVar) || l.ov < 0 || l.ov >= ib.irVars.length { return l }
   const v = irVarNew(ib, ib.irVars[l.ov].vRep, ib.irVars[l.ov].vTy, "local", -1)
   irBNode(b, { asDst: v, asSrc: l }, -1, ibNoValue, ix)
