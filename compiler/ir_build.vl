@@ -1,4 +1,5 @@
 import { nullableRecordTyOf, recFieldTyOf } from "./emit_rec_field_codes"
+import { fnTagMembers, fnTagSetOfTy } from "./check_elab_cap"
 import { printPlanPinNull } from "./emit_union_registry"
 import {
   asgFieldParks,
@@ -1025,7 +1026,7 @@ import {
   parseI32,
   parseI64Pair,
 } from "./emit_bignum"
-import { isVoidTy, tyMapValOf } from "./tyquery"
+import { isVoidTy, nonNullTy, tyMapValOf, tyStepElem } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
   listGetIdxReReadable,
@@ -22170,6 +22171,7 @@ export function irConvert(
   if k == CONVERT_RETAG { return repTempTy(b, { rgV: v }, at, dst, dstTy) }
   if k == CONVERT_NICHE { return nicheInto(b, v, dst, at) }
   if k == CONVERT_BOX { return boxTempIn(b, v, at, dst, -1, dstTy) }
+  if k == CONVERT_TAGCLO { return tagCloInto(b, v, dst, dstTy, at) }
   if k == CONVERT_WIDEN {
     const w: Rhs = {
       nwV: v,
@@ -22209,8 +22211,10 @@ const CONVERT_RETAG = 1
 const CONVERT_NICHE = 2
 const CONVERT_BOX = 3
 const CONVERT_WIDEN = 4
+const CONVERT_TAGCLO = 5
 function convertKindOf(v: Opnd, dst: i32, dstTy: i32, at: i32): i32 {
   const src = irBOpRep(v)
+  if tagCloTakes(v, dst, at) { return CONVERT_TAGCLO }
   if cloNicheTakes(v, dst, at) { return CONVERT_NICHE }
   if src == dst || convertAsIs(src, dst, dstTy) { return CONVERT_AS_IS }
   const d = repNodeAt(dst)
@@ -22227,6 +22231,63 @@ function convertKindOf(v: Opnd, dst: i32, dstTy: i32, at: i32): i32 {
   return if heldAsBox(dst) && !heldAsBox(src) && dstTy >= 0 { CONVERT_BOX } else { -1 }
 }
 
+// Whether value `v` is a tagged function set's i32 member id, typed at `at`, that goes into closure
+// rep `dst` as its member's closure: every member a function legacy writes as a value.
+function tagCloTakes(v: Opnd, dst: i32, at: i32): boolean {
+  if repPrim(irBOpRep(v)) != "i32" || !(repNodeAt(dst) is RClosure) {
+    return false
+  }
+  const ms = tagCloMembers(v, at)
+  if ms.length == 0 { return false }
+  for d in ms {
+    if closureValueCoreWhy(fnStmtsPosOf(d)) != "" { return false }
+  }
+  return true
+}
+
+// The members of the tagged set value `v`'s type carries (`tagCloTy`), in id order.
+function tagCloMembers(v: Opnd, at: i32): i32[] {
+  return fnTagMembers(fnTagSetOfTy(tagCloTy(v, at)))
+}
+
+// Value `v`'s type that carries a tagged set: its variable's, its node's, or for an index read its
+// container's element (a read's own type is a fresh one).
+function tagCloTy(v: Opnd, at: i32): i32 {
+  const vt = if v is OVar && v.ov >= 0 && v.ov < ib.irVars.length { ib.irVars[v.ov].vTy } else { -1 }
+  if fnTagSetOfTy(vt) >= 0 { return vt }
+  const u = if at >= 0 { unwrapParen(at) } else { -1 }
+  if u < 0 { return -1 }
+  const nt = nonNullTy(heldTy(nodeTyAt(u, ibFnIx)))
+  if fnTagSetOfTy(nt) >= 0 { return nt }
+  const n = nodeAt(u)
+  if !(n is Index) { return -1 }
+  const ct = nonNullTy(heldTy(nodeTyAt(n.idxArr, ibFnIx)))
+  const et = if tyMapValOf(ct) >= 0 { tyMapValOf(ct) } else { tyStepElem(ct) }
+  return nonNullTy(et)
+}
+
+// Member id `v` as its member's closure at rep `dst`, the id held in a local of its set's type.
+function tagCloInto(b: i32[], v: Opnd, dst: i32, dstTy: i32, at: i32): Opnd {
+  const ms = tagCloMembers(v, at)
+  // The lowering reads the id once per member, so a temp is held in a local first.
+  const held = v is OVar
+    && v.ov >= 0
+    && v.ov < ib.irVars.length
+    && ib.irVars[v.ov].vKind != "temp"
+    && fnTagSetOfTy(ib.irVars[v.ov].vTy) >= 0
+  const t = if held { -1 } else { irVarNew(ib, irBOpRep(v), tagCloTy(v, at), "local", -1) }
+  if t >= 0 { irBNode(b, { asDst: t, asSrc: v }, -1, ibNoValue, at) }
+  const id: Opnd = if t >= 0 { { ov: t } } else { v }
+  const r: Rhs = { tcV: id, tcFns: ms, tcAt: at }
+  return irBLetTempTy(
+    b,
+    r,
+    at,
+    dst,
+    if dstTy >= 0 { dstTy } else { repTyOf(dst) },
+  )
+}
+
 // Whether number kind `sk` widens to `dk` with no value lost: i32 into i64 or f64, f32 into f64.
 function numWidensExactly(sk: i32, dk: i32): boolean {
   return sk == 1 && (dk == 3 || dk == 4) || sk == 5 && dk == 4
@@ -22238,9 +22299,11 @@ function nicheIntoTakes(v: Opnd, dst: i32, at: i32): boolean {
   const dn = repNodeAt(dst)
   if !(dn is RNullable) || dn.rnDisc != 1 || irBOpRep(v) == dst { return false }
   if exprPrePathWhy(at, ibFnIx) != "" { return false }
+  const k = convertKindOf(v, dn.rnInner, repTyOf(dn.rnInner), at)
   return irBOpRep(v) == dn.rnInner
     || cloNicheTakes(v, dst, at)
-    || convertKindOf(v, dn.rnInner, repTyOf(dn.rnInner), at) == CONVERT_RETAG
+    || k == CONVERT_RETAG
+    || k == CONVERT_TAGCLO
 }
 
 // Value `v` retagged to niche nullable rep `dst`'s inner rep where it is apart, then into the niche.
@@ -22251,6 +22314,9 @@ function nicheInto(b: i32[], v: Opnd, dst: i32, at: i32): Opnd {
   }
   if repNodeAt(dn.rnInner) is RClosure && repNodeAt(irBOpRep(v)) is RClosure {
     return cloNicheRetag(b, v, dst, at)
+  }
+  if tagCloTakes(v, dn.rnInner, at) {
+    return repTemp(b, { rgV: tagCloInto(b, v, dn.rnInner, -1, at) }, at, dst)
   }
   const c = if irBOpRep(v) == dn.rnInner { v } else { repTemp(b, { rgV: v }, at, dn.rnInner) }
   return repTemp(b, { rgV: c }, at, dst)
