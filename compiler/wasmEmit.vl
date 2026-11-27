@@ -875,7 +875,6 @@ import {
   capCellName,
   capCellTargetOf,
   capComputeNamesOf,
-  captureCountOf,
   captureHomeOf,
   captureNamesOf,
   captureValKind,
@@ -21610,10 +21609,10 @@ function maFoldRowIn(ix: i32, decls: i32[]): i32 {
 }
 
 // How memory-intrinsic call `c` (`base` declared operands) writes its address: `bad` refused,
-// `lma` an inlined accessor's i64 operand, `const` a constant (`i32.const 0`), `fold` folded local
+// `const` a constant (`i32.const 0`), `fold` folded local
 // `maRest`, `wide` i64 node `maRest` wrapped, `rest` node `maRest`. A constant part moves into
 // offset `maOff` only where both forms name the same effective address.
-export type MemAddrArm = "bad" | "lma" | "const" | "fold" | "wide" | "rest"
+export type MemAddrArm = "bad" | "const" | "fold" | "wide" | "rest"
 export type MemAddrPlan = { maArm: MemAddrArm, maRest: i32, maOff: i64 }
 
 function memAddrAt(arm: MemAddrArm, rest: i32, off: i64): MemAddrPlan {
@@ -21640,9 +21639,6 @@ export function memAddrPlanWith(
   }
   if off < 0 { return memAddrAt("bad", -1, -1) }
   const addr = unwrapParen(c.callArgs[0])
-  if addr >= 0 && addr == lmaAddrNode {
-    return memAddrAt("lma", lmaAddrRest, lmaAddrK + off)
-  }
   if addr < 0 || addr >= P.nodes.length {
     return memAddrAt("rest", c.callArgs[0], off)
   }
@@ -21715,6 +21711,13 @@ function memLowStep(ix: i32, fnIx: i32): i32 {
   return -1
 }
 
+// Whether a memarg offset `k` folds under the low-memory promise: below the promised size and
+// within `MEM_OFFSET_MAX`; never with no promise, so `k` = 0 asks whether the build carries one.
+// The one reader the IR inliner and its address fold gate on.
+export function memLowFoldFits(k: i64): boolean {
+  return gLowMemUnused > 0 && k >= 0 && k < gLowMemUnused && k <= MEM_OFFSET_MAX
+}
+
 // The constant that `memLowStep` peeled from the `+` at `ix`; only called where it answered.
 function memLowStepK(ix: i32, fnIx: i32): i64 {
   const e = nodeAt(unwrapParen(ix))
@@ -21754,180 +21757,6 @@ function memLowFoldK(addr: i32, fnIx: i32): i64 {
   return k
 }
 
-// The frame of an accessor call `emitLowMemAccessorCall` inlines: the accessor's own address
-// operand, and the caller's operand and constant that replace it; the accessor's value
-// parameter read, and the caller's argument it stands for. Each node is -1 once consumed.
-let lmaAddrNode = -1
-let lmaAddrRest = -1
-let lmaAddrK: i64 = 0
-
-// Whether a call of function `fi` may be inlined as a folded memory access under the
-// low-memory promise; `emitLowMemAccessorCall` decides the call itself. Legacy and the IR share it.
-export function lowMemFoldsCallee(fi: i32): boolean {
-  return gLowMemUnused > 0 && lmaAccessBody(fi) >= 0
-}
-
-// The operand count of memory intrinsic call `c` without its optional offset.
-function memOffsetBaseArityOf(c: Call): i32 {
-  if c.callFn < 0 { return 1 }
-  const f = nodeAt(c.callFn)
-  if f is Ident {
-    if f.identName == "__store_i32__" || nameIsMemStoreIntrinsic(f.identName) {
-      return 2
-    }
-  }
-  return 1
-}
-
-// The body expression of function `fi` when it is a trivial memory accessor, else -1: not
-// generic, i64 parameters with no default, and one expression that is a load of `a as% i32`
-// (under `as` casts and `&` with a constant, returning its own type) or a store of `v` or
-// `v as T` there, where `a` and `v` are the parameters in order and each is read once.
-function lmaAccessBody(fi: i32): i32 {
-  if fi < 0 || fi >= fnStmts.length || captureCountOf(fi) > 0 { return -1 }
-  const fd = nodeAt(fnStmts[fi])
-  if fd is FuncDecl {
-    if fd.fnTyParams.length > 0 || fd.fnBody < 0 { return -1 }
-    const np = fd.fnParams.length
-    if np < 1 || np > 2 { return -1 }
-    for p in fd.fnParams {
-      const pn = nodeAt(p)
-      if pn is Param {
-        if pn.parDefault >= 0 || pn.parOpt != 0 || pn.parRest != 0 { return -1 }
-        if lmaTypeName(pn.parType) != "i64" { return -1 }
-      } else {
-        return -1
-      }
-    }
-    const blk = nodeAt(fd.fnBody)
-    if blk is Block {
-      if blk.blkStmts.length != 1 { return -1 }
-      // A block body's one statement returns the access: `{ return e }` is `e`.
-      const s0 = blk.blkStmts[0]
-      const sn = nodeAt(s0)
-      const bx = if sn is RetStmt { sn.retArg } else { s0 }
-      const acc = lmaAccessCall(bx, fi)
-      if acc < 0 || !lmaIsIntrinsic(acc, fi) { return -1 }
-      const ac = nodeAt(acc)
-      if ac is Call {
-        const arity = memOffsetBaseArityOf(ac)
-        if ac.callArgs.length != arity && ac.callArgs.length != arity + 1 {
-          return -1
-        }
-        if unwrapParen(ac.callArgs[0]) < 0 { return -1 }
-        if (
-          lmaParamRead(memLowWrapped(unwrapParen(ac.callArgs[0]), fi))
-          != lmaParamName(fd, 0)
-        ) {
-          return -1
-        }
-        if arity == 2 {
-          if np != 2 || fd.fnRet >= 0 || unwrapParen(bx) != acc { return -1 }
-          const vr = lmaValueRead(memCallArg(ac, 2, 1))
-          if lmaParamRead(vr) != lmaParamName(fd, 1) { return -1 }
-          return bx
-        }
-        if np != 1 { return -1 }
-        const rt = lmaTypeName(fd.fnRet)
-        if rt == "" || rt != lmaPrimOf(bx, fi) { return -1 }
-        return bx
-      }
-    }
-  }
-  return -1
-}
-
-// The intrinsic call at the core of accessor expression `ix`: the call itself, or the call
-// under `as` casts and a `&` whose other side is a constant (`memOffsetConstValue`, so it has no
-// effect and reads no parameter); -1 otherwise.
-function lmaAccessCall(ix: i32, fi: i32): i32 {
-  let x = unwrapParen(ix)
-  let depth = 0
-  while depth < 4 && x >= 0 {
-    const n = nodeAt(x)
-    if n is Call { return x }
-    if n is AsExpr {
-      x = unwrapParen(n.asObj)
-    } else if n is BinExpr {
-      if n.binOp != "&" { return -1 }
-      if memOffsetConstValue(n.binRight, fi) >= 0 {
-        x = unwrapParen(n.binLeft)
-      } else if memOffsetConstValue(n.binLeft, fi) >= 0 {
-        x = unwrapParen(n.binRight)
-      } else {
-        return -1
-      }
-    } else {
-      return -1
-    }
-    depth = depth + 1
-  }
-  return -1
-}
-
-// Whether call `acc` in function `fi` is a scalar load or store intrinsic rather than a binding
-// of that name.
-function lmaIsIntrinsic(acc: i32, fi: i32): boolean {
-  const ac = nodeAt(acc)
-  if ac is Call {
-    if ac.callFn < 0 { return false }
-    const f = nodeAt(ac.callFn)
-    if f is Ident {
-      const nm = f.identName
-      if (
-        identNameIsUserBound(ac.callFn, fi)
-        || fnIndexOfNode(ac.callFn) >= 0
-      ) {
-        return false
-      }
-      return (nm == "__load_i32__"
-        || nm == "__store_i32__"
-        || nameIsMemLoadIntrinsic(nm)
-        || nameIsMemStoreIntrinsic(nm))
-    }
-  }
-  return false
-}
-
-// The parameter read a store's value operand `ix` is: `v`, or `v as T`; else -1.
-function lmaValueRead(ix: i32): i32 {
-  const x = unwrapParen(ix)
-  if x < 0 { return -1 }
-  const n = nodeAt(x)
-  if n is AsExpr { return unwrapParen(n.asObj) }
-  return x
-}
-
-// The name an `Ident` node `ix` reads, or "" for any other node.
-function lmaParamRead(ix: i32): string {
-  if ix < 0 { return "" }
-  const n = nodeAt(unwrapParen(ix))
-  if n is Ident { return n.identName }
-  return ""
-}
-
-// The name of parameter `k` of `fd`.
-function lmaParamName(fd: FuncDecl, k: i32): string {
-  const p = nodeAt(fd.fnParams[k])
-  if p is Param { return p.parName }
-  return ""
-}
-
-// The numeric primitive a type annotation node's recorded type is, or "" for none or any other.
-function lmaTypeName(ix: i32): string {
-  if ix < 0 { return "" }
-  const pn = nodeTyPrimName(ix)
-  if pn == "i32" || pn == "i64" || pn == "f32" || pn == "f64" { return pn }
-  return ""
-}
-
-// The primitive expression `ix` of function `fi` yields, as `lmaTypeName` spells it.
-function lmaPrimOf(ix: i32, fi: i32): string {
-  if exprIsI64(ix, fi) { return "i64" }
-  if exprIsF64(ix, fi) { return "f64" }
-  if exprIsF32(ix, fi) { return "f32" }
-  return "i32"
-}
 
 // The operand left once `memLowFoldK`'s constant terms are peeled from `addr`.
 function memLowFoldRest(addr: i32, fnIx: i32): i32 {
@@ -29642,9 +29471,6 @@ export function wasmEmitStateReset() {
   hmFn = -2
   hmIdxSeen = 0
   initGuardOff = false
-  lmaAddrK = 0
-  lmaAddrNode = -1
-  lmaAddrRest = -1
   coerceHeld = -1
   rawReadNode = -1
   mfSrcSlot = -1

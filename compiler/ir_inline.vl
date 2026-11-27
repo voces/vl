@@ -1,0 +1,563 @@
+// `ir_inline.vl` — the IR inliner: a direct call of a small leaf function claimed earlier is
+// replaced, after the caller is built, by a copy of that function's nodes (ir-design-2026-11.md).
+// A leaf is one tree of whitelisted value nodes over its parameters, each read once in order, ending
+// in its return or its one effect; the copy keeps the callee's nodes, reps and source nodes, and
+// each copied node lowers under the callee's function index (`irInlTemp`, `irInlEff`). The callee
+// is still emitted. A callee claimed after its caller is called, not copied.
+
+import {
+  IrFn,
+  IrNode,
+  OImm,
+  OStr,
+  OVar,
+  Opnd,
+  RCall,
+  RMemAccess,
+  RNumCast,
+  RNumWiden,
+  RPrimOp,
+  Rhs,
+  SArmSite,
+  SArmWrite,
+  SAssign,
+  SBlock,
+  SBoundsCheck,
+  SBr,
+  SCellSet,
+  SCoalBox,
+  SDrop,
+  SEffect,
+  SForIn,
+  SGlobalSet,
+  SIf,
+  SIntSwitch,
+  SLet,
+  SListSet,
+  SLoop,
+  SRangeLoop,
+  SRawOp,
+  SReturn,
+  SSetField,
+  SSwitch,
+  STrap,
+  irFnBuiltOnce,
+  irNodeNew,
+  irPushBodies,
+  irRhsOpnds,
+  irVarNew,
+} from "./ir"
+import { emitFail } from "./emit_bytes"
+import { memLowFoldFits } from "./wasmEmit"
+
+// The most nodes a leaf may hold.
+const IL_MAX_NODES = 12
+
+// The leaves claimed so far, by `fnStmts` slot, each read only, with the node ending each, and
+// how many there are.
+let ilLeaf: {[i32]: IrFn} = Map()
+let ilRoot: {[i32]: i32} = Map()
+let ilReads: {[i32]: i32[]} = Map()
+let ilCount = 0
+
+// Forgets every leaf, at a compile's start.
+export function irInlineReset() {
+  ilLeaf = Map()
+  ilRoot = Map()
+  ilReads = Map()
+  ilCount = 0
+  return 0
+}
+
+// Whether `fnStmts` slot `pos` is a leaf claimed so far.
+export function irIsLeaf(pos: i32): boolean {
+  return ilCount > 0 && ilLeaf.has(pos)
+}
+
+// Whether the inliner runs: only under the low-memory promise, where it lets an accessor's address
+// fold; elsewhere binaryen's `-O` inlines the same leaves and a plain build only grows.
+function inlineOn(): boolean { return memLowFoldFits(0) }
+
+// Keeps function `f`, just claimed at `fnStmts` slot `pos`, when it is a leaf.
+export function irLeafNote(pos: i32, f: IrFn) {
+  if pos < 0 || !inlineOn() { return 0 }
+  const r = leafRoot(f)
+  if r < 0 { return 0 }
+  ilLeaf[pos] = f
+  ilRoot[pos] = r
+  const reads: i32[] = []
+  leafReads(f, r, reads)
+  ilReads[pos] = reads
+  ilCount = ilCount + 1
+  return 0
+}
+
+// Why right side `r` is outside the leaf whitelist, or "" for a numeric cast with no miss operand,
+// a widening, a primitive op or a memory access.
+function leafWhy(r: Rhs): string {
+  if r is RNumCast {
+    return if r.ncMiss is OVar && r.ncMiss.ov < 0 { "" } else { "a cast with a miss operand" }
+  }
+  if r is RNumWiden || r is RPrimOp || r is RMemAccess { return "" }
+  return "a right side outside the leaf whitelist"
+}
+
+// The operands whitelisted right side `r` reads, in the order its lowering reads them; null for a
+// right side outside the whitelist.
+function leafOpnds(r: Rhs): Opnd[] | null {
+  if leafWhy(r) != "" { return null }
+  return irRhsOpnds(r)
+}
+
+// Right side `r` with operand `k` of `leafOpnds` replaced by `ops[k]`.
+function leafRebuild(r: Rhs, ops: Opnd[]): Rhs {
+  if r is RNumCast {
+    const c: Rhs = { ncV: ops[0], ncAt: r.ncAt, ncMiss: r.ncMiss }
+    return c
+  }
+  if r is RNumWiden {
+    const w: Rhs = { nwV: ops[0], nwSrc: r.nwSrc, nwDst: r.nwDst, nwAt: r.nwAt }
+    return w
+  }
+  if r is RPrimOp {
+    const p: Rhs = { poOp: r.poOp, poArgs: ops }
+    return p
+  }
+  if r is RMemAccess {
+    const m: Rhs = {
+      mmArgs: ops,
+      mmAt: r.mmAt,
+      mmBase: r.mmBase,
+      mmPrim: r.mmPrim,
+      mmName: r.mmName,
+    }
+    return m
+  }
+  emitFail(
+    "emitProgram: internal: the inliner copied a right side outside its whitelist",
+  )
+  return r
+}
+
+// The node of leaf `f`'s body that ends it (its return or its one effect), or -1 when `f` is no
+// leaf: built once, no helper, thunk or fragment, no handed-back captures or fold rows; every
+// variable a parameter or a temp; a body of at most `IL_MAX_NODES` lets of whitelisted right sides
+// and that end; every temp read once, and every parameter read once, in parameter order.
+function leafRoot(f: IrFn): i32 {
+  if (
+    f.irAt < 0
+    || f.irHelper
+    || f.irThunk
+    || f.irFragment
+    || !irFnBuiltOnce(f)
+  ) {
+    return -1
+  }
+  if f.irRetExtra.length > 0 || f.irMaDecl.length > 0 { return -1 }
+  const b = f.irBody
+  if b.length == 0 || b.length > IL_MAX_NODES || b.length != f.irNodes.length {
+    return -1
+  }
+  for v in f.irVars {
+    if v.vKind == "local" { return -1 }
+  }
+  const last = b[b.length - 1]
+  const reads: i32[] = []
+  let k = 0
+  while k < b.length - 1 {
+    const n = f.irNodes[b[k]]
+    if !(n is SLet) || leafOpnds(n.lRhs) == null { return -1 }
+    k = k + 1
+  }
+  const end = f.irNodes[last]
+  if end is SReturn {
+    if !end.rtHas || !(end.rtV is OVar) || !leafTemp(f, end.rtV.ov) {
+      return -1
+    }
+  } else if !(stmtRhs(end) is RMemAccess) || end is SLet {
+    return -1
+  }
+  leafReads(f, last, reads)
+  // Each variable read once: the params in order, then nothing else repeats.
+  let p = 0
+  const seen: {[i32]: boolean} = Map()
+  for v in reads {
+    if seen[v] ?? false { return -1 }
+    seen[v] = true
+    if f.irVars[v].vKind == "param" {
+      if p >= f.irParams.length || f.irParams[p] != v { return -1 }
+      p = p + 1
+    }
+  }
+  if p != f.irParams.length { return -1 }
+  // Every let is read; the returned temp's let is the end's own value.
+  if end is SReturn {
+    const rv = end.rtV
+    if rv is OVar { seen[rv.ov] = true }
+  }
+  k = 0
+  while k < b.length - 1 {
+    const n = f.irNodes[b[k]]
+    if n is SLet {
+      if !(seen[n.lDst] ?? false) { return -1 }
+    }
+    k = k + 1
+  }
+  return last
+}
+
+// Whether `v` is a temp of `f` a let of its body defines.
+function leafTemp(f: IrFn, v: i32): boolean {
+  return v >= 0
+    && v < f.irVars.length
+    && f.irVars[v].vKind == "temp"
+    && leafDef(f, v) >= 0
+}
+
+// The let of `f`'s body defining temp `v`, or -1.
+function leafDef(f: IrFn, v: i32): i32 {
+  for id in f.irBody {
+    const n = f.irNodes[id]
+    if n is SLet {
+      if n.lDst == v { return id }
+    }
+  }
+  return -1
+}
+
+// The right side of leaf node `id`: a let's, an effect's, or a return's temp's definition.
+function leafRhs(f: IrFn, id: i32): Rhs {
+  const n = f.irNodes[id]
+  if n is SReturn {
+    const o = n.rtV
+    const d = if o is OVar { leafDef(f, o.ov) } else { -1 }
+    if d >= 0 { return leafRhs(f, d) }
+  }
+  const none: Rhs = { poOp: "add", poArgs: [] }
+  return stmtRhs(n) ?? none
+}
+
+// The right side statement `n` writes: a let's or an effect's; null for every other statement.
+function stmtRhs(n: IrNode): Rhs | null {
+  return match n {
+    SLet => n.lRhs
+    SEffect => n.efRhs
+    SArmSite |
+      SArmWrite |
+      SAssign |
+      SBlock |
+      SBoundsCheck |
+      SBr |
+      SCellSet |
+      SCoalBox |
+      SDrop |
+      SForIn |
+      SGlobalSet |
+      SIf |
+      SIntSwitch |
+      SListSet |
+      SLoop |
+      SRangeLoop |
+      SRawOp |
+      SReturn |
+      SSetField |
+      SSwitch |
+      STrap => null
+  }
+}
+
+// The node holding leaf end `root`'s value: its effect, or its returned temp's let.
+function endNode(f: IrFn, root: i32): i32 {
+  const n = f.irNodes[root]
+  if n is SReturn {
+    const o = n.rtV
+    if o is OVar { return leafDef(f, o.ov) }
+  }
+  return root
+}
+
+// Appends to `out` the variables node `id`'s value reads, in the order its lowering reads them:
+// a temp after the reads of its definition, as `irLOpnd` writes it.
+function leafReads(f: IrFn, id: i32, out: i32[]) {
+  const os = leafOpnds(leafRhs(f, id))
+  if os == null { return 0 }
+  for o in os {
+    if o is OVar {
+      const d = if leafTemp(f, o.ov) { leafDef(f, o.ov) } else { -1 }
+      if d >= 0 { leafReads(f, d, out) }
+      out.push(o.ov)
+    }
+  }
+  return 0
+}
+
+// One copy in progress: the callee, the caller's arguments by parameter, and each callee temp's
+// caller temp.
+type IlCopy = { icF: IrFn, icArgs: {[i32]: Opnd}, icTemp: {[i32]: i32} }
+
+// Replaces each direct call of a leaf in `f` by a copy of the leaf; answers how many.
+export function irInlineCalls(f: IrFn): i32 {
+  if f.irAt < 0 || !f.irCallsLeaf { return 0 }
+  let n = 0
+  const bodies: i32[][] = [f.irBody]
+  const pos: i32[] = []
+  let k = 0
+  while k < bodies.length {
+    n = n + inlineBody(f, bodies[k])
+    for id in bodies[k] { irPushBodies(f, id, bodies, pos) }
+    k = k + 1
+  }
+  return n
+}
+
+// The call a statement makes, when it is a let or effect of a direct call.
+function stmtCall(n: IrNode): RCall | null {
+  const r = stmtRhs(n)
+  return if r is RCall { r } else { null }
+}
+
+// One body being rewritten: its statements as they stood, the index of each temp's let among
+// them, and the copies to insert before each index (`b.length` for the end).
+type IlBody = { ibB: i32[], ibDef: {[i32]: i32}, ibBefore: {[i32]: i32[]} }
+
+// The body record of `b` of `f`, its lets indexed once.
+function bodyOf(f: IrFn, b: i32[]): IlBody {
+  const d: {[i32]: i32} = Map()
+  let j = 0
+  while j < b.length {
+    const n = f.irNodes[b[j]]
+    if n is SLet { d[n.lDst] = j }
+    j = j + 1
+  }
+  return { ibB: b, ibDef: d, ibBefore: Map() }
+}
+
+// Copies the leaf calls of body `b` of `f` in place; answers how many.
+function inlineBody(f: IrFn, b: i32[]): i32 {
+  // The body is indexed at its first call of a leaf, and never when it holds none.
+  let bd: IlBody | null = null
+  let n = 0
+  let i = 0
+  while i < b.length {
+    const c = stmtCall(f.irNodes[b[i]])
+    if c != null && ilLeaf.has(c.caCallee) {
+      if bd == null { bd = bodyOf(f, b) }
+      if bd != null && inlineAt(f, bd, i) { n = n + 1 }
+    }
+    i = i + 1
+  }
+  if bd == null { return 0 }
+  if n == 0 { return 0 }
+  // The rebuilt body, the copies before the node they precede.
+  const out: i32[] = []
+  let j = 0
+  const before = bd.ibBefore
+  while j <= b.length {
+    for id in before[j] ?? [] { out.push(id) }
+    if j < b.length { out.push(b[j]) }
+    j = j + 1
+  }
+  while b.length > 0 { b.pop() }
+  for id in out { b.push(id) }
+  return n
+}
+
+// The rep operand `o` of `f` holds.
+function opRepIn(f: IrFn, o: Opnd): i32 {
+  return match o {
+    OVar => if o.ov >= 0 && o.ov < f.irVars.length { f.irVars[o.ov].vRep } else { -1 }
+    OImm => o.oiRep
+    OStr => o.osRep
+  }
+}
+
+// The index in body `bd` of the let defining caller temp `v`, when it is at or before `limit`;
+// -1 for none.
+function defIndex(bd: IlBody, v: i32, limit: i32): i32 {
+  const j = bd.ibDef[v] ?? -1
+  return if j <= limit { j } else { -1 }
+}
+
+// Whether the temp defined at `b[j]` of `f` is a let of whitelisted right sides down to its
+// variables and immediates, so its definition is written where it is read.
+function lazyTemp(f: IrFn, bd: IlBody, j: i32): boolean {
+  if j < 0 { return false }
+  const n = f.irNodes[bd.ibB[j]]
+  if !(n is SLet) { return false }
+  const os = leafOpnds(n.lRhs)
+  if os == null { return false }
+  for o in os {
+    if o is OVar {
+      if o.ov >= 0 && o.ov < f.irVars.length && f.irVars[o.ov].vKind == "temp" {
+        if !lazyTemp(f, bd, defIndex(bd, o.ov, j - 1)) { return false }
+      }
+    }
+  }
+  return true
+}
+
+// Copies the leaf call at `b[i]`, when it is one: true when it did.
+function inlineAt(f: IrFn, bd: IlBody, i: i32): boolean {
+  const callId = bd.ibB[i]
+  const cn = f.irNodes[callId]
+  const c = stmtCall(cn)
+  if c == null { return false }
+  const g = ilLeaf[c.caCallee] ?? null
+  if g == null { return false }
+  if c.caEnv || c.caNever || c.caCaps.length > 0 || c.caWb.length > 0 {
+    return false
+  }
+  if c.caArgs.length != g.irParams.length { return false }
+  const root = ilRoot[c.caCallee] ?? -1
+  if root < 0 { return false }
+  const gEnd = g.irNodes[root]
+  // A let of the call takes the leaf's returned value at its own temp's rep; a call statement
+  // drops a returned load as the effect arm drops one.
+  if cn is SLet {
+    if !(gEnd is SReturn) { return false }
+    const rv = gEnd.rtV
+    if !(rv is OVar) || g.irVars[rv.ov].vRep != f.irVars[cn.lDst].vRep {
+      return false
+    }
+  } else if gEnd is SReturn {
+    if !(leafRhs(g, root) is RMemAccess) { return false }
+  }
+  const cp: IlCopy = { icF: g, icArgs: Map(), icTemp: Map() }
+  let p = 0
+  while p < g.irParams.length {
+    const a = c.caArgs[p]
+    if opRepIn(f, a) != g.irVars[g.irParams[p]].vRep { return false }
+    cp.icArgs[g.irParams[p]] = a
+    p = p + 1
+  }
+  // The leaf's reads in lowering order: each argument temp anchors the copies after it, which
+  // keeps the caller's pending temps in the order they are read.
+  const reads = ilReads[c.caCallee] ?? []
+  let last = -1
+  let copied = false
+  for v in reads {
+    if g.irVars[v].vKind == "param" {
+      const a = cp.icArgs[v] ?? null
+      if a is OVar {
+        const kind = if a.ov >= 0 && a.ov < f.irVars.length { f.irVars[a.ov].vKind } else { "" }
+        const j = if kind == "temp" { defIndex(bd, a.ov, i - 1) } else { -1 }
+        if kind == "temp" && (j < 0 || j <= last) { return false }
+        // An argument read after a copy is written after it, so it must be one the lowering
+        // writes where it is read: a parameter, or a lazy temp, never a value staged on the stack
+        // ahead of the copy, as a valued `if`'s out variable is.
+        if (
+          copied
+          && kind != "param"
+          && !(kind == "temp" && lazyTemp(f, bd, j))
+        ) {
+          return false
+        }
+        if j >= 0 { last = j }
+      }
+    } else {
+      copied = true
+    }
+  }
+  // Placement: after the latest argument temp read before each copy.
+  let cursor = -1
+  let firstArg = -1
+  for v in reads {
+    if g.irVars[v].vKind == "param" {
+      const a = cp.icArgs[v] ?? null
+      if a is OVar {
+        if (
+          a.ov >= 0
+          && a.ov < f.irVars.length
+          && f.irVars[a.ov].vKind == "temp"
+        ) {
+          cursor = defIndex(bd, a.ov, i - 1)
+          if firstArg < 0 { firstArg = cursor }
+        }
+      }
+    } else {
+      const d = leafDef(g, v)
+      const t = irVarNew(f, g.irVars[v].vRep, g.irVars[v].vTy, "temp", -1)
+      cp.icTemp[v] = t
+      const nodeCopy: IrNode = { lDst: t, lRhs: copyRhs(cp, leafRhs(g, d)) }
+      const id = irNodeNew(
+        f,
+        nodeCopy,
+        g.irNodeTy[d],
+        g.irNodeRep[d],
+        g.irNodeAt[d],
+      )
+      f.irInlTemp[t] = g.irAt
+      // A copy read before any argument temp goes just before the next one, or the call.
+      const at = if cursor >= 0 { cursor + 1 } else { nextArgIndex(f, bd, cp, reads, v, i) }
+      const list = bd.ibBefore[at] ?? []
+      list.push(id)
+      bd.ibBefore[at] = list
+    }
+  }
+  f.irInlOwn = f.irAt
+  // The end takes the call's own node, so its spans and tail marks keep pointing at it.
+  const endRhs = copyRhs(cp, leafRhs(g, root))
+  if cn is SLet {
+    f.irNodes[callId] = { lDst: cn.lDst, lRhs: endRhs }
+    f.irInlTemp[cn.lDst] = g.irAt
+  } else {
+    f.irNodes[callId] = { efRhs: endRhs }
+    f.irInlEff[callId] = g.irAt
+  }
+  // A returned value's node is its temp's let.
+  const endDef = endNode(g, root)
+  f.irNodeTy[callId] = g.irNodeTy[endDef]
+  f.irNodeRep[callId] = g.irNodeRep[endDef]
+  return true
+}
+
+// The body index a copy of leaf temp `v` goes before when no argument temp is read ahead of it:
+// the next argument temp `reads` reads after `v`, else the call at `i`.
+function nextArgIndex(
+  f: IrFn,
+  bd: IlBody,
+  cp: IlCopy,
+  reads: i32[],
+  v: i32,
+  i: i32,
+): i32 {
+  let past = false
+  for w in reads {
+    if past && cp.icF.irVars[w].vKind == "param" {
+      const a = cp.icArgs[w] ?? null
+      if a is OVar {
+        if (
+          a.ov >= 0
+          && a.ov < f.irVars.length
+          && f.irVars[a.ov].vKind == "temp"
+        ) {
+          return defIndex(bd, a.ov, i - 1)
+        }
+      }
+    }
+    if w == v { past = true }
+  }
+  return i
+}
+
+// Right side `r` of the copied leaf with each parameter read as its argument and each temp as
+// its copy.
+function copyRhs(cp: IlCopy, r: Rhs): Rhs {
+  const os = leafOpnds(r)
+  if os == null { return r }
+  const out: Opnd[] = []
+  for o in os {
+    if o is OVar {
+      const a = cp.icArgs[o.ov] ?? null
+      if a != null {
+        out.push(a)
+      } else {
+        const t: Opnd = { ov: cp.icTemp[o.ov] ?? -1 }
+        out.push(t)
+      }
+    } else {
+      out.push(o)
+    }
+  }
+  return leafRebuild(r, out)
+}

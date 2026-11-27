@@ -710,7 +710,7 @@ and, with `--low-memory-unused`, `setLowMemoryUnused`. Ten functions read the tw
 | `emitMapProbe` (`wasmEmit.vl`) | `gOptimized` | a get or has probes through `__map_entry*__`, which answers the entry | the slot probe and the index read stay at the site |
 | `mapGetHelperShape` (`wasmEmit.vl`) | `gOptimized` | a mono-valued map get, or a `?? <literal>` one, is one call of `__map_get_<row>__` | the probe and the value read stay at the site |
 | `fbPeepholes` (`emit_bytes.vl`) | `gOptimized` | the writer folds a `local.set` read straight back into a `local.tee` | the pair stays, whose shape binaryen's loop hoisting and `optMultivalue` match |
-| `memAddrPlanWith`, `emitLowMemAccessorCall`, `lowMemFoldsCallee` (`wasmEmit.vl`) | `gLowMemUnused` | the address is computed | its constant folds into the memarg |
+| `memAddrPlanWith`, `memLowFoldFits` (`wasmEmit.vl`) | `gLowMemUnused` | the address is computed, and a leaf accessor stays a call | its constant folds into the memarg, and the IR inliner copies a leaf accessor so its address folds too |
 
 Over the 4,315 single-file cases, the `-O` flavour changes 782 modules: 694 by the map-set
 helper alone, 26 by the pooled-string fill as well, and 62 only in the type section, where
