@@ -1596,8 +1596,8 @@ function rhs(r: Rhs, tail: boolean) {
     RStage => irLOpnd(r.sgV)
     RNulTest => nulTestOp(r)
     RNulNoneBox => {
-      // A call's payload held in an `anyref` once-slot, then the null tag.
-      if r.nnPay && !gConstExprEmit {
+      // A call's payload that may hold a statement is held in an `anyref` once-slot, then the null tag.
+      if r.nnPay && !gConstExprEmit && !payReadsAfterHead(r.nnV) {
         irLOpnd(r.nnV)
         const any: u8[] = [VT_ANYREF]
         const s = irOnceSlot(any)
@@ -5279,8 +5279,9 @@ function boxOp(r: RToBox) {
     return numUnionReboxTail(r.bxAt, p.hbKind, fnIx, bs)
   }
   const reads = p.hbArm != "null" && p.hbArm != "lit"
-  // A constant initializer holds no local: its operands are constants, so the head leads.
-  const lead = gConstExprEmit && boxHeadPushes(p.hbArm)
+  // A payload already on the stack (a join's or a dispatch's out) is held while the head is written;
+  // any other is written after the head, as a constant initializer's must be.
+  const lead = boxHeadPushes(p.hbArm) && (gConstExprEmit || payReadsAfterHead(r.bxV))
   if lead {
     leaf()
     if holeBoxHead(p, r.bxAt, fnIx) < 0 { return -1 }
@@ -5313,6 +5314,24 @@ function boxOp(r: RToBox) {
   if p.hbArm == "nulMap" { return holeBoxTail(p, r.bxAt, fnIx) }
   fbStructNew(uBoxIdx)
   return 0
+}
+
+// Whether payload `v` may be written after a head pushed ahead of it: an immediate, a variable read
+// from its local, or a temp built of those; a value already on the stack is not.
+function payReadsAfterHead(v: Opnd): boolean {
+  return payReadsAfterHeadAt(v, 0)
+}
+
+function payReadsAfterHeadAt(v: Opnd, depth: i32): boolean {
+  if v is OImm || v is OStr { return true }
+  if !(v is OVar) || depth > 32 { return false }
+  if v.ov >= 0 && v.ov < lwStackVal.length && lwStackVal[v.ov] { return false }
+  if !isTemp(v.ov) { return varSlot(v.ov) >= 0 }
+  // A temp is written where it is read; its operands, in turn, must hold no statement.
+  for o in irRhsOpnds(tempRhs(v.ov)) {
+    if !payReadsAfterHeadAt(o, depth + 1) { return false }
+  }
+  return true
 }
 
 // Whether box plan arm `a`'s head pushes ahead of its payload, so the payload is held while it is
