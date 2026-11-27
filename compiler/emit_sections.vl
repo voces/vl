@@ -1,7 +1,4 @@
-import { heapShadowSweep } from "./emit_heap_shadow"
 import { instVecDeliveryClose } from "./check_bind_adopt"
-import { vkShadowLocals, vkShadowSweep } from "./emit_vk_shadow"
-import { fcShadowSweep } from "./emit_fc_shadow"
 import { repSlotOfKind } from "./emit_rep_slot"
 import { spellTyShadowSweep } from "./emit_union_atoms"
 import { monoPinSpellShaped } from "./pin_spell"
@@ -36,14 +33,11 @@ import { mfrCheckSnap, mfrSnapReset } from "./mfr_shadow"
 // import/function/global/export/code sections, the shared runtime helpers, the start-function
 // model, per-function code emission, the opt-in name section). Sits above `wasmEmit.vl`, calling down into it for every statement/expression body.
 
-import { idShadowInstRow, idShadowSnap } from "./emit_id_shadow"
-import { canonRepFinal, canonShadowReport, sealEpoch } from "./emit_ty_seal"
-import { elabFnIdReset, elabSpecGroupRow, elabSpecReset } from "./elab_fn_id"
-import { idShadowModeOf } from "./id_shadow_state"
+import { canonRepFinal, sealEpoch } from "./emit_ty_seal"
+import { elabFnIdReset, elabSpecReset } from "./elab_fn_id"
 import { lamChainSnap } from "./check_lam_chain"
 import { recordRowClassOf, recordRowsRun } from "./record_rows"
 import { fvaMakerCallRows } from "./check_assignable"
-import { boxDstShadowArmed, boxDstShadowBegin } from "./box_dst_shadow"
 import {
   irClaimConstCell,
   irClaimEqHelp,
@@ -568,7 +562,6 @@ import {
   mkArrTy,
   mkListTy,
   monoArenaMarkSet,
-  monoKeys,
   mvClassIsScalar,
   mvKeyKind,
   mvMapTypeIdx,
@@ -823,12 +816,7 @@ import { asExprHoleNumSad, asExprNumFallible } from "./emit_union_casts"
 import { printPlanReset, unionKeySweep } from "./emit_union_registry"
 import { auditRecordJoinLeaves, callResultTextsReset } from "./emit_value_sites"
 import { callBindShadowBegin } from "./call_bind_shadow"
-import {
-  fnColShadowRun,
-  fnKindShadowRun,
-  fnRecordedRetTy,
-  fnRetShadowRun,
-} from "./fn_ret_shadow"
+import { fnRecordedRetTy } from "./fn_ret_shadow"
 import { cloLiftScan, cloLifted } from "./emit_lift"
 import { criFnIsAnonLambda } from "./emit_local_scope"
 import { identAuditBegin, identAuditMark, identAuditRun } from "./ident_audit"
@@ -1058,11 +1046,7 @@ function buildLocals(fnIx: i32) {
   // balanced/empty), then the emit pass rebuilds it in lockstep.
   localRegistryReset()
   const fn = nodeAt(fnIx)
-  if fn is FuncDecl {
-    const rc = collectLocals(fn.fnBody, fnIx)
-    vkShadowLocals(fnIx)
-    return rc
-  }
+  if fn is FuncDecl { return collectLocals(fn.fnBody, fnIx) }
   return emitFail("emitProgram: not a function declaration")
 }
 
@@ -4583,8 +4567,6 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
     "monomorphize" => {
       eplFreeze()
       const mr = monomorphize(stmts)
-      if idShadowModeOf() > 0 { idShadowInstRow(monoKeys.length) }
-      elabSpecGroupRow()
       return mr
     }
     "collectGenAliasShapes" => {
@@ -4610,13 +4592,8 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
       // Voidness first, then every un-annotated valued function's columns from its recorded result.
       recordRetTys()
       const cv = recordedVoidFns()
-      fnRetShadowRun()
       if cv < 0 { return cv }
-      fnColShadowRun("post seed")
-      const cr = fnRetColsFromRecorded()
-      fnColShadowRun("post settled")
-      fnKindShadowRun()
-      return cr
+      return fnRetColsFromRecorded()
     }
     "collectMapFilterUse" => {
       // The rows the signature passes read first and no reader may take late.
@@ -4958,7 +4935,6 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
   // program's must not survive into this one's early passes.
   monoSubTablesReset()
   callBindShadowBegin()
-  boxDstShadowBegin()
   irShadowBegin()
   irRefInstall()
   irStartPrologueHook = emitStrFillCalls
@@ -5035,7 +5011,6 @@ export function emitProgram(rootIx: i32) {
   const d0 = T.diags.length
   const rc = emitProgramRun(rootIx)
   while T.diags.length > d0 { T.diags.pop() }
-  canonShadowReport()
   if rc >= 0 && sealEpoch() != emitEpochAt {
     return emitFail(
       "internal: an emit-phase write changed a type an emit memo may hold",
@@ -5140,7 +5115,6 @@ export function elabPrepare(rootIx: i32) {
   elabIdentitySnap()
   elabFnIdReset()
   elabSpecReset()
-  idShadowSnap()
   if repShadowOn { mfrCheckSnap() }
   elabPreparedFor = rootIx
   return 0
@@ -5203,11 +5177,6 @@ function emitProgramRun(rootIx: i32) {
     repShadowSweep()
     unionKeySweep()
     spellTyShadowSweep()
-    // The ladder-vs-descriptor agreement oracle, same arming and window: what every converted
-    // classifier site answered beside what `repOfTy` would have. A no-op unless armed.
-    vkShadowSweep()
-    fcShadowSweep()
-    heapShadowSweep()
     repLadderABSweep()
     return rc
   }
@@ -6764,10 +6733,8 @@ function frameFunctionSection(
 // A thunk body: drop the env, forward the declared params, tail-call the target, so a
 // recursion through a function value stays in constant stack.
 function emitCloThunkCode(out: u8[], fe: i32) {
-  // The IR writes a thunk it claims; under the box-dst shadow (which instruments legacy) the
-  // thunk stays legacy's.
-  const own = !boxDstShadowArmed()
-  if own && irClaimThunk(fe, out) { return 0 }
+  // The IR writes a thunk it claims.
+  if irClaimThunk(fe, out) { return 0 }
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(0) // no local runs
@@ -7035,11 +7002,11 @@ function emitConstCellInit(buf: u8[], gi: i32): i32 {
   return emitFail("emitProgram: a module global cell that is not a binding")
 }
 
-// Whether the IR wrote global `gi`'s constant initializer, so legacy's writer does not run. Under
-// the box-dst shadow (it instruments legacy) it stays legacy's. The test refusal hook refuses its
-// own cell before any initializer, so the cells around it are the IR's as in any build.
+// Whether the IR wrote global `gi`'s constant initializer, so legacy's writer does not run. The
+// test refusal hook refuses its own cell before any initializer, so the cells around it are the
+// IR's as in any build.
 function constCellClaimed(gi: i32): boolean {
-  return !boxDstShadowArmed() && irClaimConstCell(gi, globalStmts[gi])
+  return irClaimConstCell(gi, globalStmts[gi])
 }
 
 // Writes the folded value `v` of the integer constant expression `init` into `buf` as the
