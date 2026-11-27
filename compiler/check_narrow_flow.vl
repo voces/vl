@@ -561,6 +561,7 @@ import {
   pendNulListTysSet,
   pendTys,
   pendTysSet,
+  readOnlyDefaultRows,
   readOnlyKeyRows,
   recordArmJoin,
 } from "./check_side_rows"
@@ -1407,7 +1408,44 @@ export function defaultReadOnlyContainer(ty: i32): boolean {
   } else {
     return false
   }
+  readOnlyDefaultRows.push(ty)
   return true
+}
+
+// Whether `x` reads an element of a row the read-only default settled, through un-annotated
+// bindings, `??` defaults, `.get` calls and `for … in` variables.
+export function readsUnwrittenElem(x: i32): boolean {
+  const seen: i32[] = []
+  let cur = parenPeelIx(x)
+  while cur >= 0 && cur < P.nodes.length && !i32ListHas(seen, cur) {
+    seen.push(cur)
+    const e = nodeAt(cur)
+    let row = -1
+    let next = -1
+    if e is Index { row = nodeTyIxOf(e.idxArr) }
+    if e is BinExpr && e.binOp == "??" { next = e.binLeft }
+    if e is Call && e.callFn >= 0 && e.callFn < P.nodes.length {
+      const f = nodeAt(e.callFn)
+      if f is Member && f.memProp == "get" { row = nodeTyIxOf(f.memObj) }
+    }
+    if e is Ident {
+      const d = identDeclOf(cur)
+      const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+      if dn is LetDecl && dn.letType < 0 { next = dn.letInit }
+      const lp = if dn is LoopVar && dn.lvSlot == 0 { dn.lvLoop } else { -1 }
+      const ln = if lp >= 0 && lp < P.nodes.length { nodeAt(lp) } else { null }
+      if ln is ForIn { row = nodeTyIxOf(ln.fiIter) }
+    }
+    const r0 = if row >= 0 { nonNullTy(row) } else { -1 }
+    if (
+      r0 >= 0
+      && (i32ListHas(readOnlyDefaultRows, r0) || rowSettledByDefault(r0))
+    ) {
+      return true
+    }
+    cur = if next >= 0 { parenPeelIx(next) } else { -1 }
+  }
+  return false
 }
 
 // Whether expression `ix` hands back a container no binding holds: a `Map()` or `Set()` call, a
