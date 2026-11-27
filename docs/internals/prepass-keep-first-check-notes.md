@@ -29,3 +29,19 @@ checks each of those bodies again.
 An exact rollback of loud-only checker state, or a predictor of a clean first check that runs
 before the check. Either is a restructure of the checker's ambient state, not a pre-pass change.
 Compare seeds against a FIXPOINT of the same source: the shared `build/vl-compiler.wasm` may not be one.
+
+## Second look (COV-START, 2026-11-27, after #10520): what the quiet checks are
+- The pre-pass checks 3,699 bodies quietly. None is a lambda or nested function: all are top-level declarations.
+- Only 840 are cycle members. The other 2,859 are non-cycle callees a cycle member reaches, inferred on
+  demand (checkCallOnFuncTy > checkFuncDeclNode), rolled back (RB_RETURNS keeps the returns) and checked
+  loudly again in pass 2.
+- By exclusive checkNode visits (293,009 quiet): cycle members 44%; non-cycle callees reading a module let
+  42%; movable non-cycle callees (params annotated, no module let, no pending read) 14%, about 0.76% of L2.
+  Parked as under 1%.
+- Design limit: a non-cycle callee can't move ahead of the pre-pass. Pass 2 keeps source order on purpose.
+  An un-annotated callee's parameter holes are solved by its callers' calls, and a module let is narrowed
+  by the top-level code before a call (eagerCheckable). Neither fact exists before the pre-pass.
+- On the self-compile every such callee annotates its parameters, so the hole limit costs nothing there;
+  the module-let limit costs 42%.
+- The CLI stable-sorts diagnostics by position, so moving a loud check changes the printed order only for
+  ties at one position.
