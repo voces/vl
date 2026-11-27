@@ -67,7 +67,6 @@ import {
   nodeTyIsLitUnionAlias,
   nodeTyIsNulLitUnion,
   nodeTyIxOf,
-  nodeTyPrimName,
 } from "./check_node_tys"
 import { inferRetFnKey } from "./check_side_rows"
 import {
@@ -140,20 +139,11 @@ import {
   refListSlotOfExpr,
   stmtIsTailValue,
   structIndexOfExpr,
-  unionArmKindRowsOfExpr,
   unionBoxTyIxOfExpr,
   unionNameOfExprRow,
   unionNameRowOfRead,
 } from "./emit_classify"
-import {
-  LR_I32,
-  LR_REF,
-  LR_STR,
-  eqRowOfVariant,
-  eqgRepComparable,
-  shapeHasCloField,
-  unionArmsNeedCloEq,
-} from "./emit_eq_rows"
+import { LR_I32, LR_REF, LR_STR, eqgRepComparable } from "./emit_eq_rows"
 import { globalIndexOf } from "./emit_fn_ret_kinds"
 import { exprMapOpNotAnOperand } from "./emit_list_rep"
 import {
@@ -199,7 +189,6 @@ import {
   LBK_REF,
   RLK_I32_LIST,
   fRetKind,
-  fnUses,
   pkPushBit,
   rlElemTyIx,
   sFieldCount,
@@ -975,48 +964,6 @@ export function identityBinIsMixed(e: BinExpr, fnIx: i32): boolean {
     || identityOperandIsMixed(e.binRight, fnIx)
 }
 
-export function cloEqNoteBin(binIx: i32, fnIx: i32) {
-  const e = nodeAt(binIx)
-  if e is BinExpr {
-    // A per-arm identity compares its function arms through the closure frame.
-    if e.binIdent != 0 && identityBinIsMixed(e, fnIx) {
-      fnUses.cloEq = true
-      return 0
-    }
-    if e.binOp == "==" || e.binOp == "!=" {
-      if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
-        fnUses.cloEq = true
-        return 0
-      }
-      // And the arms of a union operand (D1096), which the legs below cannot see: they read
-      // the binary's own operands and here those are boxes. A union `==` compares the arm its
-      // tag selects, and which arm runs is a runtime test, so every arm of either operand has
-      // to be reserved for. Over-reserving costs two locals; under-reserving is invalid wasm.
-      if unionOperandNeedsCloEq(e.binLeft, fnIx) { fnUses.cloEq = true }
-      if unionOperandNeedsCloEq(e.binRight, fnIx) { fnUses.cloEq = true }
-      // The struct leg stays left-only, deliberately, and is not `binEqStructRow`. A
-      // reservation scan may over-reserve and may not under-reserve, and this one fires on the
-      // left operand's row alone, so a pair the emitter will refuse still reserves the frame.
-      // Tightening it to the shared agreement resolver moves bytes for no defect.
-      const si = structIndexOfExpr(e.binLeft, fnIx)
-      if si >= 0 {
-        const seen: i32[] = []
-        if shapeHasCloField(si, seen) { fnUses.cloEq = true }
-        return 0
-      }
-      // The variant leg is agreement-gated, because that is exactly when the emitter emits a
-      // variant compare — reserve for the compare that will be produced, no wider.
-      let vi = binEqVariantRow(binIx, fnIx)
-      if vi < 0 { vi = binEqNulVariantRow(binIx, fnIx) }
-      if vi >= 0 {
-        const vseen: i32[] = []
-        if shapeHasCloField(eqRowOfVariant(vi), vseen) { fnUses.cloEq = true }
-      }
-    }
-  }
-  return 0
-}
-
 // True if `callIx` is a `recv.indexOf(sub)` or `recv.includes(sub)` over a string receiver —
 // both ride the same indexOf scan, `includes` negating the -1 compare.
 export function exprIsStrIndexOf(callIx: i32, fnIx: i32) {
@@ -1046,28 +993,6 @@ function readsGlobalAtomCell(ix: i32, fnIx: i32): boolean {
   if !(e is Ident) { return false }
   const li = globalLetOfRead(fnIx, unwrapParen(ix))
   return li >= 0 && globalCellKind(li) == "i32"
-}
-
-// `exprHasStrOp` of a long chain's root, inside a session over its region, as an emission is.
-// Did the checker type both operands of `e` as a numeric primitive or `boolean`? Such a binary
-// is no list, string, closure, struct or union operation, whatever its operator.
-export function binOperandsAreScalar(e: BinExpr): boolean {
-  return primIsScalar(nodeTyPrimName(e.binLeft))
-    && primIsScalar(nodeTyPrimName(e.binRight))
-}
-
-function primIsScalar(p: string): boolean {
-  return p == "i32"
-    || p == "i64"
-    || p == "f64"
-    || p == "f32"
-    || p == "u8"
-    || p == "i8"
-    || p == "u16"
-    || p == "i16"
-    || p == "u32"
-    || p == "u64"
-    || p == "boolean"
 }
 
 // Is the node at `ix` a builtin `fromCodePoints(e)` whose argument is not a bare name? Such
@@ -2264,14 +2189,6 @@ export function fnHasGlobalMapOp(fnIx: i32) {
   const fn = nodeAt(fnIx)
   if fn is FuncDecl { return blockHasMapOp(fn.fnBody, fnIx) }
   return false
-}
-
-// Whether an arm of the union value `exprIx` needs the closure-eq frame; false for a non-union.
-function unionOperandNeedsCloEq(exprIx: i32, fnIx: i32): boolean {
-  const kinds: i32[] = []
-  const rows: i32[] = []
-  unionArmKindRowsOfExpr(exprIx, fnIx, kinds, rows)
-  return unionArmsNeedCloEq(kinds, rows)
 }
 
 // Whether member set `s` has a primitive member whose box tag is `k` (`string` 2, the numbers

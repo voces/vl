@@ -432,7 +432,6 @@ import {
   cloCellTarget,
   cloCellUsed,
   cloDeclAt,
-  cloEqScratchBase,
   cloLiftWriteCount,
   cloLiftedFes,
   cloStructIdx,
@@ -472,11 +471,6 @@ import {
   fl64Ty,
   fnDispNames,
   fnInstOrigin,
-  fnListCatKinds,
-  fnListCatSlots,
-  fnListEqGKinds,
-  fnListEqGSlots,
-  fnListEqRSlots,
   fnNestUsed,
   fnParent,
   fnStmts,
@@ -575,11 +569,6 @@ import {
   isLTy,
   isMkListTy,
   lTy,
-  lcatBases,
-  leqIScratchBase,
-  leqRBases,
-  leqSScratchBase,
-  leqgBases,
   liBack,
   liKinds,
   liSlots,
@@ -1278,6 +1267,7 @@ import {
   asExprNumSrcName,
   asExprNumTgtName,
   callRefNestSlot,
+  cloEqScr,
   coalFieldRecvSlot,
   fcpSpillStashSlot,
   fnMvMapRefLocal,
@@ -1285,6 +1275,11 @@ import {
   fnMvValsBkLocal,
   fnMvValsOutLocal,
   intMinMaxStashSlot,
+  lcatScr,
+  leqIScr,
+  leqRScr,
+  leqSScr,
+  leqgScr,
   listIdxKindOf,
   listIdxWrapSlot,
   mapI32KeyLocal,
@@ -1354,13 +1349,7 @@ import {
   nodeSrc,
   sidOfNode,
 } from "./symbols"
-import {
-  i32ListHas,
-  i32ListIndexOf,
-  i32PairIndexOf,
-  strListHas,
-  strListIndexOf,
-} from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
   boxAtomKindOfMemberTy,
@@ -16606,7 +16595,7 @@ function emitStrLitValue(litIx: i32, fnIx: i32) {
 
 // i32-list `==`: length + element compare over the LEQI frame.
 function emitListEqICore() {
-  const bA = leqIScratchBase
+  const bA = leqIScr()
   fbLocalSet(bA + 1)    // B
   fbLocalSet(bA + 0)    // A
   fbBlock(127)          // block i32
@@ -16673,7 +16662,7 @@ function leqSElemNullTest(bA: i32) {
 // `emitStrEqCore` (the string-op frame — disjoint locals, safe to nest). Any element may be
 // null, whatever the list's declared element: two nulls are equal, a null and a string are not.
 function emitListEqSCore() {
-  const bA = leqSScratchBase
+  const bA = leqSScr()
   fbLocalSet(bA + 1)         // B
   fbLocalSet(bA + 0)         // A
   fbBlock(127)               // block i32
@@ -16786,11 +16775,7 @@ function emitListEqRCore(slot: i32, base: i32) {
 }
 
 // The reserved LEQR frame base for ref-list slot `slot`, or -1.
-function leqRBaseOfSlot(slot: i32) {
-  const i = i32ListIndexOf(fnListEqRSlots, slot)
-  if i < 0 { return -1 }
-  return leqRBases[i]
-}
+function leqRBaseOfSlot(slot: i32) { return leqRScr(slot) }
 
 // The two locals a STRUCT-element compare parked its element pair in, or -1 outside one.
 // Read by `emitChainRead` through the root sentinels -2 / -3; see its header for why the
@@ -17333,11 +17318,7 @@ function xrepWideKind(a: i32, b: i32): i32 {
 
 // The reserved LEQG frame base for compare rep `(kind, slot)`, or -1, over the pair the
 // reservation scan pushed.
-function leqgBaseOfRep(kind: i32, slot: i32) {
-  const i = i32PairIndexOf(fnListEqGKinds, fnListEqGSlots, kind, slot)
-  if i < 0 { return -1 }
-  return leqgBases[i]
-}
+function leqgBaseOfRep(kind: i32, slot: i32) { return leqgScr(kind, slot) }
 
 // How `+` node `e` at `ix` is a list concat: not one, one legacy refuses (its operands resolve to
 // no one list rep, or an element kind with no concat), one whose operands are at the concat's
@@ -17375,7 +17356,7 @@ export function listCatOperandTail(opIx: i32, binIx: i32, fnIx: i32) {
 // own LCAT frame. Legacy and the IR share it.
 export function listCatTail(binIx: i32, fnIx: i32): i32 {
   const kind = catListKindOfBin(binIx, fnIx)
-  if kind <= 0 { return listCatWrite(leqIScratchBase, lTy(), aTy()) }
+  if kind <= 0 { return listCatWrite(leqIScr(), lTy(), aTy()) }
   const slot = catSlotOfBin(binIx, fnIx)
   const bA = lcatBaseOfRep(kind, slot)
   if bA < 0 {
@@ -17475,11 +17456,7 @@ export function catScalarWidenTail(opIx: i32, fnIx: i32, kind: i32) {
 
 // The reserved LCAT frame base for concat rep `(kind, slot)`, or -1, over the pair the
 // reservation scan pushed.
-function lcatBaseOfRep(kind: i32, slot: i32) {
-  const i = i32PairIndexOf(fnListCatKinds, fnListCatSlots, kind, slot)
-  if i < 0 { return -1 }
-  return lcatBases[i]
-}
+function lcatBaseOfRep(kind: i32, slot: i32) { return lcatScr(kind, slot) }
 
 // Where a struct compare's field chain reads each side's root: `expr` the operand node; `local`
 // local `epSlot`; `elem` a ref list element over receiver local `epSlot` (its expression at -1,
@@ -17599,19 +17576,19 @@ export function refListReadPlain(idxIx: i32, fnIx: i32): boolean {
 // captured env (`ref.eq` over field 0 — two null envs are equal, two separately created
 // envs of the same function are not).
 function emitCloEqCore() {
-  fbLocalSet(cloEqScratchBase + 1) // B = right operand
-  fbLocalSet(cloEqScratchBase + 0) // A = left operand
-  fbLocalGet(cloEqScratchBase + 0)
-  fbStructGet(cloStructIdx, 2)     // A.decl
-  fbLocalGet(cloEqScratchBase + 1)
-  fbStructGet(cloStructIdx, 2)     // B.decl
-  fbI32Bin(70)                     // 0x46 i32.eq
-  fbLocalGet(cloEqScratchBase + 0)
-  fbStructGet(cloStructIdx, 0)     // A.env
-  fbLocalGet(cloEqScratchBase + 1)
-  fbStructGet(cloStructIdx, 0)     // B.env
-  fbRefEq()                        // (null == null → 1)
-  fbI32Bin(113)                    // 0x71 i32.and
+  fbLocalSet(cloEqScr() + 1)   // B = right operand
+  fbLocalSet(cloEqScr() + 0)   // A = left operand
+  fbLocalGet(cloEqScr() + 0)
+  fbStructGet(cloStructIdx, 2) // A.decl
+  fbLocalGet(cloEqScr() + 1)
+  fbStructGet(cloStructIdx, 2) // B.decl
+  fbI32Bin(70)                 // 0x46 i32.eq
+  fbLocalGet(cloEqScr() + 0)
+  fbStructGet(cloStructIdx, 0) // A.env
+  fbLocalGet(cloEqScr() + 1)
+  fbStructGet(cloStructIdx, 0) // B.env
+  fbRefEq()                    // (null == null → 1)
+  fbI32Bin(113)                // 0x71 i32.and
   return 0
 }
 
