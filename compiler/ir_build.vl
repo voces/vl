@@ -8146,7 +8146,7 @@ function callSplitRefuse(c: Call, ix: i32) {
 function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const key = callRefPlainKey(ix, ibFnIx)
   const tfe = if key == "" { topLambdaRecordFe(unwrapParen(c.callFn)) } else { -1 }
-  if tfe >= 0 { return lambdaRecordCallRhs(b, c, ix, tfe) }
+  if tfe >= 0 { return lambdaRecordCall(b, c, ix, tfe) }
   if key == "" { callSplitRefuse(c, ix) }
   if key == "" { return missRhs("call of a non-declaration") }
   if !legacyPlainAgrees(ix, key) {
@@ -8161,32 +8161,22 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   return closureCallAt(b, c, ix, key, f)
 }
 
-// A call `ix` of a top-level `const` lambda returning a bundle record (`topLambdaRecordFe`, slot
-// `tfe`): the closure called at the lambda's own signature, then the member the call's use takes,
-// as legacy's `emitCallRef` follows the call with `emitBundleResultPick`.
-function lambdaRecordCallRhs(b: i32[], c: Call, ix: i32, tfe: i32): Rhs {
+// The record type top-level `const` lambda slot `tfe` returns, its signature's row; -1 for none.
+function lambdaRecordTy(tfe: i32): i32 {
   const key = cloSigKeyExt(tfe)
   const row = if key != "" { sigKeyRetSlot(key) } else { -1 }
-  if row < 0 || row >= sTyIx.length {
-    return missRhs("top-level lambda record row")
-  }
-  const rt = sTyIx[row]
-  const pk = bundleResultPickOf(ix, tfe, ibFnIx)
-  const crep = if pk.bpField >= 0 && pk.bpTy >= 0 { repNodeOfTy(pk.bpTy) } else { -1 }
-  if crep < 0 || !(repNodeAt(crep) is RClosure) {
-    return missRhs("top-level lambda record pick")
-  }
+  return if row >= 0 && row < sTyIx.length { sTyIx[row] } else { -1 }
+}
+
+// Call `ix` of top-level `const` lambda slot `tfe`, the closure called at the lambda's signature.
+function lambdaRecordCall(b: i32[], c: Call, ix: i32, tfe: i32): Rhs {
+  if lambdaRecordTy(tfe) < 0 { return missRhs("top-level lambda record row") }
   const f = irBExpr(b, c.callFn)
   if ibMiss != "" { return missRhs("closure callee") }
   if !(repNodeAt(irBOpRep(f)) is RClosure) {
     return missRhs("closure callee rep")
   }
-  const call = closureCallAt(b, c, ix, key, f)
-  if ibMiss != "" { return missRhs(ibMiss) }
-  const rec = irBLetTempTy(b, call, ix, repNodeOfTy(rt), rt)
-  if ibMiss != "" { return missRhs(ibMiss) }
-  const r: Rhs = { rkV: rec, rkAt: ix, rkFe: tfe }
-  return r
+  return closureCallAt(b, c, ix, cloSigKeyExt(tfe), f)
 }
 
 // Whether callee `fx` is a name this frame reads through its capture (`identReadArmOf`).
@@ -8333,27 +8323,26 @@ function resultMemberCallRhs(b: i32[], c: Call, ix: i32, rx: i32): Rhs {
   }
   const ic = nodeAt(rx)
   if !(ic is Call) { return missRhs("result member callee") }
+  // A top-level `const` lambda's call is its record as a named function's is.
   const rhs = callRhs(b, ic, rx)
   if ibMiss != "" { return missRhs("result member callee") }
-  if !(rhs is RCall) { return missRhs("result member callee") }
-  const si = irSigOf(ib, rhs.caCallee)
+  const tfe = if rhs is RCall { -1 } else { topLambdaRecordFe(unwrapParen(ic.callFn)) }
+  if tfe < 0 && !(rhs is RCall) { return missRhs("result member callee") }
+  const fe = if rhs is RCall { rhs.caCallee } else { tfe }
+  const si = if tfe < 0 { irSigOf(ib, fe) } else { -1 }
   const sr = if si >= 0 { ib.irSigRet[si] } else { -1 }
-  if sr < 0 || !(repNodeAt(sr) is RRecord) {
+  if tfe < 0 && (sr < 0 || !(repNodeAt(sr) is RRecord)) {
     return missRhs("result member record")
   }
-  const pk = bundleResultPickOf(rx, rhs.caCallee, ibFnIx)
+  const pk = bundleResultPickOf(rx, fe, ibFnIx)
   const crep = if pk.bpField >= 0 && pk.bpTy >= 0 { repNodeOfTy(pk.bpTy) } else { -1 }
   if crep < 0 || !(repNodeAt(crep) is RClosure) {
     return missRhs("result member pick")
   }
-  const rec = irBLetTempTy(b, rhs, rx, sr, repTyOf(sr))
-  const f = irBLetTempTy(
-    b,
-    { rkV: rec, rkAt: rx, rkFe: rhs.caCallee },
-    rx,
-    crep,
-    pk.bpTy,
-  )
+  const lt = if tfe >= 0 { lambdaRecordTy(tfe) } else { repTyOf(sr) }
+  const rec = irBLetTempTy(b, rhs, rx, repNodeOfTy(lt), lt)
+  if ibMiss != "" { return missRhs(ibMiss) }
+  const f = irBLetTempTy(b, { rkV: rec, rkAt: rx, rkFe: fe }, rx, crep, pk.bpTy)
   if ibMiss != "" { return missRhs(ibMiss) }
   return closureCallAt(b, c, ix, key, f)
 }
@@ -17314,7 +17303,24 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       }
     }
     // A call typed past its callee's result: a bundle pick, a reference the destination stores as
-    // it stands, else the callee's own rep.
+    // it stands, else the callee's own rep. A top-level `const` lambda's call is its record as a
+    // named function's is (`topLambdaRecordFe`).
+    const tfe = topLambdaRecordFe(unwrapParen(n.callFn))
+    if tfe >= 0 && !(rhs is RCall) {
+      const lt = lambdaRecordTy(tfe)
+      const lr = repNodeOfTy(lt)
+      const pk = if lr != rep && repNodeAt(rep) is RClosure { bundleResultPickOf(ix, tfe, ibFnIx) } else { noPick() }
+      const rec = irBLetTempTy(b, rhs, ix, lr, lt)
+      const mrep = if pk.bpField >= 0 && pk.bpTy >= 0 { repNodeOfTy(pk.bpTy) } else { -1 }
+      if mrep < 0 || !(repNodeAt(mrep) is RClosure) { return rec }
+      return irBLetTempTy(
+        b,
+        { rkV: rec, rkAt: ix, rkFe: tfe },
+        ix,
+        mrep,
+        pk.bpTy,
+      )
+    }
     if rhs is RCall {
       const si = irSigOf(ib, rhs.caCallee)
       if si >= 0 && ib.irSigRet[si] != rep {
