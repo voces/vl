@@ -1,5 +1,5 @@
 // `agent-setup.sh --host-check` stops on a worktree whose `node_modules/.bin/wasm-dis` is missing:
-// `ir-identity.sh` reads each listed divergence through it. The passing control gives it a stub, and
+// disassembly is how a codegen fix is graded. The passing control gives it a stub, and
 // the check moves on to the host (which then fails on the missing seed, a different message).
 //
 // Run with:  deno test -A tests/vl_agent_setup_disasm_test.ts
