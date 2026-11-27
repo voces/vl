@@ -30,7 +30,7 @@ import {
   nulUnitPlaceReadAt,
   spreadGroupConverts,
 } from "./wasmEmit"
-import { lmForUnionArms } from "./emit_classify"
+import { identLetOfRead, lmForUnionArms } from "./emit_classify"
 import { mapUnionForKnownArm, mapUnionForPairTy } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import { litAtomMark, litAtomRollback } from "./emit_lit_atoms"
@@ -3586,10 +3586,7 @@ function openCallValue(b: i32[], n: Call, ix: i32): Opnd {
   ) {
     return repMissAt(ix, miss)
   }
-  // A call through a `const` bound to a lambda that captures nothing, whose closure call has no
-  // rep, is the direct call of that lambda, at its signature's rep: the binding holds no other.
-  const kl = constLambdaCallee(n, ix)
-  const rhs = if kl >= 0 { directCallAt(b, n, ix, kl) } else { callRhs(b, n, ix) }
+  const rhs = callRhs(b, n, ix)
   if ibMiss != "" { return irBMiss("call") }
   // A closure call is at the scalar its key's result names, as legacy's `call_ref` leaves it.
   if rhs is RCallRef && !rhs.crNever && !rhs.crVoid {
@@ -7698,6 +7695,10 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if nullBindingCall(ix) { return { dnAt: ix, dnPad: callEndsNever(ix) } }
   // A binding holding a lambda-lifted function is a direct call of it; any other, a closure's.
   const lf = if d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) { cloLiftCalleeOf(c.callFn, ibFnIx) } else { -1 }
+  // A `const` bound to a lambda that captures nothing holds no other function: its call is the
+  // direct call of that lambda, at its signature's rep.
+  const kl = if lf < 0 && d >= 0 { constLambdaCallee(c.callFn, d) } else { -1 }
+  if kl >= 0 { return directCallAt(b, c, ix, kl) }
   if lf < 0 && d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) {
     if bundleParamOfRead(c.callFn, ibFnIx) >= 0 {
       return bundleCallRhs(b, c, ix)
@@ -7722,18 +7723,16 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   return directCallAt(b, c, ix, pos)
 }
 
-// The lambda `constLambdaPos` names for call `n` at `ix` through a binding the lift does not take
-// and whose closure key names no scalar result; -1 for any other call.
-function constLambdaCallee(n: Call, ix: i32): i32 {
-  if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return -1 }
-  const d = identDeclOf(n.callFn)
-  if d < 0 || cloLiftCalleeOf(n.callFn, ibFnIx) >= 0 { return -1 }
-  if keyScalarRep(sigKeyRetKind(callRefPlainKey(ix, ibFnIx))) >= 0 { return -1 }
-  return constLambdaPos(d)
+// The lambda `constLambdaPos` names for callee read `cf`, declared at `d`: the binding this
+// instance reads (`identLetOfRead`), a generic instance's own clone, else `d` itself.
+function constLambdaCallee(cf: i32, d: i32): i32 {
+  const dl = identLetOfRead(cf, ibFnIx)
+  return constLambdaPos(if dl >= 0 { dl } else { d })
 }
 
-// The `fnStmts` slot of the lambda `const` declaration `d` binds, when the lambda captures
-// nothing, declares no type parameter and annotates every parameter; -1 for any other binding.
+// The `fnStmts` slot of the lambda `const` declaration `d` binds, when the slot holds that very
+// lambda (not an instance's clone of it), which captures nothing, declares no type parameter and
+// annotates every parameter; -1 for any other binding.
 function constLambdaPos(d: i32): i32 {
   const ld = nodeAt(d)
   if !(ld is LetDecl) || ld.letKw != "const" || ld.letInit < 0 { return -1 }
@@ -7748,7 +7747,12 @@ function constLambdaPos(d: i32): i32 {
     return -1
   }
   const pos = fnStmtsPosOf(init)
-  if pos < 0 || captureCountOf(pos) > 0 || fnHasUnannotatedParam(pos) {
+  if (
+    pos < 0
+    || fnStmts[pos] != init
+    || captureCountOf(pos) > 0
+    || fnHasUnannotatedParam(pos)
+  ) {
     return -1
   }
   return pos
@@ -17473,7 +17477,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     // it stands, else the callee's own rep. A top-level `const` lambda's call is its record as a
     // named function's is (`topLambdaRecordFe`).
     const tfe = topLambdaRecordFe(unwrapParen(n.callFn))
-    if tfe >= 0 && !(rhs is RCall) {
+    if tfe >= 0 {
       const lt = lambdaRecordTy(tfe)
       const lr = repNodeOfTy(lt)
       const pk = if lr != rep && repNodeAt(rep) is RClosure { bundleResultPickOf(ix, tfe, ibFnIx) } else { noPick() }
