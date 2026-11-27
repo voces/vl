@@ -1,3 +1,4 @@
+import { cloLiftCapN, cloLiftWrName, cloLiftWriteSlot } from "./ir_lift"
 import { tyHasNullMember } from "./tyquery"
 import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
 import { sharedFieldArmNulSet } from "./emit_obj_lit_fits"
@@ -805,9 +806,6 @@ import {
   capStartTbl,
   cboxReadsCell,
   cboxStoreCells,
-  cloLiftCapN,
-  cloLiftWrName,
-  cloLiftWriteSlot,
   coalLinkChainOf,
   emitCurFnIx,
   emitCurFnPos,
@@ -10704,9 +10702,23 @@ export function coalHoleNulNumTy(e: BinExpr, fnIx: i32): i32 {
 
 // True if a binary `e` (other than an operator over a numeric union) yields the union box:
 // a `??` over a union-valued map or a nullable box, or an assignment whose target is one.
+// Whether `??` node `e`'s operand is a map read the checker narrowed out of a union value.
+export function coalLeftNarrowedFromUnion(e: BinExpr, fnIx: i32): boolean {
+  const l = unwrapParen(e.binLeft)
+  if l < 0 || !(nodeAt(l) is Index) { return false }
+  const st = readNarrowedStoreAt(l, fnIx)
+  const su = if st >= 0 { nonNullTy(st) } else { -1 }
+  return su >= 0 && su < T.tys.length && tyAt(su) is TyUnion
+}
+
 function exprUnionBin(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
   // A hole's map read of a nullable number beside a nullable default stays that number's box.
   if e.binOp == "??" && coalHoleNulNumRead(e, fnIx) { return true }
+  // A map read narrowed out of a union value is no slot's box: the `??` is its checked type.
+  if e.binOp == "??" && coalLeftNarrowedFromUnion(e, fnIx) {
+    const nt = nodeTyAt(exprIx, fnIx)
+    return nt >= 0 && repOfTy(nt).rdKind == "union"
+  }
   const cmu = coalesceMvSlot(exprIx, fnIx)
   if cmu >= 0 {
     if mvValKindAt(cmu) == "union" && !mvUnionIsScalarNull(cmu) { return true }
@@ -14171,6 +14183,10 @@ export function exprString(exprIx: i32, fnIx: i32) {
       if e.binOp == "=" {
         const sar = asgReadNode(exprIx, fnIx)
         if sar != exprIx { return exprString(sar, fnIx) }
+      }
+      // A map read narrowed out of a union value is no slot's box: its checked type decides.
+      if e.binOp == "??" && coalLeftNarrowedFromUnion(e, fnIx) {
+        return coalTyIsStr(exprIx, fnIx)
       }
       // `m[k] ?? d`/`m.get(k) ?? d` over a string-valued map yields a string ref (the value
       // type); a nullable value with a nullable default stays `string | null`.

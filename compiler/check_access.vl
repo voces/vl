@@ -6,7 +6,9 @@ import {
   openReadNote,
   recordTestWarning,
 } from "./check_side_rows"
-import { fnDeclIx } from "./check_write_scan"
+import { cwIxBuild, cwIxParent, fnDeclIx } from "./check_write_scan"
+import { coalDefaultTy } from "./check_statements"
+import { unwrittenElemMsgOr } from "./check_demands"
 import { i32ListHas } from "./listutil"
 import { nodeTyIxOf } from "./check_node_tys"
 import { peelParenIx } from "./check_write_effects"
@@ -14,6 +16,7 @@ import { callBindNote } from "./check_bind_rows"
 import { fieldNearNote } from "./check_suggest"
 import { elabCallDeclNote, elabCapLive } from "./check_elab_cap"
 import {
+  BinExpr,
   Ident,
   Index,
   LetDecl,
@@ -21,6 +24,7 @@ import {
   OP_INDEX_GET,
   OP_INDEX_SET,
   OptMember,
+  P,
   Param,
   getDeclLabel,
   i32ToStr,
@@ -177,6 +181,7 @@ import {
   tyKeyOf,
   tyKeyOpen,
   tyPinKey,
+  tyPinVal,
   tyToStr,
   tyValOf,
   tyValOpen,
@@ -587,6 +592,19 @@ function optMemberHoleTy(
 // ── index `a[i]` ────────────────────────────────────────────────────────────
 
 // Extracted from `checkNodeReal`'s `Index` arm (C3: thin the dispatcher).
+// Pins map `at`'s open value to the type the `??` default over read `ix` spells (`coalDefaultTy`).
+function coalPinOpenVal(at: TyMap, ix: i32) {
+  if !tyValOpen(at) { return 0 }
+  cwIxBuild()
+  const q = if ix < cwIxParent.length { cwIxParent[ix] } else { -1 }
+  const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
+  if qn is BinExpr && qn.binOp == "??" && qn.binLeft == ix {
+    const ct = coalDefaultTy(qn.binRight)
+    if ct >= 0 { tyPinVal(at, ct) }
+  }
+  return 0
+}
+
 export function checkIndexNode(n: Index, ix: i32) {
   const arrTy0 = strLitRecvTy(checkNodeHook(n.idxArr))
   const idxTy = checkNodeHook(n.idxIndex)
@@ -633,9 +651,12 @@ export function checkIndexNode(n: Index, ix: i32) {
     && !(luWriteTgt[ix] ?? false)
     && unresolvedHole(arrTy)
   ) {
+    coalPinOpenVal(at, ix)
     defaultReadOnlyContainer(arrTy)
   }
   if at is TyMap {
+    // A `??` over a read of a value nothing wrote supplies its type, as at a bound map (D17734).
+    if !(luWriteTgt[ix] ?? false) { coalPinOpenVal(at, ix) }
     if tyValOpen(at) { openReadNote(arrTy) }
     if tyKeyOpen(at) {
       openKeyReadNote(arrTy, widenLitTy(idxTy))
@@ -684,7 +705,13 @@ export function checkIndexNode(n: Index, ix: i32) {
     }
   }
   if !assignable(idxTy, TY_I32) {
-    tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
+    tErr(
+      unwrittenElemMsgOr(
+        n.idxArr,
+        "array index must be i32, got " + tyToStr(idxTy),
+      ),
+      n.idxIndex,
+    )
   } else if tyHasTyVar(idxTy) {
     // A hole passes vacuously; the pin asks again at the type it binds (D3584).
     noteArgCstr(idxTy, TY_I32, "", ACF_INDEX, -1)
@@ -736,7 +763,7 @@ export function checkIndexNode(n: Index, ix: i32) {
   if at is TyPrim {
     if at.primName == "string" { return TY_I32 }
   }
-  tErr(indexFloorMsg(arrTy), ix)
+  tErr(unwrittenElemMsgOr(n.idxArr, indexFloorMsg(arrTy)), ix)
   return TY_ERR
 }
 
@@ -756,7 +783,10 @@ function checkIndexMap(n: Index, at: TyMap, idxTy: i32, ix: i32) {
   // literal as the widened `string` with no destination to narrow it against (D1748).
   if !assignableExpr(n.idxIndex, idxTy, tyKeyOf(at)) {
     tErr(
-      "map key must be " + tyToStr(tyKeyOf(at)) + ", got " + tyToStr(idxTy),
+      unwrittenElemMsgOr(
+        n.idxArr,
+        "map key must be " + tyToStr(tyKeyOf(at)) + ", got " + tyToStr(idxTy),
+      ),
       n.idxIndex,
     )
   }
@@ -788,7 +818,13 @@ function checkIndexHole(n: Index, at: TyVar, arrTy: i32, idxTy: i32, ix: i32) {
         }
       }
     }
-    tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
+    tErr(
+      unwrittenElemMsgOr(
+        n.idxArr,
+        "array index must be i32, got " + tyToStr(idxTy),
+      ),
+      n.idxIndex,
+    )
   }
   noteCtnOp(arrayDemandKey(arrTy), CTN_IDX)
   // Admitted here and re-asked at the pin (D691): `noteCtnOp` only reaches a bound
@@ -848,7 +884,7 @@ function checkIndexTrap(n: Index, at: TyObj, arrTy: i32, idxTy: i32, ix: i32) {
       }
     }
   }
-  tErr(indexFloorMsg(arrTy), ix)
+  tErr(unwrittenElemMsgOr(n.idxArr, indexFloorMsg(arrTy)), ix)
   return TY_ERR
 }
 
