@@ -605,6 +605,7 @@ import {
   holeBoxPlanOf,
   identReadArmOf,
   identReadsNull,
+  ifJoinBoxPasses,
   isArmOf,
   isArmPatTy,
   isBoxGuardPlain,
@@ -880,6 +881,7 @@ import {
   letIsNulNone,
   letMapShapeOfTy,
   letNulMapReadUnionBox,
+  letRecBuiltTy,
   letValuesBuiltApart,
   listTyOfElem,
   localIndexOf,
@@ -3757,6 +3759,8 @@ export function exprTyOf(ix: i32): i32 {
   // A read of a binding holding a returned record whole is that record (`emitHolderRead`).
   const ht = holderReadTy(ix)
   if ht >= 0 { return ht }
+  const rbt = recBuiltReadTy(ix)
+  if rbt >= 0 { return rbt }
   // A read of a parameter held at the row legacy declares it at reads that row.
   const pv = declRowParamVarOf(ix)
   if pv >= 0 { return ib.irVars[pv].vTy }
@@ -4128,6 +4132,21 @@ export function irBBoxLocal(b: i32[], ix: i32): Opnd {
   return o
 }
 
+// The record name read `ix` reads where its binding's cell is the record the record solve built
+// it as (`letRecBuiltTy`); else -1.
+export function recBuiltReadTy(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return -1 }
+  const d = identDeclOf(ix)
+  if d < 0 { return -1 }
+  const v = ibDeclVar[d] ?? -1
+  if v >= 0 {
+    const rt = letRecBuiltTy(d, ibFnIx)
+    return if rt >= 0 && ib.irVars[v].vTy == rt { rt } else { -1 }
+  }
+  if localIndexOf(ibFnIx, ix) >= 0 { return -1 }
+  return letRecBuiltTy(d, -1)
+}
+
 // Whether binding `d`'s variable `v`, of an open function type, takes closure `src` its
 // initializer built at its instance's signature: legacy's cell holds a closure (`letBindRep`), so
 // the variable is retyped to the closure built.
@@ -4156,7 +4175,8 @@ export function irBDeclVar(d: i32): i32 {
   // of it as that member's closure (`holderMemberTy`).
   const ht = holderHeldRecordTy(d, ibFnIx)
   const hm = if ht < 0 && (elabHasRetRecords() || bundleAnyNoted()) { holderMemberTy(d, ibFnIx) } else { -1 }
-  const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else { heldTy(scopeTyAt(d, ibFnIx)) }
+  const rb = if ht < 0 && hm < 0 { letRecBuiltTy(d, ibFnIx) } else { -1 }
+  const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else if rb >= 0 { rb } else { heldTy(scopeTyAt(d, ibFnIx)) }
   // A map local is held as legacy stores it, its mv slot off its initializer (`mapSlotHeldTy`).
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   const ty = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
@@ -6933,7 +6953,7 @@ function globalRep(g: i32, d: i32): i32 {
   const ht = globalHolderTy(d)
   // A holder's cell beside `null` (cell kind `nulstruct`) is the record's nullable.
   const ct = if ht >= 0 && globalCellKind(d) == "nulstruct" { nullableRecordTyOf(ht) } else { ht }
-  const r0 = globalTyRep(if ht >= 0 { ct } else { scopeTyAt(d, -1) })
+  const r0 = globalTyRep(if ht >= 0 { ct } else { globalHeldTy(d) })
   const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, openCellRep(d, r0))) } else { r0 }
   if r >= 0 {
     globalNoteAt(g, d, r)
@@ -6986,7 +7006,9 @@ function cellAtStorageRow(d: i32, r: i32): i32 {
 // of it a binding holds (`globalHolderTy`), else its own type.
 function globalHeldTy(d: i32): i32 {
   const ht = globalHolderTy(d)
-  return if ht >= 0 { ht } else { scopeTyAt(d, -1) }
+  if ht >= 0 { return ht }
+  const rb = letRecBuiltTy(d, -1)
+  return if rb >= 0 { rb } else { scopeTyAt(d, -1) }
 }
 
 // The type a module binding `d` holds a returned record at, as `irBDeclVar` holds a local's: the
@@ -11889,6 +11911,15 @@ function boxTempIn(
       return if irBOpRep(pb) == dst { pb } else { irBLetTempTy(b, { sgV: pb }, ix, dst, repTyOf(dst)) }
     }
   }
+  // A valued `if` built as a box that passes as `uTy`'s is that box (`ifJoinBoxPasses`).
+  if (
+    p.hbArm == "ladder"
+    && heldAsBox(irBOpRep(v))
+    && heldAsBox(dst)
+    && ifJoinBoxPasses(ix, uTy, ibFnIx)
+  ) {
+    return if irBOpRep(v) == dst { v } else { irBLetTempTy(b, { sgV: v }, ix, dst, repTyOf(dst)) }
+  }
   // An assignment boxed as a wide atom (`widenPlanOf`'s `asgLit`, `radix`) is its value at the
   // atom's number kind first, as legacy's `emitWidened` writes it; its span then ends there.
   const wide = p.hbArm == "atom"
@@ -14321,11 +14352,8 @@ function nulNoneEffect(b: i32[], x: i32, ix: i32, sink: Opnd[] | null): Opnd {
   if u < 0 { return irBMiss("coalesce nulnone effect") }
   const n = nodeAt(u)
   if n is IfStmt {
-    // A void `if` leaves no value a sink's reader could drop in order, so it is written here; with
-    // no temp waiting below it, that is where legacy writes it too.
-    if sink != null && endsInTemp(b) {
-      return irBMiss("coalesce nulnone effect if")
-    }
+    // A void `if` leaves no value a sink's reader could drop in order, so it is written here, a
+    // statement any temp waiting below it is staged under.
     ifForEffect(b, n, u)
     return none
   }
@@ -14542,14 +14570,14 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   // An if-expression operand is built inside the block, where legacy writes it (`nulStr`).
   if nodeAt(lhsIx) is IfStmt { return coalNulStr(b, n, ix, rep, false) }
   const lat = b.length
-  const l = irBExpr(b, n.binLeft)
-  if ibMiss != "" { return l }
-  // Legacy writes the operand inside the coalesce's block, above which a valued `if` cannot sit,
-  // nor an inner `??`, whose out stays on the stack as one's does.
-  if valuedIfFrom(b, lat) { return irBMiss("coalesce of a valued if") }
-  if coalBoxFrom(b, lat, true) || coalBoxFrom(b, lat, false) {
-    return irBMiss("coalesce string operand holds a ??")
-  }
+  const l0 = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l0 }
+  // The operand is written inside the coalesce's block, above which a valued `if` cannot sit, nor
+  // an inner `??`, whose out stays on the stack as one's does: such an operand is held in a local.
+  const spill = valuedIfFrom(b, lat)
+    || coalBoxFrom(b, lat, true)
+    || coalBoxFrom(b, lat, false)
+  const l = if spill { heldInLocal(b, l0, ix) } else { l0 }
   if !strNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
   const nul = coalesceNulStrStaysNullable(ix, ibFnIx)
   const want = if nul { irBOpRep(l) } else { strInnerOf(irBOpRep(l)) }
