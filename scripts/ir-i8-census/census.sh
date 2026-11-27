@@ -68,7 +68,11 @@ VL_IR_SHADOW=5 "$VL" build "$TREE/compiler/entry.vl" -o "$T/self.wasm" --compile
 else
   rm -f "$OUT/self.rows" "$OUT/self.programs"
 fi
-for pop in distilled cases probes witnesses scripts; do
+# $CENSUS_HARNESS names harness-pop.sh's programs.txt: the sixth population, the programs only a
+# test's harness builds, measured at default flags.
+POPS="distilled cases probes witnesses scripts"
+if [ -n "${CENSUS_HARNESS:-}" ]; then cp "$CENSUS_HARNESS" "$T/harness"; POPS="$POPS harness"; fi
+for pop in $POPS; do
   xargs -r -n 100 -P "$JOBS" env VL="$VL" PROBE="$T/probe.wasm" sh "$T/one.sh" < "$T/$pop" > "$OUT/$pop.rows" || true
   wc -l < "$T/$pop" > "$OUT/$pop.programs"
 done
@@ -77,7 +81,7 @@ cat "$T/distilled" "$T/cases" "$T/probes" "$T/witnesses" "$T/scripts" > "$OUT/pr
 # A refused unit (`fnr`) stays refused only where its program expects that refusal: one of its
 # `// @emit-error <text>` lines is a substring of the refusal. Any other is unclaimed (`fnu`), since
 # legacy may build it, and the I8 cutover would then turn a running program into a refused one.
-for pop in self distilled cases probes witnesses scripts; do
+for pop in self distilled cases probes witnesses scripts harness; do
   [ -f "$OUT/$pop.rows" ] || continue
   LC_ALL=C awk -F'\t' -v OFS='\t' '
     function expects(f, msg,   line, e, ok, n, i, E) {
