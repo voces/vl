@@ -162,8 +162,6 @@ function runJobs(over: Record<string, string> = {}): string {
     "ci-distilled",
     "ci-witnesses (1)",
     "ci-witnesses (2)",
-    "ci-ir-identity (1)",
-    "ci-ir-identity (2)",
     "ci-i8-sweep",
   ];
   return JSON.stringify({
@@ -252,7 +250,7 @@ Deno.test({
       // The jobs an inherited run must have passed: every top-level job.
       Deno.writeTextFileSync(
         `${dir}/ci.yml`,
-        "on: push\njobs:\n  ci:\n    runs-on: x\n  seed:\n    runs-on: x\n  ci-ir-identity:\n    runs-on: x\n",
+        "on: push\njobs:\n  ci:\n    runs-on: x\n  seed:\n    runs-on: x\n  ci-i8-sweep:\n    runs-on: x\n",
       );
       const pr = (head: string) => ({
         EVENT: "pull_request",
@@ -289,7 +287,7 @@ Deno.test({
               "jobs-99",
               JSON.stringify({
                 jobs: JSON.parse(runJobs()).jobs.filter((j: { name: string }) =>
-                  !j.name.startsWith("ci-ir-identity")
+                  !j.name.startsWith("ci-i8-sweep")
                 ),
               }),
             ),
@@ -302,8 +300,6 @@ Deno.test({
             write(
               "jobs-99",
               runJobs({
-                "ci-ir-identity (1)": "skipped",
-                "ci-ir-identity (2)": "skipped",
                 "ci-i8-sweep": "skipped",
               }),
             ),
@@ -409,8 +405,6 @@ Deno.test({
                 "ci-distilled": "skipped",
                 "ci-witnesses (1)": "skipped",
                 "ci-witnesses (2)": "skipped",
-                "ci-ir-identity (1)": "skipped",
-                "ci-ir-identity (2)": "skipped",
                 "ci-i8-sweep": "skipped",
               }),
             ),

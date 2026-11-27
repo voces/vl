@@ -31,9 +31,10 @@ Re-run `scripts/refresh-compiler.sh` after every `compiler/*.vl` edit.
   (`scripts/ir-i8-census/holdouts.tsv`); a lane closes a family of them by one general IR change,
   proposed to the coordinator first (owner ruling, 2026-11-26), and deletes their lines.
 - Do not re-run proof that CI runs on your PR. `scripts/ci-proof.sh rows` lists the gate rows CI
-  covers. In particular, no local byte A/B, claimless or `--cases` identity run over the corpus:
-  `ci-ir-identity` is that proof (coordinator, 2026-11-25). A local A/B is for a reading you
-  dispute, run on the programs in question only.
+  covers. In particular, no local byte A/B over the corpus: each program's pinned output, graded
+  by the corpus oracle, `ci-distilled`, `ci-witnesses` and the probes, is that proof. A local
+  A/B is for a reading you dispute, run on the programs in question only. A case you add that
+  prints carries `@run` with its `@log` lines; `@log` alone is never read.
 
 ## Standing rulings (do not ask; apply)
 
@@ -67,8 +68,7 @@ scripts/ready-check.sh [--sweep <program>...]
 
 It refuses a dirty tree and runs `scripts/gate.sh --fast`, read by its exit code. With `--sweep`,
 it also checks the Q58 armed position sweep. It notes whether `changelog.d/<branch>.md` exists
-(optional), and it ends with a block to paste into the READY. CI's `ci-ir-identity` runs `ir-identity.sh --cases`
-and `--claimless` on the PR, so a lane no longer runs them. ready-check does not cover these:
+(optional), and it ends with a block to paste into the READY. ready-check does not cover these:
 
 1. If you add or widen a claim: commit the Q58 armed position sweep under `tests/cases/` and pass
    its programs to `--sweep`.
