@@ -348,6 +348,7 @@ import {
   recAdPushListDecl,
   recAdPushMapDecl,
   recAdPushUnionList,
+  recAdPushWhole,
   recApartAt,
   recApartDecl,
   recApartDst,
@@ -7131,11 +7132,16 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     const iv = nodeAt(parenPeelIx(letInitAt(decl)))
     if iv is ArrayLit {
       if recAdoptUnionList(srcExpr, srcTy, dstTy) { return 0 }
-      // A list of record lists is built at the destination by its literal's stamp, keeping its
-      // type, and its own-storage deliveries are refused at the pass end (D15370).
+      // A list of record lists adopts the whole list it is delivered to, so its reads and the
+      // generics it is handed to follow that build; where it cannot, it is built there by its
+      // literal's stamp, keeping its type, and its own-storage deliveries are refused (D15370).
       const land = recAdLandingList(nonNulTyOf(dstTy))
       const se = tyArrayElemIx(srcTy)
       if se >= 0 && se < T.tys.length && tyAt(se) is TyArray && land >= 0 {
+        if !recReadIsSpread(p) && recAdPushWhole(decl, srcTy, land, p) {
+          recAdPushWholeElems(parenPeelIx(letInitAt(decl)), land)
+          return 0
+        }
         adoptLitAt(parenPeelIx(letInitAt(decl)), land)
         recApartDecl.push(decl)
         recApartDst.push(land)
@@ -7175,7 +7181,13 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       }
       return 0
     }
-    if bn is Call && recAdParamListArgs(b, nonNulTyOf(dstTy)) { return 0 }
+    if bn is Call && recAdParamListArgs(b, nonNulTyOf(dstTy)) {
+      // A binding holding the read holds what those arguments brought: the destination's record.
+      if recAdHeldDepth > 0 && recListArgsStamped(b) {
+        repStamp(p, nonNulTyOf(dstTy))
+      }
+      return 0
+    }
     // An element of an inferred function's list is delivered as that list is.
     if (
       bn is Call
@@ -7378,6 +7390,21 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     recAdNoteFields(p, d)
   }
   return 0
+}
+
+// Whether call `call` has a list literal argument and every one is stamped as built.
+function recListArgsStamped(call: i32): boolean {
+  const c = nodeAt(call)
+  if !(c is Call) { return false }
+  let n = 0
+  for a in c.callArgs {
+    const u = parenPeelIx(a)
+    if u >= 0 && nodeAt(u) is ArrayLit {
+      if !nodeRepStamped(u) { return false }
+      n = n + 1
+    }
+  }
+  return n > 0
 }
 
 // A call to a generic declared to return `T[]`: an element of its result can only be a value one
@@ -10706,6 +10733,45 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32) {
     }
     // no other source is a literal shape to stamp
     StrLit | CharLit | BoolLit | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread | LoopVar => {}
+  }
+  return 0
+}
+
+// Whether read `p` is a spread's argument: its elements are copied, so it is no whole delivery.
+function recReadIsSpread(p: i32): boolean {
+  cwIxBuild()
+  if p < 0 || !cwIxCovers(p) { return false }
+  const up = cwIxUp[p]
+  return up >= 0 && up < P.nodes.length && nodeAt(up) is Spread
+}
+
+// Each element of list literal `lit`, adopted whole as `whole`, that reads a binding holding
+// only a list literal adopts the element list in the same round: a list of record lists whole,
+// a list of records by its elements.
+function recAdPushWholeElems(lit: i32, whole: i32) {
+  const l = if lit >= 0 && lit < P.nodes.length { nodeAt(lit) } else { null }
+  const et = tyArrayElemIx(whole)
+  if (
+    !(l is ArrayLit)
+    || et < 0
+    || et >= T.tys.length
+    || !(tyAt(et) is TyArray)
+  ) {
+    return 0
+  }
+  for el in l.arrElems {
+    const p = parenPeelIx(el)
+    const d = if p >= 0 && nodeAt(p) is Ident { recLitOnlyDeclOf(p) } else { -1 }
+    const iv = if d >= 0 { parenPeelIx(letInitAt(d)) } else { -1 }
+    if iv >= 0 && nodeAt(iv) is ArrayLit {
+      const own = nodeTyIxOf(p)
+      const oe = tyArrayElemIx(own)
+      if oe >= 0 && oe < T.tys.length && tyAt(oe) is TyArray {
+        if recAdPushWhole(d, own, et, p) { recAdPushWholeElems(iv, et) }
+      } else {
+        recAdPushDecl(d, oe, tyArrayElemIx(et), true, p)
+      }
+    }
   }
   return 0
 }
