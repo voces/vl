@@ -13436,3 +13436,29 @@ owner:
 
 Each conversion kind lands with its own position sweep. A narrowing that loses a value stays a
 miss. Layers 2 to 4 read layer 1's rep.
+
+## The post-I8 engineering review's §5 is adopted in part (2026-11-27, coordinator ruling)
+
+The review (`docs/internals/engineering-review-2026-11-27.md`, branch ccr-67c3111d-1nl9t1,
+issue #10525) proposes an order. Adopted now:
+
+- **Delete the shadow and byte-identity machinery** (`VL_IR_SHADOW` modes that no gate reads,
+  `irPreBuild`, `irShadow*`, `irDualEmit`, `claimable()`/`IrFamily`, the dead `*shadow*.vl`
+  modules). Each deletion is traced per mode first: the review inferred deadness, and
+  `fn_ret_shadow.vl` is live.
+- **Spill a temp to a local** when it would otherwise be consumed out of legacy's byte order. Byte
+  identity is not a gate (2026-11-26), so the stage nodes that exist only to keep that order go.
+  First the holdout population that refuses on stage or order is counted, which says how much this
+  buys.
+- **Ratchet** the AST-backed `Rhs` kinds and the `irBMiss`/`missRhs`/`irLMiss` sites, so that a
+  holdout close does not add a one-function `Rhs` kind. Either count may only fall.
+- **A verifier failure reads as an internal error**, not as `cannot yet lower`.
+
+Deferred until the holdout layers (four layers, above) land: IR facts and passes (call graph,
+def-use, effects, then DCE, inliner, BCE, SROA), and the checker rework (42% of the compile;
+COV-START's profile work continues on it meanwhile). Modules and hygiene: `compiler/entry.wasm`
+is untracked now; the rest waits.
+
+Why: the owner's direction after I8 is to burn the holdouts down by generalizing the IR. The
+adopted items remove legacy constraints that the IR no longer needs, and they make the IR passes
+of the next phase possible. The deferred items are that next phase.
