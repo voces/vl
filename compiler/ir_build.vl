@@ -44,11 +44,10 @@ import {
   optCallCalleeOfMember,
   voidTwinForNode,
 } from "./emit_rewrite"
-// The IR shadow (ir-design-2026-11.md §5.2, step I0): with the shadow armed, `emitFuncCode`
-// hands each function here after its legacy lowering. The phase-A builder covers I1's set
-// (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
-// globals); any other construct leaves the function uncovered, a counted reason, not an error.
-// A covered function is verified and then discarded: nothing is claimed, so no byte moves.
+// The IR builder (ir-design-2026-11.md §5.2): each claim seam (`irClaimFn`, `irClaimStart`, a
+// thunk, a compare helper, a const cell) builds its unit's IR from the checked AST, verifies it and
+// hands it to the lowering. A construct the builder does not cover is a named miss, which declines
+// the unit; every outcome is a counted row the host prints under `$VL_IR_SHADOW`.
 import {
   emitFail,
   emitFailAt,
@@ -215,7 +214,6 @@ import {
   irCloFieldRetagNote,
   irFnBuiltOnce,
   irFnNew,
-  irFnText,
   irGlobalNote,
   irGlobalRepOf,
   irGlobalStoreNote,
@@ -244,9 +242,6 @@ import {
   sIf,
 } from "./ir"
 import {
-  RNicheRead,
-  RStructEq,
-  RUnionConcreteEq,
   boxListRetag,
   boxMapRetag,
   cloHoleRetag,
@@ -293,17 +288,12 @@ import {
 } from "./ir_verify_facts"
 import {
   irAstKind,
-  irDualEmit,
   irGlobalReadMiss,
   irGlobalWriteMiss,
-  irHexOf,
   irLowerClaim,
   irLowerEqHelper,
   irLowerFragment,
   irLowerHelper,
-  irLowerProbe,
-  irLoweredEntry,
-  irShadowLowerEqHelper,
   irSlotRowTy,
   irSlotRunAgrees,
   irSlotValtype,
@@ -369,7 +359,6 @@ import {
   callRefArgArmOf,
   callRefArmUnboxPlan,
   callRefBundleArgOf,
-  callRefLegacyPlainKey,
   callRefPlainKey,
   callRefPlainVoid,
   callRefSplitKind,
@@ -391,7 +380,6 @@ import {
   coalNulRefPlanOf,
   coalNulRefRungReached,
   coalNulRefsArmOf,
-  coerceHeldSwap,
   directArgUnionTyOf,
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
@@ -440,7 +428,6 @@ import {
   isArmTagOf,
   isDecidedFalse,
   keptDeclStoresNothing,
-  legacyContextLiveWhy,
   letIfInitPerArmRep,
   letStoresGenericAliasCore,
   listFitIsPlanOf,
@@ -935,15 +922,12 @@ import {
 import {
   FC_I32,
   LBK_UNION,
-  LiFrame,
   VKind,
   cboxReadsCell,
   cloLiftWriteCapAt,
   cloLiftWriteCount,
   cloLiftWriteSlot,
   coalLinkChainOf,
-  emitErr,
-  emitFailed,
   emitSoftAt,
   emitSoftFail,
   emitSoftMsg,
@@ -961,8 +945,6 @@ import {
   gPromoInStart,
   gTestEmitRefusal,
   globalStmtOrd,
-  liFrameRestore,
-  liFrameSave,
   localIsRef,
   maFoldScratchBase,
   monoGen,
@@ -976,7 +958,6 @@ import {
   sHeapIdx,
   sTy,
   sTyIx,
-  setIrShadowOn,
   startStmtOrd,
   startStmts,
   synthMintCount,
@@ -990,6 +971,7 @@ import {
   cloSigPosOfKey,
   cloSigTypeIdxAt,
   fnCheckedRetTy,
+  fnInMonoInstance,
   globalIndexOfSid,
 } from "./emit_fn_ret_kinds"
 import { declOrigOf, identDeclOf, nodeSrc, sidOfNode } from "./symbols"
@@ -1044,7 +1026,6 @@ import {
 import { recordHeapOfTy, structRowHeap } from "./emit_shape_intern"
 import {
   NICHE_NUL_LIT,
-  NICHE_NUL_MAP,
   RC_MAP,
   RC_REF_LIST,
   letBindingUnionTy,
@@ -1066,141 +1047,20 @@ import {
 import { declSlotPinned } from "./emit_collect"
 import { ListBuild } from "./emit_ref_list_kinds"
 
-let ibArmed = false
-let ibMode = 0
-let ibDetail = false
-let ibCorrupt = 0
 let ibRowKey: string[] = []
 let ibRowN: i32[] = []
 
-// The shadow's mode for the compiles that follow: 0 off, 1 armed, 2 armed with mismatch and `rep`
-// miss detail, 3 disarmed claiming every family but `other` (the claim path's test), 4 the
-// blocker census (each row names every class the function missed), 5 disarmed with the shipped
-// claim's rows printed.
-export function irShadowArm(on: i32) {
-  ibMode = on
-  ibArmed = armedIn(on)
-  setIrShadowOn(ibArmed)
-  ibDetail = on == 2
-  ibClaimAll = on == 3
-  ibAllMiss = on == 4
-  ibPrePost = on == 6
-  return 0
-}
+// The host's `$VL_IR_SHADOW` switch. Every compile keeps its rows (`count`) and the host prints
+// them when the switch is on, so arming the guest sets nothing.
+export function irShadowArm(_on: i32) { return 0 }
 
-// Whether shadow mode `on` arms the checks that compare the IR with what legacy wrote.
-function armedIn(on: i32): boolean {
-  return on == 1 || on == 2 || on == 4 || on == 6
-}
-
-// Mode 6, the order check: each function is also built and lowered where a claim builds it,
-// before legacy emits it, and compared with the shadow's build after. A builder or plan that reads
-// state legacy fills while emitting answers differently in the two orders.
-let ibPrePost = false
-let ibPreBuilt = false
-let ibPreWhy = ""
-let ibPreText = ""
-let ibPreCode: u8[] = []
-
-// Under mode 6, builds, verifies and lowers the function at `fnIx` before legacy emits it.
-export function irPreBuild(fnIx: i32, fnPos: i32) {
-  ibPreBuilt = false
-  if !ibPrePost { return 0 }
-  // The early build runs where a claim does, so unarmed as a claim is: an armed check that
-  // legacy has written the function already would fail it. A failure it causes stays a failure,
-  // since the writer has stopped, and the row names the function.
-  const failedBefore = emitFailed
-  ibArmed = false
-  preBuildUnarmed(fnIx, fnPos)
-  ibArmed = armedIn(ibMode)
-  if !failedBefore && emitFailed {
-    count(
-      "prepost differs: the early build failed the compile ("
-        + emitErr
-        + ") in "
-        + ib.irName,
-    )
-  }
-  return 0
-}
-
-function preBuildUnarmed(fnIx: i32, fnPos: i32) {
-  const gen = repNodeGen()
-  const minted = synthMintCount()
-  const why = build(fnIx, fnPos)
-  if synthMintCount() != minted {
-    count("prepost: the early build minted a synthetic global")
-  }
-  ibPreWhy = why
-  if why != "" || repNodeGen() != gen { return 0 }
-  ibPreBuilt = true
-  ibPreText = irFnText(ib)
-  ibPreCode = []
-  if irBVerify(ib).vfRule == 0 {
-    ibPreCode = irLowerProbe(ib, globalCtxOf(fnPos))
-  }
-  return 0
-}
-
-// Under mode 6, a row naming the function when its build after legacy differs from its build
-// before: built in one order only, or a different IR. `why` is the later build's miss.
-function prePostBuilt(why: string) {
-  const built = why == ""
-  if built != ibPreBuilt {
-    count(
-      "prepost differs: built "
-        + (if built { "after legacy only (" + ibPreWhy + ")" } else { "before legacy only (" + why + ")" })
-        + " in "
-        + ib.irName,
-    )
-    return 0
-  }
-  if built && irFnText(ib) != ibPreText {
-    count("prepost differs: ir text in " + ib.irName)
-  }
-  return 0
-}
-
-// Under mode 6, a row naming the function when its lowering after legacy differs from its
-// lowering before; `dual` is the shadow's verdict, whose `unlowered` means no lowering.
-function prePostLowered(dual: string) {
-  const unlowered = dual.length >= 9 && dual.slice(0, 9) == "unlowered"
-  const post: u8[] = if unlowered { [] } else { irLoweredEntry() }
-  let same = post.length == ibPreCode.length
-  let i = 0
-  while same && i < post.length {
-    if post[i] != ibPreCode[i] { same = false }
-    i = i + 1
-  }
-  if !same { count("prepost differs: lowered in " + ib.irName) }
-  return 0
-}
-
-let ibAllMiss = false
-// The classes the blocker census met in the function being built.
-let ibMisses: string[] = []
-// How many misses the census let the build go on past, so a statement can tell it built whole.
-let ibMissesPast = 0
-
-// Under the census, records `why` and lets the build go on; otherwise answers it.
-function censusGoesOn(why: string): boolean {
-  if !ibAllMiss { return false }
-  ibMissesPast = ibMissesPast + 1
-  for m in ibMisses {
-    if m == why { return true }
-  }
-  ibMisses.push(why)
-  return true
-}
-
-// The families whose every occurrence the shadow has matched, so a function built wholly of them
-// ships the IR's bytes and legacy does not run for it (design §10). A slice adds its family here.
+// The claimed families: a function built wholly of them ships the IR's bytes (design §10).
 const CLAIMED: IrFamily[] = [
   "scalar", "control", "call", "global", "map", "list", "box", "record",
   "closure", "start", "raw", "mem",
 ]
-let ibClaimAll = false
-// Set while `irClaimFn` builds, never under the shadow, which builds every function whole.
+const ibClaimAll = false
+// Set while `irClaimFn` builds.
 let ibClaimBuild = false
 
 function familyClaimed(fam: IrFamily): boolean {
@@ -1360,11 +1220,11 @@ function missAtOr(unit: i32): i32 {
 
 // The claim seam, before legacy lowers the function at `fnIx` (`fnStmts` slot `fnPos`): when the
 // builder covers it and every node is claimed, the lowering writes its code entry onto `out` and
-// this answers true, so legacy does not run. Armed, legacy always runs and the shadow checks it.
+// this answers true, so legacy does not run.
 export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   declUnit = -1
   // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
-  if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
+  if CLAIMED.length == 0 && !ibClaimAll { return false }
   const s = claimScopeBegin()
   const ok = claimFn(fnIx, fnPos, out)
   claimScopeEnd(s, ok)
@@ -1381,7 +1241,6 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   if softRefused("") { return declineRefused(emitSoftMsg) }
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
-  corrupt()
   if verifierRefused("this function") { return false }
   const why = irLowerClaim(ib, globalCtxOf(fnPos), fnPos, out)
   if why != "" {
@@ -1402,10 +1261,8 @@ function claimBuildMinted(before: i32): boolean {
   return true
 }
 
-// Whether the start body may be claimed: the `start` family is, and the shadow is not armed.
-export function irStartClaimOn(): boolean {
-  return !ibArmed && familyClaimed("start")
-}
+// Whether the start body may be claimed: the `start` family is.
+export function irStartClaimOn(): boolean { return familyClaimed("start") }
 
 // The claim seam for a start body (the single start, or an init function's, `poolFill` false),
 // before legacy writes it: built from `order` (an `orderGi` entry at or above 0 being that
@@ -1444,7 +1301,6 @@ function claimStart(
   if softRefused("start ") { return declineRefused(emitSoftMsg) }
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
-  corrupt()
   if verifierRefused("this top-level code") { return false }
   const why = irLowerClaim(ib, ibGlobalCtx(), -1, out)
   if why != "" {
@@ -1456,17 +1312,6 @@ function claimStart(
   count("claimed start")
   return true
 }
-
-// The shadow's failing controls: 0 none; the verifier refuses 1 (a rep swapped), 2 (a temp's
-// definition deleted), 7 to 12 (`unrelatedMapControl`, `otherAgainControl`, `nulEqNoNullableControl`,
-// `nicheKindControl` both ways, `headControl`); the dual emit reports 3 (a byte added), 4 (a span
-// row dropped) and 5 (its element-read rows); 6 is the held coercion.
-export function irShadowCorrupt(k: i32) {
-  ibCorrupt = k
-  return 0
-}
-
-export function irShadowArmed(): boolean { return ibArmed }
 
 // Starts a compile's report.
 export function irShadowBegin() {
@@ -3624,14 +3469,8 @@ function openBinRep(ix: i32): i32 {
   return if t >= 0 { repNodeOfTy(t) } else { -1 }
 }
 
-// Miss `miss` at node `ix` whose type has no rep; the shadow's detail mode adds a row naming the
-// node's kind and the function, and leaves the class itself unchanged.
-function repMissAt(ix: i32, miss: string): Opnd {
-  if ibDetail {
-    count("detail " + miss + " of " + irAstKind(ix) + " in " + ib.irName)
-  }
-  return irBMiss(miss)
-}
+// Miss `miss` at node `ix` whose type has no rep (the census probe names the node's kind).
+function repMissAt(_ix: i32, miss: string): Opnd { return irBMiss(miss) }
 
 // Call `n` at `ix`, whose own type has no rep, at its callee's result rep: a direct call of a
 // declaration that returns; any other call misses as the rep it lacks.
@@ -4409,6 +4248,25 @@ function elemRowLetTy(d: i32, rep: i32): i32 {
   return if st >= 0 && repNodeOfTy(st) == rr && !irTyHeldOpen(st, rr) { st } else { -1 }
 }
 
+// Whether struct row `si`'s record and type `ty` are records of one field-name set: a value the record
+// solve builds at another record (D2933) is that row's value under another layout.
+export function rowSameFieldNames(si: i32, ty: i32): boolean {
+  if si < 0 || si >= sTyIx.length || ty < 0 { return false }
+  const a = tyAt(sTyIx[si])
+  const t = tyAt(ty)
+  if (
+    !(a is TyObj)
+    || !(t is TyObj)
+    || a.objFieldNames.length != t.objFieldNames.length
+  ) {
+    return false
+  }
+  for f in a.objFieldNames {
+    if !strListHas(t.objFieldNames, f) { return false }
+  }
+  return true
+}
+
 // Each struct row's stored type (`rowStoredTy`), per compile; -2 while the row is being built.
 let rowStoredMemo: {[i32]: i32} = Map()
 
@@ -4527,15 +4385,49 @@ function declRowLetTy(d: i32, rep: i32): i32 {
 }
 
 // Whether local `v`, declared at `d` and not yet used, takes its initializer's rep `built` as its
-// storage row, the D14434 binding column's (`letBindTy`), as legacy's cell does; `v` is retyped.
+// storage: the D14434 binding column's row (`letBindTy`), as legacy's cell does, or a list a
+// `const` is held at as built (`builtHeldTy`); `v` is retyped.
 function localStoredAt(v: i32, d: i32, built: i32): boolean {
   const bt = heldTy(letBindTy(d, ibFnIx))
-  const st = if bt >= 0 && repNodeOfTy(bt) == built { bt } else { localSlotRecordTy(d, built) }
+  const st0 = if bt >= 0 && repNodeOfTy(bt) == built { bt } else { localSlotRecordTy(d, built) }
+  const st = if st0 >= 0 { st0 } else { builtHeldTy(v, d, built) }
   if st < 0 { return false }
   ib.irVars[v].vRep = built
   ib.irVars[v].vTy = st
   ibDeclRowSeen = true
   return true
+}
+
+// The type a `const` `d` is held at where its initializer is built as a list at `built` that its
+// variable `v`'s rep takes by no `irConvert` case: a value that cannot be rebuilt at the binding,
+// so the binding is its build. -1 otherwise, or inside an instance, whose locals the template's share.
+function builtHeldTy(v: i32, d: i32, built: i32): i32 {
+  if v < 0 || v >= ib.irVars.length { return -1 }
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(n is LetDecl) || n.letKw != "const" || !(repNodeAt(built) is RList) {
+    return -1
+  }
+  if fnInPinnedInstance(ibFnIx) || fnInMonoInstance(ibFnIx) { return -1 }
+  const o: Opnd = { oiRep: built, oiBits: 0 }
+  if convertKindOf(o, ib.irVars[v].vRep, ib.irVars[v].vTy, n.letInit) >= 0 {
+    return -1
+  }
+  const t = repTyOf(built)
+  return if t >= 0 && !irTyHeldOpen(t, built) { t } else { -1 }
+}
+
+// Whether `const` `d`'s variable `v` is held at its build (`builtHeldTy`), its type's rep not its own.
+function builtHeldVar(d: i32, v: i32): boolean {
+  if v < 0 || v >= ib.irVars.length { return false }
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(n is LetDecl)
+    || n.letKw != "const"
+    || !(repNodeAt(ib.irVars[v].vRep) is RList)
+  ) {
+    return false
+  }
+  return repNodeOfTy(heldTy(scopeTyAt(d, ibFnIx))) != ib.irVars[v].vRep
 }
 
 // Whether local `v`, not yet used, takes record value `o` laid out at its struct row (`irOpRow`)
@@ -4645,6 +4537,7 @@ function declVarAt(d: i32, rep: i32, ty: i32): i32 {
       ib.irVars[held].vRep != rep
       && !openRepTakes(ty, rep, ib.irVars[held].vRep)
       && !slotDeclStores(ty, rep, ib.irVars[held].vRep, slot)
+      && !slotHeldByTwin(d, held)
     ) {
       irBMiss("local slot shared across reps")
       return -1
@@ -4655,6 +4548,24 @@ function declVarAt(d: i32, rep: i32, ty: i32): i32 {
   const v = irVarNew(ib, rep, ty, "local", slot)
   ibDeclVar[d] = v
   return v
+}
+
+// Whether variable `held` is declared for a declaration that is binding `d` itself in this
+// instance (one minted for it, or copied from it): the instance's own storage, whatever `d`'s rep.
+function slotHeldByTwin(d: i32, held: i32): boolean {
+  for k in ibDeclVar.keys() {
+    if (ibDeclVar[k] ?? -1) == held && sameBindingDecl(k, d) { return true }
+  }
+  return false
+}
+
+// Whether declarations `a` and `b` are one binding: equal, or one minted for or copied from the other.
+function sameBindingDecl(a: i32, b: i32): boolean {
+  return a == b
+    || declOrigOf(a) == b
+    || declOrigOf(b) == a
+    || (nodeSrc[a] ?? -1) == b
+    || (nodeSrc[b] ?? -1) == a
 }
 
 // The local variable holding wasm local `w`, or -1.
@@ -6803,6 +6714,8 @@ function narrowedLocalRead(
   if rowlessReadTyOfVar(ix, v) == ib.irVars[v].vTy { return o }
   // A map local held at its slot's map (`slotMapHeldTy`) reads as it is stored.
   if slotMapHeldVar(identDeclOf(ix), v) { return o }
+  // So does a `const` held at its build (`builtHeldTy`).
+  if builtHeldVar(identDeclOf(ix), v) { return o }
   // A nullable record local held at a row its narrowed read's record does not record reads past
   // its null at that row.
   const pn = storedPastNullTy(ix, v, rep)
@@ -7066,6 +6979,16 @@ function globalStorage(d: i32): Storage {
   const br = if bt >= 0 { globalTyRep(bt) } else { -1 }
   if br >= 0 && br != r && repNodeAt(br) is RList {
     return storageAt(br, bt, -1)
+  }
+  // So is a value `if` global of `null` and a read of a record the solve builds elsewhere, at that
+  // build's nullable.
+  const gn = nodeAt(d)
+  const iv = if ht < 0 && gn is LetDecl && gn.letInit >= 0 { nodeAt(unwrapParen(gn.letInit)) } else { null }
+  const nt = if iv is IfStmt { heldTy(letBindTy(d, -1)) } else { -1 }
+  const nr = if nt >= 0 && !irTyOpen(nt) { globalTyRep(nt) } else { -1 }
+  const nn = if nr >= 0 && nr != r { repNodeAt(nr) } else { null }
+  if nn is RNullable && repNodeAt(nn.rnInner) is RRecord {
+    return storageAt(nr, nt, -1)
   }
   return storageAt(r, globalStoreTy(d, r), -1)
 }
@@ -8191,9 +8114,6 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   if tfe >= 0 { return lambdaRecordCall(b, c, ix, tfe) }
   if key == "" { callSplitRefuse(c, ix) }
   if key == "" { return missRhs("call of a non-declaration") }
-  if !legacyPlainAgrees(ix, key) {
-    return missRhs("closure call plan disagrees")
-  }
   const cf = if c.callFn >= 0 && c.callFn < P.nodes.length { nodeAt(c.callFn) } else { null }
   const f = if cf is Member && nodeTyAt(c.callFn, ibFnIx) < 0 { sharedFieldCallee(b, cf, c.callFn) } else { irBExpr(b, c.callFn) }
   if ibMiss != "" { return missRhs("closure callee") }
@@ -8308,25 +8228,11 @@ function sharedFieldCallee(b: i32[], m: Member, at: i32): Opnd {
   return irBLetTempTy(b, g, at, vkr, vft)
 }
 
-// Armed, legacy has written call `ix` already, and must have taken the plain path at `key`.
-function legacyPlainAgrees(ix: i32, key: string): boolean {
-  if ibArmed && callRefLegacyPlainKey(ix) != key {
-    emitFail(
-      "emitProgram: internal: the IR's plain closure call disagrees with legacy's",
-    )
-    return false
-  }
-  return true
-}
-
 // A call `ix` through a bundle parameter (D14841) that legacy writes plainly
 // (`bundleCallRefPlainKey`): the member `bundlePickOf` reads, called at its key.
 function bundleCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const key = bundleCallRefPlainKey(ix, ibFnIx)
   if key == "" { return missRhs("bundle call") }
-  if !legacyPlainAgrees(ix, key) {
-    return missRhs("closure call plan disagrees")
-  }
   const pk = bundlePickOf(ix, ibFnIx)
   // The parameter's local, or a captured bundle read at the record its capture holds (`capTyOf`).
   const cf = if c.callFn >= 0 && c.callFn < P.nodes.length { nodeAt(c.callFn) } else { null }
@@ -8346,9 +8252,6 @@ function bundleCallRhs(b: i32[], c: Call, ix: i32): Rhs {
 function holderCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const key = holderCallRefPlainKey(ix, ibFnIx)
   if key == "" { return missRhs("holder call") }
-  if !legacyPlainAgrees(ix, key) {
-    return missRhs("closure call plan disagrees")
-  }
   const pk = holderPickOf(ix, ibFnIx)
   // A holder captured whole is read at the record its capture holds (`capTyOf`).
   const v = if calleeIsCapture(c.callFn) { bundleCaptureRead(b, c.callFn) } else { holderRecordOf(b, c.callFn) }
@@ -8372,9 +8275,6 @@ function lambdaRecordCallOf(rx: i32): boolean {
 // (`bundleResultPickOf`, legacy's `emitBundleResultPick`), at plain key `callRefPlainKey`.
 function resultMemberCallRhs(b: i32[], c: Call, ix: i32, rx: i32): Rhs {
   const key = callRefPlainKey(ix, ibFnIx)
-  if !legacyPlainAgrees(ix, key) {
-    return missRhs("closure call plan disagrees")
-  }
   const ic = nodeAt(rx)
   if !(ic is Call) { return missRhs("result member callee") }
   // A top-level `const` lambda's call is its record as a named function's is.
@@ -11319,6 +11219,8 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   }
   const fl = if ibMiss == "" && dst >= 0 { freshListAt(b, ix, dst, dstTy) } else { null }
   if fl != null { return fl }
+  const ifV = if ibMiss == "" && dst >= 0 { recIfAtDst(b, ix, dst, dstTy) } else { null }
+  if ifV != null { return ifV }
   const cellV = if ibMiss == "" && dst >= 0 && atomNullable(dst) { asgAtCellRep(b, ix, dst) } else { null }
   if cellV != null { return cellV }
   // A `??` whose own type has no rep (a link legacy mints) is built at the destination's rep, as
@@ -13701,6 +13603,60 @@ function listCopyStmt(b: i32[], n: Call, ix: i32): i32 {
   const r: Rhs = { lcArgs: args, lcAt: ix }
   irBNode(b, { efRhs: r }, -1, ibNoValue, ix)
   return 0
+}
+
+// The value of each arm of `if` `n`, through `else if` links, into `out`; false where an arm has no
+// value or no `else`.
+function ifArmLeaves(n: IfStmt, out: i32[]): boolean {
+  if n.ifElse < 0 { return false }
+  const tv = ifArmValueExpr(n.ifThen)
+  if tv < 0 { return false }
+  out.push(unwrapParen(tv))
+  const en = nodeAt(n.ifElse)
+  if en is IfStmt { return ifArmLeaves(en, out) }
+  const ev = ifArmValueExpr(n.ifElse)
+  if ev < 0 { return false }
+  out.push(unwrapParen(ev))
+  return true
+}
+
+// Value `if` `ix` of `null`, object literals already built at record `R` and other reads, delivered
+// at `R | null` rep `dst`: the `if` built there, each arm going in as a value into its join does.
+function recIfAtDst(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd | null {
+  const u = unwrapParen(ix)
+  const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if !(n is IfStmt) || exprRepOf(u) == dst || exprPrePathWhy(u, ibFnIx) != "" {
+    return null
+  }
+  const dn = repNodeAt(dst)
+  if !(dn is RNullable) || !(repNodeAt(dn.rnInner) is RRecord) { return null }
+  const rec = dn.rnInner
+  const leaves: i32[] = []
+  if !ifArmLeaves(n, leaves) { return null }
+  let any = false
+  let nul = false
+  for l in leaves {
+    const ln = nodeAt(l)
+    if ln is NullLit {
+      nul = true
+    } else if (
+      ln is ObjLit && exprRepOf(l) == rec
+      || !(ln is ObjLit)
+        && repNodeAt(exprRepOf(l)) is RRecord
+        && exprPrePathWhy(l, ibFnIx) == ""
+    ) {
+      any = true
+    } else {
+      return null
+    }
+  }
+  if !any || !nul { return null }
+  // The join's type is one whose rep is `dst`: a nullable rep's own type can be its inner record's.
+  const t0 = if dstTy >= 0 { dstTy } else { repTyOf(dst) }
+  const rt = repTyOf(rec)
+  const ty = if t0 >= 0 && repNodeOfTy(t0) == dst { t0 } else if rt >= 0 { nullableTyOf(rt) } else { -1 }
+  if ty < 0 || irTyOpen(ty) || repNodeOfTy(ty) != dst { return null }
+  return ifExprAt(b, n, u, dst, ty)
 }
 
 // Assignment `ix` to a `K | null` local, used as a value delivered at that local's own rep `dst`:
@@ -19720,11 +19676,6 @@ function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const cut = stmtNode(b, ix, sibs, pos) == IF_CUTS_BLOCK
     && nodeAt(ix) is IfStmt
   if ibMiss != "" && ibMissAt < 0 { ibMissAt = ix }
-  if ibMiss != "" && censusGoesOn(ibMiss) {
-    ibMiss = ""
-    ibMissAt = -1
-    ibStubRhs = -1
-  }
   // Legacy writes back a region's length after its last statement, inside that statement's
   // span (`emitStmtIn`).
   if reserveEnds(ix) {
@@ -20252,13 +20203,9 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     return skip("else-less nullable tail")
   }
   if ln is RetStmt || ln is IfStmt {
-    const past = ibMissesPast
     stmt(b, last, stmts, stmts.length - 1)
-    // A tail `if` whose arms yield values rather than returning is I1's (`siOut`). An arm the
-    // census built past a miss in is incomplete, not valued.
-    if ibMiss == "" && past == ibMissesPast && !irBodyLeaves(ib, b) {
-      return skip("valued tail if")
-    }
+    // A tail `if` whose arms yield values rather than returning is I1's (`siOut`).
+    if ibMiss == "" && !irBodyLeaves(ib, b) { return skip("valued tail if") }
     return 0
   }
   const n0 = b.length
@@ -20525,9 +20472,7 @@ function build(fnIx: i32, fnPos: i32): string {
   ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
   const none = repIsNoValue(ib.irRetRep)
   if !(valueRep(ib.irRetRep, ib.irRetTy) || none) {
-    if !censusGoesOn("result rep " + repWhat(ib.irRetRep)) {
-      return "result rep " + repWhat(ib.irRetRep)
-    }
+    return "result rep " + repWhat(ib.irRetRep)
   }
   ibNoValue = if none { ib.irRetRep } else { -1 }
   ib.irBuiltOnce = fnBuiltOnce(fn, fnIx)
@@ -20569,7 +20514,6 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibMissAt = -1
   ibStubRhs = -1
   ibAliasRhs = -1
-  ibMisses = []
   ibReserveEnd = []
   ibReservePushes = []
   lbPlanDrop(null)
@@ -20852,15 +20796,9 @@ function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
       i = i + 1
       continue
     }
-    if isVoidTy(ty) || !valueRep(r, ty) {
-      if !censusGoesOn("parameter rep " + repWhat(r)) {
-        return "parameter rep " + repWhat(r)
-      }
-    }
+    if isVoidTy(ty) || !valueRep(r, ty) { return "parameter rep " + repWhat(r) }
     // An unannotated parameter's type is open until a call instances it.
-    if irTyHeldOpen(ty, r) && !censusGoesOn("open parameter type") {
-      return "open parameter type"
-    }
+    if irTyHeldOpen(ty, r) { return "open parameter type" }
     const v = irVarNew(ib, r, ty, "param", shift + i)
     ibDeclVar[p] = v
     ib.irParams.push(v)
@@ -20876,7 +20814,6 @@ type IbFrame = {
   bfFnPos: i32,
   bfDeclRowSeen: boolean,
   bfMiss: string,
-  bfMisses: string[],
   bfDeclVar: {[i32]: i32},
   bfLoopName: string[],
   bfLoopBrk: i32[],
@@ -20893,7 +20830,6 @@ function ibSave(): IbFrame {
     bfFnPos: ibFnPos,
     bfDeclRowSeen: ibDeclRowSeen,
     bfMiss: ibMiss,
-    bfMisses: ibMisses,
     bfDeclVar: ibDeclVar,
     bfLoopName: ibLoopName,
     bfLoopBrk: ibLoopBrk,
@@ -20911,7 +20847,6 @@ function ibRestore(f: IbFrame) {
   ibFnPos = f.bfFnPos
   ibDeclRowSeen = f.bfDeclRowSeen
   ibMiss = f.bfMiss
-  ibMisses = f.bfMisses
   ibDeclVar = f.bfDeclVar
   ibLoopName = f.bfLoopName
   ibLoopBrk = f.bfLoopBrk
@@ -20920,21 +20855,6 @@ function ibRestore(f: IbFrame) {
   ibBool = f.bfBool
   ibNoValue = f.bfNoValue
   return 0
-}
-
-// The op seam's legacy-to-IR door: node `ix` of function `fnIx` lowered onto the buffer legacy is
-// writing, at the rep of `ty` (-1: the node's type), in legacy's frame (live slots, no new local).
-// "" when written; else the miss, nothing written: a live legacy context (`legacyContextLiveWhy`; a
-// `probe` skips it and banks no row), a build, rep-epoch, verifier or lowering miss.
-function irLowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
-  if !probe {
-    const live = legacyContextLiveWhy(ix)
-    if live != "" { return "legacy context live: " + live }
-  }
-  const sv = ibSave()
-  const why = lowerNodeIn(ix, fnIx, ty, probe, -1, -1)
-  ibRestore(sv)
-  return why
 }
 
 // Global `gi`'s constant initializer (statement `gst`) lowered onto the buffer the global section
@@ -20949,10 +20869,9 @@ export function irLowerConstCell(gi: i32, gst: i32, probe: boolean): string {
   return why
 }
 
-// The claim seam for global `gi`'s constant initializer: unarmed and every node in a claimed family,
-// the IR writes it and this answers true, so legacy does not; armed, legacy always runs.
+// The claim seam for global `gi`'s constant initializer: every node in a claimed family, the IR
+// writes it and this answers true, so legacy does not.
 export function irClaimConstCell(gi: i32, gst: i32): boolean {
-  if ibArmed { return false }
   const s = claimScopeBegin()
   const why = irLowerConstCell(gi, gst, false)
   claimScopeEnd(s, why == "")
@@ -20963,94 +20882,6 @@ export function irClaimConstCell(gi: i32, gst: i32): boolean {
     return false
   }
   count("claimed const cell")
-  return true
-}
-
-// Under the armed shadow, the per-occurrence count of a legacy site (ir-design §10): node `ix` of
-// `fnIx` at type `ty`, legacy's bytes for it in the current buffer from `from` on, lowered as a
-// fragment into a scratch buffer and counted `node-in <kind>: matched`, `differ` or `miss <why>`.
-export function irNodeInShadow(
-  ix: i32,
-  fnIx: i32,
-  ty: i32,
-  from: i32,
-  before: LiFrame,
-): i32 {
-  if !ibArmed { return 0 }
-  // The probe allocates scratch rows from the frame legacy began with, then legacy's are put back.
-  const after = liFrameSave()
-  liFrameRestore(before)
-  const row = nodeInShadowGo(ix, fnIx, ty, from)
-  liFrameRestore(after)
-  return row
-}
-
-function nodeInShadowGo(ix: i32, fnIx: i32, ty: i32, from: i32): i32 {
-  const live = legacyContextLiveWhy(ix)
-  if live != "" { count("node-in context live: " + live) }
-  if ibCorrupt == 6 { heldControl(ix, fnIx) }
-  const cur = wTarget([])
-  const why = irLowerNodeIn(ix, fnIx, ty, true)
-  const got = wTarget(cur)
-  let row = "matched"
-  if why != "" {
-    row = "miss " + why
-  } else if !bytesFrom(cur, from, got) {
-    row = "differ"
-    if ibDetail {
-      row = row + " " + irHexOf(cur.slice(from)) + "| " + irHexOf(got)
-    }
-  }
-  return count("node-in " + irAstKind(ix) + ": " + row)
-}
-
-// Under the armed shadow, global `gi`'s constant initializer `ix` (statement `gst`, arm `arm`),
-// legacy's bytes for it from `from` on, lowered as a fragment: `const cell <arm> <kind>: matched`
-// or `miss <why>`, and a differ as `mismatch bytes: const cell <arm> <kind>`.
-export function irConstCellShadow(
-  gi: i32,
-  gst: i32,
-  ix: i32,
-  from: i32,
-  arm: string,
-): i32 {
-  if !ibArmed { return 0 }
-  const live = legacyContextLiveWhy(ix)
-  const cur = wTarget([])
-  const why = irLowerConstCell(gi, gst, true)
-  const got = wTarget(cur)
-  // The dual emit's control 3 adds a byte to the fragment, which must turn a match into a differ.
-  if ibCorrupt == 3 && why == "" { got.push(1) }
-  const at = arm + " " + irAstKind(ix)
-  if why == "" && !bytesFrom(cur, from, got) {
-    // A differ is a mismatch, so the corpus baseline and the bytes veto see it.
-    const hex = if ibDetail { " " + irHexOf(cur.slice(from)) + "| " + irHexOf(got) } else { "" }
-    return count("mismatch bytes: const cell " + at + hex)
-  }
-  const row = if why != "" { "miss " + why } else { "matched" }
-  const under = if live != "" { " under " + live } else { "" }
-  return count("const cell " + at + ": " + row + under)
-}
-
-// The held-coercion control (`irShadowCorrupt(6)`): the guard read with the mark on the fragment's
-// root, then on its enclosing function, an ancestor; the first must name it and the second not.
-function heldControl(ix: i32, fnIx: i32) {
-  const was = coerceHeldSwap(ix)
-  count("node-in held root: " + legacyContextLiveWhy(ix))
-  coerceHeldSwap(fnIx)
-  count("node-in held ancestor: " + legacyContextLiveWhy(ix))
-  coerceHeldSwap(was)
-  return 0
-}
-
-// Whether `b` from `at` on holds exactly `want`.
-function bytesFrom(b: u8[], at: i32, want: u8[]): boolean {
-  if at < 0 || b.length - at != want.length { return false }
-  let i = 0
-  while i < want.length {
-    if b[at + i] != want[i] { return false }
-    i = i + 1
-  }
   return true
 }
 
@@ -21116,127 +20947,10 @@ function lowerNodeIn(
   return irLowerFragment(ib, out, globalCtxNow(), fnPos, probe)
 }
 
-// The map join's failing control (`irShadowCorrupt(7)`): a nullable map `??`'s map out moved to
-// another map's rep and type, which the verifier's nullable-reference rule must refuse.
-function unrelatedMapControl() {
-  for n in ib.irNodes {
-    if !(n is SCoalBox) || n.cbArm != "nulRef" || n.cbOut < 0 { continue }
-    const o = ib.irVars[n.cbOut].vRep
-    if !(repNodeAt(o) is RMap) { continue }
-    for v in ib.irVars {
-      if (
-        repNodeAt(v.vRep) is RMap
-        && v.vRep != o
-        && v.vRep != repOfNulInner(irBOpRep(n.cbL))
-      ) {
-        ib.irVars[n.cbOut].vRep = v.vRep
-        ib.irVars[n.cbOut].vTy = v.vTy
-        return 0
-      }
-    }
-  }
-  return 0
-}
-
-// The operand re-read's failing control (`irShadowCorrupt(8)`): a union compare off the null leg
-// marked as reading its operand again, which the verifier must refuse.
-function otherAgainControl() {
-  for n in ib.irNodes {
-    if !(n is SLet) { continue }
-    const r = n.lRhs
-    if r is RUnionConcreteEq && !r.ucNul {
-      r.ucOtherAgain = true
-      return 0
-    }
-  }
-  return 0
-}
-
-// The nullable compare's failing control (`irShadowCorrupt(9)`): a record compare of two
-// non-nullable sides marked nullable, which verifier rule 2 must refuse.
-function nulEqNoNullableControl() {
-  for n in ib.irNodes {
-    if !(n is SLet) { continue }
-    const r = n.lRhs
-    if r is RStructEq && !r.seNul {
-      r.seNul = true
-      return 0
-    }
-  }
-  return 0
-}
-
-// The niche read's failing controls (`irShadowCorrupt(10)`, `(11)`): each reference niche read's
-// kind moved to another shape's, forward (list, closure, map) or back, which rule 2 must refuse.
-function nicheKindControl(back: boolean) {
-  for n in ib.irNodes {
-    if !(n is SLet) { continue }
-    const r = n.lRhs
-    if (
-      !(r is RNicheRead)
-      || r.nrKind == 1
-      || r.nrKind == 2
-      || r.nrKind == NICHE_NUL_LIT
-    ) {
-      continue
-    }
-    const isMap = r.nrKind == NICHE_NUL_MAP
-    const isFn = r.nrKind == 11
-    if back {
-      r.nrKind = if isMap { 11 } else if isFn { 7 } else { NICHE_NUL_MAP }
-    } else {
-      r.nrKind = if isMap { 7 } else if isFn { NICHE_NUL_MAP } else { 11 }
-    }
-  }
-  return 0
-}
-
 // The inner rep of nullable rep `r`, or -1.
 function repOfNulInner(r: i32): i32 {
   const n = repNodeAt(r)
   return if n is RNullable { n.rnInner } else { -1 }
-}
-
-// The call head's failing control (`irShadowCorrupt(12)`): a staged head read by its call as a plain
-// callee, which rule 10 must refuse.
-function headControl() {
-  for n in ib.irNodes {
-    const r = if n is SLet { n.lRhs } else if n is SEffect { n.efRhs } else { null }
-    if r is RCallRef && r.crHead { r.crHead = false }
-  }
-  return 0
-}
-
-// The failing control: breaks `ib` in the way `ibCorrupt` names.
-function corrupt() {
-  if ibCorrupt == 7 { unrelatedMapControl() }
-  if ibCorrupt == 8 { otherAgainControl() }
-  if ibCorrupt == 9 { nulEqNoNullableControl() }
-  if ibCorrupt == 10 || ibCorrupt == 11 { nicheKindControl(ibCorrupt == 11) }
-  if ibCorrupt == 12 { headControl() }
-  if ibCorrupt == 1 && ib.irVars.length > 0 {
-    const v = ib.irVars[0]
-    const other = if repPrim(v.vRep) == "bool" { repNodeOfTy(TY_I32) } else { ibBool }
-    v.vRep = other
-  }
-  if ibCorrupt == 2 {
-    let i = 0
-    while i < ib.irNodes.length {
-      const n = ib.irNodes[i]
-      if (
-        n is SLet
-        && n.lDst >= 0
-        && n.lDst < ib.irVars.length
-        && ib.irVars[n.lDst].vKind == "temp"
-      ) {
-        const t: IrNode = { tpWhy: 0 }
-        ib.irNodes[i] = t
-        return 0
-      }
-      i = i + 1
-    }
-  }
-  return 0
 }
 
 // The context the function at `fnStmts` slot `fnPos` accesses globals in. The start function's
@@ -21251,112 +20965,6 @@ function ibGlobalCtx(): GlobalCtx {
 function globalCtxOf(fnPos: i32): GlobalCtx {
   const c: GlobalCtx = { gcInStart: false, gcFnPos: fnPos, gcGuardOff: false }
   return c
-}
-
-// The dual emit of a verified function: its lowering against the legacy code entry `emitFuncCode`
-// wrote onto `out` from `outStart`, and the span rows it banked from `spanBase`. "" when they
-// match, else the mismatch class.
-function dualEmit(
-  pre: string,
-  ctx: GlobalCtx,
-  out: u8[],
-  outStart: i32,
-  spanBase: i32,
-): string {
-  const legacy: u8[] = []
-  let i = outStart
-  while i < out.length {
-    legacy.push(out[i])
-    i = i + 1
-  }
-  const skew = if ibCorrupt == 3 { 1 } else if ibCorrupt == 4 { 2 } else if ibCorrupt == 5 { 3 } else { 0 }
-  if gPromoInStart {
-    count("fail the start body reached the IR shadow")
-    return "start body"
-  }
-  const why = irDualEmit(ib, ctx, legacy, spanBase, outStart, skew)
-  if why == "" {
-    count(pre + "matched")
-    return ""
-  }
-  count("mismatch " + pre + why)
-  if ibDetail && rowN("mismatch " + pre + why) <= 3 {
-    count(
-      "detail "
-        + why
-        + " in "
-        + ib.irName
-        + "\nlegacy "
-        + irHexOf(legacy)
-        + "\nir     "
-        + irHexOf(irLoweredEntry())
-        + "\n"
-        + irFnText(ib),
-    )
-  }
-  return why
-}
-
-// How many times row `key` has been counted.
-function rowN(key: string): i32 {
-  let i = 0
-  while i < ibRowKey.length {
-    if ibRowKey[i] == key { return ibRowN[i] }
-    i = i + 1
-  }
-  return 0
-}
-
-// The seam: builds, verifies, lowers and discards the function at `fnIx`, counting the outcome.
-export function irShadowFn(
-  fnIx: i32,
-  fnPos: i32,
-  out: u8[],
-  outStart: i32,
-  spanBase: i32,
-) {
-  count("fns")
-  const gen = repNodeGen()
-  const why = build(fnIx, fnPos)
-  if ibAllMiss { return censusRow(why) }
-  if ibPrePost { prePostBuilt(why) }
-  if why != "" {
-    count("uncovered " + why)
-    return 0
-  }
-  count("covered")
-  corrupt()
-  const v = irBVerify(ib)
-  // A tree rebuilt mid-build leaves node indices that name nothing; no verdict holds.
-  if repNodeGen() != gen {
-    count("rep epoch moved")
-    return 0
-  }
-  if v.vfRule == 0 {
-    count("verified")
-    const dual = dualEmit("", globalCtxOf(fnPos), out, outStart, spanBase)
-    if ibPrePost && ibPreBuilt { prePostLowered(dual) }
-    // A function the claim rule takes must match: a claim is never a fallback.
-    if dual != "" && claimable() {
-      count(
-        "fail a claimable function did not match: " + dual + " in " + ib.irName,
-      )
-    }
-    return 0
-  }
-  count(
-    "fail rule "
-      + i32ToStr(v.vfRule)
-      + " in "
-      + ib.irName
-      + " at "
-      + i32ToStr(v.vfNode)
-      + ": "
-      + v.vfMsg
-      + "\n"
-      + irFnText(ib),
-  )
-  return 0
 }
 
 // The closure thunk of the function at `fnStmts` slot `fe`, one `collectCloThunks` gave a thunk:
@@ -21436,7 +21044,7 @@ function thunkRetTy(ty: i32, r: i32): i32 {
 // The claim seam for the thunk of `fe`, before legacy writes it: when it builds and every node is
 // in a claimed family, the lowering writes its code entry onto `out` and this answers true.
 export function irClaimThunk(fe: i32, out: u8[]): boolean {
-  if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
+  if CLAIMED.length == 0 && !ibClaimAll { return false }
   const s = claimScopeBegin()
   const ok = claimThunk(fe, out)
   claimScopeEnd(s, ok)
@@ -21447,7 +21055,6 @@ function claimThunk(fe: i32, out: u8[]): boolean {
   const built = buildThunk(fe)
   if softRefused("thunk ") { return false }
   if built != "" || !claimable() { return false }
-  corrupt()
   if irBVerify(ib).vfRule != 0 { return thunkFellBack("verifier") }
   const why = irLowerHelper(ib, out)
   if why != "" { return thunkFellBack(why) }
@@ -21458,39 +21065,6 @@ function claimThunk(fe: i32, out: u8[]): boolean {
 function thunkFellBack(why: string): boolean {
   count("claim fell back: thunk " + why)
   return false
-}
-
-// Under the armed shadow, the thunk of `fe` legacy wrote onto `out` from `from`, against its IR
-// lowering: `thunk matched`, `thunk uncovered <why>`, or a `mismatch thunk` class.
-export function irShadowThunk(fe: i32, out: u8[], from: i32) {
-  if !ibArmed { return 0 }
-  count("thunk fns")
-  const why = buildThunk(fe)
-  if why != "" { return count("thunk uncovered " + why) }
-  corrupt()
-  const v = irBVerify(ib)
-  if v.vfRule != 0 {
-    return count(
-      "fail rule "
-        + i32ToStr(v.vfRule)
-        + " in "
-        + ib.irName
-        + ": "
-        + v.vfMsg
-        + "\n"
-        + irFnText(ib),
-    )
-  }
-  const got: u8[] = []
-  const lw = irLowerHelper(ib, got)
-  if lw != "" { return count("mismatch thunk " + lw) }
-  // The dual emit's control 3 adds a byte, which must turn a match into a differ.
-  if ibCorrupt == 3 { got.push(1) }
-  if !bytesFrom(out, from, got) {
-    const hex = if ibDetail { " " + irHexOf(out.slice(from)) + "| " + irHexOf(got) } else { "" }
-    return count("mismatch bytes: thunk" + hex)
-  }
-  return count("thunk matched")
 }
 
 // The compare helper `__eq_<si>__`: its two parameters, references to struct row `si`, compared
@@ -21526,7 +21100,7 @@ function buildEqHelp(si: i32): string {
 // The claim seam for `__eq_<si>__`, in the frame `eqHelpFnCode` opened and before legacy writes
 // it: when it builds and every node is in a claimed family, its code entry goes onto `out`.
 export function irClaimEqHelp(si: i32, out: u8[]): boolean {
-  if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
+  if CLAIMED.length == 0 && !ibClaimAll { return false }
   const s = claimScopeBegin()
   const ok = claimEqHelp(si, out)
   claimScopeEnd(s, ok)
@@ -21537,7 +21111,6 @@ function claimEqHelp(si: i32, out: u8[]): boolean {
   const built = buildEqHelp(si)
   if softRefused("eq helper ") { return false }
   if built != "" || !claimable() { return false }
-  corrupt()
   if irBVerify(ib).vfRule != 0 { return eqHelpFellBack("verifier") }
   const why = irLowerEqHelper(ib, out)
   if why != "" { return eqHelpFellBack(why) }
@@ -21548,53 +21121,6 @@ function claimEqHelp(si: i32, out: u8[]): boolean {
 function eqHelpFellBack(why: string): boolean {
   count("claim fell back: eq helper " + why)
   return false
-}
-
-// Under the armed shadow, `__eq_<si>__`'s IR lowering, before legacy writes it from the same empty
-// lazy frame; empty when it does not build, verify or lower, with that row counted.
-export function irShadowEqHelp(si: i32): u8[] {
-  const got: u8[] = []
-  if !ibArmed { return got }
-  count("eq helper fns")
-  const why = buildEqHelp(si)
-  if why != "" {
-    count("eq helper uncovered " + why)
-    return got
-  }
-  corrupt()
-  const v = irBVerify(ib)
-  if v.vfRule != 0 {
-    count(
-      "fail rule "
-        + i32ToStr(v.vfRule)
-        + " in "
-        + ib.irName
-        + ": "
-        + v.vfMsg
-        + "\n"
-        + irFnText(ib),
-    )
-    return []
-  }
-  const lw = irShadowLowerEqHelper(ib, got)
-  if lw != "" {
-    count("mismatch eq helper " + lw)
-    return []
-  }
-  // The dual emit's control 3 adds a byte, which must turn a match into a differ.
-  if ibCorrupt == 3 { got.push(1) }
-  return got
-}
-
-// `irShadowEqHelp`'s lowering `got` against the helper legacy then wrote onto `out` from `from`:
-// `eq helper matched` or `mismatch bytes: eq helper`.
-export function irShadowEqHelpCheck(got: u8[], out: u8[], from: i32) {
-  if !ibArmed || got.length == 0 { return 0 }
-  if !bytesFrom(out, from, got) {
-    const hex = if ibDetail { " " + irHexOf(out.slice(from)) + "| " + irHexOf(got) } else { "" }
-    return count("mismatch bytes: eq helper" + hex)
-  }
-  return count("eq helper matched")
 }
 
 // Builds a start body: each top-level statement (`orderGi[i]` -1), or global `orderGi[i]`'s
@@ -21609,7 +21135,6 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibMissAt = -1
   ibStubRhs = -1
   ibAliasRhs = -1
-  ibMisses = []
   ibDeclVar = Map()
   ibAsgCapWant = Map()
   ibAsgCapGot = Map()
@@ -22226,38 +21751,6 @@ function cloValueWhy(ix: i32): string {
   const fe = fnValueFeOf(n, sidOfNode(ix), ix, ibFnIx)
   if fe < 0 { return "closure name of a global" }
   return "closure value " + fnValueArmOf(fe, ix, -1)
-}
-
-// The census row of the function just built: its blocker classes, sorted, or none.
-function censusRow(why: string) {
-  if why != "" { censusGoesOn(why) }
-  const key = censusKey()
-  count(if key == "" { "blockers none" } else { "blockers " + key })
-  return 0
-}
-
-// The census's classes met in the body being built, sorted and joined by ` + `, or "".
-function censusKey(): string {
-  if ibMisses.length == 0 { return "" }
-  // Insertion sort, so one set of classes is one key whatever order the build met them in.
-  let i = 1
-  while i < ibMisses.length {
-    const x = ibMisses[i]
-    let j = i - 1
-    while j >= 0 && ibMisses[j] > x {
-      ibMisses[j + 1] = ibMisses[j]
-      j = j - 1
-    }
-    ibMisses[j + 1] = x
-    i = i + 1
-  }
-  let key = ibMisses[0]
-  let k = 1
-  while k < ibMisses.length {
-    key = key + " + " + ibMisses[k]
-    k = k + 1
-  }
-  return key
 }
 
 // Whether a record at rep `src`, delivered from `at`, goes in at plain record rep `dst` as it
