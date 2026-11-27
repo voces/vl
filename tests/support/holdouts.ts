@@ -1,0 +1,68 @@
+// The I8 holdouts (`scripts/ir-i8-census/holdouts.tsv`, read as `scripts/lib/holdouts.vl` reads
+// it): programs the IR does not claim yet. A grader expects each one refused with
+// `cannot yet lower` and fails when one is not, so the list only shrinks. Keys are
+// checkout-relative paths (`tests/cases/...`), or `tests/<file>.ts#<case>` for a program a test
+// writes inline. Side-effect free apart from one file read.
+
+export const HOLDOUTS_PATH = "scripts/ir-i8-census/holdouts.tsv";
+export const HOLDOUT_REFUSAL = "cannot yet lower";
+
+const FILE = new URL(`../../${HOLDOUTS_PATH}`, import.meta.url);
+
+/** Each holdout's program mapped to its class; empty when the file is absent. */
+export const HOLDOUTS: ReadonlyMap<string, string> = (() => {
+  const out = new Map<string, string>();
+  let text = "";
+  try {
+    text = Deno.readTextFileSync(FILE);
+  } catch {
+    return out;
+  }
+  for (const line of text.split("\n")) {
+    if (line === "" || line.startsWith("#")) continue;
+    const f = line.split("\t");
+    out.set(f[0], f[2] ?? "");
+  }
+  return out;
+})();
+
+/** "" when holdout `prog`'s build was refused with `cannot yet lower`, else why it fails. */
+export const holdoutVerdict = (
+  prog: string,
+  refused: boolean,
+  err: string,
+): string => {
+  if (!refused) {
+    return `holdout ${prog} is no longer refused: remove its line from ${HOLDOUTS_PATH}`;
+  }
+  if (!err.includes(HOLDOUT_REFUSAL)) {
+    return `holdout ${prog} fails without \`${HOLDOUT_REFUSAL}\`: ${err}`;
+  }
+  return "";
+};
+
+/**
+ * For a test that builds program `key` itself: null when `key` is not a holdout (grade it as
+ * usual), else "" when its build failed with `cannot yet lower`, or why it fails. `failed` says
+ * the build failed; `err` is its error text.
+ */
+export const holdoutCheck = (key: string, failed: boolean, err: string): string | null =>
+  HOLDOUTS.has(key) ? holdoutVerdict(key, failed, err) : null;
+
+/**
+ * `fn` as a test body graded as holdout `key` (`tests/<file>.ts#<test name>`) when that key is
+ * listed: it passes only while it fails with `cannot yet lower`, and fails once it passes. An
+ * unlisted key runs `fn` unchanged.
+ */
+export const holdoutTest = (key: string, fn: () => void | Promise<void>): () => Promise<void> =>
+async () => {
+  if (!HOLDOUTS.has(key)) return await fn();
+  let err = "";
+  try {
+    await fn();
+  } catch (e) {
+    err = e instanceof Error ? e.message : String(e);
+  }
+  const why = holdoutVerdict(key, err !== "", err);
+  if (why !== "") throw new Error(why);
+};

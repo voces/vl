@@ -1,9 +1,9 @@
 # IR: the self-compile's IR misses are ratcheted at 0 (2026-11-23, lane IR-S1)
 
 IR-S1 (#9682) brought the self-compile's IR misses from 35 to 0. The gate row `self ir misses`
-(`scripts/self-ir-misses.vl`) keeps them there. It checks `compiler/entry.vl` once under the
+(`scripts/self-ir-misses.vl`, retired at I8) keeps them there. It checks `compiler/entry.vl` once under the
 blocker census (`$VL_IR_SHADOW=4`, `vl check --codegen`) and sums the `blockers` rows other than
-`none`. It reds above `scripts/self-ir-misses-baseline.txt` (0). `--write-baseline` only lowers
+`none`. It reds above `scripts/self-ir-misses-baseline.txt` (0; retired at I8). `--write-baseline` only lowers
 the baseline, and a census that prints no row exits 2. The coordinator ruled 2026-11-23 that the
 row joins the gate.
 
