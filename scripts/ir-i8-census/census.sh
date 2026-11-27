@@ -15,8 +15,8 @@
 # built with <seed> in a temp dir, never into build/. A function's name carries its module
 # (`$m<id>`) when it is not the entry's, so std functions count once across files.
 # Writes <out-dir>/<pop>.rows (file, count, row), <out-dir>/summary.txt (summary.sh), the witnesses
-# under <out-dir>/wit, and <out-dir>/programs.txt, every program, for `CENSUS_PROGRAMS=` of
-# ir-driver-census.sh. Run from the checkout root; $VL names the host, $JOBS the fan-out (default 4).
+# under <out-dir>/wit, and <out-dir>/programs.txt, every program. Run from the checkout root; $VL
+# names the host, $JOBS the fan-out (default 4).
 # $CENSUS_CLASS names a class-programs.sh list: each population is cut to the programs it lists,
 # and the self-compile runs only when the list names it.
 set -euo pipefail
