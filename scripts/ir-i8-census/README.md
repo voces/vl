@@ -23,6 +23,8 @@ conflicts with another PR on a shared line.
   meeting the refusal it expects left out), in failing.tsv's shape for red.sh.
 - `holdouts-board.sh <holdouts.tsv> [<prev>] [--red <red.tsv>]`: holdouts per owner with deltas, and the red
   programs no holdout names (must be 0); the hourly summary's post-I8 headline.
+- `holdouts/`: the I8 holdouts, one `<slug>.tsv` row per program (its README); a board's
+  `<holdouts.tsv>` is `cat holdouts/*.tsv`.
 - `scoreboard.sh <red.tsv> [<prev>]`: units and classes per owner as a markdown table, with deltas; the
   hourly run's job summary.
 - `owners.tsv`: the exceptions to the owner `red.sh` derives from a class's mechanism family, one

@@ -28,7 +28,7 @@ Re-run `scripts/refresh-compiler.sh` after every `compiler/*.vl` edit.
 ## What not to spend on (O3, O4)
 
 - Legacy's expression emitter is deleted (I8). A program the IR does not claim is a holdout
-  (`scripts/ir-i8-census/holdouts.tsv`); a lane closes a family of them by one general IR change,
+  (`scripts/ir-i8-census/holdouts/`, one file per program); a lane closes a family of them by one general IR change,
   proposed to the coordinator first (owner ruling, 2026-11-26), and deletes their lines.
 - Do not re-run proof that CI runs on your PR. `scripts/ci-proof.sh rows` lists the gate rows CI
   covers. In particular, no local byte A/B over the corpus: each program's pinned output, graded
@@ -55,7 +55,7 @@ of these.
 
 ## What to work on
 
-Pick from the holdouts your owner column names (`scripts/ir-i8-census/holdouts.tsv`), grouped by
+Pick from the holdouts your owner column names (`cat scripts/ir-i8-census/holdouts/*.tsv`), grouped by
 mechanism through ablation, largest family first.
 
 ## Before READY
