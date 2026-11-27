@@ -523,7 +523,9 @@ default build inherits the penalty with no flag available to escape it, and that
 is what says so. Since a plain build emits an unreached function as an `unreachable` stub
 (DECISIONS.md, "A plain build drops the functions no root reaches"), the `none` column counts
 only the loops the program can reach, so a runtime helper the program never calls no longer
-moves it: `binsearch-probe` read 11,4,6 at `none` and reads 3,0,6.
+moves it: `binsearch-probe` read 11,4,6 at `none`, then 3,0,6, and reads 3,0,3 since a plain
+build writes a `local.set` read straight back as one `local.tee` (a build `-O` optimises next
+keeps the pair).
 
 Both directions fail loudly. A count that goes UP means a flag change made a pinned
 program slower; one that goes DOWN is a finding — most likely that wasmtime or
