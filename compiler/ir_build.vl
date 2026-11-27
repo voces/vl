@@ -1,3 +1,12 @@
+import { coerceTakesAtomAsStr } from "./emit_plan_union"
+import { msSetOfRow } from "./emit_union_registry"
+import { unRowOfTyKey } from "./emit_union_tykey_text"
+import { boxAtomKindOfMemberTy } from "./emit_rep"
+import {
+  unionClosureArmTyOfTy,
+  unionHasRefArrayArmSlot,
+} from "./emit_union_atoms"
+import { refArrSlotTag, unionTyMemberTys } from "./emit_map_twins"
 import { nullableRecordTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import { printPlanPinNull } from "./emit_union_registry"
 import {
@@ -638,7 +647,7 @@ import {
   structRowFnSlotLayout,
   structRowOfRecordTy,
 } from "./emit_shape_rows"
-import { mvValTyIxAt } from "./emit_map_value_slots"
+import { mvValTyIxAt, unMemRefArrArmSlot } from "./emit_map_value_slots"
 import {
   BinNulTest,
   NULL_OWN_ATOM,
@@ -11916,6 +11925,60 @@ function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   return boxTempIn(b, v, ix, dst, at, holeBoxTyAt(ix, ibFnIx))
 }
 
+// The box plan of a value at rep `rep` into union `unionTy`, chosen from the member of `unionTy`
+// whose rep `rep` is: a record under its variant's tag, a scalar or scalar list under its atom
+// kind's, a ref list under its slot's, a closure under the closure arm's, a literal-union atom
+// under the string arm's; else the ladder.
+function boxPlanOfRep(rep: i32, unionTy: i32): HoleBox {
+  const ladder: HoleBox = { hbArm: "ladder", hbKind: -1, hbSrc: -1 }
+  const mems: i32[] = []
+  if rep < 0 || unionTy < 0 || !unionTyMemberTys(unionTy, mems) {
+    return ladder
+  }
+  // A literal-union atom rides under the string arm as its member text.
+  if (
+    repNodeAt(rep) is RAtom
+    && coerceTakesAtomAsStr(msSetOfRow(unRowOfTyKey(unionTy)), unionTy)
+  ) {
+    const sp: HoleBox = { hbArm: "atomAsStr", hbKind: 2, hbSrc: -1 }
+    return sp
+  }
+  for mt in mems {
+    if repNodeOfTy(mt) != rep { continue }
+    if tyAt(mt) is TyObj {
+      let vi = 0
+      while vi < uVarTyIx.length {
+        if repNodeOfTy(uVarTyIx[vi]) == rep && vi < uTags.length {
+          const rp: HoleBox = { hbArm: "rec", hbKind: vi, hbSrc: -1 }
+          return rp
+        }
+        vi = vi + 1
+      }
+      return ladder
+    }
+    const k = boxAtomKindOfMemberTy(mt)
+    if k >= 0 && k != 6 && k != 11 && irBAtomKindRep(k, rep) {
+      const ap: HoleBox = { hbArm: "atom", hbKind: k, hbSrc: -1 }
+      return ap
+    }
+    const slot = unMemRefArrArmSlot(mt)
+    if slot >= 0 && unionHasRefArrayArmSlot(unionTy, slot) {
+      const rl: HoleBox = {
+        hbArm: "refList",
+        hbKind: refArrSlotTag(slot),
+        hbSrc: -1,
+      }
+      return rl
+    }
+    if repNodeAt(rep) is RClosure && unionClosureArmTyOfTy(unionTy) >= 0 {
+      const cp: HoleBox = { hbArm: "clo", hbKind: unionTy, hbSrc: -1 }
+      return cp
+    }
+    return ladder
+  }
+  return ladder
+}
+
 // `boxTempAt` into union `uTy`, which legacy's box plan is made at.
 function boxTempIn(
   b: i32[],
@@ -12020,6 +12083,16 @@ function boxTempIn(
     && ifJoinBoxPasses(ix, uTy, ibFnIx)
   ) {
     return if irBOpRep(v) == dst { v } else { irBLetTempTy(b, { sgV: v }, ix, dst, repTyOf(dst)) }
+  }
+  // A value the node's plan does not take (a `??`'s operand past its null, say) is boxed by its
+  // own rep under the union member it is (`boxPlanOfRep`).
+  if boxPlanWhy(p, v, ix) != "" {
+    const dp = boxPlanOfRep(irBOpRep(v), repTyOf(dst))
+    const rp = if dp.hbArm != "ladder" { dp } else { boxPlanOfRep(irBOpRep(v), uTy) }
+    if rp.hbArm != "ladder" {
+      p = rp
+      pAt = ix
+    }
   }
   // An assignment boxed as a wide atom (`widenPlanOf`'s `asgLit`, `radix`) is its value at the
   // atom's number kind first, as legacy's `emitWidened` writes it; its span then ends there.
@@ -18154,10 +18227,10 @@ function assignValueGo(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   asgReReadLeave(m)
   if uw >= 0 {
     if ibMiss != "" { return o }
-    // A re-read the checker already narrowed past null is recovered, and legacy's cast after it
-    // has no nullable to narrow.
+    // A re-read the checker already narrowed past null is recovered: the non-null cast has
+    // nothing to narrow, so the value is delivered as it stands.
     if uw == 212 && !(repNodeAt(irBOpRep(o)) is RNullable) {
-      return irBMiss("assignment value unwiden of a recovered read")
+      return irConvert(b, o, rep, heldTy(nodeTyAt(ix, ibFnIx)), ix)
     }
     return irBLetTemp(b, { uwV: o, uwOp: uw, uwAt: ix }, ix, rep)
   }
@@ -18259,8 +18332,10 @@ function assignValueParked(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if uw >= 0 {
     if sn is RNullable { return irBMiss("assignment value parked unwiden") }
     // The non-null cast narrows a nullable slot only; a slot held non-null has nothing to narrow.
-    if uw == 212 { return irBMiss("assignment value unwiden rep") }
     const p = irBLetTemp(b, { apAt: ix }, ix, src)
+    if uw == 212 {
+      return irConvert(b, p, rep, heldTy(nodeTyAt(ix, ibFnIx)), ix)
+    }
     return irBLetTemp(b, { uwV: p, uwOp: uw, uwAt: ix }, ix, rep)
   }
   if src != rep && !(sn is RNullable && sn.rnInner == rep) {
