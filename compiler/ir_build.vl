@@ -581,6 +581,7 @@ import {
 import {
   RefJoin,
   ifRefJoinOf,
+  noRefJoin,
   strJoinDropsNulAtom,
   strReppedLitUnionAt,
 } from "./emit_plan_if_join"
@@ -14240,6 +14241,109 @@ function spreadSrcBuild(
   return arrayLit(b, ln, lit, rep, gb, exprTyOf(ix))
 }
 
+// `l ?? d` built by the IR alone: `l` once, held in a local unless a variable, its null test by
+// its rep (`testNull`), the default delivered at the result in the null arm, and `l` past its null
+// converted to the result in the other (`readNonNull`, `irConvert`), the arms joined at the out.
+function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const ty = outTyOf(ix, rep)
+  if ibTyOpen(ty, rep) { return irBMiss("open temp type") }
+  const l0 = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l0 }
+  if !(l0 is OVar) || l0.ov < 0 || l0.ov >= ib.irVars.length {
+    return irBMiss("coalesce operand")
+  }
+  const l = if ib.irVars[l0.ov].vKind == "temp" { heldInLocal(b, l0, ix) } else { l0 }
+  const c = testNull(b, l, ix)
+  if ibMiss != "" { return c }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  if !coalNeverDefault(nb, n.binRight, rep, t) {
+    const d0 = deliver(nb, n.binRight, rep, ty)
+    if ibMiss != "" { return d0 }
+    const d = if irBOpRep(d0) != rep { irConvert(nb, d0, rep, ty, n.binRight) } else { d0 }
+    if ibMiss != "" { return d }
+    if irBOpRep(d) != rep { return irBMiss("coalesce default rep") }
+    irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  }
+  const pb: i32[] = []
+  const nn = readNonNull(pb, l, ix)
+  if ibMiss != "" { return nn }
+  const x = irConvert(pb, nn, rep, ty, ix)
+  if ibMiss != "" { return x }
+  if irBOpRep(x) != rep { return irBMiss("coalesce present rep") }
+  irBNode(pb, { asDst: t, asSrc: x }, -1, ibNoValue, ix)
+  const j = coalJoinOf(rep, ty)
+  irBNode(
+    b,
+    {
+      siCond: c,
+      siThen: nb,
+      siElse: pb,
+      siOut: t,
+      siElseKw: true,
+      siJoin: j,
+      siJoinNul: j.rjKind != null && refNullable(rep),
+      siAtDst: false,
+    },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// The reference join a valued `if` at rep `rep`, typed `ty`, opens at: its kind and table slot,
+// read off `ty`, whose row the rep's own type may not name; or none.
+function coalJoinOf(rep: i32, ty: i32): RefJoin {
+  const d = repOfTy(if ty >= 0 { ty } else { repTyOf(rep) })
+  const k = d.rdKind
+  if (
+    k == null
+    || k == "i32"
+    || k == "i64"
+    || k == "f32"
+    || k == "f64"
+    || k == "v128"
+    || k == "reflist"
+    || k == "closure"
+  ) {
+    // A ref list's or closure's shape is keyed by its rep, so it names no slot: the lowering
+    // opens at the out's own valtype.
+    return noRefJoin()
+  }
+  // A record names its row by its type where its rep's own description names none.
+  const slot = if k == "struct" && d.rdSlot < 0 && ty >= 0 { structIndexOfTy(ty) } else { d.rdSlot }
+  return { rjKind: k, rjSlot: slot }
+}
+
+// Stand-in for COV-IS's `testNull(b, v, at)`: whether `v` is null, by its rep's discipline
+// (`RNulTest` at a `??`, whose arm the lowering reads off `v`'s rep).
+function testNull(b: i32[], v: Opnd, at: i32): Opnd {
+  return irBLetTempTy(
+    b,
+    { ntV: v, ntInvert: false, ntAt: at },
+    at,
+    ibBool,
+    TY_BOOL,
+  )
+}
+
+// Stand-in for COV-IS's `readNonNull(b, v, at)`: `v` past its null at its inner rep: a nullable
+// reference's `ref.as_non_null`, a sentinel or atom niche's value as it stands. A box is theirs.
+function readNonNull(b: i32[], v: Opnd, at: i32): Opnd {
+  const vn = repNodeAt(irBOpRep(v))
+  if !(vn is RNullable) { return irBMiss("coalesce present read") }
+  if vn.rnDisc == 1 {
+    const r: Rhs = { rcV: v, rcAt: at, rcNn: 1 }
+    return irBLetTempTy(b, r, at, vn.rnInner, repTyOf(vn.rnInner))
+  }
+  if vn.rnDisc == 2 || vn.rnDisc == 3 {
+    return repTemp(b, { rgV: v }, at, vn.rnInner)
+  }
+  return irBMiss("coalesce present read box")
+}
+
 // `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.
 // `cell` as `exprAt`'s: an arm that writes its left operand alone passes it to that operand.
 function coalesce(
@@ -14250,6 +14354,24 @@ function coalesce(
   cell: boolean,
 ): Opnd {
   const arm = coalArmOf(n, ix, ibFnIx)
+  // A probe's fused read (a map index, a list `.get`, a `.pop`) keeps its arm; every other `??` is
+  // the IR's own (`coalNative`).
+  if (
+    arm != "mapIndexGetOr"
+    && arm != "mapScalarJoin"
+    && arm != "listGetOr"
+    && arm != "popOr"
+    && arm != "holeMap"
+    && arm != "mapJoinIf"
+    && arm != "retypedDead"
+    && arm != "pinNonNull"
+    && arm != "fieldFlat"
+    && arm != "popElem"
+    && arm != "deadJoin"
+    && arm != "nulnone"
+  ) {
+    return coalNative(b, n, ix, rep)
+  }
   if arm == "closed" { return coalClosed(b, n, ix, rep) }
   if arm == "chain" { return coalChain(b, n, ix, rep) }
   if arm == "niche" { return coalNiche(b, n, ix, rep) }
@@ -14257,6 +14379,7 @@ function coalesce(
   if arm == "listGetOr" { return coalListGetOr(b, n, ix, rep) }
   // A map read joining a union is legacy's synthesized null-test `if` (`coalNullTestIf`), built
   // as the valued `if` it is.
+  if arm == "mapJoin" { return coalNative(b, n, ix, rep) }
   if arm == "mapJoinIf" {
     const v = irBExpr(b, coalNullTestIf(n, ix, ibFnIx))
     if ibMiss != "" { return v }

@@ -1076,7 +1076,7 @@ function ownedSlot(v: i32): i32 {
   if v < 0 || v >= lw.irVars.length || lw.irVars[v].vKind != "local" {
     return -1
   }
-  const vt = repLocalValtype(lw.irVars[v].vRep)
+  const vt = repLocalValtype(lw.irVars[v].vRep, lw.irVars[v].vTy)
   if vt.length == 0 { return -1 }
   const s = irOnceSlotAt(vt, v + 1)
   while lwOwnedSlots.length <= v { lwOwnedSlots.push(-1) }
@@ -1084,13 +1084,21 @@ function ownedSlot(v: i32): i32 {
   return s
 }
 
+// Whether node `ix` is a `??`.
+function coalNodeAt(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = nodeAt(unwrapParen(ix))
+  return e is BinExpr && e.binOp == "??"
+}
+
 // The valtype bytes legacy's `fbValtype` declares a non-null value of rep `r` at, a ref list's or a
 // closure's as `refRepValtype` keys it, a nullable reference's or boxed nullable's at its nullable
 // valtype, an i32-sentinel or atom nullable's at i32; none for one with no kind, or a ref list or
-// closure that keys no shape.
-function repLocalValtype(r: i32): u8[] {
+// closure that keys no shape. Read off type `ty` where it is given, whose row the rep's own
+// type may not name.
+function repLocalValtype(r: i32, ty: i32): u8[] {
   const out: u8[] = []
-  const d = repOfTy(repTyOf(r))
+  const d = repOfTy(if ty >= 0 { ty } else { repTyOf(r) })
   const k = d.rdKind
   // An i32-sentinel (discipline 2) or atom (3) nullable is its i32 cell, null a value of it.
   if k != null && (d.rdNul == 2 || d.rdNul == 3) {
@@ -2367,6 +2375,8 @@ function nulTestOpArm(r: RNulTest): NulTestArm | null {
   const n = nodeAt(r.ntAt)
   if n is IsExpr { return nulTestArmOf(n.isObj, lw.irAt, r.ntInvert, true) }
   if !(n is BinExpr) { return null }
+  // A `??`'s own test is its operand's, by that operand's rep (`coalNative`).
+  if n.binOp == "??" { return repNulTestArm(opRepOf(r.ntV)) }
   const bt = binNulTestOf(n)
   if bt != null { return nulTestArmOf(bt.bnRef, lw.irAt, r.ntInvert, false) }
   // A name read typed `null` against a nullable tests the other operand (`binNulNameTestOf`).
@@ -6739,9 +6749,25 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     && at >= 0
     && nodeAt(unwrapParen(at)) is Call
   const decided = n.siJoin.rjKind != null
-  const rj = if vt < 0 && !refOut && !strOut && !boxOut && decided { n.siJoin } else if vt < 0 && !refOut && !strOut && !boxOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
+  const rj = if vt < 0 && !refOut && !strOut && !boxOut && decided { n.siJoin } else if vt < 0 && !refOut && !strOut && !boxOut && at >= 0 && !coalNodeAt(at) { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
   const rk = rj.rjKind
-  if vt < 0 && !refOut && !strOut && !boxOut && rk == null {
+  // A `??`'s join keyed by its rep alone (a ref list's or a closure's shape) opens at the out's
+  // own valtype (`coalNative`).
+  const ownVt = if vt < 0
+    && !refOut
+    && !strOut
+    && !boxOut
+    && rk == null
+    && at >= 0
+    && coalNodeAt(at) { repLocalValtype(lw.irVars[t].vRep, lw.irVars[t].vTy) } else { [] }
+  if (
+    vt < 0
+    && !refOut
+    && !strOut
+    && !boxOut
+    && rk == null
+    && ownVt.length == 0
+  ) {
     irLMiss("valued if rep")
     return IF_DONE
   }
@@ -6771,6 +6797,9 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
       rj.rjSlot,
       if decided { n.siJoinNul } else { ifLinkYieldsNull(at, lw.irAt) },
     )
+  } else if ownVt.length > 0 {
+    fbOpenIf()
+    for x in ownVt { wU8(x) }
   } else {
     fbIf(vt)
   }
