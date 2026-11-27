@@ -18,16 +18,15 @@ if [ -z "$MAIN" ]; then
 fi
 VL=scripts/vl-host/target/release/vl
 
-# Whether the host serves this tree's guest protocol: the newest `$VL_IR_SHADOW` mode (6, the
-# order check) must print `[ir]` rows, and an invalid module must be refused with no legacy rebuild.
-# A host built before a mode landed maps it to off, and every gate row that asks for it reads "no
-# `[ir]` rows"; one built before the fallback's removal still answers the claimed fault seam.
+# Whether the host serves this tree's guest protocol: `$VL_IR_SHADOW=5` (the census's mode) must
+# print `[ir]` rows, and an invalid module must be refused with no legacy rebuild. A host built
+# before the fallback's removal still answers the claimed fault seam.
 host_ok() {
   [ -x "$VL" ] && [ -f build/vl-compiler.wasm ] || return 1
   local d
   d="$(mktemp -d)"
   printf 'function f(x: i32): i32 { return x + 1 }\nprint(f(2))\n' > "$d/t.vl"
-  VL_STD="$PWD/std" VL_IR_SHADOW=6 VL_COMPILER_WASM=build/vl-compiler.wasm \
+  VL_STD="$PWD/std" VL_IR_SHADOW=5 VL_COMPILER_WASM=build/vl-compiler.wasm \
     "$VL" build "$d/t.vl" -o "$d/t.wasm" 2>&1 | grep -q '^\[ir\]'
   local rc=$?
   if [ $rc -eq 0 ]; then
@@ -54,7 +53,7 @@ host_check() {
     return 1
   fi
   if host_ok; then
-    echo "agent-setup: host ok (\`VL_IR_SHADOW=6\` prints \`[ir]\` rows, and an invalid module is refused)"
+    echo "agent-setup: host ok (\`VL_IR_SHADOW=5\` prints \`[ir]\` rows, and an invalid module is refused)"
     return 0
   fi
   if [ ! -L scripts/vl-host/target ]; then
