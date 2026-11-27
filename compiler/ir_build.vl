@@ -2636,48 +2636,31 @@ function objLitAt(
     const v1 = if nullableOver(ks[k], irBOpRep(v0)) && heldAsBox(ks[k]) { boxTemp(b, v0, valIx, ks[k]) } else { v0 }
     if ibMiss != "" { return v1 }
     const vr = irBOpRep(v1)
-    // A closure value at a field whose closure rep leaves a part open, or fills one, is the same
-    // closure struct, retagged.
-    const holed = vr != ks[k]
-      && holeRetagNoted(vr, ks[k], true)
-      && exprPrePathWhy(valIx, ibFnIx) == ""
     // A closure at a field legacy writes plainly whose kid names another signature: the row's heap
     // types its closure kid from another row, and the struct holds any closure.
     const clo = vr != ks[k]
-      && !holed
       && own < 0
       && !typed
       && repNodeAt(vr) is RClosure
       && repNodeAt(ks[k]) is RClosure
+      && !holeRetagNoted(vr, ks[k], true)
       && exprPrePathWhy(valIx, ibFnIx) == ""
       && recHeapNoted(rep)
-    // …and so is one at a field that holds such a closure or `null` (`cloNicheTakes`).
-    const nicheClo = !holed
+    // A sub-word field (`repSubWord`) takes a plain i32, which the struct's field truncates.
+    const packed = repSubWord(ks[k]) && repPrim(vr) == "i32"
+    // A niche closure field's retag reads the record's heap.
+    if (
+      vr != ks[k]
       && !clo
+      && !packed
       && own < 0
       && !typed
       && cloNicheTakes(v1, ks[k], valIx)
-      && recHeapNoted(rep)
-    // A record or list the field holds as it stands, apart in no hole, is retagged too.
-    const stands = vr != ks[k]
-      && !holed
-      && !clo
-      && !nicheClo
-      && retagsAsStands(vr, ks[k], valIx)
-    // A sub-word field (`repSubWord`) takes a plain i32, which the struct's field truncates.
-    const packed = repSubWord(ks[k]) && repPrim(vr) == "i32"
-    if (
-      vr != ks[k]
-      && !holed
-      && !clo
-      && !stands
-      && !nicheClo
-      && !packed
-      && !openRepTakes(fieldSiteTy(arm, row, fi), ks[k], vr)
     ) {
-      return irBMiss("object field coercion")
+      recHeapNoted(rep)
     }
-    const v = if nicheClo { cloNicheRetag(b, v1, ks[k], valIx) } else if holed || clo || stands { repTemp(b, { rgV: v1 }, valIx, ks[k]) } else { v1 }
+    // Any other value goes in by the one delivery conversion.
+    const v = if vr == ks[k] || packed { v1 } else if clo { repTemp(b, { rgV: v1 }, valIx, ks[k]) } else { irConvertStored(b, v1, ks[k], fieldSiteTy(arm, row, fi), valIx) }
     if ibMiss != "" { return v }
     if clo { irCloFieldRetagNote(ib, b[b.length - 1]) }
     layout[fi] = k
@@ -10029,7 +10012,7 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
     // (`emitVariantStruct`).
     if arm == "variant" {
       const vc = variantCoerceArmOf(mvValVariantOf(sh), val, ibFnIx)
-      if vc != "struct" && vc != "bare" {
+      if vc != "struct" && vc != "bare" && vc != "box" {
         return skip("map store value variant " + vc)
       }
     } else if (
@@ -10058,7 +10041,7 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
   const vAt = b.length
   const v0 = if val < 0 { one } else if mapSetVariantLit(recv, val, sh) { mapVariantLit(b, val, sh) } else { mapSetValue(b, val, g, loc, sh, valArm) }
   if ibMiss != "" { return 0 }
-  const v = if valArm == "variant" && val >= 0 && !mapSetVariantLit(recv, val, sh) { variantPassValue(v0, val, g, loc) } else { v0 }
+  const v = if valArm == "variant" && val >= 0 && !mapSetVariantLit(recv, val, sh) { variantPassValue(b, v0, val, g, loc) } else { v0 }
   if ibMiss != "" { return 0 }
   if mapRecvReassigned(b, at, loc) { return skip("map receiver reassigned") }
   const nonNull = g >= 0 && globalReadRecovers(sidOfNode(recv), recv, ibFnIx)
@@ -10086,7 +10069,13 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
 // it (`emitVariantPassThrough`). Legacy's `ref.as_non_null` for a nullable ref niche its read does
 // not recover has no witness program, so that case is a named miss. It lands at the map's value
 // rep or misses.
-function variantPassValue(v: Opnd, val: i32, g: i32, loc: Opnd): Opnd {
+function variantPassValue(
+  b: i32[],
+  v: Opnd,
+  val: i32,
+  g: i32,
+  loc: Opnd,
+): Opnd {
   const mr = repNodeAt(
     if g >= 0 { irGlobalRepOf(ib, g) } else { irBOpRep(loc) },
   )
@@ -10094,10 +10083,7 @@ function variantPassValue(v: Opnd, val: i32, g: i32, loc: Opnd): Opnd {
   if exprNullableRefNiche(val, ibFnIx) && !readOwesNonNullRecover(val, ibFnIx) {
     return irBMiss("map store value variant bare recover")
   }
-  if irBOpRep(v) != mr.rmVal {
-    return irBMiss("map store value variant bare rep")
-  }
-  return v
+  return irConvert(b, v, mr.rmVal, repTyOf(mr.rmVal), val)
 }
 
 // Map store value `val` into receiver `g` or `loc` of shape `sh` on legacy's arm `arm`
