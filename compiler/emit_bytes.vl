@@ -83,6 +83,7 @@ import {
   cloStructIdx,
   ctrlDepth,
   curBuf,
+  curBufGen,
   dfeCallee,
   dfeOn,
   emitCurFnIx,
@@ -105,6 +106,9 @@ import {
   fbFrameParams,
   fbRunsWritten,
   fbScratchCur,
+  fbSetEnd,
+  fbSetGen,
+  fbSetIdx,
   fitGrowFn,
   fitGrowLocal,
   fitGrowName,
@@ -119,6 +123,7 @@ import {
   fl64Ty,
   fnMemAddrFoldCount,
   fnUses,
+  gOptimized,
   ia64Ty,
   il64Ty,
   isSBackTy,
@@ -326,6 +331,7 @@ export function wValRef(ht: i32, nul: boolean) {
 export function wTarget(buf: u8[]) {
   const prev = curBuf
   curBuf = buf
+  curBufGen = curBufGen + 1
   return prev
 }
 // Append one byte (low 8 bits) to the current buffer.
@@ -369,6 +375,7 @@ export function wDropBack(n: i32) {
     curBuf.pop()
     k = k - 1
   }
+  if curBuf.length < fbSetEnd { fbSetEnd = -1 }
   return relTrim()
 }
 // Append every byte of `bs` in order to the current buffer.
@@ -550,6 +557,14 @@ export function ropeAt(r: ByteRope, i: i32): i32 {
 // ── control flow / locals / consts (the universal base — Phase B) ─────────────
 // local.get / local.set / local.tee: 0x20/0x21/0x22 <localidx-uleb>.
 export function fbLocalGet(i: i32) {
+  // A read of the local the last instruction set is that set's `local.tee`, rewritten in place:
+  // the two encodings are the same length, so no recorded position moves (`fbPeepholes`).
+  if fbSetTeeable(i) {
+    curBuf[fbSetEnd - ulebLen(i) - 1] = OP_LOCAL_TEE
+    fbSetEnd = -1
+    if fbLocalIsUnsetRef(i - fbFrameParams) { fbRefAsNonNull() }
+    return 0
+  }
   wU8(OP_LOCAL_GET) // 0x20 local.get
   wULEB(i)
   if fbLocalIsUnsetRef(i - fbFrameParams) { fbRefAsNonNull() }
@@ -558,7 +573,37 @@ export function fbLocalGet(i: i32) {
 export function fbLocalSet(i: i32) {
   wU8(OP_LOCAL_SET) // 0x21 local.set
   wULEB(i)
+  fbSetGen = curBufGen
+  fbSetEnd = curBuf.length
+  fbSetIdx = i
   return 0
+}
+// Whether the writer's peepholes run: not in a build `-O` optimises next, whose passes match the
+// shapes they would rewrite (binaryen's loop hoisting, `optMultivalue`) and do the rewrite too.
+function fbPeepholes(): boolean { return gOptimized == 0 }
+
+// Whether the current buffer ends with the `local.set i` `fbLocalSet` last wrote, unchanged.
+function fbSetTeeable(i: i32): boolean {
+  if (
+    !fbPeepholes()
+    || i != fbSetIdx
+    || fbSetEnd != curBuf.length
+    || fbSetGen != curBufGen
+  ) {
+    return false
+  }
+  const at = fbSetEnd - ulebLen(i) - 1
+  return at >= 0 && curBuf[at] == OP_LOCAL_SET
+}
+// The number of bytes `wULEB(v)` writes for a non-negative `v`.
+function ulebLen(v: i32): i32 {
+  let n = 1
+  let x = v >> 7
+  while x != 0 {
+    n = n + 1
+    x = x >> 7
+  }
+  return n
 }
 // `local.tee i` — store the stack top into local `i` and LEAVE it on the stack, i.e.
 // `local.set` + `local.get` in one opcode. For a value that is both consumed here and
