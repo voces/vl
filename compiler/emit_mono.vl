@@ -26992,6 +26992,7 @@ export function monomorphize(stmts: i32[]) {
   }
   const prc = monoPruneTemplates(nDecl)
   if prc < 0 { return prc }
+  monoCallReturnedRecReads()
   // Each un-annotated binding the walk left open takes the closed type the elaboration or its
   // initializer gives it.
   // Keyed by a walk of every body, not the write index: an instance clone's nodes postdate it.
@@ -27019,6 +27020,169 @@ export function monomorphize(stmts: i32[]) {
     ai = ai + 1
   }
   return prc
+}
+
+// Types each call the checker left at an open record, whose callee returns one record literal
+// whose fields close (`monoObjLitFieldsPin`), at that literal's record, and the reads through the
+// call, directly or by a `const` bound to it, at its fields (`monoRetypeRecMemberReads`).
+function monoCallReturnedRecReads() {
+  const nodes = monoFrameNodes(-1)
+  // A record of a tagged set's ids and one of closures at the same signature share no layout,
+  // so a closed signature some tagged record's container holds is left as checked.
+  const idSigs: string[] = []
+  for c in nodes {
+    const cn = nodeAt(c)
+    const ct = nodeTyIxOf(c)
+    if (
+      cn is Call
+      && ct >= 0
+      && ct < T.tys.length
+      && monoRecHoldsTaggedSet(ct, 0)
+    ) {
+      const fd = elabOpenFnArgDecl(cn.callFn)
+      const lx = if fd >= 0 { monoFnReturnedObjLit(fd) } else { -1 }
+      if lx >= 0 { monoObjLitHeldSigs(lx, fd, idSigs) }
+    }
+  }
+  for c in nodes {
+    const cn = nodeAt(c)
+    const ct = nodeTyIxOf(c)
+    if (
+      cn is Call
+      && ct >= 0
+      && ct < T.tys.length
+      && tyAt(ct) is TyObj
+      && monoTyOpen(ct)
+    ) {
+      const fd = if monoRecHoldsTaggedSet(ct, 0) { -1 } else { elabOpenFnArgDecl(cn.callFn) }
+      const lx = if fd >= 0 { monoFnReturnedObjLit(fd) } else { -1 }
+      if lx >= 0 {
+        monoObjLitFieldsPin(lx, fd)
+        const rt = nodeTyIxOf(lx)
+        if (
+          rt >= 0
+          && rt < T.tys.length
+          && tyAt(rt) is TyObj
+          && !monoTyOpen(rt)
+          && !monoRecHoldsTaggedSet(rt, 0)
+          && !monoRecSigsAmong(rt, idSigs, 0)
+        ) {
+          nodeTyRecord(c, rt)
+          monoRetypeRecMemberReads(-1, nodes, c, rt, 0)
+          for ax in nodes {
+            const a = nodeAt(ax)
+            if (
+              a is LetDecl
+              && a.letKw == "const"
+              && a.letType < 0
+              && unwrapParen(a.letInit) == c
+            ) {
+              if monoTyOpen(nodeTyIxOf(ax)) { nodeTyRecord(ax, rt) }
+              for ix in nodes {
+                if (
+                  monoReadsBinding(ix, a.letName, -1, ax)
+                  && monoTyOpen(nodeTyIxOf(ix))
+                ) {
+                  nodeTyRecord(ix, rt)
+                  monoRetypeRecMemberReads(-1, nodes, ix, rt, 0)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return 0
+}
+
+// Whether record type `t` holds, in a field's container or a nested record, functions of a
+// tagged set, whose values are member ids and not closures.
+function monoRecHoldsTaggedSet(t: i32, depth: i32): boolean {
+  if depth > 8 || t < 0 || t >= T.tys.length { return false }
+  const o = tyAt(t)
+  if !(o is TyObj) { return false }
+  for ft in o.objFieldTypes {
+    const et = monoContainerElemTy(ft)
+    if et >= 0 && et < T.tys.length && tyAt(et) is TyFunc {
+      const es = fnTagSetOfTy(et)
+      if fnTagTyIsTagged(et) || (es >= 0 && fnTagSetIsTagged(es)) {
+        return true
+      }
+    }
+    if monoRecHoldsTaggedSet(ft, depth + 1) { return true }
+  }
+  return false
+}
+
+// Pushes onto `out` the signature of each closed function container a field of record literal
+// `lx` reads in frame `ctx` (its binding's type, else the read's own), nested literals included.
+function monoObjLitHeldSigs(lx: i32, ctx: i32, out: string[]) {
+  const lit = nodeAt(lx)
+  if !(lit is ObjLit) { return 0 }
+  for fi in lit.objFields {
+    const f = nodeAt(fi)
+    const vx = if f is FieldInit { unwrapParen(f.fiValue) } else { -1 }
+    if vx >= 0 && nodeAt(vx) is ObjLit {
+      monoObjLitHeldSigs(vx, ctx, out)
+    } else if vx >= 0 {
+      const bt = monoClosedReadTy(vx, ctx, false)
+      const rt = if bt >= 0 { bt } else if monoTyOpen(nodeTyIxOf(vx)) { -1 } else { nodeTyIxOf(vx) }
+      const et = monoContainerElemTy(rt)
+      const k = if et >= 0 && et < T.tys.length && tyAt(et) is TyFunc { sigKeyOfTy(et) } else { "" }
+      if k != "" && !strListHas(out, k) { out.push(k) }
+    }
+  }
+  return 0
+}
+
+// Whether record type `t` holds, in a field's container or a nested record, functions at one of
+// the signatures `sigs`.
+function monoRecSigsAmong(t: i32, sigs: string[], depth: i32): boolean {
+  if depth > 8 || t < 0 || t >= T.tys.length || sigs.length == 0 {
+    return false
+  }
+  const o = tyAt(t)
+  if !(o is TyObj) { return false }
+  for ft in o.objFieldTypes {
+    const et = monoContainerElemTy(ft)
+    if (
+      et >= 0
+      && et < T.tys.length
+      && tyAt(et) is TyFunc
+      && strListHas(sigs, sigKeyOfTy(et))
+    ) {
+      return true
+    }
+    if monoRecSigsAmong(ft, sigs, depth + 1) { return true }
+  }
+  return false
+}
+
+// The one record literal un-annotated, non-generic function `fd` returns, by an expression body
+// or every `return` of its own body; -1 otherwise.
+function monoFnReturnedObjLit(fd: i32): i32 {
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 || f.fnRet >= 0 { return -1 }
+  const bx = unwrapParen(f.fnBody)
+  if bx >= 0 && nodeAt(bx) is ObjLit { return bx }
+  let lit = -1
+  const stack: i32[] = [f.fnBody]
+  while stack.length > 0 {
+    const x = stack.pop() ?? -1
+    if x >= 0 && x < P.nodes.length && !(nodeAt(x) is FuncDecl) {
+      const n = nodeAt(x)
+      if n is RetStmt {
+        const r = unwrapParen(n.retArg)
+        if r < 0 || !(nodeAt(r) is ObjLit) || (lit >= 0 && lit != r) {
+          return -1
+        }
+        lit = r
+      }
+      for ch in nodeChildren(x) { stack.push(ch) }
+    }
+  }
+  return lit
 }
 
 // Records on node `i`, when it is an un-annotated binding the walk left open, the closed type the
