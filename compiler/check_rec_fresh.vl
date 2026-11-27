@@ -14,6 +14,7 @@ import {
   MatchExpr,
   ObjLit,
   P,
+  Param,
   callHasTyArgs,
   letInitAt,
   nodeAt,
@@ -28,6 +29,9 @@ import {
   recSolePinArg,
 } from "./check_record_origins"
 import { identBoundFnDeclOf } from "./check_scopes"
+import { identDeclOf } from "./symbols"
+import { a20RetWalk } from "./check_nj_gate"
+import { rcwCallSites } from "./check_record_writes"
 import {
   CW_OCC_ASG,
   cwIxBuild,
@@ -145,12 +149,76 @@ export function recHeldDecl(x: i32): i32 {
       }
       const ie = if dn.letKw == "const" && iv >= 0 { recHeldElemDecl(iv) } else { -1 }
       if ie >= 0 && ie != d { return ie }
+      const ic = if dn.letKw == "const" && iv >= 0 { recHeldRetDecl(iv) } else { -1 }
+      if ic >= 0 && ic != d { return ic }
       if dn.letKw == "const" { return d }
       if recBindReassigned(cwKeyOfRoot(x)) { return -1 }
       return d
     }
   }
   return -1
+}
+
+// The argument of call `iv` its named function returns unchanged: every return a read of one
+// parameter, the function's only use of it; -1 for any other call.
+function recRetParamArg(iv: i32): i32 {
+  const c = nodeAt(iv)
+  if !(c is Call) || c.callFn < 0 || !(nodeAt(c.callFn) is Ident) { return -1 }
+  const fd = identBoundFnDeclOf(c.callFn)
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnBody < 0 { return -1 }
+  const rv: i32[] = []
+  a20RetWalk(f.fnBody, true, rv)
+  if rv.length == 0 { return -1 }
+  let k = -1
+  for v in rv {
+    const p = cwPeelValue(v)
+    const pn = if p >= 0 { nodeAt(p) } else { null }
+    if !(pn is Ident) { return -1 }
+    let j = 0
+    let hit = -1
+    while j < f.fnParams.length {
+      const pd = nodeAt(f.fnParams[j])
+      if (
+        pd is Param
+        && pd.parName == pn.identName
+        && identDeclOf(p) == f.fnParams[j]
+      ) {
+        hit = j
+      }
+      j = j + 1
+    }
+    if hit < 0 || k >= 0 && hit != k { return -1 }
+    k = hit
+  }
+  return if k >= 0 && k < c.callArgs.length { c.callArgs[k] } else { -1 }
+}
+
+// The binding call `iv` returns: one every return of its un-annotated function names, where that
+// function has no other call site, so its result is built where this call delivers it; -1 else.
+function recHeldRetDecl(iv: i32): i32 {
+  // A call of a function every return of which is its parameter `k` hands back argument `k`.
+  const pk = recRetParamArg(iv)
+  if pk >= 0 {
+    const pa = cwPeelValue(pk)
+    return if pa >= 0 && nodeAt(pa) is Ident { recHeldDecl(pa) } else if pa >= 0 && pa != iv && nodeAt(pa) is Call { recHeldRetDecl(pa) } else { -1 }
+  }
+  const fd = recInferredFnOf(iv)
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnBody < 0 { return -1 }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length != 1 { return -1 }
+  const rv: i32[] = []
+  a20RetWalk(f.fnBody, true, rv)
+  if rv.length == 0 { return -1 }
+  let one = -1
+  for v in rv {
+    const p = cwPeelValue(v)
+    const rd = if p >= 0 && nodeAt(p) is Ident { recHeldDecl(p) } else { -1 }
+    if rd < 0 || one >= 0 && rd != one { return -1 }
+    one = rd
+  }
+  return one
 }
 
 // The binding every element of the list literal that element read `iv` reads names
