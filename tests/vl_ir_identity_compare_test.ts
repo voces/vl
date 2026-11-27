@@ -87,6 +87,14 @@ Deno.test("ir-identity --compare: a refusal the claims seed builds reds", () => 
   }
 });
 
+Deno.test("ir-identity --compare: a holdout the claims seed builds is newly claimed, not a differ", () => {
+  const base = { ...CASES, "t/r.vl": { rc: 1, err: "t/r.vl:3:7: emitProgram: the compiler cannot yet lower this statement (c)" } };
+  const r = compare("--compare", { ...CASES, "t/r.vl": { rc: 0, wasm: "built" } }, base);
+  if (r.code !== 0 || !r.text.includes("newly claimed t/r.vl") || r.text.includes("DIFF")) {
+    throw new Error(`want t/r.vl newly claimed, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
 Deno.test("ir-identity --compare: a refusal the claims seed turns into another reds", () => {
   const r = compare("--compare", { ...CASES, "t/r.vl": { rc: 1, err: "t/r.vl:1:1: trap" } }, CASES);
   if (r.code !== 1 || !r.text.includes("DIFF t/r.vl (first error:")) {
@@ -119,6 +127,17 @@ Deno.test("ir-identity --compare-errors: a witness refused for another reason re
   const r = compare("--compare-errors", { ...ERRORS, "t/e1.vl": { rc: 1, err: "t/e1.vl:9:9: other" } }, ERRORS);
   if (r.code !== 1 || !r.text.includes("DIFF t/e1.vl (first error:")) {
     throw new Error(`want t/e1.vl to red on its first error, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+Deno.test("ir-identity --compare-errors: the same refusal at another position, or a holdout's, is informational", () => {
+  const moved = { ...ERRORS, "t/e1.vl": { rc: 1, err: "t/e1.vl:7:1: undeclared identifier 'x'" } };
+  const held = { ...ERRORS, "t/e1.vl": { rc: 1, err: "t/e1.vl:2:3: the compiler cannot yet lower this statement (c)" } };
+  for (const side of [moved, held]) {
+    const r = compare("--compare-errors", side, ERRORS);
+    if (r.code !== 0 || !r.text.includes("refusal text t/e1.vl (informational:")) {
+      throw new Error(`want t/e1.vl informational, got exit ${r.code}:\n${r.text}`);
+    }
   }
 });
 
