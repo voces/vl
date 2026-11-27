@@ -418,12 +418,8 @@ import {
   idxCellReadIsNull,
   idxStoreNullUnitUnstamped,
   idxStoreSiteBoxes,
-  ifExprJoinVt,
-  ifExprPlainWhy,
-  ifExprShapeWhy,
-  ifExprSwitchMay,
+  ifIntMatchWhy,
   ifLinkExhausts,
-  ifNoElseNicheOf,
   ifThenIsDead,
   ifWritesElse,
   intSwitchMayLower,
@@ -573,6 +569,7 @@ import {
 } from "./wasmEmit"
 import {
   RefJoin,
+  ifJoinPlanOf,
   ifRefJoinOf,
   strJoinDropsNulAtom,
   strReppedLitUnionAt,
@@ -819,7 +816,6 @@ import {
 import {
   armSiteReads,
   armSiteRecv,
-  asgLitUnionMemberReRead,
   asgReReadEnter,
   asgReReadLeave,
   asgReReadOf,
@@ -1310,6 +1306,22 @@ function declineRefused(msg: string): boolean {
   return false
 }
 
+// Whether the built IR for the pending unit breaks a verifier rule. Such a unit's refusal is an
+// internal compiler error naming the rule, since a build the builder finished must verify.
+function verifierRefused(whole: string): boolean {
+  const v = irBVerify(ib)
+  if v.vfRule == 0 { return false }
+  count("claim fell back: verifier")
+  declRefusal = "internal compiler error: the IR built for "
+    + whole
+    + " breaks verifier rule "
+    + i32ToStr(v.vfRule)
+    + " ("
+    + v.vfMsg
+    + ")"
+  return true
+}
+
 // Records the lowering's why for a decline: a legacy helper's refusal inside it is that refusal.
 function declineWhy(whole: string, why: string) {
   declWhat = whole + " (" + why + ")"
@@ -1358,10 +1370,7 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
-  if irBVerify(ib).vfRule != 0 {
-    count("claim fell back: verifier")
-    return false
-  }
+  if verifierRefused("this function") { return false }
   const why = irLowerClaim(ib, globalCtxOf(fnPos), fnPos, out)
   if why != "" {
     declineWhy("this function", why)
@@ -1424,10 +1433,7 @@ function claimStart(
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
-  if irBVerify(ib).vfRule != 0 {
-    count("claim fell back: verifier")
-    return false
-  }
+  if verifierRefused("this top-level code") { return false }
   const why = irLowerClaim(ib, ibGlobalCtx(), -1, out)
   if why != "" {
     declineWhy("this top-level code", why)
@@ -2923,7 +2929,7 @@ function fieldPlainWhy(
   if arm == "variant" {
     const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
     if va == "nulnone" {
-      return nulNoneFieldWhy("object variant field nulnone", valIx, dst)
+      return nulNoneFieldWhy("object variant field nulnone", dst)
     }
     if !variantArmFits(va, dst) { return "object variant field " + va }
     // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
@@ -2950,9 +2956,7 @@ function fieldPlainWhy(
     if !nullOwnRepFits(own, dst) { return "object field explicitNull rep" }
     return ""
   }
-  if fa == "nulnone" {
-    return nulNoneFieldWhy("object field nulnone", valIx, dst)
-  }
+  if fa == "nulnone" { return nulNoneFieldWhy("object field nulnone", dst) }
   // A bundle holder's read is the member the field's closure takes (`fieldHolderPick`).
   if fa == "holder" && repNodeAt(dst) is RClosure { return "" }
   if fa == "nulStrAtom" && strNullable(dst) { return "" }
@@ -2990,10 +2994,9 @@ function fieldExplicitNullOwn(
   return fieldNullOwnOf(row, fi)
 }
 
-// Why a `null` unit field's value `valIx` is not its slot's null alone (`emitNulNoneForEffect`
-// writes nothing for it), or "": a value that runs for effect stays `why`.
-function nulNoneFieldWhy(why: string, valIx: i32, dst: i32): string {
-  if !nulNoneWritesNothing(valIx) { return why }
+// Why a `null` unit field's value cannot go into field rep `dst`, or "": the value is
+// delivered, a place read for its effects (`nulUnitPlaceRead`), then the field holds `dst`'s null.
+function nulNoneFieldWhy(why: string, dst: i32): string {
   if !nullOwnRepFits(NULL_OWN_NONE, dst) { return why + " rep" }
   return ""
 }
@@ -4663,166 +4666,116 @@ function condIsTest(ix: i32): boolean {
   return c is IsExpr
 }
 
-// A value `if` on legacy's plain scalar path (`ifExprPlainWhy`): a slotless out each arm's one
-// value writes, as `&&` and `||` build it. An `else` arm whose value is itself a value `if` is the
-// next link, built along the spine rather than through `deliver` (D1990); the links' nodes and
-// their outs' assigns then land innermost first, the order a recursion's returns give them.
+// A value `if`: a join temp at `rep` each arm's one value is delivered into (`ifArm`), so an
+// `else if` is that arm's own value. A missing `else` is the rep's null.
 function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   return ifExprAt(b, n0, ix0, rep0, -1)
 }
 
-// `ifExpr`, its first link built at type `ty0` where that is not -1: a destination's own, whose
-// rep `rep0` each arm then delivers at. Such a link ends the chain.
+// `ifExpr` at type `ty0` where that is not -1: a destination's own, whose rep `rep0` each arm
+// then delivers at.
 function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
-  // An optional call's guard whose receiver this instance closes with no `null` is its call alone,
-  // the test never written (`emitIfExpr`).
+  // An optional call's guard whose receiver this instance closes with no `null` is its call alone.
   const gv = optGuardCallOf(ix0, ibFnIx)
   if gv >= 0 { return deliver(b, gv, rep0, ty0) }
-  // A dense integer `match` at a scalar join is one `br_table` whose arms carry the value
-  // (`emitIfExprAsLink`'s `emitIntSwitch` mode 2), where its plan has an `else`.
-  if (
-    ty0 < 0
-    && ifExprShapeWhy(ix0, ibFnIx) == "int match"
-    && ifExprSwitchMay(ix0)
-    && valtypeOf(rep0) >= 0
-    && valtypeOf(rep0) == ifExprJoinVt(ix0, ibFnIx)
-  ) {
+  // A dense integer `match` whose plan has an `else` is one `br_table`, each arm's value delivered
+  // into the switch's out at the join's rep, whatever that rep is.
+  if ifIntMatchWhy(ix0, ibFnIx) != "" {
     const p = intSwitchPlanOf(ix0, ibFnIx)
-    if p != null && p.ispElse >= 0 { return valuedSwitch(b, ix0, p, rep0) }
+    if p != null { return valuedSwitch(b, ix0, p, rep0, ty0) }
   }
-  if ty0 < 0 && ifExprPlainWhy(ix0, ibFnIx) == "null join" {
-    return nullJoinIf(b, n0, ix0, rep0)
+  // The join plan picks the join's rep and how each arm is written there: the null unit, a
+  // reference at the join's row, a union's box, else a temp at the value's own rep.
+  if ty0 < 0 {
+    const arm = ifJoinPlanOf(ix0, ibFnIx).ijArm
+    if arm == "null" { return nullJoinIf(b, n0, ix0, rep0) }
+    const rj = ifRefJoinOf(ix0, ibFnIx)
+    if arm == "ref" && rj.rjKind != null {
+      return ifRefExpr(b, n0, ix0, rep0, rj)
+    }
+    if arm == "union" || exprUnion(ix0, ibFnIx) {
+      return unionIfExpr(b, n0, ix0, rep0)
+    }
   }
-  const rj = ifRefJoinOf(ix0, ibFnIx)
-  const rk = rj.rjKind
-  if ty0 < 0 && rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
-    return ifRefExpr(b, n0, ix0, rep0, rj)
-  }
-  if ty0 < 0 && ifExprPlainWhy(ix0, ibFnIx) == "union" {
-    return unionIfExpr(b, n0, ix0, rep0)
-  }
-  // The head's rep is the one the join plan writes every link at, else the chain is legacy's.
-  const hv = valtypeOf(rep0)
-  if hv >= 0 && hv != ifExprJoinVt(ix0, ibFnIx) {
-    return irBMiss("expression if join kind")
-  }
+  return ifValueJoin(b, n0, ix0, rep0, ty0)
+}
+
+// The join itself: the condition, a temp at `rep` of the value's type (`ty0`, else the node's),
+// then each arm's value delivered into it. An `else` whose value is a link this join would build
+// the same way is built along the spine, not through `deliver` (D1990).
+function ifValueJoin(b: i32[], n0: IfStmt, ix0: i32, rep: i32, ty0: i32): Opnd {
   const bs: i32[][] = []
   const ixs: i32[] = []
-  const reps: i32[] = []
   const conds: Opnd[] = []
-  const tys: i32[] = []
   const outs: i32[] = []
   const thens: i32[][] = []
-  const elses: i32[] = []
   let cb = b
   let n = n0
-  let cix = ix0
-  const crep = rep0
-  let lastDk = -1
+  let ix = ix0
+  let ty = -1
+  let dk = -1
   while true {
-    // A link built at a destination's type is `emitIfExprAs` at that type: its shape alone.
-    const pw = if ty0 >= 0 { ifExprShapeWhy(cix, ibFnIx) } else { ifExprPlainWhy(cix, ibFnIx) }
-    if pw != "" { return irBMiss("expression if " + pw) }
     const cat = cb.length
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
-    // A constant `is` condition legacy decides off its bytes (`staticValueIfCond`): a `false`
-    // writes its then arm dead, a `true` its block `else`.
-    const dk = if c is OImm && bareConstIs(c, n.ifCond, cb, cat) { if c.oiBits != 0 { 1 } else { 0 } } else { -1 }
-    // Every link is written at the head's kind (`emitIfExprAs` asks `ifJoinPlanOf` of the head
-    // alone), so a link takes the head's rep and type, never its own; a head built at a
-    // destination's type takes `ty0`.
-    const ty = if cix != ix0 { tys[0] } else if ty0 >= 0 { ty0 } else { byteHeld(rowlessRecordTy(cix, nodeTyAt(cix, ibFnIx), crep)) }
-    if irTyHeldOpen(ty, crep) { return irBMiss("open temp type") }
-    const t = irVarNew(ib, crep, ty, "local", -1)
+    // A decided `is` writes the arm it rules out as `unreachable`, never lowering a value typed at a
+    // type the pin excludes; a literal `true` rules out its `else` block.
+    dk = if c is OImm && bareConstIs(c, n.ifCond, cb, cat) { if c.oiBits != 0 { 1 } else { 0 } } else { -1 }
+    if ix == ix0 {
+      ty = if ty0 >= 0 { ty0 } else { byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)) }
+      if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
+    }
+    const t = irVarNew(ib, rep, ty, "local", -1)
     let thenB: i32[] = []
     if dk == 0 {
       irBNode(thenB, { tpWhy: 0 }, -1, ibNoValue, n.ifThen)
     } else {
-      thenB = ifArm(n.ifThen, t, crep)
+      thenB = ifArmAt(n.ifThen, t, rep, ty)
     }
-    if ibMiss != "" { return irBMiss("if arm") }
-    lastDk = dk
+    if ibMiss != "" { return irBMiss(ibMiss) }
     bs.push(cb)
-    ixs.push(cix)
-    reps.push(crep)
+    ixs.push(ix)
     conds.push(c)
-    tys.push(ty)
     outs.push(t)
     thens.push(thenB)
-    elses.push(n.ifElse)
-    // The next link: a direct `else if`, or an `else` block whose one statement is an `if`. A
-    // literal `true` decides a block `else` dead, so the chain ends there.
-    const direct = n.ifElse >= 0
-      && n.ifElse < P.nodes.length
-      && nodeAt(n.ifElse) is IfStmt
-    if n.ifElse < 0 || !direct && (valueIfLitTrue(n.ifCond) || dk == 1) {
-      break
-    }
-    const tv = if direct { n.ifElse } else { ifArmValueExpr(n.ifElse) }
-    if tv < 0 { break }
-    const nx = nodeAt(tv)
-    if !(nx is IfStmt) { break }
-    // At a destination's type legacy walks only a direct `else if` as a link (`emitIfExprAs`); an
-    // `else` block's `if` is that arm's value, not a link.
-    if ty0 >= 0 && !direct { return irBMiss("atom if join chain") }
-    // An `else` block's prelude runs before its `if`, which is then that arm's value, not a link.
-    if !direct && armHasPrelude(n.ifElse) {
-      return irBMiss("expression if else prelude")
-    }
-    // `irBExpr`'s own prelude for the link it would reach. At a destination's type legacy writes a
-    // direct link itself (`emitIfExprAsLink`), never through `emitExpr`, so that link has none.
-    const pre = if ty0 >= 0 && direct { "" } else { exprPrePathWhy(tv, ibFnIx) }
-    // A link the atom hook writes as a join at the destination is that arm's value, not a link.
-    if pre == "pre-path atom hook" && atomJoinHookAt(tv) { break }
-    if pre != "" { return irBMiss(pre) }
-    const eb: i32[] = []
-    cb = eb
-    n = nx
-    cix = tv
+    const nx = if dk == 1 || valueIfLitTrue(n.ifCond) { -1 } else { spineLinkOf(n.ifElse, rep, ty, ty0) }
+    if nx < 0 { break }
+    const nn = nodeAt(nx)
+    if !(nn is IfStmt) { break }
+    cb = []
+    n = nn
+    ix = nx
   }
   let k = bs.length - 1
-  // Legacy writes a dead `else` as `unreachable` (`emitDeadValueArm`), and a missing one as the
-  // out's niche (`ifNoElseNicheOf`), a bare `null`'s there; a constant condition kills its then.
   let elseB: i32[] = []
-  if elses[k] < 0 {
-    const own = if ifNoElseNicheOf(ixs[k]) == 2 { NULL_OWN_BOOL } else { NULL_OWN_ATOM }
+  if n.ifElse >= 0 && (dk == 1 || valueIfLitTrue(n.ifCond)) {
+    irBNode(elseB, { tpWhy: 0 }, -1, ibNoValue, n.ifElse)
+  } else if n.ifElse < 0 {
     const nv = repTemp(
       elseB,
-      { nuAt: ixs[k], nuOwn: own, nuRead: [] },
-      ixs[k],
-      reps[k],
+      { nuAt: ix, nuOwn: nullOwnAt(ix, ibFnIx), nuRead: [] },
+      ix,
+      rep,
     )
-    irBNode(elseB, { asDst: outs[k], asSrc: nv }, -1, ibNoValue, ixs[k])
-  } else if valueIfLitTrue(n.ifCond) || lastDk == 1 {
-    irBNode(elseB, { tpWhy: 0 }, -1, ibNoValue, elses[k])
+    if ibMiss != "" { return irBMiss(ibMiss) }
+    irBNode(elseB, { asDst: outs[k], asSrc: nv }, -1, ibNoValue, ix)
   } else {
-    elseB = ifArm(elses[k], outs[k], reps[k])
+    elseB = ifArmAt(n.ifElse, outs[k], rep, ty)
   }
-  if ibMiss != "" { return irBMiss("if arm") }
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  // Innermost first: link `k` is written into its block, which is link `k - 1`'s `else`, and
+  // its out is that link's value.
   while k >= 0 {
     irBNode(
       bs[k],
       sIf(conds[k], thens[k], elseB, outs[k], true),
-      tys[k],
-      reps[k],
+      ty,
+      rep,
       ixs[k],
     )
     if k == 0 { break }
-    // Link `k` is link `k - 1`'s `else` value, delivered at that link's rep as `ifArm` does.
     const inner: Opnd = { ov: outs[k] }
-    const v = widenTo(bs[k], inner, ixs[k], reps[k - 1], -1)
-    if ibMiss == "" && irBOpRep(v) != reps[k - 1] { irBMiss("if arm coercion") }
-    if ibMiss == "" {
-      irBNode(
-        bs[k],
-        { asDst: outs[k - 1], asSrc: v },
-        -1,
-        ibNoValue,
-        elses[k - 1],
-      )
-    }
-    if ibMiss != "" { return irBMiss("if arm") }
+    irBNode(bs[k], { asDst: outs[k - 1], asSrc: inner }, -1, ibNoValue, ixs[k])
     elseB = bs[k]
     k = k - 1
   }
@@ -4830,10 +4783,33 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
   return o
 }
 
-// Whether the atom hook writes `ix` as a join built at its destination (`emitIfExprAs`).
-function atomJoinHookAt(ix: i32): boolean {
-  const a = atomHookArmOf(ix, ibFnIx, false)
-  return a == "litJoin" || a == "perArmJoin"
+// The `if` an `else` (`elseIx`) holds as its whole value, where it is built as this join builds a
+// link: no prelude or hook of its own, and either the head is built at a destination's type (`ty0`
+// not -1), which every link takes, or the link is a scalar or atom join at `rep` and `ty`; else -1.
+function spineLinkOf(elseIx: i32, rep: i32, ty: i32, ty0: i32): i32 {
+  if elseIx < 0 || elseIx >= P.nodes.length { return -1 }
+  const en = nodeAt(elseIx)
+  let tv = elseIx
+  if en is Block {
+    if en.blkStmts.length != 1 { return -1 }
+    tv = ifArmValueExpr(elseIx)
+  } else if !(en is IfStmt) {
+    return -1
+  }
+  if tv < 0 || tv >= P.nodes.length || !(nodeAt(tv) is IfStmt) { return -1 }
+  if (ibAsgCapWant[tv] ?? false) || exprReadsDeadNever(tv, ibFnIx) { return -1 }
+  if exprPrePathWhy(tv, ibFnIx) != "" || optGuardCallOf(tv, ibFnIx) >= 0 {
+    return -1
+  }
+  if ifIntMatchWhy(tv, ibFnIx) != "" { return -1 }
+  if ty0 >= 0 { return tv }
+  if exprUnion(tv, ibFnIx) { return -1 }
+  const arm = ifJoinPlanOf(tv, ibFnIx).ijArm
+  if arm != "scalar" && arm != "atom" || exprRepOf(tv) != rep { return -1 }
+  if byteHeld(rowlessRecordTy(tv, nodeTyAt(tv, ibFnIx), rep)) != ty {
+    return -1
+  }
+  return tv
 }
 
 // A value `if` joined at a reference (legacy's `emitIfExprRef`): one link whose arms each write
@@ -4855,7 +4831,8 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
     && kind != "f32list"
     && kind != "u8list"
   ) {
-    return irBMiss("expression if ref " + kind)
+    // A kind the reference writer has no arm for is the plain join at its rep.
+    return ifValueJoin(b, n, ix, rep, -1)
   }
   if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) {
     return irBMiss("ref if drops null atom")
@@ -4979,13 +4956,14 @@ function unionIfLink(
   uty: i32,
   atDst: boolean,
 ): Opnd {
-  // Legacy writes every link at the head's box; the lowering opens a link at its own join, or,
-  // written into a box destination (`atDst`, `unionIfAtDstWhy`), at that box whatever its join.
-  const pw = ifExprPlainWhy(ix, ibFnIx)
-  if !atDst && pw != "union" {
-    return irBMiss(
-      if pw == "" { "union if chain join" } else { "union if " + pw },
-    )
+  // Every link opens at its own join, or, written into a box destination (`atDst`,
+  // `unionIfAtDstWhy`), at that box whatever its join.
+  if (
+    !atDst
+    && ifJoinPlanOf(ix, ibFnIx).ijArm != "union"
+    && !exprUnion(ix, ibFnIx)
+  ) {
+    return irBMiss("union if chain join")
   }
   const cat = b.length
   const c = irBExpr(b, n.ifCond)
@@ -5229,7 +5207,7 @@ function refIfArm(
   }
   // A narrowed read of a union is its box, recovered at the join's record in the arm (D17026).
   if arm == "unbox" {
-    const u = if armUnboxOwed(tv, rep) { armUnboxTemp(body, tv, rep, repTyOf(rep), false) } else if recordArmsUnboxOwed(tv, rep) { recordArmsUnboxTemp(body, tv, rep, repTyOf(rep)) } else { irBMiss("ref if arm unbox shape") }
+    const u = if armUnboxOwed(tv, rep) { armUnboxTemp(body, tv, rep, repTyOf(rep), false) } else if recordArmsUnboxOwed(tv, rep) { recordArmsUnboxTemp(body, tv, rep, repTyOf(rep)) } else { deliver(body, tv, rep, repTyOf(rep)) }
     if ibMiss == "" && irBOpRep(u) != rep { irBMiss("ref if arm unbox rep") }
     if ibMiss == "" {
       irBNode(body, { asDst: t, asSrc: u }, -1, ibNoValue, blockIx)
@@ -5492,9 +5470,9 @@ function widerNumListAt(ix: i32, dst: i32): i32 {
   return if sk >= 0 && dk >= 3 && sk != dk { lr } else { -1 }
 }
 
-// The body of value-`if` arm `blockIx`: its one value, delivered at `rep`, written to out `t`. A
-// direct `else if` the chain does not walk as a link is its own value.
-function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
+// The body of value-`if` arm `blockIx`: its one value, delivered at `rep` and type `ty` (where
+// that is not -1), written to out `t`. A direct `else if` the chain does not walk is its own value.
+function ifArmAt(blockIx: i32, t: i32, rep: i32, ty: i32): i32[] {
   const body: i32[] = []
   armPrelude(body, blockIx)
   if ibMiss != "" { return body }
@@ -5510,7 +5488,7 @@ function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
     if ibMiss == "" && !irBodyLeaves(ib, body) { irBMiss("never arm") }
     return body
   }
-  const v = deliver(body, tv, rep, -1)
+  const v = deliver(body, tv, rep, ty)
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("if arm coercion") }
   if ibMiss == "" {
     irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
@@ -5530,12 +5508,6 @@ function armPrelude(body: i32[], blockIx: i32) {
     i = i + 1
   }
   return 0
-}
-
-// Whether value-`if` arm `blockIx` is a block with statements before its value.
-function armHasPrelude(blockIx: i32): boolean {
-  const blk = nodeAt(blockIx)
-  return blk is Block && blk.blkStmts.length > 1
 }
 
 // `a && b` / `a || b`: a local the two arms of an `if` write.
@@ -11346,6 +11318,8 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   if fl != null { return fl }
   const ifV = if ibMiss == "" && dst >= 0 { recIfAtDst(b, ix, dst, dstTy) } else { null }
   if ifV != null { return ifV }
+  const cellV = if ibMiss == "" && dst >= 0 && atomNullable(dst) { asgAtCellRep(b, ix, dst) } else { null }
+  if cellV != null { return cellV }
   // A `??` whose own type has no rep (a link legacy mints) is built at the destination's rep, as
   // legacy writes it at the kind its consumer asks.
   const du = unwrapParen(ix)
@@ -13715,6 +13689,27 @@ function recIfAtDst(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd | null {
   return ifExprAt(b, n, u, dst, ty)
 }
 
+// Assignment `ix` to a `K | null` local, used as a value delivered at that local's own rep `dst`:
+// its cell re-read there, as it stands. Null for any other value or destination.
+function asgAtCellRep(b: i32[], ix: i32, dst: i32): Opnd | null {
+  const u = unwrapParen(ix)
+  const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if !(n is BinExpr) || n.binOp != "=" || !(nodeAt(n.binLeft) is Ident) {
+    return null
+  }
+  if (
+    globalTarget(n.binLeft)
+    || asgValueArmOf(u, ibFnIx) != "reRead"
+    || exprRepOf(u) == dst
+  ) {
+    return null
+  }
+  const d = identDeclOf(n.binLeft)
+  const v = if d >= 0 && nodeAt(d) is LetDecl { irBDeclVar(d) } else { -1 }
+  if v < 0 || ib.irVars[v].vRep != dst { return null }
+  return assignValueGo(b, n, u, dst)
+}
+
 // List literal `ix` built at the list `dst` (type `dstTy`) it is delivered into, where that list's
 // element is the nullable of the literal's own: each element goes in as a nullable does. Null where
 // it is not such a literal.
@@ -14833,7 +14828,8 @@ function coalNulStr(
 }
 
 // Atom default `v` of node `dIx` decoded at string rep `rep`; a `null` the decode keeps where the
-// block is non-null (legacy's `ref.as_non_null` after it) is a miss.
+// block is non-null (legacy's `ref.as_non_null` after it) is a miss, as is a default whose read
+// already delivered it as a string (an atom-assignment global's cell read at its string).
 function coalAtomStrDefault(
   nb: i32[],
   v: Opnd,
@@ -14843,6 +14839,10 @@ function coalAtomStrDefault(
 ): Opnd {
   if !nul && nulAtomWidenTexts(dIx, ibFnIx).length > 0 {
     return irBMiss("coalesce string atom default non-null")
+  }
+  const vr = irBOpRep(v)
+  if !(repNodeAt(vr) is RAtom) && !atomNullable(vr) {
+    return irBMiss("coalesce atom default decode")
   }
   return atomToStr(nb, v, dIx, rep)
 }
@@ -17187,16 +17187,6 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       return irBLetTemp(b, { aeEff: effs, aeV: t, aeAt: ix }, ix, rep)
     }
     if n.binOp == "??" { return coalesce(b, n, ix, rep, cell) }
-    // Legacy declares a string compare's locals for a side the checker typed `string` and holds as
-    // an atom, which no IR compare route declares; it misses rather than move those bytes.
-    // Legacy compares such an assignment's re-read atom by its own fold, which no IR compare
-    // route writes.
-    if (
-      (n.binOp == "==" || n.binOp == "!=")
-      && (asgMemberReReadAt(n.binLeft) || asgMemberReReadAt(n.binRight))
-    ) {
-      return irBMiss("assignment-value atom re-read as a compare operand")
-    }
     // A union box against a concrete operand is legacy's union compare, by legacy's own route.
     if (
       (n.binOp == "==" || n.binOp == "!=")
@@ -18344,13 +18334,6 @@ function assignValueNullLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("assignment value nullLit rep")
   }
   return repTemp(b, { nuAt: lit, nuOwn: own, nuRead: [] }, ix, rep)
-}
-
-// Whether `ix`, under any parentheses, is an assignment storing one member of a literal-union
-// place, which legacy yields as the re-read atom (`asgLitUnionMemberReRead`).
-function asgMemberReReadAt(ix: i32): boolean {
-  const x = unwrapParen(ix)
-  return x >= 0 && asgLitUnionMemberReRead(x, ibFnIx)
 }
 
 // Whether the re-read of assignment target `ix` is seated: a global, or a local already held at a
@@ -19576,7 +19559,21 @@ function elseStmts(e: i32): i32[] {
   return [e]
 }
 
-// Whether `on`, built into `b` from `n0` on, is a switch operand legacy reads again: a place's
+// The switch operand `on` for scrutinee `at`, built into `b` from `n0` on, as one the table reads
+// again: itself when that is a place's variable or a constant, else a local bound to it once.
+function switchOperand(b: i32[], n0: i32, on: Opnd, at: i32): Opnd {
+  if intSwitchOn(b, n0, on) { return on }
+  const ty = nodeTyAt(at, ibFnIx)
+  if ty < 0 || irTyHeldOpen(ty, irBOpRep(on)) {
+    return irBMiss("int switch scrutinee type")
+  }
+  const v = irVarNew(ib, irBOpRep(on), ty, "local", -1)
+  irBNode(b, { asDst: v, asSrc: on }, -1, ibNoValue, at)
+  const o: Opnd = { ov: v }
+  return o
+}
+
+// Whether `on`, built into `b` from `n0` on, is a switch operand read again as it is: a place's
 // variable (no temp), or the constant an unrolled range copy reads its variable as.
 function intSwitchOn(b: i32[], n0: i32, on: Opnd): boolean {
   if b.length != n0 { return false }
@@ -19587,17 +19584,24 @@ function intSwitchOn(b: i32[], n0: i32, on: Opnd): boolean {
 
 // The valued integer `match` at `ix` that `p` plans: each arm and the else writes its value at
 // `rep` into the out the frame carries, as `ifArm` writes a value `if`'s.
-function valuedSwitch(b: i32[], ix: i32, p: IntSwitchPlan, rep: i32): Opnd {
+function valuedSwitch(
+  b: i32[],
+  ix: i32,
+  p: IntSwitchPlan,
+  rep: i32,
+  ty0: i32,
+): Opnd {
   const n0 = b.length
-  const on = irBExpr(b, p.ispOn)
+  const on0 = irBExpr(b, p.ispOn)
+  if ibMiss != "" { return on0 }
+  const on = switchOperand(b, n0, on0, p.ispOn)
   if ibMiss != "" { return on }
-  if !intSwitchOn(b, n0, on) { return irBMiss("int switch scrutinee") }
-  const ty = byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep))
+  const ty = if ty0 >= 0 { ty0 } else { byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)) }
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const arms: i32[][] = []
-  for th in p.ispThens { arms.push(ifArm(th, t, rep)) }
-  const els = ifArm(p.ispElse, t, rep)
+  for th in p.ispThens { arms.push(ifArmAt(th, t, rep, ty)) }
+  const els = ifArmAt(p.ispElse, t, rep, ty)
   if ibMiss != "" { return irBMiss("if arm") }
   const sn: SIntSwitch = {
     isTail: false,
@@ -19619,9 +19623,10 @@ function valuedSwitch(b: i32[], ix: i32, p: IntSwitchPlan, rep: i32): Opnd {
 // last value (`tailArm`); a statement chain's are statement lists, as `emitSwitchArm` writes them.
 function intSwitch(b: i32[], ix: i32, p: IntSwitchPlan, tail: boolean) {
   const n0 = b.length
-  const on = irBExpr(b, p.ispOn)
+  const on0 = irBExpr(b, p.ispOn)
   if ibMiss != "" { return 0 }
-  if !intSwitchOn(b, n0, on) { return skip("int switch scrutinee") }
+  const on = switchOperand(b, n0, on0, p.ispOn)
+  if ibMiss != "" { return 0 }
   const arms: i32[][] = []
   for t in p.ispThens {
     arms.push(if tail { tailArm(t) } else { bodyOf(elseStmts(t)) })
@@ -22456,9 +22461,8 @@ function nulSentinelElem(b: i32[], e: i32, er: i32): Opnd {
   if repPrim(er) != "i32" { return irBMiss("array null sentinel rep") }
   const two: Opnd = { oiRep: er, oiBits: 2 }
   if nodeAt(unwrapParen(e)) is NullLit { return two }
-  const v = irBExpr(b, e)
-  if ibMiss != "" { return v }
-  return irBLetTempTy(b, { aeEff: [v], aeV: two, aeAt: e }, e, er, TY_I32)
+  // Any other element is read for its effects, as a store's value is (`nulSentinelStore`).
+  return nulSentinelStore(b, e, er)
 }
 
 // Whether element `e` of a `null[]` literal is that list's null: legacy's own test
