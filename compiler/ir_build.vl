@@ -605,6 +605,7 @@ import {
   holeBoxPlanOf,
   identReadArmOf,
   identReadsNull,
+  ifJoinBoxPasses,
   isArmOf,
   isArmPatTy,
   isBoxGuardPlain,
@@ -880,6 +881,7 @@ import {
   letIsNulNone,
   letMapShapeOfTy,
   letNulMapReadUnionBox,
+  letRecBuiltTy,
   letValuesBuiltApart,
   listTyOfElem,
   localIndexOf,
@@ -3757,6 +3759,8 @@ export function exprTyOf(ix: i32): i32 {
   // A read of a binding holding a returned record whole is that record (`emitHolderRead`).
   const ht = holderReadTy(ix)
   if ht >= 0 { return ht }
+  const rbt = recBuiltReadTy(ix)
+  if rbt >= 0 { return rbt }
   // A read of a parameter held at the row legacy declares it at reads that row.
   const pv = declRowParamVarOf(ix)
   if pv >= 0 { return ib.irVars[pv].vTy }
@@ -4128,6 +4132,21 @@ export function irBBoxLocal(b: i32[], ix: i32): Opnd {
   return o
 }
 
+// The record name read `ix` reads where its binding's cell is the record the record solve built
+// it as (`letRecBuiltTy`); else -1.
+export function recBuiltReadTy(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return -1 }
+  const d = identDeclOf(ix)
+  if d < 0 { return -1 }
+  const v = ibDeclVar[d] ?? -1
+  if v >= 0 {
+    const rt = letRecBuiltTy(d, ibFnIx)
+    return if rt >= 0 && ib.irVars[v].vTy == rt { rt } else { -1 }
+  }
+  if localIndexOf(ibFnIx, ix) >= 0 { return -1 }
+  return letRecBuiltTy(d, -1)
+}
+
 // Whether binding `d`'s variable `v`, of an open function type, takes closure `src` its
 // initializer built at its instance's signature: legacy's cell holds a closure (`letBindRep`), so
 // the variable is retyped to the closure built.
@@ -4156,7 +4175,8 @@ export function irBDeclVar(d: i32): i32 {
   // of it as that member's closure (`holderMemberTy`).
   const ht = holderHeldRecordTy(d, ibFnIx)
   const hm = if ht < 0 && (elabHasRetRecords() || bundleAnyNoted()) { holderMemberTy(d, ibFnIx) } else { -1 }
-  const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else { heldTy(scopeTyAt(d, ibFnIx)) }
+  const rb = if ht < 0 && hm < 0 { letRecBuiltTy(d, ibFnIx) } else { -1 }
+  const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else if rb >= 0 { rb } else { heldTy(scopeTyAt(d, ibFnIx)) }
   // A map local is held as legacy stores it, its mv slot off its initializer (`mapSlotHeldTy`).
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   const ty = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
@@ -6933,7 +6953,7 @@ function globalRep(g: i32, d: i32): i32 {
   const ht = globalHolderTy(d)
   // A holder's cell beside `null` (cell kind `nulstruct`) is the record's nullable.
   const ct = if ht >= 0 && globalCellKind(d) == "nulstruct" { nullableRecordTyOf(ht) } else { ht }
-  const r0 = globalTyRep(if ht >= 0 { ct } else { scopeTyAt(d, -1) })
+  const r0 = globalTyRep(if ht >= 0 { ct } else { globalHeldTy(d) })
   const r = if ht < 0 { atomCellRep(d, cellAtStorageRow(d, openCellRep(d, r0))) } else { r0 }
   if r >= 0 {
     globalNoteAt(g, d, r)
@@ -6986,7 +7006,9 @@ function cellAtStorageRow(d: i32, r: i32): i32 {
 // of it a binding holds (`globalHolderTy`), else its own type.
 function globalHeldTy(d: i32): i32 {
   const ht = globalHolderTy(d)
-  return if ht >= 0 { ht } else { scopeTyAt(d, -1) }
+  if ht >= 0 { return ht }
+  const rb = letRecBuiltTy(d, -1)
+  return if rb >= 0 { rb } else { scopeTyAt(d, -1) }
 }
 
 // The type a module binding `d` holds a returned record at, as `irBDeclVar` holds a local's: the
@@ -7955,6 +7977,7 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   if !(repNodeAt(frep) is RClosure) {
     return missRhs("captured call closure rep")
   }
+  const fAt = b.length
   const env = cloEnvOf(b, pos, ix)
   if ibMiss != "" { return missRhs(ibMiss) }
   const f = irBLetTempTy(
@@ -7969,7 +7992,9 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   if !(callee is FuncDecl) || callee.fnParams.length != c.callArgs.length {
     return missRhs("argument count")
   }
-  const args: Opnd[] = []
+  const ops: Opnd[] = [f]
+  const starts: i32[] = [fAt]
+  const ixs: i32[] = [c.callFn]
   let i = 0
   while i < c.callArgs.length {
     if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
@@ -7984,19 +8009,31 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     if arm != "plain" && !delivers {
       return missRhs("captured call argument " + arm)
     }
-    const at = b.length
+    starts.push(b.length)
+    ixs.push(c.callArgs[i])
     const a = if delivers { deliver(b, c.callArgs[i], dst, pty) } else { irBExpr(b, c.callArgs[i]) }
     if ibMiss != "" { return missRhs("argument") }
-    if ifBelowLead(b, at, "short-circuit closure argument") {
-      return missRhs("short-circuit closure argument")
-    }
     if irBOpRep(a) != dst { return missRhs("captured call argument rep") }
-    args.push(a)
+    ops.push(a)
     i = i + 1
   }
+  // The closure is read after its arguments (`call_ref`), so each operand is spilled, not staged.
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      ops,
+      ixs,
+      false,
+      "short-circuit closure argument",
+    )
+  ) {
+    return missRhs("short-circuit closure argument")
+  }
+  const args = ops.slice(1, ops.length)
   const isVoid = sigKeyRetIsVoid(cloSigKeyExt(pos))
   const r: Rhs = {
-    crFn: f,
+    crFn: ops[0],
     crSig: sig,
     crArgs: args,
     crVoid: isVoid,
@@ -8816,6 +8853,106 @@ function leadFirstAt(b: i32[]): i32 {
   return b.length
 }
 
+// Operands `args` of an n-ary node, `j` built into `b` from `starts[j]`: where a later one holds a
+// statement, the earlier are staged below it (`irBStageLeads`), or spilled to locals where `stack`
+// is false (the node reads operands again) or no stage holds; false, with miss `why`, where neither
+// can be. The first operand has nothing written before it.
+function irBStageOperands(
+  b: i32[],
+  starts: i32[],
+  args: Opnd[],
+  ixs: i32[],
+  stack: boolean,
+  why: string,
+): boolean {
+  // Each operand's start is kept as its first node, which nodes inserted before it do not move.
+  const ids: i32[] = []
+  let m = args.length - 1
+  while ids.length < args.length { ids.push(-1) }
+  while m >= 0 {
+    const end = if m + 1 < starts.length { starts[m + 1] } else { b.length }
+    ids[m] = if starts[m] < end { b[starts[m]] } else if m + 1 < args.length { ids[m + 1] } else { -1 }
+    m = m - 1
+  }
+  let j = 1
+  while j < args.length {
+    const at = operandAt(b, ids[j])
+    const end = if j + 1 < args.length { operandAt(b, ids[j + 1]) } else { b.length }
+    if ifBelowLeadHas(b, at, end) {
+      const n0 = b.length
+      const lead = args.slice(0, j)
+      const ls: i32[] = []
+      let k = 0
+      while k < j {
+        ls.push(operandAt(b, ids[k]))
+        k = k + 1
+      }
+      const li = ixs.slice(0, j)
+      const staged = stack
+        && !coalBoxFrom(b, at, false)
+        && !receiverStageFrom(b, at)
+        && irBStageLeads(b, at, ls, lead, li)
+      if !staged && (ibMiss != "" || !irBSpillLeads(b, at, lead, li)) {
+        if ibMiss == "" { irBMiss(why) }
+        return false
+      }
+      k = 0
+      while k < j {
+        args[k] = lead[k]
+        k = k + 1
+      }
+      // A node that reads its operands again reads this one from a local, set where it ends, so
+      // no value the statement leaves on the stack waits under a later read.
+      if !stack && !heldOperand(b, end + b.length - n0, args, ixs, j, why) {
+        return false
+      }
+    }
+    j = j + 1
+  }
+  return true
+}
+
+// Where operand start `id` (its first node, or -1 for the end) stands in `b` now.
+function operandAt(b: i32[], id: i32): i32 {
+  if id < 0 { return b.length }
+  let i = 0
+  while i < b.length && b[i] != id { i = i + 1 }
+  return i
+}
+
+// Operand `j` of `args` set into a local of its own at position `pos` of `b`, read from there.
+function heldOperand(
+  b: i32[],
+  pos: i32,
+  args: Opnd[],
+  ixs: i32[],
+  j: i32,
+  why: string,
+): boolean {
+  const a = args[j]
+  if !(a is OVar) || a.ov < 0 || a.ov >= ib.irVars.length {
+    irBMiss(why)
+    return false
+  }
+  const lv = irVarNew(
+    ib,
+    ib.irVars[a.ov].vRep,
+    ib.irVars[a.ov].vTy,
+    "local",
+    -1,
+  )
+  const one: i32[] = []
+  irBNode(one, { asDst: lv, asSrc: a }, -1, ibNoValue, ixs[j])
+  if ibMiss != "" || one.length != 1 {
+    irBMiss(why)
+    return false
+  }
+  insertAt(b, pos, one[0])
+  const o: Opnd = { ov: lv }
+  args[j] = o
+  return true
+}
+
 // `ifBelowLead` over the operands built into `b` from `at` up to `to`.
 function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
   if !ifBelowLeadHas(b, at, to) { return false }
@@ -8917,8 +9054,9 @@ function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
 function simdMemRhs(b: i32[], c: Call, ix: i32, row: i32): Rhs {
   const base = simdMemBase(row)
   const ap = irBAddrPlan(c, base)
-  const at = b.length
   const args: Opnd[] = []
+  const starts: i32[] = [b.length]
+  const ixs: i32[] = [if ap.maArm == "rest" { ap.maRest } else { ix }]
   match ap.maArm {
     "const" => {
       const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
@@ -8930,9 +9068,22 @@ function simdMemRhs(b: i32[], c: Call, ix: i32, row: i32): Rhs {
       return missRhs("simd memory address " + ap.maArm)
     }
   }
-  if base == 2 { args.push(irBExpr(b, memCallArg(c, 2, 1))) }
+  if base == 2 {
+    starts.push(b.length)
+    ixs.push(memCallArg(c, 2, 1))
+    args.push(irBExpr(b, memCallArg(c, 2, 1)))
+  }
   if ibMiss != "" { return missRhs("simd memory operand") }
-  if ifBelowLead(b, at, "simd memory short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      ixs,
+      true,
+      "simd memory short-circuit operand",
+    )
+  ) {
     return missRhs("simd memory short-circuit operand")
   }
   if (
@@ -8958,20 +9109,25 @@ function simdRhs(b: i32[], c: Call, ix: i32): Rhs {
   const row = simdCallRow(c)
   if row < 0 { return missRhs("simd row") }
   if simdRowIsMem(row) { return simdMemRhs(b, c, ix, row) }
-  const at = b.length
   const args: Opnd[] = []
   const want: string[] = []
+  const starts: i32[] = []
+  const ixs: i32[] = []
   let i = 0
   while i < c.callArgs.length {
     const p = simdOperandPrim(row, i)
     if p != "" {
+      starts.push(b.length)
+      ixs.push(c.callArgs[i])
       args.push(irBExpr(b, c.callArgs[i]))
       want.push(p)
     }
     i = i + 1
   }
   if ibMiss != "" { return missRhs("simd operand") }
-  if ifBelowLead(b, at, "simd short-circuit operand") {
+  if (
+    !irBStageOperands(b, starts, args, ixs, true, "simd short-circuit operand")
+  ) {
     return missRhs("simd short-circuit operand")
   }
   i = 0
@@ -8996,11 +9152,23 @@ function simdRhs(b: i32[], c: Call, ix: i32): Rhs {
 function hostCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const pl = hostCallPlanOf(c)
   if pl.hpFail != "" || pl.hpImport < 0 { return missRhs("host call plan") }
-  const at = b.length
   const args: Opnd[] = []
-  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  const starts: i32[] = []
+  for a in c.callArgs {
+    starts.push(b.length)
+    args.push(irBExpr(b, a))
+  }
   if ibMiss != "" { return missRhs("host call operand") }
-  if ifBelowLead(b, at, "host call short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      c.callArgs,
+      true,
+      "host call short-circuit operand",
+    )
+  ) {
     return missRhs("host call short-circuit operand")
   }
   let i = 0
@@ -9024,11 +9192,23 @@ function hostCallRhs(b: i32[], c: Call, ix: i32): Rhs {
 // call of the reserved `__log__` import.
 function logCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callArgs.length != 2 { return missRhs("log arguments") }
-  const at = b.length
   const args: Opnd[] = []
-  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  const starts: i32[] = []
+  for a in c.callArgs {
+    starts.push(b.length)
+    args.push(irBExpr(b, a))
+  }
   if ibMiss != "" { return missRhs("log operand") }
-  if ifBelowLead(b, at, "log short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      c.callArgs,
+      true,
+      "log short-circuit operand",
+    )
+  ) {
     return missRhs("log short-circuit operand")
   }
   for a in args {
@@ -9047,11 +9227,23 @@ function logCallRhs(b: i32[], c: Call, ix: i32): Rhs {
 // (a byte list, then two i32s), then the helper call (`strFromBytesTail`).
 function strFromBytesRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callArgs.length != 3 { return missRhs("byte string arguments") }
-  const at = b.length
   const args: Opnd[] = []
-  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  const starts: i32[] = []
+  for a in c.callArgs {
+    starts.push(b.length)
+    args.push(irBExpr(b, a))
+  }
   if ibMiss != "" { return missRhs("byte string operand") }
-  if ifBelowLead(b, at, "byte string short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      c.callArgs,
+      true,
+      "byte string short-circuit operand",
+    )
+  ) {
     return missRhs("byte string short-circuit operand")
   }
   const sl = repNodeAt(irBOpRep(args[0]))
@@ -11673,6 +11865,15 @@ function boxTempIn(
       return if irBOpRep(pb) == dst { pb } else { irBLetTempTy(b, { sgV: pb }, ix, dst, repTyOf(dst)) }
     }
   }
+  // A valued `if` built as a box that passes as `uTy`'s is that box (`ifJoinBoxPasses`).
+  if (
+    p.hbArm == "ladder"
+    && heldAsBox(irBOpRep(v))
+    && heldAsBox(dst)
+    && ifJoinBoxPasses(ix, uTy, ibFnIx)
+  ) {
+    return if irBOpRep(v) == dst { v } else { irBLetTempTy(b, { sgV: v }, ix, dst, repTyOf(dst)) }
+  }
   // An assignment boxed as a wide atom (`widenPlanOf`'s `asgLit`, `radix`) is its value at the
   // atom's number kind first, as legacy's `emitWidened` writes it; its span then ends there.
   const wide = p.hbArm == "atom"
@@ -13099,17 +13300,32 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   const boxTy = arrNewFillBoxTy(ix, fill, ibFnIx)
   const ln = repNodeAt(rep)
   if !(ln is RList) { return irBMiss("array new rep") }
-  const at = b.length
-  const len = irBExpr(b, n.callArgs[0])
+  const lenAt = b.length
+  const len0 = irBExpr(b, n.callArgs[0])
+  const fillAt = b.length
   // The fill is delivered at the element rep, as a literal element of the same value is; one
   // legacy boxes is boxed at its union (`arrNewFillBoxTy`), as a union element is.
   // Otherwise at the element rep's own type, so a fill already boxed at that union passes as is.
   const et = repTyOf(ln.rlsElem)
   // A `null[]`'s fill is its i32 storage's sentinel, as an element store writes it.
   const nulFill = repPrim(ln.rlsElem) == "null"
-  const v = if nulFill { nulSentinelStore(b, fill, repNodeOfTy(TY_I32)) } else if boxTy >= 0 { boxTempIn(b, unionElemValue(b, fill), fill, ln.rlsElem, -1, boxTy) } else { deliver(b, fill, ln.rlsElem, et) }
-  if ibMiss != "" { return v }
-  if ifBelowLead(b, at, "array new short-circuit operand") { return v }
+  const v0 = if nulFill { nulSentinelStore(b, fill, repNodeOfTy(TY_I32)) } else if boxTy >= 0 { boxTempIn(b, unionElemValue(b, fill), fill, ln.rlsElem, -1, boxTy) } else { deliver(b, fill, ln.rlsElem, et) }
+  if ibMiss != "" { return v0 }
+  const ops: Opnd[] = [len0, v0]
+  if (
+    !irBStageOperands(
+      b,
+      [lenAt, fillAt],
+      ops,
+      n.callArgs,
+      false,
+      "array new short-circuit operand",
+    )
+  ) {
+    return v0
+  }
+  const len = ops[0]
+  const v = ops[1]
   if repPrim(irBOpRep(len)) != "i32" {
     return irBMiss("array new length coercion")
   }
@@ -13123,11 +13339,23 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
 // operands as they stand, then the arm's instruction. A plan legacy refuses is a named miss.
 function memOpRhs(b: i32[], c: Call, ix: i32): Rhs {
   if memOpPlanOf(c).moFail != "" { return missRhs("memory op plan") }
-  const at = b.length
   const args: Opnd[] = []
-  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  const starts: i32[] = []
+  for a in c.callArgs {
+    starts.push(b.length)
+    args.push(irBExpr(b, a))
+  }
   if ibMiss != "" { return missRhs("memory op operand") }
-  if ifBelowLead(b, at, "memory op short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      c.callArgs,
+      true,
+      "memory op short-circuit operand",
+    )
+  ) {
     return missRhs("memory op short-circuit operand")
   }
   for o in args {
@@ -13191,8 +13419,9 @@ function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
   const p = memAccessPlanOf(name)
   if p.mxOp < 0 || p.mxAlign < 0 { return missRhs("memory access width") }
   const ap = irBAddrPlan(c, p.mxBase)
-  const at = b.length
   const args: Opnd[] = []
+  const starts: i32[] = [b.length]
+  const ixs: i32[] = [if ap.maArm == "rest" { ap.maRest } else { ix }]
   match ap.maArm {
     "const" => {
       const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
@@ -13204,9 +13433,22 @@ function memAccessNamed(b: i32[], c: Call, ix: i32, name: string): Rhs {
       return missRhs("memory address " + ap.maArm)
     }
   }
-  if p.mxBase == 2 { args.push(irBExpr(b, memCallArg(c, 2, 1))) }
+  if p.mxBase == 2 {
+    starts.push(b.length)
+    ixs.push(memCallArg(c, 2, 1))
+    args.push(irBExpr(b, memCallArg(c, 2, 1)))
+  }
   if ibMiss != "" { return missRhs("memory access operand") }
-  if ifBelowLead(b, at, "memory access short-circuit operand") {
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      ixs,
+      true,
+      "memory access short-circuit operand",
+    )
+  ) {
     return missRhs("memory access short-circuit operand")
   }
   // The address is an i32; a store's value is already at its width's prim, which legacy's
@@ -13265,7 +13507,8 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
     return r
   }
   const ap = irBAddrPlan(c, pl.apBase)
-  const at = b.length
+  const starts: i32[] = [b.length]
+  const ixs: i32[] = [if ap.maArm == "rest" { ap.maRest } else { ix }]
   match ap.maArm {
     "const" => {
       const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
@@ -13279,11 +13522,15 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
   }
   let k = 1
   while k < pl.apBase {
+    starts.push(b.length)
+    ixs.push(memCallArg(c, pl.apBase, k))
     args.push(irBExpr(b, memCallArg(c, pl.apBase, k)))
     k = k + 1
   }
   if ibMiss != "" { return missRhs("atomic operand") }
-  if ifBelowLead(b, at, "atomic short-circuit operand") {
+  if (
+    !irBStageOperands(b, starts, args, ixs, true, "atomic short-circuit operand")
+  ) {
     return missRhs("atomic short-circuit operand")
   }
   if repPrim(irBOpRep(args[0])) != "i32" {
@@ -13331,11 +13578,25 @@ function truncSatRhs(b: i32[], c: Call, ix: i32): Rhs {
 function listCopyStmt(b: i32[], n: Call, ix: i32): i32 {
   if n.callArgs.length != 5 { return skip("list copy arguments") }
   if arrCopyPlanOf(ix, ibFnIx).acWhy != "" { return skip("list copy refused") }
-  const at = b.length
   const args: Opnd[] = []
-  for a in n.callArgs { args.push(irBExpr(b, a)) }
+  const starts: i32[] = []
+  for a in n.callArgs {
+    starts.push(b.length)
+    args.push(irBExpr(b, a))
+  }
   if ibMiss != "" { return 0 }
-  if ifBelowLead(b, at, "list copy short-circuit operand") { return 0 }
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      args,
+      n.callArgs,
+      false,
+      "list copy short-circuit operand",
+    )
+  ) {
+    return 0
+  }
   const dl = irBOpRep(args[0])
   if !(repNodeAt(dl) is RList) || irBOpRep(args[2]) != dl {
     return skip("list copy list rep")
@@ -13613,8 +13874,10 @@ function spreadLit(
   }
   const at = b.length
   const srcs: Opnd[] = []
+  const starts: i32[] = []
   let g = 0
   while g < grps.length {
+    starts.push(b.length)
     const v0 = spreadSrcBuild(b, p, g, grps[g], ix, rep)
     if ibMiss != "" { return v0 }
     // A source list whose rep is the literal's twin, or apart only in a hole, is the same list
@@ -13644,7 +13907,18 @@ function spreadLit(
     }
     ib.irSpreadPair[b[at]] = nt
   }
-  if ifBelowLead(b, at, "array spread short-circuit operand") { return srcs[0] }
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      srcs,
+      grps,
+      false,
+      "array spread short-circuit operand",
+    )
+  ) {
+    return srcs[0]
+  }
   const r: Rhs = {
     spSrcs: srcs,
     spGroups: grps,
@@ -13701,8 +13975,10 @@ function spreadBoxedLit(
   }
   const at = b.length
   const srcs: Opnd[] = []
+  const starts: i32[] = []
   let g = 0
   while g < grps.length {
+    starts.push(b.length)
     const v = spreadBoxedGroup(b, grps[g], isSrc[g], row, lrep, lt)
     if ibMiss != "" { return v }
     srcs.push(v)
@@ -13718,7 +13994,18 @@ function spreadBoxedLit(
     }
     ib.irSpreadPair[b[at]] = nt
   }
-  if ifBelowLead(b, at, "array spread short-circuit operand") { return srcs[0] }
+  if (
+    !irBStageOperands(
+      b,
+      starts,
+      srcs,
+      grps,
+      false,
+      "array spread short-circuit operand",
+    )
+  ) {
+    return srcs[0]
+  }
   const r: Rhs = {
     spSrcs: srcs,
     spGroups: grps,
