@@ -767,86 +767,27 @@ export let loopBrkLabel: string[] = []
 // absolute depth and its result binding's wasm local, so a `break v` into it hands the value over.
 export let lvFrameDepth: i32[] = []
 export let lvFrameLocal: i32[] = []
-// Which scratch frames the function being laid out needs, one field per frame: the two frame
-// builders start each function from `fnUsesNone()`. `packedPush` is a row bitmask, bit `r` for
-// row `r`; every other field is a flag.
+// Which union-box sink frames the function being laid out needs: the two frame builders start
+// each function from `fnUsesNone()`.
 export type FnUses = {
-  push: boolean,
-  refPush: boolean,
-  strPush: boolean,
-  nulStrPush: boolean,
-  f64Push: boolean,
-  i64Push: boolean,
-  f32Push: boolean,
-  v128Push: boolean,
-  packedPush: i32,
   unionSink: boolean,
   unionLetSink: boolean,
-  mapKeys: boolean,
-  mapVals: boolean,
-  atomStage: boolean,
-  mapFilter: boolean,
 }
 
 export function fnUsesNone(): FnUses {
-  return {
-    push: false,
-    refPush: false,
-    strPush: false,
-    nulStrPush: false,
-    f64Push: false,
-    i64Push: false,
-    f32Push: false,
-    v128Push: false,
-    packedPush: 0,
-    unionSink: false,
-    unionLetSink: false,
-    mapKeys: false,
-    mapVals: false,
-    atomStage: false,
-    mapFilter: false,
-  }
+  return { unionSink: false, unionLetSink: false }
 }
 
 export let fnUses: FnUses = fnUsesNone()
 
-// The start function's frames: fresh, but for the four fields its builder never clears. The sweep
-// sets `packedPush` and `mapVals` for this body like any other, and a stale true from this compile
-// only reserves an unused frame (`emitStateReset` clears both per compile); each caller decides
-// the two sink flags after this.
+// The start function's frames: fresh, but for the two sink flags, which each caller decides
+// after this.
 export function fnUsesForStart(was: FnUses): FnUses {
   const u = fnUsesNone()
-  u.packedPush = was.packedPush
-  u.mapVals = was.mapVals
   u.unionSink = was.unionSink
   u.unionLetSink = was.unionLetSink
   return u
 }
-
-// Per-function scratch frames: `fbBeginFunc` (emit_bytes) owns the layout, walking
-// frames in a fixed order after params+locals and reserving each only when its
-// `fnUses` field is set — a new frame is appended last so an unused function keeps
-// its layout. `.push(x)` lowers inline, so each list kind needs its own typed quad.
-export let pushScratchBase = 0 // i32 list: backing `(ref $aTypeIdx)`
-export let refPushScratchBase = 0 // ref list (G7-ref): backing over the element row's `(ref null $elem)`
-// A function pushing onto distinct ref-list element types needs a separately-typed
-// quad per element type. `fnRefPushSlots` lists the table slots it pushes onto
-// (first-seen order); `refPushBaseBySlot[k]` is the k-th quad's base, and
-// `refPushScratchBaseFor` maps a table slot to its base (`refPushScratchBase` aliases the first).
-export let fnRefPushSlots: i32[] = []
-export let refPushBaseBySlot: i32[] = []
-// `string[]` (`fnUses.strPush`): val + backing `(ref $sTypeIdx)` / `(ref $mkArrIdx)`, recvRef
-// `(ref $mkListIdx)`, based at `strPushScratchBase`. A `(string | null)[]` push (`nulStrPush`, set
-// beside `strPush`) shares that quad, the niche's backing being the string list, but its value slot
-// is `(ref null $aTypeIdx)`, as the ref-push frame distinguishes per slot (`rlElemNullable`).
-export let f64PushScratchBase = 0 // `f64[]`: val f64, backing/recvRef $fa64/$fl64
-export let i64PushScratchBase = 0 // `i64[]`: val i64, backing/recvRef $ia64/$il64
-export let f32PushScratchBase = 0 // `f32[]`: val f32, backing/recvRef $fa32/$fl32
-export let v128PushScratchBase = 0 // `F32x4[]`: val v128, backing/recvRef $fa128/$fl128
-// The packed lists: one quad per row pushed, val i32 (a stored VALUE is an i32, only the
-// backing is packed) and the row's backing/recvRef. Not the i32 quad: the value slot matches,
-// the two ref slots do not. `fnUses.packedPush` is the row bitmask, bit `r` for row `r`.
-export let u8PushScratchBase = 0
 
 // The push-kind bit a `.push` onto packed row `row` sets: 128 for `u8`, then 1024, 2048, 4096.
 export function pkPushBit(row: i32): i32 {
@@ -854,17 +795,6 @@ export function pkPushBit(row: i32): i32 {
   return 1024 * (1 << (row - 1))
 }
 
-// The base of packed row `row`'s push quad: the quads sit in row order from `u8PushScratchBase`.
-export function pkPushBase(row: i32): i32 {
-  let n = 0
-  let r = 0
-  while r < row {
-    if (fnUses.packedPush & (1 << r)) != 0 { n = n + 1 }
-    r = r + 1
-  }
-  return u8PushScratchBase + 4 * n
-}
-export let strPushScratchBase = 0
 // Union-box sink: a value whose rep is the shared union box, produced on two branches,
 // gets one construction site per branch — binaryen's Heap2Local scalarizes per site, so
 // two sites merging into one value melt neither and the box survives. The sink gives the
@@ -2101,14 +2031,6 @@ export function armStageClear() {
 }
 // The map frame's base where a helper body lays it out over its own locals, else -1 (`mapScr`).
 export let mapScratchBase = -1
-// `m.keys()` / `for k in m` build a fresh string list of LIVE keys: a 6-slot frame —
-// outBack (ref $mkArrIdx), keysBack (ref $mkArrIdx), live (ref $aTypeIdx), then i/j/count
-// (3 i32). Reserved when the function builds a map's key list (`fnUses.mapKeys`).
-export let mapKeysBase = 0
-// `m.values()` over a MONO i32 map builds a fresh i32 list of LIVE values: a 6-slot frame —
-// outBack (ref $aTypeIdx), valsBack (ref $aTypeIdx), live (ref $aTypeIdx), then i/j/count
-// (3 i32). The i32 sibling of the key-list frame.
-export let mapValsBase = 0
 // How many function-value calls are open around the one being lowered, i.e. whose closure
 // is stashed and whose id is not yet read (D2329). Each depth has its own lazy slot; a call
 // in another's arguments takes its own lazy slot, so it cannot overwrite the outer closure.
@@ -2133,11 +2055,6 @@ export let listGetRecvStagedSet = false
 export let listGetDepth = 0
 export let listGetIdxOwner: i32[] = []
 export let listGetRecvOwner: i32[] = []
-// The literal-union atom-narrow staging slot: a string-repped literal union reaching
-// an atom-typed destination whose value is not re-readable (a call) stashes the
-// value's string once, non-null `(ref $sTypeIdx)`, so the narrow's select-tower
-// re-reads the slot. One slot, two claimants — `callPushBits` and `exprPopBits` — both setting the same flag.
-export let atomStageSlot = 0
 // A non-null list rep: the element class a list's builds, copies and frame slots key on.
 export type ListKind = "list"
   | "u8list"
@@ -2148,20 +2065,13 @@ export type ListKind = "list"
   | "strlist"
   | "reflist"
 
-// `.map`/`.filter` scratch frame (the HOF loop): 3 shared i32 temporaries (`i`, `n`,
-// `j`), one typed source slot per distinct receiver list type, one typed dest slot per
-// distinct result element kind. The closure slot is lazy (`mfCallbackLocal`).
-// Reserved only in a function whose body holds a `.map`/`.filter` (`mfScan`).
-export let mfScratchBase = 0
+// The `.map`/`.filter` frame's typed slots, per function: the source wrapper of each distinct
+// (receiver kind, ref-list slot) and the destination backing of each distinct (result kind,
+// slot), a slot -1 for a non-ref kind. A lazy row's key is its index here.
 export let mfSrcKinds: ListKind[] = []
 export let mfSrcSlots: i32[] = []
-export let mfSrcBases: i32[] = []
 export let mfDstKinds: ListKind[] = []
-// Parallel to `mfDstKinds`: the ref-list table slot of a kind-2 (ref-list) dest, so
-// its fresh backing valtype is `rlBackIdx[mfDstSlots[k]]` (`.filter` over a struct
-// array yields the same ref list; a struct-returning `.map` a possibly different one). -1 for a non-ref dest kind.
 export let mfDstSlots: i32[] = []
-export let mfDstBases: i32[] = []
 // Declaration-time address-const fold: one i32 scratch local per qualifying `const p = K +
 // bounded`, counted by `maFoldCandidateCount` (wasmEmit.vl) and reserved as one EAGER frame,
 // last, so a function with none keeps its existing layout — `emitMemAddr` then reads a fold's
@@ -2206,6 +2116,27 @@ export const COALCALL_FRAME = 1270
 export const REBOX_FRAME = 1280
 export const OPTRECV_FRAME = 1290
 export const LISTGET_FRAME = 1300
+// The lazy-row codes of the map key-list and value-list builders (6 slots each), the
+// `.map`/`.filter` loop's i, n and j (3), and its source wrappers and destination backings
+// (1 each, keyed by their index in `mfSrcKinds` and `mfDstKinds`).
+export const MKEYS_FRAME = 1310
+export const MVALS_FRAME = 1320
+export const MF_FRAME = 1330
+export const MFSRC_FRAME = 1340
+export const MFDST_FRAME = 1350
+// The lazy-row codes of the list push quads (value, capacity, backing, receiver wrapper): the
+// i32, string, nullable-string, f64, i64, f32 and v128 lists, each packed row (keyed by row) and
+// each ref-list row (keyed by its slot). Then the literal-union atom-narrow staging slot.
+export const PUSH_FRAME = 1360
+export const STRPUSH_FRAME = 1370
+export const NSTRPUSH_FRAME = 1380
+export const F64PUSH_FRAME = 1390
+export const I64PUSH_FRAME = 1400
+export const F32PUSH_FRAME = 1410
+export const V128PUSH_FRAME = 1420
+export const PKPUSH_FRAME = 1430
+export const REFPUSH_FRAME = 1440
+export const ATOMSTAGE_FRAME = 1450
 export let liKinds: ListKind[] = []
 export let liSlots: i32[] = []
 export let liBack: i32[] = []
@@ -3088,7 +3019,6 @@ export function emitStateReset() {
   coalDeadJoinIfs = Map()
   monoArenaMark = 0
   aTypeIdx = 0
-  atomStageSlot = 0
   pkBackIdx = [-1, -1, -1, -1]
   pkWrapIdx = [-1, -1, -1, -1]
   cloSigBase = 0
@@ -3097,9 +3027,6 @@ export function emitStateReset() {
   cmSlot = -1
   collectByNode = 0
   emitRootIx = -1
-  f32PushScratchBase = 0
-  f64PushScratchBase = 0
-  v128PushScratchBase = 0
   fa32TypeIdx = -1
   fa64TypeIdx = -1
   fbEagerScratch = 0
@@ -3110,15 +3037,12 @@ export function emitStateReset() {
   fitGrowFn = -1
   fl32TypeIdx = -1
   fl64TypeIdx = -1
-  fnUses.mapVals = false
-  fnUses.packedPush = 0
   gConstExprEmit = false
   gHelpSvGet = []
   gHelpSvLen = []
   gHelpSvMk = []
   gHelpSvSync = []
   gMemLogIdx = 0
-  i64PushScratchBase = 0
   ia64TypeIdx = -1
   il64TypeIdx = -1
   listFitStoodIn = -1
@@ -3135,22 +3059,15 @@ export function emitStateReset() {
   mStructIdx = -1
   maFoldScratchBase = 0
   envCacheBase = 0
-  mapKeysBase = 0
   mapScratchBase = -1
-  mapValsBase = 0
-  mfScratchBase = 0
   mkArrIdx = -1
   mkListIdx = -1
   monoProgStmts = []
   optRecvStagedIx = -1
-  pushScratchBase = 0
-  refPushScratchBase = 0
   sBackIdx = 0
   sTypeIdx = 0
-  strPushScratchBase = 0
   svViewTy = []
   tailCallTable = -1
-  u8PushScratchBase = 0
   uBoxIdx = 0
   unionSinkBase = 0
   vbF32Idx = 0

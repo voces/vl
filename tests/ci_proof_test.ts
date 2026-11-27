@@ -86,6 +86,9 @@ const CI_RUNS: Record<string, string[]> = {
   "conflict markers": [],
   "corpus oracle": ["- name: Corpus oracle on the wasm compiler"],
   "rep-fuzz": ["run: bash scripts/rep-fuzz-check.sh"],
+  "ir debt": [
+    "vl run scripts/ir-debt.vl --compiler build/vl-compiler.wasm -- --check",
+  ],
   "splice scan": [
     "vl run scripts/inventory/splice-scan.vl --compiler build/vl-compiler.wasm -- --self-test",
   ],

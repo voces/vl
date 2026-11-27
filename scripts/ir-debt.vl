@@ -1,0 +1,246 @@
+// The IR's two debt ratchets: the `Rhs` kinds that carry an AST node, and the builder and lowering
+// miss sites. Both counts may only fall.
+//
+//     vl run scripts/ir-debt.vl [-- --check | --write-baseline | --list]
+//
+// A kind is AST-backed when its record has a field named `<prefix>At` (the node the lowering
+// re-reads its plan from). A miss site is a call of `irBMiss`, `missRhs` or `irLMiss` in
+// `compiler/*.vl` code, comments and strings excluded, the function's own declaration not counted.
+// `--check` exits 1 when a count is above `scripts/ir-debt-baseline.txt`; a fall prints and passes,
+// and the PR that earned it runs `--write-baseline`. `--list` names the AST-backed kinds. Run from
+// the checkout root.
+
+import { listDir } from "std:fs"
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import { endsWith, join, split, startsWith, trim } from "std:str"
+import { die, findFrom, hasFlag } from "./lib/common"
+import {
+  padLeft,
+  padRight,
+  readText,
+  sortStrings,
+  writeText,
+} from "./lib/corpus"
+
+const BASELINE = "scripts/ir-debt-baseline.txt"
+const IR = "compiler/ir.vl"
+const MISS_FNS = ["irBMiss", "missRhs", "irLMiss"]
+
+function identByte(b: i32) {
+  return b == 95
+    || b >= 48 && b <= 57
+    || b >= 65 && b <= 90
+    || b >= 97 && b <= 122
+}
+
+// `s` with every comment and string literal's bytes blanked to spaces, newlines kept.
+function codeOnly(s: string): string {
+  const out: u8[] = []
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    if b == 47 && i + 1 < s.length && s[i + 1] == 47 {
+      while i < s.length && s[i] != 10 {
+        out.push(32)
+        i = i + 1
+      }
+      continue
+    }
+    if b == 47 && i + 1 < s.length && s[i + 1] == 42 {
+      while (
+        i < s.length
+        && !(s[i] == 42 && i + 1 < s.length && s[i + 1] == 47)
+      ) {
+        out.push(if s[i] == 10 { 10 } else { 32 })
+        i = i + 1
+      }
+      out.push(32)
+      out.push(32)
+      i = i + 2
+      continue
+    }
+    if b == 34 {
+      out.push(32)
+      i = i + 1
+      while i < s.length && s[i] != 34 {
+        if s[i] == 92 && i + 1 < s.length {
+          out.push(32)
+          i = i + 1
+        }
+        out.push(if s[i] == 10 { 10 } else { 32 })
+        i = i + 1
+      }
+      out.push(32)
+      i = i + 1
+      continue
+    }
+    out.push(b)
+    i = i + 1
+  }
+  return decodeUtf8Lossy(out)
+}
+
+// The calls of `name` in code `c`: the identifier followed by `(`, not a member read and not
+// the name its own `function` declaration introduces.
+function callsOf(c: string, name: string) {
+  let n = 0
+  let at = c.indexOf(name)
+  while at >= 0 {
+    const end = at + name.length
+    const before = if at > 0 { c[at - 1] } else { 32 }
+    let j = end
+    while j < c.length && (c[j] == 32 || c[j] == 9) { j = j + 1 }
+    if !identByte(before) && before != 46 && j < c.length && c[j] == 40 {
+      let k = at - 1
+      while k >= 0 && (c[k] == 32 || c[k] == 9) { k = k - 1 }
+      const decl = k >= 7 && c.slice(k - 7, k + 1) == "function"
+      if !decl && (end >= c.length || !identByte(c[end])) { n = n + 1 }
+    }
+    at = findFrom(c, name, end)
+  }
+  return n
+}
+
+// The member names of `export type Rhs = A | B | ...` in the IR module's code.
+function rhsKinds(c: string) {
+  const at = c.indexOf("export type Rhs =")
+  if at < 0 { die("ir-debt: no `export type Rhs =` in " + IR, 2) }
+  const out: string[] = []
+  let i = at + 17
+  while true {
+    while (
+      i < c.length
+      && (c[i] == 32 || c[i] == 10 || c[i] == 9 || c[i] == 124)
+    ) {
+      if c[i] == 10 && i + 1 < c.length && c[i + 1] == 10 { return out }
+      i = i + 1
+    }
+    const s = i
+    while i < c.length && identByte(c[i]) { i = i + 1 }
+    if i == s { return out }
+    out.push(c.slice(s, i))
+    let j = i
+    while j < c.length && (c[j] == 32 || c[j] == 10 || c[j] == 9) { j = j + 1 }
+    if j >= c.length || c[j] != 124 { return out }
+  }
+}
+
+// Whether kind `name`'s record, declared in code `c`, has a `<prefix>At` field.
+function astBacked(c: string, name: string) {
+  const at = c.indexOf("type " + name + " = {")
+  if at < 0 {
+    die("ir-debt: no record declaration for Rhs kind " + name + " in " + IR, 2)
+  }
+  let i = at + name.length + 9
+  let depth = 1
+  let word = ""
+  while i < c.length && depth > 0 {
+    const b = c[i]
+    if b == 123 { depth = depth + 1 }
+    if b == 125 { depth = depth - 1 }
+    if identByte(b) {
+      const s = i
+      while i < c.length && identByte(c[i]) { i = i + 1 }
+      word = c.slice(s, i)
+      let j = i
+      while j < c.length && c[j] == 32 { j = j + 1 }
+      if j < c.length && c[j] == 58 && word.length > 2 && endsWith(word, "At") {
+        const p = word[word.length - 3]
+        if p >= 97 && p <= 122 { return true }
+      }
+      continue
+    }
+    i = i + 1
+  }
+  return false
+}
+
+type Reading = {
+  kinds: i32,
+  backed: string[],
+  misses: { [string]: i32 },
+  perFile: string[],
+}
+
+function measure(): Reading {
+  const ir = codeOnly(readText(IR))
+  const kinds = rhsKinds(ir)
+  const backed: string[] = []
+  for k in kinds {
+    if astBacked(ir, k) { backed.push(k) }
+  }
+  const files = listDir("compiler")
+  if !(files is string[]) {
+    die("ir-debt: cannot list compiler/", 2)
+    return { kinds: 0, backed: [], misses: Map(), perFile: [] }
+  }
+  const misses: { [string]: i32 } = Map()
+  for f in MISS_FNS { misses[f] = 0 }
+  const perFile: string[] = []
+  for f in sortStrings(files) {
+    if !endsWith(f, ".vl") { continue }
+    const c = codeOnly(readText("compiler/" + f))
+    for fn in MISS_FNS {
+      const n = callsOf(c, fn)
+      if n > 0 {
+        misses[fn] = (misses.get(fn) ?? 0) + n
+        perFile.push(
+          padRight(fn, 8) + "  " + padLeft(toString(n), 5) + "  compiler/" + f,
+        )
+      }
+    }
+  }
+  return { kinds: kinds.length, backed, misses, perFile }
+}
+
+function rows(r: Reading) {
+  const out = ["rhs-ast-backed\t" + toString(r.backed.length)]
+  for fn in MISS_FNS {
+    out.push("miss " + fn + "\t" + toString(r.misses.get(fn) ?? 0))
+  }
+  return out
+}
+
+const got = programArgs()
+const args = if got is Utf8Error { [] } else { got }
+const r = measure()
+print("ir-debt: \{r.backed.length} of \{r.kinds} Rhs kinds carry an AST node")
+for line in r.perFile { print("  " + line) }
+const cur = rows(r)
+if hasFlag(args, "--list") {
+  for k in r.backed { print("  " + k) }
+}
+if hasFlag(args, "--write-baseline") {
+  writeText(
+    BASELINE,
+    "# scripts/ir-debt.vl --write-baseline: counts that may only fall (key<TAB>count).\n"
+      + cur.join("\n")
+      + "\n",
+  )
+  print("ir-debt: wrote " + BASELINE)
+  exit(0)
+}
+const base: { [string]: i32 } = Map()
+for line in split(readText(BASELINE), "\n") {
+  if line == "" || startsWith(line, "#") { continue }
+  const f = split(line, "\t")
+  const n = parseI32(trim(f[1]))
+  base[f[0]] = if n is i32 { n } else { -1 }
+}
+let rose = 0
+for line in cur {
+  const f = split(line, "\t")
+  const n = parseI32(f[1])
+  const now = if n is i32 { n } else { 0 }
+  const was = base.get(f[0]) ?? -1
+  const verdict = if was < 0 { "NEW (not in the baseline)" } else if now > was { "ROSE from " + toString(was) } else if now < was { "fell from " + toString(was) + ": run --write-baseline" } else { "as baseline" }
+  if was < 0 || now > was { rose = rose + 1 }
+  print(padRight(f[0], 16) + padLeft(f[1], 6) + "  " + verdict)
+}
+if hasFlag(args, "--check") && rose > 0 {
+  print("ir-debt: \{rose} count(s) above \{BASELINE}; these may only fall")
+  exit(1)
+}
