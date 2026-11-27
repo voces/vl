@@ -28,12 +28,12 @@ awk '
   /^  count\("claimed"\)$/ { print; print "  count(\"fnc \" + ib.irName)"; c = 1; next }
   # The fallbacks that count no `claim fell back: " + why` row: the verifier (a function and a
   # start body), a minted synthetic global, and a legacy helper refusing (`softRefused`).
-  /^    count\("claim fell back: verifier"\)$/ { print; print "    count(\"fnu \" + ib.irName + \" | claim fell back: verifier\")"; v++; next }
+  /^  count\("claim fell back: verifier"\)$/ { print; print "  count(\"fnu \" + ib.irName + \" | claim fell back: verifier\")"; v++; next }
   /^  count\("claim fell back: build minted a synthetic global"\)$/ { print; print "  count(\"fnu \" + ib.irName + \" | claim fell back: build minted a synthetic global\")"; m = 1; next }
   /^function softRefused\(what: string\): boolean \{$/ { sr = 1 }
   sr && /^  return true$/ { print "  count(\"fnr \" + ib.irName + \" | \" + emitSoftMsg)"; sr = 0; r = 1 }
   { print }
-  END { if (!a || b != 2 || !c || v != 2 || !m || !r) { print "ir-i8-census: a probe anchor in ir_build.vl was not found" > "/dev/stderr"; exit 1 } }
+  END { if (!a || b != 2 || !c || v != 1 || !m || !r) { print "ir-i8-census: a probe anchor in ir_build.vl was not found" > "/dev/stderr"; exit 1 } }
 ' "$D/ir_build.vl" > "$D/ir_build.vl.new"
 mv "$D/ir_build.vl.new" "$D/ir_build.vl"
 # Two classes split for the census alone: `is rung` names its rung, and a miss at a node with no
