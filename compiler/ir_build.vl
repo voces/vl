@@ -1503,6 +1503,13 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   if arm == "litMember" { return isLitMember(b, n, ix, rep) }
   // A float box tested against integer literals is each member's box test or-ed, `numBox`'s.
   if arm == "floatLits" { return isLitArmsTest(b, n, ix, rep, "numBox") }
+  // `x?.f is null` is the optional read's own null test, by its rep (`testNull`).
+  if arm == "optNull" {
+    if rep != ibBool { return irBMiss("is result rep") }
+    const ov = irBExpr(b, n.isObj)
+    if ibMiss != "" { return ov }
+    return testNull(b, ov, ix)
+  }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   // Each rung's own answer, asked once: the arm tag's `tagIsArmOf`, the variant's plain row.
   const ta: TagIsArm = if arm == "armTag" { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
@@ -4086,6 +4093,28 @@ function bindingStorage(d: i32, frame: i32, global: boolean): Storage {
   return storageOf(p)
 }
 
+// The fill of the `let x = null` hole an un-annotated `null`-typed binding `d` copies by name, as
+// legacy's slot holds the copy; -1 for any other binding.
+function boundCopyFillTy(d: i32, ty: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  if repPrim(repNodeOfTy(ty)) != "null" || !(nodeAt(dn.letInit) is Ident) {
+    return -1
+  }
+  const sd = identDeclOf(dn.letInit)
+  const sn = if sd >= 0 && sd < P.nodes.length { nodeAt(sd) } else { null }
+  if (
+    !(sn is LetDecl)
+    || sn.letType >= 0
+    || sn.letInit < 0
+    || !(nodeAt(sn.letInit) is NullLit)
+  ) {
+    return -1
+  }
+  const ft = letBindingUnionTy(sd, ibFnIx)
+  return if ft >= 0 { heldTy(ft) } else { -1 }
+}
+
 // A binding is held at what its initializer builds where today's decision `s` has no storage or
 // an open one; else `s`.
 function buildStorage(p: SpBinding, s: Storage): Storage {
@@ -4160,7 +4189,9 @@ function localStorage(d: i32): Storage {
   const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else if rb >= 0 { rb } else { heldTy(scopeTyAt(d, ibFnIx)) }
   // A map local is held as legacy stores it, its mv slot off its initializer (`mapSlotHeldTy`).
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  const ty = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
+  const ty1 = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
+  const fill = boundCopyFillTy(d, ty1)
+  const ty = if fill >= 0 { fill } else { ty1 }
   const rep = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(rep, ty) {
     // A list whose element nothing fixes is held at the list legacy declares its cell at.
@@ -9673,13 +9704,19 @@ function mapIterRhs(b: i32[], m: Member, ix: i32): Rhs {
   if ibMiss != "" { return missRhs("method operand") }
   const temp = v is OVar && v.ov >= 0 && ib.irVars[v.ov].vKind == "temp"
   const again = temp && recvReadsAgain(unwrapParen(m.memObj))
-  if !(v is OVar) || b.length != at && !temp {
+  // A receiver built into a local of its own (a `??`'s or a valued `if`'s out) is read from it
+  // each step, as a variable is.
+  const own = v is OVar
+    && !temp
+    && v.ov >= 0
+    && ib.irVars[v.ov].vKind == "local"
+  if !(v is OVar) || b.length != at && !temp && !own {
     return missRhs("map iter receiver")
   }
   if !(repNodeAt(irBOpRep(v)) is RMap) {
     return missRhs("map iter receiver rep")
   }
-  const once = temp && !again
+  const once = temp && !again || own && b.length != at
   const r: Rhs = {
     miV: v,
     miAt: ix,
@@ -11176,6 +11213,7 @@ function callOfPureArgs(ix: i32): boolean {
 // `emitScalarMapReadOtherEq` writes it: the operand and the probe in source order.
 function scalarMapEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const p = scalarMapEqPlanOf(n, ibFnIx)
+  if p.smArm == "pair" || p.smArm == "box" { return nulScalarEq(b, n, ix, rep) }
   if p.smArm != "read" { return irBMiss("scalar map compare " + p.smArm) }
   const k = p.smKind
   if k != 0 && k != 1 && k != 3 && k != 4 && k != 5 {
@@ -11214,6 +11252,73 @@ function scalarMapEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     mqAt: ix,
   }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// `==`/`!=` over two nullable scalars (two scalar map reads, or one against a `V | null` value),
+// each built once in source order: equal when both are null, or both present and equal.
+function nulScalarEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  if rep != ibBool { return irBMiss("nullable scalar compare rep") }
+  const l = heldAtRep(b, irBExpr(b, n.binLeft), n.binLeft)
+  if ibMiss != "" { return l }
+  const r = heldAtRep(b, irBExpr(b, n.binRight), n.binRight)
+  if ibMiss != "" { return r }
+  const ne = n.binOp == "!="
+  const t = irVarNew(ib, ibBool, TY_BOOL, "local", -1)
+  // `l` null: the result is whether `r` is too.
+  const nb: i32[] = []
+  const cr = testNull(nb, r, ix)
+  if ibMiss != "" { return cr }
+  const both = if ne { irBLetTemp(nb, { poOp: "not", poArgs: [cr] }, ix, ibBool) } else { cr }
+  irBNode(nb, { asDst: t, asSrc: both }, -1, ibNoValue, ix)
+  // `l` present: unequal to a null `r`, else the values' compare.
+  const ti = irVarNew(ib, ibBool, TY_BOOL, "local", -1)
+  const rn: i32[] = []
+  const miss: Opnd = { oiRep: ibBool, oiBits: if ne { 1 } else { 0 } }
+  irBNode(rn, { asDst: ti, asSrc: miss }, -1, ibNoValue, ix)
+  const vb: i32[] = []
+  const lv = readNonNull(vb, l, ix)
+  const rv = readNonNull(vb, r, ix)
+  if ibMiss != "" { return lv }
+  if irBOpRep(lv) != irBOpRep(rv) {
+    return irBMiss("nullable scalar compare kinds")
+  }
+  const eq = irBLetTemp(
+    vb,
+    { poOp: if ne { "ne" } else { "eq" }, poArgs: [lv, rv] },
+    ix,
+    ibBool,
+  )
+  irBNode(vb, { asDst: ti, asSrc: eq }, -1, ibNoValue, ix)
+  const pb: i32[] = []
+  const cr2 = testNull(pb, r, ix)
+  nulScalarIf(pb, cr2, rn, vb, ti, ix)
+  const tio: Opnd = { ov: ti }
+  irBNode(pb, { asDst: t, asSrc: tio }, -1, ibNoValue, ix)
+  const cl = testNull(b, l, ix)
+  if ibMiss != "" { return cl }
+  nulScalarIf(b, cl, nb, pb, t, ix)
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// `if c { th } else { el }`, each arm ending by writing boolean local `t`.
+function nulScalarIf(b: i32[], c: Opnd, th: i32[], el: i32[], t: i32, ix: i32) {
+  irBNode(
+    b,
+    {
+      siCond: c,
+      siThen: th,
+      siElse: el,
+      siOut: t,
+      siElseKw: true,
+      siJoin: noRefJoin(),
+      siJoinNul: false,
+      siAtDst: false,
+    },
+    TY_BOOL,
+    ibBool,
+    ix,
+  )
 }
 
 // A scalar map compare's operand of kind `k` (an i32, a boolean, an i64, f64 or f32), read in
