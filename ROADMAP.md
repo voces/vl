@@ -36,6 +36,10 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   questions file. The spec's own questions are in [`OPEN-QUESTIONS.md`](docs/spec/OPEN-QUESTIONS.md).
 - **Consumer asks:** each consumer's own doc, listed under Consumers below.
 - **Finished work:** [`CHANGELOG.md`](CHANGELOG.md). **Non-obvious rationale:** [`DECISIONS.md`](DECISIONS.md).
+- **The latest whole-project review:**
+  [`engineering-review-2026-11-27.md`](docs/internals/engineering-review-2026-11-27.md), read after
+  the IR cutover. Its §5 proposes an order for the work after I8; the coordinator rules on adopting
+  it, and until then the list below stands.
 
 ## Next, in order
 

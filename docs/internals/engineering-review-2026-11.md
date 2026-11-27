@@ -1,5 +1,8 @@
 # VL engineering review, 2026-11-14
 
+> Followed by [`engineering-review-2026-11-27.md`](engineering-review-2026-11-27.md), read after the
+> IR cutover: what the migration changed, what it did not, and a proposed order.
+
 An outside read of the whole project at master `498e6419`: compiler, host, std, tooling, tests and
 process. Seven reviewers each read one area (frontend; checker; emitter, mono and rep; optimizer and
 performance; driver, CLI and host; language and std; tooling, tests and process). Their findings were
