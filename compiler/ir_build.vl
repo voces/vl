@@ -249,6 +249,7 @@ import {
   recFieldsWiden,
   recHeapOf,
   recHeapsNote,
+  recHoleHeapsNote,
   recNullFieldsAlike,
   recRetag,
   recRowRetag,
@@ -365,6 +366,7 @@ import {
   callRefSplitKind,
   callStmtDispatches,
   callStmtIdentDrops,
+  calleeTypedDead,
   capturedArgArmOf,
   clearPlanOf,
   clearRecvIsList,
@@ -7344,6 +7346,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     }
     return numIntrRhs(b, c, cf, ix)
   }
+  // A call through a binding this instance types `null`, which no closure route takes, is the
+  // dead branch legacy's `emitCallCoreUserFn` writes as `unreachable` (D3197).
+  if nullBindingCall(ix) { return { dnAt: ix, dnPad: callEndsNever(ix) } }
   // A binding holding a lambda-lifted function is a direct call of it; any other, a closure's.
   const lf = if d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) { cloLiftCalleeOf(c.callFn, ibFnIx) } else { -1 }
   if lf < 0 && d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) {
@@ -9801,7 +9806,7 @@ function printUnionIf(b: i32[], arg: i32): Opnd {
   return deliver(b, arg, repNodeOfTy(ty), -1)
 }
 
-// `__trap__(msg?)`: its message streamed as a string `print` streams one, then `unreachable`, as
+// `__trap__(msg?)`: its message streamed as `print` streams it, then `unreachable`, as
 // `emitCallCoreTrap` writes them.
 function trapStmt(b: i32[], c: Call, ix: i32) {
   if c.callArgs.length > 1 { return skip("trap arguments") }
@@ -9810,16 +9815,27 @@ function trapStmt(b: i32[], c: Call, ix: i32) {
     return skip("trap in a never function")
   }
   if c.callArgs.length == 1 {
-    if printArmOf(c.callArgs[0], ibFnIx) != "str" {
-      return skip("trap message")
-    }
-    const v = irBExpr(b, c.callArgs[0])
+    const why = trapMessage(b, c.callArgs[0], ix)
     if ibMiss != "" { return 0 }
-    if repPrim(irBOpRep(v)) != "str" { return skip("trap message rep") }
-    irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+    if why != "" { return skip(why) }
   }
   irBNode(b, { tpWhy: 0 }, -1, ibNoValue, ix)
   return 0
+}
+
+// Streams trap `ix`'s message `arg` as `print` streams it: a string, or a literal-union atom
+// decoded to its member's text (`emitCallCoreTrap`). Answers why it does not, or "".
+function trapMessage(b: i32[], arg: i32, ix: i32): string {
+  const arm = printArmOf(arg, ibFnIx)
+  if arm != "str" && arm != "atom" { return "trap message" }
+  const asg = if arm == "atom" { asgAtomRep(arg) } else { -1 }
+  const v = if asg >= 0 { deliver(b, arg, asg, -1) } else if arm == "atom" { exprAt(b, arg, true) } else { irBExpr(b, arg) }
+  if ibMiss != "" { return "trap message" }
+  const vr = irBOpRep(v)
+  const ok = if arm == "atom" { repNodeAt(vr) is RAtom } else { repPrim(vr) == "str" }
+  if !ok { return "trap message rep" }
+  irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+  return ""
 }
 
 // `__trap__(msg?)` read as a value: its message streamed, then legacy's `unreachable` for the
@@ -9827,13 +9843,9 @@ function trapStmt(b: i32[], c: Call, ix: i32) {
 function trapCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callArgs.length > 1 { return missRhs("trap arguments") }
   if c.callArgs.length == 1 {
-    if printArmOf(c.callArgs[0], ibFnIx) != "str" {
-      return missRhs("trap message")
-    }
-    const v = irBExpr(b, c.callArgs[0])
-    if ibMiss != "" { return missRhs("trap message") }
-    if repPrim(irBOpRep(v)) != "str" { return missRhs("trap message rep") }
-    irBNode(b, { efRhs: { pnV: v, pnAt: ix, pnOpened: -1 } }, -1, ibNoValue, ix)
+    const why = trapMessage(b, c.callArgs[0], ix)
+    if ibMiss != "" { return missRhs(ibMiss) }
+    if why != "" { return missRhs(why) }
   }
   const r: Rhs = { dnAt: ix, dnPad: callEndsNever(ix) }
   return r
@@ -11085,6 +11097,23 @@ function recordRepOrNull(r: i32): boolean {
   return n is RRecord || n is RNullable && repNodeAt(n.rnInner) is RRecord
 }
 
+// Whether `ix` is a call of a name this instance types `null` that no closure route or function
+// takes: legacy's `emitCallCoreUserFn` writes it as `unreachable`.
+function nullBindingCall(ix: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const c = nodeAt(u)
+  if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) {
+    return false
+  }
+  const cf = nodeAt(c.callFn)
+  if !(cf is Ident) { return false }
+  return calleeTypedDead(c, ibFnIx)
+    && nodeTyAt(c.callFn, ibFnIx) != TY_NEVER
+    && userFnCallTarget(c, cf, ibFnIx) < 0
+    && !userFnCallRoutesRef(c, cf, ibFnIx, -1)
+}
+
 // The value of `ix` delivered at rep `dst`: as built, or widened where legacy widens it, through
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
@@ -11093,6 +11122,17 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // writes no conversion after it.
   if ibMiss == "" && dst >= 0 && exprReadsDeadNever(ix, ibFnIx) {
     return deadNeverTemp(b, ix, dst)
+  }
+  // So is a dead call through a name typed `null` (`nullBindingCall`), built at the destination.
+  if ibMiss == "" && dst >= 0 && nullBindingCall(ix) {
+    const u = unwrapParen(ix)
+    return irBLetTempTy(
+      b,
+      { dnAt: u, dnPad: callEndsNever(u) },
+      u,
+      dst,
+      TY_NEVER,
+    )
   }
   // A `??` whose own type has no rep (a link legacy mints) is built at the destination's rep, as
   // legacy writes it at the kind its consumer asks.
@@ -14295,11 +14335,8 @@ function nulNoneEffect(b: i32[], x: i32, ix: i32, sink: Opnd[] | null): Opnd {
   if u < 0 { return irBMiss("coalesce nulnone effect") }
   const n = nodeAt(u)
   if n is IfStmt {
-    // A void `if` leaves no value a sink's reader could drop in order, so it is written here; with
-    // no temp waiting below it, that is where legacy writes it too.
-    if sink != null && endsInTemp(b) {
-      return irBMiss("coalesce nulnone effect if")
-    }
+    // A void `if` leaves no value a sink's reader could drop in order, so it is written here, a
+    // statement any temp waiting below it is staged under.
     ifForEffect(b, n, u)
     return none
   }
@@ -14516,14 +14553,14 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   // An if-expression operand is built inside the block, where legacy writes it (`nulStr`).
   if nodeAt(lhsIx) is IfStmt { return coalNulStr(b, n, ix, rep, false) }
   const lat = b.length
-  const l = irBExpr(b, n.binLeft)
-  if ibMiss != "" { return l }
-  // Legacy writes the operand inside the coalesce's block, above which a valued `if` cannot sit,
-  // nor an inner `??`, whose out stays on the stack as one's does.
-  if valuedIfFrom(b, lat) { return irBMiss("coalesce of a valued if") }
-  if coalBoxFrom(b, lat, true) || coalBoxFrom(b, lat, false) {
-    return irBMiss("coalesce string operand holds a ??")
-  }
+  const l0 = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l0 }
+  // The operand is written inside the coalesce's block, above which a valued `if` cannot sit, nor
+  // an inner `??`, whose out stays on the stack as one's does: such an operand is held in a local.
+  const spill = valuedIfFrom(b, lat)
+    || coalBoxFrom(b, lat, true)
+    || coalBoxFrom(b, lat, false)
+  const l = if spill { heldInLocal(b, l0, ix) } else { l0 }
   if !strNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
   const nul = coalesceNulStrStaysNullable(ix, ibFnIx)
   const want = if nul { irBOpRep(l) } else { strInnerOf(irBOpRep(l)) }
@@ -22141,6 +22178,7 @@ function convertRetag(
 function holeRetagNoted(src: i32, dst: i32, clo: boolean): boolean {
   noteRecHeaps(src)
   noteRecHeaps(dst)
+  recHoleHeapsNote(ib, src, dst)
   return listRetagHole(ib, src, dst) || clo && cloHoleRetag(ib, src, dst)
 }
 
