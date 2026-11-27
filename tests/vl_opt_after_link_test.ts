@@ -90,7 +90,7 @@ const FLAVOUR_READERS = [
   // pair, whose shape binaryen's loop hoisting and optMultivalue match.
   "emit_bytes:fbPeepholes gOptimized",
   // `--low-memory-unused` (only with `-O`) folds an address's constant into the memarg.
-  "wasmEmit:lowMemFoldsCallee gLowMemUnused",
+  "wasmEmit:memLowFoldFits gLowMemUnused",
   "wasmEmit:memAddrPlanWith gLowMemUnused",
 ];
 const FLAVOUR_GLOBALS = ["gOptimized", "gLowMemUnused"];
