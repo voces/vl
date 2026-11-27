@@ -1347,10 +1347,35 @@ fn maybe_install_gc_stats() -> bool {
     true
 }
 
-/// The compiler's collections and peak live set on stderr, for `vl build` and the CLI pump.
+/// The live bytes a collection forced once the compile returned left (`compile_end_live`), or
+/// `u64::MAX` when none ran.
+static GC_END_LIVE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Forces one collection of the compiler's store after its compile, and keeps what it left:
+/// what the compile retains, read at a fixed point whatever the earlier collections' timing.
+/// Kept out of `GC_MAX_LIVE` and `GC_COLLECTIONS`, which stay the readings of the compile's own.
+fn compile_end_live(store: &mut Store<()>) {
+    let max = GC_MAX_LIVE.load(Ordering::Relaxed);
+    let cycles = GC_COLLECTIONS.load(Ordering::Relaxed);
+    let before = GC_SEEN.get().collections;
+    if store.gc(None).is_ok() && GC_SEEN.get().collections > before {
+        GC_END_LIVE.store(GC_SEEN.get().live, Ordering::Relaxed);
+    }
+    GC_MAX_LIVE.store(max, Ordering::Relaxed);
+    GC_COLLECTIONS.store(cycles, Ordering::Relaxed);
+}
+
+/// The compiler's collections and peak live set on stderr, for `vl build` and the CLI pump;
+/// `vl build` adds the live set at compile end (`compile_end_live`).
 fn print_compile_gc_stats() {
+    let end = GC_END_LIVE.load(Ordering::Relaxed);
+    let tail = if end == u64::MAX {
+        String::new()
+    } else {
+        format!(", live at compile end: {} KiB", end >> 10)
+    };
     eprintln!(
-        "vl: compile gc collections: {}, peak live after a collection: {} KiB",
+        "vl: compile gc collections: {}, peak live after a collection: {} KiB{tail}",
         GC_COLLECTIONS.load(Ordering::Relaxed),
         GC_MAX_LIVE.load(Ordering::Relaxed) >> 10
     );
@@ -11976,6 +12001,9 @@ fn build_cmd(args: &[String]) -> Result<()> {
         inject_fault(f, &mut bytes)?;
     }
     if gc_stats {
+        if let Some((store, _)) = session.as_mut() {
+            compile_end_live(store);
+        }
         print_compile_gc_stats();
     }
     // `--source-map`: the map is made from the rows here, while they still describe these

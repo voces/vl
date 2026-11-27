@@ -39,10 +39,10 @@ mv "$D/ir_build.vl.new" "$D/ir_build.vl"
 # Two classes split for the census alone: `is rung` names its rung, and a miss at a node with no
 # rep (`repMissAt`) names the node's kind. The shipped compiler's classes stay unsplit.
 grep -q '^  if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }$' "$D/ir_build.vl" \
-  && grep -q '^  return irBMiss(miss)$' "$D/ir_build.vl" \
+  && grep -q '^function repMissAt(_ix: i32, miss: string): Opnd { return irBMiss(miss) }$' "$D/ir_build.vl" \
   || { echo "ir-i8-census: a split anchor in ir_build.vl was not found" >&2; exit 1; }
 sed -i -e 's|^  if arm != "variant" \&\& arm != "armTag" { return irBMiss("is rung") }$|  if arm != "variant" \&\& arm != "armTag" { return irBMiss("is rung " + arm) }|' \
-  -e 's|^  return irBMiss(miss)$|  return irBMiss(miss + " of " + irAstKind(ix))|' "$D/ir_build.vl"
+  -e 's|^function repMissAt(_ix: i32, miss: string): Opnd { return irBMiss(miss) }$|function repMissAt(_ix: i32, miss: string): Opnd { return irBMiss(miss + " of " + irAstKind(_ix)) }|' "$D/ir_build.vl"
 # The call classes split the same way (COV-CALL): `call of a non-declaration` and `indirect call`
 # name why `callRefPlainKey` refused (`censusPlainWhy`, a copy of its ladder) or the callee's
 # shape, and `intrinsic <arm>` names the intrinsic.

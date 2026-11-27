@@ -1,11 +1,10 @@
 import { mapShapeOfTyPeeled } from "./emit_union_atoms"
 import { blockHasContinueFor } from "./emit_query"
-// The IR lowering (ir-design-2026-11.md §1.6) for I1's node set, and the shadow's dual emit: a
-// covered function's IR is lowered to a code entry, which is compared with the legacy one
-// byte for byte, beside its statement spans. A temp goes back onto the stack at its one use,
-// which holds only when the temps are consumed in their definition order; the lowering
-// checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
-// through the plain byte writers into its own buffer and leaves the emitter's state as found.
+// The IR lowering (ir-design-2026-11.md §1.6): a claimed function's IR is lowered to a code
+// entry, beside its statement spans. A temp goes back onto the stack at its one use, which holds
+// only when the temps are consumed in their definition order; the lowering checks that, and any
+// shape it cannot lower is a named miss, never a guess. It writes through the plain byte writers
+// into its own buffer and leaves the emitter's state as found.
 import { fnEnvIdxOf, readNarrowedBoxToNull } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
 import { refRepValtype } from "./ir_verify_facts"
@@ -120,7 +119,6 @@ import {
   addNode,
   condLitTrue,
   externGlobalLinkOfNode,
-  i32ToStr,
   nodeAt,
   nodeChildren,
   spreadArgOf,
@@ -978,9 +976,6 @@ import {
   loopContLabel,
   sHeapIdx,
   sTy,
-  shIdxFrom,
-  shIdxNode,
-  shIdxTo,
   uBoxIdx,
   uBoxNewEnd,
   uFieldCount,
@@ -3397,7 +3392,6 @@ function armSiteStmt(n: SArmSite, pending: i32[]) {
   }
   irLSettle(pending)
   const sp = emitFnSpanNode.length
-  const sh = shIdxNode.length
   lwIdxRowMutes.push(n.saAt)
   const recv = armSiteRecv(n.saAt)
   const recvRow = if recv >= 0 && recv < P.nodes.length && nodeAt(recv) is Index { recv } else { -1 }
@@ -3427,7 +3421,7 @@ function armSiteStmt(n: SArmSite, pending: i32[]) {
     k = k - 1
   }
   lwIdxRowMutes.pop()
-  adoptBankedRows(sp, sh)
+  adoptBankedRows(sp)
   // Only an element read banks a row of its own (`emitIndexBanked`).
   if nodeAt(n.saAt) is Index { irLIndexRow(n.saAt, from) }
   lwFloor = lwFloors.pop() ?? 0
@@ -3457,9 +3451,9 @@ function armSiteGlobalArmOpen(at: i32, v: i32, m: i32): i32 {
   return armSiteArmCast(m)
 }
 
-// Takes the element-read rows legacy's writer banked since marks `sp` and `sh` as this lowering's,
-// which `fragmentRows` banks again; a writer banks no other kind.
-function adoptBankedRows(sp: i32, sh: i32) {
+// Takes the element-read rows legacy's writer banked since mark `sp` as this lowering's, which
+// `fragmentRows` banks again; a writer banks no other kind.
+function adoptBankedRows(sp: i32) {
   let k = sp
   while k < emitFnSpanNode.length {
     if emitFnSpanKind[k] != 6 { return irLMiss("arm site banked row") }
@@ -3469,15 +3463,7 @@ function adoptBankedRows(sp: i32, sh: i32) {
     lwRowKind.push(6)
     k = k + 1
   }
-  let q = sh
-  while q < shIdxNode.length {
-    lwRowAst.push(shIdxNode[q])
-    lwRowFrom.push(shIdxFrom[q])
-    lwRowTo.push(shIdxTo[q])
-    lwRowKind.push(6)
-    q = q + 1
-  }
-  return bankedRowsDrop(sp, sh)
+  return bankedRowsDrop(sp)
 }
 
 // The local a named variable `o` is read from with a plain `local.get`, or -1: a temp, a staged
@@ -7588,17 +7574,6 @@ function spanClose(id: i32) {
 }
 
 let lwBuf: u8[] = []
-let lwGot: u8[] = []
-
-// The code entry the last dual emit lowered, for a mismatch's detail.
-export function irLoweredEntry(): u8[] { return lwGot }
-
-// `b` as hex bytes, space-separated.
-export function irHexOf(b: u8[]): string {
-  let s = ""
-  for x in b { s = s + hex(x) + " " }
-  return s
-}
 
 function curLen(): i32 { return lwBuf.length }
 
@@ -8051,15 +8026,11 @@ function fragmentBody(b: i32[], out: Opnd) {
 }
 
 // A fragment's rows, banked as legacy's writers bank them: an element read's only where the
-// `vl-src` section is written, else noted for the shadow; a statement's always.
+// `vl-src` section is written; a statement's always.
 function fragmentRows(fnPos: i32) {
   let r = 0
   while r < lwRowAst.length {
-    if lwRowKind[r] == 6 && !idxSpanOn() {
-      shIdxNode.push(lwRowAst[r])
-      shIdxFrom.push(lwRowFrom[r])
-      shIdxTo.push(lwRowTo[r])
-    } else {
+    if lwRowKind[r] != 6 || idxSpanOn() {
       bankSpanRow(
         lwRowAst[r],
         fnPos,
@@ -8145,23 +8116,11 @@ export function irLowerClaim(
   return ""
 }
 
-// Lowers `f` for the order check (shadow mode 6) and returns its code entry, writing nothing and
-// banking no row; empty on a miss. Legacy then lowers from the empty lazy frame.
-export function irLowerProbe(f: IrFn, ctx: GlobalCtx): u8[] {
-  const callees0 = dfeCallee.length
-  fbResetLazyFrame()
-  const got = entry(f, ctx)
-  while dfeCallee.length > callees0 { dfeCallee.pop() }
-  fbResetLazyFrame()
-  if lwMiss != "" { return [] }
-  return got
-}
-
 // Lowers the compare helper `f` onto `out` in the frame `eqHelpFnCode` opened, its locals vector
 // that frame's, as legacy's helper writes it. "" when written, else the miss, with nothing written
 // and the lazy frame left empty for legacy.
 export function irLowerEqHelper(f: IrFn, out: u8[]): string {
-  // The lazy frame grows from empty, as `fbBeginFunc` left it; the shadow's follows legacy's.
+  // The lazy frame grows from empty, as `fbBeginFunc` left it.
   fbResetLazyFrame()
   lowerBody(f, lwGlobalCtx)
   softMiss(f.irName)
@@ -8176,17 +8135,6 @@ export function irLowerEqHelper(f: IrFn, out: u8[]): string {
   wBytes(framed(locals))
   wTarget(p)
   return ""
-}
-
-// `irLowerEqHelper` for the shadow, before legacy writes the helper: the callees it notes are
-// taken back and the lazy frame is left empty again, so legacy writes from the state it would
-// have had unarmed.
-export function irShadowLowerEqHelper(f: IrFn, out: u8[]): string {
-  const callees0 = dfeCallee.length
-  const why = irLowerEqHelper(f, out)
-  while dfeCallee.length > callees0 { dfeCallee.pop() }
-  fbResetLazyFrame()
-  return why
 }
 
 // Lowers runtime helper `f` onto `out`: its locals are its `local` variables, one per slot after
@@ -8263,161 +8211,6 @@ function sinkClose() {
   fbLocalGet(unionSinkBase + 1)
   fbStructNew(uBoxIdx)
   return 0
-}
-
-// The dual emit: lowers `f` and compares it with the legacy code entry `legacy` (this function's
-// whole entry) and the statement and element-read rows banked from `spanBase` on, at offsets in `legacy`
-// once `spanShift` is taken off. "" when they are identical, else the first difference's class;
-// `skew` breaks the lowering on purpose (`irShadowCorrupt`).
-export function irDualEmit(
-  f: IrFn,
-  ctx: GlobalCtx,
-  legacy: u8[],
-  spanBase: i32,
-  spanShift: i32,
-  skew: i32,
-): string {
-  // The lowering's calls note their callees as legacy's did; the shadow takes its own back. It
-  // grows a lazy list frame of its own from empty: legacy's is spent, its locals vector written,
-  // and the next function's `fbBeginFunc` resets it.
-  const callees0 = dfeCallee.length
-  fbResetLazyFrame()
-  const got = entry(f, ctx)
-  while dfeCallee.length > callees0 { dfeCallee.pop() }
-  lwGot = got
-  if lwMiss != "" { return "unlowered: " + lwMiss }
-  // The comparison's own controls: 1 adds a byte to the lowering, 2 drops its first span row.
-  if skew == 1 { got.push(0x01) }
-  if skew == 2 && lwRowAst.length > 0 { lwRowAst[0] = -2 }
-  if skew == 3 { dropReadRows() }
-  let i = 0
-  while i < got.length && i < legacy.length && got[i] == legacy[i] { i = i + 1 }
-  if i < got.length || i < legacy.length {
-    return "bytes: "
-      + regionAt(i, legacy)
-      + " at "
-      + byteText(legacy, i)
-      + " vs "
-      + byteText(got, i)
-  }
-  // The start's top-level, statement and element-read rows (kinds 1, 5 and 6) legacy banked for
-  // this function, against the lowering's.
-  const ln: i32[] = []
-  const lf: i32[] = []
-  const lt: i32[] = []
-  const lk: i32[] = []
-  let k = spanBase
-  while k < emitFnSpanStart.length {
-    if (
-      emitFnSpanKind[k] == 1
-      || emitFnSpanKind[k] == 5
-      || emitFnSpanKind[k] == 6
-    ) {
-      ln.push(emitFnSpanNode[k])
-      lf.push(emitFnSpanStart[k] - spanShift)
-      lt.push(emitFnSpanEnd[k] - spanShift)
-      lk.push(emitFnSpanKind[k])
-    }
-    k = k + 1
-  }
-  // The element reads the armed shadow noted where the section banks none.
-  let q = 0
-  while q < shIdxNode.length {
-    ln.push(shIdxNode[q])
-    lf.push(shIdxFrom[q] - spanShift)
-    lt.push(shIdxTo[q] - spanShift)
-    lk.push(6)
-    q = q + 1
-  }
-  if ln.length != lwRowAst.length {
-    return "spans: count "
-      + i32ToStr(ln.length)
-      + " vs "
-      + i32ToStr(lwRowAst.length)
-  }
-  let j = 0
-  while j < ln.length {
-    if !rowListed(ln[j], lf[j], lt[j], lk[j]) {
-      const what = if lk[j] == 6 { "read " } else { "" }
-      return "spans: " + what + kindOf(ln[j])
-    }
-    j = j + 1
-  }
-  return ""
-}
-
-// The control that drops every element-read row the lowering banked (`irShadowCorrupt(5)`).
-function dropReadRows() {
-  const a: i32[] = []
-  const f: i32[] = []
-  const t: i32[] = []
-  const k: i32[] = []
-  let i = 0
-  while i < lwRowAst.length {
-    if lwRowKind[i] != 6 {
-      a.push(lwRowAst[i])
-      f.push(lwRowFrom[i])
-      t.push(lwRowTo[i])
-      k.push(lwRowKind[i])
-    }
-    i = i + 1
-  }
-  lwRowAst = a
-  lwRowFrom = f
-  lwRowTo = t
-  lwRowKind = k
-  return 0
-}
-
-// Whether the lowering banked the row `(node, from, to)`, in any order: rows close innermost
-// first in both emitters, but a nested statement's order is not the comparison.
-function rowListed(n: i32, from: i32, to: i32, kind: i32): boolean {
-  let i = 0
-  while i < lwRowAst.length {
-    if (
-      lwRowAst[i] == n
-      && lwRowFrom[i] == from
-      && lwRowTo[i] == to
-      && lwRowKind[i] == kind
-    ) {
-      return true
-    }
-    i = i + 1
-  }
-  return false
-}
-
-function byteText(b: u8[], i: i32): string {
-  if i >= b.length { return "end" }
-  return hex(b[i])
-}
-
-function hex(x: i32): string {
-  const d = "0123456789abcdef"
-  return "0x"
-    + d.slice((x >> 4) & 15, ((x >> 4) & 15) + 1)
-    + d.slice(x & 15, (x & 15) + 1)
-}
-
-// Where in the entry byte `i` falls: the size prefix, the locals vector, or a statement, by the
-// innermost lowered row holding it.
-function regionAt(i: i32, legacy: u8[]): string {
-  let best = -1
-  let r = 0
-  while r < lwRowAst.length {
-    if lwRowFrom[r] <= i && i < lwRowTo[r] {
-      if (
-        best < 0
-        || lwRowTo[r] - lwRowFrom[r] < lwRowTo[best] - lwRowFrom[best]
-      ) {
-        best = r
-      }
-    }
-    r = r + 1
-  }
-  if best >= 0 { return kindOf(lwRowAst[best]) }
-  if i < 5 && legacy.length > 0 { return "prefix or locals" }
-  return "outside a statement"
 }
 
 // The source kind of node `ix`, for a mismatch's class.
