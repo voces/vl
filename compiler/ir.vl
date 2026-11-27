@@ -1202,17 +1202,6 @@ export type IrFn = {
   // The effect nodes, a statement dispatch's arms, whose call legacy writes with its tail-call
   // cursor disarmed, so a call in tail position keeps its plain form.
   irNoTailEff: i32[],
-  // Each tag dispatch's run of nodes in its body, by its call node: first node, last, count.
-  irTagSpan: {[i32]: i32[]},
-  // The boxes whose leading tag the lowering writes ahead of the dispatch their value is, as legacy
-  // does: the dispatch's first node, the box's node, and the dispatch's count, the nodes directly
-  // ahead of the box in its body (verifier rule 10).
-  irBoxLeadFirst: i32[],
-  irBoxLeadBox: i32[],
-  irBoxLeadN: i32[],
-  // The boxes, by their value's node, whose value is built with a statement under it (a valued
-  // `if` or `??`): the lowering holds that value in a local and writes the head after it.
-  irBoxLate: i32[],
 }
 
 // Whether effect node `id` is one `irNoTailEff` names.
@@ -1296,11 +1285,6 @@ export function irFnNew(at: i32, name: string): IrFn {
     irUnbankedRead: -1,
     irNoTail: [],
     irNoTailEff: [],
-    irTagSpan: Map(),
-    irBoxLeadFirst: [],
-    irBoxLeadBox: [],
-    irBoxLeadN: [],
-    irBoxLate: [],
     irReadAgain: Map(),
     irReadBoxed: Map(),
     irSkipBase: Map(),
@@ -2836,37 +2820,6 @@ export function lexOpcode(op: string, p: RpPrim): i32 {
   return primOpcode(o, p)
 }
 
-// Whether node `i` of body `b` is the let of the condition the valued `if` after it tests, the
-// builder's own prelude to that join.
-export function ifCondLetAt(f: IrFn, b: i32[], i: i32): boolean {
-  if i < 0 || i + 1 >= b.length { return false }
-  const l = f.irNodes[b[i]]
-  const j = f.irNodes[b[i + 1]]
-  if !(l is SLet) || !(j is SIf) || j.siOut < 0 { return false }
-  const c = j.siCond
-  return c is OVar && c.ov == l.lDst
-}
-
-// The var node `n` steps from when it is a let of a numeric widening, a plain cast (no miss path),
-// or an op whose first operand is that var and whose others are immediates: the steps a join's
-// value takes on its way into a box, each reading the value first and nothing below it; else -1.
-export function numConvSrcOf(n: IrNode): i32 {
-  if !(n is SLet) { return -1 }
-  const r = n.lRhs
-  if r is RPrimOp {
-    if r.poArgs.length == 0 { return -1 }
-    let k = 1
-    while k < r.poArgs.length {
-      if !(r.poArgs[k] is OImm) { return -1 }
-      k = k + 1
-    }
-    const a0 = r.poArgs[0]
-    return if a0 is OVar { a0.ov } else { -1 }
-  }
-  const v = if r is RNumWiden { r.nwV } else if r is RNumCast && r.ncMiss is OVar && r.ncMiss.ov < 0 { r.ncV } else { null }
-  return if v is OVar { v.ov } else { -1 }
-}
-
 // Whether a list at rep `src` is the list at rep `dst` as it stands: the same record, list or map
 // elements, or record twins on one heap (`recRetag`), one side's possibly `| null`, which one ref
 // list holds (its backing is already nullable).
@@ -3081,7 +3034,7 @@ function repsFillHoles(
 }
 
 // Whether a record at variant rep `src` is the record at plain rep `dst` as it stands, or a plain
-// record the variant: the same fields, stored on one heap.
+// record the variant: the same fields (a `null` unit one over its nullable), stored on one heap.
 export function recRetag(src: i32, dst: i32): boolean {
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
@@ -3093,10 +3046,19 @@ export function recRetag(src: i32, dst: i32): boolean {
   if a.rrFields.length != d.rrFields.length { return false }
   let i = 0
   while i < a.rrFields.length {
-    if a.rrFields[i] != d.rrFields[i] { return false }
+    const x = a.rrFields[i]
+    const y = d.rrFields[i]
+    if x != y && !nullUnitOver(x, y) && !nullUnitOver(y, x) { return false }
     i = i + 1
   }
   return true
+}
+
+// Whether field rep `b` is the `null` unit over nullable field rep `a`: on one heap the field is
+// the nullable's storage, which holds the `null` the unit's type admits alone.
+function nullUnitOver(a: i32, b: i32): boolean {
+  const y = repNodeAt(b)
+  return y is RPrim && y.rpK == "null" && repNodeAt(a) is RNullable
 }
 
 // Whether a plain record at rep `src` is the record at plain rep `dst` as it stands: one struct
