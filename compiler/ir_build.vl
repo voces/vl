@@ -9,6 +9,7 @@ import {
   listFitShadowReadsRow,
   listFitShadowSameTy,
   listFitShadowTyOf,
+  nulUnitPlaceReadAt,
   optRecvHoleTyped,
   spreadGroupConverts,
 } from "./wasmEmit"
@@ -590,6 +591,7 @@ import {
   variantCoerceArmOf,
 } from "./emit_plan_union"
 import {
+  AtomEqPlan,
   HoleBox,
   IdentReadArm,
   IsArm,
@@ -5571,6 +5573,22 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return o
 }
 
+// The one number arm of union rep `rep` (a box's, or a boxed nullable's inner), or -1 where it
+// holds none or several.
+function litNumArmRep(rep: i32): i32 {
+  const n = repNodeAt(rep)
+  const arms = if n is RNullable { [n.rnInner] } else if n is RBox { n.rbArms } else { [] }
+  let one = -1
+  for a in arms {
+    const k = repPrim(a) ?? ""
+    if k == "i32" || k == "i64" || k == "f32" || k == "f64" {
+      if one >= 0 { return -1 }
+      one = a
+    }
+  }
+  return one
+}
+
 // Number literal `n` at `ix` as an immediate at rep `rep`, where its own width is that rep's.
 function numLit(n: NumLit, ix: i32, rep: i32): Opnd {
   const k: string = repPrim(rep) ?? ""
@@ -10326,14 +10344,7 @@ function mapVariantLit(b: i32[], val: i32, sh: i32): Opnd {
   if pre != "" { return irBMiss(pre) }
   const ty = mvValTyIxAt(sh)
   if ty < 0 { return irBMiss("map store value type") }
-  return objLitAt(
-    b,
-    unwrapParen(val),
-    repNodeOfTy(ty),
-    ty,
-    mvValVariantOf(sh),
-    true,
-  )
+  return variantRowLit(b, val, repNodeOfTy(ty), ty, mvValVariantOf(sh))
 }
 
 // A `.pop()` statement over any list legacy pops (`popAnyPlanOf`), through legacy's pop tail.
@@ -12922,9 +12933,14 @@ function opndAboveBox(b: i32[], at: i32, bx: Opnd): boolean {
 // Whether operand `ix` is typed at a literal union delivered as an interned atom.
 // An `==`/`!=` with an atom operand, by legacy's own arm (`atomEqPlanOf`). A side typed as one
 // string literal is its member's id: a `StrLit` spelling is an unread immediate here, anything
-// else is built and dropped by the lowering, in source order.
-function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
-  const p = atomEqPlanOf(n, ibFnIx)
+// else is built and dropped by the lowering, in source order. `p` is `n`'s `atomEqPlanOf`.
+function atomCompare(
+  b: i32[],
+  n: BinExpr,
+  ix: i32,
+  rep: i32,
+  p: AtomEqPlan,
+): Opnd {
   const ne = n.binOp == "!="
   const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
   if p.aqArm == "none" { return irBMiss("atom compare") }
@@ -13786,6 +13802,22 @@ function variantCoerced(b: i32[], e: i32, rep: i32, ty: i32, vi: i32): Opnd {
   }
   const pre = exprPrePathWhy(e, ibFnIx)
   if pre != "" { return irBMiss(pre) }
+  return variantRowLit(b, e, rep, ty, vi)
+}
+
+// Object literal `e` built at variant row `vi` for rep `rep` of type `ty`; where the row's own type
+// is `rep` under another type, or another record `rep` retags (a rowless `{ r: null }` narrowed to
+// its arm), at the row's type, the consumer retagging it.
+function variantRowLit(b: i32[], e: i32, rep: i32, ty: i32, vi: i32): Opnd {
+  const vt = if vi >= 0 && vi < uVarTyIx.length { uVarTyIx[vi] } else { -1 }
+  const vr = if vt >= 0 && !irTyOpen(vt) { repNodeOfTy(vt) } else { -1 }
+  if (
+    vr >= 0
+    && repNodeAt(vr) is RRecord
+    && (vr == rep && repNodeOfTy(ty) != rep || vr != rep && recRetag(vr, rep))
+  ) {
+    return objLitAt(b, unwrapParen(e), vr, vt, vi, true)
+  }
   return objLitAt(b, unwrapParen(e), rep, ty, vi, true)
 }
 
@@ -14312,7 +14344,9 @@ function nulNoneEffect(b: i32[], x: i32, ix: i32, sink: Opnd[] | null): Opnd {
   }
   // An element read is dropped as it is stored (`buildIndex`'s `nulDropped`).
   const em = if n is Index { storageReadEnter(u) } else { storageReadEnter(-1) }
-  const v = irBExpr(b, u)
+  // A null-unit place read is read for its effect alone, and a call of a function returning only
+  // `null` is run at its own result: either's null is dropped with it.
+  const v = if nulUnitPlaceReadAt(u, ibFnIx) { exprAtPre(b, u, false, "") } else if n is Call { nulNoneCallRun(b, n, u) } else { irBExpr(b, u) }
   storageReadLeave(em)
   if ibMiss != "" { return v }
   if sink == null {
@@ -14321,6 +14355,22 @@ function nulNoneEffect(b: i32[], x: i32, ix: i32, sink: Opnd[] | null): Opnd {
     sink.push(v)
   }
   return none
+}
+
+// Call `n` at node `u` built for its effect: a direct call of a function whose every value is
+// `null` (`nulNoneCallee`) at its own result rep, any other call as itself.
+function nulNoneCallRun(b: i32[], n: Call, u: i32): Opnd {
+  const cf = if n.callFn >= 0 { nodeAt(n.callFn) } else { null }
+  const d = if cf is Ident { identDeclOf(n.callFn) } else { -1 }
+  const pos = if cf is Ident && d >= 0 && nodeAt(d) is FuncDecl { userFnCallTarget(n, cf, ibFnIx) } else { -1 }
+  if !nulNoneCallee(pos) { return irBExpr(b, u) }
+  const rhs = callRhs(b, n, u)
+  if ibMiss != "" { return irBMiss("call") }
+  if !(rhs is RCall) { return irBMiss("null-typed call") }
+  const si = irSigOf(ib, rhs.caCallee)
+  if si < 0 { return irBMiss("null-typed call signature") }
+  const sr = ib.irSigRet[si]
+  return irBLetTempTy(b, rhs, u, sr, repTyOf(sr))
 }
 
 // Node `x` built as itself at the `??`'s rep `rep`, or the miss arm `arm` names.
@@ -16844,6 +16894,18 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   if rep < 0 {
     return repMissAt(ix, "rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
   }
+  // A signed literal an instance's pin stamps at a union (`dstRetypeLitArgs`) is built at the
+  // union's one number arm and boxed under it.
+  const litArm = if isSignedNumLit(ix) { litNumArmRep(rep) } else { -1 }
+  if litArm >= 0 {
+    return irConvert(
+      b,
+      signedLitAt(unwrapParen(ix), litArm),
+      rep,
+      nodeTyAt(ix, ibFnIx),
+      ix,
+    )
+  }
   if n is NumLit { return numLit(n, ix, rep) }
   if n is BoolLit {
     const bits: i64 = if n.boolVal != 0 { 1 } else { 0 }
@@ -16997,12 +17059,11 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
         return unionConcreteEq(b, n, ix, rep, rt == "unionRight")
       }
     }
+    // Legacy's atom compare arm, asked once: null for an operator no atom compare takes.
+    const aq = if n.binOp == "==" || n.binOp == "!=" { atomEqPlanOf(n, ibFnIx) } else { null }
     // Two operands typed at single string literals fold to a constant (`atomEqPlanOf`).
-    if (
-      (n.binOp == "==" || n.binOp == "!=")
-      && atomEqPlanOf(n, ibFnIx).aqArm == "fold"
-    ) {
-      return atomCompare(b, n, ix, rep)
+    if aq != null && aq.aqArm == "fold" {
+      return atomCompare(b, n, ix, rep, aq)
     }
     // An atom operand of no atom compare (a `+`, or `==` against a plain string) is the string
     // op's, which decodes the atom to its member string, as legacy's dispatch routes it.
@@ -17012,9 +17073,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
         || atomOperand(n.binRight)
         || irTyOpen(exprTyOf(n.binLeft))
         || irTyOpen(exprTyOf(n.binRight)))
-      && atomEqPlanOf(n, ibFnIx).aqArm != "none"
+      && aq != null
+      && aq.aqArm != "none"
     ) {
-      return atomCompare(b, n, ix, rep)
+      return atomCompare(b, n, ix, rep, aq)
     }
     // `===`/`!==` over references is legacy's identity (`emitIdentityBin`).
     if (
@@ -18389,7 +18451,8 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   if nulStore && repPrim(ln.rlsElem) != "null" {
     return skip("store null unit sentinel rep")
   }
-  const x0 = if nulStore { nulSentinelStore(b, n.binRight, er) } else if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
+  // Every value a `null[]` element takes is its sentinel, the value read for its effects.
+  const x0 = if nulStore || repPrim(ln.rlsElem) == "null" { nulSentinelStore(b, n.binRight, er) } else if site { boxTempIn(b, unionElemValue(b, n.binRight), n.binRight, er, -1, st.unionTy) } else { deliver(b, n.binRight, er, -1) }
   if ibMiss != "" { return 0 }
   // A value at another rep goes into the element's slot through the one converter.
   const x = if irBOpRep(x0) != er { irConvertStored(b, x0, er, repTyOf(er), n.binRight) } else { x0 }
@@ -18539,7 +18602,7 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
     return skip("field store box from a box")
   }
   const at = b.length
-  const x0 = deliver(b, n.binRight, dst, siteTy)
+  const x0 = if va == "nulnone" { nulUnitSlotValue(b, n.binRight, dst) } else { deliver(b, n.binRight, dst, siteTy) }
   if ibMiss != "" { return 0 }
   // A sub-word field (`repSubWord`) takes a plain i32, which `struct.set` truncates.
   const subWord = repSubWord(dst) && repPrim(irBOpRep(x0)) == "i32"
@@ -18561,14 +18624,31 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   return 0
 }
 
+// A `null`-unit value `x` into a slot at the `null` unit `dst`: `x` read for its effects, then the
+// slot's one value, the bottom ref.
+function nulUnitSlotValue(b: i32[], x: i32, dst: i32): Opnd {
+  const effs: Opnd[] = []
+  const e = nulNoneEffect(b, x, x, effs)
+  if ibMiss != "" { return e }
+  const nul = repTemp(b, { nuAt: x, nuOwn: NULL_OWN_NONE, nuRead: [] }, x, dst)
+  if ibMiss != "" || effs.length == 0 { return nul }
+  return irBLetTempTy(
+    b,
+    { aeEff: effs, aeV: nul, aeAt: x },
+    x,
+    dst,
+    repTyOf(dst),
+  )
+}
+
 // The field store value arms whose write is the value delivered at the field's rep: the bare
 // value, the box (`emitUnionBoxOwed`, the hole box plan), the widenings (`emitWidened`), an atom's
 // decode to its string (`emitAtomToStr`, which `emitStrValue` writes for an atom) and a nullable
 // record's value where `emitArmDelivery` owes no unbox (`fieldStore` checks that).
 function fieldStoreValueDelivers(va: FieldStoreValArm): boolean {
   return match va {
-    "plain" | "box" | "f64" | "i64" | "f32" | "atomToStr" | "strValue" | "armDelivery" => true
-    "noKind" | "nulnone" | "unencodable" => false
+    "plain" | "box" | "f64" | "i64" | "f32" | "atomToStr" | "strValue" | "armDelivery" | "nulnone" => true
+    "noKind" | "unencodable" => false
   }
 }
 
@@ -18582,8 +18662,10 @@ function fieldStoreRepFits(va: FieldStoreValArm, dst: i32): boolean {
     "f32" => repPrim(dst) == "f32"
     "atomToStr" => repPrim(dst) == "str"
     "strValue" => repPrim(dst) == "str" || strNullable(dst)
+    // A `null`-unit value into the field's `null` slot, whose one value is the bottom ref.
+    "nulnone" => repPrim(dst) == "null"
     "plain" | "armDelivery" => true
-    "noKind" | "nulnone" | "unencodable" => false
+    "noKind" | "unencodable" => false
   }
 }
 
@@ -22061,6 +22143,15 @@ export function irConvert(
   if k == CONVERT_RETAG { return repTempTy(b, { rgV: v }, at, dst, dstTy) }
   if k == CONVERT_NICHE { return nicheInto(b, v, dst, at) }
   if k == CONVERT_BOX { return boxTempIn(b, v, at, dst, -1, dstTy) }
+  if k == CONVERT_WIDEN {
+    const w: Rhs = {
+      nwV: v,
+      nwSrc: numKindOf(irBOpRep(v)),
+      nwDst: numKindOf(dst),
+      nwAt: at,
+    }
+    return irBLetTempTy(b, w, at, dst, repTyOf(dst))
+  }
   return irBMiss("convert " + repWhat(irBOpRep(v)) + " -> " + repWhat(dst))
 }
 
@@ -22090,6 +22181,7 @@ const CONVERT_AS_IS = 0
 const CONVERT_RETAG = 1
 const CONVERT_NICHE = 2
 const CONVERT_BOX = 3
+const CONVERT_WIDEN = 4
 function convertKindOf(v: Opnd, dst: i32, dstTy: i32, at: i32): i32 {
   const src = irBOpRep(v)
   if cloNicheTakes(v, dst, at) { return CONVERT_NICHE }
@@ -22104,7 +22196,13 @@ function convertKindOf(v: Opnd, dst: i32, dstTy: i32, at: i32): i32 {
   }
   if re { return CONVERT_RETAG }
   if nicheIntoTakes(v, dst, at) { return CONVERT_NICHE }
+  if numWidensExactly(numKindOf(src), numKindOf(dst)) { return CONVERT_WIDEN }
   return if heldAsBox(dst) && !heldAsBox(src) && dstTy >= 0 { CONVERT_BOX } else { -1 }
+}
+
+// Whether number kind `sk` widens to `dk` with no value lost: i32 into i64 or f64, f32 into f64.
+function numWidensExactly(sk: i32, dk: i32): boolean {
+  return sk == 1 && (dk == 3 || dk == 4) || sk == 5 && dk == 4
 }
 
 // Whether value `v` goes into niche nullable rep `dst` (`rnDisc` 1): it is the nullable's inner
