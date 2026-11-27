@@ -27,12 +27,9 @@ Re-run `scripts/refresh-compiler.sh` after every `compiler/*.vl` edit.
 
 ## What not to spend on (O3, O4)
 
-- Do not fix a defect in legacy's emitter (`wasmEmit.vl`, `emit_*.vl` outside the plans and tails
-  the IR shares) unless your claim needs that fix. Claim the shape in the IR. Bytes that differ from
-  legacy's need no listing; only behaviour is graded. Where legacy is wrong, list the divergence
-  (`scripts/ir-divergence-baseline.txt`, a `legacy-wrong:` mechanism) and prove it with the
-  program's expected output.
-- Do not file a row for a legacy-emitter defect. Give it one line in your refactor note.
+- Legacy's expression emitter is deleted (I8). A program the IR does not claim is a holdout
+  (`scripts/ir-i8-census/holdouts.tsv`); a lane closes a family of them by one general IR change,
+  proposed to the coordinator first (owner ruling, 2026-11-26), and deletes their lines.
 - Do not re-run proof that CI runs on your PR. `scripts/ci-proof.sh rows` lists the gate rows CI
   covers. In particular, no local byte A/B, claimless or `--cases` identity run over the corpus:
   `ci-ir-identity` is that proof (coordinator, 2026-11-25). A local A/B is for a reading you
@@ -44,26 +41,21 @@ These were each ruled more than once on 2026-11-25. Ask the coordinator only whe
 touches another lane's files, changes a shared plan's output across many programs, or fits none
 of these.
 
-- **Fix in the IR, not legacy (O3).** A wrong value legacy ships is closed by an IR claim, listed
-  `legacy-wrong` with the Want that proves it. No inventory row when the claim lands in the same PR.
 - **Shared plans are fair game.** The checker, mono, layout families, `letCellKind`, shared tails
-  and reservation scans outlive I8; fix them at the root, even when legacy's bytes change too. List
-  every program whose claims-off output changes, with run output before and after.
+  and reservation scans; fix them at the root.
 - **A clause-1 find jumps your queue.** A program `vl check` accepts that traps, prints a wrong
   value or builds invalid wasm goes ahead of coverage work. Tell the coordinator in one line.
 - **Measure the population before changing a rep or type derivation.** Count it over the census
   and self, report the count, then build. A self hit is reported at once.
 - **No special-case closes.** A fold or guard that makes one spelling run while its neighbours keep
   refusing is not a fix. Park the general gap with its spellings in one row.
-- **A divergence-baseline row is only legacy-wrong proved by a Want.** An IR parity defect your
-  claim uncovers is fixed in your PR.
 - **One owner per mechanism.** If your ablation shows your class shares a guard or lowering limit
   with another lane's class, say so; the coordinator gives the whole family to one lane.
 
 ## What to work on
 
-Pick from INFRA's latest I8 draft red list (the owner-grouped comment on the draft PR) before the
-census table: it is exactly what blocks I8. Within it, largest group first.
+Pick from the holdouts your owner column names (`scripts/ir-i8-census/holdouts.tsv`), grouped by
+mechanism through ablation, largest family first.
 
 ## Before READY
 
@@ -74,23 +66,19 @@ scripts/ready-check.sh [--sweep <program>...]
 ```
 
 It refuses a dirty tree and runs `scripts/gate.sh --fast`, read by its exit code. With `--sweep`,
-it also checks the Q58 armed position sweep. It checks that `changelog.d/<branch>.md` exists, and
-it ends with a block to paste into the READY. CI's `ci-ir-identity` runs `ir-identity.sh --cases`
-and `--claimless` on the PR, so a lane no longer runs them; a differ the divergence baseline does
-not list reds that job. ready-check does not cover these:
+it also checks the Q58 armed position sweep. It notes whether `changelog.d/<branch>.md` exists
+(optional), and it ends with a block to paste into the READY. CI's `ci-ir-identity` runs `ir-identity.sh --cases`
+and `--claimless` on the PR, so a lane no longer runs them. ready-check does not cover these:
 
 1. If you add or widen a claim: commit the Q58 armed position sweep under `tests/cases/` and pass
    its programs to `--sweep`.
-2. For a coverage PR: your class's count before and after on that class's programs only (O1). The
-   CENSUS lane publishes the program lists. Not a full-population census.
+2. For a holdout PR: the holdout lines it deletes, each one's program now running.
 3. A PR that touches `std/*.vl` exports: the `std-api-reviewer` agent's verdict (ready-check names
    the need).
-4. For a measurement, one refactor note. Never edit `CHANGELOG.md` or architecture-target's Status.
+4. A refactor note and a `changelog.d/` entry are optional (DECISIONS.md, "Docs and comments are
+   not part of the job"). Never edit `CHANGELOG.md` or architecture-target's Status.
 5. Grade the inventory rows you file or close with `VL_IR_STRICT=1`, as CI does:
    `VL_IR_STRICT=1 vl run scripts/check-filed-witnesses.vl -- --strict <dirs>` (coordinator, 2026-11-25).
-6. A claim that a unit is covered is proven under `VL_IR_REQUIRE_CLAIM=1`, which refuses a function or
-   start body the IR does not claim. `VL_IR_STRICT=1` cannot prove it: a unit the IR declines cleanly
-   still builds and runs through legacy (coordinator ruling, 2026-11-26).
 
 ## Landing
 
