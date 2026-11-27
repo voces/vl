@@ -599,6 +599,7 @@ import {
   captureSlotOf,
   eqOperandRecovers,
   holeBoxPlanOf,
+  holeBoxPlanPresentOf,
   identReadArmOf,
   identReadsNull,
   ifJoinBoxPasses,
@@ -1021,7 +1022,7 @@ import {
   parseI32,
   parseI64Pair,
 } from "./emit_bignum"
-import { isVoidTy, tyMapValOf } from "./tyquery"
+import { isVoidTy, tyAdmitsNull, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
   listGetIdxReReadable,
@@ -12076,6 +12077,16 @@ function boxTempIn(
       uTy = dTy
     }
   }
+  // A nullable operand read past its null (a `??`'s present value) is planned as that value, not
+  // as the niche the ladder leaves whole (`holeBoxPlanPresentOf`).
+  if (
+    p.hbArm == "ladder"
+    && tyAdmitsNull(exprTyOf(ix))
+    && !(repNodeAt(irBOpRep(v)) is RNullable)
+  ) {
+    const pp = holeBoxPlanPresentOf(ix, uTy, ibFnIx)
+    if pp.hbArm != "ladder" { p = pp }
+  }
   // An assignment the ladder would box is boxed as its target's value after its store, on the
   // target's own plan (an `asgLit`, say: the stored literal's box at the target's kind).
   let pAt = ix
@@ -14252,9 +14263,12 @@ function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   }
   // Read twice (its test, then its present value): held in a local unless a named variable, as a
   // temp or a valued `if`'s out on the stack (an inner `??`) is read once.
-  const named = nodeAt(unwrapParen(n.binLeft)) is Ident
-    && ib.irVars[l0.ov].vKind != "temp"
-  const l = if named { l0 } else { heldAtRep(b, l0, n.binLeft) }
+  const id = nodeAt(unwrapParen(n.binLeft)) is Ident
+  const named = id && ib.irVars[l0.ov].vKind != "temp"
+  // A name read into a temp (a global's cell) is read again for its present value instead: its
+  // rep may be one no local declares (a nullable list of closures).
+  const again = id && !named
+  const l = if named || again { l0 } else { heldAtRep(b, l0, n.binLeft) }
   const c = testNull(b, l, ix)
   if ibMiss != "" { return c }
   const t = irVarNew(ib, rep, ty, "local", -1)
@@ -14268,8 +14282,10 @@ function coalNative(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
   }
   const pb: i32[] = []
+  const lp = if again { irBExpr(pb, n.binLeft) } else { l }
+  if ibMiss != "" { return lp }
   // An operand already at a nullable result's rep (`(a ?? b) ?? c`'s inner) is that result present.
-  const nn = if irBOpRep(l) == rep { l } else { readNonNull(pb, l, ix) }
+  const nn = if irBOpRep(lp) == rep { lp } else { readNonNull(pb, lp, ix) }
   if ibMiss != "" { return nn }
   // A closure apart from the result's only in openness, or a value standing at the result's rep
   // as it is (`retagsAsStands`), goes in retagged, as a list element does.
