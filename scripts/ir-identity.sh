@@ -202,6 +202,12 @@ same_refusal() {
     || { grep -q 'emitProgram: ' "$1" && grep -q 'emitProgram: ' "$2"; }
 }
 
+# A program the claims side builds and the other side refuses with `cannot yet lower` is one the
+# claim newly covers (a holdout's fix): informational, its run graded by its own `@log`/Want.
+newly_claimed() {
+  [ "$(cat "$2/$4.rc")" = 0 ] && [ "$(cat "$3/$4.rc")" != 0 ] && grep -q 'cannot yet lower' "$3/$4.err"
+}
+
 legacy_wrong() {
   [ -f "$BASELINE" ] && awk -F '\t' -v f="$(bkey "$1")" '$1 == f && $3 ~ /^legacy-wrong:/ { hit = 1 } END { exit !hit }' "$BASELINE"
 }
@@ -212,7 +218,7 @@ keep() { printf '%s\t%s\n%s\t%s\n' "$1" "$3" "$2" "$3" >> "$T/keep"; }
 # Compares the builds of the files listed in $1 under dirs $2 and $3; prints each that differs.
 # With $ERRCMP=1, a file that fails under both differs when its first diagnostic line does.
 compare_all() {
-  same=0; both=0; diff=0; tmo=0; expd=0; bytes=0; held=0; why=""
+  same=0; both=0; diff=0; tmo=0; expd=0; bytes=0; held=0; claimed=0; why=""
   : > "$T/bdiff"
   while read -r f; do
     k=$(printf "%s" "$f" | tr "/" "_")
@@ -225,7 +231,9 @@ compare_all() {
     fi
     [ "$ra" = "$rb" ] && { [ "$ra" != 0 ] || cmp -s "$2/$k.wasm" "$3/$k.wasm"; } \
       && { [ "$ra" = 0 ] || [ "${ERRCMP:-0}" != 1 ] || cmp -s "$2/$k.err" "$3/$k.err"; } || keep "$2" "$3" "$k"
-    if [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
+    if newly_claimed "$f" "$2" "$3" "$k"; then
+      claimed=$((claimed + 1)); echo "newly claimed $f (informational: the other side refuses with cannot yet lower)"
+    elif [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
       expd=$((expd + 1)); echo "expected divergence $f (legacy-wrong: claimless exit $rb)"
       bkey "$f" >> "$T/bdiff"
     elif [ "$ra" != "$rb" ]; then diff=$((diff + 1)); echo "DIFF $f (exit $ra vs $rb)"
@@ -246,7 +254,7 @@ compare_all() {
 # Compares the refusals of the files listed in $1 under dirs $2 and $3: the exit code and the
 # first diagnostic line, or the wasm when both build; prints each that differs.
 compare_errors() {
-  esame=0; ediff=0; etmo=0; eexpd=0; ebytes=0; eheld=0; why=""
+  esame=0; ediff=0; etmo=0; eexpd=0; ebytes=0; eheld=0; eclaimed=0; why=""
   while read -r f; do
     k=$(printf "%s" "$f" | tr "/" "_")
     why=""
@@ -258,7 +266,9 @@ compare_errors() {
     fi
     if [ "$ra" != "$rb" ] || { [ "$ra" = 0 ] && ! cmp -s "$2/$k.wasm" "$3/$k.wasm"; } \
       || ! cmp -s "$2/$k.err" "$3/$k.err"; then keep "$2" "$3" "$k"; fi
-    if [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
+    if newly_claimed "$f" "$2" "$3" "$k"; then
+      eclaimed=$((eclaimed + 1)); echo "newly claimed $f (informational: the other side refuses with cannot yet lower)"
+    elif [ "$ra" != "$rb" ] && [ "$ra" = 0 ] && legacy_wrong "$f"; then
       eexpd=$((eexpd + 1)); echo "expected divergence $f (legacy-wrong: claimless exit $rb)"
     elif [ "$ra" != "$rb" ]; then ediff=$((ediff + 1)); echo "DIFF $f (exit $ra vs $rb)"
     elif [ "$ra" = 0 ] && [ "$BYTES" != 1 ] && ! cmp -s "$2/$k.wasm" "$3/$k.wasm"; then
@@ -307,14 +317,14 @@ verdict() {
 
 if [ "${1:-}" = "--compare" ]; then
   ERRCMP=1 compare_all "${2:?usage: --compare <list> <dir-a> <dir-b>}" "${3:?}" "${4:?}"
-  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, holdouts refused $held, bytes differ $bytes (informational)"
+  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, holdouts refused $held, newly claimed $claimed, bytes differ $bytes (informational)"
   verdict "$diff" "$tmo"
   exit
 fi
 
 if [ "${1:-}" = "--compare-errors" ]; then
   compare_errors "${2:?usage: --compare-errors <list> <dir-a> <dir-b>}" "${3:?}" "${4:?}"
-  echo "errors: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd, holdouts refused $eheld, bytes differ $ebytes (informational)"
+  echo "errors: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd, holdouts refused $eheld, newly claimed $eclaimed, bytes differ $ebytes (informational)"
   verdict "$ediff" "$etmo"
   exit
 fi
@@ -380,7 +390,7 @@ if [ "${1:-}" = "--claimless" ]; then
   build_all "$T/list" "$SEED" "$T/a"
   build_all "$T/list" "$T/claimless.wasm" "$T/b"
   compare_all "$T/list" "$T/a" "$T/b"
-  echo "claimless: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, holdouts refused $held, bytes differ $bytes (informational)"
+  echo "claimless: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, holdouts refused $held, newly claimed $claimed, bytes differ $bytes (informational)"
   behaviour_check "$SEED" "$T/claimless.wasm"
   verdict $((diff + bdiff)) $((tmo + btmo))
   exit
@@ -397,7 +407,7 @@ if [ "${1:-}" = "--cases" ]; then
   build_all "$T/list" "$SEED" "$T/a"
   build_all "$T/list" "$T/claimless.wasm" "$T/b"
   compare_all "$T/list" "$T/a" "$T/b"
-  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, holdouts refused $held, bytes differ $bytes (informational)"
+  echo "cases: identical $same, fail under both $both, differ $diff, timeout $tmo, expected divergence $expd, holdouts refused $held, newly claimed $claimed, bytes differ $bytes (informational)"
   behaviour_check "$SEED" "$T/claimless.wasm"
   "$VL" run scripts/inventory/witnesses.vl --compiler "$SEED" -- --outcome emit_reject --out "$T/w" > "$T/errs"
   shard_list "$T/errs"
@@ -405,7 +415,7 @@ if [ "${1:-}" = "--cases" ]; then
   FLAGS=--test-emit-refusal build_all "$T/errs" "$SEED" "$T/ea"
   FLAGS=--test-emit-refusal build_all "$T/errs" "$T/claimless.wasm" "$T/eb"
   compare_errors "$T/errs" "$T/ea" "$T/eb"
-  echo "witnesses: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd, holdouts refused $eheld, bytes differ $ebytes (informational)"
+  echo "witnesses: same $esame, differ $ediff, timeout $etmo, expected divergence $eexpd, holdouts refused $eheld, newly claimed $eclaimed, bytes differ $ebytes (informational)"
   verdict $((diff + ediff + bdiff)) $((tmo + etmo + btmo))
   exit
 fi

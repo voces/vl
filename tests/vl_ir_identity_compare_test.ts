@@ -87,6 +87,14 @@ Deno.test("ir-identity --compare: a refusal the claims seed builds reds", () => 
   }
 });
 
+Deno.test("ir-identity --compare: a holdout the claims seed builds is newly claimed, not a differ", () => {
+  const base = { ...CASES, "t/r.vl": { rc: 1, err: "t/r.vl:3:7: emitProgram: the compiler cannot yet lower this statement (c)" } };
+  const r = compare("--compare", { ...CASES, "t/r.vl": { rc: 0, wasm: "built" } }, base);
+  if (r.code !== 0 || !r.text.includes("newly claimed t/r.vl") || r.text.includes("DIFF")) {
+    throw new Error(`want t/r.vl newly claimed, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
 Deno.test("ir-identity --compare: a refusal the claims seed turns into another reds", () => {
   const r = compare("--compare", { ...CASES, "t/r.vl": { rc: 1, err: "t/r.vl:1:1: trap" } }, CASES);
   if (r.code !== 1 || !r.text.includes("DIFF t/r.vl (first error:")) {
