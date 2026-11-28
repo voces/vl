@@ -4060,6 +4060,10 @@ function elabSetCallRows(
   // instance's own type of it names, when it names any, and nothing at the root.
   const openParam = elabOpenParamRead(cn.callFn)
   if from < 0 && openParam { return 0 }
+  // A call through a record holder takes the record's member (`elabWriteBuiltAsHolderRecord`).
+  const cfx = parenPeelIx(cn.callFn)
+  const hd = if cfx >= 0 && cfx < P.nodes.length && nodeAt(cfx) is Ident { identDeclOf(cfx) } else { -1 }
+  if hd >= 0 && elabWriteBuiltAsHolderRecord(hd) { return 0 }
   const ct = if calleeTy >= 0 { calleeTy } else { nodeTyIxOf(cn.callFn) }
   if ct < 0 || ct >= T.tys.length { return 0 }
   // A call through a literal list's constant element that is a hole function runs that element
@@ -4399,7 +4403,10 @@ function elabAnnotatedDeliveryRows(g: i32) {
       if args.length > 0 { elabDeliverParams(n.letInit, args, []) }
     }
   } else if n is BinExpr {
-    const args = if elabStoredRead(n.binRight) { [] } else { elabBindingCallArgs(elabWrittenLet(n.binLeft)) }
+    // A write into a record holder is built as the holder's record.
+    const wl = elabWrittenLet(n.binLeft)
+    const held = wl >= 0 && elabWriteBuiltAsHolderRecord(wl)
+    const args = if elabStoredRead(n.binRight) || held { [] } else { elabBindingCallArgs(wl) }
     if args.length > 0 { elabDeliverParams(n.binRight, args, []) }
   } else if n is FuncDecl {
     const s = nodeTyIxOf(g)
@@ -7644,6 +7651,13 @@ export function elabLetAssigned(d: i32): boolean {
   return r
 }
 
+// Whether a write into binding `d` is built as the holder's record: `d` is initialised by a
+// maker's call and written again, so each function written there is the record's member, built
+// beside the maker's own, never an instance at the binding's call types (D17814).
+function elabWriteBuiltAsHolderRecord(d: i32): boolean {
+  return elabResCallHolder(d) && elabLetAssigned(d)
+}
+
 // Whether declaration `d` is a binding initialised by a call that can return a record.
 function elabResCallHolder(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
@@ -9742,7 +9756,10 @@ function elabFnValueAt(v: i32, rec: i32[], at: i32) {
 // Whether `v` is a function value a holder's write can store as a record: a read of a named
 // function. A lambda written there is not yet built beside the maker's own (D17804).
 function elabFnValueWrite(v: i32): boolean {
-  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  if v < 0 || v >= P.nodes.length { return false }
+  const vn = nodeAt(v)
+  if vn is FuncDecl { return vn.fnName == "" }
+  if !(vn is Ident) { return false }
   const d = identDeclOf(v)
   return d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl
 }
@@ -13539,6 +13556,8 @@ function elabLateName(decl: i32): string {
 // (D3851). A generic the cell also holds is instanced by its own writes.
 function elabCellPeers() {
   for bd in elabFnLetBindings() {
+    // A record holder's functions are the record's members, not peers of one cell.
+    if elabWriteBuiltAsHolderRecord(bd) { continue }
     const ms = elabFnLetMembers(bd)
     const hs: i32[] = []
     for m in ms {
