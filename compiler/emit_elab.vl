@@ -8080,6 +8080,8 @@ function elabSlotUnionNote(d: i32, vals: i32[]): i32 {
     && (dn.letKw == "const" || !cwDeclAssigned(d))
   const readers: i32[] = []
   const rcalls: i32[] = []
+  elabSlotUnionJoinCalls = calls
+  elabSlotUnionJoinPicks = picks
   const ow = cwOccWalk(d)
   while cwOccNext(ow) {
     const k = cwIxKind[ow.row]
@@ -8159,14 +8161,71 @@ function elabSlotUnionReadOk(
     } else {
       return false
     }
-    for r in recs {
-      if elabCallSigMember(t, r) < 0 { return false }
+    let q = 0
+    while q < recs.length {
+      // A record with no member at the call's signature joins it: the call is one more signature
+      // of the bundle its maker builds, so its lambda is instanced there too (D17727).
+      if elabCallSigMember(t, recs[q]) < 0 { elabSlotUnionJoin(t, q, recs) }
+      if elabCallSigMember(t, recs[q]) < 0 { return false }
+      q = q + 1
     }
     mine.push(t)
   }
   readers.push(g)
   for t in mine { calls.push(t) }
   return true
+}
+
+// The store calls of the union-of-records map being noted and each one's record index there, for
+// `elabSlotUnionJoin`.
+let elabSlotUnionJoinCalls: i32[] = []
+let elabSlotUnionJoinPicks: i32[] = []
+
+// Adds call `t`'s signature to record `q` of `recs`: the maker instance a store of that record calls
+// notes it for the parameter it returns, the lambda handed there instanced at `t`'s argument types,
+// and `recs[q]` is read again; nothing where the store, its lambda or `t`'s types do not close.
+function elabSlotUnionJoin(t: i32, q: i32, recs: i32[][]) {
+  const tn = nodeAt(t)
+  if !(tn is Call) { return 0 }
+  const wp: i32[] = []
+  for a in tn.callArgs {
+    const at = nodeTyIxOf(a)
+    if at < 0 || at >= T.tys.length || !elabTyClosed(at) { return 0 }
+    wp.push(widenLitTy(at))
+  }
+  let j = 0
+  while j < elabSlotUnionJoinCalls.length && j < elabSlotUnionJoinPicks.length {
+    if elabSlotUnionJoinPicks[j] == q {
+      const v = elabSlotUnionJoinCalls[j]
+      const vn = nodeAt(v)
+      const kc = elabCallInstFrom(v, -1)
+      const dn = if kc >= 0 { nodeAt(ekDecl[kc]) } else { null }
+      if vn is Call && dn is FuncDecl {
+        let i = 0
+        while i < dn.fnParams.length && i < vn.callArgs.length {
+          const lam = parenPeelIx(vn.callArgs[i])
+          if (
+            elabBodyReturnsParam(dn.fnBody, dn.fnParams[i])
+            && lam >= 0
+            && nodeAt(lam) is FuncDecl
+          ) {
+            const n0 = ekDecl.length
+            elabEnqueueAtParams(lam, wp)
+            elabSettle(n0)
+            const r = elabMemberResultAt(lam, wp)
+            if r >= 0 {
+              const one: i32[] = [lam]
+              elabBundleSigNote(kc, i, one, wp, widenLitTy(r))
+              recs[q] = elabReturnedBundleSigs(kc)
+            }
+          }
+          i = i + 1
+        }
+      }
+    }
+    j = j + 1
+  }
+  return 0
 }
 
 // Per `const` initialised with a read of a union-of-records map, that map's index in
@@ -18296,8 +18355,13 @@ export function elabNodeTyAt(ix: i32, fnIx: i32): i32 {
   }
   const ct = elabCalleeTyOf(ix)
   if ct >= 0 { return ct }
-  const k = if fnIx >= 0 { elabKeyAt(fnIx) } else { elabKeyAtPos(monoArgInstFe.get(ix) ?? -1) }
-  const t = if k >= 0 { elabNodeTy(ix, k) } else if k == -1 { elabRootCallTy(ix) } else { -1 }
+  // An open argument the frame's own key does not type reads at the instance its callee reaches,
+  // at module scope and in a function alike (D17679).
+  const fk = if fnIx >= 0 { elabKeyAt(fnIx) } else { -1 }
+  const ak = elabKeyAtPos(monoArgInstFe.get(ix) ?? -1)
+  const k = if fk != -1 { fk } else { ak }
+  const t0 = if k >= 0 { elabNodeTy(ix, k) } else if k == -1 { elabRootCallTy(ix) } else { -1 }
+  const t = if t0 < 0 && k != ak && ak >= 0 { elabNodeTy(ix, ak) } else { t0 }
   if t >= 0 || ix < 0 || ix >= P.nodes.length { return t }
   const n = nodeAt(ix)
   if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
@@ -23851,8 +23915,10 @@ export function elabHeldFnLitStamps() {
       if ht >= 0 { repStampNode(g, elabStampKeepsTagged(g, ht)) }
       else if ut >= 0 { repStampNode(g, elabStampKeepsTagged(g, ut)) }
     } else if top && k == 1 && !(nested.get(g) ?? false) {
-      // A field whose function an instance calls keeps the rep its calls key.
-      const ut = if elabTreeFnsInstanced(nodeRepTyIxOf(g), []) { -1 } else { elabUncalledFnsClosed(nodeRepTyIxOf(g), []) }
+      // A function's returned literal every call delivers to one closed type is built at it (D17744);
+      // else a field whose function an instance calls keeps the rep its calls key.
+      const rd = elabRetLitDstTy(g)
+      const ut = if rd >= 0 { rd } else if elabTreeFnsInstanced(nodeRepTyIxOf(g), []) { -1 } else { elabUncalledFnsClosed(nodeRepTyIxOf(g), []) }
       if ut >= 0 { elabStampLitTree(g, ut) }
     }
     g = g + 1
@@ -23923,6 +23989,23 @@ function elabStampKeepsTagged(x: i32, t: i32): i32 {
     }
   }
   return if moved { mkObjTy(tt.objFieldNames, tys) } else { t }
+}
+
+// The closed type at literal `x`'s path every call of the function returning it is delivered to
+// (`elabRetDstTy`), or -1 where `x` is no returned value or a call's destination is open.
+function elabRetLitDstTy(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const fr = elabEnclosingFn(x)
+  if fr < 0 { return -1 }
+  const path: string[] = []
+  if !elabRetPathOf(x, fr, path) { return -1 }
+  const dt = elabTyAtPath(elabRetDstTy(fr), path)
+  if dt < 0 || dt >= T.tys.length || tyHasTyVar(dt) { return -1 }
+  // Only a destination of the literal's own kind: a `| null` join's arm is another value's type.
+  const n = nodeAt(x)
+  const same = n is ObjLit && tyAt(dt) is TyObj
+    || n is ArrayLit && tyAt(dt) is TyArray
+  return if same { dt } else { -1 }
 }
 
 // The list and record literals literal `x` holds directly, as elements or field values; `keys`

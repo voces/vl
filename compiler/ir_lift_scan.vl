@@ -48,7 +48,6 @@ import { listIsTestedName, moduleLocalLetOfAt, unwrapParen } from "./emit_base"
 import {
   cloCellTarget,
   emitRootIx,
-  fnInstOrigin,
   fnNestUsed,
   fnParent,
   fnStmts,
@@ -407,13 +406,13 @@ function clNoteOwner(ix: i32, pp: i32) {
   return 0
 }
 
-// True when the frame chain from `pos` up holds a generic or monomorphized frame, whose body
-// is shared between pins: lifting is decided per slot, so those keep the closure path.
+// True when the frame chain from `pos` up holds a generic frame or a clone sharing its
+// template's statements: lifting is decided per slot, so those keep the closure path. A
+// monomorphized instance is not one: a lambda it pins is rebuilt there, with its own binding.
 function clChainIsGeneric(pos: i32): boolean {
   let pp = pos
   let steps = 0
   while pp >= 0 && steps <= fnStmts.length {
-    if pp < fnInstOrigin.length && fnInstOrigin[pp] >= 0 { return true }
     if lfOriginOf(pp) >= 0 { return true }
     if pp < lfCloneHead.length && lfCloneHead[pp] >= 0 { return true }
     const d = nodeAt(fnStmts[pp])
@@ -532,7 +531,9 @@ function clSyntax(fe: i32): i32 {
   }
   ci = 0
   while ci < caps.length {
-    if (clhDecls[hk + caps[ci]] ?? clNoRows).length > 1 { return -1 }
+    // The caller reads a parameter or loop variable capture by name; a `let` by its binding.
+    const ck = hk + caps[ci]
+    if (clhOwnN[ck] ?? 0) > 1 && (clhOwnNamed[ck] ?? false) { return -1 }
     ci = ci + 1
   }
   return caps.length
@@ -612,6 +613,8 @@ let clhBind: {[string]: i32} = Map()
 let clhDecls: {[string]: i32[]} = Map()
 let clhUseDecl: {[string]: i32[]} = Map()
 let clhDeclKey: {[i32]: string} = Map()
+let clhOwnN: {[string]: i32} = Map()
+let clhOwnNamed: {[string]: boolean} = Map()
 let clhCallDecl: {[string]: i32[]} = Map()
 let clhProp: {[string]: boolean} = Map()
 let clhCallEnc: {[string]: i32[]} = Map()
@@ -625,6 +628,8 @@ function clIndexReset() {
   clhDecls = Map()
   clhUseDecl = Map()
   clhDeclKey = Map()
+  clhOwnN = Map()
+  clhOwnNamed = Map()
   clsDone = Map()
   clsNonLet = Map()
   clsUseBy = Map()
@@ -669,7 +674,13 @@ function clIndexPush(m: {[string]: i32[]}, key: string, v: i32) {
   return 0
 }
 
-function clIndexDecl(key: string, ix: i32) {
+// Records declaration `ix` under `key`; `enc` is its innermost enclosing function, -1 for the
+// host's own code, whose declarations a capture's caller-side read can confuse by name.
+function clIndexDecl(key: string, ix: i32, enc: i32) {
+  if enc < 0 {
+    clhOwnN[key] = (clhOwnN[key] ?? 0) + 1
+    if !(nodeAt(ix) is LetDecl) { clhOwnNamed[key] = true }
+  }
   clhDeclKey[ix] = key
   const ds = clhDecls[key]
   if ds == null { clhDecls[key] = [ix] } else { ds.push(ix) }
@@ -707,7 +718,7 @@ function clIndexWalk(hk: string, ix: i32, enc: i32, inBody: boolean) {
   if n is Member { clhProp[hk + n.memProp] = true }
   if n is OptMember { clhProp[hk + n.omProp] = true }
   if n is LetDecl {
-    clIndexDecl(hk + n.letName, ix)
+    clIndexDecl(hk + n.letName, ix, enc)
     if (
       inBody
       && enc < 0
@@ -719,15 +730,15 @@ function clIndexWalk(hk: string, ix: i32, enc: i32, inBody: boolean) {
       if !clhBind.has(bk) { clhBind[bk] = ix }
     }
   }
-  if n is Param { clIndexDecl(hk + n.parName, ix) }
-  if n is ForRange { clIndexDecl(hk + n.frVar, ix) }
+  if n is Param { clIndexDecl(hk + n.parName, ix, enc) }
+  if n is ForRange { clIndexDecl(hk + n.frVar, ix, enc) }
   if n is ForIn {
-    clIndexDecl(hk + n.fiVar, ix)
-    if n.fiVar2 != "" { clIndexDecl(hk + n.fiVar2, ix) }
+    clIndexDecl(hk + n.fiVar, ix, enc)
+    if n.fiVar2 != "" { clIndexDecl(hk + n.fiVar2, ix, enc) }
   }
   let inner = enc
   if n is FuncDecl {
-    clIndexDecl(hk + n.fnName, ix)
+    clIndexDecl(hk + n.fnName, ix, enc)
     inner = ix
   }
   const kids = nodeChildren(ix)
