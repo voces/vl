@@ -2683,6 +2683,37 @@ function recFnReturns(fd: i32): i32[] {
   return out
 }
 
+// Whether every call site in `sites` is a call a queued delivery lands on `dst`'s storage: no site
+// is handed on at its own record or queued for none, so one build at `dst` serves them all.
+function recSitesAllQueuedAt(sites: i32[], own: i32, dst: i32): boolean {
+  if sites.length < 2 { return false }
+  for s in sites {
+    if s % 2 != 0 { return false }
+    if !recSiteLandsDirect(s / 2, dst) { return false }
+  }
+  return true
+}
+
+// Whether a queued delivery is call `c` itself, or a join whose tail it is, at `dst`'s storage: a
+// call stored into a container's element or field is not one, as its reads hand it on there.
+function recSiteLandsDirect(c: i32, dst: i32): boolean {
+  let i = 0
+  while i < recPendSrc.length {
+    const src = cwPeelValue(recPendSrc[i])
+    let hit = src == c
+    if !hit && src >= 0 && valueJoinAt(src) >= 0 {
+      const leaves: i32[] = []
+      tailValueLeaves(src, leaves)
+      for lf in leaves {
+        if cwPeelValue(lf) == c { hit = true }
+      }
+    }
+    if hit && fieldStorageEq(nonNulTyOf(recPendDstTy[i]), dst) { return true }
+    i = i + 1
+  }
+  return false
+}
+
 // Whether call sites `sites` are `call` and calls each landing `own` on `dst`'s field storage,
 // queued for none, or stored into a container (`recHeldStored`, `recStoresAgree`), so one build
 // serves them all (D8201). For one queued for none, `dst` widens a field no further than
@@ -6975,10 +7006,15 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   if !(oa is TyObj) || !(da is TyObj) { return false }
   if fieldStorageEq(own, dst) || !recCopyBoxesOnly(own, dst) { return false }
   // Calls that all land on one record need no copy: one build at that record serves them all,
-  // whatever their count (D8201, D17228).
-  if !fnReturnsCallSpread(fd) && recSitesLandAt(sites, p, own, dst) {
+  // whatever their count, where no site needs its own copy (D8201, D17228).
+  if (
+    !fnReturnsCallSpread(fd)
+    && recCallBuildsFreshRecord(p)
+    && recSitesAllQueuedAt(sites, own, dst)
+  ) {
     return false
   }
+
   // A copy only the `null` arm admits is taken where some call lands off `dst`'s storage; calls
   // that all land there share one build, which keeps their identity.
   if (
