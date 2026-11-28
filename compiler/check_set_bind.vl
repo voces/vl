@@ -1,8 +1,7 @@
 // `check_set_bind.vl` — which function sets reach each un-annotated parameter, per call, at check
 // time: a call's instantiation of the parameter's `BK_ARROW` bounds, storage-free
 // (`refactor-notes/2026-11-16-store-set-bind-shadow.md`). Built from the check's hand rows
-// (`fnParamHandNote`), closed over parameters handed on to another un-annotated callee. A shadow:
-// `setBindDiffLine` compares it with the elaboration's per-instance notes; no decision reads it.
+// (`fnParamHandNote`), closed over parameters handed on to another un-annotated callee.
 import {
   ArrayLit,
   AsExpr,
@@ -62,12 +61,6 @@ import {
 import { nodeTyIxOf } from "./check_node_tys"
 import { T, TyArray, TyFunc, tyAt, tyElemOf, tyFieldTyOf } from "./check_types"
 import { identFnDeclOf } from "./check_scopes"
-import {
-  mintFactCallOf,
-  mintFactRows,
-  mintFactSetOf,
-  mintRetParamsOf,
-} from "./check_mint"
 import { handBackHoleIx, handBackIx, handBackShared } from "./check_hand_back"
 import { parenPeelIx } from "./check_places"
 import {
@@ -81,7 +74,7 @@ import { i32ListHas, strListHas } from "./listutil"
 import { holeSetSplitsAt } from "./check_relate_core"
 import { nonNullTy } from "./tyquery"
 import { decDigitsOf } from "./strutil"
-import { declOrigOf, identDeclOf, nodeSrc } from "./symbols"
+import { identDeclOf } from "./symbols"
 
 // One row per (call, callee, parameter position) a set reaches: the call node, the callee
 // declaration, the position, the set ids, and the caller's parameter the argument reads (-1 when
@@ -100,10 +93,6 @@ let sbDecls: i32[] = []
 let sbSetsOf: {[string]: i32[]} = Map()
 // By `decl|position`: the union of the argument types every row for it hands.
 let sbTysOf: {[string]: i32[]} = Map()
-
-// One row per declaration handing back its parameter: every value it returns reads it.
-let hbFn: i32[] = []
-let hbParam: i32[] = []
 
 function sbKey(d: i32, i: i32): string {
   return i32ToStr(d) + "|" + i32ToStr(i)
@@ -805,8 +794,6 @@ export function setBindSetPartial(s: i32): boolean {
 
 // The arena length the rows are built over: the checked tree, not the nodes an elaboration adds.
 let sbEnd = -1
-// Whether a build also finds the hand-backs, which only the diff against the elaboration reads.
-let sbWithHandBacks = true
 
 // The sets the check's tag decision tries from these rows, built over the arena's first `end`
 // nodes: each set a call through a parameter, or a path from one, reaches. A set an instance may
@@ -814,9 +801,7 @@ let sbWithHandBacks = true
 // reaching a stored parameter, one handed to or by a set's members, and a partial one.
 export function setBindTrySets(end: i32): i32[] {
   sbEnd = end
-  sbWithHandBacks = false
   setBindBuild()
-  sbWithHandBacks = true
   const keys: string[] = []
   for d in sbDecls { setBindCallsIn(d, keys) }
   for hs in sbHandedCalls { sbCalledSets.push(hs) }
@@ -871,8 +856,6 @@ export function setBindBuild() {
   sbFromParam = []
   sbDecls = []
   sbSetsOf = Map()
-  hbFn = []
-  hbParam = []
   cwIxBuild()
   // Direct rows, and each forwarded row with the caller's parameter it reads.
   // The checked tree only: a declaration the elaboration copied is the original's instance.
@@ -994,47 +977,7 @@ export function setBindBuild() {
       for st in sbSets[r] { sbStoredSets[st] = true }
     }
   }
-  if sbWithHandBacks { setBindHandBacks() }
   return 0
-}
-
-// Whether `dn` at `d` is a lambda handed straight to a list method: it runs inside the method's
-// loop, so no instance of it hands a value back.
-function sbInlineCallback(d: i32, dn: FuncDecl): boolean {
-  return fnNameIsLambda(dn.fnName) && i32ListHas(cbFn, d)
-}
-
-// Notes each declaration handing back a parameter (`check_hand_back.vl`) that some call binds
-// to a function: a set reaches it, or an argument of function type. An inline list-method
-// callback is no such declaration.
-function setBindHandBacks() {
-  for d in sbDecls {
-    const dn = nodeAt(d)
-    if dn is FuncDecl && dn.fnBody >= 0 {
-      const own = handBackIx(dn)
-      const one = if own >= 0 { own } else { handBackHoleIx(dn, 0) }
-      const ats = if one >= 0 { [one] } else { handBackShared(d, dn) }
-      // An inline lambda handed to a list method runs inside the method's loop, no call of it
-      // stands anywhere to take the value back.
-      const inline = sbInlineCallback(d, dn)
-      for at in ats {
-        if !inline && sbFnReaches(d, at) {
-          hbFn.push(d)
-          hbParam.push(at)
-        }
-      }
-    }
-  }
-  return 0
-}
-
-// Whether some call binds parameter `i` of `d` to a function.
-function sbFnReaches(d: i32, i: i32): boolean {
-  if setBindSetsOf(d, i).length > 0 { return true }
-  for t in sbTysOf[sbKey(d, i)] ?? [] {
-    if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc { return true }
-  }
-  return false
 }
 
 // Each call through a parameter of `d` in its body, as `[call, set, ...]` over the sets reaching
@@ -1069,112 +1012,6 @@ function setBindCallsIn(d: i32, out: string[]) {
     }
   }
   return 0
-}
-
-// One line comparing these rows with the elaboration's notes: calls through a set
-// (`mintFactNote`) and hand-backs (`mintRetNote`), each as both / only here / only there.
-// "" when neither side has a row.
-export function setBindDiffLine(end: i32): string {
-  sbEnd = end
-  setBindBuild()
-  const mine: string[] = []
-  for d in sbDecls { setBindCallsIn(d, mine) }
-  const theirs: string[] = []
-  for r in mintFactRows() { theirs.push(sbFactKey(r)) }
-  const mineHb: string[] = []
-  let h = 0
-  while h < hbFn.length {
-    mineHb.push(sbKey(hbFn[h], hbParam[h]))
-    h = h + 1
-  }
-  const theirsHb: string[] = []
-  for d in sbDecls {
-    for i in mintRetParamsOf(d) { theirsHb.push(sbKey(d, i)) }
-  }
-  if mine.length + theirs.length + mineHb.length + theirsHb.length == 0 {
-    return ""
-  }
-  // The sets each side names: what the tag decision tries (`fnTagDecide`'s mint pass).
-  const mineSets: string[] = []
-  for k in mine { mineSets.push(sbSetOfKey(k)) }
-  const theirsSets: string[] = []
-  for r in mintFactRows() { theirsSets.push(i32ToStr(mintFactSetOf(r))) }
-  return "setbind calls "
-    + sbCmp(mine, theirs)
-    + " handback "
-    + sbCmp(mineHb, theirsHb)
-    + " rows "
-    + i32ToStr(sbCall.length)
-    + " sets "
-    + sbCmp(mineSets, theirsSets)
-}
-
-// `both/onlyMine/onlyTheirs` over two lists of keys, each counted once.
-function sbCmp(mine: string[], theirs: string[]): string {
-  const inTheirs: {[string]: boolean} = Map()
-  for k in theirs { inTheirs[k] = true }
-  const seen: {[string]: boolean} = Map()
-  let both = 0
-  let onlyMine = 0
-  for k in mine {
-    if !(seen[k] ?? false) {
-      seen[k] = true
-      if inTheirs[k] ?? false {
-        both = both + 1
-      } else {
-        onlyMine = onlyMine + 1
-      }
-    }
-  }
-  let onlyTheirs = 0
-  for k in theirs {
-    if !(seen[k] ?? false) {
-      seen[k] = true
-      onlyTheirs = onlyTheirs + 1
-    }
-  }
-  return i32ToStr(both) + "/" + i32ToStr(onlyMine) + "/" + i32ToStr(onlyTheirs)
-}
-
-// The checked node minted node `x` copies, through every copy, else `x`.
-function sbSrcOf(x: i32): i32 {
-  let y = x
-  let n = 0
-  while n < 64 {
-    const s = nodeSrc[y] ?? -1
-    if s < 0 || s == y { return y }
-    y = s
-    n = n + 1
-  }
-  return y
-}
-
-// The declaration minted declaration `d` copies, else `d`.
-function sbOrigDecl(d: i32): i32 {
-  const s = sbSrcOf(d)
-  if s != d { return s }
-  const o = declOrigOf(d)
-  return if o >= 0 { sbSrcOf(o) } else { d }
-}
-
-// Fact row `r` at the grain of these rows: `P<decl>|<position>|<set>` for a call through a
-// parameter, else `C<call>|<set>`.
-function sbFactKey(r: i32): string {
-  const c = sbSrcOf(mintFactCallOf(r))
-  const set = i32ToStr(mintFactSetOf(r))
-  if c >= 0 && c < P.nodes.length {
-    const n = nodeAt(c)
-    if n is Call {
-      const f = parenPeelIx(n.callFn)
-      const pd = if f >= 0 && nodeAt(f) is Ident { identDeclOf(f) } else { -1 }
-      if pd >= 0 && pd < P.nodes.length && nodeAt(pd) is Param {
-        const owner = if pd < cwIxParent.length { cwIxParent[pd] } else { -1 }
-        const q = sbParamIndexIn(owner, f)
-        if q >= 0 { return "P" + sbKey(sbOrigDecl(owner), q) + "|" + set }
-      }
-    }
-  }
-  return "C" + i32ToStr(c) + "|" + set
 }
 
 // The list a `for` loop walks when name `x` reads that loop's element; -1 otherwise.
@@ -1312,11 +1149,4 @@ function sbSetHasGeneric(s: i32): boolean {
     if mn is FuncDecl && mn.fnTyParams.length > 0 { return true }
   }
   return false
-}
-
-// The set id a diff key ends with (`…|<set>`).
-function sbSetOfKey(k: string): string {
-  let i = k.length - 1
-  while i >= 0 && k[i] != 124 { i = i - 1 }
-  return k.slice(i + 1, k.length)
 }
