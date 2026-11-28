@@ -9,6 +9,7 @@ import {
   BoolLit,
   Call,
   FieldInit,
+  ForIn,
   FuncDecl,
   Ident,
   IfStmt,
@@ -44,6 +45,7 @@ import { rcwCallSites } from "./check_record_writes"
 import {
   CW_OCC_ASG,
   CW_OCC_BIND,
+  CW_OCC_CALL,
   CW_OCC_USE,
   CW_UP_ARG,
   CW_UP_ASG_LHS,
@@ -494,8 +496,16 @@ function bindUseDests(
   while ok && cwOccNext(ow) {
     const r = ow.row
     const kind = cwIxKind[r]
-    if kind == CW_OCC_USE { ok = exprDests(cwIxNode[r], path, out, paths, on) }
-    else if kind != CW_OCC_ASG && kind != CW_OCC_BIND { ok = false }
+    if kind == CW_OCC_USE {
+      ok = exprDests(cwIxNode[r], path, out, paths, on)
+    } else if kind == CW_OCC_CALL {
+      // A call row is filed by name with no frame: only one whose callee is this binding counts.
+      const cn = nodeAt(cwIxNode[r])
+      const cf = if cn is Call && cn.callFn >= 0 { parenPeelIx(cn.callFn) } else { -1 }
+      if cf < 0 || identDeclOf(cf) == d { ok = false }
+    } else if kind != CW_OCC_ASG && kind != CW_OCC_BIND {
+      ok = false
+    }
   }
   on.pop()
   return ok
@@ -513,7 +523,8 @@ function exprDests(
   if !cwIxCovers(x) { return false }
   const uk = cwIxUpKind[x]
   const up = cwIxUp[x]
-  if uk == CW_UP_CMP || uk == CW_UP_IS || uk == CW_UP_ITER { return true }
+  if uk == CW_UP_CMP || uk == CW_UP_IS { return true }
+  if uk == CW_UP_ITER { return iterDests(x, up, path, out, paths, on) }
   if uk == CW_UP_OBJ { return projDests(x, up, path, out, paths, on) }
   if uk == CW_UP_COAL { return exprDests(up, path, out, paths, on) }
   if uk == CW_UP_LETINIT {
@@ -605,12 +616,14 @@ function projDests(
   on: i32[],
 ): boolean {
   const ix = nodeAt(up)
+  if ix is Member && nodeAt(x) is Ident && parenPeelIx(ix.memObj) == x {
+    return callbackDests(x, up, path, out, paths)
+  }
   if !(ix is Index) || parenPeelIx(ix.idxArr) != x || !(nodeAt(x) is Ident) {
     return true
   }
   if !cwIxCovers(up) || cwIxUpKind[up] == CW_UP_ASG_LHS { return true }
-  const root = aliasRoot(identDeclOf(x))
-  const st = if bindIsNarrowed(root) || bindSlotWritten(root) { "" } else { readWrapStep(root) }
+  const st = elemReadStep(x)
   if st == "" { return true }
   const o2: i32[] = []
   const p2: string[] = []
@@ -668,7 +681,12 @@ function bindSlotWrittenIn(d: i32, seen: i32[]): boolean {
         }
       }
       const pn = nodeAt(p)
-      if pn is Member && cwIxCovers(p) && cwIxUpKind[p] == CW_UP_CALLEE {
+      if (
+        pn is Member
+        && (pn.memProp == "push" || pn.memProp == "unshift" || pn.memProp == "set")
+        && cwIxCovers(p)
+        && cwIxUpKind[p] == CW_UP_CALLEE
+      ) {
         const c = nodeAt(cwIxUp[p])
         if !(c is Call) || c.callArgs.length != 1 { return true }
         if !bindFreshLit(nodeAt(parenPeelIx(c.callArgs[0]))) { return true }
@@ -676,6 +694,87 @@ function bindSlotWrittenIn(d: i32, seen: i32[]): boolean {
     }
   }
   return false
+}
+
+// The step a typed read of an element of the binding read `x` takes to it (`readWrapStep`), ""
+// where the binding is narrowed, slot-written or no fresh literal.
+function elemReadStep(x: i32): string {
+  const root = aliasRoot(identDeclOf(x))
+  if bindIsNarrowed(root) || bindSlotWritten(root) { return "" }
+  return readWrapStep(root)
+}
+
+// The destinations a `for` over binding read `x` gives the binding: each typed read of its
+// element variable, at the element path. A loop over no list literal, or whose variable's uses
+// no rule places, is untyped and names none.
+function iterDests(
+  x: i32,
+  up: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+  on: i32[],
+): boolean {
+  const l = nodeAt(up)
+  if (
+    !(l is ForIn)
+    || l.fiDecl1 < 0
+    || !(nodeAt(x) is Ident)
+    || elemReadStep(x) != "E"
+  ) {
+    return true
+  }
+  const o2: i32[] = []
+  const p2: string[] = []
+  if !bindUseDests(l.fiDecl1, destJoin("E", path), o2, p2, on) { return true }
+  let i = 0
+  while i < o2.length {
+    out.push(o2[i])
+    paths.push(p2[i])
+    i = i + 1
+  }
+  return true
+}
+
+// The destination a list method's callback gives the binding read `x` it is called on
+// (`xs.map((r: T) => ...)`, `xs.forEach(f)`): the callback's annotated first parameter, at the
+// element path. Any other member read names none.
+function callbackDests(
+  x: i32,
+  mem: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+): boolean {
+  const m = nodeAt(mem)
+  if !(m is Member) || !cwIxCovers(mem) || cwIxUpKind[mem] != CW_UP_CALLEE {
+    return true
+  }
+  const nm = m.memProp
+  if (
+    nm != "map"
+    && nm != "forEach"
+    && nm != "filter"
+    && nm != "some"
+    && nm != "every"
+  ) {
+    return true
+  }
+  if elemReadStep(x) != "E" { return true }
+  const c = nodeAt(cwIxUp[mem])
+  if !(c is Call) || c.callArgs.length < 1 { return true }
+  const a = parenPeelIx(c.callArgs[0])
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  let fd = -1
+  if an is FuncDecl { fd = a }
+  if an is Ident { fd = cwCalleeDeclOf(a) }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 || f.fnParams.length < 1 {
+    return true
+  }
+  const pn = nodeAt(f.fnParams[0])
+  if !(pn is Param) || pn.parType < 0 { return true }
+  return destPush(pn.parType, destJoin("E", path), out, paths)
 }
 
 // The fresh binding an un-annotated alias chain from `d` (`const g = c`) names, or `d`.
