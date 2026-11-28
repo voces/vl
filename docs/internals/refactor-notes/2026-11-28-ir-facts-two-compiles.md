@@ -42,7 +42,11 @@ Measured with `$VL_FUEL=1`, master's fixpoint seed against this branch's:
 
 | program | -O, once | -O, twice | peak RSS once → twice |
 |---|---|---|---|
+| compiler/entry.vl (self-compile) | 114.909 G | 227.528 G (1.98×) | 4,172 → 4,172 MB |
 | capture-union-closure-write-member-grid | 403.7 M | 799.2 M (1.98×) | 200 → 214 MB |
+
+Peak RSS is the larger compile's, not the sum: the reset frees what compile 1 held. With the
+switch off, this branch's self-compile fuel is master's within 0.0004%, plain and -O alike.
 
 At -O, wasm-opt dominates wall time: on the self-compile, 65 s of a 462 s build is the guest. So
 the second guest compile costs about 2× guest fuel but about +14% wall time on the self-compile,
