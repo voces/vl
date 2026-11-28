@@ -889,6 +889,12 @@ let monoLamCloneSlots: i32[] = []
 // stays -1, the fall-through to `moduleLocalLetOfUnique`. Rebuilt at the one write to
 // `monoProgStmts`, so it carries no row from an earlier compile.
 let monoProgLetBySid: i32[] = []
+// Elements of a stamped list literal whose place agrees on no signature, each with its frame and
+// the stamp's element: one no path instanced (`monoElemInst`) takes the stamp (D17771).
+let monoStampElemAt: i32[] = []
+let monoStampElemCtx: i32[] = []
+let monoStampElemTy: i32[] = []
+let monoStampElemLit: i32[] = []
 
 // The arena's size, a memo key for the walks below that cache a whole-arena answer.
 function monoArenaStamp() {
@@ -10899,9 +10905,7 @@ function monoCoerceFnValueTys(
                 if tyNulFuncInner(tnameTy) >= 0 { tyNulFuncInner(tnameTy) } else { tnameTy },
               ),
             )
-            if vr >= 0 {
-              monoElemInstRecord(exprIx).meSig = monoConcreteFnTyName(tnameTy)
-            }
+            if vr >= 0 { monoElemInstRecord(exprIx) }
             return vr
           }
         }
@@ -18179,6 +18183,13 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const mt = monoNodeTyAt(m.memObj, ctx)
     if mt >= 0 && !monoTyOpen(mt) { rt = mt }
   }
+  // A literal receiver no binding holds reads as the type it is stamped at, else the value its
+  // holder class closes, as a bound one's binding does (D17771).
+  if (rt < 0 || monoTyOpen(rt)) && nodeAt(unwrapParen(m.memObj)) is ArrayLit {
+    const st = nodeRepTyIxOf(unwrapParen(m.memObj))
+    const vt = if st >= 0 && !monoTyOpen(st) { st } else { eplValueTy(unwrapParen(m.memObj), elabWalkTop()) }
+    if vt >= 0 { rt = vt }
+  }
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = tyAt(rt)
   // A tagged set element is closed: the callback's instance takes the set, as a direct call's does.
@@ -18193,7 +18204,7 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   if lam {
     // A lambda the elaboration keyed at the list's build takes that record as its parameter's type.
     // Over a lambda's `map`, directly or through a `const`, the lambda reads the records of the
-    // list that map built or handed on.
+    // list that map built or handed on; over a stamped literal left open, that literal's.
     let rx = unwrapParen(m.memObj)
     const rd = if rx >= 0 && nodeAt(rx) is Ident { identDeclOf(rx) } else { -1 }
     const rdn = if rd >= 0 && rd < P.nodes.length { nodeAt(rd) } else { null }
@@ -18205,7 +18216,10 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const rcb = if rc is Call && rm is Member && rm.memProp == "map" { unwrapParen(rc.callArgs[0]) } else { -1 }
     const lamMap = rcb >= 0 && nodeAt(rcb) is FuncDecl
     const rw0 = elabCbParamRowTy(ax, ax)
-    const rw = if rw0 < 0 && lamMap { tyElemOf(lt) } else { rw0 }
+    const stamped = nodeAt(unwrapParen(m.memObj)) is ArrayLit
+      && monoTyOpen(nodeTyIxOf(unwrapParen(m.memObj)))
+      && nodeRepTyIxOf(unwrapParen(m.memObj)) == rt
+    const rw = if rw0 < 0 && (lamMap || stamped) { tyElemOf(lt) } else { rw0 }
     const lf = nodeAt(ax)
     const lsf = if nodeTyIxOf(ax) >= 0 { tyAt(nodeTyIxOf(ax)) } else { null }
     // A `map` whose lambda hands each element back returns them at the build too (D16211).
@@ -18741,12 +18755,11 @@ function monoAllFnValues(xs: i32[]): boolean {
   return true
 }
 
-// How each list element's function value is instanced, by node, from every instancing path:
-// `meList` the type a call through the list coerced it to (D10701), `meSig` a coercion's type,
-// `meSet` instanced at a tagged set (`monoElemsAtSet`), `meDirect` a read of it turned direct.
+// How each list element's function value is instanced, by node: a row is written by every
+// instancing path (a coercion writes the bare row); `meList` the type a call through the list
+// coerced it to (D10701), `meSet` at a tagged set, `meDirect` a read of it turned direct.
 type MonoElemInst = {
   meList: string,
-  meSig: string,
   meSet: boolean,
   meDirect: boolean,
 }
@@ -18756,12 +18769,7 @@ let monoElemInst: {[i32]: MonoElemInst} = Map()
 function monoElemInstRecord(el: i32): MonoElemInst {
   const have = monoElemInst.get(el)
   if have != null { return have }
-  const r: MonoElemInst = {
-    meList: "",
-    meSig: "",
-    meSet: false,
-    meDirect: false,
-  }
+  const r: MonoElemInst = { meList: "", meSet: false, meDirect: false }
   monoElemInst[el] = r
   return r
 }
@@ -24113,6 +24121,14 @@ function monoWalk(ix: i32, ctx: i32) {
         const efe = if evn is Ident && identFnDeclOf(ev) >= 0 { monoFnFeOfIdent(ev, evn.identName, ctx) } else { -1 }
         if efe >= 0 && efe < monoGen.length && monoGen[efe] == 1 {
           const vs = eplValueSig(ev, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+          const sl = nodeRepTyIxOf(ix)
+          const ss = if sl >= 0 && tyAt(sl) is TyArray { tyArrayElemIx(sl) } else { -1 }
+          if !monoTyClosedFn(vs) && monoTyClosedFn(ss) {
+            monoStampElemAt.push(ev)
+            monoStampElemCtx.push(ctx)
+            monoStampElemTy.push(ss)
+            monoStampElemLit.push(ix)
+          }
           const none: i32[] = []
           if (
             monoTyClosedFn(vs)
@@ -27086,6 +27102,10 @@ export function monomorphize(stmts: i32[]) {
   // The index follows the table it answers for, at the write and not at a build point:
   // between the two there is no reader, so `monoModuleLetOf` cannot see an empty column.
   monoProgLetBySid = []
+  monoStampElemAt = []
+  monoStampElemCtx = []
+  monoStampElemTy = []
+  monoStampElemLit = []
   let mi = 0
   while mi < stmts.length {
     const ms = nodeAt(stmts[mi])
@@ -27237,6 +27257,30 @@ export function monomorphize(stmts: i32[]) {
       }
     }
     fe3 = fe3 + 1
+  }
+  // Every element is instanced or rewritten: a stamped literal's open element no path instanced
+  // (an empty `monoElemInst` row) is delivered at the stamp's element, its holder's one fact.
+  let se = 0
+  while se < monoStampElemAt.length {
+    const sev = monoStampElemAt[se]
+    const sst = monoStampElemTy[se]
+    const none: i32[] = []
+    // A literal an element of which a read named directly is a list of call targets, not a value.
+    const sln = nodeAt(monoStampElemLit[se])
+    let direct = false
+    if sln is ArrayLit {
+      for e in sln.arrElems {
+        if monoElemInst.get(unwrapParen(e))?.meDirect ?? false { direct = true }
+      }
+    }
+    if (
+      monoElemInst.get(sev) == null
+      && !direct
+      && monoCoerceFnValueTys(sev, monoStampElemCtx[se], sst, none, sst) < 0
+    ) {
+      return -1
+    }
+    se = se + 1
   }
   const prc = monoPruneTemplates(nDecl)
   if prc < 0 { return prc }
