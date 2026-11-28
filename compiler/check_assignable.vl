@@ -22,7 +22,12 @@ import {
 } from "./check_iface"
 import { rangeVarFits } from "./check_range_var"
 import { arrowNote } from "./check_arrow"
-import { cwIxCovers, cwPeelValue } from "./check_write_scan"
+import {
+  cwFnCalls,
+  cwIxCovers,
+  cwIxParent,
+  cwPeelValue,
+} from "./check_write_scan"
 import { recLitOnlyDeclOf } from "./check_rec_fresh"
 import { identTyOf } from "./check_nar_store"
 import {
@@ -6821,7 +6826,6 @@ function lamRetFreshNone(_lx: i32, _own: i32, _dst: i32): boolean {
 let fvaAliasSite: i32[] = []
 let fvaAliasDecl: i32[] = []
 let fvaAliasElem: i32[] = []
-let fvaAliasSrc: i32[] = []
 
 // Notes a delivery of a binding's list of a set's records to a mutable list closing a field.
 function fvaAliasNote(site: i32, srcTy: i32, dstTy: i32) {
@@ -6843,7 +6847,6 @@ function fvaAliasNote(site: i32, srcTy: i32, dstTy: i32) {
   fvaAliasSite.push(site)
   fvaAliasDecl.push(d)
   fvaAliasElem.push(dr)
-  fvaAliasSrc.push(sr)
   return 0
 }
 
@@ -6852,13 +6855,12 @@ export function fvaAliasReset() {
   fvaAliasSite = []
   fvaAliasDecl = []
   fvaAliasElem = []
-  fvaAliasSrc = []
   return 0
 }
 
-// Refuses each noted alias delivery where a call of a function the aliased field's set holds,
-// read from that storage or from a parameter, meets the destination's closed field at
-// another signature: the two names are one storage, called at one signature. One walk.
+// Refuses each noted alias delivery where a call of a field of a record read from that storage
+// meets the destination's closed field at another signature: the two names are one storage,
+// called at one signature (`fvaCallMeetsStorage`). One walk.
 export function fvaAliasConflictsAll() {
   if fvaAliasSite.length == 0 { return 0 }
   const refused: boolean[] = []
@@ -6866,15 +6868,17 @@ export function fvaAliasConflictsAll() {
   let i = 0
   while i < P.nodes.length {
     const n = nodeAt(i)
-    const cs = if n is Call { fnTagSetOfTy(nodeTyIxOf(n.callFn)) } else { -1 }
-    const root = if n is Call && cs >= 0 { fvaCallRoot(n.callFn) } else { -1 }
-    if n is Call && cs >= 0 {
+    if n is Call {
       let k = 0
       while k < fvaAliasSite.length {
         if (
           !refused[k]
-          && (root == fvaAliasDecl[k] || root == FVA_HANDED_IN)
-          && fvaAliasCallMeets(n.callArgs, cs, fvaAliasSrc[k], fvaAliasElem[k])
+          && fvaCallMeetsStorage(
+            n.callFn,
+            n.callArgs,
+            fvaAliasDecl[k],
+            fvaAliasElem[k],
+          )
         ) {
           refused[k] = true
           tErr(fvaAliasMsg(fvaAliasDecl[k]), fvaAliasSite[k])
@@ -6887,60 +6891,113 @@ export function fvaAliasConflictsAll() {
   return 0
 }
 
-// The storage root of a parameter: storage handed in, which may be any binding's.
-const FVA_HANDED_IN = -2
+// The one conflict: a call of callee `c` with arguments `args` reads field `f` of a record that
+// may be held in binding `d`'s storage, and its arguments do not store as record `dr`'s closed
+// field `f` takes them.
+function fvaCallMeetsStorage(c: i32, args: i32[], d: i32, dr: i32): boolean {
+  const ro = tyAt(dr)
+  const m = fvaCalleeField(c)
+  const mn = if m >= 0 { nodeAt(m) } else { null }
+  if !(ro is TyObj) || !(mn is Member) { return false }
+  const k = strListIndexOf(ro.objFieldNames, mn.memProp)
+  if k < 0 || fvaArgsStoreAt(args, ro.objFieldTypes[k]) { return false }
+  const seen: i32[] = []
+  return fvaReaches(mn.memObj, d, seen)
+}
 
-// The binding whose storage callee `c` reads its function from: the root of the object of the
-// field it reads, or of the field read a binding it names holds; -1 where no binding is known.
-function fvaCallRoot(c: i32): i32 {
+// The field read callee `c` calls: `c` itself, or the read a binding it names is bound to; -1.
+function fvaCalleeField(c: i32): i32 {
   const x = parenPeelIx(c)
   if x < 0 || x >= P.nodes.length { return -1 }
   const n = nodeAt(x)
-  if n is Member { return fvaStorageRoot(n.memObj) }
+  if n is Member { return x }
   if !(n is Ident) { return -1 }
   const dd = identDeclOf(x)
   const dn = if dd >= 0 && dd < P.nodes.length { nodeAt(dd) } else { null }
   if !(dn is LetDecl) || dn.letInit < 0 { return -1 }
   const ix = parenPeelIx(dn.letInit)
-  const iv = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
-  return if iv is Member { fvaStorageRoot(iv.memObj) } else { -1 }
+  return if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Member { ix } else { -1 }
 }
 
-// The binding whose storage expression `x` reads: through an index, a `for` variable or a
-// binding initialised from such a read, to the binding that holds anything else; a parameter is
-// `FVA_HANDED_IN`, and -1 is no binding the walk names.
-function fvaStorageRoot(x0: i32): i32 {
+// Whether expression `x`'s value may be, or be read from, binding `d`'s storage: through an
+// index, a field, a list or record literal, a binding's initialiser, a `for` variable, a call's
+// returned values, a method's receiver, and a parameter some call or method hands it to.
+function fvaReaches(x0: i32, d: i32, seen: i32[]): boolean {
   const x = parenPeelIx(x0)
-  if x < 0 || x >= P.nodes.length { return -1 }
+  if x < 0 || x >= P.nodes.length || i32ListHas(seen, x) { return false }
+  seen.push(x)
   const n = nodeAt(x)
-  if n is Index { return fvaStorageRoot(n.idxArr) }
-  if !(n is Ident) { return -1 }
+  if n is Index { return fvaReaches(n.idxArr, d, seen) }
+  if n is Member { return fvaReaches(n.memObj, d, seen) }
+  if n is ArrayLit {
+    for e in n.arrElems {
+      if fvaReaches(e, d, seen) { return true }
+    }
+    return false
+  }
+  if n is ObjLit {
+    for f in n.objFields {
+      const fi = nodeAt(f)
+      if fi is FieldInit && fvaReaches(fi.fiValue, d, seen) { return true }
+    }
+    return false
+  }
+  if n is Call { return fvaCallReaches(n, d, seen) }
+  if !(n is Ident) { return false }
   const dd = identDeclOf(x)
-  const dn = if dd >= 0 && dd < P.nodes.length { nodeAt(dd) } else { null }
+  if dd == d { return true }
+  if dd < 0 || dd >= P.nodes.length || i32ListHas(seen, dd) { return false }
+  seen.push(dd)
+  const dn = nodeAt(dd)
+  if dn is LetDecl { return dn.letInit >= 0 && fvaReaches(dn.letInit, d, seen) }
   if dn is LoopVar {
     const l = if dn.lvLoop >= 0 && dn.lvLoop < P.nodes.length { nodeAt(dn.lvLoop) } else { null }
-    return if l is ForIn { fvaStorageRoot(l.fiIter) } else { -1 }
+    return l is ForIn && fvaReaches(l.fiIter, d, seen)
   }
-  if dn is Param { return FVA_HANDED_IN }
-  if !(dn is LetDecl) { return -1 }
-  const ix = if dn.letInit >= 0 { parenPeelIx(dn.letInit) } else { -1 }
-  const iv = if ix >= 0 && ix < P.nodes.length && ix != x { nodeAt(ix) } else { null }
-  if iv is Ident || iv is Index { return fvaStorageRoot(ix) }
-  return dd
+  if dn is Param { return fvaParamReaches(dd, d, seen) }
+  return false
 }
 
-// Whether a call through set `cs` with arguments `args` calls a set record `sr`'s field holds,
-// and does not store them as record `dr`'s closed field takes them.
-function fvaAliasCallMeets(args: i32[], cs: i32, sr: i32, dr: i32): boolean {
-  const so = tyAt(sr)
-  const ro = tyAt(dr)
-  if !(so is TyObj) || !(ro is TyObj) { return false }
-  let k = 0
-  while k < ro.objFieldNames.length {
-    const j = strListIndexOf(so.objFieldNames, ro.objFieldNames[k])
-    const fs = if j >= 0 { fnTagSetOfTy(so.objFieldTypes[j]) } else { -1 }
-    if fs == cs && !fvaArgsStoreAt(args, ro.objFieldTypes[k]) { return true }
-    k = k + 1
+// Whether call `n`'s result may be read from binding `d`'s storage: a method's receiver, or a
+// value the called function returns.
+function fvaCallReaches(n: Call, d: i32, seen: i32[]): boolean {
+  const cx = parenPeelIx(n.callFn)
+  const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
+  if cn is Member { return fvaReaches(cn.memObj, d, seen) }
+  const fd = if cn is Ident { identFnDeclOf(cx) } else { -1 }
+  if fd < 0 { return false }
+  for lf in recFnValueLeaves(fd) {
+    if fvaReaches(lf, d, seen) { return true }
+  }
+  return false
+}
+
+// Whether parameter `p` may be handed binding `d`'s storage: an argument at its place in a call
+// of its function, or the receiver of the method call a lambda owning it is an argument of.
+function fvaParamReaches(p: i32, d: i32, seen: i32[]): boolean {
+  const fx = if cwIxCovers(p) { cwIxParent[p] } else { -1 }
+  const f = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+  if !(f is FuncDecl) { return false }
+  const j = i32ListIndexOf(f.fnParams, p)
+  if j < 0 { return false }
+  if f.fnName == "" {
+    const ux = if cwIxCovers(fx) { cwIxParent[fx] } else { -1 }
+    const u = if ux >= 0 && ux < P.nodes.length { nodeAt(ux) } else { null }
+    const ucx = if u is Call && u.callFn >= 0 { parenPeelIx(u.callFn) } else { -1 }
+    const um = if ucx >= 0 && ucx < P.nodes.length { nodeAt(ucx) } else { null }
+    return um is Member && fvaReaches(um.memObj, d, seen)
+  }
+  const calls: i32[] = []
+  cwFnCalls(fx, calls)
+  for c in calls {
+    const cn = nodeAt(c)
+    if (
+      cn is Call
+      && j < cn.callArgs.length
+      && fvaReaches(cn.callArgs[j], d, seen)
+    ) {
+      return true
+    }
   }
   return false
 }
