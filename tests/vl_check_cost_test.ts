@@ -45,7 +45,7 @@ Deno.test({
 
 Deno.test({
   name:
-    "check cost: passes by cause, and the arena's distinct rows within its rows",
+    "check cost: passes by cause, and the arena's distinct rows, minted and solved, within its rows",
   ignore: !ENABLED,
   async fn() {
     const err = await checkCodegen({ VL_CHECK_COST: "1" });
@@ -73,9 +73,11 @@ Deno.test({
         `want the causes to sum to the passes (${n})\ngot: ${byCause}`,
       );
     }
-    const m = arena.match(/^arena rows (\d+) distinct (\d+)$/);
-    if (m === null || Number(m[2]) < 1 || Number(m[2]) > Number(m[1])) {
-      throw new Error(`want 0 < distinct <= rows\ngot: ${arena}`);
+    // A solved view only merges classes the minted view keeps apart.
+    const m = arena.match(/^arena rows (\d+) distinct (\d+) solved (\d+)$/);
+    const [arenaRows, minted, solved] = m === null ? [0, 0, 0] : m.slice(1).map(Number);
+    if (m === null || solved < 1 || solved > minted || minted > arenaRows) {
+      throw new Error(`want 0 < solved <= distinct <= rows\ngot: ${arena}`);
     }
   },
 });
