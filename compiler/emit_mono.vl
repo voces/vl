@@ -27,7 +27,6 @@ import {
   mfrLitsMapStored,
   mfrLitsOf,
 } from "./elab_reads"
-import { mfrShadowNote } from "./mfr_shadow"
 import {
   LC_CHAIN_LONG,
   lamCellOf,
@@ -446,7 +445,6 @@ import {
   tyParamShadowReset,
   unwrapParen,
 } from "./emit_base"
-import { callBindShadowNote } from "./call_bind_shadow"
 import {
   monoAnnPinTy,
   monoClosedPinOwnTy,
@@ -13898,7 +13896,6 @@ function monoFlowInsertAt(xs: i32[], at: i32, v: i32) {
 // that name is in scope; false when either fails.
 function monoFlowReadSet(x: i32, g: i32): boolean {
   const call = if monoFlowCalledAt(x) { mfrParentOf(x) } else { -1 }
-  if repShadowOn { mfrShadowNote(x, g, call) }
   // The generic is the elaboration's; the walkers that chose `g` only gate which reads are asked.
   if !elabReadNames(x, g, call) { return false }
   // A read of a tagged set is its member id, which no name read can carry.
@@ -16967,6 +16964,9 @@ function monoRetypeElemTakeAliases(ctx: i32, at: i32, ft: i32) {
   if !(d is LetDecl) { return 0 }
   const nt = mkNullableTy(ft)
   const nodes = monoFrameNodes(ctx)
+  // A generic instance sharing its body's nodes with the others reads and records each in itself.
+  const fx = if ctx >= 0 && monoFrameIsGenericInstance(ctx) { ctx } else { -1 }
+  nodeTyInstFrameNote(fx)
   const aliases: i32[] = []
   for ax in nodes {
     const a = nodeAt(ax)
@@ -16976,9 +16976,9 @@ function monoRetypeElemTakeAliases(ctx: i32, at: i32, ft: i32) {
       if (
         recv >= 0
         && monoReadsBinding(recv, d.letName, ctx, at)
-        && monoTyOpen(nodeTyIxOf(ii))
+        && monoTyOpen(nodeTyIxIn(ii, fx))
       ) {
-        nodeTyRecord(ii, nt)
+        nodeTyRecordIn(fx, ii, nt)
         aliases.push(ax)
       }
     }
@@ -16987,16 +16987,18 @@ function monoRetypeElemTakeAliases(ctx: i32, at: i32, ft: i32) {
   while ai < aliases.length {
     const a = nodeAt(aliases[ai])
     if a is LetDecl {
-      if monoTyOpen(nodeTyIxOf(aliases[ai])) { nodeTyRecord(aliases[ai], nt) }
+      if monoTyOpen(nodeTyIxIn(aliases[ai], fx)) {
+        nodeTyRecordIn(fx, aliases[ai], nt)
+      }
       for ix in nodes {
-        const ty = nodeTyIxOf(ix)
+        const ty = nodeTyIxIn(ix, fx)
         if (
           ty >= 0
           && ty < T.tys.length
           && monoTyOpen(ty)
           && monoReadsBinding(ix, a.letName, ctx, aliases[ai])
         ) {
-          nodeTyRecord(ix, if tyAt(ty) is TyNullable { nt } else { ft })
+          nodeTyRecordIn(fx, ix, if tyAt(ty) is TyNullable { nt } else { ft })
         }
         const b = nodeAt(ix)
         if (
@@ -20759,7 +20761,6 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         fn.fnBody,
         callIx,
       )
-      callBindShadowNote(callIx, fn.fnName, fn.fnTyParams, tvN, tvV)
       // The elaboration's binding replaces a closed one of another representation; one of the
       // same representation keeps mono's spelling, and one mono left open stays mono's.
       for tp in fn.fnTyParams {
@@ -27275,6 +27276,31 @@ function monoFnReturnedObjLit(fd: i32): i32 {
     lit = r
   }
   return lit
+}
+
+// The one closed type un-annotated function `fd`, whose result type `t` is open, builds its
+// result at, where every value it hands back (`collectRetValues`) is a list or record literal
+// stamped at that type (`litRepTyAt`); -1 otherwise, or where `t` is closed. A call's result is
+// read at it, one value with one layout (D17795).
+export function monoFnBuiltRetLitTy(fd: i32, t: i32): i32 {
+  if t >= 0 && !tyHasTyVar(t) && !tyHasInferHole(t) { return -1 }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 || f.fnRet >= 0 { return -1 }
+  const vs: i32[] = []
+  collectRetValues(f.fnBody, vs)
+  let bt = -1
+  for v in vs {
+    const u = unwrapParen(v)
+    const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+    if !(n is ArrayLit) && !(n is ObjLit) { return -1 }
+    const lt = litRepTyAt(u, -1)
+    if lt < 0 || lt >= T.tys.length || tyHasTyVar(lt) || tyHasInferHole(lt) {
+      return -1
+    }
+    if bt >= 0 && !tySameSealed(bt, lt) { return -1 }
+    bt = lt
+  }
+  return bt
 }
 
 // Records on node `i`, when it is an un-annotated binding the walk left open, the closed type the
