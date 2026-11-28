@@ -629,6 +629,7 @@ import {
   RRecord,
   RepDesc,
   boxTagOfTy,
+  declTyIxOfName,
   fieldCodeIn,
   nodeMapValTyIx,
   nodeRepIs,
@@ -3353,7 +3354,8 @@ function letCellKindGo(letIx: i32, fnIx: i32): VKind {
 }
 
 // The scalar width an un-annotated `const` holding a call the frame types open is built at: the
-// call's own result width (`cloCallSigKey`), as its print and its store read it; "" else (D17809).
+// call's own result width (`cloCallSigKey`), the one reader its slot, its reads, its print and the
+// IR's storage (`openLocalInitTy`) take; "" else (D17809, D17808).
 export function letOpenCallWidth(letIx: i32, fnIx: i32): VKind | "" {
   const d = if letIx >= 0 && letIx < P.nodes.length { nodeAt(letIx) } else { null }
   if !(d is LetDecl) || d.letType >= 0 || d.letKw != "const" || d.letInit < 0 {
@@ -3362,17 +3364,17 @@ export function letOpenCallWidth(letIx: i32, fnIx: i32): VKind | "" {
   const ix = unwrapParen(d.letInit)
   // A `const` copy of such a binding holds its width too.
   if ix >= 0 && nodeAt(ix) is Ident {
-    const sd = identDeclOf(ix)
+    const sd = identLetOfRead(ix, fnIx)
     return if sd >= 0 && sd != letIx { letOpenCallWidth(sd, fnIx) } else { "" }
   }
   if ix < 0 || !(nodeAt(ix) is Call) { return "" }
   const t = exprValueTyAt(ix, fnIx)
   if t >= 0 && !tyHasTyVar(t) { return "" }
-  const k = sigKeyRetKind(cloCallSigKey(ix, fnIx)) ?? ""
-  if k == "f64" { return "f64" }
-  if k == "f32" { return "f32" }
-  if k == "i64" { return "i64" }
-  return ""
+  const k = sigKeyRetKind(cloCallSigKey(ix, fnIx))
+  // Only a numeric scalar is a width; any other kind leaves the binding at its own type. Two calls
+  // of one lifted lambda in one frame each hold their own, i32 included (D17808).
+  const num = k == "f64" || k == "f32" || k == "i64" || k == "i32"
+  return if k != null && num { k } else { "" }
 }
 
 // The map shape beside an inferred `map` or `nulmap` result valtype: the return expression's,
@@ -5750,15 +5752,17 @@ export function exprValueTyAt(exprIx0: i32, fnIx: i32): i32 {
 }
 
 // A read of an un-annotated `const` holding a call the frame types open is at the width the call
-// is built at (`letOpenCallWidth`); -1 for any other node.
+// is built at (`letOpenCallTy`); -1 for any other node.
 function openReadTy(exprIx: i32, fnIx: i32): i32 {
   if !(nodeAt(exprIx) is Ident) { return -1 }
-  const w = letOpenCallWidth(identDeclOf(exprIx), fnIx)
-  if w == "f64" { return TY_F64 }
-  if w == "i64" { return TY_I64 }
-  // An `f32` call keeps its open type here; its slot and print read the width directly.
-  if w == "f32" { return -1 }
-  return -1
+  return letOpenCallTy(identLetOfRead(exprIx, fnIx), fnIx)
+}
+
+// The type binding `letIx` is stored and read at where `letOpenCallWidth` gives it a width; -1
+// else. An `f32` call keeps its open type here; its slot and print read the width directly.
+export function letOpenCallTy(letIx: i32, fnIx: i32): i32 {
+  const w = letOpenCallWidth(letIx, fnIx)
+  return if w == "" || w == "f32" { -1 } else { declTyIxOfName(w) }
 }
 
 // Arithmetic the checker left open is at the width both its operands are read at; -1 for any
@@ -5927,6 +5931,15 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
           }
         }
         return k
+      }
+    }
+    // A call mono redirected to a clone of a lambda is keyed by that clone's lifted function.
+    if cre is Ident {
+      const rd = identDeclOf(cfx)
+      const rn = if rd >= 0 && rd < P.nodes.length { nodeAt(rd) } else { null }
+      if rn is FuncDecl && fnNameIsLambda(rn.fnName) {
+        const rk = cloSigKeyExt(fnStmtsPosOf(rd))
+        if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
       }
     }
     // A lambda literal called in place is keyed by its own lifted function, as a binding holding
