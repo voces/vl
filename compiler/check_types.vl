@@ -100,11 +100,15 @@ export type TyObj = {
 // A function: parameter type indices and a return type index.
 export type TyFunc = { fnParamTypes: i32[], fnRet: i32 }
 
-// A union `A | B | …`: member type-arena indices.
-export type TyUnion = { uMembers: i32[] }
+// A union `A | B | …`: member type-arena indices, and how a join formed it, which equality ignores
+// and identity does not: `uJoin` a join of type parameters (`tyJoinMark`), `uHole` a join with a
+// hole member (`tyHoleJoin`), `uElse` the base an `is` else's remainder re-reads (`tyElseBase`).
+export type TyUnion = { uMembers: i32[], uJoin: i32, uHole: i32, uElse: i32 }
 
-// A nullable `T?` / `T | null`: the inner type-arena index.
-export type TyNullable = { nInner: i32 }
+// A nullable `T?` / `T | null`: the inner type-arena index, and `nJoin`, the join mark of a join
+// whose null is kept as this wrapper (as `TyUnion.uJoin`). The mark is the nullable's own, never its
+// inner's: only the joins that keep their null as this wrapper set it.
+export type TyNullable = { nInner: i32, nJoin: i32 }
 
 // A list `T[]`: the element type-arena index (`-1` for an empty `[]` whose element is not
 // yet known — assignable to any array, like a hole). `aRead` is 1 for the read-only view
@@ -4832,19 +4836,23 @@ export function mkFuncTy(params: i32[], ret: i32) {
   return addTy(t)
 }
 
-export function mkNullableTy(inner: i32) {
+export function mkNullableTy(inner: i32) { return mkJoinNullableTy(inner, 0) }
+
+// `inner | null` as the wrapper of a join marked `join` (`TyNullable.nJoin`); 0 is a plain nullable.
+export function mkJoinNullableTy(inner: i32, join: i32): i32 {
   // D1026 — nullable is idempotent: `(T | null) | null` is `T | null`, and `null | null` is
   // `null`. The language has no second null, so both are artefacts of composing a type that
   // already holds `null`, and folding at this one home keeps each spelling one type.
   if inner >= 0 {
     const innerT = tyAt(inner)
-    if innerT is TyNullable { return inner }
+    if innerT is TyNullable { return tyJoinMarked(inner, join) }
     if innerT is TyPrim {
       if innerT.primName == "null" { return inner }
     }
   }
   if tyIsWidePrim(inner) { tyWideUnionMinted = true }
-  const t: Ty = { nInner: strLitAsSet(inner) }
+  if join > 0 { tyJoinMinted = true }
+  const t: Ty = { nInner: strLitAsSet(inner), nJoin: join }
   return addTy(t)
 }
 
@@ -4859,10 +4867,7 @@ export function strLitAsSet(elem: i32): i32 {
   if elem < 0 || elem >= T.tys.length { return elem }
   const t = tyAt(elem)
   if t is TyLit {
-    if t.litKind == "str" {
-      const u: Ty = { uMembers: [elem] }
-      return addTy(u)
-    }
+    if t.litKind == "str" { return mkUnionRow([elem], 0, 0) }
   }
   return elem
 }
@@ -4890,6 +4895,94 @@ export function mkMapTy(key: i32, val: i32, isSet: i32) {
 // Whether any map type has been minted in this instance. Only ever set, so a gate on it can
 // skip work, never a map (`mapDeliveryMayRecord`).
 export let tyMapMinted = false
+
+// The union row over `members` formed as `join` and `hole` say (`TyUnion`); the one mint of a
+// union row, so how a union is formed belongs to the row from its mint, never to a table on an index.
+export function mkUnionRow(members: i32[], join: i32, hole: i32): i32 {
+  if join > 0 { tyJoinMinted = true }
+  const t: Ty = { uMembers: members, uJoin: join, uHole: hole, uElse: -1 }
+  return addTy(t)
+}
+
+// The remainder of an `is` else over a type parameter's list in union `base`: a row over `base`'s
+// members that each pin re-reads as `base` (`TyUnion.uElse`), so it is never `base` itself.
+export function mkElseRemUnionRow(base: TyUnion, baseIx: i32): i32 {
+  tyElseMinted = true
+  const ms: i32[] = []
+  for m in base.uMembers { ms.push(m) }
+  const t: Ty = { uMembers: ms, uJoin: base.uJoin, uHole: 0, uElse: baseIx }
+  return addTy(t)
+}
+
+// `TyUnion.uElse` of `t`, -1 for a type that is no else remainder.
+export function tyElseBase(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const a = tyAt(t)
+  if a is TyUnion { return a.uElse }
+  return -1
+}
+
+// Whether any else remainder has been minted in this instance; only ever set, so a gate on it
+// skips work, never a remainder.
+export let tyElseMinted = false
+
+// `TyUnion.uHole` of `t`: 1 a join with a hole member that a call's bindings re-fold, 2 one whose
+// arms re-join apart there, 0 any other type.
+export function tyHoleJoin(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return 0 }
+  const a = tyAt(t)
+  if a is TyUnion { return a.uHole }
+  return 0
+}
+
+// The join mark of `t` (`TyUnion.uJoin`, `TyNullable.nJoin`): 1 a join of type parameters kept
+// apart and re-joined at each pin, 2 such a join of runtime arms, whose members stay apart there
+// too, 0 any other type. The one reader of a join's mark.
+export function tyJoinMark(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return 0 }
+  const a = tyAt(t)
+  return match a {
+    TyUnion => a.uJoin
+    TyNullable => a.nJoin
+    // Only a union, and the nullable that wraps one's null, is minted as a join.
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => 0
+  }
+}
+
+// `t` as a join marked `join`: `t` itself when it carries that mark, else a row over the same
+// children minted with it. A row the join did not mint is never marked in place; a type that is
+// neither a union nor a nullable stays unmarked.
+export function tyJoinMarked(t: i32, join: i32): i32 {
+  if t < 0 || t >= T.tys.length || tyJoinMark(t) == join { return t }
+  const a = tyAt(t)
+  match a {
+    TyUnion => {
+      const ms: i32[] = []
+      for m in a.uMembers { ms.push(m) }
+      if join > 0 { tyJoinMinted = true }
+      const u: Ty = {
+        uMembers: ms,
+        uJoin: join,
+        uHole: a.uHole,
+        uElse: a.uElse,
+      }
+      return addTy(u)
+    }
+    TyNullable => {
+      if join > 0 { tyJoinMinted = true }
+      const n: Ty = { nInner: a.nInner, nJoin: join }
+      return addTy(n)
+    }
+    // No other type carries a join mark (`tyJoinMark`).
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      return t
+    }
+  }
+}
+
+// Whether any join of type parameters has been minted in this instance; only ever set, so a gate
+// on it skips work, never a join.
+export let tyJoinMinted = false
 
 // Whether any union or `| null` with an `i64` or `f64` member has been minted: the same kind of
 // gate for a delivery a narrower member widens into (`recordWidenRetag`).

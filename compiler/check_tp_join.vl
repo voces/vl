@@ -4,7 +4,9 @@
 // pin; the tables here name the unions and holes kept apart, and the deferred joins a call
 // site parks or lets escape. The predicates over declared and gradual parameters
 // (`tyIsNamedParamHole`, `tyIsGradualParam`, `tyParamOfInnermostBody`) are what those
-// decisions read. `joinRowsReset` clears the join rows per program.
+// decisions read. `joinRowsReset` clears the join rows per program. A join's mark is its row's
+// (`TyUnion.uJoin`); `tpParamLitJoins` stays a table because its value is another row, and it is
+// keyed only on rows minted with mark 1, never on a written union.
 
 import { FuncDecl, P, i32ToStr, nodeAt } from "./ast"
 import {
@@ -55,6 +57,8 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  mkElseRemUnionRow,
+  mkJoinNullableTy,
   mkNullableTy,
   tyArrayElemIx,
   tyAt,
@@ -63,39 +67,27 @@ import {
   tyEqSameHoles,
   tyIsDeclaredParam,
   tyIsHole,
+  tyJoinMark,
+  tyJoinMarked,
+  tyJoinMinted,
   tyNulInnerTy,
 } from "./check_types"
-import { mkUnionTy } from "./check_union_mint"
+import { mkJoinUnionTy, mkUnionTy } from "./check_union_mint"
 import { i32ListHas } from "./listutil"
 import { fnDeclIx } from "./check_write_scan"
 import { declOrigOf } from "./symbols"
-
-// The unions `joinTys` made of two type parameters (D2760). At a pin their members re-join as a
-// non-generic join would, so `A | B` at `i32` and `f64` is `f64`, not a box of the two.
-export let tpJoinUnions: {[i32]: i32} = Map()
 
 // The joins `joinTys` kept apart of a written union of type parameters and a concrete type,
 // to that written union: at a pin the union's members re-join apart and the other folds in.
 export let tpParamLitJoins: {[i32]: i32} = Map()
 
-// The else remainders of an `is` test over a type parameter's list, keyed by a fresh copy of the
-// union read there: `substTyDeep` reads the copy as its base, and a pin subtracts the tested type
-// at the instance, where `T[]` and `i32[]` are apart (or one list).
-export let tvElseBase: {[i32]: i32} = Map()
-export let tvElseTested: {[i32]: i32} = Map()
-
-// A copy of union `cur` that pins to `cur − tIdx` per instance, or -1 when `cur` is not a union.
-export function mkTvElseRemTy(cur: i32, tIdx: i32): i32 {
+// The else remainder of an `is` test over a type parameter's list in union `cur`
+// (`mkElseRemUnionRow`): `substTyDeep` reads it as `cur`, and each instance's emitter reads the
+// remainder there, where `T[]` and `i32[]` are apart (or one list). -1 when `cur` is no union.
+export function mkTvElseRemTy(cur: i32): i32 {
   const u = tyAt(cur)
   if !(u is TyUnion) { return -1 }
-  const ms: i32[] = []
-  for m in u.uMembers { ms.push(m) }
-  const f = mkUnionTy(ms)
-  const j = tpJoinUnions.get(cur)
-  if j != null { tpJoinUnions[f] = j }
-  tvElseBase[f] = cur
-  tvElseTested[f] = tIdx
-  return f
+  return mkElseRemUnionRow(u, cur)
 }
 
 // The parameter holes some join kept apart as an implicit type parameter (D3333): an instance
@@ -340,23 +332,20 @@ export function writtenTpUnion(t: i32): boolean {
   return u >= 0 && u < T.tys.length && tyAt(u) is TyUnion
 }
 
-// Gives `to` the mark `from` carries as a join kept apart, if any.
-export function tpJoinCarry(from: i32, to: i32) {
-  const j = tpJoinUnions.get(from)
-  if j != null { tpJoinUnions[to] = j }
-  return 0
-}
-
-// Marks a join kept apart over a type parameter (`tpJoinUnions`), or the union inside its
-// nullable, as one of runtime arms: a pin re-joins its members apart too (`rejoinMembers`).
-export function markTpJoinApart(j: i32) {
-  if j < 0 || j >= T.tys.length || tpJoinUnions.length == 0 { return 0 }
-  if tpJoinUnions.has(j) { tpJoinUnions[j] = 2 }
+// Join `j` marked as one of runtime arms, so a pin re-joins its members apart too
+// (`rejoinMembers`): a marked join, and the marked union inside a nullable; `j` itself when it is
+// no join.
+export function markTpJoinApart(j: i32): i32 {
+  if !tyJoinMinted || j < 0 || j >= T.tys.length { return j }
   const jt = tyAt(j)
   if jt is TyNullable {
-    if tpJoinUnions.has(jt.nInner) { tpJoinUnions[jt.nInner] = 2 }
+    const inner = if tyJoinMark(jt.nInner) > 0 { tyJoinMarked(jt.nInner, 2) } else { jt.nInner }
+    const nj = if jt.nJoin > 0 { 2 } else { 0 }
+    if inner == jt.nInner && nj == jt.nJoin { return j }
+    return mkJoinNullableTy(inner, nj)
   }
-  return 0
+  if tyJoinMark(j) == 0 { return j }
+  return tyJoinMarked(j, 2)
 }
 
 // Whether `t` is arithmetic over a declared type parameter or a parameter's hole, beside an
@@ -409,18 +398,15 @@ export function tpOpenJoin(a: i32, b: i32): i32 {
     noteHoleTpJoin(kept[0])
     return mkNullableTy(kept[0])
   }
-  const u = mkUnionTy(kept)
-  tpJoinUnions[u] = 1
+  const u = mkJoinUnionTy(kept, 1)
   noteHoleTpJoin(u)
   if !hasNull { return u }
-  const res = mkNullableTy(u)
-  tpJoinUnions[res] = 1
-  return res
+  return mkJoinNullableTy(u, 1)
 }
 
 // Whether `t` is a join `joinTys` kept apart over a type parameter, re-joined at each pin.
 export function tyIsTpJoinUnion(t: i32): boolean {
-  return t >= 0 && tpJoinUnions.length > 0 && tpJoinUnions.has(t)
+  return tyJoinMinted && tyJoinMark(t) > 0
 }
 
 // Whether `p` is a bare declared type parameter of a body being checked and `c` a concrete
@@ -566,14 +552,12 @@ export function keptParamUnion(tyIx: i32, keep: boolean): i32 {
     if isNullTy(m) { nul = true }
     else if !i32ListHas(own, m) { own.push(m) }
   }
-  const tc = mkUnionTy(own)
+  const tc = mkJoinUnionTy(own, 2)
   if !tpOwnParamsOnly(tc) { return -1 }
-  tpJoinUnions[tc] = 2
   noteHoleTpJoin(tc)
   if !nul { return tc }
   // The null stays the wrapper, as a body declaring these parameters keeps it (D3612).
-  const res = mkNullableTy(tc)
-  tpJoinUnions[res] = 2
+  const res = mkJoinNullableTy(tc, 2)
   noteHoleTpJoin(res)
   return res
 }
@@ -643,7 +627,7 @@ export function deferredJoinOverOpenParams(tyIx: i32): boolean {
 export function tyIsDeferredJoin(tyIx: i32) {
   if tyIx < 0 { return false }
   // A declared parameter's join with a concrete type is a real union, not a placeholder.
-  if tpJoinUnions.length > 0 && tpJoinUnions.has(tyIx) { return false }
+  if tyJoinMinted && tyJoinMark(tyIx) > 0 { return false }
   const t = tyAt(tyIx)
   match t {
     TyNullable => {

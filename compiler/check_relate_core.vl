@@ -198,7 +198,6 @@ import {
   mkBinOpHole,
 } from "./check_coal"
 import {
-  apartHoleJoins,
   cFillActive,
   checkerForceFn,
   cnhIsOpen,
@@ -208,8 +207,6 @@ import {
   gaParamCount,
   gaParamNames,
   gaParamStart,
-  isJoinHoleUnion,
-  joinHoleUnions,
   paramNullJoins,
   recordJoinMinted,
   recordJoinMintedSet,
@@ -452,10 +449,8 @@ import {
   sameDeclaredTyParam,
   tpArmJoinDepth,
   tpGradualView,
-  tpJoinUnions,
   tpOpenJoin,
   tpParamLitJoins,
-  tvElseBase,
   tyIsDeferredJoin,
   tyIsGradualParam,
   tyIsTpJoinUnion,
@@ -539,6 +534,7 @@ import {
   mkArrayTy,
   mkArrayViewTy,
   mkFuncTy,
+  mkJoinNullableTy,
   mkLitTy,
   mkMapTy,
   mkNegTy,
@@ -556,6 +552,8 @@ import {
   tyBearsNull,
   tyElemOf,
   tyElemOpen,
+  tyElseBase,
+  tyElseMinted,
   tyEq,
   tyEqSameHoles,
   tyFieldTyOf,
@@ -563,10 +561,14 @@ import {
   tyFreshEnd,
   tyHasHole,
   tyHasInferHole,
+  tyHoleJoin,
   tyIsDeclaredParam,
   tyIsHole,
   tyIsLitUnion,
   tyIsNulValueUnionBox,
+  tyJoinMark,
+  tyJoinMarked,
+  tyJoinMinted,
   tyKeyOf,
   tyKeyOpen,
   tyLinkElem,
@@ -602,6 +604,8 @@ import {
 import {
   binArithOp,
   binArithPinTy,
+  mkHoleJoinUnionTy,
+  mkJoinUnionTy,
   mkUnionTy,
   noteUnionMembers,
   numUnionLossNote,
@@ -2087,9 +2091,9 @@ function asPinHolds(from: i32, to: i32): boolean {
 // union holding one too: the side holding every member of the other, or their union kept
 // apart. -1 otherwise.
 function gradualUnionJoin(a: i32, b: i32): i32 {
-  if tpJoinUnions.length == 0 { return -1 }
-  const ta = tpJoinUnions.has(a)
-  const tb = tpJoinUnions.has(b)
+  if !tyJoinMinted { return -1 }
+  const ta = tyJoinMark(a) > 0
+  const tb = tyJoinMark(b) > 0
   if !ta && !tb { return -1 }
   // A kept-apart join beside a concrete type keeps it too, unless it already holds it.
   const concreteBeside = (ta && !tyHasTyVar(b)) || (tb && !tyHasTyVar(a))
@@ -2099,15 +2103,12 @@ function gradualUnionJoin(a: i32, b: i32): i32 {
   if isNullTy(a) || isNullTy(b) || a == TY_VOID || b == TY_VOID { return -1 }
   if tyMembersWithin(b, a) { return a }
   if tyMembersWithin(a, b) { return b }
-  const tc = joinVariantTys(a, b)
-  tpJoinUnions[tc] = 1
+  const tc = tyJoinMarked(joinVariantTys(a, b), 1)
   // A join of runtime arms beside a concrete type keeps its members apart at the pin, the other
   // folding into them (`paramLitRejoin`, D3534).
   if concreteBeside {
     const rt = if ta { a } else { b }
-    if (tpJoinUnions.get(rt) ?? 0) == 2 && tyAt(rt) is TyUnion {
-      tpParamLitJoins[tc] = rt
-    }
+    if tyJoinMark(rt) == 2 && tyAt(rt) is TyUnion { tpParamLitJoins[tc] = rt }
   }
   return tc
 }
@@ -2191,8 +2192,7 @@ function joinTysAcc(acc: JoinAcc, a: i32, b: i32): i32 {
   const aVar = tyAt(a) is TyVar
   const bVar = tyAt(b) is TyVar
   if (aVar || bVar) && (tyParamBesideBare(a, b) || tyParamBesideBare(b, a)) {
-    const tc = joinVariantTys(a, b)
-    tpJoinUnions[tc] = 1
+    const tc = tyJoinMarked(joinVariantTys(a, b), 1)
     noteHoleTpJoin(tc)
     return tc
   }
@@ -2200,20 +2200,19 @@ function joinTysAcc(acc: JoinAcc, a: i32, b: i32): i32 {
   const npa = nullParamBesideBare(a, b)
   const npb = nullParamBesideBare(b, a)
   if npa >= 0 || npb >= 0 {
-    const tn = if npa >= 0 { joinVariantTys(npa, b) } else { joinVariantTys(a, npb) }
-    tpJoinUnions[tn] = 1
+    const tn = tyJoinMarked(
+      if npa >= 0 { joinVariantTys(npa, b) } else { joinVariantTys(a, npb) },
+      1,
+    )
     noteHoleTpJoin(tn)
-    const tw = mkNullableTy(tn)
-    tpJoinUnions[tw] = 1
-    return tw
+    return mkJoinNullableTy(tn, 1)
   }
   if (
     aVar
     && bVar
     && (tyParamBesideDerived(a, b) || tyParamBesideDerived(b, a))
   ) {
-    const td = joinVariantTys(a, b)
-    tpJoinUnions[td] = 1
+    const td = tyJoinMarked(joinVariantTys(a, b), 1)
     noteHoleTpJoin(td)
     return td
   }
@@ -2228,21 +2227,20 @@ function joinTysAcc(acc: JoinAcc, a: i32, b: i32): i32 {
   }
   // Such a union absorbs only its own members: its parameter member is assignable from
   // anything, which would fold `T | string` beside `T | i32` to the first (D3212).
-  if tpJoinUnions.length > 0 && !aVar && !bVar {
+  if tyJoinMinted && !aVar && !bVar {
     const gj = gradualUnionJoin(a, b)
     if gj >= 0 { return gj }
   }
   // A declared parameter beside such a union joins into it, as a member or kept apart: the
   // parameter is assignable to the union's own parameter, which would drop one of them.
-  if tpJoinUnions.length > 0 {
+  if tyJoinMinted {
     if (
-      (aVar && tyIsGradualParam(a) && tpJoinUnions.has(b))
-      || (bVar && tyIsGradualParam(b) && tpJoinUnions.has(a))
+      (aVar && tyIsGradualParam(a) && tyJoinMark(b) > 0)
+      || (bVar && tyIsGradualParam(b) && tyJoinMark(a) > 0)
     ) {
       if aVar && tyVarMemberOf(a, b) { return b }
       if bVar && tyVarMemberOf(b, a) { return a }
-      const tv = joinVariantTys(a, b)
-      tpJoinUnions[tv] = 1
+      const tv = tyJoinMarked(joinVariantTys(a, b), 1)
       noteHoleTpJoin(tv)
       return tv
     }
@@ -2255,8 +2253,7 @@ function joinTysAcc(acc: JoinAcc, a: i32, b: i32): i32 {
     || tyParamArmAbsorbs(a, b)
     || tyParamArmAbsorbs(b, a)
   ) {
-    const tj = joinVariantTys(a, b)
-    tpJoinUnions[tj] = 1
+    const tj = tyJoinMarked(joinVariantTys(a, b), 1)
     return tj
   }
   // A type parameter beside a union holding it joins as that union: inside the body the
@@ -2395,8 +2392,7 @@ function paramUnionBesideConcrete(a: i32, b: i32): i32 {
   if tyHasTyVar(c) || isNullTy(c) || c == TY_VOID || tyBearsNull(c) {
     return -1
   }
-  const tc = joinVariantTys(u, c)
-  tpJoinUnions[tc] = 1
+  const tc = tyJoinMarked(joinVariantTys(u, c), 1)
   tpParamLitJoins[tc] = u
   noteHoleTpJoin(tc)
   return tc
@@ -2407,8 +2403,7 @@ function paramUnionBesideConcrete(a: i32, b: i32): i32 {
 // fold `A | i32` beside `string` to the union and drop `string` at each pin (D17446). -1 otherwise.
 function mixedParamUnionBesideConcrete(a: i32, b: i32): i32 {
   if !mixedParamApart(a, b) { return -1 }
-  const tc = joinVariantTys(a, b)
-  tpJoinUnions[tc] = 1
+  const tc = tyJoinMarked(joinVariantTys(a, b), 1)
   noteHoleTpJoin(tc)
   return tc
 }
@@ -2606,17 +2601,20 @@ function paramNullJoin(a: i32, b: i32): i32 {
     }
   }
   if hasNull { kept.push(TY_NULL) }
-  const res = mkUnionTy(kept)
   // A join of runtime arms stays one beside its null, and so does a join of two or more
   // declared parameters, each a runtime value (D3611).
-  const ma = tpJoinUnions.get(a) ?? 0
-  const mb = tpJoinUnions.get(b) ?? 0
+  const ma = tyJoinMark(a)
+  const mb = tyJoinMark(b)
   let mk = if ma > mb { ma } else { mb }
   if hasNull && allDeclaredParams(kept) { mk = 2 }
-  if mk > 0 { tpJoinUnions[res] = mk }
-  if isJoinHoleUnion(a) || isJoinHoleUnion(b) { joinHoleUnions.push(res) }
-  // Its deferred re-fold keeps the members apart too.
-  if mk == 2 && isJoinHoleUnion(res) { apartHoleJoins[res] = true }
+  // A join of a join with holes has them too; its deferred re-fold keeps the members apart when
+  // the join is one of runtime arms.
+  const jh = tyHoleJoin(a) > 0 || tyHoleJoin(b) > 0
+  const res = mkHoleJoinUnionTy(
+    kept,
+    mk,
+    if !jh { 0 } else if mk == 2 { 2 } else { 1 },
+  )
   noteHoleTpJoin(res)
   paramNullJoins[res] = 1
   return res
@@ -2772,15 +2770,15 @@ export function joinArmLit(a: i32, aLit: boolean, b: i32, bLit: boolean): i32 {
     const same = joinArmTys(a, b)
     // A kept-apart join of runtime arms joined with itself is still one (D3569), and so is a
     // written union of type parameters, whose runtime members a pin must not fold (D3594).
-    if (tpJoinUnions.get(a) ?? 0) == 2 { markTpJoinApart(same) }
-    else if !aLit && !bLit && writtenTpUnion(a) { markTpJoinApart(same) }
+    if tyJoinMark(a) == 2 { return markTpJoinApart(same) }
+    if !aLit && !bLit && writtenTpUnion(a) { return markTpJoinApart(same) }
     return same
   }
   const apart = !aLit && !bLit
   njApartSet(apart)
   const j = keepListStorage(a, !aLit, b, !bLit, joinArmTys(a, b))
   njApartSet(false)
-  if apart { markTpJoinApart(j) }
+  if apart { return markTpJoinApart(j) }
   return j
 }
 
@@ -3001,10 +2999,7 @@ export function joinRetTys(a: i32, b: i32) {
     i = i + 1
   }
   if uniq.length == 1 { return uniq[0] }
-  const res = mkUnionTy(uniq)
-  joinHoleUnions.push(res)
-  if njApartRet { apartHoleJoins[res] = true }
-  return res
+  return mkHoleJoinUnionTy(uniq, 0, if njApartRet { 2 } else { 1 })
 }
 
 // Whether `t` is a hole or a union or nullable one of whose flattened members is.
@@ -3085,7 +3080,7 @@ function refoldJoinLive(
   // A lambda's deferred return re-joins as it always has: its instance builds no kept-apart join.
   lamCheckDepth = lamCheckDepth + 1
   lamRefoldDepth = lamRefoldDepth + 1
-  const apart = apartHoleJoins.get(tyIx) ?? false
+  const apart = tyHoleJoin(tyIx) == 2
   while j < subst.length {
     if orig.length == 0 || !holeMemberDeadAt(orig[j], bNames, bTys) {
       njApartRetSet(apart)
@@ -11780,9 +11775,9 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     if fr != null { return fr }
   }
   if bNames.length == 0 { return tyIx }
-  if tvElseBase.length > 0 {
-    const eb = tvElseBase.get(tyIx)
-    if eb != null { return substTyDeep(eb, bNames, bTys) }
+  if tyElseMinted {
+    const eb = tyElseBase(tyIx)
+    if eb >= 0 { return substTyDeep(eb, bNames, bTys) }
   }
   const t = tyAt(tyIx)
   if t is TyVar {
@@ -11912,19 +11907,21 @@ function substRejoinApart(
     if !i32ListHas(uniq, m) { uniq.push(m) }
   }
   if holes > 0 && uniq.length > 1 {
-    const r = mkUnionTy(uniq)
-    tpJoinUnions[r] = tpJoinUnions.get(tyIx) ?? 1
+    const r = mkJoinUnionTy(
+      uniq,
+      if tyJoinMark(tyIx) > 0 { tyJoinMark(tyIx) } else { 1 },
+    )
     if recorded { carryRetJoin(r, key, vals) }
     return r
   }
   const pl = tpParamLitJoins.get(tyIx)
-  if pl != null && !recorded && (tpJoinUnions.get(tyIx) ?? 0) == 1 {
+  if pl != null && !recorded && tyJoinMark(tyIx) == 1 {
     const pj = paramLitRejoin(tyIx, pl, ms)
     if pj >= 0 { return pj }
   }
   const tpSaved = tpApartConcrete
   tpApartConcreteSet(true)
-  njRejoinApartSet((tpJoinUnions.get(tyIx) ?? 0) == 2)
+  njRejoinApartSet(tyJoinMark(tyIx) == 2)
   const res = rejoinMembers(ms, fixed)
   tpApartConcreteSet(tpSaved)
   if recorded { carryRetJoin(res, key, vals) }
@@ -11974,7 +11971,7 @@ function substNullableTy(
   if (
     n2 != t.nInner
     && t.nInner >= 0
-    && tpJoinUnions.has(tyIx)
+    && tyJoinMark(tyIx) > 0
     && tyAt(t.nInner) is TyUnion
   ) {
     // A kept-apart join's null wraps its union: the members re-join as one set (D3267).
@@ -12053,7 +12050,7 @@ function substUnionTy(
   }
   // A deferred join re-folds: every provably dead member drops and the rest re-joins,
   // checked even when nothing changed — an unresolved member is dead precisely because it did not resolve.
-  if isJoinHoleUnion(tyIx) {
+  if tyHoleJoin(tyIx) > 0 {
     return refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
   }
   if !changed3 { return tyIx }
@@ -12072,7 +12069,7 @@ function substUnionTy(
   if kout.length == 0 { return TY_NEVER }
   if kout.length == 1 && kout.length < ms.length { return kout[0] }
   // A union the return-set join kept apart re-joins under the same rule (D2784).
-  if tpJoinUnions.has(tyIx) {
+  if tyJoinMark(tyIx) > 0 {
     return substRejoinApart(tyIx, tyIx, kout, bNames, bTys)
   }
   return substUnionRebuild(kms, kout)
