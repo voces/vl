@@ -13436,6 +13436,20 @@ mono builds it at that parameter's annotation (`monoSubstLetType`), so its read 
 agree. `F`'s own set is never widened: in the instance it is the type of the value it pins, which
 every read of that value shares. Ruled by the coordinator.
 
+## A binding annotated with a type parameter has that parameter's type at the instance (coordinator ruling, 2026-11-28) — D17323, D17324
+
+`let b: F = a1` gives `b` the type `F` is bound to at that call of the function, one type per
+instance. When `F` is bound to a generic signature, that one type is polymorphic, so each call
+through `b` is instanced at its own arguments. When `F` is concrete, a call at another type is
+refused by the contract sentence that names `F` ("`cI32` is passed as `F`, but `mid` calls `F`
+with `string`"). Why: T9.1 checks each call at its own type arguments; an explicit `<T>` behaves
+as an inferred hole (D1431, owner); and a parameter `b: F`, or `let b: F = c` with `c: F`, already
+runs at two types. The other reading, an annotation monomorphic within the body, would make a type
+parameter mean one thing on a parameter and another on a `let`. Two consequences in the compiler:
+the unread default that instances a generic handed to a parameter nothing reads (D6213) fixes that
+value's instance and never the type parameter other readers use; and a binding's alias source is
+the value it stores, whatever its annotation names. Ruled by the coordinator.
+
 ## A maker's call is built at its destination's record (coordinator ruling, 2026-11-28) — D17226, D17228
 
 A maker's call is built at the record its destination stores. The destination's stored rep
