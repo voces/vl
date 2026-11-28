@@ -50,6 +50,7 @@ import {
   invalidateRatchetBaselines,
 } from "./ratchetHold.ts";
 import { lintPathFor as lintPathForFile } from "./vlRoot.ts";
+import { isCurrent, latestWins } from "./latestWins.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -318,28 +319,19 @@ const runUnusedExportPass = async (): Promise<void> => {
   connection.sendRequest(CodeLensRefreshRequest.type).catch(() => {});
 };
 
-documents.onDidChangeContent(async (event) => {
-  connection.console.log(
-    `[Server(${process.pid}) ${workspaceFolder}] Document changed: ${event.document.uri}`,
-  );
-
-  // ANY open buffer changing moves what `workspaceReader` answers, including
-  // for the OTHER documents that import this one — and their own text is
-  // unchanged, so the checker's prepared-state memo cannot see it. This is the
-  // bump that keeps a hover in an importer from answering with the pre-edit
-  // types of the module just edited.
-  wasmChecker?.bumpReaderGeneration();
-  const stamp = ++editStamp;
-  editedAt.set(entryKeyOf(event.document.uri), stamp);
-
+// The check behind one pause in a document's edits (`latestWins`): lint and check over the text
+// the document holds now, published only while the document is still at the version it read.
+const checkDocument = async (uri: string): Promise<void> => {
+  const doc = documents.get(uri);
+  if (doc === undefined) return;
   // The most-recently-computed unused-export hints (from the last workspace
   // pass). Stale relative to this edit — the debounce timer below refreshes
   // them after idle; publishing the stale set avoids losing them on every
   // keystroke.
   const hints = wasmChecker !== undefined
     ? unusedExportHints(
-      event.document.getText(),
-      entryKeyOf(event.document.uri),
+      doc.getText(),
+      entryKeyOf(doc.uri),
       lastUseMap,
       wasmChecker,
     )
@@ -368,41 +360,63 @@ documents.onDidChangeContent(async (event) => {
   // `moduleSurface` (which resets the module table) would discard it. The hover
   // / semantic-tokens / inlay requests that follow an edit then answer off the
   // staging this leaves, for no second whole-graph check.
+  const version = doc.version;
+  const stamp = editStamp;
   let diagnostics: VLDiagnostic[] = [];
   if (wasmChecker !== undefined) {
     try {
-      const text = event.document.getText();
+      const text = doc.getText();
       // Linted inside the document's module graph, so a rule reading an imported
       // declaration agrees with `vl check`; the staging is the one `check` reuses.
       const lintDiags = await wasmChecker.lintInGraph(
         text,
-        lintPathFor(event.document.uri),
-        entryKeyOf(event.document.uri),
+        lintPathFor(doc.uri),
+        entryKeyOf(doc.uri),
         workspaceReader,
       );
       const errors = await wasmChecker.check(
         text,
-        entryKeyOf(event.document.uri),
+        entryKeyOf(doc.uri),
         workspaceReader,
       );
       diagnostics = [...errors, ...lintDiags];
-      checkedOver.set(event.document.uri, { stamp, graph: wasmChecker.lastGraph() });
+      checkedOver.set(doc.uri, { stamp, graph: wasmChecker.lastGraph() });
     } catch (err) {
       connection.console.log(`[wasm-checker] check failed: ${err}`);
     }
   }
 
+  // A newer edit superseded this check while it ran: its own check publishes.
+  if (!isCurrent(version, documents.get(uri)?.version)) return;
+
   // Cache the raw VL diagnostics (which carry `code`/`range`/`source`) so
   // `onCodeAction` can offer fixes by line overlap, not just for the exact
   // diagnostics VS Code passes back.
-  diagnosticsByUri.set(event.document.uri, diagnostics);
+  diagnosticsByUri.set(doc.uri, diagnostics);
 
   connection.sendDiagnostics({
-    uri: event.document.uri,
-    version: event.document.version,
-    diagnostics: [...heldFiltered(event.document.uri, diagnostics), ...hints]
+    uri: doc.uri,
+    version,
+    diagnostics: [...heldFiltered(doc.uri, diagnostics), ...hints]
       .map(toLspDiagnostic),
   });
+};
+
+const checks = latestWins(checkDocument);
+
+documents.onDidChangeContent((event) => {
+  connection.console.log(
+    `[Server(${process.pid}) ${workspaceFolder}] Document changed: ${event.document.uri}`,
+  );
+
+  // ANY open buffer changing moves what `workspaceReader` answers, including
+  // for the OTHER documents that import this one — and their own text is
+  // unchanged, so the checker's prepared-state memo cannot see it. This is the
+  // bump that keeps a hover in an importer from answering with the pre-edit
+  // types of the module just edited.
+  wasmChecker?.bumpReaderGeneration();
+  editedAt.set(entryKeyOf(event.document.uri), ++editStamp);
+  checks.schedule(event.document.uri);
 
   // Arm the idle debounce timer: after UNUSED_EXPORT_DEBOUNCE_MS of no edits,
   // trigger a fresh workspace pass. A subsequent edit or a save resets the timer.
@@ -417,6 +431,7 @@ documents.onDidChangeContent(async (event) => {
 // — the two differ whenever the buffer was dirty. Nothing else here notices, so
 // the memo is retired the same way an edit retires it.
 documents.onDidClose((event) => {
+  checks.cancel(event.document.uri);
   connection.console.log(
     `[Server(${process.pid}) ${workspaceFolder}] Document closed: ${event.document.uri}`,
   );
