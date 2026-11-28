@@ -79,6 +79,7 @@ import {
   i32ToStr,
   letNameAt,
   mkArrayLit,
+  mkBinary,
   mkBlock,
   mkBool,
   mkCall,
@@ -6341,6 +6342,12 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       return true
     }
   }
+  // A nullable function is a value, not shared storage: it is delivered through the adapter of
+  // its function, built only where it is not null (D17816).
+  if s is TyNullable && d is TyFunc && tyAt(dstTy) is TyNullable {
+    const ns = fvaAdaptNullable(srcExpr, srcTy, s.nInner, dstTy, d)
+    if ns >= 0 { return ns == 1 }
+  }
   if !(s is TyFunc) || !(d is TyFunc) {
     // A value still open here may be a set's once its holes close; the decision checks the site.
     if d is TyFunc && tyHasHole(srcTy) { fvaValueSiteNote(srcExpr, srcTy, dt) }
@@ -6531,16 +6538,7 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     const outerPs: i32[] = []
     outerPs.push(fvParam)
     const outer = luAt(addNode(fvaLambda(outerPs, -1, li, site, pos)), site)
-    const outerArgs: i32[] = []
-    outerArgs.push(moved)
-    const names: string[] = []
-    const c: Node = {
-      callFn: outer,
-      callArgs: outerArgs,
-      callArgNames: names,
-      pos: pos,
-    }
-    arenaSetNode(site, c)
+    fvaCallInPlace(site, outer, moved, pos)
   }
   luGrow()
   const t = checkNodeHook(site)
@@ -6552,6 +6550,126 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   }
   if stable && callee >= 0 { fvaCopyCalleeAtInstance(callee, t) }
   return true
+}
+
+// Writes `site` as the call of adapter lambda `outer` on the value moved out of it, `moved`.
+function fvaCallInPlace(site: i32, outer: i32, moved: i32, pos: i32) {
+  const outerArgs: i32[] = [moved]
+  const names: string[] = []
+  const c: Node = {
+    callFn: outer,
+    callArgs: outerArgs,
+    callArgNames: names,
+    pos: pos,
+  }
+  arenaSetNode(site, c)
+  return 0
+}
+
+// Rewrites nullable function value `srcExpr` of type `srcTy` into
+// `((fv) => if fv != null { (ps) => fv(ps) } else { null })(srcExpr)` at nullable `dstTy`, whose
+// function is `d`: 1 when rewritten (or refused), 0 when no conversion is needed, -1 when this
+// shape is not one it builds (an open or set-valued function), left to the general refusal.
+function fvaAdaptNullable(
+  srcExpr: i32,
+  srcTy: i32,
+  inner: i32,
+  dstTy: i32,
+  d: TyFunc,
+): i32 {
+  const it = if inner >= 0 && inner < T.tys.length { tyAt(inner) } else { null }
+  if !(it is TyFunc) || it.fnParamTypes.length != d.fnParamTypes.length {
+    return -1
+  }
+  if (
+    tyHasTyVar(srcTy)
+    || tyHoldsHole(srcTy)
+    || tyHasTyVar(dstTy)
+    || tyHoldsHole(dstTy)
+  ) {
+    return -1
+  }
+  if fnTagSetValueOfTy(inner) { return -1 }
+  const dt = nonNullTy(dstTy)
+  if !fvaFnMayDiffer(inner, dt, 8) { return 0 }
+  const site = srcExpr
+  if fvaDone[site] ?? false { return 0 }
+  const pos = nodePos(site)
+  const st = fvaAnnot(srcTy, site, pos)
+  const rt = fvaAnnot(d.fnRet, site, pos)
+  if st < 0 || rt < 0 {
+    fvaRefuse(srcExpr, srcTy, dt, "")
+    return 1
+  }
+  const params: i32[] = []
+  const args: i32[] = []
+  let i = 0
+  while i < d.fnParamTypes.length {
+    const pt = fvaAnnot(d.fnParamTypes[i], site, pos)
+    if pt < 0 {
+      fvaRefuse(srcExpr, srcTy, dt, "")
+      return 1
+    }
+    const pd = luAt(mkParam("$fp" + i32ToStr(i), pt, -1, 0, 0, pos), site)
+    params.push(pd)
+    args.push(luRef(pd, site, pos))
+    i = i + 1
+  }
+  const fvParam = luAt(mkParam("$fv" + i32ToStr(site), st, -1, 0, 0, pos), site)
+  const lam = luAt(
+    addNode(
+      fvaLambda(
+        params,
+        rt,
+        luAt(mkCall(luRef(fvParam, site, pos), args, pos), site),
+        site,
+        pos,
+      ),
+    ),
+    site,
+  )
+  const test = luAt(
+    mkBinary(
+      "!=",
+      luRef(fvParam, site, pos),
+      luAt(mkNull("null", pos), site),
+      pos,
+    ),
+    site,
+  )
+  const thenS: i32[] = [lam]
+  const elseS: i32[] = [luAt(mkNull("null", pos), site)]
+  const iff = luAt(
+    mkIf(
+      test,
+      luAt(mkBlock(thenS, pos), site),
+      luAt(mkBlock(elseS, pos), site),
+      pos,
+    ),
+    site,
+  )
+  valueIfAdd(iff)
+  const outerPs: i32[] = [fvParam]
+  const outer = luAt(
+    addNode(
+      fvaLambda(outerPs, fvaAnnot(dstTy, site, pos), iff, site, pos),
+    ),
+    site,
+  )
+  const moved = fvaMoveSite(site)
+  fvaDone.set(site, true)
+  fvaBuilt.set(site, true)
+  const mark = T.diags.length
+  fvaCallInPlace(site, outer, moved, pos)
+  luGrow()
+  const t = checkNodeHook(site)
+  if T.diags.length > mark || !assignable(t, dstTy) {
+    let why = ""
+    if T.diags.length > mark { why = T.diags[mark].tmsg }
+    while T.diags.length > mark { T.diags.pop() }
+    fvaRefuse(site, srcTy, dt, why)
+  }
+  return 1
 }
 
 // A binding copied from a generic function value, called by its adapter: its read is the
