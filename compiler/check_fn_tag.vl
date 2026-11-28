@@ -410,6 +410,7 @@ function ftArmOnlyLamMark(v: i32) {
 
 export function fnTagDecide(rootIx: i32) {
   ftRetJoinFns = Map()
+  ftListHeldMemo = Map()
   ftArmOnlyLamsNote(rootIx)
   ftParamOwners = Map()
   ftParamOwnersBuilt = false
@@ -2392,9 +2393,6 @@ function ftScan(
   const gs: i32[] = [-1]
   const fs: i32[] = [-1]
   const oks: boolean[] = [true]
-  ftHandOnUsed = false
-  // A holder of the set that is not a list of its ids, nor one of lists of them, reads no ids.
-  let otherHolder = false
   while xs.length > 0 {
     const x = xs.pop()
     const p = ps.pop() ?? -1
@@ -2559,8 +2557,6 @@ function ftScan(
       ) {
         return false
       }
-      const hk = if ftHolds(x, s) { ftHoldKind(nodeTyIxOf(x), s) } else { 0 }
-      if hk != 0 && hk != 1 && hk != 4 { otherHolder = true }
       // A value a slot method writes into the holder is an id of the set, as a store's is.
       for v in ftSlotWrites(x, p, g, s) {
         const xti = nodeTyIxOf(x)
@@ -2620,8 +2616,6 @@ function ftScan(
       }
     }
   }
-  // A hand-on held the set's list: every reader reads ids only if no other holder exists.
-  if ftHandOnUsed && otherHolder { return false }
   return true
 }
 
@@ -6124,9 +6118,28 @@ function ftMapSetValTy(c: Call, x: i32, s: i32): i32 {
   return -1
 }
 
-// Whether a list of the set being scanned was held by handing it on (`ftHandOnReadsIds`): its
-// readers read ids only if every other holder of the set does too (`ftScan`).
-let ftHandOnUsed = false
+// Whether each set's holders are all lists of its ids or lists of them (`ftSetListHeldOnly`),
+// by set, for this decision.
+let ftListHeldMemo: {[i32]: boolean} = Map()
+
+// Whether every holder of set `s` in the program is a list of its ids or a list of such lists: a
+// record or map holding it is a reader that reads no ids, so no list of it is held by a hand-on.
+function ftSetListHeldOnly(s: i32): boolean {
+  const have = ftListHeldMemo.get(s)
+  if have != null { return have }
+  let ok = true
+  const xs: i32[] = [ftDecideRoot]
+  while ok && xs.length > 0 {
+    const x = xs.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const k = if ftHolds(x, s) { ftHoldKind(nodeTyIxOf(x), s) } else { 0 }
+      if k != 0 && k != 1 && k != 4 { ok = false }
+      nodeChildrenPush(x, xs)
+    }
+  }
+  ftListHeldMemo[s] = ok
+  return ok
+}
 
 // Whether every reader of the list `x` hands to a hole parameter of call `c`'s callee reads the
 // set's ids: each read of the parameter in the callee's body, and, where the callee hands it back,
@@ -6147,10 +6160,8 @@ function ftHandOnReadsIds(c: i32, x: i32, s: i32, seen: i32[]): boolean {
     const u = cwIxNode[w.row]
     if u != par && !ftReadReadsIds(u, d, s, seen) { return false }
   }
-  const ok = !ftArgHandedBack(cn, x)
+  return !ftArgHandedBack(cn, x)
     || ftReadReadsIds(c, recEnclosingFn(c), s, seen)
-  if ok { ftHandOnUsed = true }
-  return ok
 }
 
 // Whether read `u` of a list of set `s`'s ids, in function `fn`, reads them: a hand-on to a hole
@@ -6286,6 +6297,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         && ftDeclsOnly(s)
         && !mintSetPartial(s)
         && (ftHoldKind(tx, s) == 1 || ftHoldKind(tx, s) == 4)
+        && ftSetListHeldOnly(s)
         && ftHandOnReadsIds(p, x, s, [])
       // A field or element read, or a named call's result, handed on is held, so its place's
       // rep is stamped on it.
