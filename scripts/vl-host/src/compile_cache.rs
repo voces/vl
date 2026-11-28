@@ -56,7 +56,8 @@ const INERT: &[&str] = &[
 /// `VL_INST_KEYS` the instance-key shadow (STORE A0), `VL_TOUCH_SET` each function's touch set, and
 /// `VL_ID_SHADOW` prints the identity shadow's rows (its mode 2 also moves the output),
 /// `VL_CHECK_COST` the checker's passes and arena size,
-/// `VL_CLS_CENSUS` prints the classifier phase census, and `VL_IR_SHADOW` the IR shadow's rows.
+/// `VL_CLS_CENSUS` prints the classifier phase census, `VL_IR_SHADOW` the IR shadow's rows, and
+/// `VL_IR_GRAPH` adds the IR analyses' rows to them.
 fn is_bypass(k: &str) -> bool {
     matches!(
         k,
@@ -75,6 +76,7 @@ fn is_bypass(k: &str) -> bool {
             | "VL_ID_SHADOW"
             | "VL_CLS_CENSUS"
             | "VL_IR_SHADOW"
+            | "VL_IR_GRAPH"
     ) || k.starts_with("VL_PROFILE")
         || k.ends_with("_DUMP")
         || k.ends_with("_EXPLAIN")

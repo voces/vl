@@ -4617,6 +4617,13 @@ fn compile_vl_instance(
             set.call(&mut store, k.parse().unwrap_or(0))?;
         }
     }
+    // `$VL_IR_GRAPH=1`: each claimed function banks its IR def-use as shadow rows, which
+    // `$VL_IR_SHADOW` prints (the analyses' test instrument). A seed without the export ignores it.
+    if std::env::var("VL_IR_GRAPH").is_ok_and(|v| v == "1") {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setIrGraph") {
+            set.call(&mut store, 1)?;
+        }
+    }
     // `$VL_IR_REQUIRE_CLAIM=1`: a function or start body the IR does not claim fails instead of
     // lowering through legacy. Refused on an old seed, which would build legacy's bytes and pass.
     if std::env::var("VL_IR_REQUIRE_CLAIM").is_ok_and(|v| !v.is_empty() && v != "0") {
