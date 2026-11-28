@@ -1,5 +1,7 @@
 # VL incremental builds & caching
 
+> **Switched off and deleted on 2026-11-28, PR #10748** (the per-module artifact path; it returns only with a consumer).
+
 > **Superseded (2026-10-06)** by `incremental-compilation-design.md` (lane IC). This page
 > describes the retired TypeScript pipeline: `compiler/buildCache.ts`, `toWasm` and
 > binaryen.js `optimize()` no longer exist. It is kept as a record; do not schedule from it.
