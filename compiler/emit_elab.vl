@@ -881,21 +881,29 @@ function elabTestsTyVarIn(ix: i32): boolean {
 
 // One binding's spelling in a key; `canon` spells each union's members in sorted order.
 function elabBindStr(t: i32, canon: boolean): string {
-  // A function value stands for itself only while its type is not closed on its own, at any
-  // depth: a list of one is keyed by the functions it holds.
-  const fds = if tyHasTyVar(t) { elabFnSetOf(t) } else { elabFnNone }
-  if fds.length > 0 {
-    let fk = "Fn"
-    for fd in fds { fk = fk + "#" + i32ToStr(fd) }
-    return fk
-  }
+  // A function value stands for itself while its type is not closed on its own, at any depth: a
+  // list of one is keyed by the functions it holds. A closed value of two or more members may be
+  // tagged, so it keys apart from a closure of its signature; the member count is a fact at key
+  // time, where the tag may be decided only later (D17863).
+  const fs = elabFnSetOf(t)
+  const open = tyHasTyVar(t)
+  if open && fs.length > 0 { return elabFnIdsStr(fs) }
   let r = if canon { elabCanonStr(t, []) } else { tyToStructStr(t) }
-  if tyHasTyVar(t) {
+  // A closed one keys by its signature too, apart from an open one of the same members.
+  if !open && fs.length >= 2 { return elabFnIdsStr(fs) + "@" + r }
+  if open {
     const ds: i32[] = []
     elabFnIdsIn(t, ds, [])
     for d in ds { r = r + "#" + i32ToStr(d) }
   }
   return r
+}
+
+// The key spelling of a set of functions: `Fn` and each member's declaration.
+function elabFnIdsStr(fds: i32[]): string {
+  let fk = "Fn"
+  for fd in fds { fk = fk + "#" + i32ToStr(fd) }
+  return fk
 }
 
 // Type `t` spelled structurally with every union's members sorted, so two orders of one union
@@ -2662,11 +2670,7 @@ function elabDemandFrom(
             }
             j = j + 1
           }
-        } else if (
-          elabTyClosed(pTys[p])
-          && !(p < byId.length && byId[p])
-          && !elabPinIsUnreadValue(decl, f.fnParamTypes[p])
-        ) {
+        } else if elabTyClosed(pTys[p]) && !(p < byId.length && byId[p]) {
           bindGenWalk(f.fnParamTypes[p], pTys[p], names, tys)
         }
         p = p + 1
@@ -14140,37 +14144,6 @@ function elabArgOwnTy(ix: i32, names: string[], i: i32, t: i32): i32 {
   return -1
 }
 
-// Whether `tp` is a declared type parameter of function `d` that names more than whole parameter
-// annotations, so a binding other than the parameters reads it as a type (D17323).
-function elabTyParamReadElsewhere(d: i32, tp: string): boolean {
-  const fd = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  return fd is FuncDecl && strListHas(fd.fnTyParams, tp) && !tyParamIsBareOnly(d, tp)
-}
-
-// Whether a pin of a parameter of `d` typed `pt` is the instance of a value nothing calls, handed
-// through a type parameter another binding reads: the value's own, never that parameter's.
-export function elabPinIsUnreadValue(d: i32, pt: i32): boolean {
-  if pt < 0 || pt >= T.tys.length { return false }
-  const v = tyAt(pt)
-  return v is TyVar && elabTyParamReadElsewhere(d, v.tvName) && !elabTyParamValueCalled(d, v.tvName)
-}
-
-// Whether the body of function `d` calls a parameter annotated with type parameter `tp` bare.
-function elabTyParamValueCalled(d: i32, tp: string): boolean {
-  const fd = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  if !(fd is FuncDecl) { return false }
-  for p in fd.fnParams {
-    const pn = nodeAt(p)
-    const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
-    if pt is TypeRef && pt.tyName == tp {
-      const calls: i32[] = []
-      elabCallsThrough(fd.fnBody, p, calls)
-      if calls.length > 0 { return true }
-    }
-  }
-  return false
-}
-
 // Enqueues call `ix`'s row `names`/`tys` with each set of functions taking its rep at `ck`
 // (`elabSetRepTy`), when one moves and the row closes.
 function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
@@ -14205,16 +14178,6 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
       rt = elabWrittenRep(ix, names[i0], t)
     }
     if rt < 0 { rt = elabSetRepTy(t, [], ck) }
-    // A value nothing reaches takes its stub instance as the value's own; the type parameter
-    // it is handed through keeps its type wherever another binding reads that type (D17323).
-    if (
-      i0 < names.length
-      && elabTyParamReadElsewhere(elabCallDeclOf(ix), names[i0])
-      && (elabRepStubbed || !elabTyParamValueCalled(elabCallDeclOf(ix), names[i0]))
-    ) {
-      rt = t
-      elabRepStubbed = false
-    }
     // A tagged set is keyed by itself, so it has no instance at its rep.
     if direct && fnTagSetIsTagged(fnTagSetOfTy(t)) { rt = t }
     elabRepStubbed = elabRepStubbed || stubbed0
