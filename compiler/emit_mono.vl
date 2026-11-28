@@ -66,6 +66,7 @@ import {
   elabDeclFnOf,
   elabDeclIsValue,
   elabDeclPinnedByCall,
+  elabProbeRows,
   elabFnDeclRetAt,
   elabFnDeclRetAtUnder,
   elabFnTyRetAt,
@@ -4840,6 +4841,7 @@ function monoPinValueLambda(
       const pnames: string[] = []
       for pt in tf.fnParamTypes { pnames.push(monoPinOfClosedTy(pt)) }
       monoLastInstFe = -1
+      monoProbeTag = "L4843"
       const r = if strListHas(pnames, "") { -1 } else { monoInstanceFor(lfe, pnames, ix, -1, [], tf.fnParamTypes) }
       // The first signature may pin the template's own slot in place; that slot is the instance.
       if r >= 0 && monoLastInstFe >= 0 && monoLastInstFe < fnStmts.length {
@@ -10489,6 +10491,8 @@ function monoInstanceForReq(
       "emitProgram: monomorphize: an instance was asked for at no template slot",
     )
   }
+  monoProbeRow("inst:" + monoProbeTag, letInitIx)
+  monoProbeTag = ""
   // A value a call through its set already instanced keeps that instance.
   if (monoElemAtSet[letInitIx] ?? false) && !monoTysHoldSet(deliveryTys) {
     return 0
@@ -10890,6 +10894,7 @@ function monoCoerceFnValueTys(
             // A capturing nested generic's value is this frame's instance, as a call is (D3902).
             const req = instReqAt(monoNestedCallFrame(gfe, ctx))
             req.retTy = if monoBuild.widenRet { monoFnTyRet(tnameTy) } else { -1 }
+            monoProbeTag = "L10893"
             const vr = monoInstanceForReq(
               req,
               gfe,
@@ -10974,6 +10979,7 @@ function monoMakerTwin(
   const req = instReqAt(monoNestedCallFrame(fe, ctx))
   req.retWidenTy = ret
   const fty = mkFuncTy(pts, ret)
+  monoProbeTag = "L10977"
   const r = monoInstanceForReq(req, fe, pins, at, fty, delTys, pts)
   return r
 }
@@ -17772,6 +17778,7 @@ function monoCellLamTakeAt(
   const had = monoInstantiatedAny(lfe)
   if !had {
     monoLastInstFe = -1
+    monoProbeTag = "L17775"
     const r = monoInstanceForReq(
       instReqAt(monoNestedCallFrame(lfe, ctx)),
       lfe,
@@ -18248,6 +18255,7 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const gfe = monoFnFeOfIdent(ax, an.identName, ctx)
     if gfe < 0 || gfe >= monoGen.length || monoGen[gfe] != 1 { return 0 }
     const pn: string[] = [tyToStr(tyElemOf(lt))]
+    monoProbeTag = "L18251"
     if monoInstanceFor(gfe, pn, ax, ft, qs, [tyElemOf(lt)]) < 0 { return -1 }
   } else {
     if monoCoerceFnValueName(a, ctx, ft) < 0 { return -1 }
@@ -18468,6 +18476,7 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
     }
     if monoCoerceFnValueName(el, ctx, ft) < 0 { return -1 }
     monoElemTakenSig[el] = nm
+    monoProbeRow("record:takenSig", el)
   }
   nodeTyRecord(n.callFn, ft)
   return 1
@@ -18566,8 +18575,10 @@ function monoElemsAtSet(
         if fnTagTyIsTagged(pt) { tyToStr(pt) } else { monoClosedTyPin(pt) },
       )
     }
+    monoProbeTag = "L18569"
     if monoInstanceFor(fe, pins, x, -1, rows[k], rows[k]) < 0 { return -1 }
     monoElemAtSet[x] = true
+    monoProbeRow("record:atSet", x)
     k = k + 1
   }
   nodeTyRecord(n.callFn, ft)
@@ -18725,6 +18736,37 @@ function monoAllFnValues(xs: i32[]): boolean {
 
 // The function type a call through each list or join element node coerces it to, by node.
 let monoElemTakenSig: {[i32]: string} = Map()
+let monoProbeTag = ""
+let monoProbeElems: {[i32]: i32} = Map()
+let monoProbeBuilt = false
+let monoProbeElemDecls: {[i32]: i32} = Map()
+function monoProbeElemOf(x: i32): i32 {
+  if !monoProbeBuilt {
+    monoProbeBuilt = true
+    let i = 0
+    while i < P.nodes.length {
+      const n = nodeAt(i)
+      if n is ArrayLit {
+        for e in n.arrElems {
+          monoProbeElems[unwrapParen(e)] = i
+          const ed = identFnDeclOf(unwrapParen(e))
+          if ed >= 0 { monoProbeElemDecls[ed] = i }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return monoProbeElems[x] ?? -1
+}
+function monoProbeRow(kind: string, x: i32) {
+  const lit = if x >= 0 && x < P.nodes.length { monoProbeElemOf(x) } else { -1 }
+  const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  const nm = if xn is Ident { xn.identName } else { "" }
+  if lit >= 0 && xn is Ident {
+    elabProbeRows.push("PROBE " + kind + " elem " + nm + " node " + i32ToStr(x) + " lit " + i32ToStr(lit))
+  }
+  return 0
+}
 
 // The declaration of the function element `el` names in frame `ctx`: the generic itself when an
 // earlier call through the same join already instanced the element (D7842), else
@@ -19643,6 +19685,22 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
   // A refusal raised while this call is monomorphized is anchored at the call (D15154).
   const savedStmt = emitCurStmtIx
   emitCurStmtIx = callIx
+  if c is Call {
+    const cx = unwrapParen(c.callFn)
+    const cxn = if cx >= 0 { nodeAt(cx) } else { null }
+    if cxn is Ident {
+      monoProbeElemOf(-1)
+      const cd = identFnDeclOf(cx)
+      if cd >= 0 && (monoProbeElemDecls[cd] ?? -1) >= 0 {
+        elabProbeRows.push("PROBE call:elemfn " + cxn.identName + " call " + i32ToStr(callIx) + " lit " + i32ToStr(monoProbeElemDecls[cd] ?? -1))
+      }
+    }
+    if cxn is Index {
+      const ax = unwrapParen(cxn.idxArr)
+      const axn = if ax >= 0 { nodeAt(ax) } else { null }
+      elabProbeRows.push("PROBE call:index arr " + (if axn is Ident { axn.identName } else { "-" }) + " call " + i32ToStr(callIx))
+    }
+  }
   const r = monoInstantiateCall(origFe, callIx, ctx)
   emitCurStmtIx = savedStmt
   monoOpenArgCall = 0 - 1
@@ -21262,6 +21320,7 @@ function monoBundlePinArg(
     if !(f is TyFunc) { return 1 }
     const pn: string[] = []
     for pt in f.fnParamTypes { pn.push(monoPinOfClosedTy(pt)) }
+    monoProbeTag = "L21265"
     if monoInstanceFor(lfe, pn, x, s, f.fnParamTypes, f.fnParamTypes) < 0 {
       return -1
     }
@@ -25033,6 +25092,7 @@ function monoNoteBindDeliveryCall(at: i32, ctx: i32, callIx: i32, annTy: i32) {
     && monoGen[fe] == 1
     && !monoInstantiatedAny(fe)
   ) {
+    monoProbeTag = "L25037"
     if (
       monoInstanceFor(fe, monoSigPins(sig + ";"), fnStmts[fe], -1, [], sigTys)
       < 0
@@ -25048,6 +25108,7 @@ function monoNoteBindDeliveryCall(at: i32, ctx: i32, callIx: i32, annTy: i32) {
   ) {
     // One pinned at another signature: the delivered name takes the instance at this one, minted
     // by the first such delivery and found by every later one (D3867, D3881).
+    monoProbeTag = "L25051"
     if monoInstanceFor(fe, monoSigPins(sig + ";"), at, -1, [], sigTys) < 0 {
       return -1
     }
@@ -25153,6 +25214,7 @@ function monoHoleLamArgAgain(
   while k < c.callArgs.length && unwrapParen(c.callArgs[k]) != x { k = k + 1 }
   if k >= c.callArgs.length { return -1 }
   monoLastInstFe = -1
+  monoProbeTag = "L25156"
   const r = monoInstanceFor(lfe, pnames, x, -1, [], pinTys)
   const fe = monoLastInstFe
   if r < 0 || fe < 0 || fe >= fnStmts.length || fe == lfe { return -1 }
@@ -26333,6 +26395,7 @@ function monoRenameInitAt(
   const targetTys = monoFnTyParamTys(targetTy)
   if monoInstantiatedAny(fe) && monoSlotParamsAre(fe, targetTys) { return 0 }
   monoLastInstFe = -1
+  monoProbeTag = "L26336"
   if (monoInstanceFor(fe, monoSigPins(target), iv, -1, [], targetTys) < 0) {
     return -1
   }
@@ -26449,6 +26512,7 @@ function monoPinLamAtDelivery(fe: i32) {
     const rowTy: i32[] = []
     const rowSp = monoCbFnListRowSpell(fnStmts[fe], rowTy)
     if rowSp != "" && fn.fnParams.length == 1 {
+      monoProbeTag = "L26452"
       return monoInstanceFor(fe, [rowSp], fnStmts[fe], -1, [], rowTy)
     }
     if !monoSubtreeCallsGeneric(fn.fnBody, fnStmts[fe], 0) { return 0 }
@@ -26512,6 +26576,7 @@ function monoPinLamAtTys(fe: i32, tys: i32[], builtin: boolean): i32 {
       pins.push(nm)
       i = i + 1
     }
+    monoProbeTag = "L26515"
     return monoInstanceFor(fe, pins, fnStmts[fe], -1, [], tys)
   }
   return 0
@@ -26941,6 +27006,7 @@ function monoCloCoerceBuild(): i32 {
         // The delivery is the member's node, not the fresh read standing for it.
         const req = instReqAt(-1)
         req.delivery = ix
+        monoProbeTag = "L26944"
         const made = monoInstanceForReq(
           req,
           gfe,
