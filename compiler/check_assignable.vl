@@ -85,7 +85,6 @@ import {
   mkFieldInit,
   mkIdent,
   mkIf,
-  mkLet,
   mkMember,
   mkNull,
   mkNum,
@@ -2385,10 +2384,8 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       // A fresh record, or list of them, holding a set where the destination closes the
       // function fields is copied field by field there (D17764).
       if fvaRecFnCopy(srcExpr, srcTy, dstTy) {
-        // The copy's literal is delivered as a hand-written one is: adopted there, its fields
-        // coerced; a copy through a binding is that `if`'s arm.
-        const cl = fvaRecCopyLit(srcExpr)
-        return assignableExprIn(cl, nodeTyIxOf(cl), dstTy)
+        // The copy is delivered as a hand-written literal is: adopted there, its field coerced.
+        return assignableExprIn(srcExpr, nodeTyIxOf(srcExpr), dstTy)
       }
       noteRefListView(srcExpr, srcTy, dstTy)
       recordListCopy(srcExpr, srcTy, dstTy)
@@ -4753,45 +4750,23 @@ export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
   }
   if list != (da is TyArray) || !fvaRecFieldsClose(sr, dr) { return false }
   // A list's copy would go through `.map`, which does not yet coerce a set's field at its
-  // lambda's result (D17775).
+  // lambda's result (D17764); a record of one field is copied without one.
   const dro = tyAt(dr)
-  if list || !(dro is TyObj) || dro.objFieldNames.length == 0 { return false }
+  if list || !(dro is TyObj) || dro.objFieldNames.length != 1 { return false }
   const pos = nodePos(site)
   const siteNode = nodeAt(site)
   const moved = addNode(siteNode)
   adoptNodeTok(moved, site)
-  // One field reads the call once; several read it through a binding the copy opens,
-  // `if true { const $c = site; { … } } else { __trap__() }`, whose dead arm the lowering drops.
-  const one = dro.objFieldNames.length == 1
-  const bind = if one { -1 } else { luAt(mkLet("const", "$c" + i32ToStr(site), -1, moved, pos), site) }
+  const nm = dro.objFieldNames[0]
+  const rd = luAt(mkMember(moved, nm, pos), site)
   const fs: i32[] = []
-  for nm in dro.objFieldNames {
-    const recv = if one { moved } else { luRef(bind, site, pos) }
-    fs.push(luAt(mkFieldInit(nm, luAt(mkMember(recv, nm, pos), site), pos), site))
-  }
-  const lit = luAt(mkObjLit(fs, pos), site)
-  if one {
-    arenaSetNode(site, nodeAt(lit))
-  } else {
-    const thenB = luAt(mkBlock([bind, lit], pos), site)
-    const trap = luAt(mkCall(luTrap(site, pos), [], pos), site)
-    const elseB = luAt(mkBlock([trap], pos), site)
-    const ifx = luAt(mkIf(luAt(mkBool(1, pos), site), thenB, elseB, pos), site)
-    arenaSetNode(site, nodeAt(ifx))
-  }
+  fs.push(luAt(mkFieldInit(nm, rd, pos), site))
+  const lit: Node = { objFields: fs, pos: pos }
+  arenaSetNode(site, lit)
   fvaListCopyNote(site)
   luGrow()
   checkNodeHook(site)
   return true
-}
-
-// The record literal a copy `fvaRecFnCopy` made at `site` builds: `site` itself, or the tail of
-// its `if true` arm.
-function fvaRecCopyLit(site: i32): i32 {
-  const n = nodeAt(site)
-  if !(n is IfStmt) { return site }
-  const t = nodeAt(n.ifThen)
-  return if t is Block && t.blkStmts.length == 2 { t.blkStmts[1] } else { site }
 }
 
 // Whether record `src` holds a set or hole function at a field record `dst` declares a closed
