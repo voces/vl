@@ -1,3 +1,4 @@
+import { ftCallFreshLits } from "./check_fn_tag"
 import {
   irInlineCalls,
   irInlineReset,
@@ -21624,7 +21625,7 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     && iu < P.nodes.length
     && nodeAt(iu) is ArrayLit
   const iv = if atBind { nodeAt(iu) } else { null }
-  const d = if iv is ArrayLit { arrayLit(
+  const d0 = if iv is ArrayLit { arrayLit(
     b,
     iv,
     iu,
@@ -21632,9 +21633,12 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     arrLitListBuild(iu, ibFnIx),
     heldTy(letBindTy(gst, -1)),
   ) } else { deliver(b, init, rep, -1) }
-  if ibMiss != "" { return d }
+  if ibMiss != "" { return d0 }
   // A record on the cell's own struct heap, or a declared subtype's, is stored retagged; so is a
   // list or closure the body lanes' retags take, unless legacy already stores it as it stands.
+  const dr0 = irBOpRep(d0)
+  const rc = if dr0 != rep { recFreshConvert(b, d0, rep, init) } else { null }
+  const d = if rc != null { rc } else { d0 }
   const dr = irBOpRep(d)
   const v = if dr != rep
     && (recRetagNoted(dr, rep, init)
@@ -22044,7 +22048,73 @@ export function irConvert(
     }
     return irBLetTempTy(b, w, at, dst, repTyOf(dst))
   }
+  const rc = recFreshConvert(b, v, dst, at)
+  if rc != null { return rc }
   return irBMiss("convert " + repWhat(irBOpRep(v)) + " -> " + repWhat(dst))
+}
+
+// Fresh record `v` (a call of a function returning only record literals, at `at`) taken to plain
+// record rep `dst` field by field: each field read and converted to the destination's, built at
+// `dst`'s row as a literal is (D17777). Null where `v` is no such value or a field converts by none.
+function recFreshConvert(b: i32[], v: Opnd, dst: i32, at: i32): Opnd | null {
+  const src = irBOpRep(v)
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if !(a is RRecord) || !(d is RRecord) || a.rrVariant || d.rrVariant {
+    return null
+  }
+  if a.rrFields.length != d.rrFields.length { return null }
+  const u = unwrapParen(at)
+  const cn = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if !(cn is Call) || !ftCallFreshLits(cn) { return null }
+  const si = recStorageRow(dst)
+  const sty = repTyOf(src)
+  const dty = repTyOf(dst)
+  if (
+    si < 0
+    || si >= sFieldStart.length
+    || sFieldCount[si] != d.rrFields.length
+  ) {
+    return null
+  }
+  const fields: Opnd[] = []
+  for _k in d.rrFields { fields.push({ ov: -1 }) }
+  const layout: i32[] = []
+  let fi = 0
+  while fi < sFieldCount[si] {
+    const nm = sFieldNames[sFieldStart[si] + fi]
+    const dk = repRecordKidOf(dst, dty, nm)
+    const sk = repRecordKidOf(src, sty, nm)
+    if dk < 0 || sk < 0 || dk >= d.rrFields.length || sk >= a.rrFields.length {
+      return null
+    }
+    const fr = a.rrFields[sk]
+    const g: Rhs = {
+      gfV: v,
+      gfIx: sk,
+      gfAt: at,
+      gfStored: false,
+      gfStr: false,
+      gfShared: false,
+    }
+    const fv = irBLetTempTy(b, g, at, fr, repTyOf(fr))
+    const cv = if fr == d.rrFields[dk] { fv } else { irConvert(b, fv, d.rrFields[dk], repTyOf(d.rrFields[dk]), at) }
+    if ibMiss != "" { return cv }
+    fields[dk] = cv
+    layout.push(dk)
+    fi = fi + 1
+  }
+  const r: Rhs = {
+    mrFields: fields,
+    mrLayout: layout,
+    mrSrc: [],
+    mrAt: at,
+    mrRow: si,
+    mrVariant: false,
+    mrBuiltRow: si,
+    mrSet: false,
+  }
+  return irBLetTempTy(b, r, at, dst, dty)
 }
 
 // `irConvert` into a cell, which stores one rep: a value taken as it stands at another rep is
