@@ -17,7 +17,7 @@ import {
   idSlotTaggedTy,
 } from "./elab_fn_id"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
-import { recEnclosingFn } from "./check_fit_rules"
+import { recEnclosingFn, recRetSoleCall } from "./check_fit_rules"
 import {
   elabReadNames,
   mfrChainFns,
@@ -56,7 +56,7 @@ import {
 } from "./check_scopes"
 import { elabRelayResultAt, fvaIsMaker } from "./check_assignable"
 import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
-import { ftWithinInstancedFn } from "./check_fn_tag"
+import { fnTagValueArms, ftWithinInstancedFn } from "./check_fn_tag"
 import {
   elabArmFeOf,
   elabBindingFnSet,
@@ -715,6 +715,7 @@ import {
   elabDeclOnePin,
   elabDeliveredBundleSigs,
   elabDeliveredBundles,
+  elabDeliveredSlotTy,
   elabDemand,
   elabHeldValTy,
   elabHoleContainerClosed,
@@ -8408,8 +8409,8 @@ export function monoSubTablesReset() {
   return 0
 }
 
-// The module-scope call being instantiated and its callee, whose open-typed arguments are read
-// at the instance the callee reaches (`monoArgInstFe`); -1 for none.
+// The call being instantiated and its callee, whose open-typed arguments are read at the instance
+// the callee reaches (`monoArgInstFe`) where the frame's own key does not type them; -1 for none.
 let monoOpenArgCall = 0 - 1
 let monoOpenArgCallee = 0 - 1
 
@@ -14309,6 +14310,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   if !(fty is TyFunc) { return 0 }
   if shared {
     monoRetypeSlotReads(ctx, at, "e", ft)
+    monoRetypeElemTakeAliases(ctx, at, ft)
     return 0
   }
   // The pin's own parameter spelling, from which each instance is built, in the canonical
@@ -14325,6 +14327,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
       nodeTyRecord(e, ft)
     }
   }
+  monoRetypeElemTakeAliases(ctx, at, ft)
   let ri = 0
   while ri + 1 < repoints.length {
     const rl = nodeAt(repoints[ri])
@@ -14505,6 +14508,7 @@ function monoHeldReadsBuiltAt(stored: i32[][], t: i32): boolean {
   for st in stored {
     const x = unwrapParen(st[0])
     const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if !monoWholeReadHeldAt(x, st[1], t) { return false }
     if n is ObjLit {
       for fx in n.objFields {
         const f = nodeAt(fx)
@@ -14531,6 +14535,24 @@ function monoHeldReadsBuiltAt(stored: i32[][], t: i32): boolean {
     }
   }
   return true
+}
+
+// Whether list element `x` of frame `ctx`, where it is an existing record (a binding read, or a
+// plain function's result), is held at record type `t`: the pin re-types neither, so the list
+// takes its elements' layout. A generic's result is its instance's literal, built at the pin.
+function monoWholeReadHeldAt(x: i32, ctx: i32, t: i32): boolean {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if n is Ident {
+    const rt = monoClosedReadTy(x, ctx, false)
+    return rt >= 0 && tySameSealed(rt, t)
+  }
+  const cf = if n is Call { n.callFn } else { -1 }
+  if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return true }
+  const fd = identFnDeclOf(cf)
+  const fn = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) || fn.fnTyParams.length > 0 { return true }
+  const ct = nodeTyIxOf(x)
+  return ct >= 0 && (!monoTyOpen(ct) || tySameSealed(ct, t))
 }
 
 // Records the list literal of record literals `rx` the un-annotated function `fnIx` returns, by
@@ -15631,7 +15653,9 @@ function monoPinMapValues(d: LetDecl, at: i32, ctx: i32): i32 {
   const nt = monoPinMapSlot(d.letInit, at, ctx, "")
   if nt < 0 { return monoStoredSlotDecline(nt) }
   if et < 0 { return 0 }
-  if !tyEqSealed(et, nt) {
+  // A slot fact taken from the destination it is delivered at instances each write there.
+  const fromDst = elabDeliveredSlotTy(at) == et
+  if !tyEqSealed(et, nt) && !fromDst {
     emitFail(
       "monoPinMapValues: the map's stored functions close at another type than its slot fact",
     )
@@ -16381,6 +16405,11 @@ function monoMapStoredFields(stored: i32[][], name: string): i32[][] {
 // pushed onto `spell`; -1 when the slot is pinned at none or two or a function does not close or
 // agree, -2 when instancing one is refused.
 function monoStoredSlotFnTy(lf0: i32[], path: string[], vals: i32[][]): i32 {
+  // A map delivered whole at one closed map is that map, as an annotation of it would be (D17756).
+  const dd = if path.length == 1 && path[0] == "v" { elabDeliveredSlotTy(lf0[1]) } else { -1 }
+  const dm = if dd >= 0 && dd < T.tys.length { tyAt(dd) } else { null }
+  const dft = if dm is TyMap { tyValOf(dm) } else { -1 }
+  if monoTyClosedFn(dft) { return monoInstanceSlotVals(vals, dft) }
   let lf = lf0
   let pinFts: i32[] = []
   let pins = monoDeclPathKeys(lf, path, false, pinFts)
@@ -16427,6 +16456,12 @@ function monoStoredSlotFnTy(lf0: i32[], path: string[], vals: i32[][]): i32 {
   )
   if own == -2 { return -1 }
   if own >= 0 && sigKeyOfTy(own) != sigKeyOfTy(ft) { ft = own }
+  return monoInstanceSlotVals(vals, ft)
+}
+
+// Instances each function of `vals` (each beside its write's frame) at slot type `ft` and records
+// it there; `ft`, -1 for a slot type that is no function, -2 when instancing one is refused.
+function monoInstanceSlotVals(vals: i32[][], ft: i32): i32 {
   const dTys: i32[] = []
   for vw in vals {
     const val = vw[0]
@@ -16439,8 +16474,7 @@ function monoStoredSlotFnTy(lf0: i32[], path: string[], vals: i32[][]): i32 {
       if monoNoteBindDeliveryAt(val, wf, ft) < 0 { return -2 }
     }
   }
-  const fty = tyAt(ft)
-  if !(fty is TyFunc) { return -1 }
+  if ft < 0 || ft >= T.tys.length || !(tyAt(ft) is TyFunc) { return -1 }
   for vw in vals { monoRecordOpen(vw[0], ft, vw[1]) }
   return ft
 }
@@ -16902,6 +16936,64 @@ function monoRetypeMethodReads(ctx: i32, at: i32, method: string, t: i32) {
         nodeTyRecord(ix, t)
       }
     }
+  }
+  return 0
+}
+
+// Types, at `ft` or `ft | null` where the checker left them open, each `const` the list binding
+// declared at `at` hands an element by `pop` or `get` in frame `ctx`, through further such
+// `const`s, that call and the aliases' reads, so a call through a narrowed read has the pinned
+// element's signature.
+function monoRetypeElemTakeAliases(ctx: i32, at: i32, ft: i32) {
+  const d = nodeAt(at)
+  if !(d is LetDecl) { return 0 }
+  const nt = mkNullableTy(ft)
+  const nodes = monoFrameNodes(ctx)
+  const aliases: i32[] = []
+  for ax in nodes {
+    const a = nodeAt(ax)
+    const ii = if a is LetDecl && a.letKw == "const" && a.letType < 0 { unwrapParen(a.letInit) } else { -1 }
+    for m in ["pop", "get"] {
+      const recv = monoMethodCallRecv(ii, m)
+      if (
+        recv >= 0
+        && monoReadsBinding(recv, d.letName, ctx, at)
+        && monoTyOpen(nodeTyIxOf(ii))
+      ) {
+        nodeTyRecord(ii, nt)
+        aliases.push(ax)
+      }
+    }
+  }
+  let ai = 0
+  while ai < aliases.length {
+    const a = nodeAt(aliases[ai])
+    if a is LetDecl {
+      if monoTyOpen(nodeTyIxOf(aliases[ai])) { nodeTyRecord(aliases[ai], nt) }
+      for ix in nodes {
+        const ty = nodeTyIxOf(ix)
+        if (
+          ty >= 0
+          && ty < T.tys.length
+          && monoTyOpen(ty)
+          && monoReadsBinding(ix, a.letName, ctx, aliases[ai])
+        ) {
+          nodeTyRecord(ix, if tyAt(ty) is TyNullable { nt } else { ft })
+        }
+        const b = nodeAt(ix)
+        if (
+          b is LetDecl
+          && b.letKw == "const"
+          && b.letType < 0
+          && b.letInit >= 0
+          && monoReadsBinding(unwrapParen(b.letInit), a.letName, ctx, aliases[ai])
+          && !i32ListHas(aliases, ix)
+        ) {
+          aliases.push(ix)
+        }
+      }
+    }
+    ai = ai + 1
   }
   return 0
 }
@@ -18286,6 +18378,73 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
   return 1
 }
 
+// Call `n` (node `ix`) straight through an element of a list literal written in place, whose
+// function elements the check left open and whose arguments are closed values: each element is
+// instanced at the argument types, and the literal and callee typed at that one signature.
+// 1 when it typed the callee, 0 when none applies, -1 on a failure.
+function monoInlineListCallAt(n: Call, ix: i32, ctx: i32): i32 {
+  const cx = unwrapParen(n.callFn)
+  const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
+  if !(cn is Index) { return 0 }
+  const lx = unwrapParen(cn.idxArr)
+  const lit = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  if (
+    !(lit is ArrayLit)
+    || lit.arrElems.length == 0
+    || !monoTyOpen(nodeTyIxOf(cx))
+  ) {
+    return 0
+  }
+  const pts: i32[] = []
+  for a in n.callArgs {
+    const at = nodeTyIxOf(unwrapParen(a))
+    if at < 0 || at >= T.tys.length || monoTyOpen(at) || tyAt(at) is TyFunc {
+      return 0
+    }
+    pts.push(at)
+  }
+  const hN: string[] = []
+  const hT: i32[] = []
+  monoOneInstHoleBinds(hN, hT)
+  let ft = -1
+  for el in lit.arrElems {
+    const fx = if nodeAt(el) is Spread { -1 } else { elabOpenFnArgDecl(el) }
+    const f = if fx >= 0 { nodeAt(fx) } else { null }
+    if (
+      !(f is FuncDecl)
+      || f.fnTyParams.length > 0
+      || f.fnParams.length != pts.length
+    ) {
+      return 0
+    }
+    for p in f.fnParams {
+      const pn = nodeAt(p)
+      if !(pn is Param) || pn.parType >= 0 { return 0 }
+    }
+    const r = monoFnDeclRetAtUnder(fx, pts, hN, hT)
+    if r < 0 { return 0 }
+    const et = mkFuncTy(pts, r)
+    if !monoTyClosedFn(et) || (ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft)) {
+      return 0
+    }
+    ft = et
+  }
+  for el in lit.arrElems {
+    if monoLamLitTakeTys(el, ctx, [], ft) != 0 {
+      return emitFailAt(
+        "emitProgram: a lambda this call reaches through a list cannot take the call's function type",
+        el,
+      )
+    }
+    if monoCoerceFnValueName(el, ctx, ft) < 0 { return -1 }
+    if monoTyOpen(nodeTyIxOf(el)) { nodeTyRecord(el, ft) }
+  }
+  nodeTyRecord(lx, mkArrayTy(ft))
+  nodeTyRecord(cx, ft)
+  if monoTyOpen(nodeTyIxOf(ix)) { nodeTyRecord(ix, monoFnTyRet(ft)) }
+  return 1
+}
+
 // `monoOpenCallAtElems` where a parameter takes a tagged set: each element is its own instance
 // at the rows' types, keyed by the set as a direct call's is. 1 when it typed the callee, else 0.
 function monoElemsAtSet(
@@ -19382,7 +19541,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
   const saved = monoDestPinOff
   monoDestPinOff = monoCalleeHasTyParamArrow(origFe)
   const c = nodeAt(callIx)
-  if ctx < 0 && c is Call {
+  if c is Call {
     monoOpenArgCall = callIx
     monoOpenArgCallee = c.callFn
   }
@@ -23484,6 +23643,10 @@ function monoCoerceIfArms(n: IfStmt, ix: i32, ctx: i32): i32 {
 // kind — is in place when the outer call's argument types are read.
 function monoWalk(ix: i32, ctx: i32) {
   if ix < 0 { return 0 }
+  // A value arm instances its member where the site's value is converted to a closure.
+  for va in fnTagValueArms(ix) {
+    if monoWalk(va, ctx) < 0 { return -1 }
+  }
   const n = nodeAt(ix)
   match n {
     Call => {
@@ -23517,6 +23680,10 @@ function monoWalk(ix: i32, ctx: i32) {
         || monoForInlineGenElems(n.callFn, ctx)
       ) {
         elemsTyped = monoOpenCallAtElems(n, ix, ctx)
+        if elemsTyped < 0 { return -1 }
+      }
+      if elemsTyped == 0 {
+        elemsTyped = monoInlineListCallAt(n, ix, ctx)
         if elemsTyped < 0 { return -1 }
       }
       if n.callFn < 0 { return 0 }
@@ -24197,6 +24364,7 @@ function monoWalkFnBodyIn(fnIx: i32) {
       if b is Block && b.blkStmts.length > 0 {
         const tail = b.blkStmts[b.blkStmts.length - 1]
         if monoCoerceRetAtPin(tail, fnIx) < 0 { return -1 }
+        monoPinReturnedObj(tail, fnIx)
         if monoPinReturnedList(tail, fnIx) < 0 { return -1 }
       }
     }
@@ -24932,7 +25100,8 @@ function monoMapValTy(t: i32): i32 {
 }
 
 // `monoDeliverLitAt` for a list or record literal `v` stored into place `e`, or into its slot
-// `kid` when not "", whose type there is `ty`; nothing for any other value.
+// `kid` when not "", whose type there is `ty`; nothing for any other value. A slot still open is
+// the literal's own closed stamp, the type its declaration laid it out at (D17742).
 function monoDeliverLitAtPlace(
   v: i32,
   e: i32,
@@ -24945,7 +25114,9 @@ function monoDeliverLitAtPlace(
   const path: string[] = []
   const d = monoPlaceRoot(e, path, 0)
   if kid != "" { path.push(kid) }
-  return monoDeliverLitAt(x, d, path, ty, ctx, 0)
+  const own = nodeRepTyIxOf(x)
+  const at = if tyHasTyVar(ty) && own >= 0 && !tyHasTyVar(own) { own } else { ty }
+  return monoDeliverLitAt(x, d, path, at, ctx, 0)
 }
 
 // Each function list or record literal `v` holds, at slot `path` of binding `d` (-1 for none)
@@ -25527,7 +25698,10 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
     if ft == -2 { return -1 }
     if ft >= 0 { return 0 }
     const noPath: string[] = []
-    return monoDeliverLitAt(x, x, noPath, nodeTyIxOf(x), ctx, 0)
+    // A literal still open is delivered at its own closed stamp, its declaration's layout (D17744).
+    const own = nodeRepTyIxOf(x)
+    const lt = if tyHasTyVar(nodeTyIxOf(x)) && own >= 0 && !tyHasTyVar(own) { own } else { nodeTyIxOf(x) }
+    return monoDeliverLitAt(x, x, noPath, lt, ctx, 0)
   }
   if (
     monoIfBindingOf(x, ctx)[1] >= 0
@@ -25600,7 +25774,12 @@ function monoRetFnListTy(x: i32, ctx: i32): i32 {
   const l = nodeAt(x)
   const it = monoFrameInstTmpl(ctx)
   const tmpl = if it[0] == ctx { it[1] } else { -1 }
-  const jt = if l is ArrayLit { elabRetTaggedJoinTy(x, ctx, tmpl) } else { -1 }
+  // A result and the literal it returns share one layout: with one call site, the destination's
+  // (D15900); with several, the joined result (D15226).
+  const away = l is ArrayLit
+    && recRetSoleCall(x) != x
+    && nodeRepTyIxOf(x) != nodeTyIxOf(x)
+  const jt = if l is ArrayLit && !away { elabRetTaggedJoinTy(x, ctx, tmpl) } else { -1 }
   if jt >= 0 {
     monoRecordJoinedLit(x, jt, ctx, 0)
     return monoListElemTy(jt)
@@ -26894,6 +27073,7 @@ export function monomorphize(stmts: i32[]) {
   }
   const prc = monoPruneTemplates(nDecl)
   if prc < 0 { return prc }
+  monoCallReturnedRecReads()
   // Each un-annotated binding the walk left open takes the closed type the elaboration or its
   // initializer gives it.
   // Keyed by a walk of every body, not the write index: an instance clone's nodes postdate it.
@@ -26921,6 +27101,164 @@ export function monomorphize(stmts: i32[]) {
     ai = ai + 1
   }
   return prc
+}
+
+// Types each call the checker left at an open record, whose callee returns one record literal
+// whose fields close (`monoObjLitFieldsPin`), at that literal's record, and the reads through the
+// call, directly or by a `const` bound to it, at its fields (`monoRetypeRecMemberReads`).
+function monoCallReturnedRecReads() {
+  const nodes = monoFrameNodes(-1)
+  // A record of a tagged set's ids and one of closures at the same signature share no layout,
+  // so a closed signature some tagged record's container holds is left as checked.
+  const idSigs: string[] = []
+  for c in nodes {
+    const cn = nodeAt(c)
+    const ct = nodeTyIxOf(c)
+    if (
+      cn is Call
+      && ct >= 0
+      && ct < T.tys.length
+      && monoFnContainersTagged(ct)
+    ) {
+      const fd = elabOpenFnArgDecl(cn.callFn)
+      const lx = if fd >= 0 { monoFnReturnedObjLit(fd) } else { -1 }
+      if lx >= 0 { monoObjLitHeldSigs(lx, fd, idSigs) }
+    }
+  }
+  for c in nodes {
+    const cn = nodeAt(c)
+    const ct = nodeTyIxOf(c)
+    if (
+      cn is Call
+      && ct >= 0
+      && ct < T.tys.length
+      && tyAt(ct) is TyObj
+      && monoTyOpen(ct)
+    ) {
+      const cs: i32[] = []
+      monoRecFnContainers(ct, cs, [])
+      let open = false
+      for k in cs {
+        if monoTyOpen(k) { open = true }
+      }
+      const fd = if !open || monoFnContainersTagged(ct) { -1 } else { elabOpenFnArgDecl(cn.callFn) }
+      const lx = if fd >= 0 { monoFnReturnedObjLit(fd) } else { -1 }
+      if lx >= 0 {
+        monoObjLitFieldsPin(lx, fd)
+        const rt = nodeTyIxOf(lx)
+        if (
+          rt >= 0
+          && rt < T.tys.length
+          && tyAt(rt) is TyObj
+          && !monoTyOpen(rt)
+          && !monoFnContainersTagged(rt)
+          && !monoFnContainersAtSigs(rt, idSigs)
+        ) {
+          nodeTyRecord(c, rt)
+          monoRetypeRecMemberReads(-1, nodes, c, rt, 0)
+          for ax in nodes {
+            const a = nodeAt(ax)
+            if (
+              a is LetDecl
+              && a.letKw == "const"
+              && a.letType < 0
+              && unwrapParen(a.letInit) == c
+            ) {
+              if monoTyOpen(nodeTyIxOf(ax)) { nodeTyRecord(ax, rt) }
+              for ix in nodes {
+                if (
+                  monoReadsBinding(ix, a.letName, -1, ax)
+                  && monoTyOpen(nodeTyIxOf(ix))
+                ) {
+                  nodeTyRecord(ix, rt)
+                  monoRetypeRecMemberReads(-1, nodes, ix, rt, 0)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return 0
+}
+
+// Pushes onto `out` each map or list type of functions record type `t` holds in a field or a
+// nested record, `seen` keeping the records walked.
+function monoRecFnContainers(t: i32, out: i32[], seen: i32[]) {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return 0 }
+  seen.push(t)
+  const o = tyAt(t)
+  if !(o is TyObj) { return 0 }
+  for ft in o.objFieldTypes {
+    const et = monoContainerElemTy(ft)
+    if et >= 0 && et < T.tys.length && tyAt(et) is TyFunc {
+      out.push(ft)
+    } else {
+      monoRecFnContainers(ft, out, seen)
+    }
+  }
+  return 0
+}
+
+// Whether record type `t` holds a container of functions of a tagged set, whose values are member
+// ids and not closures.
+function monoFnContainersTagged(t: i32): boolean {
+  const cs: i32[] = []
+  monoRecFnContainers(t, cs, [])
+  for k in cs {
+    const et = monoContainerElemTy(k)
+    const es = fnTagSetOfTy(et)
+    if fnTagTyIsTagged(et) || (es >= 0 && fnTagSetIsTagged(es)) { return true }
+  }
+  return false
+}
+
+// Whether record type `t` holds a container of functions at one of the signatures `sigs`.
+function monoFnContainersAtSigs(t: i32, sigs: string[]): boolean {
+  const cs: i32[] = []
+  monoRecFnContainers(t, cs, [])
+  for k in cs {
+    if strListHas(sigs, sigKeyOfTy(monoContainerElemTy(k))) { return true }
+  }
+  return false
+}
+
+// Pushes onto `out` the signature of each closed function container a field of record literal
+// `lx` reads in frame `ctx` (its binding's type, else the read's own), nested literals included.
+function monoObjLitHeldSigs(lx: i32, ctx: i32, out: string[]) {
+  const lit = nodeAt(lx)
+  if !(lit is ObjLit) { return 0 }
+  for fi in lit.objFields {
+    const f = nodeAt(fi)
+    const vx = if f is FieldInit { unwrapParen(f.fiValue) } else { -1 }
+    if vx >= 0 && nodeAt(vx) is ObjLit {
+      monoObjLitHeldSigs(vx, ctx, out)
+    } else if vx >= 0 {
+      const bt = monoClosedReadTy(vx, ctx, false)
+      const rt = if bt >= 0 { bt } else if monoTyOpen(nodeTyIxOf(vx)) { -1 } else { nodeTyIxOf(vx) }
+      const et = monoContainerElemTy(rt)
+      const k = if et >= 0 && et < T.tys.length && tyAt(et) is TyFunc { sigKeyOfTy(et) } else { "" }
+      if k != "" && !strListHas(out, k) { out.push(k) }
+    }
+  }
+  return 0
+}
+
+// The one record literal un-annotated, non-generic function `fd` returns, as every value its
+// body hands back (`collectRetValues`: each `return`, an expression body's value); -1 otherwise.
+function monoFnReturnedObjLit(fd: i32): i32 {
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 || f.fnRet >= 0 { return -1 }
+  const vs: i32[] = []
+  collectRetValues(f.fnBody, vs)
+  let lit = -1
+  for v in vs {
+    const r = unwrapParen(v)
+    if r < 0 || !(nodeAt(r) is ObjLit) || (lit >= 0 && lit != r) { return -1 }
+    lit = r
+  }
+  return lit
 }
 
 // Records on node `i`, when it is an un-annotated binding the walk left open, the closed type the

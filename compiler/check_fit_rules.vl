@@ -4185,7 +4185,9 @@ export function recLitPlaceBuiltTy(p: i32): i32 {
   // A list literal bound where its one read is delivered is delivered there: at a list of its
   // records with function fields closed, it is built there (D15900).
   const lit = p >= 0 && p < P.nodes.length && nodeAt(p) is ArrayLit
-  const q = if lit { recSoleReadOfInit(p, 0) } else { p }
+  const q0 = if lit { recSoleReadOfInit(p, 0) } else { p }
+  // So is one an un-annotated function returns as its only value, delivered where its one call is.
+  const q = if lit && q0 == p { recRetSoleCall(p) } else { q0 }
   const qd = if q != p { nodeCtxTyIxOf(q) } else { -1 }
   if qd >= 0 && recListFnFieldsWiden(nodeTyIxOf(p), qd) { return qd }
   const init = recAsgBindInit(q)
@@ -4554,6 +4556,83 @@ function recSoleReadOfInit(p: i32, depth: i32): i32 {
   tailValueLeaves(x, leaves)
   if !i32ListHas(leaves, p) { return p }
   return recSoleReadOfInit(u, depth + 1)
+}
+
+// The one call of the un-annotated function whose only returned value is `p`, where that call
+// initialises an annotated binding; else `p`.
+export function recRetSoleCall(p: i32): i32 {
+  cwIxBuild()
+  // A node minted past the index (an instance's copy) has no column to read.
+  if p < 0 || p >= cwIxCoveredLen() { return p }
+  const uk = cwIxUpKind[p]
+  if uk != CW_UP_RET && uk != CW_UP_TAIL { return p }
+  const fd = recEnclosingFn(p)
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnTyParams.length > 0 { return p }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length != 1 || cwPeelValue(leaves[0]) != p { return p }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length != 1 || sites[0] % 2 != 0 {
+    return p
+  }
+  // Only an annotated binding's initialiser names a build of its own.
+  const c = sites[0] / 2
+  if c < 0 || c >= cwIxCoveredLen() || cwIxUpKind[c] != CW_UP_LETINIT {
+    return p
+  }
+  const b = cwIxUp[c]
+  const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { null }
+  return if bn is LetDecl && bn.letType >= 0 { c } else { p }
+}
+
+// Whether `p` is the one value an un-annotated, non-generic function returns, and that function is
+// called at more than one site: its result is then the join of every call's, which no one
+// destination builds (D17764).
+export function recRetSharedLeaf(p: i32): boolean {
+  cwIxBuild()
+  if p < 0 || p >= cwIxCoveredLen() { return false }
+  const uk = cwIxUpKind[p]
+  if uk != CW_UP_RET && uk != CW_UP_TAIL { return false }
+  const fd = recEnclosingFn(p)
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnTyParams.length > 0 {
+    return false
+  }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length != 1 || cwPeelValue(leaves[0]) != p { return false }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length < 2 { return false }
+  // A call initialising an annotated binding keeps its annotation's build until the list copy
+  // that converts it exists (D17801).
+  for st in sites {
+    const c = st / 2
+    if c >= 0 && c < cwIxCoveredLen() && cwIxUpKind[c] == CW_UP_LETINIT {
+      const bn = nodeAt(cwIxUp[c])
+      if bn is LetDecl && bn.letType >= 0 { return false }
+    }
+  }
+  return true
+}
+
+// The list literal call `c` returns where `c` is the one call of an un-annotated function
+// returning only it (`recRetSoleCall`), or -1.
+export function recRetLitOfSoleCall(c: i32): i32 {
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if (
+    !(cn is Call)
+    || cn.callFn < 0
+    || cn.callFn >= P.nodes.length
+    || !(nodeAt(cn.callFn) is Ident)
+  ) {
+    return -1
+  }
+  const fd = identFnDeclOf(cn.callFn)
+  if fd < 0 || !(nodeAt(fd) is FuncDecl) { return -1 }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length != 1 { return -1 }
+  const l = cwPeelValue(leaves[0])
+  if l < 0 || l >= P.nodes.length || !(nodeAt(l) is ArrayLit) { return -1 }
+  return if recRetSoleCall(l) == c { l } else { -1 }
 }
 
 // Whether list `w` is list `own` of records whose function fields `w`'s close (`recFnFieldsWiden`).
@@ -7106,6 +7185,11 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
         const hd = recHeldDecl(p)
         if hd >= 0 && cwPeelValue(letInitAt(hd)) == oc {
           recBuildPushKept(hd, oc)
+          // One holding an element of a list literal read in place, which nothing else shares,
+          // adopts the record as one holding the literal does: its reads follow (D17732).
+          if recLitElemRead(oc) {
+            recAdPushDecl(hd, srcTy, nonNulTyOf(dstTy), false, p)
+          }
         }
         return 0
       }
@@ -10747,6 +10831,14 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32) {
     StrLit | CharLit | BoolLit | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread | LoopVar => {}
   }
   return 0
+}
+
+// Whether `x` is an element read of a list literal in place (`[{ r: 7 }][0]`).
+function recLitElemRead(x: i32): boolean {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is Index) { return false }
+  const b = cwPeelValue(n.idxArr)
+  return b >= 0 && b < P.nodes.length && nodeAt(b) is ArrayLit
 }
 
 // Whether read `p` is a spread's argument: its elements are copied, so it is no whole delivery.
