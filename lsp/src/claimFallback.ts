@@ -7,7 +7,6 @@ export type ClaimExports = {
   irShadowRowCount?: () => number;
   irShadowRowLen?: (i: number) => number;
   irShadowRowAt?: (i: number, j: number) => number;
-  irShadowArm?: (mode: number) => number;
 };
 
 const CLAIMED = "claimed";

@@ -382,7 +382,6 @@ import {
   elabHoleFnClosed,
   elabKeyAtPos,
   elabListFnElemTy,
-  elabMakesHeldClosureRecords,
   elabNarrowedFromAt,
   elabNodeTyAt,
   elabPlaceRecordAt,
@@ -3345,7 +3344,32 @@ function letCellKindGo(letIx: i32, fnIx: i32): VKind {
   }
   const d = nodeAt(letIx)
   if d is LetDecl && d.letType >= 0 { return vtKindOfType(d.letType) }
+  const ow = letOpenCallWidth(letIx, fnIx)
+  if ow != "" { return ow }
   return letBindRepKind(letIx, fnIx) ?? "i32"
+}
+
+// The scalar width an un-annotated `const` holding a call the frame types open is built at: the
+// call's own result width (`cloCallSigKey`), as its print and its store read it; "" else (D17809).
+export function letOpenCallWidth(letIx: i32, fnIx: i32): VKind | "" {
+  const d = if letIx >= 0 && letIx < P.nodes.length { nodeAt(letIx) } else { null }
+  if !(d is LetDecl) || d.letType >= 0 || d.letKw != "const" || d.letInit < 0 {
+    return ""
+  }
+  const ix = unwrapParen(d.letInit)
+  // A `const` copy of such a binding holds its width too.
+  if ix >= 0 && nodeAt(ix) is Ident {
+    const sd = identDeclOf(ix)
+    return if sd >= 0 && sd != letIx { letOpenCallWidth(sd, fnIx) } else { "" }
+  }
+  if ix < 0 || !(nodeAt(ix) is Call) { return "" }
+  const t = exprValueTyAt(ix, fnIx)
+  if t >= 0 && !tyHasTyVar(t) { return "" }
+  const k = sigKeyRetKind(cloCallSigKey(ix, fnIx)) ?? ""
+  if k == "f64" { return "f64" }
+  if k == "f32" { return "f32" }
+  if k == "i64" { return "i64" }
+  return ""
 }
 
 // The map shape beside an inferred `map` or `nulmap` result valtype: the return expression's,
@@ -5707,7 +5731,41 @@ export function exprValueTyAt(exprIx0: i32, fnIx: i32): i32 {
     const el = elabNodeTyAt(exprIx, fnIx)
     if el >= 0 { ty = el }
   }
+  if ty < 0 || tyHasTyVar(ty) {
+    const rt = openReadTy(exprIx, fnIx)
+    if rt >= 0 { return rt }
+    const at = openArithTy(exprIx, fnIx)
+    if at >= 0 { return at }
+  }
   return ty
+}
+
+// A read of an un-annotated `const` holding a call the frame types open is at the width the call
+// is built at (`letOpenCallWidth`); -1 for any other node.
+function openReadTy(exprIx: i32, fnIx: i32): i32 {
+  if !(nodeAt(exprIx) is Ident) { return -1 }
+  const w = letOpenCallWidth(identDeclOf(exprIx), fnIx)
+  if w == "f64" { return TY_F64 }
+  if w == "i64" { return TY_I64 }
+  // An `f32` call keeps its open type here; its slot and print read the width directly.
+  if w == "f32" { return -1 }
+  return -1
+}
+
+// Arithmetic the checker left open is at the width both its operands are read at; -1 for any
+// other node or where they differ.
+function openArithTy(exprIx: i32, fnIx: i32): i32 {
+  const n = nodeAt(exprIx)
+  if !(n is BinExpr) || !binIsArith(n.binOp) { return -1 }
+  const l = exprValueTyAt(n.binLeft, fnIx)
+  const r = exprValueTyAt(n.binRight, fnIx)
+  const lp = if l >= 0 && !tyHasTyVar(l) { tyScalarBasePrim(l) ?? "" } else { "" }
+  return if lp != "" && r >= 0 && lp == (tyScalarBasePrim(r) ?? "") { l } else { -1 }
+}
+
+// Whether `op` is an arithmetic operator, whose result is its operands' width.
+function binIsArith(op: string): boolean {
+  return op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
 }
 
 // `k` where it names a scalar width, else "".
@@ -16406,33 +16464,55 @@ function readMapValTyAt(e: Index, fnIx: i32): i32 {
 // `i32` id or the closure (`closureHeld`), or either nullable; each record field, list element
 // and map value at its own kid. A closed part holds at any rep. `path` is the walk's open parts.
 export function tyOpenHeldAsIds(ty: i32, rep: i32, path: i32[]): boolean {
+  return tyOpenHeldAsIdsAt(ty, rep, path, true)
+}
+
+// `tyOpenHeldAsIds`, where `closures` says whether the place holds an open function at the
+// uniform closure; a place the elaboration holds as a record of closures does not.
+export function tyOpenHeldAsIdsAt(
+  ty: i32,
+  rep: i32,
+  path: i32[],
+  closures: boolean,
+): boolean {
   if ty < 0 { return false }
   if !tyHasTyVar(ty) || i32ListHas(path, ty) { return true }
   path.push(ty)
-  const r = tyOpenHeldAt(ty, rep, path)
+  const r = tyOpenHeldAt(ty, rep, path, closures)
   path.pop()
   return r
 }
 
-function tyOpenHeldAt(ty: i32, rep: i32, path: i32[]): boolean {
+function tyOpenHeldAt(
+  ty: i32,
+  rep: i32,
+  path: i32[],
+  closures: boolean,
+): boolean {
   const t = tyAt(ty)
   const n = repNodeAt(rep)
   return match t {
-    TyFunc => repIsI32(rep) || n is RNullable && repIsI32(n.rnInner) || closureHeld(rep)
+    TyFunc => repIsI32(rep)
+      || n is RNullable && repIsI32(n.rnInner)
+      || closures && closureHeld(rep)
     TyNullable => {
-      if n is RNullable { return tyOpenHeldAsIds(t.nInner, n.rnInner, path) }
-      tyOpenHeldAsIds(t.nInner, rep, path)
+      if n is RNullable {
+        return tyOpenHeldAsIdsAt(t.nInner, n.rnInner, path, closures)
+      }
+      tyOpenHeldAsIdsAt(t.nInner, rep, path, closures)
     }
-    TyArray => n is RList && tyOpenHeldAsIds(tyElemOf(t), n.rlsElem, path)
+    TyArray => n is RList && tyOpenHeldAsIdsAt(tyElemOf(t), n.rlsElem, path, closures)
     TyMap => n is RMap
       && !tyHasTyVar(tyKeyOf(t))
-      && tyOpenHeldAsIds(tyValOf(t), n.rmVal, path)
+      && tyOpenHeldAsIdsAt(tyValOf(t), n.rmVal, path, closures)
     TyObj => {
       const ks = repNodeKids(rep)
       if !(n is RRecord) || ks.length != t.objFieldTypes.length { return false }
       let k = 0
       while k < ks.length {
-        if !tyOpenHeldAsIds(t.objFieldTypes[k], ks[k], path) { return false }
+        if !tyOpenHeldAsIdsAt(t.objFieldTypes[k], ks[k], path, closures) {
+          return false
+        }
         k = k + 1
       }
       true
@@ -16443,12 +16523,11 @@ function tyOpenHeldAt(ty: i32, rep: i32, path: i32[]): boolean {
 }
 
 // Whether an open function type is held at rep `r`: the uniform closure, or it nullable, which no
-// instance changes, in a build that holds or returns no record of closures. A bundle parameter is
-// one per instance, so the builder refuses its read but at a member pick.
+// instance changes. A place held as a record of closures has a record rep, and its readers ask that
+// place (`placeHeldOpen`), so no other binding's layout enters this answer.
 export function closureHeld(r: i32): boolean {
   const n = repNodeAt(r)
-  const c = n is RClosure || n is RNullable && repNodeAt(n.rnInner) is RClosure
-  return c && !elabMakesHeldClosureRecords()
+  return n is RClosure || n is RNullable && repNodeAt(n.rnInner) is RClosure
 }
 
 // Whether rep `r` is the plain `i32` a tagged set's id is held at.
