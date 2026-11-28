@@ -23820,46 +23820,143 @@ export function fnSetTyKeep(ct: i32, t: i32): i32 {
   return elabFnSetTyMint(t, fnTagMembers(s))
 }
 
-// Stamps each list or record literal outside an instanced function whose type holds a list of
-// closures of an open function, and no tagged set's id, with the closed type the elaboration
-// holds it at (`elabHeldValTy`) once the tag decision is final: its rows, and every holder read by
-// its type, are laid out at that type rather than at an open function's, which keys none.
+// Stamps each list or record literal outside an instanced function whose type holds a closure of
+// an open function, and no tagged set's id, once the tag decision is final: a list of them at the
+// closed type the elaboration holds it at (`elabHeldValTy`), else, and a bare function field only,
+// at the uncalled default where nothing calls them. Every holder read by its type follows it.
 export function elabHeldFnLitStamps() {
+  const nested: {[i32]: boolean} = Map()
   let g = 0
   while g < P.nodes.length {
+    for c in elabLitKids(g, []) { nested[c] = true }
+    g = g + 1
+  }
+  g = 0
+  while g < P.nodes.length {
     const n = nodeAt(g)
-    if (
-      (n is ArrayLit || n is ObjLit || n is IfStmt || n is MatchExpr)
-      && tyOpenFnLists(nodeRepTyIxOf(g), []) == 1
-    ) {
-      const ks = elabEnclosingKeys(g)
-      const top = ks.length == 1 && ks[0] == -1
-      const ht = if top { elabHeldValTy(g, -1) } else { -1 }
-      const ut = if top && ht < 0 { elabUncalledFnsClosed(nodeRepTyIxOf(g), []) } else { -1 }
+    const k = if n is ArrayLit || n is ObjLit || n is IfStmt || n is MatchExpr { tyOpenFnLists(nodeRepTyIxOf(g), []) } else { 0 }
+    const ks = if k == 1 || k == 2 { elabEnclosingKeys(g) } else { [] }
+    const top = ks.length == 1 && ks[0] == -1
+    if top && k == 2 {
+      const ht = elabHeldValTy(g, -1)
+      const ut = if ht < 0 { elabUncalledFnsClosed(nodeRepTyIxOf(g), []) } else { -1 }
       if ht >= 0 { repStampNode(g, ht) }
       else if ut >= 0 { repStampNode(g, ut) }
+    } else if top && k == 1 && !(nested.get(g) ?? false) {
+      // A field whose function an instance calls keeps the rep its calls key.
+      const ut = if elabTreeFnsInstanced(nodeRepTyIxOf(g), []) { -1 } else { elabUncalledFnsClosed(nodeRepTyIxOf(g), []) }
+      if ut >= 0 { elabStampLitTree(g, ut) }
     }
     g = g + 1
   }
   return 0
 }
 
-// What the function positions of `t` hold, through lists, records, maps and nullables: 2 where
-// one holds a tagged set's id, else 1 where a list's element is a closure still open, else 0.
-// `seen` holds the types walked already, so a recursive type is walked once.
+// Whether a function a closure leaf of `t` carries has an instance the elaboration keyed outside
+// a guess: some call reaches it, through a parameter say. `seen` holds the types walked already.
+function elabTreeFnsInstanced(t: i32, seen: i32[]): boolean {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return false }
+  seen.push(t)
+  const x = tyAt(t)
+  match x {
+    TyFunc => {
+      const s = fnTagSetOfTy(t)
+      if s < 0 { return false }
+      for d in fnTagMembers(s) {
+        let k = 0
+        while k < ekDecl.length {
+          if ekDecl[k] == d && !(elabGuessKeys.get(k) ?? false) { return true }
+          k = k + 1
+        }
+      }
+      return false
+    }
+    TyArray => {
+      return elabTreeFnsInstanced(tyElemOf(x), seen)
+    }
+    TyNullable => {
+      return elabTreeFnsInstanced(x.nInner, seen)
+    }
+    TyObj => {
+      for ft in x.objFieldTypes {
+        if elabTreeFnsInstanced(ft, seen) { return true }
+      }
+      return false
+    }
+    // A map, union or bare variable holds no closure leaf the tree is stamped at.
+    TyMap | TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// The list and record literals literal `x` holds directly, as elements or field values; `keys`
+// gains each one's place, "" for an element and the field's name for a field.
+function elabLitKids(x: i32, keys: string[]): i32[] {
+  const out: i32[] = []
+  const n = nodeAt(x)
+  const vs: i32[] = []
+  const ks: string[] = []
+  if n is ArrayLit {
+    for el in n.arrElems {
+      vs.push(el)
+      ks.push("")
+    }
+  }
+  if n is ObjLit {
+    for fx in n.objFields {
+      const f = nodeAt(fx)
+      if f is FieldInit {
+        vs.push(f.fiValue)
+        ks.push(f.fiName)
+      }
+    }
+  }
+  let i = 0
+  while i < vs.length {
+    const u = unwrapParen(vs[i])
+    if u >= 0 && (nodeAt(u) is ArrayLit || nodeAt(u) is ObjLit) {
+      out.push(u)
+      keys.push(ks[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Stamps literal `x` with `t`, and each literal it holds with `t`'s part at its place.
+function elabStampLitTree(x: i32, t: i32) {
+  if t < 0 || t >= T.tys.length { return 0 }
+  repStampNode(x, t)
+  const keys: string[] = []
+  const kids = elabLitKids(x, keys)
+  let i = 0
+  while i < kids.length {
+    const pt = if keys[i] == "" { tyArrayElemIx(t) } else { tyFieldTyOf(t, keys[i]) }
+    elabStampLitTree(kids[i], pt)
+    i = i + 1
+  }
+  return 0
+}
+
+// What the function positions of `t` hold, through lists, records, maps and nullables: 3 where
+// one holds a tagged set's id, else 2 where a list's element is a closure still open, else 1 where
+// a field or value is one, else 0. `seen` holds the types walked already, so a recursive type is
+// walked once.
 function tyOpenFnLists(t: i32, seen: i32[]): i32 {
   if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return 0 }
   seen.push(t)
   const x = tyAt(t)
   match x {
     TyFunc => {
-      return if fnTagTyIsTagged(t) { 2 } else { 0 }
+      if fnTagTyIsTagged(t) { return 3 }
+      return if tyHasTyVar(t) { 1 } else { 0 }
     }
     TyArray => {
       const e = tyElemOf(x)
       const ef = if e >= 0 && e < T.tys.length { tyAt(e) } else { null }
       if ef is TyFunc && !fnTagTyIsTagged(e) {
-        return if tyHasTyVar(e) { 1 } else { 0 }
+        return if tyHasTyVar(e) { 2 } else { 0 }
       }
       return tyOpenFnLists(e, seen)
     }
