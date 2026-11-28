@@ -74,7 +74,7 @@ import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx, tyIsValueUnionBox } from "./check_ty_rep"
 import {
   fnTagLateRows,
-  fnTagValueArms,
+  fnTagValueArmsAll,
   ftParamListCopied,
   ftWithinInstancedFn,
 } from "./check_fn_tag"
@@ -137,6 +137,7 @@ import {
   fvaRetRowsNote,
   monoRecheckBegin,
 } from "./check_assignable"
+import { deliveredSlotTyOf } from "./check_side_rows"
 import { fieldStorageEq, numWidens } from "./check_ty_relate"
 import {
   recBuildCount,
@@ -11791,15 +11792,16 @@ export function elabRun() {
         elabHoleCallAt(a, identDeclOf(an.callFn))
       }
     }
-    for a in fnTagValueArms(c) {
-      const an = nodeAt(a)
-      if an is Call && elabCallInstFrom(a, -1) < 0 {
-        elabHoleCallAt(a, identDeclOf(an.callFn))
-      }
-    }
     if elabCallInstFrom(c, -1) < 0 { elabHoleCallAt(c, elabSoleCalleeHole(c)) }
     if elabCallInstFrom(c, -1) < 0 && rowed.get(c) == null {
       elabSolvedHoleCallAt(c)
+    }
+  }
+  // A value arm reaches its member at the closed signature its site is converted at.
+  for a in fnTagValueArmsAll() {
+    const an = nodeAt(a)
+    if an is Call && elabCallInstFrom(a, -1) < 0 {
+      elabHoleCallAt(a, identDeclOf(an.callFn))
     }
   }
   // A call of a module binding above its declaration, at its arguments' own types.
@@ -12558,7 +12560,8 @@ export function elabHoleGenFlowTy(argIx: i32, holder: i32): i32 {
     ps = bo.fnParamTypes
   } else {
     cx = eplSlotOneCall(holder, path, -1, ps)
-    if cx < 0 { return -1 }
+    // Several calls whose arguments are all closed at one type deliver one signature.
+    if cx < 0 && !eplSlotCallsAgree(holder, path, -1, ps) { return -1 }
   }
   if ps.length == 0 || vf.fnParamTypes.length != ps.length { return -1 }
   const gN: string[] = []
@@ -15374,6 +15377,10 @@ function elabTyAtPath(t0: i32, path: string[]): i32 {
   return t
 }
 
+// The closed type binding `d` is delivered at whole (`deliveredSlotTyOf`), for the emit modules
+// that read the elaboration; -1 for none.
+export function elabDeliveredSlotTy(d: i32): i32 { return deliveredSlotTyOf(d) }
+
 // The program-level holders `elabSlotFacts` asked, for `elabSlotMakerTwins`.
 let elabSlotHolders: i32[] = []
 
@@ -15452,8 +15459,10 @@ function elabSlotFacts() {
           inst.push(ix)
           instFn.push(fd)
         } else {
-          // The values written decide first; the classes close what they leave open.
-          const ft = eplHolderTy(ix, -1)
+          // A closed destination it is delivered at whole decides first, as an annotation would
+          // (D17756); then the values written; the classes close what they leave open.
+          const dd = deliveredSlotTyOf(ix)
+          const ft = if dd >= 0 && !tyHasTyVar(dd) && !tyHasHole(dd) { dd } else { eplHolderTy(ix, -1) }
           // A `let` held per region (`elabRegionsDecide`): each later region a holder of its own.
           const rss = if n is LetDecl && regionUsedOf(ix) { regionStartsOf(ix, fnStmts) } else { [] }
           const rts: i32[] = [ft]
@@ -23383,6 +23392,46 @@ export function eplSlotOneCall(
   }
   EPL.k = k0
   return if cn is Call { EPL.callNode[one] } else { -1 }
+}
+
+// Whether slot `path` of `holder` or a copy, in instance `k`, is called at least twice and every
+// call's arguments are closed at one list of types, pushed onto `tys`; false for any open argument.
+export function eplSlotCallsAgree(
+  holder: i32,
+  path: string[],
+  k: i32,
+  tys: i32[],
+): boolean {
+  const k0 = EPL.k
+  const p = eplSlotPlace(holder, path, k)
+  let first: i32[] = []
+  let n = 0
+  for ci in if p >= 0 { eplCallsStar(p) } else { [] } {
+    const cn = nodeAt(EPL.callNode[ci])
+    if !(cn is Call) {
+      EPL.k = k0
+      return false
+    }
+    const at: i32[] = []
+    for a in cn.callArgs {
+      const t = eplArgTy(ci, a)
+      if t < 0 || t >= T.tys.length || tyHasTyVar(t) {
+        EPL.k = k0
+        return false
+      }
+      at.push(t)
+    }
+    if n > 0 && !tysSameList(first, at) {
+      EPL.k = k0
+      return false
+    }
+    if n == 0 { first = at }
+    n = n + 1
+  }
+  EPL.k = k0
+  if n < 2 { return false }
+  for t in first { tys.push(t) }
+  return true
 }
 
 // Whether every call through slot `path` of `holder` or a copy, in instance `k`, whose arguments
