@@ -1034,6 +1034,7 @@ import {
   mkNullableTy,
   mkObjTy,
   tyAt,
+  tyFieldTyOf,
   tyIsRecord,
   tyScalarBasePrim,
 } from "./check_types"
@@ -22068,6 +22069,7 @@ function recFreshConvert(b: i32[], v: Opnd, dst: i32, at: i32): Opnd | null {
   const cn = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
   if !(cn is Call) || !ftCallFreshLits(cn) { return null }
   const si = recStorageRow(dst)
+  const ri = recStorageRow(src)
   const sty = repTyOf(src)
   const dty = repTyOf(dst)
   if (
@@ -22077,6 +22079,11 @@ function recFreshConvert(b: i32[], v: Opnd, dst: i32, at: i32): Opnd | null {
   ) {
     return null
   }
+  // The record is read once per field, so a temp is held in a local first.
+  const held = v is OVar && v.ov >= 0 && v.ov < ib.irVars.length && ib.irVars[v.ov].vKind != "temp"
+  const t = if held { -1 } else { irVarNew(ib, src, sty, "local", -1) }
+  if t >= 0 { irBNode(b, { asDst: t, asSrc: v }, -1, ibNoValue, at) }
+  const o: Opnd = if t >= 0 { { ov: t } } else { v }
   const fields: Opnd[] = []
   for _k in d.rrFields { fields.push({ ov: -1 }) }
   const layout: i32[] = []
@@ -22089,15 +22096,13 @@ function recFreshConvert(b: i32[], v: Opnd, dst: i32, at: i32): Opnd | null {
       return null
     }
     const fr = a.rrFields[sk]
-    const g: Rhs = {
-      gfV: v,
-      gfIx: sk,
-      gfAt: at,
-      gfStored: false,
-      gfStr: false,
-      gfShared: false,
-    }
-    const fv = irBLetTempTy(b, g, at, fr, repTyOf(fr))
+    // The source is a call, so its field is read by its own row's layout, with no member node.
+    const sfi = if ri >= 0 && ri < sHeapIdx.length { sFieldIndex(ri, nm) } else { -1 }
+    if sfi < 0 || sFieldIsUnionBox(ri, sfi) { return null }
+    const g: Rhs = { rmbV: o, rmbHeap: sHeapIdx[ri], rmbField: sfi }
+    // The field is typed at the call's own field type, which carries the set its ids name.
+    const ft0 = tyFieldTyOf(heldTy(nodeTyAt(u, ibFnIx)), nm)
+    const fv = irBLetTempTy(b, g, at, fr, if ft0 >= 0 { ft0 } else { repTyOf(fr) })
     const cv = if fr == d.rrFields[dk] { fv } else { irConvert(b, fv, d.rrFields[dk], repTyOf(d.rrFields[dk]), at) }
     if ibMiss != "" { return cv }
     fields[dk] = cv
