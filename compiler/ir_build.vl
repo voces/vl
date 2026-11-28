@@ -965,6 +965,7 @@ import {
   sTyIx,
   startStmtOrd,
   startStmts,
+  rlElemName,
   synthMintCount,
   uFieldCount,
   uFieldStart,
@@ -1222,11 +1223,18 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   const minted = synthMintCount()
   const built = build(fnIx, fnPos)
   declinePending(fnIx, built, "this function")
+  if built != "" && (anNodes[fnPos] ?? -2) >= 0 { count("probe: phase A built, the claim missed") }
   if softRefused("") { return declineRefused(emitSoftMsg) }
   if claimBuildMinted(minted) { return false }
   if built != "" || repNodeGen() != gen { return false }
   irInlineCalls(ib)
   irMemFoldAdds(ib)
+  const an = anNodes[fnPos] ?? -2
+  if an == -1 { count("probe: phase A missed, the claim built") }
+  if !anAgrees(fnPos, ib) {
+    emitFail("internal compiler error: `" + ib.irName + "` built to other IR than phase A analysed")
+    return false
+  }
   if verifierRefused("this function") { return false }
   const why = irLowerClaim(ib, globalCtxOf(fnPos), fnPos, out)
   if why != "" {
@@ -1241,6 +1249,84 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   }
   irLeafNote(fnPos, ib)
   return true
+}
+
+// Phase A's facts by `fnStmts` slot: the node count of the IR its build verified, -1 for a build
+// that missed, and absent for a slot phase A did not reach.
+let anNodes: {[i32]: i32} = Map()
+
+// The marks of what a build may write: atoms, rep nodes, synthetic globals and list rows.
+type AnMark = { amAtoms: i32, amGen: i32, amSynth: i32, amRows: i32 }
+
+function anMark(): AnMark {
+  return {
+    amAtoms: litAtomMark(),
+    amGen: repNodeGen(),
+    amSynth: synthMintCount(),
+    amRows: rlElemName.length,
+  }
+}
+
+// The first mark `b` moved past `a`, or "" when none did.
+function anMoved(a: AnMark, b: AnMark): string {
+  if a.amAtoms != b.amAtoms { return "atoms" }
+  if a.amGen != b.amGen { return "rep nodes" }
+  if a.amSynth != b.amSynth { return "synthetic globals" }
+  if a.amRows != b.amRows { return "list rows" }
+  return ""
+}
+
+// The marks phase A opened at, and the first trace one of its builds left, or "".
+let anOpen: AnMark | null = null
+let anTrace = ""
+
+// Builds function `fnIx` (`fnStmts` slot `fnPos`) for its facts alone, in the frame the caller laid
+// out, then rolls back every trace of the build: no shadow row, atom or decline survives it, and
+// one that cannot be rolled back fails the compile at `irAnalyseEnd`.
+export function irAnalyseFn(fnIx: i32, fnPos: i32) {
+  if anOpen == null { anOpen = anMark() }
+  const before = anMark()
+  const rowKey = ibRowKey.slice(0, ibRowKey.length)
+  const rowN = ibRowN.slice(0, ibRowN.length)
+  const s = claimScopeBegin()
+  const built = build(fnIx, fnPos)
+  let n = -1
+  if built == "" && emitSoftMsg == "" && anMoved(before, anMark()) == "" {
+    irInlineCalls(ib)
+    irMemFoldAdds(ib)
+    if irBVerify(ib).vfRule == 0 { n = ib.irNodes.length }
+  }
+  anNodes[fnPos] = n
+  claimScopeEnd(s, false)
+  ibRowKey = rowKey
+  ibRowN = rowN
+  declUnit = -1
+  const moved = anMoved(before, anMark())
+  if moved != "" && anTrace == "" { anTrace = "the build of `" + ib.irName + "` moved the " + moved }
+  ib = irFnNew(-1, "")
+  return 0
+}
+
+// Closes phase A: every mark stands where it opened, or the compile fails naming the first trace.
+export function irAnalyseEnd() {
+  const open = anOpen
+  if open == null { return 0 }
+  const moved = anMoved(open, anMark())
+  if anTrace != "" || moved != "" {
+    emitFail(
+      "internal compiler error: phase A left a trace ("
+        + if anTrace != "" { anTrace } else { "the " + moved }
+        + ")",
+    )
+  }
+  return 0
+}
+
+// Whether the build of `fnPos` is the one phase A analysed: a slot it analysed whose node count
+// differs was built twice to different IR, so the facts read from the first are not this build's.
+function anAgrees(fnPos: i32, f: IrFn): boolean {
+  const n = anNodes[fnPos] ?? -2
+  return n == -2 || n == -1 || n == f.irNodes.length
 }
 
 // Whether a claim's build minted a synthetic global past count `before`: the builder asks plans
@@ -1300,6 +1386,9 @@ function claimStart(
 // Starts a compile's report.
 export function irShadowBegin() {
   irInlineReset()
+  anNodes = Map()
+  anOpen = null
+  anTrace = ""
   ibRowKey = []
   ibRowN = []
   claimScopeOpen = false
