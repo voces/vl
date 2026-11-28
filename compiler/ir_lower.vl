@@ -1238,7 +1238,57 @@ function takeUse(v: i32): boolean {
 }
 
 function isTemp(v: i32): boolean {
-  return v >= 0 && v < lw.irVars.length && lw.irVars[v].vKind == "temp"
+  return v >= 0 && v < lw.irVars.length && lw.irVars[v].vKind == "temp" && !(lwSpill[v] ?? false)
+}
+
+// The temps a claim's lowering keeps in a local of their own (`spillSlot`) instead of on the stack
+// at their one use, as a retry after a stack-order miss named them; empty on the first try.
+let lwSpill: {[i32]: boolean} = Map()
+// The temps the last stack-order miss named, for the retry to spill.
+let lwSpillWant: i32[] = []
+
+// Notes, at a stack-order miss, every temp of `vs` that is not already a stack value.
+function spillWant(vs: i32[]) {
+  for v in vs {
+    if isTemp(v) && !(v < lwStackVal.length && lwStackVal[v]) && !i32ListHas(lwSpillWant, v) {
+      lwSpillWant.push(v)
+    }
+  }
+  return 0
+}
+
+// Notes, at a stack-order miss over `pending` where `seq` is what a node consumed, the pending temps
+// it left that no other pending temp's definition reads: spilling those settles the rest in order.
+// Every pending temp when there is none.
+function spillWantRoots(pending: i32[], seq: i32[]) {
+  const readBy: {[i32]: boolean} = Map()
+  for v in pending {
+    if v >= 0 && v < lwTempRhs.length && !(v < lwStackVal.length && lwStackVal[v]) {
+      for o in irRhsOpnds(lwTempRhs[v]) {
+        if o is OVar { readBy[o.ov] = true }
+      }
+    }
+  }
+  const roots: i32[] = []
+  for v in pending {
+    if !i32ListHas(seq, v) && !readBy.has(v) { roots.push(v) }
+  }
+  return spillWant(if roots.length > 0 { roots } else { pending })
+}
+
+// Whether temp `v` is spilled to a local (`lwSpill`).
+function spilled(v: i32): boolean {
+  return v >= 0 && v < lw.irVars.length && lw.irVars[v].vKind == "temp" && (lwSpill[v] ?? false)
+}
+
+// The local spilled temp `v` is held in, declared at its rep's valtype; -1 where it writes none.
+function spillSlot(v: i32): i32 {
+  const vt = repLocalValtype(lw.irVars[v].vRep, lw.irVars[v].vTy)
+  if vt.length == 0 { return -1 }
+  const s = irOnceSlotAt(vt, v + 1)
+  while lwOwnedSlots.length <= v { lwOwnedSlots.push(-1) }
+  lwOwnedSlots[v] = s
+  return s
 }
 
 // Consumes operand `o` without writing it, as legacy skips a receiver a live hoist already holds:
@@ -1250,7 +1300,10 @@ export function irLSkip(o: Opnd) {
   }
   if o is OVar && isTemp(o.ov) {
     if !tempDefined(o.ov) { return irLMiss("temp used before its definition") }
-    if !takeUse(o.ov) { return irLMiss("non-stack temp: used twice") }
+    if !takeUse(o.ov) {
+      spillWant([o.ov])
+      return irLMiss("non-stack temp: used twice")
+    }
     // A field read's receiver, or a narrowed global read's box, is consumed first, as `irLOpnd`
     // writes it.
     const r = tempRhs(o.ov)
@@ -1276,7 +1329,10 @@ export function irLOpnd(o: Opnd) {
       }
       if isTemp(v) {
         if !tempDefined(v) { return irLMiss("temp used before its definition") }
-        if !takeUse(v) { return irLMiss("non-stack temp: used twice") }
+        if !takeUse(v) {
+          spillWant([v])
+          return irLMiss("non-stack temp: used twice")
+        }
         tempOpenNote(v)
         if lw.irInlOwn < 0 { tempRhsWrite(v) } else { tempRhsWriteInl(v) }
         lwSeq.push(v)
@@ -5805,17 +5861,34 @@ function cond(o: Opnd, pending: i32[]) {
 // The stack-order precondition: the temps a node's operands consumed are the ones its body
 // defined since the previous node, in definition order.
 export function irLSettle(pending: i32[]) {
-  if lwSeq.length != pending.length {
+  let ordered = lwSeq.length == pending.length
+  let i = 0
+  while ordered && i < pending.length {
+    if lwSeq[i] != pending[i] { ordered = false }
+    i = i + 1
+  }
+  if !ordered {
+    spillWantRoots(pending, lwSeq)
     irLMiss("non-stack temp: out of order")
-  } else {
-    let i = 0
-    while i < pending.length {
-      if lwSeq[i] != pending[i] { irLMiss("non-stack temp: out of order") }
-      i = i + 1
-    }
   }
   while pending.length > 0 { pending.pop() }
   lwSeq = []
+  return 0
+}
+
+// A spilled temp's definition: its value written now, consuming the temps defined since the
+// previous node in their order, as any node does, and stored to its own local.
+function spillLet(n: SLet, pending: i32[]) {
+  const v = n.lDst
+  const s = spillSlot(v)
+  if s < 0 { return irLMiss("spilled temp at a rep with no valtype") }
+  while lwTempRhs.length <= v { lwTempRhs.push(n.lRhs) }
+  lwTempRhs[v] = n.lRhs
+  lwTempDef[v] = true
+  lwSeq = []
+  if lw.irInlOwn < 0 { tempRhsWrite(v) } else { tempRhsWriteInl(v) }
+  irLSettle(pending)
+  fbLocalSet(s)
   return 0
 }
 
@@ -5939,6 +6012,7 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
       continue
     }
     if lwMiss == "" && pending.length > 0 && !(keepTop && top == 0) {
+      spillWantRoots(pending, [])
       irLMiss("non-stack temp: unconsumed")
     }
     const ifId = fif[top]
@@ -6098,6 +6172,7 @@ function nodeNow(id: i32, pending: i32[], tail: boolean, armOut: i32) {
   const n = lw.irNodes[id]
   match n {
     SLet => {
+      if spilled(n.lDst) { return spillLet(n, pending) }
       if !isTemp(n.lDst) { return irLMiss("let of a non-temp") }
       if n.lDst >= lwTempRhs.length { return irLMiss("let of a non-temp") }
       lwTempRhs[n.lDst] = n.lRhs
@@ -6743,12 +6818,16 @@ function stageLeadOf(cs: Opnd[], pending: i32[]): i32[] {
   i = 0
   while i < k {
     if i >= lwSeq.length || lwSeq[i] != pending[i] {
+      spillWantRoots(pending, lwSeq)
       irLMiss("non-stack temp: out of order")
       return roots
     }
     i = i + 1
   }
-  if lwSeq.length != k { irLMiss("non-stack temp: out of order") }
+  if lwSeq.length != k {
+    spillWantRoots(pending, lwSeq)
+    irLMiss("non-stack temp: out of order")
+  }
   lwSeq = []
   const rest: i32[] = []
   i = k
@@ -8120,7 +8199,10 @@ function fragmentBody(b: i32[], out: Opnd) {
   const pending = body(b, false, -1, true)
   if lwMiss != "" { return 0 }
   cond(out, pending)
-  if pending.length > 0 { irLMiss("non-stack temp: unconsumed") }
+  if pending.length > 0 {
+    spillWantRoots(pending, [])
+    irLMiss("non-stack temp: unconsumed")
+  }
   return 0
 }
 
@@ -8174,6 +8256,9 @@ function framed(locals: u8[]): u8[] {
   return out
 }
 
+// How many times a claim's lowering retries with more temps spilled before its miss stands.
+const SPILL_TRIES = 8
+
 // Lowers claimed function `f` (at `fnStmts` slot `fnPos`) onto `out` in legacy's place: its code
 // entry, its statement rows, and its callees kept for dead-function elimination. "" when written,
 // else the miss, with nothing written.
@@ -8187,7 +8272,19 @@ export function irLowerClaim(
   if gTestClaimRefusal == 1 {
     emitFail("emitProgram: test claim refusal before the body")
   }
-  const got = entry(f, ctx)
+  lwSpill = Map()
+  lwSpillWant = []
+  let got = entry(f, ctx)
+  // A temp the stack cannot hold in order is spilled to a local and the body lowered again.
+  let tries = 0
+  while lwMiss.indexOf("non-stack temp") == 0 && lwSpillWant.length > 0 && tries < SPILL_TRIES {
+    for v in lwSpillWant { lwSpill[v] = true }
+    lwSpillWant = []
+    while dfeCallee.length > callees0 { dfeCallee.pop() }
+    fbResetLazyFrame()
+    got = entry(f, ctx)
+    tries = tries + 1
+  }
   if gTestClaimRefusal == 2 {
     emitFail("emitProgram: test claim refusal after the body")
   }
