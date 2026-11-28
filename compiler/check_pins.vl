@@ -1,3 +1,4 @@
+import { ckPassCause, ckPassWhy } from "./check_stats"
 // The checker's driver: one walk of the program, then the pin solvers in a fixed order, each
 // writing the annotations it solved and re-checking the program, under a budget per solver. A
 // solver finds and applies; this file decides when a re-check runs, when a pending rewrite is
@@ -50,6 +51,7 @@ import { i32ListHas } from "./listutil"
 import { identDeclOf } from "./symbols"
 import { strContains } from "./strutil"
 import { checkRestart, fvaBuiltReset } from "./check_core_state"
+import { fvaAliasConflictsAll, fvaAliasReset } from "./check_assignable"
 import { ovUnpinnedReport, recAdForcedReport } from "./check_emit_queries"
 import { checkProgramPass } from "./check_program"
 import { annotateTyArgLambdas } from "./check_generic_args"
@@ -195,11 +197,13 @@ export function checkProgram(rootIx: i32) {
   fnTagEtaReset()
   fvaBuiltReset()
   recCovArgReset()
+  fvaAliasReset()
   pinDeepIsRan = false
   pinDeepIsOff = pinDeepIsHeld
   pinDeepIsHeld = false
   checkProgramResumed(rootIx)
   copySafeRecordAll()
+  fvaAliasConflictsAll()
 }
 
 // Overwrites each parenthesised bare name with the name itself: `(id)` is `id` wherever it stands,
@@ -239,6 +243,7 @@ function checkProgramResumed(rootIx: i32) {
   wsReset()
   slotReset()
   holeSlotLateReset()
+  if ckPassWhy == "unnamed" { ckPassCause("resumed") }
   checkProgramPass(rootIx)
   holeSlotLateRun()
   pinSolve()
@@ -250,7 +255,10 @@ function checkProgramResumed(rootIx: i32) {
   if wsPendDecl.length > 0 { pinRun("width", rootIx) }
   pinRun("literal", rootIx)
   // A rewrite still pending after the last pass quieted a refusal nothing will apply.
-  if wsDecline() { checkProgramAgain(rootIx) }
+  if wsDecline() {
+    ckPassCause("wsDecline")
+    checkProgramAgain(rootIx)
+  }
   slotContractWords(rootIx)
   pinReport()
   if P.diags.length == 0 && T.diags.length == 0 { namedCallsPositional(rootIx) }
@@ -264,8 +272,8 @@ function checkProgramResumed(rootIx: i32) {
   weMemoDrop()
   // A choice delivered to a closed function type is built there once its set is tagged.
   if fnTagEtaAgain() && P.diags.length == 0 && T.diags.length == 0 {
-    checkRestart()
-    fnTyFactsReset()
+    pinsRestart()
+    ckPassCause("etaAgain")
     checkProgramResumed(rootIx)
   }
 }
@@ -344,10 +352,10 @@ function pinDeepIs(rootIx: i32) {
   pinDeepIsRan = true
   const genTok = jwExpand(rootIx, crRows.retCalls, crRows.retNames)
   if genTok < 0 { return 0 }
-  checkRestart()
-  fnTyFactsReset()
+  pinsRestart()
   // After the restart, which clears it: the style tier reports nothing about generated code.
   jwSetGenTokStart(genTok)
+  ckPassCause("deepIs")
   checkProgramResumed(rootIx)
 }
 
@@ -393,6 +401,7 @@ function pinRun(p: PinPhase, rootIx: i32) {
       if p == "literal" && lbiPending() { pinUnsettled(p) }
       return pinLate(late)
     }
+    ckPassCause("pin:" + p)
     checkProgramAgain(rootIx)
     round = round + 1
     pinSettle(p, mark, rootIx)
@@ -447,7 +456,10 @@ function pinSettle(p: PinPhase, mark: i32, rootIx: i32) {
     "expParam" => 0
     "width" => 0
     "slot" => {
-      if slotSettle(rootIx) { checkProgramAgain(rootIx) }
+      if slotSettle(rootIx) {
+        ckPassCause("settle:slot")
+        checkProgramAgain(rootIx)
+      }
       0
     }
     "literal" => {
@@ -455,10 +467,12 @@ function pinSettle(p: PinPhase, mark: i32, rootIx: i32) {
       const blamed = recAdBlamed(mark)
       if blamed.length > 0 && recAdUndo(mark, blamed) {
         pinAdoptUndid = true
+        ckPassCause("settle:literal")
         checkProgramAgain(rootIx)
       }
       if recAdLoosened(mark) && recAdUndo(mark, []) {
         pinAdoptUndid = true
+        ckPassCause("settle:literal")
         checkProgramAgain(rootIx)
       }
       0
@@ -517,8 +531,9 @@ function pinSolve() {
 
 // A fresh check of the program after a phase rewrote some declarations' annotations.
 function checkProgramAgain(rootIx: i32) {
-  checkRestart()
-  fnTyFactsReset()
+  const why = ckPassWhy
+  pinsRestart()
+  ckPassCause(why)
   lbiReset()
   recAdPassReset()
   checkProgramPass(rootIx)
@@ -1187,5 +1202,15 @@ function expInfReset() {
   expInfDone = []
   expInfPinLets = []
   pinHintDrop("expParam")
+  return 0
+}
+
+// Restarts the check from an empty arena: the checker's tables (`checkRestart`) and every fact
+// a walk keyed or valued by a type index, which the next walk notes again at its own rows. A
+// table a restart keeps holds no type index or is entry-scoped, and says why where it is declared.
+function pinsRestart() {
+  checkRestart()
+  fnTyFactsReset()
+  copySafeAskedReset()
   return 0
 }
