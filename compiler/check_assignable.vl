@@ -411,7 +411,7 @@ import {
 } from "./check_num_lits"
 import { recordNullHoleObjAdopt } from "./check_obj_shape"
 import { parenPeelIx } from "./check_places"
-import { recOwnPend, recPend } from "./check_rec_rows"
+import { recCovArgNote, recOwnPend, recPend } from "./check_rec_rows"
 import { recDropAdopt } from "./check_rec_drop"
 import { noteRefListView } from "./check_ref_list_view"
 import {
@@ -2475,6 +2475,11 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       // function fields is copied field by field there (D17764).
       if fvaRecFnCopy(srcExpr, srcTy, dstTy) {
         // The copy is delivered as a hand-written literal is: adopted there, its field coerced.
+        return assignableExprIn(srcExpr, nodeTyIxOf(srcExpr), dstTy)
+      }
+      // A `.map` whose callback leaves its result open is typed at the element the destination
+      // closes: a fresh record it returns is built there, a shared one refused (D17793).
+      if fvaMapCbTyped(srcExpr, srcTy, dstTy) {
         return assignableExprIn(srcExpr, nodeTyIxOf(srcExpr), dstTy)
       }
       fvaAliasNote(srcExpr, srcTy, dstTy)
@@ -4689,6 +4694,55 @@ function listSiteMapCopy(site: i32, lam: i32, pos: i32): boolean {
   return fvaSiteSet(site, c)
 }
 
+// Types `.map` call `site`'s un-annotated callback at the element record of `dstTy` that closes a
+// set or hole function field its result leaves open, and re-checks the call; false where `site` is
+// no such call.
+function fvaMapCbTyped(site: i32, srcTy: i32, dstTy: i32): boolean {
+  if site < 0 || srcTy < 0 || dstTy < 0 || inferQuiet || monoRecheckDepth > 0 {
+    return false
+  }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length || fvaListCopyAt(site) {
+    return false
+  }
+  const sx = parenPeelIx(site)
+  const n = if sx >= 0 && sx < P.nodes.length { nodeAt(sx) } else { null }
+  if !(n is Call) || n.callArgs.length != 1 || n.callFn < 0 { return false }
+  const m = nodeAt(parenPeelIx(n.callFn))
+  const lx = parenPeelIx(n.callArgs[0])
+  const l = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  if !(m is Member) || m.memProp != "map" || !(l is FuncDecl) { return false }
+  if l.fnName != "" || l.fnRet >= 0 { return false }
+  const sa = tyAt(nonNullTy(srcTy))
+  const da = tyAt(nonNullTy(dstTy))
+  if !(sa is TyArray) || !(da is TyArray) || da.aRead == 1 { return false }
+  const sr = tyElemOf(sa)
+  const dr = tyElemOf(da)
+  if sr < 0 || dr < 0 || sr >= T.tys.length || dr >= T.tys.length {
+    return false
+  }
+  if !fvaRecFieldsClose(sr, dr) { return false }
+  const rt = fvaAnnot(dr, site, nodePos(site))
+  if rt < 0 { return false }
+  const typed: Node = {
+    fnName: l.fnName,
+    fnTyParams: l.fnTyParams,
+    fnParams: l.fnParams,
+    fnRet: rt,
+    fnBody: l.fnBody,
+    pos: l.pos,
+  }
+  const lam = luAt(addNode(typed), site)
+  const cargs: i32[] = []
+  cargs.push(lam)
+  const c: Node = {
+    callFn: n.callFn,
+    callArgs: cargs,
+    callArgNames: n.callArgNames,
+    pos: n.pos,
+  }
+  return fvaSiteSet(site, c)
+}
+
 // Writes converting copy `n` over `site`, notes it a copy, and checks it: the one place a
 // copy rewrites a delivered site.
 function fvaSiteSet(site: i32, n: Node): boolean {
@@ -6386,6 +6440,9 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         fvaNestedFnDiffers(srcTy, dm, 0, 8)
         || recordHolder(srcTy) && fvaHeldHoleFnDiffers(srcTy, dm, 8)
       ) {
+        // A readonly list of functions handed to a function's parameter is read where it is
+        // stored: the callee is instanced at the argument's own storage, not copied (D17816).
+        if fvaCovariantArgRep(srcExpr, srcTy, dm) { return false }
         fvaRefuseNested(srcExpr, srcTy, dm)
         return true
       }
@@ -6571,6 +6628,48 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     fvaRefuse(site, srcTy, dt, why)
   }
   if stable && callee >= 0 { fvaCopyCalleeAtInstance(callee, t) }
+  return true
+}
+
+// Whether `srcExpr`, a closed list of functions of type `srcTy`, is the argument of a non-generic
+// function whose parameter there is annotated at readonly list `dstTy`; noted with
+// `recCovArgNote`, so the callee is instanced at the argument's storage and each read through the
+// wider type is delivered from it (D17816, D14532's instance per storage rep).
+function fvaCovariantArgRep(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  const x = parenPeelIx(srcExpr)
+  if x < 0 || !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_ARG { return false }
+  const da = if dstTy >= 0 && dstTy < T.tys.length { tyAt(dstTy) } else { null }
+  const sa = if srcTy >= 0 && srcTy < T.tys.length { tyAt(srcTy) } else { null }
+  if !(da is TyArray) || da.aRead != 1 || !(sa is TyArray) { return false }
+  if (
+    !(tyAt(tyElemOf(sa)) is TyFunc)
+    || tyHasTyVar(srcTy)
+    || tyHoldsHole(srcTy)
+  ) {
+    return false
+  }
+  const c = nodeAt(cwIxUp[x])
+  if !(c is Call) || c.callFn < 0 { return false }
+  const fd = identBoundFnDeclOf(c.callFn)
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  const i = cwIxUpAux[x]
+  if (
+    !(f is FuncDecl)
+    || f.fnTyParams.length > 0
+    || i < 0
+    || i >= f.fnParams.length
+  ) {
+    return false
+  }
+  const pn = nodeAt(f.fnParams[i])
+  if (
+    !(pn is Param)
+    || pn.parType < 0
+    || !tySame(nodeTyIxOf(f.fnParams[i]), dstTy)
+  ) {
+    return false
+  }
+  recCovArgNote(x, srcTy)
   return true
 }
 
