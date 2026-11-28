@@ -1,0 +1,215 @@
+// The checker's cost facts for `$VL_CHECK_COST`: each full check pass the build ran, by cause, and
+// the type arena's size beside its structurally distinct rows: by children as minted, the share
+// hash-consing can merge, and by children read through solved holes.
+// Computed only when the host asks, after the compile; nothing in a build reads it.
+
+import { i32ToStr } from "./ast"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyAt,
+  tyElemMinted,
+  tyElemOf,
+  tyKeyMinted,
+  tyKeyOf,
+  tyValMinted,
+  tyValOf,
+} from "./check_types"
+
+// Per build, the cause of each full check pass, for `$VL_CHECK_COST`; the cause a caller names
+// is taken by the next pass.
+let ckPassLog: string[] = []
+export let ckPassWhy = "first"
+
+// Forgets the last build's passes; once per build, not per re-check (`checkRestart`).
+export function ckPassReset() {
+  ckPassLog = []
+  ckPassWhy = "first"
+  return 0
+}
+
+// Names `why` as the cause of the next full check pass.
+export function ckPassCause(why: string) {
+  ckPassWhy = why
+  return 0
+}
+
+// Records a full check pass under the cause named for it.
+export function ckPassNote() {
+  ckPassLog.push(ckPassWhy)
+  ckPassWhy = "unnamed"
+  return 0
+}
+
+// The causes of this build's full check passes, in order.
+export function ckPassCauses(): string[] {
+  return ckPassLog.slice(0, ckPassLog.length)
+}
+
+let csRows: string[] = []
+
+// Builds the report and returns its row count; each row's text is read through `checkStatsLen` and
+// `checkStatsAt`.
+export function checkStatsCount(): i32 {
+  csRows = []
+  const log = ckPassCauses()
+  csRows.push("passes " + i32ToStr(log.length))
+  const causes: string[] = []
+  const counts: i32[] = []
+  for w in log {
+    let k = 0
+    while k < causes.length && causes[k] != w { k = k + 1 }
+    if k == causes.length {
+      causes.push(w)
+      counts.push(1)
+    } else {
+      counts[k] = counts[k] + 1
+    }
+  }
+  let q = 0
+  while q < causes.length {
+    csRows.push("pass " + causes[q] + " " + i32ToStr(counts[q]))
+    q = q + 1
+  }
+  csRows.push(
+    "arena rows "
+      + i32ToStr(T.tys.length)
+      + " distinct "
+      + i32ToStr(csDistinctRows(false))
+      + " solved "
+      + i32ToStr(csDistinctRows(true)),
+  )
+  return csRows.length
+}
+
+export function checkStatsLen(i: i32): i32 {
+  return if i >= 0 && i < csRows.length { csRows[i].length } else { 0 }
+}
+
+export function checkStatsAt(i: i32, j: i32): i32 {
+  return if i >= 0 && i < csRows.length && j >= 0 && j < csRows[i].length { csRows[i][j] } else { 0 }
+}
+
+// The arena's structurally distinct rows: each row keyed by its kind and its children's classes,
+// refined until the class count stops falling; `solved` reads a hole child as its solution.
+function csDistinctRows(solved: boolean): i32 {
+  const n = T.tys.length
+  let canon: i32[] = []
+  let i = 0
+  while i < n {
+    canon.push(i)
+    i = i + 1
+  }
+  let distinct = n
+  let round = 0
+  while round < 16 {
+    const ids: {[string]: i32} = Map()
+    const next: i32[] = []
+    let d = 0
+    let j = 0
+    while j < n {
+      const key = csKeyOf(j, canon, solved)
+      const e = ids[key] ?? -1
+      if e < 0 {
+        ids[key] = j
+        next.push(j)
+        d = d + 1
+      } else {
+        next.push(e)
+      }
+      j = j + 1
+    }
+    canon = next
+    if d == distinct { return d }
+    distinct = d
+    round = round + 1
+  }
+  return distinct
+}
+
+// Row `t`'s key over the classes `canon` gives its children.
+function csKeyOf(t: i32, canon: i32[], solved: boolean): string {
+  const a = tyAt(t)
+  match a {
+    TyPrim => {
+      return "P" + a.primName
+    }
+    TyErr => {
+      return "E"
+    }
+    TyObj => {
+      let k = "O"
+      let i = 0
+      while i < a.objFieldNames.length {
+        k = k
+          + a.objFieldNames[i]
+          + ":"
+          + csClassOf(a.objFieldTypes[i], canon)
+          + ","
+        i = i + 1
+      }
+      return k
+    }
+    TyFunc => {
+      let k = "F"
+      for p in a.fnParamTypes { k = k + csClassOf(p, canon) + "," }
+      return k + ">" + csClassOf(a.fnRet, canon)
+    }
+    TyUnion => {
+      let k = "U"
+      for m in a.uMembers { k = k + csClassOf(m, canon) + "," }
+      return k
+    }
+    TyNullable => {
+      return "N" + csClassOf(a.nInner, canon)
+    }
+    TyArray => {
+      return "A"
+        + csClassOf(
+        if solved { tyElemOf(a) } else { tyElemMinted(a) },
+        canon,
+      )
+        + "/"
+        + i32ToStr(a.aRead)
+    }
+    TyMap => {
+      return "M"
+        + csClassOf(if solved { tyKeyOf(a) } else { tyKeyMinted(a) }, canon)
+        + ","
+        + csClassOf(if solved { tyValOf(a) } else { tyValMinted(a) }, canon)
+        + "/"
+        + i32ToStr(a.mSet)
+    }
+    TyVar => {
+      return "V"
+        + a.tvName
+        + "/"
+        + a.tvKind
+        + "/"
+        + i32ToStr(a.tvBinder)
+        + "/"
+        + i32ToStr(a.tvIdx)
+    }
+    TyLit => {
+      return "L" + a.litKind + a.litText + (if a.litWide { "w" } else { "" })
+    }
+    TyNeg => {
+      return "G" + csClassOf(a.negTy, canon)
+    }
+  }
+}
+
+// The class of child index `k`: its row's class, or the index itself for a sentinel.
+function csClassOf(k: i32, canon: i32[]): string {
+  return i32ToStr(if k >= 0 && k < canon.length { canon[k] } else { k })
+}
