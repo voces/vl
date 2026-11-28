@@ -369,6 +369,7 @@ import {
   elabCallResultMember,
   elabCallResultTy,
   elabDeclFnOf,
+  elabDeliveredSlotTy,
   elabFnReturnsRecordAt,
   elabHasHolderMemberTy,
   elabHasHolderRecords,
@@ -2424,9 +2425,9 @@ function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
   }
   // A function value whose own type's set is tagged is held as that set's id (D15039).
   if fnTagTyIsTagged(own) { return own }
-  // A list of functions left open at this frame holds the closed list its instance's slot fact
-  // closes it to: the signatures its values are called at there (D17729).
-  const sf = letOpenFnListSlotTy(letIx, own, fnIx)
+  // An un-annotated holder of open functions delivered whole at a closed type holds its slot
+  // fact there, as an annotation of that type would (D17729, D17756).
+  const sf = letDeliveredSlotTy(letIx, own, fnIx)
   if sf >= 0 { return sf }
   // A map read the checker stamped as a held list of a tagged set's records holds that rep.
   const hr = heldRepOf(letIx)
@@ -2450,21 +2451,35 @@ function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
   return letNamedHeldTy(letIx, init, fnIx)
 }
 
-// The closed slot fact instance frame `fnIx` holds for binding `letIx` of `[]` where its type `own`
-// there is a list of functions still holding a type variable or hole; -1 otherwise.
-function letOpenFnListSlotTy(letIx: i32, own: i32, fnIx: i32): i32 {
-  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyArray) { return -1 }
-  if !(tyHasTyVar(own) || tyHasInferHole(own)) { return -1 }
-  // A literal with items is built at its own row; only an empty one takes its fill's.
-  if letIx < 0 || letIx >= P.nodes.length { return -1 }
+// The closed slot fact un-annotated holder `letIx` of open functions takes in frame `fnIx`, one
+// reader over holder kinds: a list of `[]` holds its instance frame's own fact, and a map delivered
+// whole at one closed map holds that map; -1 for any other binding or an open fact.
+function letDeliveredSlotTy(letIx: i32, own: i32, fnIx: i32): i32 {
+  if own < 0 || own >= T.tys.length || letIx < 0 || letIx >= P.nodes.length {
+    return -1
+  }
   const d = nodeAt(letIx)
-  const li = if d is LetDecl && d.letType < 0 { unwrapParen(d.letInit) } else { -1 }
-  const ln = if li >= 0 { nodeAt(li) } else { null }
-  if !(ln is ArrayLit) || ln.arrElems.length > 0 { return -1 }
-  if !(tyAt(tyArrayElemIx(own)) is TyFunc) { return -1 }
-  const st = elabSlotInstTyAt(letIx, fnIx)
-  if st < 0 || st >= T.tys.length || !(tyAt(st) is TyArray) { return -1 }
-  return if tyHasTyVar(st) || tyHasInferHole(st) { -1 } else { st }
+  if !(d is LetDecl) || d.letType >= 0 { return -1 }
+  const o = tyAt(own)
+  let st = -1
+  if o is TyArray {
+    // A literal with items is built at its own row; only an empty one takes its fill's.
+    const li = if d.letInit >= 0 { unwrapParen(d.letInit) } else { -1 }
+    const ln = if li >= 0 { nodeAt(li) } else { null }
+    const empty = ln is ArrayLit && ln.arrElems.length == 0
+    if empty && tyAt(tyArrayElemIx(own)) is TyFunc {
+      st = elabSlotInstTyAt(letIx, fnIx)
+    }
+  } else if o is TyMap {
+    const v = tyValOf(o)
+    if tyHasTyVar(v) || tyHasInferHole(v) { st = elabDeliveredSlotTy(letIx) }
+  }
+  if !(tyHasTyVar(own) || tyHasInferHole(own)) || st < 0 || st >= T.tys.length {
+    return -1
+  }
+  const so = tyAt(st)
+  const kind = o is TyArray && so is TyArray || o is TyMap && so is TyMap
+  return if kind && !tyHasTyVar(st) && !tyHasInferHole(st) { st } else { -1 }
 }
 
 // The record a read `xs[i]`, `m[k]` or `m.get(k)` of a container binding holds, nullable where the
@@ -13121,7 +13136,7 @@ export function letRefListSlot(letIx: i32, fnIx: i32) {
   const hs = if held >= 0 { rlSlotOfTy(held) } else { -1 }
   if hs >= 0 { return hs }
   // A list of functions left open at this frame is built at its slot fact's row (D17729).
-  const sf = if d is LetDecl && d.letType < 0 { letOpenFnListSlotTy(letIx, nodeTyAt(letIx, fnIx), fnIx) } else { -1 }
+  const sf = if d is LetDecl && d.letType < 0 { letDeliveredSlotTy(letIx, nodeTyAt(letIx, fnIx), fnIx) } else { -1 }
   const ss = if sf >= 0 { rlSlotOfTy(tyArrayElemIx(sf)) } else { -1 }
   if ss >= 0 { return ss }
   if d is LetDecl && d.letType < 0 && d.letInit >= 0 {
@@ -13576,6 +13591,14 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
           if tsh != -3 { return tsh }
         }
       }
+    }
+    // A map delivered whole at one closed map is built at its shape (D17756).
+    const dm = if d.letType < 0 { letDeliveredSlotTy(letIx, nodeTyIxOf(letIx), fnIx) } else { -1 }
+    if dm >= 0 {
+      const dmo = tyAt(dm)
+      const dv = if dmo is TyMap { tyValOf(dmo) } else { -1 }
+      const dsh = mvShapeOfMapHeldTy(dm, dv, dv)
+      if dsh != -3 { return dsh }
     }
     // A `Map()` whose values are delivered to a record storing a field differently is built
     // at that record's storage, so the delivery is a reference.
