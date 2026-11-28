@@ -2477,6 +2477,11 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         // The copy is delivered as a hand-written literal is: adopted there, its field coerced.
         return assignableExprIn(srcExpr, nodeTyIxOf(srcExpr), dstTy)
       }
+      // A `.map` whose callback leaves its result open is typed at the element the destination
+      // closes: a fresh record it returns is built there, a shared one refused (D17793).
+      if fvaMapCbTyped(srcExpr, srcTy, dstTy) {
+        return assignableExprIn(srcExpr, nodeTyIxOf(srcExpr), dstTy)
+      }
       fvaAliasNote(srcExpr, srcTy, dstTy)
       noteRefListView(srcExpr, srcTy, dstTy)
       recordListCopy(srcExpr, srcTy, dstTy)
@@ -4689,6 +4694,50 @@ function listSiteMapCopy(site: i32, lam: i32, pos: i32): boolean {
   return fvaSiteSet(site, c)
 }
 
+// Types `.map` call `site`'s un-annotated callback at the element record of `dstTy` that closes a
+// set or hole function field its result leaves open, and re-checks the call; false where `site` is
+// no such call.
+function fvaMapCbTyped(site: i32, srcTy: i32, dstTy: i32): boolean {
+  if site < 0 || srcTy < 0 || dstTy < 0 || inferQuiet || monoRecheckDepth > 0 {
+    return false
+  }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length || fvaListCopyAt(site) {
+    return false
+  }
+  const sx = parenPeelIx(site)
+  const n = if sx >= 0 && sx < P.nodes.length { nodeAt(sx) } else { null }
+  if !(n is Call) || n.callArgs.length != 1 || n.callFn < 0 { return false }
+  const m = nodeAt(parenPeelIx(n.callFn))
+  const lx = parenPeelIx(n.callArgs[0])
+  const l = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  if !(m is Member) || m.memProp != "map" || !(l is FuncDecl) { return false }
+  if l.fnName != "" || l.fnRet >= 0 { return false }
+  const sa = tyAt(nonNullTy(srcTy))
+  const da = tyAt(nonNullTy(dstTy))
+  if !(sa is TyArray) || !(da is TyArray) || da.aRead == 1 { return false }
+  const sr = tyElemOf(sa)
+  const dr = tyElemOf(da)
+  if sr < 0 || dr < 0 || sr >= T.tys.length || dr >= T.tys.length {
+    return false
+  }
+  if !fvaRecFieldsClose(sr, dr) { return false }
+  const rt = fvaAnnot(dr, site, nodePos(site))
+  if rt < 0 { return false }
+  const typed: Node = {
+    fnName: l.fnName,
+    fnTyParams: l.fnTyParams,
+    fnParams: l.fnParams,
+    fnRet: rt,
+    fnBody: l.fnBody,
+    pos: l.pos,
+  }
+  arenaSetNode(lx, typed)
+  fvaListCopyNote(site)
+  luGrow()
+  checkNodeHook(site)
+  return true
+}
+
 // Writes converting copy `n` over `site`, notes it a copy, and checks it: the one place a
 // copy rewrites a delivered site.
 function fvaSiteSet(site: i32, n: Node): boolean {
@@ -4803,34 +4852,6 @@ function fvaListBuiltAt(site: i32, de: i32): boolean {
   return ra is TyArray && tySame(tyElemOf(ra), de)
 }
 
-// Whether call `c`'s result is fresh, held by nothing else: a `.map`, which builds a new list, or
-// a call of an un-annotated function every value it returns is a list or record literal.
-function fvaFreshCall(c: Call): boolean {
-  const cx = if c.callFn >= 0 && c.callFn < P.nodes.length { c.callFn } else { -1 }
-  const cn = if cx >= 0 { nodeAt(cx) } else { null }
-  if cn is Member {
-    const rt = nonNullTy(nodeTyIxOf(cn.memObj))
-    return cn.memProp == "map"
-      && rt >= 0
-      && rt < T.tys.length
-      && tyAt(rt) is TyArray
-  }
-  if !(cn is Ident) { return false }
-  const fd = identFnDeclOf(cx)
-  const fn = if fd >= 0 { nodeAt(fd) } else { null }
-  if !(fn is FuncDecl) || fn.fnRet >= 0 { return false }
-  const leaves = recFnValueLeaves(fd)
-  if leaves.length == 0 { return false }
-  for lf in leaves {
-    const l = parenPeelIx(lf)
-    const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
-    if !(ln is ObjLit || ln is ArrayLit) || recRetSoleCall(l) != l {
-      return false
-    }
-  }
-  return true
-}
-
 // A call `site` of record type `srcTy` whose function field holds a set, delivered to `dstTy`
 // closing that field: `site` becomes `{ f: site.f }`, its field coerced there. Only a call of an
 // un-annotated function returning only literals, with another call site, is fresh, so no other
@@ -4844,7 +4865,26 @@ export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
   }
   const sx = parenPeelIx(site)
   const sn = if sx >= 0 && sx < P.nodes.length { nodeAt(sx) } else { null }
-  if !(sn is Call) || !fvaFreshCall(sn) { return false }
+  if (
+    !(sn is Call)
+    || sn.callFn < 0
+    || sn.callFn >= P.nodes.length
+    || !(nodeAt(sn.callFn) is Ident)
+  ) {
+    return false
+  }
+  const fd = identFnDeclOf(sn.callFn)
+  const fn = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) || fn.fnRet >= 0 { return false }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length == 0 { return false }
+  for lf in leaves {
+    const l = parenPeelIx(lf)
+    const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+    if !(ln is ObjLit || ln is ArrayLit) || recRetSoleCall(l) != l {
+      return false
+    }
+  }
   const sa = tyAt(nonNullTy(srcTy))
   const da = tyAt(nonNullTy(dstTy))
   const list = sa is TyArray && da is TyArray
@@ -4879,18 +4919,8 @@ export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
 // field of record type `dr`.
 function fvaRecListMapCopy(site: i32, dr: i32, dro: TyObj): boolean {
   const pos = nodePos(site)
-  const lam = fvaRecCopyLam(site, dr, dro, pos)
-  if lam < 0 { return false }
-  // An identity `.map` is the copy itself: `x.map((r) => r)` becomes `x.map(copy)` (D17793).
-  const recv = fvaIdentityMapRecv(parenPeelIx(site))
-  if recv >= 0 { return fvaMapCallSet(site, recv, lam, pos) }
-  return listSiteMapCopy(site, lam, pos)
-}
-
-// The converting lambda `($r): dr => ({ f: $r.f, … })` over every field of record `dr`, or -1.
-function fvaRecCopyLam(site: i32, dr: i32, dro: TyObj, pos: i32): i32 {
   const rt = fvaAnnot(dr, site, pos)
-  if rt < 0 { return -1 }
+  if rt < 0 { return false }
   const pd = luAt(mkParam("$r" + i32ToStr(site), -1, -1, 0, 0, pos), site)
   const ps: i32[] = []
   ps.push(pd)
@@ -4901,44 +4931,8 @@ function fvaRecCopyLam(site: i32, dr: i32, dro: TyObj, pos: i32): i32 {
   }
   const lit: Node = { objFields: fs, pos: pos }
   const body = luAt(mkParen(luAt(addNode(lit), site), pos), site)
-  return luAt(addNode(fvaLambda(ps, rt, body, site, pos)), site)
-}
-
-// The receiver of `.map` call `x` whose callback is an un-annotated lambda returning only its
-// one parameter, or -1.
-function fvaIdentityMapRecv(x: i32): i32 {
-  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
-  if !(n is Call) || n.callArgs.length != 1 || n.callFn < 0 { return -1 }
-  const m = nodeAt(parenPeelIx(n.callFn))
-  const lx = parenPeelIx(n.callArgs[0])
-  const l = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
-  if !(m is Member) || m.memProp != "map" || !(l is FuncDecl) { return -1 }
-  if l.fnName != "" || l.fnRet >= 0 || l.fnParams.length != 1 { return -1 }
-  const leaves = recFnValueLeaves(lx)
-  if leaves.length != 1 { return -1 }
-  const v = parenPeelIx(leaves[0])
-  const own = v >= 0
-    && v < P.nodes.length
-    && nodeAt(v) is Ident
-    && identDeclOf(v) == l.fnParams[0]
-  return if own { m.memObj } else { -1 }
-}
-
-// Rewrites `site` to `recv.map(lam)` and checks it.
-function fvaMapCallSet(site: i32, recv: i32, lam: i32, pos: i32): boolean {
-  const mem = luAt(mkMember(recv, "map", pos), site)
-  adoptNodeTok(mem, site)
-  const cargs: i32[] = []
-  cargs.push(lam)
-  const names: string[] = []
-  const c: Node = {
-    callFn: mem,
-    callArgs: cargs,
-    callArgNames: names,
-    pos: pos,
-  }
-  fvaListCopyNote(mem)
-  return fvaSiteSet(site, c)
+  const lam = luAt(addNode(fvaLambda(ps, rt, body, site, pos)), site)
+  return listSiteMapCopy(site, lam, pos)
 }
 
 // Whether record `src` holds a set or hole function at a field record `dst` declares a closed
