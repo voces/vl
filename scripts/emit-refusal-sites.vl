@@ -6,9 +6,12 @@
 //     vl run scripts/emit-refusal-sites.vl -- --sample N  # the seeded draw (`--seed S`)
 //     vl run scripts/emit-refusal-sites.vl -- --json OUT  # the sites, machine-readable
 //
-// The unit is the call site of `emitFail` / `emitFailAt`, the only emit-side failure channel,
-// found by balancing parentheses across lines; its first argument becomes a template, literal
-// chunks kept and every other chunk `{}`. Run from the checkout root.
+//     vl run scripts/emit-refusal-sites.vl -- --ir      # every IR decline site, by template
+//
+// The unit is the call site of `emitFail` / `emitFailAt`, found by balancing parentheses across
+// lines; its first argument becomes a template, literal chunks kept and every other chunk `{}`.
+// The IR's own decline channel (`irLMiss`, `irBMiss`, `missRhs`, each a `cannot yet lower`
+// refusal) is counted beside it, the same way. Run from the checkout root.
 
 import { IoError, listDir } from "std:fs"
 import { exit } from "std:process"
@@ -29,7 +32,7 @@ import { Rng, below, newRng } from "./day-one/rng"
 
 const SRC = "compiler"
 const PROG = "emit-refusal-sites.vl"
-const USAGE = "usage: emit-refusal-sites.vl [-h] [--groups] [--full] [--sample N]\n                             [--seed SEED] [--json OUT]"
+const USAGE = "usage: emit-refusal-sites.vl [-h] [--groups] [--full] [--ir] [--sample N]\n                             [--seed SEED] [--json OUT]"
 
 // One alternative of a pattern: a case-folded literal, `\b` on either side optional.
 type Alt = { lit: string, lb: boolean, rb: boolean }
@@ -47,6 +50,7 @@ type Site = {
 }
 
 type Opts = {
+  ir: boolean,
   groups: boolean,
   full: boolean,
   sample: i32,
@@ -327,6 +331,33 @@ function firstArg(text: string, start: i32): string {
   return text.slice(start, i - 1)
 }
 
+// Argument `n` (0-based) of the call whose `(` is at `start - 1`, as `firstArg` reads the first;
+// "" when the call has fewer.
+function argAt(text: string, start: i32, n: i32): string {
+  let s = start
+  let k = 0
+  while k < n {
+    let depth = 1
+    let i = s
+    let comma = -1
+    while i < text.length && depth > 0 && comma < 0 {
+      const c = text[i]
+      if c == 34 {
+        i = strEnd(text, i)
+        continue
+      }
+      if c == 40 || c == 91 || c == 123 { depth = depth + 1 }
+      else if c == 41 || c == 93 || c == 125 { depth = depth - 1 }
+      else if c == 44 && depth == 1 { comma = i }
+      i = i + 1
+    }
+    if comma < 0 { return "" }
+    s = comma + 1
+    k = k + 1
+  }
+  return firstArg(text, s)
+}
+
 // A string literal found in an argument: its body and the byte span it covers.
 type Lit = { body: string, start: i32, end: i32 }
 
@@ -453,6 +484,171 @@ function sites(): Site[] {
   return found
 }
 
+// The IR's decline channel: a miss the builder (`irBMiss`, `missRhs`) or the lowering (`irLMiss`)
+// records, which refuses the claim as `cannot yet lower`.
+const IR_MISS_FNS = ["irLMiss", "irBMiss", "missRhs"]
+
+// A function that records an IR miss of its message argument `arg`: a decline function itself, or
+// a wrapper that hands one of its `string` parameters straight to one (`skip`, `repMissAt`, …).
+type MissFn = { name: string, arg: i32 }
+
+// The parameter names of the function whose header's `(` is at `open`, with each one's `string`ness.
+function paramsAt(text: string, open: i32): string[] {
+  const out: string[] = []
+  let k = 0
+  while true {
+    const a = stripWs(argAt(text, open + 1, k))
+    if a == "" { break }
+    const c = findFrom(a, ":", 0)
+    const nm = if c > 0 { stripWs(a.slice(0, c)) } else { a }
+    const ty = if c > 0 { stripWs(a.slice(c + 1, a.length)) } else { "" }
+    out.push(if ty == "string" { nm } else { "" })
+    k = k + 1
+  }
+  return out
+}
+
+// `IR_MISS_FNS` at their argument 0, then every wrapper over them, to a fixpoint: a top-level
+// function whose body calls a miss function with exactly one of its `string` parameters there.
+function missFns(): MissFn[] {
+  const out: MissFn[] = []
+  for n in IR_MISS_FNS { out.push({ name: n, arg: 0 }) }
+  const names = listDir(SRC)
+  if names is IoError { return out }
+  const texts: string[] = []
+  for fn in sortStrings(names) {
+    if fn.length >= 3 && fn.slice(fn.length - 3, fn.length) == ".vl" {
+      texts.push(blankComments(readText(SRC + "/" + fn)))
+    }
+  }
+  let grew = true
+  while grew {
+    grew = false
+    for text in texts {
+      let p = findFrom(text, "\nfunction ", 0)
+      let q = findFrom(text, "\nexport function ", 0)
+      while p >= 0 || q >= 0 {
+        const at = if p < 0 || (q >= 0 && q < p) { q } else { p }
+        const nameAt = findFrom(text, "function ", at) + 9
+        const open = findFrom(text, "(", nameAt)
+        const name = text.slice(nameAt, open)
+        const bodyEnd = findFrom(text, "\n}\n", open)
+        if at == p {
+          p = findFrom(text, "\nfunction ", p + 1)
+        } else {
+          q = findFrom(text, "\nexport function ", q + 1)
+        }
+        if open < 0 || bodyEnd < 0 { continue }
+        let known = false
+        for m in out {
+          if m.name == name { known = true }
+        }
+        if known { continue }
+        const ps = paramsAt(text, open)
+        const body = text.slice(open, bodyEnd)
+        for m in out {
+          let c = findFrom(body, m.name + "(", 0)
+          let hit = -1
+          while c >= 0 && hit < 0 {
+            if !identAt(body, c - 1) {
+              const a = stripWs(argAt(body, c + m.name.length + 1, m.arg))
+              let i = 0
+              while i < ps.length {
+                if ps[i] != "" && ps[i] == a { hit = i }
+                i = i + 1
+              }
+            }
+            c = findFrom(body, m.name + "(", c + 1)
+          }
+          if hit >= 0 {
+            out.push({ name: name, arg: hit })
+            grew = true
+            break
+          }
+        }
+      }
+    }
+  }
+  return out
+}
+
+function identAt(text: string, i: i32): boolean {
+  return i >= 0 && i < text.length && wordAt(text, i)
+}
+
+// Every call site of an `IR_MISS_FNS` function in `compiler/*.vl`, by file then line; a call that
+// forwards a variable (no literal chunk) is a site of its caller's literal, not its own.
+function irSites(): Site[] {
+  const fns = missFns()
+  const names = listDir(SRC)
+  if names is IoError {
+    die("emit-refusal-sites: cannot list \{SRC} (\{names.msg})", 1)
+    return []
+  }
+  const found: Site[] = []
+  for fn in sortStrings(names) {
+    if fn.length < 3 || fn.slice(fn.length - 3, fn.length) != ".vl" { continue }
+    const raw = readText(SRC + "/" + fn)
+    const text = blankComments(raw)
+    const here: i32[] = []
+    const which: string[] = []
+    const argOf: i32[] = []
+    for mf in fns {
+      let p = findFrom(text, mf.name, 0)
+      while p >= 0 {
+        if !identAt(text, p - 1) && !identAt(text, p + mf.name.length) {
+          here.push(p)
+          which.push(mf.name)
+          argOf.push(mf.arg)
+        }
+        p = findFrom(text, mf.name, p + 1)
+      }
+    }
+    // By position, so the file's sites read in source order.
+    const ord: i32[] = []
+    for _ in here {
+      let j = ord.length
+      ord.push(j)
+      while j > 0 && here[ord[j - 1]] > here[ord[j]] {
+        const t = ord[j - 1]
+        ord[j - 1] = ord[j]
+        ord[j] = t
+        j = j - 1
+      }
+    }
+    for j in ord {
+      const at = here[j]
+      let k = at + which[j].length
+      while k < text.length && isSpace(text[k]) { k = k + 1 }
+      if k >= text.length || text[k] != 40 { continue }
+      let bol = at
+      while bol > 0 && text[bol - 1] != 10 { bol = bol - 1 }
+      if findFrom(text.slice(bol, at), "function", 0) >= 0 { continue }
+      const arg = stripWs(argAt(text, k + 1, argOf[j]))
+      const lits = litsOf(arg)
+      if lits.length == 0 { continue }
+      const t = template(arg, lits)
+      const line = countNl(raw, at) + 1
+      const bodies: string[] = []
+      for l in lits { bodies.push(l.body) }
+      found.push(
+        {
+          file: fn,
+          line: line,
+          loc: fn + ":" + toString(line),
+          fn: which[j],
+          arg: arg,
+          template: t,
+          group: groupOf(t),
+          concedes: anyAlt(toLowerAscii(t), CONCEDES),
+          lits: bodies,
+        },
+      )
+    }
+  }
+  return found
+}
+
 function distinctCount(xs: string[]): i32 {
   const seen: Set<string> = Set()
   for x in xs { seen.add(x) }
@@ -558,7 +754,9 @@ function usageError(msg: string) {
   die(PROG + ": error: " + msg, 2)
 }
 
-const LONG = ["--help", "--groups", "--full", "--sample", "--seed", "--json"]
+const LONG = [
+  "--help", "--groups", "--full", "--ir", "--sample", "--seed", "--json",
+]
 
 // The long option `a` names, as argparse resolves a unique prefix; "" with the error said.
 function resolve(a: string): string {
@@ -577,6 +775,7 @@ function resolve(a: string): string {
 
 function parse(args: readonly string[]): Opts {
   const o: Opts = {
+    ir: false,
     groups: false,
     full: false,
     sample: 0,
@@ -604,13 +803,14 @@ function parse(args: readonly string[]): Opts {
     if opt == "--help" {
       print(
         USAGE
-          + "\n\noptions:\n  -h, --help   show this help message and exit\n  --groups\n  --full\n  --sample N\n  --seed SEED\n  --json OUT",
+          + "\n\noptions:\n  -h, --help   show this help message and exit\n  --groups\n  --full\n  --ir\n  --sample N\n  --seed SEED\n  --json OUT",
       )
       exit(0)
     }
     if opt == "--groups" { o.groups = true }
     if opt == "--full" { o.full = true }
-    if opt == "--groups" || opt == "--full" {
+    if opt == "--ir" { o.ir = true }
+    if opt == "--groups" || opt == "--full" || opt == "--ir" {
       if value != null {
         usageError(
           "argument \{opt}: ignored explicit argument '\{value ?? ""}'",
@@ -707,6 +907,33 @@ function main(args: readonly string[]): i32 {
       + "%)",
   )
   print(row("  their distinct templates", distinctCount(templatesOf(un))))
+  const ir = irSites()
+  print("")
+  print(row("IR DECLINE SITES (`cannot yet lower`)", ir.length))
+  let direct = 0
+  for name in IR_MISS_FNS {
+    let n = 0
+    for s in ir {
+      if s.fn == name { n = n + 1 }
+    }
+    direct = direct + n
+    print(row("  " + name, n))
+  }
+  print(row("  through a wrapper (skip, repMissAt, …)", ir.length - direct))
+  print(row("  their distinct templates", distinctCount(templatesOf(ir))))
+  if a.ir {
+    print("")
+    const by: Map<string, string[]> = Map()
+    for s in ir {
+      const xs = by[s.template] ?? []
+      xs.push(s.loc)
+      by[s.template] = xs
+    }
+    for t in sortStrings(by.keys()) {
+      const xs = by[t] ?? []
+      print("* `\{t}` — \{toString(xs.length)}: \{join(xs, ", ")}")
+    }
+  }
 
   if a.groups || a.full {
     print("")

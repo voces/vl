@@ -61,6 +61,7 @@ import {
   elabBindingFnSet,
   elabCallHoleParamTy,
   elabCallParamBoundTy,
+  elabCallStorageAt,
   elabCbArgSig,
   elabDeclFnOf,
   elabDeclIsValue,
@@ -2629,53 +2630,37 @@ function monoSubstLetType(
   bT: i32[],
 ) {
   if letType < 0 { return letType }
-  // A binding of one type parameter seeded from a parameter of another holds what that
-  // parameter holds: a rung for the binding's writes' join (D17803).
+  // A binding of one type parameter initialised at another is built at its initialiser's type, as
+  // the check binds it: it holds what it is written, not its annotation's pin (D17321's ruling).
   const ln = if letIx >= 0 && letIx < P.nodes.length { nodeAt(letIx) } else { null }
-  const lt = if ln is LetDecl { nodeAt(letType) } else { null }
-  const ix = if ln is LetDecl && ln.letInit >= 0 { unwrapParen(ln.letInit) } else { -1 }
-  const d = if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Ident { identDeclOf(ix) } else { -1 }
-  const pn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
-  if (
-    lt is TypeRef
-    && pt is TypeRef
-    && pn is Param
-    && pt.tyName != lt.tyName
-    && strListHas(typarams, lt.tyName)
-    && strListHas(typarams, pt.tyName)
-  ) {
-    return monoSubstLetType(-1, pn.parType, typarams, bN, bT)
-  }
+  const bound = if ln is LetDecl && ln.letInit >= 0 { nodeTyIxOf(unwrapParen(ln.letInit)) } else { -1 }
+  const annTy = nodeTyIxOf(letType)
+  const seeded = bound >= 0
+    && annTy >= 0
+    && bound != annTy
+    && tyAt(annTy) is TyVar
+    && tyAt(bound) is TyVar
   // A copy of a parameter takes the type the elaboration closes that parameter at.
-  const ct = elabCopyTyOwn(letIx)
+  const ct = if seeded { -1 } else { elabCopyTyOwn(letIx) }
   if ct >= 0 && tyAt(ct) is TyFunc {
     return monoSynthPinRef(monoPinOfClosedTy(ct), ct, -1)
   }
   const tn = nodeAt(letType)
-  if tn is TypeRef {
-    if monoAnnMentionsTyParam(letType, typarams) {
-      // The let's type substituted at the instance, spelled by the naming rule with an anonymous
-      // record by its fields: its `#anonN` handle inside a union names no type the registry can
-      // key (D12641). A binding that stays open keeps its annotation.
-      let sty = -1
-      // A loop value's carrier keeps its open type beside its annotation (`monoAnnOpenTyNote`).
-      const ot = nodeTyIxOf(letType)
-      const origLet = if ot >= 0 { ot } else { monoAnnOpenTyOf(letType) }
-      if origLet >= 0 {
-        const s2 = substTyDeepOf(origLet, bN, bT, monoBuild.own)
-        if s2 >= 0 && s2 != origLet {
-          if !tyHasTyVar(s2) { sty = s2 }
-        }
-      }
-      const sub = if sty >= 0 { monoPinSpellNoAnon(sty) } else { "" }
-      if sub != "" && sub != tn.tyName {
-        const subC = monoPinMintedUnion(sub, sty, sty)
-        // Spelled by the registered union an assignment's `letUnionNameOf` resolves (D2676), and
-        // typed at the substitution, never by parsing that spelling back: an arm may be spelled
-        // by its row label, which names no type.
-        return synthTypeRefTy(subC, tn.pos, sty)
-      }
+  if tn is TypeRef && (seeded || monoAnnMentionsTyParam(letType, typarams)) {
+    // The open type substituted at the instance, spelled by the naming rule with an anonymous
+    // record by its fields: its `#anonN` handle inside a union names no type the registry can
+    // key (D12641). A binding that stays open keeps its annotation. A loop value's carrier keeps
+    // its open type beside its annotation (`monoAnnOpenTyNote`).
+    const origLet = if seeded { bound } else if annTy >= 0 { annTy } else { monoAnnOpenTyOf(letType) }
+    const s2 = if origLet >= 0 { substTyDeepOf(origLet, bN, bT, monoBuild.own) } else { -1 }
+    const sty = if s2 >= 0 && s2 != origLet && !tyHasTyVar(s2) { s2 } else { -1 }
+    const sub = if sty >= 0 { monoPinSpellNoAnon(sty) } else { "" }
+    if sub != "" && sub != tn.tyName {
+      const subC = monoPinMintedUnion(sub, sty, sty)
+      // Spelled by the registered union an assignment's `letUnionNameOf` resolves (D2676), and
+      // typed at the substitution, never by parsing that spelling back: an arm may be spelled
+      // by its row label, which names no type.
+      return synthTypeRefTy(subC, tn.pos, sty)
     }
   }
   return letType
@@ -11279,10 +11264,38 @@ function monoCoerceChoiceBinding(
   if !(d is LetDecl) { return 0 }
   // A choice of a tagged set is its member's id, delivered as it is (D15063).
   if fnTagTyIsTagged(nodeTyIxOf(d.letInit)) { return 0 }
-  const xt = expTy
-  const et = if monoTyConcreteFn(expTy) { expTy } else { tnameTy }
+  // A nullable destination delivers its function to the function arms, and its `null` to a `null`
+  // arm (D17818).
+  const xt = if tyNulFuncInner(expTy) >= 0 { tyNulFuncInner(expTy) } else { expTy }
+  const tn = if tyNulFuncInner(tnameTy) >= 0 { tyNulFuncInner(tnameTy) } else { tnameTy }
+  const et = if monoTyConcreteFn(xt) { xt } else { tn }
   const pTys = delTys
   const iv = unwrapParen(d.letInit)
+  // A choice with a `null` arm is taken only where the elaboration types it the nullable of the
+  // destination's function; where the arm's instance differs it stays refused (D17828, D17829).
+  // Whether the choice, or an `if` an arm of it hands on, has an arm whose value is `null`.
+  let nul = false
+  const xs: i32[] = [iv]
+  while xs.length > 0 && !nul {
+    const x = xs.pop() ?? -1
+    const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if xn is IfStmt {
+      for arm in [xn.ifThen, xn.ifElse] {
+        const tv = if arm >= 0 { ifArmValueExpr(arm) } else { -1 }
+        const a = unwrapParen(if tv >= 0 { tv } else { arm })
+        if a >= 0 && nodeAt(a) is NullLit { nul = true }
+        xs.push(a)
+      }
+    }
+  }
+  const ht = if nul { elabNodeTy(lf[1], if lf[0] >= 0 { elabKeyAt(lf[0]) } else { -1 }) } else { -1 }
+  const hn = if ht >= 0 && ht < T.tys.length { tyAt(ht) } else { null }
+  if (
+    nul
+    && !(hn is TyNullable && hn.nInner >= 0 && tySameSealed(hn.nInner, et))
+  ) {
+    return 0
+  }
   const g0 = monoFirstArmGenName(iv, lf[0], 0)
   const seen = monoChoiceBindNote(
     lf,
@@ -11294,12 +11307,21 @@ function monoCoerceChoiceBinding(
     monoRetypeChoiceRead(d.letInit, at)
     return 1
   }
-  if monoCoerceFnValueTys(d.letInit, lf[0], xt, pTys, tnameTy) < 0 { return -1 }
-  if monoTyConcreteFn(et) {
+  if monoCoerceFnValueTys(d.letInit, lf[0], xt, pTys, tn) < 0 { return -1 }
+  // A choice holding `null` is typed at the nullable of its arm's instance (`monoRetypeIfInit`).
+  if monoTyConcreteFn(et) && !nul {
     nodeTyRecord(iv, et)
     nodeTyRecord(d.letInit, et)
   } else {
     monoRetypeIfInit(d.letInit, monoFirstArmGenName(iv, lf[0], 0), at, lf[0])
+    // One holding `null` holds the nullable of its arm's instance, as does the read it typed.
+    const it = nodeTyIxOf(iv)
+    if nul && monoTyConcreteFn(it) {
+      const nt = mkNullableTy(it)
+      if nodeTyIxOf(at) == it { nodeTyRecord(at, nt) }
+      nodeTyRecord(iv, nt)
+      nodeTyRecord(d.letInit, nt)
+    }
   }
   monoRetypeChoiceRead(d.letInit, at)
   return 1
@@ -14175,6 +14197,14 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   const rtE = elabNodeTyAt(d.letInit, ctx)
   const rt = if rtE >= 0 && rtE < T.tys.length && tyAt(rtE) is TyArray && !tyHasTyVar(rtE) { rtE } else { nodeTyIxOf(d.letInit) }
   if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyArray && !tyHasTyVar(rt) {
+    // Its function elements are still delivered at its closed element type: a hole function
+    // stored here and in a list of another width is built at each list's own (D17820).
+    const fe = tyArrayElemIx(rt)
+    if fe >= 0 && fe < T.tys.length && tyAt(fe) is TyFunc && !tyHasTyVar(fe) {
+      for e in lit.arrElems {
+        if monoCoerceFnValueName(e, ctx, fe) < 0 { return -1 }
+      }
+    }
     return 0
   }
   // A literal of maps takes the elaboration's closed slot fact, its open elements and the reads of
@@ -16455,6 +16485,11 @@ function monoStoredSlotFnTy(lf0: i32[], path: string[], vals: i32[][]): i32 {
   if pins.length != 1 { return -1 }
   // The slot's type is the one the elaboration delivers it at; each value is instanced there.
   let ft = monoSlotDeliveryTy(lf, path, omit, true)
+  // A pin no closed delivery serves came through reads of the stored slot, which read it at its
+  // stored rep: the stored values decide it, as they do an uncalled slot's.
+  if ft < 0 && monoUncalledSlotFnTy(at, path, vals) >= 0 {
+    return monoUncalledSlotFnTy(at, path, vals)
+  }
   if ft < 0 {
     emitFailAt(
       "emitProgram: internal: a function slot pinned at one signature has no one closed type the elaboration delivers it at",
@@ -20103,8 +20138,9 @@ function monoArgCallsBackGeneric(a: i32): boolean {
   return monoInertArgFns(c, fes, at, 0) && fes.length > 0
 }
 
-// Whether argument `a` is an `if` whose arms each name a function, one of them generic or
-// un-annotated, so it takes the type the value arguments bind as either function would (D9005).
+// Whether argument `a` is an `if` whose arms each name a function or are `null`, one of them
+// generic or un-annotated, so it takes the type the value arguments bind as either function would
+// (D9005, D17818).
 function monoArgIsOpenFnChoice(a: i32, depth: i32): boolean {
   const x = unwrapParen(a)
   if x < 0 || depth > MONO_ALIAS_CHAIN_MAX { return false }
@@ -20125,9 +20161,16 @@ function monoArgIsOpenFnChoice(a: i32, depth: i32): boolean {
       const tv = ifArmValueExpr(arm)
       const v = unwrapParen(if tv >= 0 { tv } else { arm })
       if v < 0 { return false }
-      if monoCalleeIsGeneric(v) || monoArgIsOpenFnValue(v, -1) { open = true }
-      else if monoArgIsOpenFnChoice(v, depth + 1) { open = true }
-      else if !(nodeAt(v) is Ident) || fnIndexOfNode(v) < 0 { return false }
+      if monoCalleeIsGeneric(v) || monoArgIsOpenFnValue(v, -1) {
+        open = true
+      } else if monoArgIsOpenFnChoice(v, depth + 1) {
+        open = true
+      } else if (
+        !(nodeAt(v) is NullLit)
+        && (!(nodeAt(v) is Ident) || fnIndexOfNode(v) < 0)
+      ) {
+        return false
+      }
     }
   }
   return open
@@ -21887,6 +21930,17 @@ function monoPinAnnotatedParam(
     return 0
   }
   if tp == "" {
+    // An argument held at another storage than a concrete annotation pins the instance at that
+    // storage, asked before the annotation pins itself (D14532, D17816).
+    const sk = elabCallStorageAt(monoCallTplOf(callIx), i)
+    const sr = if sk >= 0 { sk } else { recArgRepOf(monoArgSrcOf(args[i])) }
+    const srp = if sr >= 0 && monoAnnHasTyParam(p.parType, -1, fn.fnTyParams) { "" } else if sr >= 0 { monoClosedTyPin(sr) } else { "" }
+    if srp != "" {
+      pinned.push(srp)
+      pinTys.push(sr)
+      pinOwn.push(sr)
+      return 0
+    }
     // A composite annotation riding type params (`Box<T>`): bind them by
     // matching the pattern against the argument's concrete type name, then
     // pin the substituted annotation. A concrete annotation pins unchanged.
@@ -27276,6 +27330,31 @@ function monoFnReturnedObjLit(fd: i32): i32 {
     lit = r
   }
   return lit
+}
+
+// The one closed type un-annotated function `fd`, whose result type `t` is open, builds its
+// result at, where every value it hands back (`collectRetValues`) is a list or record literal
+// stamped at that type (`litRepTyAt`); -1 otherwise, or where `t` is closed. A call's result is
+// read at it, one value with one layout (D17795).
+export function monoFnBuiltRetLitTy(fd: i32, t: i32): i32 {
+  if t >= 0 && !tyHasTyVar(t) && !tyHasInferHole(t) { return -1 }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 || f.fnRet >= 0 { return -1 }
+  const vs: i32[] = []
+  collectRetValues(f.fnBody, vs)
+  let bt = -1
+  for v in vs {
+    const u = unwrapParen(v)
+    const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+    if !(n is ArrayLit) && !(n is ObjLit) { return -1 }
+    const lt = litRepTyAt(u, -1)
+    if lt < 0 || lt >= T.tys.length || tyHasTyVar(lt) || tyHasInferHole(lt) {
+      return -1
+    }
+    if bt >= 0 && !tySameSealed(bt, lt) { return -1 }
+    bt = lt
+  }
+  return bt
 }
 
 // Records on node `i`, when it is an un-annotated binding the walk left open, the closed type the

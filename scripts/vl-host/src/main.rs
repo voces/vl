@@ -4488,7 +4488,11 @@ fn arm_seed_store(store: &mut Store<()>) {
         FUEL_WEIGHED_AT.with(|c| c.set(Some(u64::MAX)));
     }
     let mut last = resident_bytes();
+    let stop_on_sigint = prof.is_some() && guest_sigint_stop_arm();
     store.epoch_deadline_callback(move |mut cx| {
+        if stop_on_sigint && GUEST_SIGINT.load(Ordering::Relaxed) {
+            return Err(Error::msg("stopped by SIGINT ($VL_PROFILE_GUEST_SIGINT)"));
+        }
         if let Some(p) = prof.as_ref() {
             if let Some(p) = p.lock().unwrap().as_mut() {
                 let delta = if fuel {
@@ -4509,6 +4513,33 @@ fn arm_seed_store(store: &mut Store<()>) {
         }
         Ok(UpdateDeadline::Continue(1))
     });
+}
+
+/// Set by SIGINT under `$VL_PROFILE_GUEST_SIGINT=1`; the next sample traps the guest.
+static GUEST_SIGINT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn guest_sigint(_: libc::c_int) {
+    GUEST_SIGINT.store(true, Ordering::Relaxed);
+}
+
+/// Under `$VL_PROFILE_GUEST_SIGINT=1`, makes SIGINT stop a profiled guest at its next sample with a
+/// trap, so a hung compile ends with the guest's backtrace and its profile written; false when the
+/// flag is off or the platform has no SIGINT handler.
+fn guest_sigint_stop_arm() -> bool {
+    if std::env::var("VL_PROFILE_GUEST_SIGINT").ok().as_deref() != Some("1") {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let handler: extern "C" fn(libc::c_int) = guest_sigint;
+        unsafe { libc::signal(libc::SIGINT, handler as libc::sighandler_t) };
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Stop sampling and write the profile. Idempotent — the second call finds `None` —
@@ -4711,6 +4742,7 @@ fn compile_vl_instance(
     report_guest_fuel(store);
     report_guest_alloc(resident0);
     report_late_demands(inst, store, source_path);
+    report_check_cost(inst, store, source_path);
     report_inst_keys(inst, store, source_path);
     report_touch_set(inst, store, source_path);
     report_cls_census(inst, store, source_path);
@@ -4931,6 +4963,37 @@ fn report_late_demands(inst: &Instance, store: &mut Store<()>, path: &str) {
             .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
             .collect();
         rows.push_str(&format!("[late] {path}: demand {name}\n"));
+    }
+    eprint!("{rows}");
+}
+
+/// Whether `$VL_CHECK_COST=1` asked for each compile's checker cost facts.
+fn check_cost_on() -> bool {
+    std::env::var("VL_CHECK_COST").ok().as_deref() == Some("1")
+}
+
+/// Under `$VL_CHECK_COST=1`, print one `[check-cost] <path>: <row>` line per row of the guest's
+/// checker cost report (`checkStatsCount`): the full check passes, by cause, and the type arena's
+/// rows beside its structurally distinct ones. A seed without the report prints nothing.
+fn report_check_cost(inst: &Instance, store: &mut Store<()>, path: &str) {
+    if !check_cost_on() {
+        return;
+    }
+    let (Ok(count), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "checkStatsCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "checkStatsLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "checkStatsAt"),
+    ) else {
+        return;
+    };
+    let n = count.call(&mut *store, ()).unwrap_or(0);
+    let mut rows = String::new();
+    for i in 0..n {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let row: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        rows.push_str(&format!("[check-cost] {path}: {row}\n"));
     }
     eprint!("{rows}");
 }
@@ -7479,12 +7542,23 @@ const BINARYEN_CORES_DEFAULT: usize = 4;
 ///
 /// `map`, when given, is the module's source map: binaryen reads it and writes it back
 /// rewritten for the module it writes (`--source-map`, D3561).
+///
+/// Runs `wasm-opt` over `path` in place, once per `--then`-separated stage of `passes`, each
+/// stage on the one before's output; with no `--then` it is one run.
 fn optimize_in_place<S: AsRef<str>>(
     path: &str,
     flag: &str,
     passes: &[S],
     map: Option<&str>,
 ) -> Result<()> {
+    let all: Vec<&str> = passes.iter().map(AsRef::as_ref).collect();
+    for stage in all.split(|p| *p == "--then") {
+        optimize_stage(path, flag, stage, map)?;
+    }
+    Ok(())
+}
+
+fn optimize_stage(path: &str, flag: &str, passes: &[&str], map: Option<&str>) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
         // The unoptimized module is already on disk at this point. Leaving it there
         // would re-open the hole from the other side: a caller that ignores the exit
@@ -7502,7 +7576,7 @@ fn optimize_in_place<S: AsRef<str>>(
         );
     };
     let mut argv: Vec<&str> = vec![path];
-    argv.extend(passes.iter().map(AsRef::as_ref));
+    argv.extend_from_slice(passes);
     argv.extend_from_slice(BINARYEN_FEATURES);
     if let Some(m) = map {
         argv.extend_from_slice(&["--input-source-map", m, "--output-source-map", m]);
@@ -10405,6 +10479,10 @@ fn pump_session(
                 if late_demands_on() {
                     let p = cmd_path.read(&mut store)?;
                     report_late_demands(&inst, &mut store, &p);
+                }
+                if check_cost_on() {
+                    let p = cmd_path.read(&mut store)?;
+                    report_check_cost(&inst, &mut store, &p);
                 }
                 if inst_keys_on() {
                     let p = cmd_path.read(&mut store)?;

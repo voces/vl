@@ -143,6 +143,7 @@ import {
   recBuildCount,
   recBuildTable,
   recBuildTyIn,
+  recCovArgOf,
   recKeptFnDecl,
   recKeptFnDstOf,
 } from "./check_rec_rows"
@@ -584,6 +585,145 @@ export let elabDeliveredRowClassFn: (ty: i32) => string = elabDeliveredRowClassU
 // Whether binding name `nm` is a delivered-row entry (`#r.<param>`), keyed by its record's row class.
 function elabIsRowEntry(nm: string): boolean {
   return nm.length > 3 && nm.slice(0, 3) == "#r."
+}
+
+// The storage the instance call `call` makes under the walk's current instance keys its
+// parameter `i` at: exactly that call's key, never another instance's (D17816); -1 else.
+export function elabCallStorageAt(call: i32, i: i32): i32 {
+  if call < 0 { return -1 }
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  return elabKeyStorageAt(elabCallInstFrom(call, top), i)
+}
+
+// The storage instance `k`'s storage entry binds parameter `i` at, or -1 (D17816).
+export function elabKeyStorageAt(k: i32, i: i32): i32 {
+  if k < 0 || k >= ekNames.length { return -1 }
+  const names = ekNames[k]
+  const tys = ekTys[k]
+  let j = 0
+  while j < names.length && j < tys.length {
+    if elabRepEntryParam(names[j]) == i { return tys[j] }
+    j = j + 1
+  }
+  return -1
+}
+
+// The storage argument `a` of a call made inside instance `from` is held at: the check's note for
+// it, or, for a read of one of the instance's own storage-keyed parameters, that storage; -1 else.
+function elabArgStorageTy(a: i32, from: i32): i32 {
+  const sr = recCovArgOf(a)
+  if (
+    sr >= 0
+    || from < 0
+    || from >= ekDecl.length
+    || a < 0
+    || !(nodeAt(a) is Ident)
+  ) {
+    return sr
+  }
+  const d = identDeclOf(a)
+  const dn = nodeAt(ekDecl[from])
+  if !(dn is FuncDecl) { return -1 }
+  let i = 0
+  while i < dn.fnParams.length {
+    if dn.fnParams[i] == d { return elabKeyStorageAt(from, i) }
+    i = i + 1
+  }
+  return -1
+}
+
+// Whether callee `decl`'s parameter `i` is a readonly list a storage `st` of another type can be
+// handed to, so the callee is instanced at that storage.
+function elabCovParamTakes(decl: i32, i: i32, st: i32): boolean {
+  const dn = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return false }
+  const pn = nodeAt(dn.fnParams[i])
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const pt = nodeTyIxOf(dn.fnParams[i])
+  const pa = if pt >= 0 && pt < T.tys.length { tyAt(pt) } else { null }
+  return pa is TyArray && pa.aRead == 1 && !tySameSealed(pt, st)
+}
+
+// Enqueues the instance root call `c` at `ix` keys its callee at, where one of its arguments holds
+// a storage the check noted (`recCovArgOf`); none for any other call.
+function elabStorageRootAt(ix: i32, c: Call) {
+  if c.callFn < 0 { return 0 }
+  const d = identFnDeclOf(c.callFn)
+  if d < 0 || !elabBindsNothing(d) { return 0 }
+  const names: string[] = []
+  const tys: i32[] = []
+  elabStorageEntries(ix, d, names, tys, -1)
+  if names.length == 0 { return 0 }
+  elabReachNote(-1, elabEnqueue(d, names, tys, -1), ix)
+  return 0
+}
+
+// Adds a storage entry to `names`/`tys` for each argument of `call` to `decl`, made inside
+// instance `from`, held at another storage than its readonly list parameter: the callee is
+// instanced there (D17816).
+function elabStorageEntries(
+  call: i32,
+  decl: i32,
+  names: string[],
+  tys: i32[],
+  from: i32,
+) {
+  const cn = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { null }
+  if !(cn is Call) { return 0 }
+  let ai = 0
+  while ai < cn.callArgs.length {
+    const nm = "$rep." + i32ToStr(ai)
+    const sr = elabArgStorageTy(parenPeelIx(cn.callArgs[ai]), from)
+    if sr >= 0 && elabCovParamTakes(decl, ai, sr) && !strListHas(names, nm) {
+      names.push(nm)
+      tys.push(sr)
+    }
+    ai = ai + 1
+  }
+  return 0
+}
+
+// The storage binding `d` is an alias of (`recCovArgOf`, the one storage accessor), else -1.
+export function elabAliasStorageTy(d: i32): i32 { return recCovArgOf(d) }
+
+// The storage parameter `par` of the function at `fnIx` is held at in that instance, where a
+// storage entry keys it (D17816); else -1.
+export function elabParamStorageTy(par: i32, fnIx: i32): i32 {
+  const k = elabKeyAt(fnIx)
+  if k < 0 || k >= ekDecl.length { return -1 }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) { return -1 }
+  const names = ekNames[k]
+  const tys = ekTys[k]
+  let i = 0
+  while i < names.length && i < tys.length {
+    const rp = elabRepEntryParam(names[i])
+    if rp >= 0 && rp < dn.fnParams.length && dn.fnParams[rp] == par {
+      return tys[i]
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Whether `nm` names a storage entry: `$rep.<i>` binds parameter `i` at the storage its argument
+// is held at, so a callee handed two storages is two instances (D17816).
+function elabIsRepEntry(nm: string): boolean {
+  return nm.length > 5 && nm.slice(0, 5) == "$rep."
+}
+
+// The parameter index storage entry `nm` names, or -1.
+function elabRepEntryParam(nm: string): i32 {
+  if !elabIsRepEntry(nm) { return -1 }
+  let v = 0
+  let i = 5
+  while i < nm.length {
+    const d = nm.charCodeAt(i) - 48
+    if d < 0 || d > 9 { return -1 }
+    v = v * 10 + d
+    i = i + 1
+  }
+  return v
 }
 
 // Per read of a parameter the instance being walked delivers at another record (`#r.<i>`), that
@@ -1542,7 +1682,10 @@ function elabCanon(
     }
     if (
       !has
-      && (elabOwnName(decl, nm) || elabSigReads(decl, nm) || elabIsRowEntry(nm))
+      && (elabOwnName(decl, nm)
+        || elabSigReads(decl, nm)
+        || elabIsRowEntry(nm)
+        || elabIsRepEntry(nm))
     ) {
       if !elabTyClosed(tys0[i0]) { return false }
       names.push(nm)
@@ -2524,6 +2667,7 @@ function elabDemandFrom(
       }
     }
   }
+  elabStorageEntries(call, decl, names, tys, from)
   // A declaration with no type variable to bind is its generic pass's own typing: the root.
   if names.length == 0 && elabBindsNothing(decl) { return -1 }
   // A binding kept as a set where the elaboration already holds the instance at every closed pin
@@ -3527,13 +3671,10 @@ function elabReadRowsStamp(k: i32) {
 
 // The one row every value call `c`'s callee returns is stamped at (`elabWalkReadRows`): a read the
 // walk stamps, or a read of the callee's own un-annotated parameter whose argument is one; -1
-// otherwise. The callee is a named function or a binding of a lambda.
+// otherwise. The callee is a named function, a binding of a lambda, or a field of a binding of a
+// record literal holding one.
 function elabCallReadRow(c: Call): i32 {
-  const cf = parenPeelIx(c.callFn)
-  if cf < 0 || !(nodeAt(cf) is Ident) { return -1 }
-  const d = identDeclOf(cf)
-  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  const fx = if dn is LetDecl && dn.letType < 0 { parenPeelIx(dn.letInit) } else { d }
+  const fx = elabCalleeDeclOf(parenPeelIx(c.callFn))
   const fd = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
   if !(fd is FuncDecl) || fd.fnRet >= 0 { return -1 }
   const vals: i32[] = []
@@ -3553,6 +3694,28 @@ function elabCallReadRow(c: Call): i32 {
     row = r
   }
   return row
+}
+
+// The declaration callee read `cf` names: a named function, an un-annotated binding's initializer,
+// or field `b` of `o.b` where `o` names a record literal so; -1 for a read that names none.
+function elabCalleeDeclOf(cf: i32): i32 {
+  const n = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
+  if n is Member {
+    const o = elabCalleeDeclOf(parenPeelIx(n.memObj))
+    const ol = if o >= 0 && o < P.nodes.length { nodeAt(o) } else { null }
+    if !(ol is ObjLit) { return -1 }
+    for fx in ol.objFields {
+      const fi = nodeAt(fx)
+      if fi is FieldInit && fi.fiName == n.memProp {
+        return parenPeelIx(fi.fiValue)
+      }
+    }
+    return -1
+  }
+  if !(n is Ident) { return -1 }
+  const d = identDeclOf(cf)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  return if dn is LetDecl && dn.letType < 0 { parenPeelIx(dn.letInit) } else { d }
 }
 
 // Walks key `k`, with `k` the key every hole row its walk banks records.
@@ -3581,6 +3744,13 @@ function elabOneAt(k: i32) {
     }
     if pt >= 0 { pt = substTyDeep(pt, names, tys) }
     pTys.push(pt)
+  }
+  // A storage entry types its parameter at the storage the instance is keyed by.
+  let ri = 0
+  while ri < names.length && ri < tys.length {
+    const rp = elabRepEntryParam(names[ri])
+    if rp >= 0 && rp < pTys.length { pTys[rp] = tys[ri] }
+    ri = ri + 1
   }
   let ret = TY_ERR
   const ft = nodeTyIxOf(decl)
@@ -3670,6 +3840,15 @@ function elabOneAt(k: i32) {
     ps.push(elabCapTy[ix] ?? -1)
     elabNodeTys[ix] = ps
     elabRowNote(elabTyRowCol, ix)
+  }
+  // A parameter a storage entry keys is the storage itself in this instance (D17816).
+  let rk = 0
+  while rk < names.length && rk < tys.length {
+    const rp = elabRepEntryParam(names[rk])
+    if rp >= 0 && rp < dn.fnParams.length {
+      elabNodeTyFill(dn.fnParams[rp], k, tys[rk])
+    }
+    rk = rk + 1
   }
   // A stamp that only repeats the literal's own anonymous type there names no destination: not
   // banked; a named or generic-application record is a row of its own.
@@ -3765,8 +3944,16 @@ function elabOneAt(k: i32) {
     }
     // An instance's call binds a tagged set or a primed stub as a root call does.
     const ct = elabSetArgBind(elabCallIx[c], cn, ct0, k)
-    if tysClosed(ct) {
+    // A plain function's call binds nothing unless a storage entry keys it: the root's own.
+    const plainRoot = cn.length == 0
+      && elabCallD[c] >= 0
+      && elabBindsNothing(elabCallD[c])
+    if plainRoot { elabStorageEntries(elabCallIx[c], elabCallD[c], cn, ct, k) }
+    if tysClosed(ct) && !(plainRoot && cn.length == 0) {
       elabRowEntries(elabCallIx[c], elabCallD[c], cn, ct)
+      if !plainRoot {
+        elabStorageEntries(elabCallIx[c], elabCallD[c], cn, ct, k)
+      }
       if elabParentFor(elabCallD[c], k) == 0 - 2 {
         elabHandedNote(k, elabCallD[c], elabCallIx[c], cn, ct, k)
       } else {
@@ -3873,6 +4060,10 @@ function elabSetCallRows(
   // instance's own type of it names, when it names any, and nothing at the root.
   const openParam = elabOpenParamRead(cn.callFn)
   if from < 0 && openParam { return 0 }
+  // A call through a record holder takes the record's member (`elabWriteBuiltAsHolderRecord`).
+  const cfx = parenPeelIx(cn.callFn)
+  const hd = if cfx >= 0 && cfx < P.nodes.length && nodeAt(cfx) is Ident { identDeclOf(cfx) } else { -1 }
+  if hd >= 0 && elabWriteBuiltAsHolderRecord(hd) { return 0 }
   const ct = if calleeTy >= 0 { calleeTy } else { nodeTyIxOf(cn.callFn) }
   if ct < 0 || ct >= T.tys.length { return 0 }
   // A call through a literal list's constant element that is a hole function runs that element
@@ -4207,12 +4398,15 @@ function elabAnnotatedDeliveryRows(g: i32) {
     const t = nodeTyIxOf(g)
     if n.letType >= 0 {
       if elabClosedFnTy(t) { elabDeliverAt(n.letInit, t) }
-    } else {
+    } else if !elabStoredRead(n.letInit) {
       const args = elabBindingCallArgs(g)
       if args.length > 0 { elabDeliverParams(n.letInit, args, []) }
     }
   } else if n is BinExpr {
-    const args = elabBindingCallArgs(elabWrittenLet(n.binLeft))
+    // A write into a record holder is built as the holder's record.
+    const wl = elabWrittenLet(n.binLeft)
+    const held = wl >= 0 && elabWriteBuiltAsHolderRecord(wl)
+    const args = if elabStoredRead(n.binRight) || held { [] } else { elabBindingCallArgs(wl) }
     if args.length > 0 { elabDeliverParams(n.binRight, args, []) }
   } else if n is FuncDecl {
     const s = nodeTyIxOf(g)
@@ -4224,6 +4418,15 @@ function elabAnnotatedDeliveryRows(g: i32) {
     }
   }
   return 0
+}
+
+// Whether `v` reads an element or field of a holder: a stored value, held at its slot's rep, which
+// a binding's calls through it read as stored and instance nothing at.
+function elabStoredRead(v: i32): boolean {
+  const p = parenPeelIx(v)
+  if p < 0 || p >= P.nodes.length { return false }
+  const pn = nodeAt(p)
+  return pn is Index || pn is Member
 }
 
 // `elabArgValueRows` for value `v` delivered at closed type `t`, through the values a call of a
@@ -7448,6 +7651,13 @@ export function elabLetAssigned(d: i32): boolean {
   return r
 }
 
+// Whether a write into binding `d` is built as the holder's record: `d` is initialised by a
+// maker's call and written again, so each function written there is the record's member, built
+// beside the maker's own, never an instance at the binding's call types (D17814).
+function elabWriteBuiltAsHolderRecord(d: i32): boolean {
+  return elabResCallHolder(d) && elabLetAssigned(d)
+}
+
 // Whether declaration `d` is a binding initialised by a call that can return a record.
 function elabResCallHolder(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
@@ -9546,7 +9756,10 @@ function elabFnValueAt(v: i32, rec: i32[], at: i32) {
 // Whether `v` is a function value a holder's write can store as a record: a read of a named
 // function. A lambda written there is not yet built beside the maker's own (D17804).
 function elabFnValueWrite(v: i32): boolean {
-  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  if v < 0 || v >= P.nodes.length { return false }
+  const vn = nodeAt(v)
+  if vn is FuncDecl { return vn.fnName == "" }
+  if !(vn is Ident) { return false }
   const d = identDeclOf(v)
   return d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl
 }
@@ -13343,6 +13556,8 @@ function elabLateName(decl: i32): string {
 // (D3851). A generic the cell also holds is instanced by its own writes.
 function elabCellPeers() {
   for bd in elabFnLetBindings() {
+    // A record holder's functions are the record's members, not peers of one cell.
+    if elabWriteBuiltAsHolderRecord(bd) { continue }
     const ms = elabFnLetMembers(bd)
     const hs: i32[] = []
     for m in ms {
@@ -15518,6 +15733,9 @@ function elabSlotFacts() {
   let ix = 0
   while ix < P.nodes.length {
     const n = nodeAt(ix)
+    // A root call handing a storage its callee is keyed by is that instance, planned here rather
+    // than demanded late by mono (D17816).
+    if n is Call { elabStorageRootAt(ix, n) }
     // A call argument holding an open function is a holder, as a binding of it is (D16816).
     const argCall = eplArgHoldsCallFn(ix)
       && cwIxCovers(ix)
@@ -24064,11 +24282,8 @@ function eplHolderTy(ix: i32, k: i32): i32 {
 
 // Whether every function leaf of closed type `dd`, holder `ix`'s delivered type, is the one
 // signature its class is called at, or is not called: two signatures, an open argument, or one
-// other than the leaf's own leave the delivery no fact to give (D17800). A nullable binding is
-// delivered only through a narrowing, at a type it does not hold whole.
+// other than the leaf's own leave the delivery no fact to give (D17800).
 function eplDeliveredAgrees(ix: i32, dd: i32): boolean {
-  const own = nodeTyIxOf(ix)
-  if own < 0 || own >= T.tys.length || tyAt(own) is TyNullable { return false }
   if EPL.stale {
     eplBuild()
     EPL.stale = false

@@ -22,7 +22,12 @@ import {
 } from "./check_iface"
 import { rangeVarFits } from "./check_range_var"
 import { arrowNote } from "./check_arrow"
-import { cwIxCovers, cwPeelValue } from "./check_write_scan"
+import {
+  cwFnCalls,
+  cwIxCovers,
+  cwIxParent,
+  cwPeelValue,
+} from "./check_write_scan"
 import { recLitOnlyDeclOf } from "./check_rec_fresh"
 import { identTyOf } from "./check_nar_store"
 import {
@@ -79,6 +84,7 @@ import {
   i32ToStr,
   letNameAt,
   mkArrayLit,
+  mkBinary,
   mkBlock,
   mkBool,
   mkCall,
@@ -108,6 +114,7 @@ import {
   fvaRefuseNested,
   fvaUnionArm,
   luDecl,
+  resolveAnnot,
 } from "./check_annot_resolve"
 import {
   IV_DECL,
@@ -405,7 +412,13 @@ import {
 } from "./check_num_lits"
 import { recordNullHoleObjAdopt } from "./check_obj_shape"
 import { parenPeelIx } from "./check_places"
-import { recOwnPend, recPend } from "./check_rec_rows"
+import {
+  recCovArgNote,
+  recCovArgOf,
+  recOwnPend,
+  recPend,
+  roFnListTy,
+} from "./check_rec_rows"
 import { recDropAdopt } from "./check_rec_drop"
 import { noteRefListView } from "./check_ref_list_view"
 import {
@@ -522,6 +535,7 @@ import {
   mkArrayTy,
   mkFuncTy,
   mkMapTy,
+  mkObjTy,
   nestParentOf,
   nwTyIxs,
   objFieldType,
@@ -1273,11 +1287,13 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
   const dwhole = nonNullTy(dstTy)
   const sx = parenPeelIx(srcExpr)
   // A destination counts only where its type is closed apart from the binding: one holding a hole
-  // is closed by its own pins, which may be what typed the destination (D9182).
+  // is closed by its own pins, which may be what typed the destination (D9182). A read a narrowing
+  // retyped delivers the narrowed value, not the binding (D17812).
   const whole = sx >= 0
     && nodeAt(sx) is Ident
     && identDeclOf(sx) == d
     && !tyHasInferHole(srcTy)
+    && tyEq(srcTy, nodeTyIxOf(d))
   if (
     !inferQuiet
     && monoRecheckDepth == 0
@@ -2468,6 +2484,12 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         // The copy is delivered as a hand-written literal is: adopted there, its field coerced.
         return assignableExprIn(srcExpr, nodeTyIxOf(srcExpr), dstTy)
       }
+      // A `.map` whose callback leaves its result open is typed at the element the destination
+      // closes: a fresh record it returns is built there, a shared one refused (D17793).
+      if fvaMapCbTyped(srcExpr, srcTy, dstTy) {
+        return assignableExprIn(srcExpr, nodeTyIxOf(srcExpr), dstTy)
+      }
+      fvaAliasNote(srcExpr, srcTy, dstTy)
       noteRefListView(srcExpr, srcTy, dstTy)
       recordListCopy(srcExpr, srcTy, dstTy)
       // D2060 — the record twin: a field widened by this delivery is shared with the source,
@@ -4679,6 +4701,80 @@ function listSiteMapCopy(site: i32, lam: i32, pos: i32): boolean {
   return fvaSiteSet(site, c)
 }
 
+// The receiver `recv` of a `.map` or `.filter` whose callback `cb` annotates its parameter at a
+// record closing a set field the receiver's elements leave open, when `recv` is a `.map` or a
+// binding of one: the parameter is the inner map's consumer, so its callback is typed there
+// (D17827). The receiver's new type, or -1 (also for a binding, whose read keeps its type).
+export function fvaMapRecvTyped(recv: i32, recvTy: i32, cb: i32): i32 {
+  const lx = parenPeelIx(cb)
+  const l = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  if !(l is FuncDecl) || l.fnParams.length != 1 { return -1 }
+  const pn = nodeAt(l.fnParams[0])
+  if !(pn is Param) || pn.parType < 0 { return -1 }
+  const ptn = nodeAt(pn.parType)
+  const pt = if ptn is TypeRef { resolveAnnot(ptn.tyName, l.fnTyParams) } else { -1 }
+  if pt < 0 || pt >= T.tys.length { return -1 }
+  // A binding the call reads holds the inner map, typed at the same consumer (D17826's alias).
+  const rx = parenPeelIx(recv)
+  const rd = if rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Ident { identDeclOf(rx) } else { -1 }
+  const rn = if rd >= 0 && rd < P.nodes.length { nodeAt(rd) } else { null }
+  if rn is LetDecl && rn.letType < 0 && rn.letInit >= 0 {
+    fvaMapCbTyped(rn.letInit, nodeTyIxOf(rn.letInit), mkArrayTy(pt))
+    return -1
+  }
+  if !fvaMapCbTyped(recv, recvTy, mkArrayTy(pt)) { return -1 }
+  return nodeTyIxOf(rx)
+}
+
+// Types `.map` call `site`'s un-annotated callback at the element record of `dstTy` that closes a
+// set or hole function field its result leaves open, and re-checks the call; false where `site` is
+// no such call.
+function fvaMapCbTyped(site: i32, srcTy: i32, dstTy: i32): boolean {
+  if site < 0 || srcTy < 0 || dstTy < 0 || inferQuiet || monoRecheckDepth > 0 {
+    return false
+  }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length || fvaListCopyAt(site) {
+    return false
+  }
+  const sx = parenPeelIx(site)
+  const n = if sx >= 0 && sx < P.nodes.length { nodeAt(sx) } else { null }
+  if !(n is Call) || n.callArgs.length != 1 || n.callFn < 0 { return false }
+  const m = nodeAt(parenPeelIx(n.callFn))
+  const lx = parenPeelIx(n.callArgs[0])
+  const l = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  if !(m is Member) || m.memProp != "map" || !(l is FuncDecl) { return false }
+  if l.fnName != "" || l.fnRet >= 0 { return false }
+  const sa = tyAt(nonNullTy(srcTy))
+  const da = tyAt(nonNullTy(dstTy))
+  if !(sa is TyArray) || !(da is TyArray) || da.aRead == 1 { return false }
+  const sr = tyElemOf(sa)
+  const dr = tyElemOf(da)
+  if sr < 0 || dr < 0 || sr >= T.tys.length || dr >= T.tys.length {
+    return false
+  }
+  if !fvaRecFieldsClose(sr, dr) { return false }
+  const rt = fvaAnnot(dr, site, nodePos(site))
+  if rt < 0 { return false }
+  const typed: Node = {
+    fnName: l.fnName,
+    fnTyParams: l.fnTyParams,
+    fnParams: l.fnParams,
+    fnRet: rt,
+    fnBody: l.fnBody,
+    pos: l.pos,
+  }
+  const lam = luAt(addNode(typed), site)
+  const cargs: i32[] = []
+  cargs.push(lam)
+  const c: Node = {
+    callFn: n.callFn,
+    callArgs: cargs,
+    callArgNames: n.callArgNames,
+    pos: n.pos,
+  }
+  return fvaSiteSet(site, c)
+}
+
 // Writes converting copy `n` over `site`, notes it a copy, and checks it: the one place a
 // copy rewrites a delivered site.
 function fvaSiteSet(site: i32, n: Node): boolean {
@@ -4835,9 +4931,10 @@ export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   if list != (da is TyArray) || !fvaRecFieldsClose(sr, dr) { return false }
-  // A list's copy would go through `.map`, which does not yet coerce a set's field at its
-  // lambda's result (D17775); a record of one field is copied without one.
   const dro = tyAt(dr)
+  // A list is copied through `.map`, each element rebuilt at the destination's record, whose
+  // result converts each field: `site.map(($r): R => ({ f: $r.f, … }))`.
+  if list && dro is TyObj { return fvaRecListMapCopy(site, dr, dro) }
   // A record of several fields is converted where it is delivered, each member pinned there.
   if !list && dro is TyObj && dro.objFieldNames.length > 1 {
     fnTagValueDstNote(sx, dr)
@@ -4853,6 +4950,26 @@ export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
   fs.push(luAt(mkFieldInit(nm, rd, pos), site))
   const lit: Node = { objFields: fs, pos: pos }
   return fvaSiteSet(site, lit)
+}
+
+// `fvaRecFnCopy`'s list half: `site` becomes `site.map(($r): dr => ({ f: $r.f, … }))` over every
+// field of record type `dr`.
+function fvaRecListMapCopy(site: i32, dr: i32, dro: TyObj): boolean {
+  const pos = nodePos(site)
+  const rt = fvaAnnot(dr, site, pos)
+  if rt < 0 { return false }
+  const pd = luAt(mkParam("$r" + i32ToStr(site), -1, -1, 0, 0, pos), site)
+  const ps: i32[] = []
+  ps.push(pd)
+  const fs: i32[] = []
+  for nm in dro.objFieldNames {
+    const rd = luAt(mkMember(luRef(pd, site, pos), nm, pos), site)
+    fs.push(luAt(mkFieldInit(nm, rd, pos), site))
+  }
+  const lit: Node = { objFields: fs, pos: pos }
+  const body = luAt(mkParen(luAt(addNode(lit), site), pos), site)
+  const lam = luAt(addNode(fvaLambda(ps, rt, body, site, pos)), site)
+  return listSiteMapCopy(site, lam, pos)
 }
 
 // Whether record `src` holds a set or hole function at a field record `dst` declares a closed
@@ -4884,6 +5001,45 @@ function fvaRecFieldsClose(src: i32, dst: i32): boolean {
     i = i + 1
   }
   return any
+}
+
+// The type a value of type `src` holds once delivered at `dst`: a set or hole function at a closed
+// function type is stored at it; a record's fields that `dst` closes so, the others as they are.
+export function fvaDeliveredTy(src: i32, dst: i32): i32 {
+  const sn = nonNullTy(src)
+  const dn = nonNullTy(dst)
+  // A set or hole function delivered at a closed function type is stored at that type.
+  const dfo = if dn >= 0 && dn < T.tys.length { tyAt(dn) } else { null }
+  if (
+    sn == src
+    && sn >= 0
+    && sn < T.tys.length
+    && dfo is TyFunc
+    && !tyHasHole(dn)
+    && (fnTagSetValueOfTy(sn) || fnTagSetOfTy(sn) >= 0 || tyHasHole(sn))
+  ) {
+    return dn
+  }
+  if sn != src || sn < 0 || dn < 0 || !fvaRecFieldsClose(sn, dn) { return src }
+  const so = tyAt(sn)
+  const d = tyAt(dn)
+  if !(so is TyObj) || !(d is TyObj) { return src }
+  const tys: i32[] = []
+  let i = 0
+  while i < so.objFieldNames.length {
+    const st = so.objFieldTypes[i]
+    const k = strListIndexOf(d.objFieldNames, so.objFieldNames[i])
+    const dt = if k >= 0 { d.objFieldTypes[k] } else { -1 }
+    const dft = if dt >= 0 && dt < T.tys.length { tyAt(dt) } else { null }
+    const held = st >= 0
+      && st < T.tys.length
+      && (fnTagSetValueOfTy(st)
+      || fnTagSetOfTy(st) >= 0
+      || tyHasHole(st))
+    tys.push(if dft is TyFunc && !tyHasHole(dt) && held { dt } else { st })
+    i = i + 1
+  }
+  return mkObjTy(so.objFieldNames, tys)
 }
 
 // Set while `fvaAdaptEnclosing` lets an adapter name the enclosing generic's type parameters.
@@ -4939,6 +5095,20 @@ function fvaHoleDeclOf(site: i32, depth: i32): i32 {
   const ix = parenPeelIx(site)
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = nodeAt(ix)
+  // A name an un-annotated `const` binds holds what its initialiser holds (D17815).
+  if n is Ident {
+    const ld = identDeclOf(ix)
+    const l = if ld >= 0 && ld < P.nodes.length { nodeAt(ld) } else { null }
+    if (
+      !(l is LetDecl)
+      || l.letKw != "const"
+      || l.letType >= 0
+      || l.letInit < 0
+    ) {
+      return -1
+    }
+    return fvaHoleDeclOf(l.letInit, depth - 1)
+  }
   if !(n is Call) { return -1 }
   const cd = cwCalleeDeclOf(n.callFn)
   if cd < 0 || cd >= P.nodes.length { return -1 }
@@ -6217,6 +6387,16 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if srcTy >= T.tys.length || dstTy >= T.tys.length { return false }
   // A join typed at the destination still carries each tail's own function value.
   if fvaAdaptJoin(srcExpr, dstTy) { return srcTy != dstTy }
+  // An element read of a storage-keyed holder is delivered through an adapter at a closed function
+  // type even at its own type: a narrower storage's instance calls the element at its own (D17816).
+  if fvaCovRead(srcExpr, dstTy) {
+    return fvaAdaptCovRead(srcExpr, srcTy, dstTy)
+  }
+  // A storage alias handed to a readonly-list parameter hands its storage (D17816).
+  const ast = fvaAliasStorageOf(srcExpr)
+  if ast >= 0 && fvaCovariantArgRep(srcExpr, ast, nonNullTy(dstTy)) {
+    return false
+  }
   if srcTy == dstTy || !tyMayHoldFn(dstTy) { return false }
   // A lambda whose every return is a fresh list or record literal is built at the destination, as
   // an annotated one is; a list never widens, so no adapter can deliver it (D16918, D16924).
@@ -6277,6 +6457,12 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       return true
     }
   }
+  // A nullable function is a value, not shared storage: it is delivered through the adapter of
+  // its function, built only where it is not null (D17816).
+  if s is TyNullable && d is TyFunc && tyAt(dstTy) is TyNullable {
+    const ns = fvaAdaptNullable(srcExpr, srcTy, s.nInner, dstTy, d)
+    if ns >= 0 { return ns == 1 }
+  }
   if !(s is TyFunc) || !(d is TyFunc) {
     // A value still open here may be a set's once its holes close; the decision checks the site.
     if d is TyFunc && tyHasHole(srcTy) { fvaValueSiteNote(srcExpr, srcTy, dt) }
@@ -6296,6 +6482,10 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         fvaNestedFnDiffers(srcTy, dm, 0, 8)
         || recordHolder(srcTy) && fvaHeldHoleFnDiffers(srcTy, dm, 8)
       ) {
+        // A readonly list of functions handed to a function's parameter is read where it is
+        // stored: the callee is instanced at the argument's own storage, not copied (D17816).
+        if fvaCovariantArgRep(srcExpr, srcTy, dm) { return false }
+        if fvaCovariantAlias(srcExpr, srcTy, dm) { return false }
         fvaRefuseNested(srcExpr, srcTy, dm)
         return true
       }
@@ -6399,11 +6589,14 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     fvaRefuse(srcExpr, srcTy, dt, "")
     return true
   }
-  // A function declaration or a `const` is stable; any other value is read once, as the
-  // argument of an enclosing lambda called in place, or into a `const` beside the adapter for a
-  // set at the enclosing generic's types, so the adapter calls the delivered value rather than
-  // what a `let` later holds.
+  // A function declaration or a `const` naming one is stable; any other value (a `const` holding
+  // a hole function's value too) is read once, as the argument of an enclosing lambda called in
+  // place, or into a `const` beside the adapter for a set at the enclosing generic's types, so the
+  // adapter calls the delivered value rather than what a `let` later holds.
   const stable = fvaStableName(pe, parenPeelIx(site))
+    && !(holeInst >= 0
+    && pe is Ident
+    && cwFnValueDeclOf(parenPeelIx(site)) < 0)
   let callee = -1
   let fvParam = -1
   let snap = -1
@@ -6459,24 +6652,14 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       luAt(mkBlock(tl, pos), site),
       pos,
     )
-    arenaSetNode(site, nodeAt(luAt(iff, site)))
-    valueIfAdd(site)
+    fvaInstallIf(site, iff)
   } else {
     const moved = fvaMoveSite(site)
     const li = luAt(addNode(lam), site)
     const outerPs: i32[] = []
     outerPs.push(fvParam)
     const outer = luAt(addNode(fvaLambda(outerPs, -1, li, site, pos)), site)
-    const outerArgs: i32[] = []
-    outerArgs.push(moved)
-    const names: string[] = []
-    const c: Node = {
-      callFn: outer,
-      callArgs: outerArgs,
-      callArgNames: names,
-      pos: pos,
-    }
-    arenaSetNode(site, c)
+    fvaCallInPlace(site, outer, moved, pos)
   }
   luGrow()
   const t = checkNodeHook(site)
@@ -6486,8 +6669,297 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     while T.diags.length > mark { T.diags.pop() }
     fvaRefuse(site, srcTy, dt, why)
   }
-  if stable && callee >= 0 { fvaCopyCalleeAtInstance(callee, t) }
+  // A set's value is called as the set, at its id, so its read keeps the set's type (D17823).
+  if stable && callee >= 0 && !setSrc { fvaCopyCalleeAtInstance(callee, t) }
   return true
+}
+
+// Whether `srcExpr`, a closed list of functions of type `srcTy`, is the argument of a non-generic
+// function whose parameter there is annotated at readonly list `dstTy`; noted with
+// `recCovArgNote`, so the callee is instanced at the argument's storage and each read through the
+// wider type is delivered from it (D17816, D14532's instance per storage rep).
+function fvaCovariantArgRep(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  const x = parenPeelIx(srcExpr)
+  if x < 0 || !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_ARG { return false }
+  const da = if dstTy >= 0 && dstTy < T.tys.length { tyAt(dstTy) } else { null }
+  const sa = if srcTy >= 0 && srcTy < T.tys.length { tyAt(srcTy) } else { null }
+  if !(da is TyArray) || da.aRead != 1 || !(sa is TyArray) { return false }
+  if (
+    !(tyAt(tyElemOf(sa)) is TyFunc)
+    || tyHasTyVar(srcTy)
+    || tyHoldsHole(srcTy)
+  ) {
+    return false
+  }
+  const c = nodeAt(cwIxUp[x])
+  if !(c is Call) || c.callFn < 0 { return false }
+  const fd = identBoundFnDeclOf(c.callFn)
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  const i = cwIxUpAux[x]
+  if (
+    !(f is FuncDecl)
+    || f.fnTyParams.length > 0
+    || i < 0
+    || i >= f.fnParams.length
+  ) {
+    return false
+  }
+  const pn = nodeAt(f.fnParams[i])
+  if (
+    !(pn is Param)
+    || pn.parType < 0
+    || !tySame(nodeTyIxOf(f.fnParams[i]), dstTy)
+  ) {
+    return false
+  }
+  recCovArgNote(x, srcTy)
+  return true
+}
+
+// Whether `srcExpr`, a read of a closed list of functions of type `srcTy`, initializes a `const`
+// annotated at readonly list `dstTy`: the binding is an alias of that storage, whose element reads
+// are typed at it; noted with `recCovArgNote` on the declaration (D17816).
+function fvaCovariantAlias(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  const x = parenPeelIx(srcExpr)
+  if (
+    x < 0
+    || !cwIxCovers(x)
+    || cwIxUpKind[x] != CW_UP_LETINIT
+    || !(nodeAt(x) is Ident)
+  ) {
+    return false
+  }
+  const da = if dstTy >= 0 && dstTy < T.tys.length { tyAt(dstTy) } else { null }
+  const sa = if srcTy >= 0 && srcTy < T.tys.length { tyAt(srcTy) } else { null }
+  if !(da is TyArray) || da.aRead != 1 || !(sa is TyArray) { return false }
+  if (
+    !(tyAt(tyElemOf(sa)) is TyFunc)
+    || tyHasTyVar(srcTy)
+    || tyHoldsHole(srcTy)
+  ) {
+    return false
+  }
+  const ld = nodeAt(cwIxUp[x])
+  if !(ld is LetDecl) || ld.letKw != "const" || ld.letType < 0 { return false }
+  recCovArgNote(cwIxUp[x], srcTy)
+  return true
+}
+
+// The storage a read of a storage alias holds (`fvaCovariantAlias`), else -1.
+function fvaAliasStorageOf(srcExpr: i32): i32 {
+  const x = parenPeelIx(srcExpr)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  return recCovArgOf(identDeclOf(x))
+}
+
+// Whether `srcExpr` reads an element of a holder whose storage can differ from its declared type
+// (a readonly function-list parameter of a storage-parametric function, or a storage alias of a
+// list), delivered at closed
+// function type `dstTy`: decided by the declaration, never by a caller (D17816).
+function fvaCovRead(srcExpr: i32, dstTy: i32): boolean {
+  const x = parenPeelIx(srcExpr)
+  const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(xn is Index) { return false }
+  const a = parenPeelIx(xn.idxArr)
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if !(an is Ident) { return false }
+  const d = identDeclOf(a)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const param = dn is Param && dn.parType >= 0 && roFnListTy(nodeTyIxOf(d))
+  if !param && recCovArgOf(d) < 0 { return false }
+  const dt = if dstTy >= 0 && dstTy < T.tys.length { tyAt(dstTy) } else { null }
+  return dt is TyFunc && !tyHasTyVar(dstTy) && !tyHoldsHole(dstTy)
+}
+
+// Rewrites element read `srcExpr` into `if true { const $fv = srcExpr; (ps) => $fv(ps) }` at
+// function type `dstTy`: the snapshot takes each instance's own element type, so the adapter
+// calls a narrower storage's element at its own signature and widens its result (D17816).
+function fvaAdaptCovRead(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  const site = srcExpr
+  if fvaDone[site] ?? false { return false }
+  const d = tyAt(dstTy)
+  if !(d is TyFunc) { return false }
+  const pos = nodePos(site)
+  const params: i32[] = []
+  const args: i32[] = []
+  let i = 0
+  while i < d.fnParamTypes.length {
+    const pt = fvaAnnot(d.fnParamTypes[i], site, pos)
+    if pt < 0 { return false }
+    const pd = luAt(mkParam("$fp" + i32ToStr(i), pt, -1, 0, 0, pos), site)
+    params.push(pd)
+    args.push(luRef(pd, site, pos))
+    i = i + 1
+  }
+  const rt = fvaAnnot(d.fnRet, site, pos)
+  if rt < 0 { return false }
+  const snap = luDecl(
+    "const",
+    "$fv" + i32ToStr(site),
+    -1,
+    fvaMoveSite(site),
+    site,
+    pos,
+  )
+  const lam = fvaLambda(
+    params,
+    rt,
+    luAt(mkCall(luRef(snap, site, pos), args, pos), site),
+    site,
+    pos,
+  )
+  fvaDone.set(site, true)
+  fvaBuilt.set(site, true)
+  const stmts: i32[] = [
+    snap,
+    luAt(mkParen(luAt(addNode(lam), site), pos), site),
+  ]
+  const none: i32[] = []
+  const tl: i32[] = [luAt(mkCall(luTrap(site, pos), none, pos), site)]
+  const iff = mkIf(
+    luAt(mkBool(1, pos), site),
+    luAt(mkBlock(stmts, pos), site),
+    luAt(mkBlock(tl, pos), site),
+    pos,
+  )
+  const mark = T.diags.length
+  fvaInstallIf(site, iff)
+  luGrow()
+  const t = checkNodeHook(site)
+  if T.diags.length > mark || !assignable(t, dstTy) {
+    let why = ""
+    if T.diags.length > mark { why = T.diags[mark].tmsg }
+    while T.diags.length > mark { T.diags.pop() }
+    fvaRefuse(site, srcTy, dstTy, why)
+  }
+  return true
+}
+
+// Writes `site` as the valued `if` node `iff` holding an adapter beside its snapshot.
+function fvaInstallIf(site: i32, iff: i32) {
+  arenaSetNode(site, nodeAt(luAt(iff, site)))
+  valueIfAdd(site)
+  return 0
+}
+
+// Writes `site` as the call of adapter lambda `outer` on the value moved out of it, `moved`.
+function fvaCallInPlace(site: i32, outer: i32, moved: i32, pos: i32) {
+  const outerArgs: i32[] = [moved]
+  const names: string[] = []
+  const c: Node = {
+    callFn: outer,
+    callArgs: outerArgs,
+    callArgNames: names,
+    pos: pos,
+  }
+  arenaSetNode(site, c)
+  return 0
+}
+
+// Rewrites nullable function value `srcExpr` of type `srcTy` into
+// `((fv) => if fv != null { (ps) => fv(ps) } else { null })(srcExpr)` at nullable `dstTy`, whose
+// function is `d`: 1 when rewritten (or refused), 0 when no conversion is needed, -1 when this
+// shape is not one it builds (an open or set-valued function), left to the general refusal.
+function fvaAdaptNullable(
+  srcExpr: i32,
+  srcTy: i32,
+  inner: i32,
+  dstTy: i32,
+  d: TyFunc,
+): i32 {
+  const it = if inner >= 0 && inner < T.tys.length { tyAt(inner) } else { null }
+  if !(it is TyFunc) || it.fnParamTypes.length != d.fnParamTypes.length {
+    return -1
+  }
+  if (
+    tyHasTyVar(srcTy)
+    || tyHoldsHole(srcTy)
+    || tyHasTyVar(dstTy)
+    || tyHoldsHole(dstTy)
+  ) {
+    return -1
+  }
+  if fnTagSetValueOfTy(inner) { return -1 }
+  const dt = nonNullTy(dstTy)
+  if !fvaFnMayDiffer(inner, dt, 8) { return 0 }
+  const site = srcExpr
+  if fvaDone[site] ?? false { return 0 }
+  const pos = nodePos(site)
+  const st = fvaAnnot(srcTy, site, pos)
+  const rt = fvaAnnot(d.fnRet, site, pos)
+  if st < 0 || rt < 0 {
+    fvaRefuse(srcExpr, srcTy, dt, "")
+    return 1
+  }
+  const params: i32[] = []
+  const args: i32[] = []
+  let i = 0
+  while i < d.fnParamTypes.length {
+    const pt = fvaAnnot(d.fnParamTypes[i], site, pos)
+    if pt < 0 {
+      fvaRefuse(srcExpr, srcTy, dt, "")
+      return 1
+    }
+    const pd = luAt(mkParam("$fp" + i32ToStr(i), pt, -1, 0, 0, pos), site)
+    params.push(pd)
+    args.push(luRef(pd, site, pos))
+    i = i + 1
+  }
+  const fvParam = luAt(mkParam("$fv" + i32ToStr(site), st, -1, 0, 0, pos), site)
+  const lam = luAt(
+    addNode(
+      fvaLambda(
+        params,
+        rt,
+        luAt(mkCall(luRef(fvParam, site, pos), args, pos), site),
+        site,
+        pos,
+      ),
+    ),
+    site,
+  )
+  const test = luAt(
+    mkBinary(
+      "!=",
+      luRef(fvParam, site, pos),
+      luAt(mkNull("null", pos), site),
+      pos,
+    ),
+    site,
+  )
+  const thenS: i32[] = [lam]
+  const elseS: i32[] = [luAt(mkNull("null", pos), site)]
+  const iff = luAt(
+    mkIf(
+      test,
+      luAt(mkBlock(thenS, pos), site),
+      luAt(mkBlock(elseS, pos), site),
+      pos,
+    ),
+    site,
+  )
+  valueIfAdd(iff)
+  const outerPs: i32[] = [fvParam]
+  const outer = luAt(
+    addNode(
+      fvaLambda(outerPs, fvaAnnot(dstTy, site, pos), iff, site, pos),
+    ),
+    site,
+  )
+  const moved = fvaMoveSite(site)
+  fvaDone.set(site, true)
+  fvaBuilt.set(site, true)
+  const mark = T.diags.length
+  fvaCallInPlace(site, outer, moved, pos)
+  luGrow()
+  const t = checkNodeHook(site)
+  if T.diags.length > mark || !assignable(t, dstTy) {
+    let why = ""
+    if T.diags.length > mark { why = T.diags[mark].tmsg }
+    while T.diags.length > mark { T.diags.pop() }
+    fvaRefuse(site, srcTy, dt, why)
+  }
+  return 1
 }
 
 // A binding copied from a generic function value, called by its adapter: its read is the
@@ -6632,4 +7104,271 @@ export let lamRetFreshFn: (lx: i32, own: i32, dst: i32) => boolean = lamRetFresh
 
 function lamRetFreshNone(_lx: i32, _own: i32, _dst: i32): boolean {
   return false
+}
+
+// Each binding's list of a set's records delivered to a mutable list that closes a field: the
+// delivery site, the binding, and the destination's element record.
+let fvaAliasSite: i32[] = []
+let fvaAliasDecl: i32[] = []
+let fvaAliasElem: i32[] = []
+
+// Notes a delivery of a binding's list of a set's records to a mutable list closing a field.
+function fvaAliasNote(site: i32, srcTy: i32, dstTy: i32) {
+  if site < 0 || srcTy < 0 || dstTy < 0 || inferQuiet || monoRecheckDepth > 0 {
+    return 0
+  }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length { return 0 }
+  const sx = parenPeelIx(site)
+  if sx < 0 || sx >= P.nodes.length || !(nodeAt(sx) is Ident) { return 0 }
+  const d = identDeclOf(sx)
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return 0 }
+  const sa = tyAt(nonNullTy(srcTy))
+  const da = tyAt(nonNullTy(dstTy))
+  if !(sa is TyArray) || !(da is TyArray) || da.aRead == 1 { return 0 }
+  const sr = tyElemOf(sa)
+  const dr = tyElemOf(da)
+  if sr < 0 || dr < 0 || sr >= T.tys.length || dr >= T.tys.length { return 0 }
+  if !fvaRecFieldsClose(sr, dr) { return 0 }
+  fvaAliasSite.push(site)
+  fvaAliasDecl.push(d)
+  fvaAliasElem.push(dr)
+  // The binding is the destination's storage, so a `.map` it holds is consumed where the element
+  // closes, and its callback typed there (D17826).
+  const dn = nodeAt(d)
+  if dn is LetDecl && dn.letType < 0 && dn.letInit >= 0 {
+    fvaMapCbTyped(dn.letInit, nodeTyIxOf(dn.letInit), dstTy)
+  }
+  return 0
+}
+
+// Forgets the noted alias deliveries, at the start of a program's check.
+export function fvaAliasReset() {
+  fvaAliasSite = []
+  fvaAliasDecl = []
+  fvaAliasElem = []
+  return 0
+}
+
+// Refuses each noted alias delivery where a call of a field of a record read from that storage
+// meets the destination's closed field at another signature: the two names are one storage,
+// called at one signature (`fvaCallMeetsStorage`). One walk.
+export function fvaAliasConflictsAll() {
+  if fvaAliasSite.length == 0 { return 0 }
+  const refused: boolean[] = []
+  for _ in fvaAliasSite { refused.push(false) }
+  let i = 0
+  while i < P.nodes.length {
+    const n = nodeAt(i)
+    if n is Call {
+      let k = 0
+      while k < fvaAliasSite.length {
+        if (
+          !refused[k]
+          && fvaCallMeetsStorage(
+            n.callFn,
+            n.callArgs,
+            fvaAliasDecl[k],
+            fvaAliasElem[k],
+          )
+        ) {
+          refused[k] = true
+          tErr(fvaAliasMsg(fvaAliasDecl[k]), fvaAliasSite[k])
+        }
+        k = k + 1
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The one conflict: a call of callee `c` with arguments `args` reads field `f` of a record that
+// may be held in binding `d`'s storage, and its arguments do not store as record `dr`'s closed
+// field `f` takes them.
+function fvaCallMeetsStorage(c: i32, args: i32[], d: i32, dr: i32): boolean {
+  const ro = tyAt(dr)
+  const m = fvaCalleeField(c)
+  const mn = if m >= 0 { nodeAt(m) } else { null }
+  if !(ro is TyObj) || !(mn is Member) { return false }
+  const k = strListIndexOf(ro.objFieldNames, mn.memProp)
+  if k < 0 || fvaArgsStoreAt(args, ro.objFieldTypes[k]) { return false }
+  const seen: i32[] = []
+  return fvaReaches(mn.memObj, d, seen)
+}
+
+// The field read callee `c` calls: `c` itself, or the read a binding it names is bound to; -1.
+function fvaCalleeField(c: i32): i32 {
+  const x = parenPeelIx(c)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const n = nodeAt(x)
+  if n is Member { return x }
+  if !(n is Ident) { return -1 }
+  const dd = identDeclOf(x)
+  const dn = if dd >= 0 && dd < P.nodes.length { nodeAt(dd) } else { null }
+  if !(dn is LetDecl) || dn.letInit < 0 { return -1 }
+  const ix = parenPeelIx(dn.letInit)
+  return if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Member { ix } else { -1 }
+}
+
+// Whether expression `x`'s value may be, or be read from, binding `d`'s storage. Each kind either
+// follows its edge or is named as yielding no storage, so the walk misses no kind. The alias
+// analysis a def-use points-to pass should replace.
+function fvaReaches(x: i32, d: i32, seen: i32[]): boolean {
+  if x < 0 || x >= P.nodes.length || i32ListHas(seen, x) { return false }
+  seen.push(x)
+  const n = nodeAt(x)
+  match n {
+    Ident => {
+      return fvaDeclReaches(identDeclOf(x), d, seen)
+    }
+    Index => {
+      return fvaReaches(n.idxArr, d, seen)
+    }
+    Member => {
+      return fvaReaches(n.memObj, d, seen)
+    }
+    OptMember => {
+      return fvaReaches(n.omObj, d, seen)
+    }
+    Paren => {
+      return fvaReaches(n.parInner, d, seen)
+    }
+    AsExpr => {
+      return fvaReaches(n.asObj, d, seen)
+    }
+    Spread => {
+      return fvaReaches(n.spdArg, d, seen)
+    }
+    Call => {
+      return fvaCallReaches(n, d, seen)
+    }
+    ArrayLit => {
+      for e in n.arrElems {
+        if fvaReaches(e, d, seen) { return true }
+      }
+      return false
+    }
+    ObjLit => {
+      for f in n.objFields {
+        if fvaReaches(f, d, seen) { return true }
+      }
+      return false
+    }
+    FieldInit => {
+      return fvaReaches(n.fiValue, d, seen)
+    }
+    // An assignment yields its value, and `??` either operand; every other operator a scalar.
+    BinExpr => {
+      if n.binOp == "??" && fvaReaches(n.binLeft, d, seen) { return true }
+      return (n.binOp == "??" || n.binOp == "=")
+        && fvaReaches(n.binRight, d, seen)
+    }
+    IfStmt | MatchExpr | Block => {
+      const leaves: i32[] = []
+      tailValueLeaves(x, leaves)
+      for lf in leaves {
+        if lf != x && fvaReaches(lf, d, seen) { return true }
+      }
+      return false
+    }
+    // Scalars, a parse error's leaf, and declarations or statements, which yield no storage.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | IsExpr | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | UnionDecl | ForRange | ForIn | ImportDecl | LoopVar => {
+      return false
+    }
+  }
+}
+
+// Whether a read of declaration `dd` may yield binding `d`'s storage: `d` itself, a binding's
+// initialiser, a `for` variable's list, or a parameter some call hands it.
+function fvaDeclReaches(dd: i32, d: i32, seen: i32[]): boolean {
+  if dd == d { return true }
+  if dd < 0 || dd >= P.nodes.length || i32ListHas(seen, dd) { return false }
+  seen.push(dd)
+  const dn = nodeAt(dd)
+  match dn {
+    LetDecl => {
+      return dn.letInit >= 0 && fvaReaches(dn.letInit, d, seen)
+    }
+    LoopVar => {
+      const l = if dn.lvLoop >= 0 && dn.lvLoop < P.nodes.length { nodeAt(dn.lvLoop) } else { null }
+      return l is ForIn && fvaReaches(l.fiIter, d, seen)
+    }
+    Param => {
+      return fvaParamReaches(dd, d, seen)
+    }
+    // A function, a type, an import or a loop counter names no list or record storage.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {
+      return false
+    }
+  }
+}
+
+// Whether call `n`'s result may be read from binding `d`'s storage: a method's receiver, or a
+// value the called function returns.
+function fvaCallReaches(n: Call, d: i32, seen: i32[]): boolean {
+  const cx = parenPeelIx(n.callFn)
+  const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
+  if cn is Member { return fvaReaches(cn.memObj, d, seen) }
+  const fd = if cn is Ident { identFnDeclOf(cx) } else { -1 }
+  if fd < 0 { return false }
+  for lf in recFnValueLeaves(fd) {
+    if fvaReaches(lf, d, seen) { return true }
+  }
+  return false
+}
+
+// Whether parameter `p` may be handed binding `d`'s storage: an argument at its place in a call
+// of its function, or the receiver of the method call a lambda owning it is an argument of.
+function fvaParamReaches(p: i32, d: i32, seen: i32[]): boolean {
+  const fx = if cwIxCovers(p) { cwIxParent[p] } else { -1 }
+  const f = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+  if !(f is FuncDecl) { return false }
+  const j = i32ListIndexOf(f.fnParams, p)
+  if j < 0 { return false }
+  if f.fnName == "" {
+    const ux = if cwIxCovers(fx) { cwIxParent[fx] } else { -1 }
+    const u = if ux >= 0 && ux < P.nodes.length { nodeAt(ux) } else { null }
+    const ucx = if u is Call && u.callFn >= 0 { parenPeelIx(u.callFn) } else { -1 }
+    const um = if ucx >= 0 && ucx < P.nodes.length { nodeAt(ucx) } else { null }
+    return um is Member && fvaReaches(um.memObj, d, seen)
+  }
+  const calls: i32[] = []
+  cwFnCalls(fx, calls)
+  for c in calls {
+    const cn = nodeAt(c)
+    if (
+      cn is Call
+      && j < cn.callArgs.length
+      && fvaReaches(cn.callArgs[j], d, seen)
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether arguments `args` store as the closed function type `ft` takes them.
+function fvaArgsStoreAt(args: i32[], ft: i32): boolean {
+  const f = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+  if !(f is TyFunc) || tyHasHole(ft) || f.fnParamTypes.length != args.length {
+    return true
+  }
+  let j = 0
+  while j < args.length {
+    const at = nodeTyIxOf(args[j])
+    if at >= 0 && !tySame(at, f.fnParamTypes[j]) { return false }
+    j = j + 1
+  }
+  return true
+}
+
+// The refusal of an alias delivery of binding `d`.
+function fvaAliasMsg(d: i32): string {
+  const dn = nodeAt(d)
+  const a = if dn is LetDecl { dn.letName } else { "the list" }
+  return "a list is passed as the same storage, so its element type cannot differ between `"
+    + a
+    + "` and this destination, and a call through `"
+    + a
+    + "` takes its function field at another signature; copy it with `.map` for the other use"
 }

@@ -1,6 +1,12 @@
 import { cloLiftCalleeOf } from "./ir_lift_scan"
 import { cloLiftWriteCount, cloLifted, cloLiftedFes } from "./ir_lift"
-import { asgNameWiderRow, cloRetValSlot, nulTagIdRepTy } from "./emit_classify"
+import {
+  asgNameWiderRow,
+  cloRetValSlot,
+  identLetOfRead,
+  letOpenCallWidth,
+  nulTagIdRepTy,
+} from "./emit_classify"
 import { lexOpcode, primOpcode } from "./ir"
 import { bodyEndsInReturn, identityBinIsMixed } from "./emit_fn_scans"
 import { identityArmSlot } from "./emit_if_arm_values"
@@ -694,8 +700,6 @@ import {
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
-  fbI32Rel,
-  fbI32RelOf,
   fbI32TruncF32S,
   fbI32TruncF64S,
   fbI32WrapI64,
@@ -790,18 +794,6 @@ import {
   wU8,
   wULEB,
 } from "./emit_bytes"
-import {
-  RS_ATOM,
-  RS_GNAME,
-  RS_GREAD,
-  RS_GUARD,
-  RS_SLOT,
-  RS_TAG,
-  relCopy,
-  relFoldNote,
-  relHold,
-  relSkew,
-} from "./emit_reloc"
 import {
   fieldRowIsNulAtom,
   fieldRowIsNulNone,
@@ -2252,7 +2244,7 @@ function emitClosureEnvOf(fe: i32, fnIx: i32, envIdx: i32) {
 export function cloDeclConstTail(fe: i32) {
   markFnAddrTaken(fe)
   const decl = cloDeclOf(fe)
-  fbI32RelOf(RS_SLOT, decl, gImports + decl + relSkew(RS_SLOT))
+  fbI32Const(gImports + decl)
   return 0
 }
 
@@ -2279,7 +2271,7 @@ export function tyHasNull(t: i32): boolean {
 
 // A tagged id `id` in the `i32 | null` box a nullable id is stored as.
 export function tagIdBoxTail(id: i32) {
-  fbI32Rel(RS_TAG, scalarTagOfKind(1))
+  fbI32Const(scalarTagOfKind(1))
   fbI32Const(id)
   return atomBoxTail(1)
 }
@@ -2290,9 +2282,9 @@ export function emitClosureIds(fe: i32) {
   // address-taken set is recorded: the element section lists exactly these entries, and an
   // id no expression here produces cannot reach a `call_indirect`.
   markFnAddrTaken(fe)
-  fbI32RelOf(RS_SLOT, fe, gImports + fe + relSkew(RS_SLOT))
+  fbI32Const(gImports + fe)
   const decl = cloDeclOf(fe)
-  fbI32RelOf(RS_SLOT, decl, gImports + decl + relSkew(RS_SLOT))
+  fbI32Const(gImports + decl)
   fbStructNew(cloStructIdx)
   return 0
 }
@@ -2855,7 +2847,7 @@ function emitRecCopyIntoMember(
   const rows: i32[] = []
   variantRowFields(vi, names, rows)
   const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
-  fbI32Rel(RS_TAG, uTags[vi])
+  fbI32Const(uTags[vi])
   rcElem.pathHeap.push(sHeapIdx[sRow])
   rcElem.pathField.push(sfi)
   const ps = rcElem.src
@@ -3023,7 +3015,7 @@ function emitRecCopyLevel(
       fieldRowIsNulNone(sFieldStart[sRow] + sfi)
       && fieldRowIsUnionBox(dFieldRows[fj])
     ) {
-      fbI32Rel(RS_TAG, nullBoxTag())
+      fbI32Const(nullBoxTag())
       fbRefNullNone()
       fbStructNew(uBoxIdx)
       fj = fj + 1
@@ -3102,7 +3094,7 @@ function emitRecCopyLevel(
       sFieldStart[sRow] + sfi,
       dFieldRows[fj],
     )
-    if wk >= 0 { fbI32Rel(RS_TAG, scalarTagOfKind(wk)) }
+    if wk >= 0 { fbI32Const(scalarTagOfKind(wk)) }
     if rcReadSource(exprIx, sHeap, reReadable, fnIx) < 0 { return -1 }
     fbStructGet(sHeapIdx[sRow], sfi)
     if wk >= 0 {
@@ -3430,7 +3422,7 @@ function emitRowUnionElemCopy(
       fbLocalGet(rcElem.iL)
       fbArrayGet(rcElem.back)
       fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, uTags[arms[k]])
+      fbI32Const(uTags[arms[k]])
       fbI32Bin(70) // i32.eq
       fbIfRef(sHeapIdx[dsi])
     }
@@ -3894,7 +3886,7 @@ function emitNulIsNullTest(
 // After a union box: its tag compared with `null`'s, `i32.ne` for `invert`. Returns 1.
 export function nulTestBoxTagTail(invert: boolean): i32 {
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   if invert { fbI32Bin(71) } else { fbI32Bin(70) }
   return 1
 }
@@ -4094,7 +4086,7 @@ function emitFieldLitEq(r: i32, lex: string, fnIx: i32) {
     // The i32 slot serves both the interned string ATOM and a small numeric literal; the
     // quotes are what part them, exactly as they do in `emitLitMemberEq`.
     if nameIsQuotedLeaf(lex) {
-      fbI32Rel(RS_ATOM, internAtom(lex))
+      fbI32Const(internAtom(lex))
     } else {
       fbI32Const(parseI32(lex))
     }
@@ -4316,7 +4308,7 @@ function emitRecordFitCore(
         fbStructGet(heap, fis[k])
         fbRefAsNonNull()
         fbStructGet(uBoxIdx, 0)
-        fbI32Rel(RS_TAG, fieldTags[k][ti])
+        fbI32Const(fieldTags[k][ti])
         fbI32Bin(70) // i32.eq
         if ti > 0 {
           fbI32Bin(114) // i32.or
@@ -4851,7 +4843,7 @@ function emptyFitArmRowOf(
 export function emptyFitArmHead(p: EmptyFitArmsPlan, i: i32) {
   if p.eaBoxed {
     fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, p.eaRows[i].erTag)
+    fbI32Const(p.eaRows[i].erTag)
     fbI32Bin(70) // 0x46 i32.eq
   } else {
     fbRefIsNull()
@@ -5597,7 +5589,7 @@ function emitListFitElem(
       if emitStrEqLit(mkStr(quoteLex(lexes[i]), -1), fnIx) < 0 { return -1 }
       fbEnd()
     } else if leafKind == "atom" {
-      fbI32Rel(RS_ATOM, internAtom(quoteLex(lexes[i])))
+      fbI32Const(internAtom(quoteLex(lexes[i])))
       fbI32Bin(70) // 0x46 i32.eq
     } else if leafKind == "i64w" {
       fbI64ExtendI32S()
@@ -5850,7 +5842,7 @@ function emitBoxFieldTagsIn(heap: i32, rslot: i32, fi: i32, fx: i32): i32 {
     fbLocalGet(rslot)
     fbStructGet(heap, fi)
     fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, tags[j])
+    fbI32Const(tags[j])
     fbI32Bin(70)
     if j > 0 { fbI32Bin(114) }
     j = j + 1
@@ -6047,7 +6039,7 @@ function emitListIsAcrossRepsAt(
     fbLocalGet(slot)
     fbRefAsNonNull()
     fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, tags[i])
+    fbI32Const(tags[i])
     fbI32Bin(70) // 0x46 i32.eq
     const k = fits[i]
     if k != LIST_ARM_OWN {
@@ -6171,7 +6163,7 @@ export function atomNotNulIsTail(): i32 {
 
 // After the operand's `i`-th read: whether it is member `text`'s atom, or'd onto the reads before.
 export function atomEqIsTail(text: string, i: i32) {
-  fbI32Rel(RS_ATOM, internAtom(quoteLex(text)))
+  fbI32Const(internAtom(quoteLex(text)))
   fbI32Bin(70)
   memberOrTail(i)
 }
@@ -6184,7 +6176,7 @@ export function memberOrTail(i: i32) {
 // After a box: its tag compared with `tag`.
 export function boxTagIsTail(tag: i32) {
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, tag)
+  fbI32Const(tag)
   fbI32Bin(70)
   return 1
 }
@@ -6246,7 +6238,7 @@ function recNeverFitsArm(arm: i32, rcv: i32): boolean {
 // After a box: whether its tag is variant `vi`'s.
 export function variantTagTail(vi: i32) {
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, uTags[vi])
+  fbI32Const(uTags[vi])
   fbI32Bin(70)
   return 0
 }
@@ -6482,7 +6474,7 @@ function emitCrossTagFits(
     const yi = rows[i]
     if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
     fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, uTags[yi])
+    fbI32Const(uTags[yi])
     fbI32Bin(70)
     if kinds[i] == 2 {
       fbIf(127)
@@ -6712,7 +6704,7 @@ function emitArmFieldsFit(
     while j < yes.length {
       if emitArmBoxField(recv, yi, fi, fnIx, slot) < 0 { return -1 }
       fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, yes[j])
+      fbI32Const(yes[j])
       fbI32Bin(70)
       if j > 0 { fbI32Bin(114) }
       j = j + 1
@@ -6722,7 +6714,7 @@ function emitArmFieldsFit(
       // The member's tag, then inside it its payload against the fitting literals.
       if emitArmBoxField(recv, yi, fi, fnIx, slot) < 0 { return -1 }
       fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, partTags[pj])
+      fbI32Const(partTags[pj])
       fbI32Bin(70)
       fbIf(127)
       const partLexes = boxFitLexes(partKinds[pj], fxs[i])
@@ -6955,7 +6947,7 @@ function emitOptChainLeafNulTest(si: i32, fi: i32) {
   if disc == 1 { return fbRefIsNull() }
   if disc == 4 {
     fbStructGet(uBoxIdx, 0) // field 0: the tag
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     return fbI32Bin(70) // 0x46 i32.eq
   }
   if disc == 2 { fbI32Const(2) } else { fbI32Const(0 - 1) }
@@ -7373,12 +7365,12 @@ export function emitOptLeafHead(exprIx: i32, fnIx: i32): i32 {
     "boxUnion" | "boxScalar" => {
       fbOpenIf()
       fbValtype("union", -1)
-      fbI32Rel(RS_TAG, nullBoxTag())
+      fbI32Const(nullBoxTag())
       fbRefNullNone()
       fbStructNew(uBoxIdx)
       fbElse()
       if fieldRowKind(oRow) != "union" {
-        fbI32Rel(RS_TAG, scalarTagOfKind(optLeafBoxKind(oRow)))
+        fbI32Const(scalarTagOfKind(optLeafBoxKind(oRow)))
       }
     }
     "nonNull" | "fail" => {}
@@ -7470,7 +7462,7 @@ export function emitNicheReadTail(exprIx: i32, ak: i32, fnIx: i32) {
   fbLocalSet(st)
   fbLocalGet(st)
   fbStructGet(uBoxIdx, 0) // field 0: the tag
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbI32Bin(70) // 0x46 i32.eq
   if ak == NICHE_NUL_LIT {
     const texts = nulLitMemberTexts(instanceReadTyOf(exprIx, fnIx))
@@ -7788,7 +7780,7 @@ function mapBoxTagOf(sh: i32, unionTy: i32, exprIx: i32, fnIx: i32): i32 {
 function cloArmBoxHead(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
   const own = cloBoxOwnFnTy(exprIx, fnIx)
   const arm = if own >= 0 { own } else { unionClosureArmTyOfTy(unionTy) }
-  return fbI32Rel(RS_TAG, cloArmTagOfTy(arm))
+  return fbI32Const(cloArmTagOfTy(arm))
 }
 
 // The head of map `exprIx` boxed into union `unionTy` under its map arm's tag: the tag, or -1
@@ -7798,7 +7790,7 @@ function mapArmBoxHead(unionTy: i32, memTy: i32, exprIx: i32, fnIx: i32): i32 {
   const sh = if memTy >= 0 { mapShapeOfTyPeeled(memTy) } else { mapShapeOfExpr(exprIx, fnIx) }
   const tag = mapBoxTagOf(sh, unionTy, exprIx, fnIx)
   if tag < 0 { return -1 }
-  return fbI32Rel(RS_TAG, tag)
+  return fbI32Const(tag)
 }
 
 // Ahead of a `M | null` value boxed under map arm tag `tag`: the box's block, and the tag's, which
@@ -7809,7 +7801,7 @@ function nulMapArmBoxHead(tag: i32): i32 {
   }
   fbBlockRefNul(uBoxIdx, false) // (ref $uBox) blocktype
   fbBlock(127) // i32: the tag, carried out when the value is null
-  fbI32Rel(RS_TAG, tag)
+  fbI32Const(tag)
   return 0
 }
 
@@ -7824,7 +7816,7 @@ function nulMapArmBoxPresent() {
 }
 
 function nulMapArmBoxNull() {
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbRefNullNone()
   fbStructNew(uBoxIdx) // { null tag, unread }
   return 0
@@ -7842,8 +7834,8 @@ function nulMapArmBoxTail(): i32 {
 // `nlTexts` under the string tag, boxed.
 function atomNulStrTail(nlTexts: string[]): i32 {
   setStrScrI(0)
-  fbI32Rel(RS_TAG, nullBoxTag())
-  fbI32Rel(RS_TAG, scalarTagOfKind(2))
+  fbI32Const(nullBoxTag())
+  fbI32Const(scalarTagOfKind(2))
   pushStrScrI(0)
   fbI32Const(-1)
   fbI32Bin(70) // i32.eq
@@ -7924,7 +7916,7 @@ export function unionIfAtDstWhy(ixIn: i32, fnIx: i32, unionTy: i32): string {
 
 // The head of a `null`-typed value's box: the null tag, ahead of its payload.
 export function nulNoneBoxHead() {
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   return 0
 }
 
@@ -8001,20 +7993,20 @@ export function holeBoxLeads(a: HoleBoxArm): boolean {
 export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
     "null" => {
-      fbI32Rel(RS_TAG, nullBoxTag())
+      fbI32Const(nullBoxTag())
       fbRefNullNone() // the payload slot is unread under the null tag
     }
-    "atom" | "atomAsStr" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
-    "atomList" => fbI32Rel(RS_TAG, atomListArmTag())
-    "rec" | "obj" | "recCopy" | "narrowBox" => if p.hbKind >= 0 && p.hbKind < uTags.length { fbI32Rel(RS_TAG, uTags[p.hbKind]) } else { emitFail("a record box arm whose kind names no union tag") }
-    "refList" | "armLit" => fbI32Rel(RS_TAG, p.hbKind)
+    "atom" | "atomAsStr" => fbI32Const(scalarTagOfKind(p.hbKind))
+    "atomList" => fbI32Const(atomListArmTag())
+    "rec" | "obj" | "recCopy" | "narrowBox" => if p.hbKind >= 0 && p.hbKind < uTags.length { fbI32Const(uTags[p.hbKind]) } else { emitFail("a record box arm whose kind names no union tag") }
+    "refList" | "armLit" => fbI32Const(p.hbKind)
     "map" => mapArmBoxHead(p.hbKind, p.hbSrc, exprIx, fnIx)
     "nulMap" => nulMapArmBoxHead(
       mapBoxTagOf(mapShapeOfExpr(exprIx, fnIx), p.hbKind, exprIx, fnIx),
     )
     "clo" => cloArmBoxHead(p.hbKind, exprIx, fnIx)
     "lit" => {
-      fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
+      fbI32Const(scalarTagOfKind(p.hbKind))
       widenLitAt(exprIx, p.hbKind, fnIx)
     }
     // The niche's stash slot is taken ahead of its value, as legacy's rung takes it.
@@ -8119,10 +8111,10 @@ function emitWideRetagChain(fromTags: i32[], toTags: i32[]) {
   while i < fromTags.length {
     fbLocalGet(slot)
     fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, fromTags[i])
+    fbI32Const(fromTags[i])
     fbI32Bin(70) // i32.eq
     fbIfRefNul(uBoxIdx, false)
-    fbI32Rel(RS_TAG, toTags[i])
+    fbI32Const(toTags[i])
     fbLocalGet(slot)
     fbStructGet(uBoxIdx, 1)
     fbStructNew(uBoxIdx)
@@ -8440,7 +8432,7 @@ export function unionEqHead(): i32 {
 // After the box's first read: its tag against the plan's, opening the payload compare's `if`.
 export function unionEqTagTail(qp: UnionEqPlan): i32 {
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, qp.uqTag)
+  fbI32Const(qp.uqTag)
   fbI32Bin(70)
   fbIf(127)
   return 0
@@ -8553,7 +8545,7 @@ export function unionEqNulTestTail(leg: i32): i32 {
 // The null leg's answer after the box's read: whether the box holds `null`.
 export function unionEqNullTagTail(): i32 {
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbI32Bin(70)
   return 0
 }
@@ -8817,22 +8809,22 @@ export function unionVariantEqTail(
     fbIf(127) // 0x04 if, i32 result: null against the box's null tag
     fbLocalGet(sl)
     fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbI32Bin(70)
     fbElse()
   }
   fbLocalGet(sl)
-  fbStructGet(uBoxIdx, 0)     // field 0: tag
-  fbI32Rel(RS_TAG, uTags[vi]) // the arm's program-global tag
-  fbI32Bin(70)                // 0x46 i32.eq
-  fbIf(127)                   // 0x04 if, i32 result
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Const(uTags[vi])   // the arm's program-global tag
+  fbI32Bin(70)            // 0x46 i32.eq
+  fbIf(127)               // 0x04 if, i32 result
   const al = unionEqArmSlot(vi)
   fbLocalGet(sl)
-  fbStructGet(uBoxIdx, 1)     // field 1: payload (anyref)
+  fbStructGet(uBoxIdx, 1) // field 1: payload (anyref)
   fbRefCast(variantHeap(vi))
   fbLocalSet(al)
   if emitVariantFieldsEq(al, ar, vi, fnIx) < 0 { return -1 }
-  fbElse()                    // the box holds a different arm — structurally unequal
+  fbElse()                // the box holds a different arm — structurally unequal
   fbI32Const(0)
   fbEnd()
   if otherNul { fbEnd() }
@@ -8880,7 +8872,7 @@ function emitUnionBoxEqStagedX(
   while a < vis.length - 1 {
     fbLocalGet(sl)
     fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, unionArmTagOf(vis[a], aks[a], armTys[a]))
+    fbI32Const(unionArmTagOf(vis[a], aks[a], armTys[a]))
     fbI32Bin(70)
     fbIf(127)
     if emitUnionArmEq(sl, sr, vis[a], aks[a], fnIx) < 0 { return -1 }
@@ -9007,7 +8999,7 @@ export function unionNumCrossTail(kas: i32[], eak: i32, isNe: boolean): i32 {
   for ka in kas {
     fbLocalGet(bs)
     fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, scalarTagOfKind(ka))
+    fbI32Const(scalarTagOfKind(ka))
     fbI32Bin(70) // i32.eq
     fbIf(127)
     fbLocalGet(bs)
@@ -9060,11 +9052,11 @@ function emitUnionNumCrossArm(sl: i32, sr: i32, ka: i32, kb: i32): boolean {
   if eqOp < 0 { return false }
   fbLocalGet(sl)
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, scalarTagOfKind(ka))
+  fbI32Const(scalarTagOfKind(ka))
   fbI32Bin(70) // i32.eq
   fbLocalGet(sr)
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, scalarTagOfKind(kb))
+  fbI32Const(scalarTagOfKind(kb))
   fbI32Bin(70) // i32.eq
   fbI32And()
   fbIf(127)
@@ -9110,7 +9102,7 @@ function emitUnionCloTagIn(slot: i32, vis: i32[], aks: i32[], armTys: i32[]) {
     if aks[a] == 11 {
       fbLocalGet(slot)
       fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, unionArmTagOf(vis[a], aks[a], armTys[a]))
+      fbI32Const(unionArmTagOf(vis[a], aks[a], armTys[a]))
       fbI32Bin(70)  // 0x46 i32.eq
       fbI32Bin(114) // 0x72 i32.or
     }
@@ -9500,7 +9492,7 @@ export function unionLitTagHead(p: UnionLitIsPlan) {
   const s = unionLitIsStashSlot()
   if p.ulOnce { fbLocalTee(s) }
   fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-  fbI32Rel(RS_TAG, scalarTagOfKind(p.ulLak))
+  fbI32Const(scalarTagOfKind(p.ulLak))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
   if p.ulOnce { fbLocalGet(s) }
@@ -9796,7 +9788,7 @@ export function sharedArmHead(
   return match mode {
     "null" => sharedArmNullTail(sharedArmNullOf(code, vi, fi))
     "litAtom" => {
-      fbI32Rel(RS_ATOM, internAtom(quoteLex(sharedFieldArmLitTexts(vi, fi)[0])))
+      fbI32Const(internAtom(quoteLex(sharedFieldArmLitTexts(vi, fi)[0])))
       0
     }
     "setToStr" => if sharedFieldArmSetTexts(vi, fi).length == 0 { emitFail(
@@ -9825,7 +9817,7 @@ function sharedArmReadHead(
     return 0
   }
   if sharedArmSetStr(code, vi, fi) {
-    fbI32Rel(RS_TAG, scalarTagOfKind(2))
+    fbI32Const(scalarTagOfKind(2))
   } else if sharedFieldReadBoxes(code, vi, fi) {
     sharedArmBoxHead(vi, fi, readIx, fnIx)
   }
@@ -9903,8 +9895,8 @@ function sharedArmReadTail(
   if refTag >= 0 && sharedFieldArmNullable(vi, fi) {
     const rSlot = sharedFieldNulRefSlot(vi, fi)
     fbLocalSet(rSlot)
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbI32Rel(RS_TAG, refTag)
+    fbI32Const(nullBoxTag())
+    fbI32Const(refTag)
     fbLocalGet(rSlot)
     fbRefIsNull()
     fbSelect()
@@ -9929,7 +9921,7 @@ function sharedArmBoxTagOf(vi: i32, fi: i32, readIx: i32, fnIx: i32): i32 {
 
 // Before the receiver: a boxing arm's tag.
 function sharedArmBoxHead(vi: i32, fi: i32, readIx: i32, fnIx: i32) {
-  return fbI32Rel(RS_TAG, sharedArmBoxTagOf(vi, fi, readIx, fnIx))
+  return fbI32Const(sharedArmBoxTagOf(vi, fi, readIx, fnIx))
 }
 
 // After the payload read: a boxing arm's value box, where its atom has one, and the union box.
@@ -9990,7 +9982,7 @@ function sharedArmNullTail(nk: i32): i32 {
   } else if nk == SHARED_NULL_DEAD {
     fbUnreachable()
   } else if nk == SHARED_NULL_BOX {
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbRefNullNone()
     fbStructNew(uBoxIdx)
   } else {
@@ -10005,7 +9997,7 @@ function sharedArmNullTail(nk: i32): i32 {
 // the `if` whose result is the field's rep.
 export function sharedArmTestTail(code: i32, vis: i32[], fis: i32[], i: i32) {
   fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, uTags[vis[i]])
+  fbI32Const(uTags[vis[i]])
   fbI32Bin(70) // 0x46 i32.eq
   const a = sharedFieldValueArm(vis, fis)
   return fbIfForSharedPlan(code, vis[a], fis[a])
@@ -10119,11 +10111,11 @@ function sharedArmNulSetBoxTail(vi: i32, fi: i32): i32 {
   fbI32Const(0 - 1)
   fbI32Bin(70) // 0x46 i32.eq — the niche's `null`
   fbIfRefNul(uBoxIdx, false)
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbRefNullNone()
   fbStructNew(uBoxIdx)
   fbElse()
-  fbI32Rel(RS_TAG, scalarTagOfKind(2))
+  fbI32Const(scalarTagOfKind(2))
   if emitAtomToStrChain(texts, 0, idSlot) < 0 { return -1 }
   fbStructNew(uBoxIdx)
   fbEnd()
@@ -10190,7 +10182,7 @@ export function sharedFieldValSlot(
 // and the IR share it, as they share `sharedFieldArmCast` and `sharedFieldArmClose`.
 export function sharedFieldArmTest(vis: i32[], i: i32) {
   fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, uTags[vis[i]])
+  fbI32Const(uTags[vis[i]])
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(64)                // 0x40 void
   return 0
@@ -10375,7 +10367,7 @@ function emitUnionFieldTagDispatch(kinds: i32[], ck: i32) {
   while i < kinds.length - 1 {
     fbLocalGet(slot)
     fbStructGet(uBoxIdx, 0) // field 0: tag
-    fbI32Rel(RS_TAG, scalarTagOfKind(kinds[i]))
+    fbI32Const(scalarTagOfKind(kinds[i]))
     fbI32Bin(70) // 0x46 i32.eq
     fbIfForAtomKind(ck)
     fbLocalGet(slot)
@@ -11777,7 +11769,7 @@ export function mapGetOrUnionHead(mslot: i32) {
   fbArrayGet(cmValsBack())     // the stored (ref null $uBox) slot read
   fbLocalSet(stashL)
   fbElse()                     // miss = the read's null (a null-tagged box)
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbRefNullNone()
   fbStructNew(uBoxIdx)
   fbLocalSet(stashL)
@@ -11790,7 +11782,7 @@ export function mapGetOrUnionHead(mslot: i32) {
 export function mapGetOrUnionScalarOpen(mslot: i32, qp: MapUnionPlan) {
   fbLocalGet(fnMvValStashLocal(mslot))
   fbStructGet(uBoxIdx, 0)             // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbI32Bin(70)                        // 0x46 i32.eq → null?
   fbIf(valBlockTypeOfKind(qp.muWide)) // value-typed if in the result's rep
   return 0
@@ -11825,7 +11817,7 @@ export function mapGetOrUnionBoxOf(mslot: i32, defIx: i32): boolean {
 export function mapGetOrUnionBoxOpen(mslot: i32) {
   fbLocalGet(fnMvValStashLocal(mslot))
   fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbI32Bin(70)            // 0x46 i32.eq → null?
   fbIf(64)
   return 0
@@ -12075,7 +12067,7 @@ export function mapGetUnionBoxTail() {
   fbArrayGet(cmValsBack())     // the stored (ref null $uBoxIdx) slot read
   fbLocalSet(fnMvValStashLocal(mslot))
   fbElse()                     // else — a miss IS the read's `null`: the null-tagged box
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbRefNullNone()              // the payload slot is unread under the null tag
   fbStructNew(uBoxIdx)
   fbLocalSet(fnMvValStashLocal(mslot))
@@ -12094,9 +12086,9 @@ export function emitMapGetScalarBoxTail(atomKind: i32) {
   // ── the TAG: the value's atom on a hit, `null`'s atom on a miss ──
   pushMapScr(5) // entry
   fbIf(127)     // i32 blocktype
-  fbI32Rel(RS_TAG, scalarTagOfKind(atomKind))
+  fbI32Const(scalarTagOfKind(atomKind))
   fbElse()
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbEnd()
   // ── the PAYLOAD: the boxed value on a hit, a null ref on a miss ──
   pushMapScr(5) // entry
@@ -12150,7 +12142,7 @@ export function mapScalarJoinBoxes(e: BinExpr, ak: i32, fnIx: i32): boolean {
 export function mapScalarJoinOpen(ak: i32): i32 {
   pushMapScr(5)    // entry
   fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
-  fbI32Rel(RS_TAG, scalarTagOfKind(ak))
+  fbI32Const(scalarTagOfKind(ak))
   pushMapScalarHit()
   fbStructNew(vbHeapIdxOfKind(ak))
   fbStructNew(uBoxIdx)
@@ -13566,11 +13558,10 @@ export function forLitStrPooled(sx: i32): boolean {
   return n is StrLit && (gStrPoolIx[n.strText] ?? -1) >= 0
 }
 
-// Appends element bytes `one` to the hoisted list's initializer `init`, with their relocations;
+// Appends element bytes `one` to the hoisted list's initializer `init`;
 // false, appending nothing, when `one` is not exactly one constant instruction.
 export function forLitHoistAdd(one: u8[], init: u8[]): boolean {
   if !isOneConstIns(one) { return false }
-  relCopy(one, init, init.length)
   for x in one { init.push(x) }
   return true
 }
@@ -13582,7 +13573,6 @@ export function forLitHoistClose(init: u8[], n: i32, t: ForLitHoistTys): i32 {
   fbArrayNewFixed(t.fhBack, n)
   arrLitWrap(n, t.fhWrap)
   wTarget(prev)
-  relHold(init)
   const g = synthConstListIdx(t.fhWrap, init)
   return if g < 0 { -1 } else { g }
 }
@@ -17209,7 +17199,7 @@ function xrepElemEq(
     if ka >= 0 && wide >= 0 && numEqOpOfKind(wide) >= 0 {
       fbLocalGet(bs)
       fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, scalarTagOfKind(ka))
+      fbI32Const(scalarTagOfKind(ka))
       fbI32Bin(70)
       fbIf(127)
       fbLocalGet(bs)
@@ -18881,10 +18871,10 @@ function emitMapRetagTail(exprIx: i32) {
   while i < fromTags.length {
     fbLocalGet(unionAsBoxSlot())
     fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, fromTags[i])
+    fbI32Const(fromTags[i])
     fbI32Bin(70) // i32.eq
     fbIfRefNul(uBoxIdx, false)
-    fbI32Rel(RS_TAG, toTags[i])
+    fbI32Const(toTags[i])
     fbLocalGet(unionAsBoxSlot())
     fbStructGet(uBoxIdx, 1)
     fbStructNew(uBoxIdx)
@@ -18968,10 +18958,10 @@ function emitWidenRetagArm(fromTy: i32, toTy: i32) {
   }
   fbLocalGet(unionAsBoxSlot())
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, scalarTagOfKind(fk))
+  fbI32Const(scalarTagOfKind(fk))
   fbI32Bin(70) // i32.eq
   fbIfRefNul(uBoxIdx, false)
-  fbI32Rel(RS_TAG, scalarTagOfKind(tk))
+  fbI32Const(scalarTagOfKind(tk))
   fbLocalGet(unionAsBoxSlot())
   if emitUnionUnboxTail(fk) < 0 { return -1 }
   wU8(conv)
@@ -19013,10 +19003,10 @@ function emitBoxAtomRetagMembers(ft: i32[], tt: i32[], at: i32) {
       }
       fbLocalGet(slot)
       fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, scalarTagOfKind(fk))
+      fbI32Const(scalarTagOfKind(fk))
       fbI32Bin(70) // i32.eq
       fbIfRefNul(uBoxIdx, false)
-      fbI32Rel(RS_TAG, scalarTagOfKind(k))
+      fbI32Const(scalarTagOfKind(k))
       fbLocalGet(slot)
       if emitUnionUnboxTail(fk) < 0 { return -1 }
       wU8(atomConvOp(fk, k))
@@ -19338,7 +19328,7 @@ export function unionBoxToPairTail(idx: i32) {
 // The rep's NULL into the sink pair (the else-less false path): the null tag and the
 // unread payload slot, written directly rather than through a box the merge would discard.
 export function emitUnionNullToPair() {
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbLocalSet(unionSinkBase)
   fbRefNullNone() // the payload slot is unread under the null tag
   fbLocalSet(unionSinkBase + 1)
@@ -19691,13 +19681,13 @@ export function numExactCastHead(exprIx: i32, srcIn: string, fnIx: i32): i32 {
       )
     }
     fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
-    fbI32Rel(RS_TAG, scalarTagOfKind(nck))
+    fbI32Const(scalarTagOfKind(nck))
     if emitNumExactConvert(src, tgt) < 0 { return -1 }
     fbStructNew(nvb) // wrap the scalar payload
     fbStructNew(uBoxIdx)
     fbElse()
     // The null-tagged box, not a null box ref — what `T | null` means for a boxed union.
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbRefNullNone() // the payload slot is unread under the null tag
     fbStructNew(uBoxIdx)
     fbEnd()
@@ -19889,7 +19879,7 @@ function emitAsUnionOpt(
     // the null-tagged box, what `T | null` means for a boxed union — a non-null box
     // carrying `nullBoxTag()`, not a null box ref: the rep the null test and
     // `emitUnionCoerce`'s `NullLit` both use, so a `!= null` on the result agrees.
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbRefNullNone() // the payload slot is unread under the null tag
     fbStructNew(uBoxIdx)
     fbEnd()
@@ -19996,7 +19986,7 @@ function emitAsBoxToLitUnionTail(
   fbLocalSet(st)
   fbLocalGet(st)
   fbStructGet(uBoxIdx, 0) // field 0: the tag
-  fbI32Rel(RS_TAG, scalarTagOfKind(k))
+  fbI32Const(scalarTagOfKind(k))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // the payload is read only under its own tag
   let i = 0
@@ -20109,7 +20099,7 @@ function emitAsUnionTagTail(e: AsExpr, p: AsUnionTag) {
   while wi < wantTags.length {
     fbLocalGet(unionAsBoxSlot())
     fbStructGet(uBoxIdx, 0) // field 0: the tag
-    fbI32Rel(RS_TAG, wantTags[wi])
+    fbI32Const(wantTags[wi])
     fbI32Bin(70)            // 0x46 i32.eq
     if wi > 0 {
       fbI32Bin(114) // 0x72 i32.or
@@ -20465,7 +20455,7 @@ export function asLitAtomTail(exprIx: i32, fnIx: i32): i32 {
   let i = 0
   while i < texts.length {
     fbLocalGet(s)
-    fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
+    fbI32Const(internAtom(quoteLex(texts[i])))
     fbI32Bin(70) // 0x46 i32.eq
     if i > 0 {
       fbI32Bin(114) // 0x72 i32.or
@@ -20568,12 +20558,12 @@ export function asNumLitScalarTail(exprIx: i32, fnIx: i32): i32 {
     }
     fbOpenIf()             // 0x04 if
     fbValtype("union", -1) // result blocktype: the union box `(ref $uBox)`
-    fbI32Rel(RS_TAG, scalarTagOfKind(k))
+    fbI32Const(scalarTagOfKind(k))
     fbLocalGet(s)
     fbStructNew(vb)
     fbStructNew(uBoxIdx)
     fbElse()
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbRefNullNone()        // the payload slot is unread under the null tag
     fbStructNew(uBoxIdx)
     fbEnd()
@@ -20584,7 +20574,7 @@ export function asNumLitScalarTail(exprIx: i32, fnIx: i32): i32 {
   if e.asMode == "trap" {
     fbUnreachable()
   } else if retBox {
-    fbI32Rel(RS_TAG, scalarTagOfKind(k))
+    fbI32Const(scalarTagOfKind(k))
     fbLocalGet(s)
     fbStructNew(vbHeapIdxOfKind(k))
     fbStructNew(uBoxIdx)
@@ -20722,7 +20712,7 @@ function holeOptExactSrc(exprIx: i32, fnIx: i32): string {
 
 // The tag of `holeOptShapeOf`'s "box" at cast `exprIx`, written ahead of its operand.
 export function holeOptBoxHead(exprIx: i32) {
-  return fbI32Rel(RS_TAG, scalarTagOfKind(asExprNumTgtKind(exprIx)))
+  return fbI32Const(scalarTagOfKind(asExprNumTgtKind(exprIx)))
 }
 
 // The scalar type `holeOptShapeOf`'s "box" at cast `exprIx` boxes: its target's.
@@ -22378,9 +22368,14 @@ export function printArmOf(argIx: i32, fnIx: i32): PrintArm {
 function openCallWidth(argIx: i32, fnIx: i32): string {
   const ix = unwrapParen(argIx)
   if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = nodeAt(ix)
+  // A read of an un-annotated `const` holding such a call is that call's width (D17809).
+  if n is Ident {
+    const d = identLetOfRead(ix, fnIx)
+    return if d >= 0 { letOpenCallWidth(d, fnIx) } else { "" }
+  }
   const t = exprValueTyAt(ix, fnIx)
   if t >= 0 && !tyHasTyVar(t) { return "" }
-  const n = nodeAt(ix)
   if !(n is Call) { return "" }
   const lf = cloLiftCalleeOf(n.callFn, fnIx)
   if lf >= 0 { return repOfFnSlot(lf).rdKind ?? "" }
@@ -22395,6 +22390,7 @@ function printScalarArmOf(argIx: i32, fnIx: i32): PrintArm {
   if lw == "f32" { return "f32" }
   if lw == "f64" { return "f64" }
   if lw == "i64" { return "i64" }
+  if lw == "i32" { return "i32" }
   if exprIsF32(argIx, fnIx) { return "f32" }
   if exprIsF64(argIx, fnIx) { return "f64" }
   if exprIsI64(argIx, fnIx) { return "i64" }
@@ -24324,17 +24320,17 @@ function emitPopNulBox(
     )
   }
   if pushTakeCond(lIdx, lTy, idxIx, fnIx) < 0 { return -1 }
-  fbOpenIf()                            // 0x04 if
-  fbValtype("union", -1)                // result blocktype: the union box `(ref $uBox)`
-  fbI32Rel(RS_TAG, scalarTagOfKind(vk)) // the present arm's atom tag
+  fbOpenIf()                      // 0x04 if
+  fbValtype("union", -1)          // result blocktype: the union box `(ref $uBox)`
+  fbI32Const(scalarTagOfKind(vk)) // the present arm's atom tag
   if pushTakeElem(lIdx, lTy, aTy, idxIx, fnIx) < 0 { return -1 }
-  fbStructNew(vb)                       // the per-rep value box
-  fbStructNew(uBoxIdx)                  // { tag, value }
-  fbElse()                              // 0x05 else — absent → the null-tagged box
-  fbI32Rel(RS_TAG, nullBoxTag())
-  fbRefNullNone()                       // the payload slot is unread under the null tag
+  fbStructNew(vb)                 // the per-rep value box
+  fbStructNew(uBoxIdx)            // { tag, value }
+  fbElse()                        // 0x05 else — absent → the null-tagged box
+  fbI32Const(nullBoxTag())
+  fbRefNullNone()                 // the payload slot is unread under the null tag
   fbStructNew(uBoxIdx)
-  fbEnd()                               // 0x0b end
+  fbEnd()                         // 0x0b end
   return 0
 }
 
@@ -24592,7 +24588,7 @@ function emitPopRefChecked(
     fbRefAsNonNull()
     if emitStaleBoxRetag(popRefSlot, callIx) < 0 { return -1 }
     fbElse() // 0x05 else — absent → the null-tagged box
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbRefNullNone()
     fbStructNew(uBoxIdx)
     fbEnd() // 0x0b end
@@ -25297,11 +25293,11 @@ function emitRefListWidenTop(srcSlot: i32, dstSlot: i32) {
     fbArrayGet(srcBack)
     fbRefIsNull()
     fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbRefNullNone() // the payload slot is unread under the null tag
     fbStructNew(uBoxIdx)
     fbElse()
-    fbI32Rel(RS_TAG, tag) // the arm's program-global tag
+    fbI32Const(tag) // the arm's program-global tag
     fbLocalGet(sL)
     fbStructGet(srcWrap, 0)
     fbLocalGet(iL)
@@ -25309,7 +25305,7 @@ function emitRefListWidenTop(srcSlot: i32, dstSlot: i32) {
     fbStructNew(uBoxIdx)
     fbEnd()
   } else {
-    fbI32Rel(RS_TAG, tag) // the arm's program-global tag
+    fbI32Const(tag) // the arm's program-global tag
     fbLocalGet(sL)
     fbStructGet(srcWrap, 0) // the source backing, `(ref $srcBack)`
     fbLocalGet(iL)
@@ -25472,7 +25468,7 @@ function emitAtomLocalToStrChain(texts: string[], i: i32, aL: i32) {
   if emitStr(mkStr(quoteLex(texts[i]), -1), -1) < 0 { return -1 }
   if emitAtomLocalToStrChain(texts, i + 1, aL) < 0 { return -1 }
   fbLocalGet(aL)
-  fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
+  fbI32Const(internAtom(quoteLex(texts[i])))
   fbI32Bin(70) // i32.eq
   fbSelectRef(sTy())
   return 0
@@ -25583,12 +25579,12 @@ function emitScalarListBoxTop(
       fbI32Bin(70) // i32.eq
     }
     fbIfRef(uBoxIdx)
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbRefNullNone()
     fbStructNew(uBoxIdx)
     fbElse()
   }
-  fbI32Rel(RS_TAG, scalarTagOfKind(atomK))
+  fbI32Const(scalarTagOfKind(atomK))
   fbLocalGet(sL)
   fbStructGet(srcWrap, 0)
   fbLocalGet(iL)
@@ -27018,7 +27014,7 @@ export function emitNullRetTail(p: NullRet | null) {
     return emitFail("emitNullForRet: unsupported nullable return rep")
   }
   if p.nrBox {
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbRefNullNone() // payload slot unread under the null tag
     fbStructNew(uBoxIdx)
     return 0
@@ -28680,7 +28676,7 @@ export function luForElemChain(
 function luForArmTest(box: i32, tag: i32) {
   fbLocalGet(box)
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, tag)
+  fbI32Const(tag)
   fbI32Bin(70) // 0x46 i32.eq
   return 0
 }
@@ -28774,7 +28770,7 @@ function armElemRowOf(e: i32): ArmElemRow {
 // The two halves of boxing a value read between them at `row`: the tag below the value, then its
 // scalar value box and the union box over both; a stored box is only recovered non-null.
 function armRowBoxOpen(row: ArmElemRow) {
-  if row.et >= 0 { fbI32Rel(RS_TAG, row.et) }
+  if row.et >= 0 { fbI32Const(row.et) }
   return 0
 }
 
@@ -28800,7 +28796,7 @@ export function mapUnionForArmTest(m: i32): i32 {
   const t = listIsArmTag(m)
   if t < 0 { return -1 }
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, t)
+  fbI32Const(t)
   fbI32Bin(70) // 0x46 i32.eq
   fbIf(64)
   return 0
@@ -28970,7 +28966,7 @@ export function emitListUnionForElem(
     emitListUnionForRead(box, cur, heap)
     fbRefIsNull()
     fbIfRef(uBoxIdx)
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbRefNullNone()
     fbStructNew(uBoxIdx)
     fbElse()
@@ -29250,7 +29246,6 @@ export function emitFoldedConstRead(gi: i32) {
       "emitProgram: a folded module const read past its banked bytes",
     )
   }
-  relFoldNote(gi)
   let k = at
   while k < end {
     wU8(gFoldPool[k])
@@ -29402,14 +29397,14 @@ export function emitInitGuard(gi: i32, verb: string) {
     fbI32Eqz()
   } else {
     fbGlobalGet(gInitProgIdx)
-    fbI32RelOf(RS_GUARD, gi, initGuardValue(gi) + relSkew(RS_GUARD))
+    fbI32Const(initGuardValue(gi))
     fbI32Bin(72) // 0x48 i32.lt_s
   }
   fbIf(64)              // 0x40 void
-  fbI32RelOf(RS_GNAME, gi, initGuardGlobalRow(gi) + relSkew(RS_GNAME))
+  fbI32Const(initGuardGlobalRow(gi))
   if verb == "written" { fbI32Const(1) } else { fbI32Const(0) }
   const rr = initGuardReaderRow()
-  fbI32RelOf(RS_GREAD, rr, rr + relSkew(RS_GREAD))
+  fbI32Const(rr)
   fbCall(gHelpInitFail) // never returns
   fbEnd()
   return 0
@@ -29725,7 +29720,7 @@ export function printUnionTail(slot: i32, kinds: i32[]) {
   while i < kinds.length - 1 {
     fbLocalGet(slot)
     fbStructGet(uBoxIdx, 0) // field 0: tag
-    fbI32Rel(RS_TAG, scalarTagOfKind(kinds[i]))
+    fbI32Const(scalarTagOfKind(kinds[i]))
     fbI32Bin(70)            // 0x46 i32.eq
     fbIf(64)                // if (void)
     if emitPrintUnionArm(slot, kinds[i]) < 0 { return -1 }
@@ -29915,7 +29910,7 @@ function emitAtomToStrChain(texts: string[], i: i32, idSlot: i32) {
   if emitAtomToStrChain(texts, i + 1, idSlot) < 0 { return -1 }
   // cond = (stashed id == this member's id)
   fbLocalGet(idSlot)
-  fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
+  fbI32Const(internAtom(quoteLex(texts[i])))
   fbI32Bin(70) // i32.eq
   // select_t typed for a non-null string ref (0x64 $sTypeIdx): val1 if cond else val2
   fbSelectRef(sTy())
@@ -29981,10 +29976,10 @@ function emitStashedStrToAtomChain(
   fnIx: i32,
 ) {
   if i >= texts.length - 1 {
-    fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
+    fbI32Const(internAtom(quoteLex(texts[i])))
     return 0
   }
-  fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
+  fbI32Const(internAtom(quoteLex(texts[i])))
   if emitStashedStrToAtomChain(st, texts, i + 1, fnIx) < 0 { return -1 }
   fbLocalGet(st)
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
@@ -30006,7 +30001,7 @@ export function strToAtomIdTail(texts: string[], i: i32): i32 {
       "emitProgram: internal: an atom tower member past its texts",
     )
   }
-  fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
+  fbI32Const(internAtom(quoteLex(texts[i])))
   return 0
 }
 
@@ -30030,10 +30025,10 @@ function emitStagedStrToAtomChain(
   fnIx: i32,
 ) {
   if i >= texts.length - 1 {
-    fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
+    fbI32Const(internAtom(quoteLex(texts[i])))
     return 0
   }
-  fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
+  fbI32Const(internAtom(quoteLex(texts[i])))
   if emitStagedStrToAtomChain(texts, i + 1, slot, fnIx) < 0 { return -1 }
   fbLocalGet(slot)
   if emitStrEqLit(mkStr(quoteLex(texts[i]), -1), fnIx) < 0 { return -1 }
@@ -30060,7 +30055,7 @@ function litPushNeedsDestNarrow(valIx: i32, fnIx: i32) {
 
 // Pushes the interned atom id of lexeme `lex`, the half of a static operand after its effects.
 export function staticAtomId(lex: string) {
-  fbI32Rel(RS_ATOM, internAtom(lex))
+  fbI32Const(internAtom(lex))
   return 0
 }
 
@@ -30217,7 +30212,7 @@ export function nullReadDstOwnOf(exprIx: i32, fnIx: i32): i32 {
 export function emitStrLitAt(ix: i32, fnIx: i32) {
   const e = nodeAt(ix)
   if e is StrLit && strLitTakesAtom(ix, fnIx) {
-    fbI32Rel(RS_ATOM, internAtom(e.strText))
+    fbI32Const(internAtom(e.strText))
     return 0
   }
   return emitStr(ix, fnIx)
@@ -30297,7 +30292,7 @@ function ctxIsNulAtom(ix: i32, fnIx: i32): boolean {
 // Emits the null `own` names (`nullOwnAt`): the shared tail of every `null` value.
 export function emitNullOwn(own: i32) {
   if own == NULL_OWN_BOX {
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbRefNullNone() // the payload slot is unread under the null tag
     return fbStructNew(uBoxIdx)
   }
@@ -30590,7 +30585,7 @@ export function armIndexWriteTest(m: i32): i32 {
   const t = listIsArmTag(m)
   if t < 0 { return armIndexWriteNoWrapper() }
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, t)
+  fbI32Const(t)
   fbI32Bin(70) // 0x46 i32.eq
   fbIf(64)
   return 0
@@ -30671,7 +30666,7 @@ export function armSiteArmOpen(idxIx: i32, slot: i32, m: i32, fnIx: i32): i32 {
 // the read's rep.
 export function armSiteArmTest(idxIx: i32, t: i32, fnIx: i32) {
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, t)
+  fbI32Const(t)
   fbI32Bin(70) // 0x46 i32.eq
   if armSiteUName(idxIx, fnIx) != "" {
     fbIfRef(uBoxIdx)
@@ -30893,7 +30888,7 @@ function njPushSide(left: boolean, m: i32, p: i32) {
 function njTagTest(slot: i32, k: i32) {
   fbLocalGet(slot)
   fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, scalarTagOfKind(k))
+  fbI32Const(scalarTagOfKind(k))
   fbI32Bin(70) // 0x46 i32.eq
 }
 
@@ -30911,7 +30906,7 @@ function njPair(a: i32, b: i32) {
       "emitProgram: a numeric union member pair has no operator type",
     )
   }
-  if njResBox { fbI32Rel(RS_TAG, scalarTagOfKind(p)) }
+  if njResBox { fbI32Const(scalarTagOfKind(p)) }
   const fRem = njOp == "%" && (p == 4 || p == 5)
   if njPushSide(true, a, p) < 0 { return -1 }
   if fRem { f64RemOperandTail(p == 5) }
@@ -31105,7 +31100,7 @@ function njReboxArm(ms: i32[], i: i32, bs: i32, dk: i32[]) {
     fbLocalGet(bs)
     fbRefAsNonNull()
   } else {
-    fbI32Rel(RS_TAG, scalarTagOfKind(sk))
+    fbI32Const(scalarTagOfKind(sk))
     fbLocalGet(bs)
     if emitUnionUnboxTail(mk) < 0 { return -1 }
     if njConvert(mk, sk) < 0 { return -1 }
@@ -32188,11 +32183,11 @@ export function nulBoolBoxTail(): i32 {
   fbI32Const(2)
   fbI32Bin(70) // 0x46 i32.eq → null?
   fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbRefNullNone()
   fbStructNew(uBoxIdx)
   fbElse()
-  fbI32Rel(RS_TAG, scalarTagOfKind(1))
+  fbI32Const(scalarTagOfKind(1))
   fbLocalGet(bSlot)
   fbStructNew(vbHeapIdxOfKind(1))
   fbStructNew(uBoxIdx)
@@ -32220,11 +32215,11 @@ export function nulNicheBoxTail(nnTag: i32): i32 {
   fbLocalTee(nnSlot)
   fbRefIsNull()
   fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the box is the result either way
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbRefNullNone()  // the payload slot is unread under the null tag
   fbStructNew(uBoxIdx)
   fbElse()         // 0x05 else — present → the niche's own ref, under its arm's tag
-  fbI32Rel(RS_TAG, nnTag)
+  fbI32Const(nnTag)
   fbLocalGet(nnSlot)
   fbStructNew(uBoxIdx)
   fbEnd()          // 0x0b end
@@ -32266,7 +32261,7 @@ export function coalNulRefJoinOpen() {
 // The present arm of a joining `l ?? d`: the staged reference boxed under tag `tag`.
 export function coalNulRefJoinPresent(tag: i32) {
   fbElse() // 0x05 else — present → the staged ref, boxed under its own arm's tag
-  fbI32Rel(RS_TAG, tag)
+  fbI32Const(tag)
   fbLocalGet(optRecvScr())
   fbStructNew(uBoxIdx) // { tag, the niche's own ref }
 }
@@ -32302,7 +32297,7 @@ export function coalNulBoolJoinOpen(): i32 {
 // After the default: the present 0/1 boxed under the boolean arm's tag, and the end.
 export function coalNulBoolJoinPresent(): i32 {
   fbElse() // 0x05 else — present → the 0/1 under the boolean arm's tag
-  fbI32Rel(RS_TAG, scalarTagOfKind(1))
+  fbI32Const(scalarTagOfKind(1))
   fbLocalGet(widenTmpSlot(4000))
   fbStructNew(vbHeapIdxOfKind(1))
   fbStructNew(uBoxIdx)
@@ -32813,7 +32808,7 @@ function coalBoxAtomKind(
 // The null test on the box on the stack: its tag is the null tag.
 function coalTagIsNull() {
   fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbI32Bin(70) // 0x46 i32.eq → null?
 }
 
@@ -32866,13 +32861,13 @@ function coalElemOpen(
     fbElse()
     fbLocalGet(slot)
     fbStructGet(uBoxIdx, 0) // field 0: tag
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbI32Bin(71) // 0x47 i32.ne
     fbEnd()
   } else {
     fbLocalGet(slot)
     fbStructGet(uBoxIdx, 0) // field 0: tag
-    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Const(nullBoxTag())
     fbI32Bin(71) // 0x47 i32.ne — present?
   }
   // The result is read at the instance's pin, since a generic body records its `??` at the hole
@@ -33148,7 +33143,7 @@ export function coalFieldValOpen(p: CoalFieldPlan) {
 function coalFieldNullTest(p: CoalFieldPlan) {
   coalFieldRead(p)        // the union box
   fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbI32Bin(70)            // 0x46 i32.eq → null?
 }
 
@@ -33551,7 +33546,7 @@ export function coalNulAtomJoinOpen(slot: i32) {
 // `texts`, under the union's string arm, then the `end`.
 export function coalNulAtomJoinPresent(texts: string[], slot: i32) {
   fbElse()
-  fbI32Rel(RS_TAG, scalarTagOfKind(2))
+  fbI32Const(scalarTagOfKind(2))
   if emitAtomToStrChain(texts, 0, slot) < 0 { return -1 }
   fbStructNew(uBoxIdx)
   fbEnd()
@@ -33590,7 +33585,7 @@ export function coalBoxRuntimeOpen(slot: i32, bk: i32) {
   fbLocalSet(slot)
   fbLocalGet(slot)
   fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbI32Bin(71) // 0x47 i32.ne  -> present?
   fbIf(vt)
   fbLocalGet(slot)
@@ -33605,7 +33600,7 @@ export function coalBoxStashOpen(slot: i32) {
   fbLocalSet(slot)
   fbLocalGet(slot)
   fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbI32Bin(71) // 0x47 i32.ne  -> present?
   fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
   fbLocalGet(slot)
@@ -33665,7 +33660,7 @@ export function coalBoxFieldScalarOpen(p: BoxFieldPlan) {
   fbLocalSet(slot)
   fbLocalGet(slot)
   fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Const(nullBoxTag())
   fbI32Bin(71) // 0x47 i32.ne — present?
   fbIf(nulBoxScalarValtype(p.bfRes))
   fbLocalGet(slot)
@@ -33767,7 +33762,7 @@ function njNegArm(ms: i32[], i: i32, bs: i32) {
     fbOpenIf()
     fbValtype("union", -1)
   }
-  fbI32Rel(RS_TAG, scalarTagOfKind(mk))
+  fbI32Const(scalarTagOfKind(mk))
   if mk == 0 { fbI32Const(0) }
   if mk == 3 { fbI64Const(0, 0) }
   fbLocalGet(bs)

@@ -10,6 +10,12 @@ VL_PROFILE_GUEST=/tmp/p.json vl check compiler/typecheck.vl --compiler /tmp/name
 vl run scripts/profile-rank.vl -- /tmp/p.json 20   # rank by SELF time
 ```
 
+**A HANG: `VL_PROFILE_GUEST_SIGINT=1`.** Beside `VL_PROFILE_GUEST`, a SIGINT (`timeout -s INT 20 vl
+...`) stops the guest at its next sample with a trap, so a compile that never ends prints the guest's
+backtrace (a `--names` seed names the frames) and writes the profile; inclusive time in it shows the
+looping frame where the trap's innermost frame is only where the sample landed. Off by default, and
+unix only (`tests/vl_profile_sigint_test.ts`).
+
 **EVERY ENTRY THE HOST DRIVES TAKES IT** — `check`, `build`, `run`, `fmt`, `test`, and the
 `--batch` / `--json` forms. The sampler is a per-STORE epoch-deadline callback
 (`arm_guest_profile` in `scripts/vl-host/src/main.rs`), so it fires whenever guest code is on
@@ -72,6 +78,13 @@ prints this split on every gate run (the pair's stage 4 is profiled this way) an
 `--phases`. It prints, never grades: the 1% tier stays on the total. A host that predates the flag
 writes time weights; `--weighted` sees their total miss the fuel and falls back to sample shares,
 and says so.
+
+**CHECKER COST: `VL_CHECK_COST=1`.** Each compile prints `[check-cost] <path>:` rows: `passes N`, one
+`pass <cause> N` per cause of a full check pass (`first`, `pin:<phase>`, `settle:<phase>`,
+`wsDecline`, `deepIs`, `etaAgain`), and `arena rows R distinct D solved S`, the type arena's size beside its
+structurally distinct rows (`compiler/check_stats.vl`). Measured 2026-11-28 (#10525): the
+self-compile runs one pass, and its arena holds 181,000 rows, 27,110 distinct by their stored
+children (the merge interning can reach) and 10,706 with solved holes read through.
 
 ## Comparing CPU between two seeds: interleave, and read the ranges
 
