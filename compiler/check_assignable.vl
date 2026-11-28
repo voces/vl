@@ -79,6 +79,7 @@ import {
   i32ToStr,
   letNameAt,
   mkArrayLit,
+  mkBinary,
   mkBlock,
   mkBool,
   mkCall,
@@ -522,6 +523,7 @@ import {
   mkArrayTy,
   mkFuncTy,
   mkMapTy,
+  mkObjTy,
   nestParentOf,
   nwTyIxs,
   objFieldType,
@@ -4837,9 +4839,10 @@ export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   if list != (da is TyArray) || !fvaRecFieldsClose(sr, dr) { return false }
-  // A list's copy would go through `.map`, which does not yet coerce a set's field at its
-  // lambda's result (D17775); a record of one field is copied without one.
   const dro = tyAt(dr)
+  // A list is copied through `.map`, each element rebuilt at the destination's record, whose
+  // result converts each field: `site.map(($r): R => ({ f: $r.f, … }))`.
+  if list && dro is TyObj { return fvaRecListMapCopy(site, dr, dro) }
   // A record of several fields is converted where it is delivered, each member pinned there.
   if !list && dro is TyObj && dro.objFieldNames.length > 1 {
     fnTagValueDstNote(sx, dr)
@@ -4855,6 +4858,26 @@ export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
   fs.push(luAt(mkFieldInit(nm, rd, pos), site))
   const lit: Node = { objFields: fs, pos: pos }
   return fvaSiteSet(site, lit)
+}
+
+// `fvaRecFnCopy`'s list half: `site` becomes `site.map(($r): dr => ({ f: $r.f, … }))` over every
+// field of record type `dr`.
+function fvaRecListMapCopy(site: i32, dr: i32, dro: TyObj): boolean {
+  const pos = nodePos(site)
+  const rt = fvaAnnot(dr, site, pos)
+  if rt < 0 { return false }
+  const pd = luAt(mkParam("$r" + i32ToStr(site), -1, -1, 0, 0, pos), site)
+  const ps: i32[] = []
+  ps.push(pd)
+  const fs: i32[] = []
+  for nm in dro.objFieldNames {
+    const rd = luAt(mkMember(luRef(pd, site, pos), nm, pos), site)
+    fs.push(luAt(mkFieldInit(nm, rd, pos), site))
+  }
+  const lit: Node = { objFields: fs, pos: pos }
+  const body = luAt(mkParen(luAt(addNode(lit), site), pos), site)
+  const lam = luAt(addNode(fvaLambda(ps, rt, body, site, pos)), site)
+  return listSiteMapCopy(site, lam, pos)
 }
 
 // Whether record `src` holds a set or hole function at a field record `dst` declares a closed
@@ -4886,6 +4909,45 @@ function fvaRecFieldsClose(src: i32, dst: i32): boolean {
     i = i + 1
   }
   return any
+}
+
+// The type a value of type `src` holds once delivered at `dst`: a set or hole function at a closed
+// function type is stored at it; a record's fields that `dst` closes so, the others as they are.
+export function fvaDeliveredTy(src: i32, dst: i32): i32 {
+  const sn = nonNullTy(src)
+  const dn = nonNullTy(dst)
+  // A set or hole function delivered at a closed function type is stored at that type.
+  const dfo = if dn >= 0 && dn < T.tys.length { tyAt(dn) } else { null }
+  if (
+    sn == src
+    && sn >= 0
+    && sn < T.tys.length
+    && dfo is TyFunc
+    && !tyHasHole(dn)
+    && (fnTagSetValueOfTy(sn) || fnTagSetOfTy(sn) >= 0 || tyHasHole(sn))
+  ) {
+    return dn
+  }
+  if sn != src || sn < 0 || dn < 0 || !fvaRecFieldsClose(sn, dn) { return src }
+  const so = tyAt(sn)
+  const d = tyAt(dn)
+  if !(so is TyObj) || !(d is TyObj) { return src }
+  const tys: i32[] = []
+  let i = 0
+  while i < so.objFieldNames.length {
+    const st = so.objFieldTypes[i]
+    const k = strListIndexOf(d.objFieldNames, so.objFieldNames[i])
+    const dt = if k >= 0 { d.objFieldTypes[k] } else { -1 }
+    const dft = if dt >= 0 && dt < T.tys.length { tyAt(dt) } else { null }
+    const held = st >= 0
+      && st < T.tys.length
+      && (fnTagSetValueOfTy(st)
+      || fnTagSetOfTy(st) >= 0
+      || tyHasHole(st))
+    tys.push(if dft is TyFunc && !tyHasHole(dt) && held { dt } else { st })
+    i = i + 1
+  }
+  return mkObjTy(so.objFieldNames, tys)
 }
 
 // Set while `fvaAdaptEnclosing` lets an adapter name the enclosing generic's type parameters.
@@ -6293,6 +6355,12 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       return true
     }
   }
+  // A nullable function is a value, not shared storage: it is delivered through the adapter of
+  // its function, built only where it is not null (D17816).
+  if s is TyNullable && d is TyFunc && tyAt(dstTy) is TyNullable {
+    const ns = fvaAdaptNullable(srcExpr, srcTy, s.nInner, dstTy, d)
+    if ns >= 0 { return ns == 1 }
+  }
   if !(s is TyFunc) || !(d is TyFunc) {
     // A value still open here may be a set's once its holes close; the decision checks the site.
     if d is TyFunc && tyHasHole(srcTy) { fvaValueSiteNote(srcExpr, srcTy, dt) }
@@ -6486,16 +6554,7 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     const outerPs: i32[] = []
     outerPs.push(fvParam)
     const outer = luAt(addNode(fvaLambda(outerPs, -1, li, site, pos)), site)
-    const outerArgs: i32[] = []
-    outerArgs.push(moved)
-    const names: string[] = []
-    const c: Node = {
-      callFn: outer,
-      callArgs: outerArgs,
-      callArgNames: names,
-      pos: pos,
-    }
-    arenaSetNode(site, c)
+    fvaCallInPlace(site, outer, moved, pos)
   }
   luGrow()
   const t = checkNodeHook(site)
@@ -6507,6 +6566,126 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   }
   if stable && callee >= 0 { fvaCopyCalleeAtInstance(callee, t) }
   return true
+}
+
+// Writes `site` as the call of adapter lambda `outer` on the value moved out of it, `moved`.
+function fvaCallInPlace(site: i32, outer: i32, moved: i32, pos: i32) {
+  const outerArgs: i32[] = [moved]
+  const names: string[] = []
+  const c: Node = {
+    callFn: outer,
+    callArgs: outerArgs,
+    callArgNames: names,
+    pos: pos,
+  }
+  arenaSetNode(site, c)
+  return 0
+}
+
+// Rewrites nullable function value `srcExpr` of type `srcTy` into
+// `((fv) => if fv != null { (ps) => fv(ps) } else { null })(srcExpr)` at nullable `dstTy`, whose
+// function is `d`: 1 when rewritten (or refused), 0 when no conversion is needed, -1 when this
+// shape is not one it builds (an open or set-valued function), left to the general refusal.
+function fvaAdaptNullable(
+  srcExpr: i32,
+  srcTy: i32,
+  inner: i32,
+  dstTy: i32,
+  d: TyFunc,
+): i32 {
+  const it = if inner >= 0 && inner < T.tys.length { tyAt(inner) } else { null }
+  if !(it is TyFunc) || it.fnParamTypes.length != d.fnParamTypes.length {
+    return -1
+  }
+  if (
+    tyHasTyVar(srcTy)
+    || tyHoldsHole(srcTy)
+    || tyHasTyVar(dstTy)
+    || tyHoldsHole(dstTy)
+  ) {
+    return -1
+  }
+  if fnTagSetValueOfTy(inner) { return -1 }
+  const dt = nonNullTy(dstTy)
+  if !fvaFnMayDiffer(inner, dt, 8) { return 0 }
+  const site = srcExpr
+  if fvaDone[site] ?? false { return 0 }
+  const pos = nodePos(site)
+  const st = fvaAnnot(srcTy, site, pos)
+  const rt = fvaAnnot(d.fnRet, site, pos)
+  if st < 0 || rt < 0 {
+    fvaRefuse(srcExpr, srcTy, dt, "")
+    return 1
+  }
+  const params: i32[] = []
+  const args: i32[] = []
+  let i = 0
+  while i < d.fnParamTypes.length {
+    const pt = fvaAnnot(d.fnParamTypes[i], site, pos)
+    if pt < 0 {
+      fvaRefuse(srcExpr, srcTy, dt, "")
+      return 1
+    }
+    const pd = luAt(mkParam("$fp" + i32ToStr(i), pt, -1, 0, 0, pos), site)
+    params.push(pd)
+    args.push(luRef(pd, site, pos))
+    i = i + 1
+  }
+  const fvParam = luAt(mkParam("$fv" + i32ToStr(site), st, -1, 0, 0, pos), site)
+  const lam = luAt(
+    addNode(
+      fvaLambda(
+        params,
+        rt,
+        luAt(mkCall(luRef(fvParam, site, pos), args, pos), site),
+        site,
+        pos,
+      ),
+    ),
+    site,
+  )
+  const test = luAt(
+    mkBinary(
+      "!=",
+      luRef(fvParam, site, pos),
+      luAt(mkNull("null", pos), site),
+      pos,
+    ),
+    site,
+  )
+  const thenS: i32[] = [lam]
+  const elseS: i32[] = [luAt(mkNull("null", pos), site)]
+  const iff = luAt(
+    mkIf(
+      test,
+      luAt(mkBlock(thenS, pos), site),
+      luAt(mkBlock(elseS, pos), site),
+      pos,
+    ),
+    site,
+  )
+  valueIfAdd(iff)
+  const outerPs: i32[] = [fvParam]
+  const outer = luAt(
+    addNode(
+      fvaLambda(outerPs, fvaAnnot(dstTy, site, pos), iff, site, pos),
+    ),
+    site,
+  )
+  const moved = fvaMoveSite(site)
+  fvaDone.set(site, true)
+  fvaBuilt.set(site, true)
+  const mark = T.diags.length
+  fvaCallInPlace(site, outer, moved, pos)
+  luGrow()
+  const t = checkNodeHook(site)
+  if T.diags.length > mark || !assignable(t, dstTy) {
+    let why = ""
+    if T.diags.length > mark { why = T.diags[mark].tmsg }
+    while T.diags.length > mark { T.diags.pop() }
+    fvaRefuse(site, srcTy, dt, why)
+  }
+  return 1
 }
 
 // A binding copied from a generic function value, called by its adapter: its read is the

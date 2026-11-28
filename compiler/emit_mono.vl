@@ -2629,53 +2629,37 @@ function monoSubstLetType(
   bT: i32[],
 ) {
   if letType < 0 { return letType }
-  // A binding of one type parameter seeded from a parameter of another holds what that
-  // parameter holds: a rung for the binding's writes' join (D17803).
+  // A binding of one type parameter initialised at another is built at its initialiser's type, as
+  // the check binds it: it holds what it is written, not its annotation's pin (D17321's ruling).
   const ln = if letIx >= 0 && letIx < P.nodes.length { nodeAt(letIx) } else { null }
-  const lt = if ln is LetDecl { nodeAt(letType) } else { null }
-  const ix = if ln is LetDecl && ln.letInit >= 0 { unwrapParen(ln.letInit) } else { -1 }
-  const d = if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Ident { identDeclOf(ix) } else { -1 }
-  const pn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
-  if (
-    lt is TypeRef
-    && pt is TypeRef
-    && pn is Param
-    && pt.tyName != lt.tyName
-    && strListHas(typarams, lt.tyName)
-    && strListHas(typarams, pt.tyName)
-  ) {
-    return monoSubstLetType(-1, pn.parType, typarams, bN, bT)
-  }
+  const bound = if ln is LetDecl && ln.letInit >= 0 { nodeTyIxOf(unwrapParen(ln.letInit)) } else { -1 }
+  const annTy = nodeTyIxOf(letType)
+  const seeded = bound >= 0
+    && annTy >= 0
+    && bound != annTy
+    && tyAt(annTy) is TyVar
+    && tyAt(bound) is TyVar
   // A copy of a parameter takes the type the elaboration closes that parameter at.
-  const ct = elabCopyTyOwn(letIx)
+  const ct = if seeded { -1 } else { elabCopyTyOwn(letIx) }
   if ct >= 0 && tyAt(ct) is TyFunc {
     return monoSynthPinRef(monoPinOfClosedTy(ct), ct, -1)
   }
   const tn = nodeAt(letType)
-  if tn is TypeRef {
-    if monoAnnMentionsTyParam(letType, typarams) {
-      // The let's type substituted at the instance, spelled by the naming rule with an anonymous
-      // record by its fields: its `#anonN` handle inside a union names no type the registry can
-      // key (D12641). A binding that stays open keeps its annotation.
-      let sty = -1
-      // A loop value's carrier keeps its open type beside its annotation (`monoAnnOpenTyNote`).
-      const ot = nodeTyIxOf(letType)
-      const origLet = if ot >= 0 { ot } else { monoAnnOpenTyOf(letType) }
-      if origLet >= 0 {
-        const s2 = substTyDeepOf(origLet, bN, bT, monoBuild.own)
-        if s2 >= 0 && s2 != origLet {
-          if !tyHasTyVar(s2) { sty = s2 }
-        }
-      }
-      const sub = if sty >= 0 { monoPinSpellNoAnon(sty) } else { "" }
-      if sub != "" && sub != tn.tyName {
-        const subC = monoPinMintedUnion(sub, sty, sty)
-        // Spelled by the registered union an assignment's `letUnionNameOf` resolves (D2676), and
-        // typed at the substitution, never by parsing that spelling back: an arm may be spelled
-        // by its row label, which names no type.
-        return synthTypeRefTy(subC, tn.pos, sty)
-      }
+  if tn is TypeRef && (seeded || monoAnnMentionsTyParam(letType, typarams)) {
+    // The open type substituted at the instance, spelled by the naming rule with an anonymous
+    // record by its fields: its `#anonN` handle inside a union names no type the registry can
+    // key (D12641). A binding that stays open keeps its annotation. A loop value's carrier keeps
+    // its open type beside its annotation (`monoAnnOpenTyNote`).
+    const origLet = if seeded { bound } else if annTy >= 0 { annTy } else { monoAnnOpenTyOf(letType) }
+    const s2 = if origLet >= 0 { substTyDeepOf(origLet, bN, bT, monoBuild.own) } else { -1 }
+    const sty = if s2 >= 0 && s2 != origLet && !tyHasTyVar(s2) { s2 } else { -1 }
+    const sub = if sty >= 0 { monoPinSpellNoAnon(sty) } else { "" }
+    if sub != "" && sub != tn.tyName {
+      const subC = monoPinMintedUnion(sub, sty, sty)
+      // Spelled by the registered union an assignment's `letUnionNameOf` resolves (D2676), and
+      // typed at the substitution, never by parsing that spelling back: an arm may be spelled
+      // by its row label, which names no type.
+      return synthTypeRefTy(subC, tn.pos, sty)
     }
   }
   return letType
@@ -16455,6 +16439,11 @@ function monoStoredSlotFnTy(lf0: i32[], path: string[], vals: i32[][]): i32 {
   if pins.length != 1 { return -1 }
   // The slot's type is the one the elaboration delivers it at; each value is instanced there.
   let ft = monoSlotDeliveryTy(lf, path, omit, true)
+  // A pin no closed delivery serves came through reads of the stored slot, which read it at its
+  // stored rep: the stored values decide it, as they do an uncalled slot's.
+  if ft < 0 && monoUncalledSlotFnTy(at, path, vals) >= 0 {
+    return monoUncalledSlotFnTy(at, path, vals)
+  }
   if ft < 0 {
     emitFailAt(
       "emitProgram: internal: a function slot pinned at one signature has no one closed type the elaboration delivers it at",

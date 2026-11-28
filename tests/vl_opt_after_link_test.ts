@@ -10,9 +10,7 @@
 //      `gOptimized` or `gLowMemUnused`, so an artifact emitted for `-O` differs from a plain one
 //      at those sites, and the artifact key carries the flavour (§13). A new reader is a new
 //      decision the key has to name, so the list is exhaustive and this test says which moved.
-//   3. The artifact key carries every program-wide fact (`LinkFacts`): only `elFacts` reads
-//      the flavour and the map-delete bit into the link section, and the delete bit is
-//      written only by the per-module merge, so the link can re-derive it.
+//   3. The map-delete bit is written only by its merge and reset.
 //   4. The host calls the chain once per `-O` / `-O3` build and never on a plain one. The
 //      multi-value step prints its header once per chain run under `$VL_MV_EXPLAIN`.
 
@@ -94,12 +92,6 @@ const FLAVOUR_READERS = [
   "wasmEmit:memAddrPlanWith gLowMemUnused",
 ];
 const FLAVOUR_GLOBALS = ["gOptimized", "gLowMemUnused"];
-// The one function that reads the program-wide facts into an artifact's key (`LinkFacts`,
-// link.vl), and every fact it has to carry: the flavour, and the program's map-delete bit,
-// which every map struct's layout reads.
-const KEY_READER = "emit_link:elFacts";
-const KEY_FACTS = [...FLAVOUR_GLOBALS, "gMapDeletes"];
-
 const readersOf = (file: string, src: string, globals = FLAVOUR_GLOBALS): string[] => {
   const out = new Set<string>();
   let fn = "";
@@ -121,7 +113,6 @@ const readersOf = (file: string, src: string, globals = FLAVOUR_GLOBALS): string
 Deno.test("opt-after-link: the emitter's -O flavour is the named decisions", () => {
   const got = [...sources().entries()]
     .flatMap(([m, s]) => readersOf(m, s))
-    .filter((r) => !r.startsWith(`${KEY_READER} `))
     .sort();
   const want = [...FLAVOUR_READERS].sort();
   const added = got.filter((r) => !want.includes(r));
@@ -130,26 +121,14 @@ Deno.test("opt-after-link: the emitter's -O flavour is the named decisions", () 
     throw new Error(
       `-O flavour readers moved. new: [${added.join("; ")}], gone: [${gone.join("; ")}]. ` +
         "A new reader is an emitter decision an -O artifact differs on: name it here and in " +
-        "s5-per-module-artifacts.md §13, or move it behind the link.",
-    );
-  }
-});
-
-Deno.test("opt-after-link: the artifact key carries every program-wide fact", () => {
-  const src = sources().get("emit_link") ?? "";
-  const got = readersOf("emit_link", src, KEY_FACTS).sort();
-  const want = KEY_FACTS.map((g) => `${KEY_READER} ${g}`).sort();
-  if (got.join(";") !== want.join(";")) {
-    throw new Error(
-      `the link section's fact readers: want [${want.join("; ")}], got [${got.join("; ")}]. ` +
-        "Each fact an artifact's bodies read is a field of its key (`LinkFacts`), read in one place.",
+        "s5-per-module-artifacts.md §13.",
     );
   }
 });
 
 // The program's map-delete bit is the merge of each module's `.delete` calls, written only by
-// the merge and its reset, so the link can re-derive it from the artifacts.
-Deno.test("opt-after-link: gMapDeletes is written only by the per-module merge", () => {
+// the merge and its reset.
+Deno.test("opt-after-link: gMapDeletes is written only by its merge and reset", () => {
   const writers: string[] = [];
   for (const [m, s] of sources()) {
     let fn = "";
