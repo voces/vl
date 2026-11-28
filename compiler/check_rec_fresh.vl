@@ -15,6 +15,7 @@ import {
   Index,
   LetDecl,
   MatchExpr,
+  Member,
   Node,
   NumLit,
   ObjLit,
@@ -44,11 +45,14 @@ import {
   CW_OCC_BIND,
   CW_OCC_USE,
   CW_UP_ARG,
+  CW_UP_ASG_LHS,
   CW_UP_ASG_RHS,
   CW_UP_CMP,
+  CW_UP_COAL,
   CW_UP_ELEM,
   CW_UP_FIELD,
   CW_UP_IS,
+  CW_UP_ITER,
   CW_UP_LETINIT,
   CW_UP_OBJ,
   CW_UP_RET,
@@ -505,7 +509,9 @@ function exprDests(
   if !cwIxCovers(x) { return false }
   const uk = cwIxUpKind[x]
   const up = cwIxUp[x]
-  if uk == CW_UP_OBJ || uk == CW_UP_CMP || uk == CW_UP_IS { return true }
+  if uk == CW_UP_CMP || uk == CW_UP_IS || uk == CW_UP_ITER { return true }
+  if uk == CW_UP_OBJ { return projDests(x, up, path, out, paths, on) }
+  if uk == CW_UP_COAL { return exprDests(up, path, out, paths, on) }
   if uk == CW_UP_LETINIT {
     const c = nodeAt(up)
     if !(c is LetDecl) { return false }
@@ -524,9 +530,13 @@ function exprDests(
   }
   if uk == CW_UP_ARG {
     const c = nodeAt(up)
-    if !(c is Call) || c.callFn < 0 || !(nodeAt(c.callFn) is Ident) {
-      return false
+    if !(c is Call) || c.callFn < 0 { return false }
+    // `xs.push(v)` stores `v` into a slot of `xs`.
+    const cf = nodeAt(c.callFn)
+    if cf is Member && cf.memProp == "push" && c.callArgs.length == 1 {
+      return slotDests(parenPeelIx(cf.memObj), path, out, paths, on)
     }
+    if !(cf is Ident) { return false }
     // A named function, or a lambda bound to the callee's name.
     const fd = cwCalleeDeclOf(c.callFn)
     const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
@@ -576,14 +586,106 @@ function storeDests(
   if !(a is BinExpr) || a.binOp != "=" { return false }
   const lhs = nodeAt(parenPeelIx(a.binLeft))
   if !(lhs is Index) { return false }
-  const ri = parenPeelIx(lhs.idxArr)
+  return slotDests(parenPeelIx(lhs.idxArr), path, out, paths, on)
+}
+
+// The destinations an element read `up` of binding read `x` gives the binding: where the read's
+// value is delivered, behind the step from an element to the binding's own type. A read that is
+// no element read of a fresh binding, or whose value no rule places, is untyped and names none.
+function projDests(
+  x: i32,
+  up: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+  on: i32[],
+): boolean {
+  const ix = nodeAt(up)
+  if !(ix is Index) || parenPeelIx(ix.idxArr) != x || !(nodeAt(x) is Ident) {
+    return true
+  }
+  if !cwIxCovers(up) || cwIxUpKind[up] == CW_UP_ASG_LHS { return true }
+  const st = readWrapStep(aliasRoot(identDeclOf(x)))
+  if st == "" { return true }
+  const o2: i32[] = []
+  const p2: string[] = []
+  if !exprDests(up, destJoin(st, path), o2, p2, on) { return true }
+  let i = 0
+  while i < o2.length {
+    out.push(o2[i])
+    paths.push(p2[i])
+    i = i + 1
+  }
+  return true
+}
+
+// The fresh binding an un-annotated alias chain from `d` (`const g = c`) names, or `d`.
+function aliasRoot(d: i32): i32 {
+  const seen: i32[] = []
+  let cur = d
+  while cur >= 0 && cur < P.nodes.length && !i32ListHas(seen, cur) {
+    seen.push(cur)
+    const n = nodeAt(cur)
+    if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return cur }
+    const iv = parenPeelIx(n.letInit)
+    if !(nodeAt(iv) is Ident) { return cur }
+    cur = identDeclOf(iv)
+  }
+  return cur
+}
+
+// The destinations of a value stored into a slot of the container `ri` names: an annotated
+// binding's or parameter's slot type, or a fresh container binding's own destinations at its
+// slot; false for any other container.
+function slotDests(
+  ri: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+  on: i32[],
+): boolean {
   if ri < 0 || !(nodeAt(ri) is Ident) { return false }
   const cd = identDeclOf(ri)
-  if cd < 0 || cd >= P.nodes.length || !bindHoldsFresh(cd) { return false }
+  if cd < 0 || cd >= P.nodes.length { return false }
   const cn = nodeAt(cd)
+  if cn is Param {
+    if cn.parType < 0 || cn.parRest == 1 { return false }
+    return destPush(cn.parType, destJoin("s", path), out, paths)
+  }
   if !(cn is LetDecl) { return false }
+  if cn.letType >= 0 {
+    return destPush(cn.letType, destJoin("s", path), out, paths)
+  }
+  if !bindHoldsFresh(cd) { return false }
   const step = if bindMapCtor(parenPeelIx(cn.letInit)) { "v" } else { "e" }
   return bindUseDests(cd, destJoin(step, path), out, paths, on)
+}
+
+// The step an element read of fresh binding `d` takes to its own type: a list literal's list
+// (`E`), or a `Map()` whose every store keys a string literal (`M`); "" for no such binding.
+function readWrapStep(d: i32): string {
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(n is LetDecl) || n.letInit < 0 { return "" }
+  const iv = parenPeelIx(n.letInit)
+  if nodeAt(iv) is ArrayLit { return "E" }
+  if !bindMapCtor(iv) { return "" }
+  const k = cwKeyOfDecl(d)
+  if k < 0 { return "" }
+  const ow = cwOccWalk(k)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    if cwIxCovers(u) && cwIxUpKind[u] == CW_UP_OBJ {
+      const ix = nodeAt(cwIxUp[u])
+      if (
+        ix is Index
+        && cwIxCovers(cwIxUp[u])
+        && cwIxUpKind[cwIxUp[u]] == CW_UP_ASG_LHS
+      ) {
+        if !(nodeAt(parenPeelIx(ix.idxIndex)) is StrLit) { return "" }
+      }
+    }
+  }
+  return "M"
 }
 
 function destPush(tr: i32, path: string, out: i32[], paths: string[]): boolean {

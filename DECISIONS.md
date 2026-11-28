@@ -13414,3 +13414,10 @@ values through the binding's own reads; those programs are pinned as D17760, D17
 destination, as `const x: f32 = 7.5` is, not a container conversion. The nullable and
 union-of-shapes exclusion is a mechanism limit, not design, and is open as D17763. An annotation
 an adoption reads is load-bearing for the redundant-annotation hint. Ruled by the coordinator.
+
+**Addendum (coordinator ruling, 2026-11-28).** An annotated container's slot is a destination
+of a fresh binding stored into it (by index or `push`), and a `for` over the binding names none.
+An element read whose value is delivered to an annotated destination is a typed read, so it is
+a delivery at the element path, as F1's typed reads pin; an untyped index or member read
+supplies no shape. One destination type across every delivery and typed read at every path,
+with (i)–(iv) at that path; any conflict adopts nothing. Ruled by the coordinator.
