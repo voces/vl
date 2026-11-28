@@ -142,6 +142,7 @@ import { fieldStorageEq, numWidens } from "./check_ty_relate"
 import {
   recBuildCount,
   recBuildTable,
+  recCovArgOf,
   recBuildTyIn,
   recKeptFnDecl,
   recKeptFnDstOf,
@@ -584,6 +585,26 @@ export let elabDeliveredRowClassFn: (ty: i32) => string = elabDeliveredRowClassU
 // Whether binding name `nm` is a delivered-row entry (`#r.<param>`), keyed by its record's row class.
 function elabIsRowEntry(nm: string): boolean {
   return nm.length > 3 && nm.slice(0, 3) == "#r."
+}
+
+// Whether `nm` names a storage entry: `$rep.<i>` binds parameter `i` at the storage its argument
+// is held at, so a callee handed two storages is two instances (D17816).
+function elabIsRepEntry(nm: string): boolean {
+  return nm.length > 5 && nm.slice(0, 5) == "$rep."
+}
+
+// The parameter index storage entry `nm` names, or -1.
+function elabRepEntryParam(nm: string): i32 {
+  if !elabIsRepEntry(nm) { return -1 }
+  let v = 0
+  let i = 5
+  while i < nm.length {
+    const d = nm.charCodeAt(i) - 48
+    if d < 0 || d > 9 { return -1 }
+    v = v * 10 + d
+    i = i + 1
+  }
+  return v
 }
 
 // Per read of a parameter the instance being walked delivers at another record (`#r.<i>`), that
@@ -1542,7 +1563,12 @@ function elabCanon(
     }
     if (
       !has
-      && (elabOwnName(decl, nm) || elabSigReads(decl, nm) || elabIsRowEntry(nm))
+      && (
+        elabOwnName(decl, nm)
+        || elabSigReads(decl, nm)
+        || elabIsRowEntry(nm)
+        || elabIsRepEntry(nm)
+      )
     ) {
       if !elabTyClosed(tys0[i0]) { return false }
       names.push(nm)
@@ -2522,6 +2548,19 @@ function elabDemandFrom(
         }
         p = p + 1
       }
+    }
+  }
+  // An argument held at another storage than its readonly list parameter keys the instance there.
+  const cn = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { null }
+  if cn is Call {
+    let ai = 0
+    while ai < cn.callArgs.length {
+      const sr = recCovArgOf(parenPeelIx(cn.callArgs[ai]))
+      if sr >= 0 {
+        names.push("$rep." + i32ToStr(ai))
+        tys.push(sr)
+      }
+      ai = ai + 1
     }
   }
   // A declaration with no type variable to bind is its generic pass's own typing: the root.
@@ -3582,6 +3621,13 @@ function elabOneAt(k: i32) {
     if pt >= 0 { pt = substTyDeep(pt, names, tys) }
     pTys.push(pt)
   }
+  // A storage entry types its parameter at the storage the instance is keyed by.
+  let ri = 0
+  while ri < names.length && ri < tys.length {
+    const rp = elabRepEntryParam(names[ri])
+    if rp >= 0 && rp < pTys.length { pTys[rp] = tys[ri] }
+    ri = ri + 1
+  }
   let ret = TY_ERR
   const ft = nodeTyIxOf(decl)
   if ft >= 0 && ft < T.tys.length {
@@ -3670,6 +3716,13 @@ function elabOneAt(k: i32) {
     ps.push(elabCapTy[ix] ?? -1)
     elabNodeTys[ix] = ps
     elabRowNote(elabTyRowCol, ix)
+  }
+  // A parameter a storage entry keys is the storage itself in this instance (D17816).
+  let rk = 0
+  while rk < names.length && rk < tys.length {
+    const rp = elabRepEntryParam(names[rk])
+    if rp >= 0 && rp < dn.fnParams.length { elabNodeTyFill(dn.fnParams[rp], k, tys[rk]) }
+    rk = rk + 1
   }
   // A stamp that only repeats the literal's own anonymous type there names no destination: not
   // banked; a named or generic-application record is a row of its own.

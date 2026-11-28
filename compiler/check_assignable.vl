@@ -406,7 +406,7 @@ import {
 } from "./check_num_lits"
 import { recordNullHoleObjAdopt } from "./check_obj_shape"
 import { parenPeelIx } from "./check_places"
-import { recOwnPend, recPend } from "./check_rec_rows"
+import { recCovArgNote, recOwnPend, recPend } from "./check_rec_rows"
 import { recDropAdopt } from "./check_rec_drop"
 import { noteRefListView } from "./check_ref_list_view"
 import {
@@ -6305,6 +6305,9 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         fvaNestedFnDiffers(srcTy, dm, 0, 8)
         || recordHolder(srcTy) && fvaHeldHoleFnDiffers(srcTy, dm, 8)
       ) {
+        // A readonly list of functions handed to a function's parameter is read where it is
+        // stored: the callee is instanced at the argument's own storage, not copied (D17816).
+        if fvaCovariantArgRep(srcExpr, srcTy, dm) { return false }
         fvaRefuseNested(srcExpr, srcTy, dm)
         return true
       }
@@ -6487,6 +6490,29 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     fvaRefuse(site, srcTy, dt, why)
   }
   if stable && callee >= 0 { fvaCopyCalleeAtInstance(callee, t) }
+  return true
+}
+
+// Whether `srcExpr`, a closed list of functions of type `srcTy`, is the argument of a non-generic
+// function whose parameter there is annotated at readonly list `dstTy`; noted with
+// `recCovArgNote`, so the callee is instanced at the argument's storage and each read through the
+// wider type is delivered from it (D17816, D14532's instance per storage rep).
+function fvaCovariantArgRep(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  const x = parenPeelIx(srcExpr)
+  if x < 0 || !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_ARG { return false }
+  const da = if dstTy >= 0 && dstTy < T.tys.length { tyAt(dstTy) } else { null }
+  const sa = if srcTy >= 0 && srcTy < T.tys.length { tyAt(srcTy) } else { null }
+  if !(da is TyArray) || da.aRead != 1 || !(sa is TyArray) { return false }
+  if !(tyAt(tyElemOf(sa)) is TyFunc) || tyHasTyVar(srcTy) || tyHoldsHole(srcTy) { return false }
+  const c = nodeAt(cwIxUp[x])
+  if !(c is Call) || c.callFn < 0 { return false }
+  const fd = identBoundFnDeclOf(c.callFn)
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  const i = cwIxUpAux[x]
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 || i < 0 || i >= f.fnParams.length { return false }
+  const pn = nodeAt(f.fnParams[i])
+  if !(pn is Param) || pn.parType < 0 || !tySame(nodeTyIxOf(f.fnParams[i]), dstTy) { return false }
+  recCovArgNote(x, fd, srcTy)
   return true
 }
 
