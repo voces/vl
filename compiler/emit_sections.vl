@@ -656,7 +656,6 @@ import {
   fbGlobalGet,
   fbGlobalSet,
   fbI32Const,
-  fbI32RelOf,
   fbI64Const,
   fbImmutI32Field,
   fbLocalGet,
@@ -703,35 +702,7 @@ import {
   wValI32,
   wValRef,
 } from "./emit_bytes"
-import {
-  RELOC_ARMED,
-  RELOC_VERSION,
-  RS_GUARD,
-  RS_SLOT,
-  relCopy,
-  relCount,
-  relFoldBank,
-  relHold,
-  relOffAt,
-  relPlace,
-  relPlaceSection,
-  relRebase,
-  relReset,
-  relSectionParts,
-  relSkew,
-  relSpAt,
-  relSubAt,
-  relValAt,
-} from "./emit_reloc"
-import { relKeysReset, relSymKey } from "./emit_reloc_keys"
 import { modIdOrderNames } from "./modid"
-import {
-  emitLinkSection,
-  linkIsNote,
-  linkIsReset,
-  linkLiftNote,
-} from "./emit_link"
-import { STR_FILL_RUN, linkFillPlan, linkPoolBytes } from "./link"
 import {
   fieldRowStorageKind,
   fieldRowsStoreAlike,
@@ -1307,7 +1278,6 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // Where `bodyExpr` lands INSIDE the body: the locals vector, plus the sink's block
     // opener when there is one. The start function computes the same offset.
     const exprInBody = body.length
-    relCopy(bodyExpr, body, exprInBody)
     appendAll(body, bodyExpr)
     // Bind the writer at `body` (the framed code entry) for the trailing padding/end
     // opcodes emitted via the `fb*` methods.
@@ -1976,7 +1946,7 @@ function emitInitProgressAt(ord: i32) {
   if gInitProgIdx < 0 { return 0 }
   const gi = gInitProgAfter[ord] ?? -1
   if gi < 0 { return 0 }
-  fbI32RelOf(RS_GUARD, gi, initGuardValue(gi) + relSkew(RS_GUARD))
+  fbI32Const(initGuardValue(gi))
   fbGlobalSet(gInitProgIdx)
   return 0
 }
@@ -3011,61 +2981,6 @@ function emitNameSection(n: i32) {
   return 0
 }
 
-// Places the recorder's global-section rows once every section is in the module rope: their
-// offsets are relative to a payload whose place only the finished rope knows.
-function relPlaceSections() {
-  if !RELOC_ARMED { return 0 }
-  let pos = 8
-  while pos < W.len {
-    const id = ropeAt(W, pos)
-    let size = 0
-    let shift = 0
-    let q = pos + 1
-    let more = true
-    while more && q < W.len {
-      const b = ropeAt(W, q)
-      size = size | ((b & 0x7f) << shift)
-      shift = shift + 7
-      q = q + 1
-      more = (b & 0x80) != 0
-    }
-    if id == 6 { relPlaceSection(id, q) }
-    pos = q + size
-  }
-  return 0
-}
-
-// The slot key of each of the first `n` user functions: its name-section name, then `#k` when
-// `k` earlier functions carry that name too (clones of one declaration, or namesake lambdas).
-function fnSymKeys(n: i32): string[] {
-  const seen: { [string]: i32 } = Map()
-  const out: string[] = []
-  let fi = 0
-  while fi < n {
-    let nm = fnSymName(fi)
-    // A lambda's synthesized name counts every lambda of the program, its anchor only its own.
-    const fn = nodeAt(fnStmts[fi])
-    if fn is FuncDecl && fnDispNames[fi].length == 0 {
-      const lam = "__lambda_"
-      if (
-        fn.fnName.length > lam.length
-        && fn.fnName.slice(0, lam.length) == lam
-      ) {
-        nm = "__lambda" + fnLocSuffix(fnStmts[fi], true)
-      }
-    }
-    const dup = seen[nm] ?? 0
-    seen[nm] = dup + 1
-    if dup == 0 {
-      out.push("f:" + nm)
-    } else {
-      out.push("f:" + nm + "#" + i32ToStr(dup))
-    }
-    fi = fi + 1
-  }
-  return out
-}
-
 // Each shared runtime helper's function index, keyed to its name-section name, and the
 // `__log__` decoder's; a per-module artifact names a call to one by that name.
 function runtimeFnNames(): { [i32]: string } {
@@ -3162,68 +3077,6 @@ function seedNames(names: string[], from: i32, n: i32): string {
   return s
 }
 
-// The armed recorder's rows as the `vl.reloc` custom section: version 2, the symbols (space,
-// UTF-8 key, value) and then per row its module offset and symbol. Written last, so no
-// offset moves.
-function emitRelocSection(n: i32) {
-  if !RELOC_ARMED { return 0 }
-  const symAt: { [string]: i32 } = Map()
-  const symSp: i32[] = []
-  const symKey: string[] = []
-  const symVal: i32[] = []
-  const rowSym: i32[] = []
-  const fnKeys = fnSymKeys(n)
-  let k = 0
-  while k < relCount() {
-    const sp = relSpAt(k)
-    const id = i32ToStr(sp)
-      + "/"
-      + i32ToStr(relSubAt(k))
-      + "/"
-      + i32ToStr(relValAt(k))
-    let s = symAt[id] ?? -1
-    if s < 0 {
-      s = symKey.length
-      symAt[id] = s
-      symSp.push(sp)
-      symVal.push(relValAt(k))
-      const fe = relSubAt(k)
-      if sp == RS_SLOT && fe >= 0 && fe < fnKeys.length {
-        symKey.push(fnKeys[fe])
-      } else if sp == RS_SLOT {
-        symKey.push("f#" + i32ToStr(fe))
-      } else {
-        symKey.push(relSymKey(sp, relSubAt(k), relValAt(k)))
-      }
-    }
-    rowSym.push(s)
-    k = k + 1
-  }
-  const payload: u8[] = []
-  const prev = wTarget(payload)
-  wName("vl.reloc")
-  wU8(RELOC_VERSION)
-  wULEB(symKey.length)
-  k = 0
-  while k < symKey.length {
-    wU8(symSp[k])
-    const bs = cpsToUtf8(strToCps(symKey[k]))
-    wULEB(bs.length)
-    for b in bs { wU8(b) }
-    wSLEB(symVal[k])
-    k = k + 1
-  }
-  wULEB(relCount())
-  k = 0
-  while k < relCount() {
-    wULEB(relOffAt(k))
-    wULEB(rowSym[k])
-    k = k + 1
-  }
-  wTarget(prev)
-  return wSection(0, payload)
-}
-
 // Collects the string-literal pool, in arena order: every `StrLit` lexeme that fits one
 // `array.new_fixed` (an over-cap one keeps the inline build), every literal an `is` compares
 // with `__str_eq__`, and every string literal type an atom's conversion prints, so a module's
@@ -3238,7 +3091,6 @@ function collectStrPool() {
   gLitSegAt = Map()
   gStrFillOff = []
   gStrFillSeg = -1
-  linkIsReset()
   const isLexes: string[] = []
   let i = 0
   while i < P.nodes.length {
@@ -3249,7 +3101,6 @@ function collectStrPool() {
       let k = 0
       while k < texts.length {
         isLexes.push(quoteLex(texts[k]))
-        linkIsNote(i, isLexes[isLexes.length - 1])
         k = k + 1
       }
     }
@@ -3266,12 +3117,55 @@ function collectStrPool() {
   strFillPlan()
 }
 
-// The pool entries the start function fills from one passive segment, by `linkFillPlan`, which
-// a split build's link re-derives over the pool it lays out; the segment holds their bytes.
+// Bytes a module pays to fill pool entries from a segment at all: `__str_fill__`'s type and
+// body, a start function if the module has none, and the data-count and segment framing.
+const STR_FILL_FIXED = 64
+// Filled entries per offset chain. A chain is one nested expression to a tree-shaped reader
+// (binaryen overflows its stack parsing thousands), so each run restarts from its own offset.
+const STR_FILL_RUN = 32
+
+// The segment offset of each pooled literal of `bytes` that fills from a passive segment, in
+// pool order, or -1: one whose pushed bytes cost more than its segment bytes plus a `global.get`
+// and a `call`, only when that saves more than the fixed cost. Empty when none fills, and always
+// under `-O`, since the fill reads every entry and binaryen could then not drop the dead ones.
+function poolFillOffsets(bytes: i32[][], optimized: i32): i32[] {
+  if optimized != 0 { return [] }
+  const off: i32[] = []
+  let save = 0
+  let at = 0
+  for b in bytes {
+    // Inline: an `i32.const` per byte. Filled: the bytes in the segment, a `global.get` and a
+    // `call`, and the init's `i32.const n`, one byte wider than the count `array.new_fixed` takes.
+    let pushed = 0
+    for v in b {
+      if v < 64 { pushed = pushed + 2 } else { pushed = pushed + 3 }
+    }
+    const gain = pushed - b.length - countWidening(b.length) - 7
+    if gain > 0 {
+      save = save + gain
+      off.push(at)
+      at = at + b.length
+    } else {
+      off.push(-1)
+    }
+  }
+  if save <= STR_FILL_FIXED { return [] }
+  return off
+}
+
+// How much wider `n` is as an `i32.const` (signed LEB) than as a count (unsigned LEB).
+function countWidening(n: i32): i32 {
+  if n >= 64 && n < 128 { return 1 }
+  if n >= 8192 && n < 16384 { return 1 }
+  return 0
+}
+
+// The pool entries the start function fills from one passive segment (`poolFillOffsets`); the
+// segment holds their bytes.
 function strFillPlan() {
   const bytes: i32[][] = []
-  for lex in gStrPoolTexts { bytes.push(linkPoolBytes(lex)) }
-  gStrFillOff = linkFillPlan(bytes, gOptimized)
+  for lex in gStrPoolTexts { bytes.push(cpsToUtf8(decodeStr(strToCps(lex)))) }
+  gStrFillOff = poolFillOffsets(bytes, gOptimized)
   if gStrFillOff.length == 0 { return 0 }
   const seg: u8[] = []
   let k = 0
@@ -3389,8 +3283,6 @@ function emitModule(_stmts: i32[]) {
   fnSigRowsMint()
   emitReset()
   typeOrderReset()
-  relReset()
-  relKeysReset()
   // The collect passes are done, so this is the last moment before any section indexes a
   // variant: prove the field-span tables cover every `uVariants` row, or fail loudly and pad
   // them, since a short table turns the next thirty reads into a compiler trap. Deliberately not
@@ -3526,7 +3418,6 @@ function emitModule(_stmts: i32[]) {
   emitDataCountSection()
   if writeCodeSection(codePayload) < 0 { return -1 }
   emitDataSection()
-  relPlaceSections()
   // Every section that names a type is written, so the first group can take its final order.
   if !emitFailed { typeOrderRun(lateTypeOffset, typeSeeds(lateTypeOffset)) }
 
@@ -3534,16 +3425,6 @@ function emitModule(_stmts: i32[]) {
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
   // unchanged for every golden.
   emitNameSection(n)
-  emitRelocSection(n)
-  if RELOC_ARMED {
-    emitLinkSection(
-      n,
-      fnSymKeys(n),
-      cloThunkFes,
-      runtimeFnNames(),
-      exportRootGlobals(),
-    )
-  }
   if wStray.length > 0 {
     return emitFail(
       "emitProgram: a module byte was written outside any section",
@@ -4543,7 +4424,6 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
     }
     "collectFns" => {
       const nf = collectFns(stmts)
-      linkLiftNote()
       return nf
     }
     "buildFnMap" => {
@@ -6904,7 +6784,6 @@ function emitGlobalSection() {
       bk = bk + 1
     }
     wTarget(gPrev)
-    relHold(globalPayload)
   }
   return 0
 }
@@ -6940,20 +6819,15 @@ function frameGlobalSection() {
       wBytes(gSynthInit[i])
     } else {
       fbRefNullStruct()
-      fbI32RelOf(
-        RS_SLOT,
-        gSynthArg[i],
-        gImports + gSynthArg[i] + relSkew(RS_SLOT),
-      )
+      fbI32Const(gImports + gSynthArg[i])
       const decl = cloDeclAt[gSynthArg[i]] ?? gSynthArg[i]
-      fbI32RelOf(RS_SLOT, decl, gImports + decl + relSkew(RS_SLOT))
+      fbI32Const(gImports + decl)
       fbStructNew(ty)
     }
     fbEnd()
     i = i + 1
   }
   wTarget(prev)
-  relSectionParts(6, [countBuf, gGlobalEntries, synthBuf])
   return wSectionPartsAt(gGlobalRopeAt, 6, [countBuf, gGlobalEntries, synthBuf])
 }
 
@@ -7042,7 +6916,6 @@ function captureFoldedConsts(): i32 {
       if rc < 0 { return -1 }
       if wIsOneScalarConst(one) {
         gFoldOk[gi] = 1
-        relFoldBank(one, gi)
         gFoldAt[gi] = gFoldPool.length
         gFoldLen[gi] = one.length
         let k = 0
@@ -7455,7 +7328,6 @@ function rewriteCodeCount(codePayload: ByteRope, count: i32, rowsAt: i32) {
   const delta = head.length - codePayload.chunks[0].b.length
   codePayload.chunks[0] = { b: head }
   codePayload.len = codePayload.len + delta
-  relRebase(delta)
   let r = rowsAt
   while r < emitFnSpanStart.length {
     emitFnSpanStart[r] = emitFnSpanStart[r] + delta
@@ -7480,10 +7352,9 @@ let dfeTag: string[] = []
 // Where the next held entry's calls begin in `dfeCallee`.
 let dfeEdgeAt = 0
 
-// Start holding code entries back and recording calls. Off in an armed relocation build,
-// whose units another module may call by symbol.
+// Start holding code entries back and recording calls.
 function dfeArm() {
-  dfeOn = !RELOC_ARMED
+  dfeOn = true
   dfeCallee = []
   dfeEdgeAt = 0
   dfeBuf = []
@@ -7636,7 +7507,6 @@ function placeCodeEntryRows(
     emitFnSpanEnd[r] = emitFnSpanEnd[r] + at
     r = r + 1
   }
-  relPlace(entry, at)
   ropePush(code, entry)
   return bankFnSpan(node, pos, at, at + entry.length, kind, tag)
 }
@@ -7649,7 +7519,6 @@ function writeCodeSection(codePayload: ByteRope) {
   // the payload to the module rope, so `W.len - codePayload.len` is where it starts — a
   // module offset being exactly the coordinate the engine's validator reports. Derived from the length, not the section header's own width, so the ULEB size prefix cannot be counted wrong.
   const codeBase = W.len - codePayload.len
-  relRebase(codeBase)
   let sp = 0
   while sp < emitFnSpanStart.length {
     emitFnSpanStart[sp] = emitFnSpanStart[sp] + codeBase
