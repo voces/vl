@@ -4488,7 +4488,11 @@ fn arm_seed_store(store: &mut Store<()>) {
         FUEL_WEIGHED_AT.with(|c| c.set(Some(u64::MAX)));
     }
     let mut last = resident_bytes();
+    let stop_on_sigint = prof.is_some() && guest_sigint_stop_arm();
     store.epoch_deadline_callback(move |mut cx| {
+        if stop_on_sigint && GUEST_SIGINT.load(Ordering::Relaxed) {
+            return Err(Error::msg("stopped by SIGINT ($VL_PROFILE_GUEST_SIGINT)"));
+        }
         if let Some(p) = prof.as_ref() {
             if let Some(p) = p.lock().unwrap().as_mut() {
                 let delta = if fuel {
@@ -4509,6 +4513,33 @@ fn arm_seed_store(store: &mut Store<()>) {
         }
         Ok(UpdateDeadline::Continue(1))
     });
+}
+
+/// Set by SIGINT under `$VL_PROFILE_GUEST_SIGINT=1`; the next sample traps the guest.
+static GUEST_SIGINT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn guest_sigint(_: libc::c_int) {
+    GUEST_SIGINT.store(true, Ordering::Relaxed);
+}
+
+/// Under `$VL_PROFILE_GUEST_SIGINT=1`, makes SIGINT stop a profiled guest at its next sample with a
+/// trap, so a hung compile ends with the guest's backtrace and its profile written; false when the
+/// flag is off or the platform has no SIGINT handler.
+fn guest_sigint_stop_arm() -> bool {
+    if std::env::var("VL_PROFILE_GUEST_SIGINT").ok().as_deref() != Some("1") {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let handler: extern "C" fn(libc::c_int) = guest_sigint;
+        unsafe { libc::signal(libc::SIGINT, handler as libc::sighandler_t) };
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Stop sampling and write the profile. Idempotent — the second call finds `None` —
@@ -7518,12 +7549,23 @@ const BINARYEN_CORES_DEFAULT: usize = 4;
 ///
 /// `map`, when given, is the module's source map: binaryen reads it and writes it back
 /// rewritten for the module it writes (`--source-map`, D3561).
+///
+/// Runs `wasm-opt` over `path` in place, once per `--then`-separated stage of `passes`, each
+/// stage on the one before's output; with no `--then` it is one run.
 fn optimize_in_place<S: AsRef<str>>(
     path: &str,
     flag: &str,
     passes: &[S],
     map: Option<&str>,
 ) -> Result<()> {
+    let all: Vec<&str> = passes.iter().map(AsRef::as_ref).collect();
+    for stage in all.split(|p| *p == "--then") {
+        optimize_stage(path, flag, stage, map)?;
+    }
+    Ok(())
+}
+
+fn optimize_stage(path: &str, flag: &str, passes: &[&str], map: Option<&str>) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
         // The unoptimized module is already on disk at this point. Leaving it there
         // would re-open the hole from the other side: a caller that ignores the exit
@@ -7541,7 +7583,7 @@ fn optimize_in_place<S: AsRef<str>>(
         );
     };
     let mut argv: Vec<&str> = vec![path];
-    argv.extend(passes.iter().map(AsRef::as_ref));
+    argv.extend_from_slice(passes);
     argv.extend_from_slice(BINARYEN_FEATURES);
     if let Some(m) = map {
         argv.extend_from_slice(&["--input-source-map", m, "--output-source-map", m]);
