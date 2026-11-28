@@ -301,7 +301,7 @@ import {
   fnTagWriteLeavesOf,
   fnWidenedSourceSets,
 } from "./check_elab_cap"
-import { fvaListCopyAt } from "./check_fn_tag_facts"
+import { fvaListCopyAt, tyClosedByTags } from "./check_fn_tag_facts"
 
 // Decides every set from scratch over the program at `rootIx`, then raises the refusal each
 // call through a set left a closure owes.
@@ -912,6 +912,7 @@ type FtRec = {
   // The parameters of lambdas `.map` calls on a list of records of ids, and each list's element.
   mapParam: i32[],
   mapElemTy: i32[],
+  mapCall: i32[],
 }
 
 function ftRecNew(): FtRec {
@@ -938,6 +939,7 @@ function ftRecNew(): FtRec {
     inits: [],
     mapParam: [],
     mapElemTy: [],
+    mapCall: [],
   }
 }
 
@@ -961,8 +963,12 @@ function ftApply(rootIx: i32, calls: i32[], mint: i32[]) {
   }
   // A `.map` lambda's parameter takes the element the list holds, its set's ids included.
   let mi = 0
-  while mi < ftP.mapParam.length && mi < ftP.mapElemTy.length {
-    ftMapParamRetype(ftP.mapParam[mi], ftP.mapElemTy[mi])
+  while (
+    mi < ftP.mapParam.length
+    && mi < ftP.mapElemTy.length
+    && mi < ftP.mapCall.length
+  ) {
+    ftMapParamRetype(ftP.mapParam[mi], ftP.mapElemTy[mi], ftP.mapCall[mi])
     mi = mi + 1
   }
   // Every holder's rep, once each planned set is tagged.
@@ -1325,15 +1331,29 @@ function ftMapOfIdRecs(x: i32, p: i32, g: i32, s: i32): boolean {
 }
 
 // Types `.map` lambda parameter `par` at element type `et`, and its lambda's signature with it.
-function ftMapParamRetype(par: i32, et: i32) {
+// A result still open but whose tail value the tag decision closes is that value's type, and so
+// is each element of `.map` call `call`'s list.
+function ftMapParamRetype(par: i32, et: i32, call: i32) {
   if par < 0 || et < 0 { return 0 }
   nodeTySetGrow(par, et)
   const lam = recEnclosingFn(par)
   const lt = if lam >= 0 { nodeTyIxOf(lam) } else { -1 }
   const lf = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
-  if lf is TyFunc && lf.fnParamTypes.length == 1 {
-    nodeTySetGrow(lam, mkFuncTy([et], lf.fnRet))
+  if !(lf is TyFunc) || lf.fnParamTypes.length != 1 { return 0 }
+  let rt = lf.fnRet
+  const ln = nodeAt(lam)
+  const tails: i32[] = []
+  if ln is FuncDecl && ln.fnBody >= 0 { tailValueLeaves(ln.fnBody, tails) }
+  const tv = if tails.length == 1 { nodeTyIxOf(parenPeelIx(tails[0])) } else { -1 }
+  if (rt < 0 || tyHasHole(rt) || tyHasTyVar(rt)) && tyClosedByTags(tv) {
+    rt = tv
+    const cn = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { null }
+    const cm = if cn is Call { nodeAt(cn.callFn) } else { null }
+    if cm is Member && cm.memProp == "map" {
+      nodeTySetGrow(call, mkArrayTy(rt))
+    }
   }
+  nodeTySetGrow(lam, mkFuncTy([et], rt))
   return 0
 }
 
@@ -6100,6 +6120,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     if la is TyArray && !i32ListHas(ftP.mapParam, x) {
       ftP.mapParam.push(x)
       ftP.mapElemTy.push(tyElemOf(la))
+      ftP.mapCall.push(g)
     }
     return true
   }
