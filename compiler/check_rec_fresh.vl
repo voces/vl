@@ -1,20 +1,26 @@
 // Where a delivered record comes from: the literal it names through un-annotated bindings,
 // aliases and calls, and whether such a binding is ever reassigned.
 // Does not import the checker.
+import { i32ListHas } from "./listutil"
 import {
   ArrayLit,
   BinExpr,
   Block,
+  BoolLit,
   Call,
+  FieldInit,
   FuncDecl,
   Ident,
   IfStmt,
   Index,
   LetDecl,
   MatchExpr,
+  Node,
+  NumLit,
   ObjLit,
   P,
   Param,
+  StrLit,
   TypeRef,
   callHasTyArgs,
   letInitAt,
@@ -35,9 +41,27 @@ import { a20RetWalk } from "./check_nj_gate"
 import { rcwCallSites } from "./check_record_writes"
 import {
   CW_OCC_ASG,
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  CW_UP_ARG,
+  CW_UP_ASG_RHS,
+  CW_UP_CMP,
+  CW_UP_ELEM,
+  CW_UP_FIELD,
+  CW_UP_IS,
+  CW_UP_LETINIT,
+  CW_UP_OBJ,
+  CW_UP_RET,
+  cwFnDeclAt,
   cwIxBuild,
+  cwIxCovers,
   cwIxKind,
   cwIxNode,
+  cwIxParent,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
+  cwKeyOfDecl,
   cwKeyOfRoot,
   cwOccNext,
   cwOccWalk,
@@ -420,4 +444,178 @@ export function recPassLitDeclOf(at: i32): i32 {
     return recHeldDecl(at)
   }
   return -1
+}
+
+// The annotations every whole delivery of un-annotated binding `d` names, into `out` with each
+// one's projection down to the binding's value in `paths` (`e` an element, `f:name` a field,
+// `/`-joined, outermost first). `d` holds a fresh literal, is never written as a whole, and every
+// other use reads it. False where any use is another form, so the binding keeps its own type.
+export function bindDestAnnots(d: i32, out: i32[], paths: string[]): boolean {
+  if !bindHoldsFresh(d) { return false }
+  const on: i32[] = []
+  return bindUseDests(d, "", out, paths, on) && out.length > 0
+}
+
+// Whether `d` is an un-annotated `let`/`const` of a fresh literal never written as a whole.
+function bindHoldsFresh(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
+  const iv = parenPeelIx(dn.letInit)
+  if iv < 0 || !bindFreshLit(nodeAt(iv)) && !bindMapCtor(iv) { return false }
+  const k = cwKeyOfDecl(d)
+  return k >= 0 && (dn.letKw == "const" || !recBindAssigned(k))
+}
+
+// The destinations of every whole use of binding `d`, whose value sits at `path` below them.
+// `on` is the path of bindings and functions the walk is inside: one met again on it is a
+// cycle, which names no destination.
+function bindUseDests(
+  d: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+  on: i32[],
+): boolean {
+  const k = cwKeyOfDecl(d)
+  if k < 0 || i32ListHas(on, d) { return false }
+  on.push(d)
+  cwIxBuild()
+  let ok = true
+  const ow = cwOccWalk(k)
+  while ok && cwOccNext(ow) {
+    const r = ow.row
+    const kind = cwIxKind[r]
+    if kind == CW_OCC_USE { ok = exprDests(cwIxNode[r], path, out, paths, on) }
+    else if kind != CW_OCC_ASG && kind != CW_OCC_BIND { ok = false }
+  }
+  on.pop()
+  return ok
+}
+
+// The destinations value `x` (at `path` below them) is delivered to by its consumer; false for a
+// consumer no rule places.
+function exprDests(
+  x: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+  on: i32[],
+): boolean {
+  if !cwIxCovers(x) { return false }
+  const uk = cwIxUpKind[x]
+  const up = cwIxUp[x]
+  if uk == CW_UP_OBJ || uk == CW_UP_CMP || uk == CW_UP_IS { return true }
+  if uk == CW_UP_LETINIT {
+    const c = nodeAt(up)
+    if !(c is LetDecl) { return false }
+    if c.letType >= 0 { return destPush(c.letType, path, out, paths) }
+    // An un-annotated alias delivers where its own uses do.
+    if c.letKw != "const" && recBindAssigned(cwKeyOfDecl(up)) { return false }
+    return bindUseDests(up, path, out, paths, on)
+  }
+  if uk == CW_UP_ELEM {
+    return exprDests(up, destJoin("e", path), out, paths, on)
+  }
+  if uk == CW_UP_FIELD {
+    const fi = nodeAt(cwIxUpAux[x])
+    if !(fi is FieldInit) { return false }
+    return exprDests(up, destJoin("f:" + fi.fiName, path), out, paths, on)
+  }
+  if uk == CW_UP_ARG {
+    const c = nodeAt(up)
+    if !(c is Call) || c.callFn < 0 || !(nodeAt(c.callFn) is Ident) {
+      return false
+    }
+    const fd = cwFnDeclAt(c.callFn)
+    const f = if fd >= 0 { nodeAt(fd) } else { null }
+    if !(f is FuncDecl) { return false }
+    // A generic parameter takes the argument at whatever it is: no destination of its own.
+    if f.fnTyParams.length > 0 { return true }
+    const a = cwIxUpAux[x]
+    if a < 0 || a >= f.fnParams.length { return false }
+    const pn = nodeAt(f.fnParams[a])
+    if !(pn is Param) || pn.parType < 0 || pn.parRest == 1 { return false }
+    return destPush(pn.parType, path, out, paths)
+  }
+  if uk == CW_UP_RET {
+    const fi = destEnclosingFn(up)
+    const f = if fi >= 0 { nodeAt(fi) } else { null }
+    if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+    if f.fnRet >= 0 { return destPush(f.fnRet, path, out, paths) }
+    // An inferred result is delivered where each call of the function is.
+    const sites: i32[] = []
+    if rcwCallSites(fi, sites) >= 0 || i32ListHas(on, fi) { return false }
+    on.push(fi)
+    let ok = true
+    for e in sites {
+      // A method spelling hands the result back the same way as a plain call. A call that is
+      // returned again hands it to another inferred result: no destination is followed there.
+      const call = e / 2
+      if ok && cwIxCovers(call) && cwIxUpKind[call] == CW_UP_RET { ok = false }
+      if ok { ok = exprDests(call, path, out, paths, on) }
+    }
+    on.pop()
+    return ok
+  }
+  if uk == CW_UP_ASG_RHS { return storeDests(up, path, out, paths, on) }
+  return false
+}
+
+// The destinations of the value assignment `at` stores into an element of a fresh container
+// binding (`c[k] = v`): that container's, at its element; false for any other assignment.
+function storeDests(
+  at: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+  on: i32[],
+): boolean {
+  const a = nodeAt(at)
+  if !(a is BinExpr) || a.binOp != "=" { return false }
+  const lhs = nodeAt(parenPeelIx(a.binLeft))
+  if !(lhs is Index) { return false }
+  const ri = parenPeelIx(lhs.idxArr)
+  if ri < 0 || !(nodeAt(ri) is Ident) { return false }
+  const cd = identDeclOf(ri)
+  if cd < 0 || cd >= P.nodes.length || !bindHoldsFresh(cd) { return false }
+  const cn = nodeAt(cd)
+  if !(cn is LetDecl) { return false }
+  const step = if bindMapCtor(parenPeelIx(cn.letInit)) { "v" } else { "e" }
+  return bindUseDests(cd, destJoin(step, path), out, paths, on)
+}
+
+function destPush(tr: i32, path: string, out: i32[], paths: string[]): boolean {
+  out.push(tr)
+  paths.push(path)
+  return true
+}
+
+function destJoin(step: string, path: string): string {
+  return if path == "" { step } else { step + "/" + path }
+}
+
+// The function declaration a `return` at `r` returns from, or -1.
+function destEnclosingFn(r: i32): i32 {
+  let x = r
+  while x >= 0 && cwIxCovers(x) {
+    if nodeAt(x) is FuncDecl { return x }
+    x = cwIxParent[x]
+  }
+  return -1
+}
+
+// Whether node `x` is a bare `Map()`.
+function bindMapCtor(x: i32): boolean {
+  const n = nodeAt(x)
+  return n is Call && recMapCtorCall(n)
+}
+
+// Whether node `n` is a fresh literal a binding may hold at its destination's type.
+function bindFreshLit(n: Node): boolean {
+  return n is ObjLit
+    || n is ArrayLit
+    || n is NumLit
+    || n is StrLit
+    || n is BoolLit
 }
