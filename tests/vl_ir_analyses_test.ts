@@ -18,6 +18,7 @@ if (GATED && !ENABLED) {
 const FIXTURE = `${ROOT}/tests/ir-analyses/defuse.vl`;
 const CG_FIXTURE = `${ROOT}/tests/ir-analyses/callgraph.vl`;
 const EFF_FIXTURE = `${ROOT}/tests/ir-analyses/effect.vl`;
+const DCE_FIXTURE = `${ROOT}/tests/ir-analyses/dce.vl`;
 
 // `count  row`: how many variables bank that row, then the row.
 const WANT_DU = [
@@ -226,5 +227,27 @@ Deno.test({
       return m ? [`${m[1]} ${m[2]}`] : [];
     });
     sameRows("effect", got, WANT_EFF);
+  },
+});
+
+// How many statements dead-code elimination deletes from each unit of `dce.vl`: `bare` drops
+// parameter `a` (1), `a + 1` with its drop (2) and the immediate `7` (1); `keepsRead`'s `xs[0]`
+// may trap, so it stays (clause 1); the top level drops nothing.
+const WANT_DCE = ["1 dce bare 4", "1 dce keepsRead 0", "1 dce @start 0"];
+
+Deno.test({
+  name:
+    "ir-analyses: dead-code elimination deletes the hand-counted statements",
+  ignore: !ENABLED,
+  fn: async () => {
+    const r = await run("1", DCE_FIXTURE);
+    if (r.code !== 0 || r.out !== "3\n1\n") {
+      throw new Error(`want rc 0 and 3 1, got rc ${r.code}: ${r.out}${r.err}`);
+    }
+    const got = r.err.split("\n").flatMap((l) => {
+      const m = /^\[ir\] .*: (\d+)\t(dce .*)$/.exec(l);
+      return m ? [`${m[1]} ${m[2]}`] : [];
+    });
+    sameRows("dce", got, WANT_DCE);
   },
 });
