@@ -13415,6 +13415,16 @@ destination, as `const x: f32 = 7.5` is, not a container conversion. The nullabl
 union-of-shapes exclusion is a mechanism limit, not design, and is open as D17763. An annotation
 an adoption reads is load-bearing for the redundant-annotation hint. Ruled by the coordinator.
 
+**Addendum (coordinator ruling, 2026-11-28).** An annotated container's slot is a destination
+of a fresh binding stored into it (by index or `push`), and a `for` over the binding names none.
+An element read whose value is delivered to an annotated destination is a typed read, so it is
+a delivery at the element path, as F1's typed reads pin; an untyped index or member read
+supplies no shape. One destination type across every delivery and typed read at every path,
+with (i)–(iv) at that path; any conflict adopts nothing. A typed read does not pin a binding
+the program narrows with `is` (the narrowing types its reads) or one whose slot it writes with a
+value other than a fresh literal (the write decides the element type), and an exported binding
+is never adopted, since its type is its module's API. Ruled by the coordinator.
+
 ## A type parameter's pin is not a binding's set (coordinator ruling, 2026-11-28) — D17117, D17321
 
 A type parameter is a type, not a function's identity. Its by-name pin describes the value bound to
