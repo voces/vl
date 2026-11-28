@@ -9,7 +9,9 @@
 //
 // `fixtures/emit-refusal-sites/compiler/` is a made-up compiler tree with one site per group
 // and the parsing edge cases; each `<case>.txt` and `sites.json` is the Python's output on it,
-// recorded before it was deleted. The script reads `compiler/` against the working directory.
+// recorded before it was deleted. The IR decline rows (`irLMiss`, `irBMiss`, `missRhs`) and
+// `--ir` came after; `ir_miss.vl` is their parsing cases. The script reads `compiler/` against
+// the working directory.
 //
 // @test-timing native
 
@@ -34,6 +36,7 @@ const CASES: { name: string; args: string[]; code: number }[] = [
   { name: "sample-set", args: ["--sample", "5", "--seed", "3"], code: 0 },
   { name: "bad-flag", args: ["--bogus"], code: 2 },
   { name: "json", args: ["--json", "out.json"], code: 0 },
+  { name: "ir", args: ["--ir"], code: 0 },
 ];
 
 Deno.test({
