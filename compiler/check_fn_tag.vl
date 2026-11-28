@@ -101,11 +101,14 @@ import {
   CW_UP_ARG,
   CW_UP_ELEM,
   CW_UP_LETINIT,
+  CW_UP_RET,
+  CW_UP_TAIL,
   cwBindingWrittenValues,
   cwCalleeDeclOf,
   cwDeclWriteValues,
   cwFnValueDeclOf,
   cwIxBuild,
+  cwIxCoveredLen,
   cwIxCovers,
   cwIxKind,
   cwIxNode,
@@ -1274,6 +1277,57 @@ export function fnTagValueArmFn(c: i32, d: i32, sig: i32): i32 {
     }
   }
   return -1
+}
+
+// The annotated result of the function record literal `x` is a return or tail value of, -1 for
+// none.
+function ftLitRetAnnotAt(x0: i32): i32 {
+  cwIxBuild()
+  let x = x0
+  while (
+    x >= 0
+    && x < cwIxCoveredLen()
+    && cwIxParent[x] >= 0
+    && nodeAt(cwIxParent[x]) is Paren
+  ) {
+    x = cwIxParent[x]
+  }
+  if x < 0 || x >= cwIxCoveredLen() { return -1 }
+  const uk = cwIxUpKind[x]
+  if uk != CW_UP_RET && uk != CW_UP_TAIL { return -1 }
+  const fd = recEnclosingFn(x)
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnRet < 0 { return -1 }
+  const ft = nodeTyIxOf(fd)
+  const fty = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+  return if fty is TyFunc { fty.fnRet } else { -1 }
+}
+
+// Whether `g` calls `.map` (member `p`) on `x`, a list of records holding set `s`'s ids, with a
+// lambda literal: the lambda is instanced at the element's record, so each id stays an id.
+function ftMapOfIdRecs(x: i32, p: i32, g: i32, s: i32): boolean {
+  const gc = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { null }
+  if !(gc is Call) || gc.callFn != p || gc.callArgs.length != 1 { return false }
+  if ftHoldKind(nodeTyIxOf(x), s) != 6 { return false }
+  const a = parenPeelIx(gc.callArgs[0])
+  return a >= 0 && a < P.nodes.length && nodeAt(a) is FuncDecl
+}
+
+// Whether lambda `lam` is the argument of call `g`, a `.map` on a list of records holding set
+// `s`'s ids.
+function ftMapLamOfIdRecs(lam: i32, g: i32, s: i32): boolean {
+  const gc = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { null }
+  if (
+    !(gc is Call)
+    || gc.callArgs.length != 1
+    || parenPeelIx(gc.callArgs[0]) != lam
+  ) {
+    return false
+  }
+  const m = if gc.callFn >= 0 && gc.callFn < P.nodes.length { nodeAt(gc.callFn) } else { null }
+  return m is Member
+    && m.memProp == "map"
+    && ftHoldKind(nodeTyIxOf(m.memObj), s) == 6
 }
 
 // Whether every member of set `s` takes as many parameters as function type `f`.
@@ -5423,11 +5477,16 @@ function ftHolderCoerced(x: i32, s: i32): boolean {
   // A list literal an annotation builds at its closures holds none either (D15338).
   if ftLitAtClosed(x, s) { return true }
   const n = nodeAt(x)
+  // A parenthesised value holds what the value holds.
+  if n is Paren { return ftHolderCoerced(parenPeelIx(x), s) }
   // A record literal the record solve builds at a place holding no set decided with `s` holds
   // that place's closures.
   if n is ObjLit {
     const r = ftLitBuiltAt(x)
     if r >= 0 && !ftTyHoldsDecided(r, s) { return true }
+    // So does one a function returns at its annotated result, which converts each field there.
+    const ra = ftLitRetAnnotAt(x)
+    if ra >= 0 && !ftTyHoldsDecided(ra, s) { return true }
   }
   // A read of a binding read nowhere else holds what its initialiser holds.
   if n is Ident {
@@ -6007,6 +6066,8 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
   if p < 0 { return false }
   const tx = nodeTyIxOf(x)
   const pn = nodeAt(p)
+  // The parameter of a lambda `.map` calls on a list of records of ids takes each element whole.
+  if n is Param && pn is FuncDecl && ftMapLamOfIdRecs(p, g, s) { return true }
   // A list of lists of ids is read in place: indexed, walked, bound, nested in a literal, a
   // record's field or a map entry, or returned where the function's inferred result is its type.
   if (
@@ -6044,7 +6105,8 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         || ftSlotOp(pn, x, g, s)
         || g >= 0 && nodeAt(g) is Call && ftTyParamListTakes(g, x, s)
         || pn.memProp == "length"
-        || pn.memProp == "map" && fvaListCopyAt(g)
+        || pn.memProp == "map"
+        && (fvaListCopyAt(g) || ftMapOfIdRecs(x, p, g, s))
     }
     ForIn => {
       return pn.fiIter == x
