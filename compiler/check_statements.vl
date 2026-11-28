@@ -1,7 +1,7 @@
 // The statements: `let`, `if` with its narrowing head, `while`, `for` over a range or a
 // collection, `return` and a block.
 
-import { bindDestAnnots } from "./check_rec_fresh"
+import { bindDestAnnots, bindSlotStored } from "./check_rec_fresh"
 import { recCovArgOf, recInferRetPend } from "./check_rec_rows"
 import { checkTailArmsAgainst } from "./check_fn_decl"
 import { noteOpenUnionRows } from "./check_hole_links"
@@ -633,8 +633,7 @@ function destArmFor(a: i32, d: i32, path: string): i32 {
 // Whether a binding may be built at destination type `t`: one type at every depth (no nullable
 // or union of shapes, D17763), no function, and leaves a literal takes without a widening, which
 // a container never takes implicitly. One leaf at least narrows the literal's own type (a literal
-// union, `f32`); else the binding is that type already. An empty list `hole` is no type yet, so
-// any such destination narrows it.
+// union, `f32`); else the binding is that type already, unless it holds an unwritten `hole`.
 function destAdopts(t: i32, fnOk: boolean, hole: boolean): boolean {
   if t < 0 || t >= T.tys.length || (!fnOk && tyMayHoldFn(t)) { return false }
   const seen: i32[] = []
@@ -642,14 +641,15 @@ function destAdopts(t: i32, fnOk: boolean, hole: boolean): boolean {
   return destAdoptsIn(t, seen, nar) && (hole || nar.length > 0)
 }
 
-// Whether binding `d`'s literal holds an empty list literal at any depth, whose element type is a
-// hole.
+// Whether binding `d`'s literal holds an empty list at any depth and no write stores into it, so
+// its element type is a hole no value fills.
 function litEmptyList(d: i32): boolean {
   const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  if !(n is LetDecl) || n.letInit < 0 { return false }
+  if !(n is LetDecl) || n.letInit < 0 || bindSlotStored(d) { return false }
   return litHasEmptyList(parenPeelIx(n.letInit))
 }
 
+// Whether literal `x` is or holds an empty list literal: a list's elements, else a record's fields.
 function litHasEmptyList(x: i32): boolean {
   const l = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
   if l is ArrayLit {
@@ -657,13 +657,19 @@ function litHasEmptyList(x: i32): boolean {
     for e in l.arrElems {
       if litHasEmptyList(parenPeelIx(e)) { return true }
     }
+    return false
   }
-  if l is ObjLit {
-    for f in l.objFields {
-      const fi = nodeAt(f)
-      if fi is FieldInit && litHasEmptyList(parenPeelIx(fi.fiValue)) {
-        return true
-      }
+  return recLitHasEmptyList(x)
+}
+
+// Whether record literal `x` holds an empty list literal in a field; false for any other node.
+function recLitHasEmptyList(x: i32): boolean {
+  const l = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(l is ObjLit) { return false }
+  for f in l.objFields {
+    const fi = nodeAt(f)
+    if fi is FieldInit && litHasEmptyList(parenPeelIx(fi.fiValue)) {
+      return true
     }
   }
   return false
