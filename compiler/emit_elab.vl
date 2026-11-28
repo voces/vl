@@ -74,7 +74,7 @@ import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx, tyIsValueUnionBox } from "./check_ty_rep"
 import {
   fnTagLateRows,
-  fnTagValueArms,
+  fnTagValueArmsAll,
   ftParamListCopied,
   ftWithinInstancedFn,
 } from "./check_fn_tag"
@@ -11782,15 +11782,16 @@ export function elabRun() {
         elabHoleCallAt(a, identDeclOf(an.callFn))
       }
     }
-    for a in fnTagValueArms(c) {
-      const an = nodeAt(a)
-      if an is Call && elabCallInstFrom(a, -1) < 0 {
-        elabHoleCallAt(a, identDeclOf(an.callFn))
-      }
-    }
     if elabCallInstFrom(c, -1) < 0 { elabHoleCallAt(c, elabSoleCalleeHole(c)) }
     if elabCallInstFrom(c, -1) < 0 && rowed.get(c) == null {
       elabSolvedHoleCallAt(c)
+    }
+  }
+  // A value arm reaches its member at the closed signature its site is converted at.
+  for a in fnTagValueArmsAll() {
+    const an = nodeAt(a)
+    if an is Call && elabCallInstFrom(a, -1) < 0 {
+      elabHoleCallAt(a, identDeclOf(an.callFn))
     }
   }
   // A call of a module binding above its declaration, at its arguments' own types.
@@ -12549,7 +12550,8 @@ export function elabHoleGenFlowTy(argIx: i32, holder: i32): i32 {
     ps = bo.fnParamTypes
   } else {
     cx = eplSlotOneCall(holder, path, -1, ps)
-    if cx < 0 { return -1 }
+    // Several calls whose arguments are all closed at one type deliver one signature.
+    if cx < 0 && !eplSlotCallsAgree(holder, path, -1, ps) { return -1 }
   }
   if ps.length == 0 || vf.fnParamTypes.length != ps.length { return -1 }
   const gN: string[] = []
@@ -13851,6 +13853,38 @@ function elabListCallSig(bd: i32, s: i32): i32 {
   return sig
 }
 
+// Whether every declaration in `ds` is a generic function.
+function elabAllGeneric(ds: i32[]): boolean {
+  for d in ds {
+    const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if !(n is FuncDecl) || n.fnTyParams.length == 0 { return false }
+  }
+  return true
+}
+
+// The closed type the `let` call `ix` hands at parameter row `names[i]` holds, read from its
+// holder class as mono pins it (`eplHolderTy`), where it closes and differs from `t`; else -1.
+function elabArgOwnTy(ix: i32, names: string[], i: i32, t: i32): i32 {
+  const cn = nodeAt(ix)
+  const d = elabCallDeclOf(ix)
+  const fd = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(cn is Call) || !(fd is FuncDecl) || i >= names.length { return -1 }
+  let pi = 0
+  while pi < fd.fnParams.length && pi < cn.callArgs.length {
+    if paramHoleName(fd.fnName, d, pi) == names[i] {
+      const a = parenPeelIx(cn.callArgs[pi])
+      const bd = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
+      if bd < 0 || bd >= P.nodes.length || !(nodeAt(bd) is LetDecl) {
+        return -1
+      }
+      const own = eplHolderTy(bd, -1)
+      return if own >= 0 && own != t && tysClosed([own]) { own } else { -1 }
+    }
+    pi = pi + 1
+  }
+  return -1
+}
+
 // Enqueues call `ix`'s row `names`/`tys` with each set of functions taking its rep at `ck`
 // (`elabSetRepTy`), when one moves and the row closes.
 function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
@@ -13876,6 +13910,11 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
     // A set the callee writes functions into through the parameter runs at their signature.
     const held: i32[] = []
     elabFnIdsIn(t, held, [])
+    // A binding the callee writes generics into is built at its own closed type, the one mono
+    // pins it at, not at a type it shares with another binding (D10023).
+    if rt < 0 && ck < 0 && held.length > 0 && elabAllGeneric(held) {
+      rt = elabArgOwnTy(ix, names, i0, t)
+    }
     if rt < 0 && i0 < names.length && held.length > 0 {
       rt = elabWrittenRep(ix, names[i0], t)
     }
@@ -23380,6 +23419,46 @@ export function eplSlotOneCall(
   }
   EPL.k = k0
   return if cn is Call { EPL.callNode[one] } else { -1 }
+}
+
+// Whether slot `path` of `holder` or a copy, in instance `k`, is called at least twice and every
+// call's arguments are closed at one list of types, pushed onto `tys`; false for any open argument.
+export function eplSlotCallsAgree(
+  holder: i32,
+  path: string[],
+  k: i32,
+  tys: i32[],
+): boolean {
+  const k0 = EPL.k
+  const p = eplSlotPlace(holder, path, k)
+  let first: i32[] = []
+  let n = 0
+  for ci in if p >= 0 { eplCallsStar(p) } else { [] } {
+    const cn = nodeAt(EPL.callNode[ci])
+    if !(cn is Call) {
+      EPL.k = k0
+      return false
+    }
+    const at: i32[] = []
+    for a in cn.callArgs {
+      const t = eplArgTy(ci, a)
+      if t < 0 || t >= T.tys.length || tyHasTyVar(t) {
+        EPL.k = k0
+        return false
+      }
+      at.push(t)
+    }
+    if n > 0 && !tysSameList(first, at) {
+      EPL.k = k0
+      return false
+    }
+    if n == 0 { first = at }
+    n = n + 1
+  }
+  EPL.k = k0
+  if n < 2 { return false }
+  for t in first { tys.push(t) }
+  return true
 }
 
 // Whether every call through slot `path` of `holder` or a copy, in instance `k`, whose arguments
