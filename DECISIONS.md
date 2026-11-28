@@ -13590,3 +13590,25 @@ coordinator. The coordinator ruled:
 The owner's post-cutover direction is to burn the holdouts down by optimizing and generalizing the
 IR, and the holdouts reached zero on 2026-11-28, so the review's order is that direction made
 concrete.
+
+## A record's function field is invariant; VL gains no readonly record field for D17816 (2026-11-28, coordinator ruling)
+
+D17816 asked whether a narrower-result function may be delivered where a record field declares a
+wider result. A list can be declared `readonly T[]`, which makes its element covariant, and that
+face runs by adapting the element at the read, never by a copy. VL cannot spell a readonly record
+field (`{ readonly f: T }` is a parse error, and `readonly` describes only a list). So every record
+field is mutable, and a mutable field's type is invariant, because the callee may write the field
+through the same storage the caller holds. The coordinator ruled:
+
+1. **The record face is a design refusal.** `fvaRefuseNested`'s record sentence names the contract:
+   a record's mutable field is invariant, because it is passed as the same storage.
+2. **No readonly record field is added for this.** It would be a language change that one refusal
+   does not justify. A program that needs a covariant field brings it back as a language proposal,
+   not as a lane fix.
+3. **Covariance is decided by the type, never by the callee's body.** "The body never writes the
+   field" is not a qualification: it would make a call's checking depend on another function's
+   body.
+
+**Why.** Copying the record at the call would break aliasing, and admitting it unadapted would
+trap. The design already has a covariant container that carries the contract in its type
+(`readonly T[]`). The owner may overrule.
