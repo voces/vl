@@ -219,6 +219,7 @@ import {
 } from "./check_arrow_facts"
 import { fnDeclParent } from "./check_decl_scan"
 import { identDeclOf, identFromDecl } from "./symbols"
+import { recFnValueLeaves } from "./check_type_shape"
 import { identFnDeclOf } from "./check_scopes"
 import { declIsExportedFn } from "./check_exp_obs"
 import {
@@ -5161,6 +5162,29 @@ function ftMapElemOk(el: i32, s: i32): boolean {
   return true
 }
 
+// Whether call `c` names an un-annotated function every value of which is a record literal, so
+// each call hands back a record no other handle holds.
+function ftCallFreshLits(c: Call): boolean {
+  if (
+    c.callFn < 0
+    || c.callFn >= P.nodes.length
+    || !(nodeAt(c.callFn) is Ident)
+  ) {
+    return false
+  }
+  const fd = identFnDeclOf(c.callFn)
+  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) || fn.fnRet >= 0 { return false }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length == 0 { return false }
+  for lf in leaves {
+    const l = parenPeelIx(lf)
+    const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+    if !(ln is ObjLit) { return false }
+  }
+  return true
+}
+
 // Whether literal `x` holds set `s` only through values whose deliveries into it the decision
 // coerces to a closure (`fnCloCoerceNote`): after the elaboration, each such value is built as
 // its member's closure, so the literal holds closures and no id (D14884). A written binding
@@ -5183,10 +5207,12 @@ function ftHolderCoerced(x: i32, s: i32): boolean {
     const init = cwSoleReadInit(x)
     return init >= 0 && ftHolderCoerced(init, s)
   }
-  // A function's one call holds what the literal it alone returns holds.
+  // A function's one call holds what the literal it alone returns holds; a call of one returning
+  // only fresh literals is converted at its closed destination, whatever its call count (D17777).
   if n is Call {
     const rl = recRetLitOfSoleCall(x)
-    return rl >= 0 && ftHolderCoerced(rl, s)
+    if rl >= 0 { return ftHolderCoerced(rl, s) }
+    return ftCallFreshLits(n)
   }
   // An annotated binding of such a literal, and a write of one, hold what the literal holds.
   if n is LetDecl {
