@@ -79,5 +79,9 @@ Deno.test({
     if (m === null || solved < 1 || solved > minted || minted > arenaRows) {
       throw new Error(`want 0 < solved <= distinct <= rows\ngot: ${arena}`);
     }
+    // No writer changes a row after the table interned it.
+    if (!rows.includes("interned stale 0")) {
+      throw new Error(`want "interned stale 0"\ngot:\n${rows.join("\n")}`);
+    }
   },
 });

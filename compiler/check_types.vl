@@ -4844,13 +4844,21 @@ export function mkNullableTy(inner: i32) {
     }
   }
   if tyIsWidePrim(inner) { tyWideUnionMinted = true }
-  const t: Ty = { nInner: strLitAsSet(inner) }
-  return addTy(t)
+  const c = strLitAsSet(inner)
+  const t: Ty = { nInner: c }
+  if c < 0 || tyTieMoves(c) { return addTy(t) }
+  return tyInternRow("N" + i32ToStr(c), t)
 }
 
-export function mkArrayTy(elem: i32) {
-  const t: Ty = { aElem: openChild(strLitAsSet(elem)), aRead: 0 }
-  return addTy(t)
+export function mkArrayTy(elem: i32) { return mkListRow(elem, 0) }
+
+// A list row over `elem`, read-only when `read` is 1; interned unless its element is open or one
+// the null-fold tie can move, the two cases a writer changes the row in place.
+function mkListRow(elem: i32, read: i32): i32 {
+  const c = openChild(strLitAsSet(elem))
+  const t: Ty = { aElem: c, aRead: read }
+  if c < 0 || tyTieMoves(c) { return addTy(t) }
+  return tyInternRow("A" + i32ToStr(c) + "/" + i32ToStr(read), t)
 }
 
 // A list element, map value or nullable inner of one string literal is its one-member set, so
@@ -4859,12 +4867,112 @@ export function strLitAsSet(elem: i32): i32 {
   if elem < 0 || elem >= T.tys.length { return elem }
   const t = tyAt(elem)
   if t is TyLit {
-    if t.litKind == "str" {
-      const u: Ty = { uMembers: [elem] }
-      return addTy(u)
-    }
+    if t.litKind == "str" { return mkUnionRow([elem]) }
   }
   return elem
+}
+
+// The union row over `members`, interned unless it has no member yet (a declared union's
+// placeholder, filled in place), holds an open member, or is a null-fold wrapper the tie rewrites.
+export function mkUnionRow(members: i32[]): i32 {
+  const t: Ty = { uMembers: members }
+  if members.length == 0 { return addTy(t) }
+  let k = "U"
+  for m in members {
+    if m < 0 { return addTy(t) }
+    k = k + i32ToStr(m) + ","
+  }
+  if members.length == 1 && tyAt(members[0]) is TyNullable { return addTy(t) }
+  return tyInternRow(k, t)
+}
+
+// Whether the null-fold tie can replace child `c` of a list or nullable row: a union the table
+// refused (a placeholder or a wrapper), or a nullable over one.
+function tyTieMoves(c: i32): boolean {
+  let cur = c
+  while cur >= 0 && cur < T.tys.length {
+    const t = tyAt(cur)
+    match t {
+      TyUnion => {
+        return !(tyInternKeyAt.length > cur && tyInternKeyAt[cur].length > 0)
+      }
+      TyNullable => {
+        cur = t.nInner
+      }
+      TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+        return false
+      }
+    }
+  }
+  return false
+}
+
+// The row of key `k`, minting `t` on a miss; the key a row was interned under is kept so the cost
+// report can tell whether any writer changed an interned row afterwards.
+function tyInternRow(k: string, t: Ty): i32 {
+  const hit = tyIntern.get(k) ?? -1
+  if hit >= 0 { return hit }
+  const ix = addTy(t)
+  tyIntern.set(k, ix)
+  while tyInternKeyAt.length <= ix { tyInternKeyAt.push("") }
+  tyInternKeyAt[ix] = k
+  return ix
+}
+
+// The interned rows by key, and each row's key ("" when not interned); reset with the arena.
+let tyIntern: {[string]: i32} = Map()
+let tyInternKeyAt: string[] = []
+
+// Forgets every interned row, for a new arena.
+export function tyInternReset() {
+  tyIntern = Map()
+  tyInternKeyAt = []
+  return 0
+}
+
+// The interned rows a writer has changed since: each one's key, rebuilt from its fields now, differs
+// from the key it was interned under. Zero is the table's invariant; the cost report reads it.
+export function tyInternStale(): i32 {
+  let n = 0
+  let i = 0
+  while i < tyInternKeyAt.length {
+    if tyInternKeyAt[i].length > 0 && tyInternKeyNow(i) != tyInternKeyAt[i] { n = n + 1 }
+    i = i + 1
+  }
+  return n
+}
+
+// Row `ix`'s intern key from its fields as they are now.
+function tyInternKeyNow(ix: i32): string {
+  const t = tyAt(ix)
+  match t {
+    TyNullable => {
+      return "N" + i32ToStr(t.nInner)
+    }
+    TyArray => {
+      return "A" + i32ToStr(t.aElem) + "/" + i32ToStr(t.aRead)
+    }
+    TyMap => {
+      return "M" + i32ToStr(t.mKey) + "," + i32ToStr(t.mVal) + "/" + i32ToStr(t.mSet)
+    }
+    TyNeg => {
+      return "G" + i32ToStr(t.negTy)
+    }
+    TyUnion => {
+      let k = "U"
+      for m in t.uMembers { k = k + i32ToStr(m) + "," }
+      return k
+    }
+    // The table interns no other kind.
+    TyPrim | TyErr | TyObj | TyFunc | TyVar | TyLit => {
+      return ""
+    }
+  }
+}
+
+// The key row `ix` was interned under, or "" when it was not interned.
+export function tyInternKeyOf(ix: i32): string {
+  return if ix >= 0 && ix < tyInternKeyAt.length { tyInternKeyAt[ix] } else { "" }
 }
 
 // `ty | null`, for an emit-side rewrite that needs a box over a value with no niche (D2826).
@@ -4872,19 +4980,15 @@ export function mkNullableTyOf(ty: i32) { return mkNullableTy(ty) }
 
 // The read-only view over the same element (`readonly T[]`). A sibling constructor rather
 // than a flag on `mkArrayTy`, so every existing mint stays a mutable list by construction.
-export function mkArrayViewTy(elem: i32) {
-  const t: Ty = { aElem: openChild(strLitAsSet(elem)), aRead: 1 }
-  return addTy(t)
-}
+export function mkArrayViewTy(elem: i32) { return mkListRow(elem, 1) }
 
 export function mkMapTy(key: i32, val: i32, isSet: i32) {
   tyMapMinted = true
-  const t: Ty = {
-    mKey: openChild(strLitAsSet(key)),
-    mVal: openChild(strLitAsSet(val)),
-    mSet: isSet,
-  }
-  return addTy(t)
+  const k = openChild(strLitAsSet(key))
+  const v = openChild(strLitAsSet(val))
+  const t: Ty = { mKey: k, mVal: v, mSet: isSet }
+  if k < 0 || v < 0 { return addTy(t) }
+  return tyInternRow("M" + i32ToStr(k) + "," + i32ToStr(v) + "/" + i32ToStr(isSet), t)
 }
 
 // Whether any map type has been minted in this instance. Only ever set, so a gate on it can
@@ -4996,7 +5100,8 @@ export function litMemberTy(name: string) {
 
 export function mkNegTy(inner: i32) {
   const t: Ty = { negTy: inner }
-  return addTy(t)
+  if inner < 0 { return addTy(t) }
+  return tyInternRow("G" + i32ToStr(inner), t)
 }
 
 // Strip every `$m<digits>` module-merge and `$b<digits>` block-scope mangle suffix from a free-form
