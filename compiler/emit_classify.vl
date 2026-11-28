@@ -2984,7 +2984,9 @@ export function letInitCaptureRow(letIx: i32, fnIx: i32): i32 {
 // The function call `c` reaches in `fnIx` where it returns a hole parameter at that parameter's
 // row (`fnRetCaptureRow`): a named callee, or a binding holding such a closure; -1 otherwise.
 function callCaptureRowFe(c: Call, fnIx: i32): i32 {
-  if c.callFn < 0 || !(nodeAt(c.callFn) is Ident) { return -1 }
+  if c.callFn < 0 { return -1 }
+  if nodeAt(c.callFn) is Member { return capRowLetFe(c.callFn, fnIx) }
+  if !(nodeAt(c.callFn) is Ident) { return -1 }
   const fe = fnIndexOfAt(sidOfNode(c.callFn), fnIx, c.callFn)
   if (
     fe >= 0
@@ -15102,6 +15104,9 @@ function readCloSigKey(atIx: i32, fnIx: i32): string {
 // `readCloSigKey` short of its last rung; "" where none of the typed rungs keys the read.
 function readCloSigKeyOfDecl(atIx: i32, fnIx: i32, hops: i32): string {
   if atIx < 0 { return "" }
+  // A record field holding a closure that returns its capture at the capture slot's row keys by it.
+  const mf = if nodeAt(atIx) is Member { capRowLetFe(atIx, fnIx) } else { -1 }
+  if mf >= 0 { return cloSigKeyExt(mf) }
   const fk = sigKeyOfTy(monoFieldReadTyAt(atIx, fnIx))
   if fk != "" && cloSigPosOfKey(fk) >= 0 { return fk }
   const nft = narrowedFnTyOf(atIx, fnIx)
@@ -15140,15 +15145,40 @@ function readCloSigKeyOfDecl(atIx: i32, fnIx: i32, hops: i32): string {
   }
 }
 
-// The closure an un-annotated `let` read `atIx` holds where it returns a captured hole parameter
-// at its capture slot's row (`fnRetCaptureRow`); -1 otherwise.
+// The closure an un-annotated `let` read `atIx` holds, or field read `o.b` of such a binding of a
+// record literal holds in `b`, where it returns a captured hole parameter at its capture slot's
+// row (`fnRetCaptureRow`); -1 otherwise.
 function capRowLetFe(atIx: i32, fnIx: i32): i32 {
+  const m = if atIx >= 0 && atIx < P.nodes.length { nodeAt(atIx) } else { null }
+  if m is Member { return capRowFieldFe(m, fnIx) }
   const sd = bindingDeclInScope(atIx)
   const d = if sd >= 0 { sd } else { identDeclOf(atIx) }
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
   const fe = fieldValueFeOfIn(dn.letInit, fnIx)
   return if fe >= 0 && fnRetCaptureRow(fe) >= 0 { fe } else { -1 }
+}
+
+// `capRowLetFe` of field read `m`: the closure field `m.memProp` of the record literal an
+// un-annotated binding `m.memObj` reads is initialized with; -1 otherwise.
+function capRowFieldFe(m: Member, fnIx: i32): i32 {
+  const ob = parenPeelIx(m.memObj)
+  if ob < 0 || !(nodeAt(ob) is Ident) { return -1 }
+  const sd = bindingDeclInScope(ob)
+  const d = if sd >= 0 { sd } else { identDeclOf(ob) }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 { return -1 }
+  const li = parenPeelIx(dn.letInit)
+  const ol = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { null }
+  if !(ol is ObjLit) { return -1 }
+  for fx in ol.objFields {
+    const fi = nodeAt(fx)
+    if fi is FieldInit && fi.fiName == m.memProp {
+      const fe = fieldValueFeOfIn(fi.fiValue, fnIx)
+      return if fe >= 0 && fnRetCaptureRow(fe) >= 0 { fe } else { -1 }
+    }
+  }
+  return -1
 }
 
 // The `$fnsig` key of function type `ty`, its `| null` peeled; "" for any other type.
