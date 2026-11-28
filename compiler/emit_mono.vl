@@ -889,9 +889,11 @@ let monoLamCloneSlots: i32[] = []
 // stays -1, the fall-through to `moduleLocalLetOfUnique`. Rebuilt at the one write to
 // `monoProgStmts`, so it carries no row from an earlier compile.
 let monoProgLetBySid: i32[] = []
-// The list literals, nested ones included, a `.map` or `.filter` is called on in place: their
-// elements take the literal's stamp where their place agrees on no signature (D17771).
-let monoRecvLits: i32[] = []
+// Elements of a stamped list literal whose place agrees on no signature, each with its frame and
+// the stamp's element: one no call through the list instanced takes the stamp (D17771).
+let monoStampElemAt: i32[] = []
+let monoStampElemCtx: i32[] = []
+let monoStampElemTy: i32[] = []
 
 // The arena's size, a memo key for the walks below that cache a whole-arena answer.
 function monoArenaStamp() {
@@ -18183,15 +18185,6 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     return 0
   }
   monoRecordPinnedRecv(m.memObj, rt, ctx, 0)
-  const rlw: i32[] = [unwrapParen(m.memObj)]
-  while rlw.length > 0 {
-    const rl = rlw.pop() ?? -1
-    const rln = if rl >= 0 && rl < P.nodes.length { nodeAt(rl) } else { null }
-    if rln is ArrayLit {
-      monoRecvLits.push(rl)
-      for e in rln.arrElems { rlw.push(unwrapParen(e)) }
-    }
-  }
   if lam {
     // A lambda the elaboration keyed at the list's build takes that record as its parameter's type.
     // Over a lambda's `map`, directly or through a `const`, the lambda reads the records of the
@@ -24101,13 +24094,17 @@ function monoWalk(ix: i32, ctx: i32) {
             ev,
             if ctx >= 0 { elabKeyAt(ctx) } else { -1 },
           )
-          const sl = if i32ListHas(monoRecvLits, ix) { nodeRepTyIxOf(ix) } else { -1 }
+          const sl = nodeRepTyIxOf(ix)
           const ss = if sl >= 0 && tyAt(sl) is TyArray { tyArrayElemIx(sl) } else { -1 }
-          const vs = if monoTyClosedFn(vs0) || !monoTyClosedFn(ss) { vs0 } else { ss }
+          if !monoTyClosedFn(vs0) && monoTyClosedFn(ss) {
+            monoStampElemAt.push(ev)
+            monoStampElemCtx.push(ctx)
+            monoStampElemTy.push(ss)
+          }
           const none: i32[] = []
           if (
-            monoTyClosedFn(vs)
-            && monoCoerceFnValueTys(ev, ctx, vs, none, vs) < 0
+            monoTyClosedFn(vs0)
+            && monoCoerceFnValueTys(ev, ctx, vs0, none, vs0) < 0
           ) {
             return -1
           }
@@ -27077,7 +27074,9 @@ export function monomorphize(stmts: i32[]) {
   // The index follows the table it answers for, at the write and not at a build point:
   // between the two there is no reader, so `monoModuleLetOf` cannot see an empty column.
   monoProgLetBySid = []
-  monoRecvLits = []
+  monoStampElemAt = []
+  monoStampElemCtx = []
+  monoStampElemTy = []
   let mi = 0
   while mi < stmts.length {
     const ms = nodeAt(stmts[mi])
@@ -27190,6 +27189,21 @@ export function monomorphize(stmts: i32[]) {
       }
     }
     fe2 = fe2 + 1
+  }
+  // Every call is walked: a stamped literal's open element no call through the list instanced
+  // (`monoElemTakenSig`) is delivered at the stamp's element, its holder's one fact.
+  let se = 0
+  while se < monoStampElemAt.length {
+    const sev = monoStampElemAt[se]
+    const sst = monoStampElemTy[se]
+    const none: i32[] = []
+    if (
+      !monoElemTakenSig.has(sev)
+      && monoCoerceFnValueTys(sev, monoStampElemCtx[se], sst, none, sst) < 0
+    ) {
+      return -1
+    }
+    se = se + 1
   }
   // A hole lambda written into a slot holding a record is instanced at each of its signatures, in
   // its own frame (D17572).
