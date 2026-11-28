@@ -74,7 +74,7 @@ import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx, tyIsValueUnionBox } from "./check_ty_rep"
 import {
   fnTagLateRows,
-  fnTagValueArms,
+  fnTagValueArmsAll,
   ftParamListCopied,
   ftWithinInstancedFn,
 } from "./check_fn_tag"
@@ -137,6 +137,7 @@ import {
   fvaRetRowsNote,
   monoRecheckBegin,
 } from "./check_assignable"
+import { deliveredSlotTyOf } from "./check_side_rows"
 import { fieldStorageEq, numWidens } from "./check_ty_relate"
 import {
   recBuildCount,
@@ -7756,18 +7757,13 @@ function elabSlotRecordNote(c: i32) {
   // A value that reads a holder stands for the holder's call, and the holder is held whole.
   const linked: i32[] = []
   const stores: i32[] = []
-  // A hole lambda written into the slot is built as the record at its signatures (D17572).
+  // A function value whose declaration is instanced per signature (a hole lambda, or a read of a
+  // generic or hole-parameter function) is built as the record at its signatures (D17572).
   const lams: i32[] = []
   const wraps: i32[] = []
   for v0 in vals {
     const lv = parenPeelIx(v0)
-    const ln = if lv >= 0 && lv < P.nodes.length { nodeAt(lv) } else { null }
-    if (
-      ln is FuncDecl
-      && ln.fnName == ""
-      && elabDeclHasHoleParam(lv)
-      && elabInPlainCode(lv)
-    ) {
+    if elabInstanceableFnOf(lv) {
       lams.push(lv)
       continue
     }
@@ -7946,6 +7942,13 @@ function elabSlotRecordNote(c: i32) {
   for l in lams {
     elabLamProducers.push(l)
     elabLamProducerAt.push(at)
+    // A named declaration is elaborated at each signature its producer is instanced at.
+    if nodeAt(l) is Ident {
+      for sg in rec {
+        const sf = tyAt(sg)
+        if sf is TyFunc { elabEnqueueAtParams(identDeclOf(l), sf.fnParamTypes) }
+      }
+    }
   }
   for w in wraps { elabFnWraps[w] = at }
   for h in linked {
@@ -8079,6 +8082,8 @@ function elabSlotUnionNote(d: i32, vals: i32[]): i32 {
     && (dn.letKw == "const" || !cwDeclAssigned(d))
   const readers: i32[] = []
   const rcalls: i32[] = []
+  elabSlotUnionJoinCalls = calls
+  elabSlotUnionJoinPicks = picks
   const ow = cwOccWalk(d)
   while cwOccNext(ow) {
     const k = cwIxKind[ow.row]
@@ -8158,14 +8163,71 @@ function elabSlotUnionReadOk(
     } else {
       return false
     }
-    for r in recs {
-      if elabCallSigMember(t, r) < 0 { return false }
+    let q = 0
+    while q < recs.length {
+      // A record with no member at the call's signature joins it: the call is one more signature
+      // of the bundle its maker builds, so its lambda is instanced there too (D17727).
+      if elabCallSigMember(t, recs[q]) < 0 { elabSlotUnionJoin(t, q, recs) }
+      if elabCallSigMember(t, recs[q]) < 0 { return false }
+      q = q + 1
     }
     mine.push(t)
   }
   readers.push(g)
   for t in mine { calls.push(t) }
   return true
+}
+
+// The store calls of the union-of-records map being noted and each one's record index there, for
+// `elabSlotUnionJoin`.
+let elabSlotUnionJoinCalls: i32[] = []
+let elabSlotUnionJoinPicks: i32[] = []
+
+// Adds call `t`'s signature to record `q` of `recs`: the maker instance a store of that record calls
+// notes it for the parameter it returns, the lambda handed there instanced at `t`'s argument types,
+// and `recs[q]` is read again; nothing where the store, its lambda or `t`'s types do not close.
+function elabSlotUnionJoin(t: i32, q: i32, recs: i32[][]) {
+  const tn = nodeAt(t)
+  if !(tn is Call) { return 0 }
+  const wp: i32[] = []
+  for a in tn.callArgs {
+    const at = nodeTyIxOf(a)
+    if at < 0 || at >= T.tys.length || !elabTyClosed(at) { return 0 }
+    wp.push(widenLitTy(at))
+  }
+  let j = 0
+  while j < elabSlotUnionJoinCalls.length && j < elabSlotUnionJoinPicks.length {
+    if elabSlotUnionJoinPicks[j] == q {
+      const v = elabSlotUnionJoinCalls[j]
+      const vn = nodeAt(v)
+      const kc = elabCallInstFrom(v, -1)
+      const dn = if kc >= 0 { nodeAt(ekDecl[kc]) } else { null }
+      if vn is Call && dn is FuncDecl {
+        let i = 0
+        while i < dn.fnParams.length && i < vn.callArgs.length {
+          const lam = parenPeelIx(vn.callArgs[i])
+          if (
+            elabBodyReturnsParam(dn.fnBody, dn.fnParams[i])
+            && lam >= 0
+            && nodeAt(lam) is FuncDecl
+          ) {
+            const n0 = ekDecl.length
+            elabEnqueueAtParams(lam, wp)
+            elabSettle(n0)
+            const r = elabMemberResultAt(lam, wp)
+            if r >= 0 {
+              const one: i32[] = [lam]
+              elabBundleSigNote(kc, i, one, wp, widenLitTy(r))
+              recs[q] = elabReturnedBundleSigs(kc)
+            }
+          }
+          i = i + 1
+        }
+      }
+    }
+    j = j + 1
+  }
+  return 0
 }
 
 // Per `const` initialised with a read of a union-of-records map, that map's index in
@@ -9438,8 +9500,8 @@ function elabMakerLamRecord(d: i32, dn: FuncDecl): i32[] {
 let elabLamProducers: i32[] = []
 let elabLamProducerAt: i32[] = []
 
-// The record signatures hole lambda `lam` is built as where a slot holding a record is written
-// with it; none for any other lambda.
+// The record signatures producer `lam` (a hole lambda, or a generic or hole-parameter function's
+// read) is built as where a slot holding a record is written with it; none for any other node.
 export function elabLamProducerSigs(lam: i32): i32[] {
   const at = i32ListIndexOf(elabLamProducers, nodeSrc[lam] ?? lam)
   const r = if at >= 0 { elabLamProducerAt[at] } else { -1 }
@@ -9454,6 +9516,19 @@ let elabFnWraps: {[i32]: i32} = Map()
 export function elabFnWrapSigs(x: i32): i32[] {
   const r = elabFnWraps.get(nodeSrc[x] ?? x) ?? -1
   return if r >= 0 && r < elabRecTable.length { elabRecTable[r] } else { [] }
+}
+
+// Whether `x`, in plain code, is a function value instanced per signature: a hole lambda, or a read
+// of a named function with type parameters or a hole parameter.
+function elabInstanceableFnOf(x: i32): boolean {
+  if x < 0 || x >= P.nodes.length || !elabInPlainCode(x) { return false }
+  const xn = nodeAt(x)
+  if xn is FuncDecl { return xn.fnName == "" && elabDeclHasHoleParam(x) }
+  if !(xn is Ident) { return false }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) || dn.fnName == "" { return false }
+  return dn.fnTyParams.length > 0 || elabDeclHasHoleParam(d)
 }
 
 // The member of record `rec` named function read `x`'s closed signature is, where `x` names an
@@ -11732,15 +11807,16 @@ export function elabRun() {
         elabHoleCallAt(a, identDeclOf(an.callFn))
       }
     }
-    for a in fnTagValueArms(c) {
-      const an = nodeAt(a)
-      if an is Call && elabCallInstFrom(a, -1) < 0 {
-        elabHoleCallAt(a, identDeclOf(an.callFn))
-      }
-    }
     if elabCallInstFrom(c, -1) < 0 { elabHoleCallAt(c, elabSoleCalleeHole(c)) }
     if elabCallInstFrom(c, -1) < 0 && rowed.get(c) == null {
       elabSolvedHoleCallAt(c)
+    }
+  }
+  // A value arm reaches its member at the closed signature its site is converted at.
+  for a in fnTagValueArmsAll() {
+    const an = nodeAt(a)
+    if an is Call && elabCallInstFrom(a, -1) < 0 {
+      elabHoleCallAt(a, identDeclOf(an.callFn))
     }
   }
   // A call of a module binding above its declaration, at its arguments' own types.
@@ -11940,6 +12016,7 @@ export function elabRun() {
     lr = lr + 1
   }
   elabHeldListFacts()
+  elabHeldFnLitInstFacts()
   elabSlotFacts()
   elabSlotMakerTwins()
   elabPinsClosedSet(true)
@@ -12498,7 +12575,8 @@ export function elabHoleGenFlowTy(argIx: i32, holder: i32): i32 {
     ps = bo.fnParamTypes
   } else {
     cx = eplSlotOneCall(holder, path, -1, ps)
-    if cx < 0 { return -1 }
+    // Several calls whose arguments are all closed at one type deliver one signature.
+    if cx < 0 && !eplSlotCallsAgree(holder, path, -1, ps) { return -1 }
   }
   if ps.length == 0 || vf.fnParamTypes.length != ps.length { return -1 }
   const gN: string[] = []
@@ -12809,6 +12887,59 @@ function elabHeldListFacts() {
     f = f + 3
   }
   if ekDecl.length > n0 { elabSettle(0) }
+  return 0
+}
+
+// Whether node `x` is typed the same in every instance that records it as the template types it:
+// its type holds no instance's own type variable.
+function elabInstTysAlike(x: i32): boolean {
+  const own = nodeRepTyIxOf(x)
+  const ps = elabNodeTys[x] ?? []
+  let i = 0
+  while i + 1 < ps.length {
+    if !tySameSealed(ps[i + 1], own) { return false }
+    i = i + 2
+  }
+  return true
+}
+
+// Stamps each instance's list or record literal whose type there holds a list of closures still
+// open, and no tagged set's id, at the type the instance's own calls close them to, where that
+// instance stamped it at nothing else: the instanced form of `elabHeldFnLitStamps`.
+function elabHeldFnLitInstFacts() {
+  // A literal that holds a binding another literal initialises reads that literal's bank, so
+  // the walk repeats while a pass banks anything new.
+  let more = true
+  while more {
+    more = false
+    for ix in elabNodeTys.keys() {
+      if ix < 0 || ix >= P.nodes.length { continue }
+      const lit = nodeAt(ix)
+      if !(lit is ArrayLit) && !(lit is ObjLit) { continue }
+      // A literal whose template rep holds a tagged set's id is that set's, in every instance.
+      if tyOpenFnLists(nodeRepTyIxOf(ix), []) == 3 { continue }
+      const ps = elabNodeTys[ix] ?? []
+      let i = 0
+      while i + 1 < ps.length {
+        const t = ps[i + 1]
+        if (
+          tyOpenFnLists(t, []) == 2
+          && elabPairIn(elabNodeReps, ix, ps[i]) < 0
+        ) {
+          const none: string[] = []
+          const nv = elabHeldClosedTyAt(t, [ix], [], -1, none, ps[i])
+          if nv >= 0 && !tyHasTyVar(nv) {
+            const rs = elabNodeReps[ix] ?? []
+            rs.push(ps[i])
+            rs.push(nv)
+            elabNodeReps[ix] = rs
+            more = true
+          }
+        }
+        i = i + 2
+      }
+    }
+  }
   return 0
 }
 
@@ -13747,6 +13878,38 @@ function elabListCallSig(bd: i32, s: i32): i32 {
   return sig
 }
 
+// Whether every declaration in `ds` is a generic function.
+function elabAllGeneric(ds: i32[]): boolean {
+  for d in ds {
+    const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if !(n is FuncDecl) || n.fnTyParams.length == 0 { return false }
+  }
+  return true
+}
+
+// The closed type the `let` call `ix` hands at parameter row `names[i]` holds, read from its
+// holder class as mono pins it (`eplHolderTy`), where it closes and differs from `t`; else -1.
+function elabArgOwnTy(ix: i32, names: string[], i: i32, t: i32): i32 {
+  const cn = nodeAt(ix)
+  const d = elabCallDeclOf(ix)
+  const fd = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(cn is Call) || !(fd is FuncDecl) || i >= names.length { return -1 }
+  let pi = 0
+  while pi < fd.fnParams.length && pi < cn.callArgs.length {
+    if paramHoleName(fd.fnName, d, pi) == names[i] {
+      const a = parenPeelIx(cn.callArgs[pi])
+      const bd = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
+      if bd < 0 || bd >= P.nodes.length || !(nodeAt(bd) is LetDecl) {
+        return -1
+      }
+      const own = eplHolderTy(bd, -1)
+      return if own >= 0 && own != t && tysClosed([own]) { own } else { -1 }
+    }
+    pi = pi + 1
+  }
+  return -1
+}
+
 // Enqueues call `ix`'s row `names`/`tys` with each set of functions taking its rep at `ck`
 // (`elabSetRepTy`), when one moves and the row closes.
 function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
@@ -13772,6 +13935,11 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
     // A set the callee writes functions into through the parameter runs at their signature.
     const held: i32[] = []
     elabFnIdsIn(t, held, [])
+    // A binding the callee writes generics into is built at its own closed type, the one mono
+    // pins it at, not at a type it shares with another binding (D10023).
+    if rt < 0 && ck < 0 && held.length > 0 && elabAllGeneric(held) {
+      rt = elabArgOwnTy(ix, names, i0, t)
+    }
     if rt < 0 && i0 < names.length && held.length > 0 {
       rt = elabWrittenRep(ix, names[i0], t)
     }
@@ -14966,7 +15134,7 @@ function elabHeldClosedGo(
 ): i32 {
   if t < 0 || t >= T.tys.length { return -1 }
   if !tyHasTyVar(t) { return t }
-  const bound = elabHeldBoundTy(vals)
+  const bound = elabHeldBoundTy(vals, k)
   if bound >= 0 { return bound }
   const o = tyAt(t)
   match o {
@@ -15170,18 +15338,26 @@ function elabPathPlus(path: string[], k: string): string[] {
 
 // The slot fact of the binding every one of `vals` reads, where they all read bindings that have
 // one and agree; -1 otherwise.
-function elabHeldBoundTy(vals: i32[]): i32 {
+function elabHeldBoundTy(vals: i32[], k: i32): i32 {
   if vals.length == 0 { return -1 }
   let t = -1
   for v in vals {
     const x = parenPeelIx(v)
     if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
     const d = identDeclOf(x)
-    const ft = elabSlotTys[elabSlotKey(d, -1)] ?? -1
+    const ik = if k >= 0 { elabHeldInstInitTy(d, k) } else { -1 }
+    const ft = if ik >= 0 { ik } else { elabSlotTys[elabSlotKey(d, -1)] ?? -1 }
     if ft < 0 || (t >= 0 && !tySameSealed(t, ft)) { return -1 }
     t = ft
   }
   return t
+}
+
+// The closed type instance `k` banked for binding `d`'s literal initialiser, or -1.
+function elabHeldInstInitTy(d: i32, k: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letInit < 0 { return -1 }
+  return elabPairIn(elabNodeReps, parenPeelIx(dn.letInit), k)
 }
 
 // Holder and instance → the closed type the holder's value is built at there: a `let` binding's
@@ -15252,6 +15428,10 @@ function elabTyAtPath(t0: i32, path: string[]): i32 {
   }
   return t
 }
+
+// The closed type binding `d` is delivered at whole (`deliveredSlotTyOf`), for the emit modules
+// that read the elaboration; -1 for none.
+export function elabDeliveredSlotTy(d: i32): i32 { return deliveredSlotTyOf(d) }
 
 // The program-level holders `elabSlotFacts` asked, for `elabSlotMakerTwins`.
 let elabSlotHolders: i32[] = []
@@ -15331,8 +15511,10 @@ function elabSlotFacts() {
           inst.push(ix)
           instFn.push(fd)
         } else {
-          // The values written decide first; the classes close what they leave open.
-          const ft = eplHolderTy(ix, -1)
+          // A closed destination it is delivered at whole decides first, as an annotation would
+          // (D17756); then the values written; the classes close what they leave open.
+          const dd = deliveredSlotTyOf(ix)
+          const ft = if dd >= 0 && !tyHasTyVar(dd) && !tyHasHole(dd) { dd } else { eplHolderTy(ix, -1) }
           // A `let` held per region (`elabRegionsDecide`): each later region a holder of its own.
           const rss = if n is LetDecl && regionUsedOf(ix) { regionStartsOf(ix, fnStmts) } else { [] }
           const rts: i32[] = [ft]
@@ -23264,6 +23446,46 @@ export function eplSlotOneCall(
   return if cn is Call { EPL.callNode[one] } else { -1 }
 }
 
+// Whether slot `path` of `holder` or a copy, in instance `k`, is called at least twice and every
+// call's arguments are closed at one list of types, pushed onto `tys`; false for any open argument.
+export function eplSlotCallsAgree(
+  holder: i32,
+  path: string[],
+  k: i32,
+  tys: i32[],
+): boolean {
+  const k0 = EPL.k
+  const p = eplSlotPlace(holder, path, k)
+  let first: i32[] = []
+  let n = 0
+  for ci in if p >= 0 { eplCallsStar(p) } else { [] } {
+    const cn = nodeAt(EPL.callNode[ci])
+    if !(cn is Call) {
+      EPL.k = k0
+      return false
+    }
+    const at: i32[] = []
+    for a in cn.callArgs {
+      const t = eplArgTy(ci, a)
+      if t < 0 || t >= T.tys.length || tyHasTyVar(t) {
+        EPL.k = k0
+        return false
+      }
+      at.push(t)
+    }
+    if n > 0 && !tysSameList(first, at) {
+      EPL.k = k0
+      return false
+    }
+    if n == 0 { first = at }
+    n = n + 1
+  }
+  EPL.k = k0
+  if n < 2 { return false }
+  for t in first { tys.push(t) }
+  return true
+}
+
 // Whether every call through slot `path` of `holder` or a copy, in instance `k`, whose arguments
 // are all closed is made at `ps` (each argument widened from its literal).
 export function eplSlotCallsAt(
@@ -23845,10 +24067,13 @@ export function elabHeldFnLitStamps() {
     const n = nodeAt(g)
     const k = if n is ArrayLit || n is ObjLit || n is IfStmt || n is MatchExpr { tyOpenFnLists(nodeRepTyIxOf(g), []) } else { 0 }
     const ks = if k == 1 || k == 2 { elabEnclosingKeys(g) } else { [] }
+    // An instanced function's literal every instance types alike is one value in all.
     const top = ks.length == 1 && ks[0] == -1
+      || ks.length > 0 && elabInstTysAlike(g)
     if top && k == 2 {
       const ht = elabHeldValTy(g, -1)
-      const ut = if ht < 0 { elabUncalledFnsClosed(nodeRepTyIxOf(g), []) } else { -1 }
+      const ut0 = if ht < 0 { elabUncalledFnsClosed(nodeRepTyIxOf(g), []) } else { -1 }
+      const ut = if ht < 0 && ut0 < 0 { elabLitTyOfValueStamps(g) } else { ut0 }
       if ht >= 0 { repStampNode(g, elabStampKeepsTagged(g, ht)) }
       else if ut >= 0 { repStampNode(g, elabStampKeepsTagged(g, ut)) }
     } else if top && k == 1 && !(nested.get(g) ?? false) {
@@ -23909,6 +24134,9 @@ function elabStampKeepsTagged(x: i32, t: i32): i32 {
   const tt = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
   if !(n is ObjLit) || !(tt is TyObj) { return t }
   const tys = tt.objFieldTypes.slice(0)
+  // The literal's own rep holds the ids a tagged field is built as, where it closes them.
+  const own = nodeRepTyIxOf(x)
+  const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
   let moved = false
   for fx in n.objFields {
     const f = nodeAt(fx)
@@ -23921,7 +24149,9 @@ function elabStampKeepsTagged(x: i32, t: i32): i32 {
       && vt != tys[k]
       && (fnTagTyIsTagged(vt) || fnTagHoldsTy(vt))
     ) {
-      tys[k] = vt
+      const ok = if ot is TyObj && f is FieldInit { strListIndexOf(ot.objFieldNames, f.fiName) } else { -1 }
+      const of = if ot is TyObj && ok >= 0 && ok < ot.objFieldTypes.length { ot.objFieldTypes[ok] } else { -1 }
+      tys[k] = if of >= 0 && !tyHasTyVar(of) { of } else { vt }
       moved = true
     }
   }
@@ -23943,6 +24173,45 @@ function elabRetLitDstTy(x: i32): i32 {
   const same = n is ObjLit && tyAt(dt) is TyObj
     || n is ArrayLit && tyAt(dt) is TyArray
   return if same { dt } else { -1 }
+}
+
+// Record literal `x`'s type composed from each field value's closed stamp: a literal's own, a direct
+// call's returned literal's (`elabRetLitOf`), else the field's closed type; -1 where one stays open.
+function elabLitTyOfValueStamps(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const n = nodeAt(x)
+  const own = nodeRepTyIxOf(x)
+  const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+  if !(n is ObjLit) || !(ot is TyObj) { return -1 }
+  const tys = ot.objFieldTypes.slice(0)
+  for fx in n.objFields {
+    const f = nodeAt(fx)
+    const k = if f is FieldInit { strListIndexOf(ot.objFieldNames, f.fiName) } else { -1 }
+    if k < 0 || k >= tys.length { return -1 }
+    if tyHasTyVar(tys[k]) {
+      const v = if f is FieldInit { parenPeelIx(f.fiValue) } else { -1 }
+      const rl = elabRetLitOf(v)
+      const vt = if rl >= 0 { nodeRepTyIxOf(rl) } else { nodeRepTyIxOf(v) }
+      if vt < 0 || tyHasTyVar(vt) { return -1 }
+      tys[k] = vt
+    }
+  }
+  return mkObjTy(ot.objFieldNames, tys)
+}
+
+// The one list or record literal direct call `v`'s named callee returns, or -1.
+function elabRetLitOf(v: i32): i32 {
+  const c = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
+  if !(c is Call) { return -1 }
+  const cf = parenPeelIx(c.callFn)
+  const d = if cf >= 0 && nodeAt(cf) is Ident { identFnDeclOf(cf) } else { -1 }
+  const fd = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(fd is FuncDecl) || fd.fnBody < 0 { return -1 }
+  const vs: i32[] = []
+  collectRetValues(fd.fnBody, vs)
+  if vs.length != 1 { return -1 }
+  const r = parenPeelIx(vs[0])
+  return if r >= 0 && (nodeAt(r) is ArrayLit || nodeAt(r) is ObjLit) { r } else { -1 }
 }
 
 // The list and record literals literal `x` holds directly, as elements or field values; `keys`

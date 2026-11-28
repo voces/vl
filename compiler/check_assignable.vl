@@ -241,6 +241,7 @@ import {
   ctnCutClear,
   ctnCutKills,
   ctnWrDeclOf,
+  ctnWrRecv,
   ctnWrUnreachedBy,
   wrDstDecl,
   wrUnreachedBy,
@@ -443,7 +444,11 @@ import {
   prbLeave,
   quietRunOpen,
 } from "./check_rollback"
-import { recordWidenRetagTails, valBindLambda } from "./check_side_rows"
+import {
+  ctnDeliveryNote,
+  recordWidenRetagTails,
+  valBindLambda,
+} from "./check_side_rows"
 import {
   CSTR_ANYFN,
   SUBST_ALL,
@@ -1250,11 +1255,59 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
   const bTys: i32[] = []
   bindGenWalk(srcTy, nonNullTy(dstTy), bNames, bTys)
   if bNames.length == 0 { return 0 }
+  // A map delivered whole at a closed map takes that map as its slot; a function or list
+  // destination keeps the binding's own reading (a kind rung, D17800).
+  const dmap = nonNullTy(dstTy)
+  const sx = parenPeelIx(srcExpr)
+  // A destination counts only where its type is closed apart from the binding: one holding a hole
+  // is closed by its own pins, which may be what typed the destination (D9182).
+  const whole = sx >= 0
+    && nodeAt(sx) is Ident
+    && identDeclOf(sx) == d
+    && !tyHasInferHole(srcTy)
+  if (
+    !inferQuiet
+    && monoRecheckDepth == 0
+    && whole
+    && dmap >= 0
+    && dmap < T.tys.length
+    && tyAt(dmap) is TyMap
+  ) {
+    ctnDeliveryNote(d, dmap)
+  }
   const at = " (written into `"
     + letNameAt(d)
     + "`, delivered at "
     + tyToStr(dstTy)
     + ")"
+  // A write that fits the destination's own slot is delivered there, as an annotation of the
+  // binding at that type would hold it (D17756).
+  const dm = nonNullTy(dstTy)
+  const dmt = if dm >= 0 && dm < T.tys.length { tyAt(dm) } else { null }
+  const dv = if dmt is TyMap && whole { tyValOf(dmt) } else { -1 }
+  // Each generic function written there is delivered at that slot, adapted as an annotated
+  // holder's write is (`fvaAdapt`).
+  if dv >= 0 && !inferQuiet && monoRecheckDepth == 0 {
+    // The map's slot is the destination's, decided once: each write's bound into it reads that
+    // slot, not the one its first write's own type set (D17756).
+    const sm = if srcTy >= 0 && srcTy < T.tys.length { tyAt(srcTy) } else { null }
+    const old = if sm is TyMap { tyValOf(sm) } else { -1 }
+    let bi = 0
+    while old >= 0 && bi < bndCount(BND_BM) {
+      const bw0 = bndAt(BND_BM, bi)
+      if bw0.a == old && ctnWrDeclOf(bw0.site) == d { bw0.a = dv }
+      bi = bi + 1
+    }
+    for wv0 in ctnWrRecv.keys() {
+      const wv = parenPeelIx(wv0)
+      if ctnWrDeclOf(wv0) == d && wv >= 0 && nodeAt(wv) is Ident {
+        const wd = identDeclOf(wv)
+        if wd >= 0 && wd < P.nodes.length && nodeAt(wd) is FuncDecl {
+          fvaAdapt(wv0, nodeTyOf(wv0), dv)
+        }
+      }
+    }
+  }
   let ci = 0
   while ci < bndCount(BND_BM) {
     if (
@@ -1265,7 +1318,8 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
       const bw = substTyDeep(bndAt(BND_BM, ci).a, bNames, bTys)
       let bc = bndAt(BND_BM, ci).b
       if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
-      if !tyHasHole(bg) && !tyHasHole(bw) {
+      const fitsDst = dv >= 0 && !tyHasHole(bw) && assignable(bw, dv)
+      if !tyHasHole(bg) && !tyHasHole(bw) && !fitsDst {
         if !bmArgPred(bndAt(BND_BM, ci).c, bg, bw, bndAt(BND_BM, ci).site) {
           const m = bmArgMsg(
             bndAt(BND_BM, ci).c,
@@ -6107,6 +6161,14 @@ export function fvaValueRowAt(decl: i32, dt: i32) {
   return elabWideRowNote(decl, names, tys, d.fnRet)
 }
 
+// Notes `site`, a value its holes leave open, delivered at closed function type `dt`, which no
+// adapter is built at: the decision pins each member there by a value arm when the value turns
+// out to carry a set, which the destination converts to a closure.
+function fvaValueSiteNote(site: i32, srcTy: i32, dt: i32) {
+  if !tyHasHole(srcTy) || tyHasTyVar(dt) || tyHasHole(dt) { return 0 }
+  return fnTagValueDstNote(parenPeelIx(site), dt)
+}
+
 // A copy of the node at `site`, keeping its token and the declaration an identifier resolves to,
 // so the site itself can be rewritten around it.
 function fvaMoveSite(site: i32): i32 {
@@ -6190,6 +6252,8 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     }
   }
   if !(s is TyFunc) || !(d is TyFunc) {
+    // A value still open here may be a set's once its holes close; the decision checks the site.
+    if d is TyFunc && tyHasHole(srcTy) { fvaValueSiteNote(srcExpr, srcTy, dt) }
     // A function inside a container is not rewritten on the way, so a call through the
     // destination's function type would reach it at another signature. A union delivers the
     // container to each arm it is assignable to, so each is such a destination (D16296).

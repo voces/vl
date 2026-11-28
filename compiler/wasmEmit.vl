@@ -925,6 +925,7 @@ import {
   fnIndexOfAt,
   fnIndexOfNode,
   fnReturnsLitAtom,
+  fnSigParamOpen,
   forInElemKind,
   forInPairValsSlot,
   globalCellKind,
@@ -22372,9 +22373,28 @@ export function printArmOf(argIx: i32, fnIx: i32): PrintArm {
   return printScalarArmOf(argIx, fnIx)
 }
 
+// The scalar width call `argIx` returns where its frame type is open, as the call is written:
+// a lifted `const` lambda's slot result, else a closure call's signature result; "" otherwise.
+function openCallWidth(argIx: i32, fnIx: i32): string {
+  const ix = unwrapParen(argIx)
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const t = exprValueTyAt(ix, fnIx)
+  if t >= 0 && !tyHasTyVar(t) { return "" }
+  const n = nodeAt(ix)
+  if !(n is Call) { return "" }
+  const lf = cloLiftCalleeOf(n.callFn, fnIx)
+  if lf >= 0 { return repOfFnSlot(lf).rdKind ?? "" }
+  return sigKeyRetKind(cloCallSigKey(ix, fnIx)) ?? ""
+}
+
 // The print import a scalar argument takes: f32 before f64, so a mixed f32 and float-literal
 // expression prints as f32, and either float before i64, bool and i32.
 function printScalarArmOf(argIx: i32, fnIx: i32): PrintArm {
+  // A call the frame types open returns at the width its callee is called at (D17782).
+  const lw = openCallWidth(argIx, fnIx)
+  if lw == "f32" { return "f32" }
+  if lw == "f64" { return "f64" }
+  if lw == "i64" { return "i64" }
   if exprIsF32(argIx, fnIx) { return "f32" }
   if exprIsF64(argIx, fnIx) { return "f64" }
   if exprIsI64(argIx, fnIx) { return "i64" }
@@ -24948,6 +24968,9 @@ function mfNulUnitToRef(
   return key != "" && sigParamKindAt(key, 0) == "nulnone"
 }
 
+// The refusal of a callback no instance closes at the list's element type.
+const MF_CB_OPEN = "emitProgram: a .map/.filter callback needs an instance at the list's element type, and none was built for this call"
+
 // The plan of `.map`/`.filter` call `callIx`, asked where legacy's arm asks it.
 export function mapFilterPlanOf(callIx: i32, fnIx: i32): MfPlan {
   const c = nodeAt(callIx)
@@ -24977,6 +25000,9 @@ export function mapFilterPlanOf(callIx: i32, fnIx: i32): MfPlan {
   // result backing/wrapper + the matching dst scratch local. -1 for a non-ref result.
   const dstSlot = mfResultSlotOf(callIx, fnIx)
   const cbFe = mfCallbackFe(c.callArgs[0], fnIx)
+  // A callback whose parameter no instance closes would be called through a defaulted signature;
+  // the refusal is recorded and the plan still built, so the lowering stays whole.
+  if cbFe >= 0 && fnSigParamOpen(cbFe) { emitFail(MF_CB_OPEN) }
   const sig = mfCallbackSigOf(c.callArgs[0], cbFe, fnIx)
   if sig < 0 {
     return mfRefused(
