@@ -411,7 +411,13 @@ import {
 } from "./check_num_lits"
 import { recordNullHoleObjAdopt } from "./check_obj_shape"
 import { parenPeelIx } from "./check_places"
-import { recCovArgNote, recOwnPend, recPend } from "./check_rec_rows"
+import {
+  recCovArgNote,
+  recCovArgOf,
+  recOwnPend,
+  recPend,
+  roFnListTy,
+} from "./check_rec_rows"
 import { recDropAdopt } from "./check_rec_drop"
 import { noteRefListView } from "./check_ref_list_view"
 import {
@@ -6355,6 +6361,16 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if srcTy >= T.tys.length || dstTy >= T.tys.length { return false }
   // A join typed at the destination still carries each tail's own function value.
   if fvaAdaptJoin(srcExpr, dstTy) { return srcTy != dstTy }
+  // An element read of a storage-keyed holder is delivered through an adapter at a closed function
+  // type even at its own type: a narrower storage's instance calls the element at its own (D17816).
+  if fvaCovRead(srcExpr, dstTy) {
+    return fvaAdaptCovRead(srcExpr, srcTy, dstTy)
+  }
+  // A storage alias handed to a readonly-list parameter hands its storage (D17816).
+  const ast = fvaAliasStorageOf(srcExpr)
+  if ast >= 0 && fvaCovariantArgRep(srcExpr, ast, nonNullTy(dstTy)) {
+    return false
+  }
   if srcTy == dstTy || !tyMayHoldFn(dstTy) { return false }
   // A lambda whose every return is a fresh list or record literal is built at the destination, as
   // an annotated one is; a list never widens, so no adapter can deliver it (D16918, D16924).
@@ -6443,6 +6459,7 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         // A readonly list of functions handed to a function's parameter is read where it is
         // stored: the callee is instanced at the argument's own storage, not copied (D17816).
         if fvaCovariantArgRep(srcExpr, srcTy, dm) { return false }
+        if fvaCovariantAlias(srcExpr, srcTy, dm) { return false }
         fvaRefuseNested(srcExpr, srcTy, dm)
         return true
       }
@@ -6609,8 +6626,7 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       luAt(mkBlock(tl, pos), site),
       pos,
     )
-    arenaSetNode(site, nodeAt(luAt(iff, site)))
-    valueIfAdd(site)
+    fvaInstallIf(site, iff)
   } else {
     const moved = fvaMoveSite(site)
     const li = luAt(addNode(lam), site)
@@ -6671,6 +6687,132 @@ function fvaCovariantArgRep(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   }
   recCovArgNote(x, srcTy)
   return true
+}
+
+// Whether `srcExpr`, a read of a closed list of functions of type `srcTy`, initializes a `const`
+// annotated at readonly list `dstTy`: the binding is an alias of that storage, whose element reads
+// are typed at it; noted with `recCovArgNote` on the declaration (D17816).
+function fvaCovariantAlias(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  const x = parenPeelIx(srcExpr)
+  if (
+    x < 0
+    || !cwIxCovers(x)
+    || cwIxUpKind[x] != CW_UP_LETINIT
+    || !(nodeAt(x) is Ident)
+  ) {
+    return false
+  }
+  const da = if dstTy >= 0 && dstTy < T.tys.length { tyAt(dstTy) } else { null }
+  const sa = if srcTy >= 0 && srcTy < T.tys.length { tyAt(srcTy) } else { null }
+  if !(da is TyArray) || da.aRead != 1 || !(sa is TyArray) { return false }
+  if (
+    !(tyAt(tyElemOf(sa)) is TyFunc)
+    || tyHasTyVar(srcTy)
+    || tyHoldsHole(srcTy)
+  ) {
+    return false
+  }
+  const ld = nodeAt(cwIxUp[x])
+  if !(ld is LetDecl) || ld.letKw != "const" || ld.letType < 0 { return false }
+  recCovArgNote(cwIxUp[x], srcTy)
+  return true
+}
+
+// The storage a read of a storage alias holds (`fvaCovariantAlias`), else -1.
+function fvaAliasStorageOf(srcExpr: i32): i32 {
+  const x = parenPeelIx(srcExpr)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  return recCovArgOf(identDeclOf(x))
+}
+
+// Whether `srcExpr` reads an element of a holder whose storage can differ from its declared type
+// (a readonly function-list parameter of a storage-parametric function, or a storage alias of a
+// list), delivered at closed
+// function type `dstTy`: decided by the declaration, never by a caller (D17816).
+function fvaCovRead(srcExpr: i32, dstTy: i32): boolean {
+  const x = parenPeelIx(srcExpr)
+  const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(xn is Index) { return false }
+  const a = parenPeelIx(xn.idxArr)
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if !(an is Ident) { return false }
+  const d = identDeclOf(a)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const param = dn is Param && dn.parType >= 0 && roFnListTy(nodeTyIxOf(d))
+  if !param && recCovArgOf(d) < 0 { return false }
+  const dt = if dstTy >= 0 && dstTy < T.tys.length { tyAt(dstTy) } else { null }
+  return dt is TyFunc && !tyHasTyVar(dstTy) && !tyHoldsHole(dstTy)
+}
+
+// Rewrites element read `srcExpr` into `if true { const $fv = srcExpr; (ps) => $fv(ps) }` at
+// function type `dstTy`: the snapshot takes each instance's own element type, so the adapter
+// calls a narrower storage's element at its own signature and widens its result (D17816).
+function fvaAdaptCovRead(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  const site = srcExpr
+  if fvaDone[site] ?? false { return false }
+  const d = tyAt(dstTy)
+  if !(d is TyFunc) { return false }
+  const pos = nodePos(site)
+  const params: i32[] = []
+  const args: i32[] = []
+  let i = 0
+  while i < d.fnParamTypes.length {
+    const pt = fvaAnnot(d.fnParamTypes[i], site, pos)
+    if pt < 0 { return false }
+    const pd = luAt(mkParam("$fp" + i32ToStr(i), pt, -1, 0, 0, pos), site)
+    params.push(pd)
+    args.push(luRef(pd, site, pos))
+    i = i + 1
+  }
+  const rt = fvaAnnot(d.fnRet, site, pos)
+  if rt < 0 { return false }
+  const snap = luDecl(
+    "const",
+    "$fv" + i32ToStr(site),
+    -1,
+    fvaMoveSite(site),
+    site,
+    pos,
+  )
+  const lam = fvaLambda(
+    params,
+    rt,
+    luAt(mkCall(luRef(snap, site, pos), args, pos), site),
+    site,
+    pos,
+  )
+  fvaDone.set(site, true)
+  fvaBuilt.set(site, true)
+  const stmts: i32[] = [
+    snap,
+    luAt(mkParen(luAt(addNode(lam), site), pos), site),
+  ]
+  const none: i32[] = []
+  const tl: i32[] = [luAt(mkCall(luTrap(site, pos), none, pos), site)]
+  const iff = mkIf(
+    luAt(mkBool(1, pos), site),
+    luAt(mkBlock(stmts, pos), site),
+    luAt(mkBlock(tl, pos), site),
+    pos,
+  )
+  const mark = T.diags.length
+  fvaInstallIf(site, iff)
+  luGrow()
+  const t = checkNodeHook(site)
+  if T.diags.length > mark || !assignable(t, dstTy) {
+    let why = ""
+    if T.diags.length > mark { why = T.diags[mark].tmsg }
+    while T.diags.length > mark { T.diags.pop() }
+    fvaRefuse(site, srcTy, dstTy, why)
+  }
+  return true
+}
+
+// Writes `site` as the valued `if` node `iff` holding an adapter beside its snapshot.
+function fvaInstallIf(site: i32, iff: i32) {
+  arenaSetNode(site, nodeAt(luAt(iff, site)))
+  valueIfAdd(site)
+  return 0
 }
 
 // Writes `site` as the call of adapter lambda `outer` on the value moved out of it, `moved`.
