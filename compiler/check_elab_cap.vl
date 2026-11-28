@@ -5005,6 +5005,7 @@ export function elabCapReset() {
   elabWideRowsKeep(0)
   elabFnSetTy = Map()
   fnSets = []
+  ffAtSets = -1
   fnParamWriteJoins = Map()
   fnValGenerics = []
   fnSetByKey = Map()
@@ -6095,8 +6096,88 @@ function hbcReturnedValues(body: i32): i32[] {
   return out
 }
 
-// The sets sharing a member with set `s`, transitively, `s` among them, ascending: one function
-// value has one layout, so every set holding it takes one rep.
+// Per set, the other sets a map or list in the same field of a record of the same field names
+// holds, memoised while the sets and the type arena stay the same size.
+let ffJoined: i32[][] = []
+let ffAtSets = -1
+let ffAtTys = -1
+
+// The sets a record field holding set `s`'s map or list also holds another's of (D17773).
+export function fnFieldJoinedOf(s: i32): i32[] {
+  if ffAtSets != fnSets.length || ffAtTys != T.tys.length { fnFieldJoinBuild() }
+  return if s >= 0 && s < ffJoined.length { ffJoined[s] } else { [] }
+}
+
+// Builds `ffJoined` from every record type in the arena: its field `f`, keyed by its sorted field
+// names, joins the sets the maps and lists it holds carry.
+function fnFieldJoinBuild() {
+  const byKey: {[string]: i32[]} = Map()
+  let t = 0
+  while t < T.tys.length {
+    const o = tyAt(t)
+    if o is TyObj {
+      const names: string[] = []
+      for nm in o.objFieldNames { names.push(nm) }
+      let si = 1
+      while si < names.length {
+        const v = names[si]
+        let sj = si - 1
+        while sj >= 0 && names[sj] > v {
+          names[sj + 1] = names[sj]
+          sj = sj - 1
+        }
+        names[sj + 1] = v
+        si = si + 1
+      }
+      let shape = ""
+      for nm in names { shape = shape + nm + "," }
+      let i = 0
+      while i < o.objFieldNames.length && i < o.objFieldTypes.length {
+        const fs = fnFieldHeldSet(o.objFieldTypes[i])
+        if fs >= 0 {
+          const key = shape + "." + o.objFieldNames[i]
+          const g = byKey[key] ?? []
+          if !i32ListHas(g, fs) { g.push(fs) }
+          byKey[key] = g
+        }
+        i = i + 1
+      }
+    }
+    t = t + 1
+  }
+  ffJoined = []
+  while ffJoined.length < fnSets.length { ffJoined.push([]) }
+  for key in byKey.keys() {
+    const g = byKey[key] ?? []
+    for a in g {
+      for b in g {
+        if (
+          a != b
+          && a >= 0
+          && a < ffJoined.length
+          && !i32ListHas(ffJoined[a], b)
+        ) {
+          ffJoined[a].push(b)
+        }
+      }
+    }
+  }
+  ffAtSets = fnSets.length
+  ffAtTys = T.tys.length
+  return 0
+}
+
+// The set the functions a map or list type `ft` holds carry, through `| null`; -1 for none.
+function fnFieldHeldSet(ft: i32): i32 {
+  const c = nonNullTy(ft)
+  const n = if c >= 0 && c < T.tys.length { tyAt(c) } else { null }
+  const e = if n is TyMap { tyValOf(n) } else if n is TyArray { tyArrayElemIx(c) } else { -1 }
+  return if e >= 0 { fnTagSetOfTy(nonNullTy(e)) } else { -1 }
+}
+
+// The sets sharing a member with set `s`, or a record field holding their maps or lists
+// (`fnFieldJoinedOf`), transitively, `s` among them, ascending: one function value, and one field,
+// has one layout, so every set holding it takes one rep.
 export function fnTagFamilyOf(s: i32): i32[] {
   if s < 0 || s >= fnSets.length { return [] }
   const out: i32[] = [s]
@@ -6110,6 +6191,10 @@ export function fnTagFamilyOf(s: i32): i32[] {
         let shares = false
         for m in fnSets[k] {
           if i32ListHas(mem, m) { shares = true }
+        }
+        // Sets a map or list stored into one record field holds share that field's one layout.
+        for o in out {
+          if i32ListHas(fnFieldJoinedOf(o), k) { shares = true }
         }
         if shares {
           out.push(k)
