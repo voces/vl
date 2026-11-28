@@ -1,4 +1,5 @@
-import { gIrGraph, irDuRows } from "./ir_graph_rows"
+import { gIrGraph, irCgRows, irDuRows, irEffRows } from "./ir_graph_rows"
+import { cgNoteLegacy, cgRecord, cgReset, cgSeal } from "./ir_callgraph"
 import { fnTagValueArmFn, ftValueConvertAt } from "./check_fn_tag"
 import {
   irInlineCalls,
@@ -1214,7 +1215,63 @@ export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   const s = claimScopeBegin()
   const ok = claimFn(fnIx, fnPos, out)
   claimScopeEnd(s, ok)
+  if !ok && gIrGraph == 1 { cgNoteLegacy() }
+  factsAgree(fnPos, if ok { ib.irNodes.length } else { -1 })
   return ok
+}
+
+// The facts compile 1 of an optimised build gathers for compile 2 (`irFactsBegin`), by `fnStmts`
+// slot: the node count of the IR each claim lowered, -1 for a claim that fell back. They live
+// outside every per-compile reset, and `irFactsDrop` forgets them once compile 2 ends.
+let factsGathering = false
+let factsHeld = false
+let factNodes: {[i32]: i32} = Map()
+
+// Opens compile 1: the claims it makes are recorded as the facts compile 2 is held to.
+export function irFactsBegin() {
+  factNodes = Map()
+  factsGathering = true
+  factsHeld = false
+  return 0
+}
+
+// Closes compile 1: compile 2's claims must agree with what it recorded.
+export function irFactsEnd() {
+  factsGathering = false
+  factsHeld = true
+  return 0
+}
+
+// Forgets the facts once compile 2 is done, so no later compile is held to them.
+export function irFactsDrop() {
+  factNodes = Map()
+  factsGathering = false
+  factsHeld = false
+  return 0
+}
+
+// Records claim outcome `n` of slot `fnPos` in compile 1, or holds compile 2's to it: compile 2 is
+// the same compile, so an outcome that differs is a build that is not deterministic, and every
+// fact compile 1 gathered may describe IR compile 2 does not build.
+function factsAgree(fnPos: i32, n: i32) {
+  if fnPos < 0 { return 0 }
+  if factsGathering {
+    factNodes[fnPos] = n
+    return 0
+  }
+  if !factsHeld { return 0 }
+  const was = factNodes[fnPos] ?? -2
+  if was == n { return 0 }
+  emitFail(
+    "internal compiler error: the claim of `"
+      + ib.irName
+      + "` differs between the two compiles of an optimised build ("
+      + i32ToStr(was)
+      + " nodes, then "
+      + i32ToStr(n)
+      + ")",
+  )
+  return 0
 }
 
 function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
@@ -1237,7 +1294,9 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   declUnit = -1
   count("claimed")
   if gIrGraph == 1 {
+    cgRecord(fnPos, ib)
     for r in irDuRows(ib) { count(r) }
+    for r in irEffRows(ib) { count(r) }
   }
   irLeafNote(fnPos, ib)
   return true
@@ -1265,6 +1324,7 @@ export function irClaimStart(
   const s = claimScopeBegin()
   const ok = claimStart(order, orderGi, poolFill, out)
   claimScopeEnd(s, ok)
+  if !ok && gIrGraph == 1 { cgNoteLegacy() }
   return ok
 }
 
@@ -1294,12 +1354,14 @@ function claimStart(
   }
   declUnit = -1
   count("claimed start")
+  if gIrGraph == 1 { cgRecord(-1, ib) }
   return true
 }
 
 // Starts a compile's report.
 export function irShadowBegin() {
   irInlineReset()
+  cgReset()
   ibRowKey = []
   ibRowN = []
   claimScopeOpen = false
@@ -1319,6 +1381,15 @@ function count(key: string) {
   }
   ibRowKey.push(key)
   ibRowN.push(1)
+  return 0
+}
+
+// Closes the claim pass for the call graph once every unit's code is written; under `gIrGraph`
+// banks the graph's rows.
+export function irClaimsSealed() {
+  if gIrGraph != 1 { return 0 }
+  cgSeal()
+  for r in irCgRows() { count(r) }
   return 0
 }
 
