@@ -889,6 +889,9 @@ let monoLamCloneSlots: i32[] = []
 // stays -1, the fall-through to `moduleLocalLetOfUnique`. Rebuilt at the one write to
 // `monoProgStmts`, so it carries no row from an earlier compile.
 let monoProgLetBySid: i32[] = []
+// The list literals, nested ones included, a `.map` or `.filter` is called on in place: their
+// elements take the literal's stamp where their place agrees on no signature (D17771).
+let monoRecvLits: i32[] = []
 
 // The arena's size, a memo key for the walks below that cache a whole-arena answer.
 function monoArenaStamp() {
@@ -18180,6 +18183,15 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     return 0
   }
   monoRecordPinnedRecv(m.memObj, rt, ctx, 0)
+  const rlw: i32[] = [unwrapParen(m.memObj)]
+  while rlw.length > 0 {
+    const rl = rlw.pop() ?? -1
+    const rln = if rl >= 0 && rl < P.nodes.length { nodeAt(rl) } else { null }
+    if rln is ArrayLit {
+      monoRecvLits.push(rl)
+      for e in rln.arrElems { rlw.push(unwrapParen(e)) }
+    }
+  }
   if lam {
     // A lambda the elaboration keyed at the list's build takes that record as its parameter's type.
     // Over a lambda's `map`, directly or through a `const`, the lambda reads the records of the
@@ -24085,7 +24097,13 @@ function monoWalk(ix: i32, ctx: i32) {
         const evn = if ev >= 0 && ev < P.nodes.length { nodeAt(ev) } else { null }
         const efe = if evn is Ident && identFnDeclOf(ev) >= 0 { monoFnFeOfIdent(ev, evn.identName, ctx) } else { -1 }
         if efe >= 0 && efe < monoGen.length && monoGen[efe] == 1 {
-          const vs = eplValueSig(ev, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+          const vs0 = eplValueSig(
+            ev,
+            if ctx >= 0 { elabKeyAt(ctx) } else { -1 },
+          )
+          const sl = if i32ListHas(monoRecvLits, ix) { nodeRepTyIxOf(ix) } else { -1 }
+          const ss = if sl >= 0 && tyAt(sl) is TyArray { tyArrayElemIx(sl) } else { -1 }
+          const vs = if monoTyClosedFn(vs0) || !monoTyClosedFn(ss) { vs0 } else { ss }
           const none: i32[] = []
           if (
             monoTyClosedFn(vs)
@@ -27059,6 +27077,7 @@ export function monomorphize(stmts: i32[]) {
   // The index follows the table it answers for, at the write and not at a build point:
   // between the two there is no reader, so `monoModuleLetOf` cannot see an empty column.
   monoProgLetBySid = []
+  monoRecvLits = []
   let mi = 0
   while mi < stmts.length {
     const ms = nodeAt(stmts[mi])
