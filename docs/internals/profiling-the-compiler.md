@@ -77,7 +77,8 @@ and says so.
 `pass <cause> N` per cause of a full check pass (`first`, `pin:<phase>`, `settle:<phase>`,
 `wsDecline`, `deepIs`, `etaAgain`), and `arena rows R distinct D`, the type arena's size beside its
 structurally distinct rows (`compiler/check_stats.vl`). Measured 2026-11-28 (#10525): the
-self-compile runs one pass, and its arena holds 180,977 rows, 27,111 distinct.
+self-compile runs one pass, and its arena holds 180,988 rows, 10,706 distinct (a solved hole read
+through to its type, as `tyElemOf` reads it).
 
 ## Comparing CPU between two seeds: interleave, and read the ranges
 
