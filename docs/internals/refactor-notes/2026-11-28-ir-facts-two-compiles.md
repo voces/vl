@@ -81,3 +81,24 @@ Rolling back list rows would cover the first; the second shows the emitter's ord
 interning is wider than any list of marks can be shown to be. Every future interning table would
 be a silent hazard for phase A. Two compiles from the existing reset need no such list
 (coordinator ruling, 2026-11-28).
+
+## The first reader is not the order-free inliner
+
+The IR inliner (`irInlineCalls`) copies a leaf only once the leaf has been claimed, so a leaf
+claimed after its caller is called instead of copied. An order-free inliner was the proposed
+first reader of compile 1's facts. A probe compiler counted every direct call in claimed bodies
+over the corpus at `-O --low-memory-unused=4096`, the only builds where the inliner runs:
+
+| measure | count |
+|---|---|
+| programs built | 8,571 of 10,024 |
+| direct calls in claimed bodies | 115,642 |
+| leaf functions | 4,634 |
+| leaf calls copied today | 1,637, in 543 programs |
+| leaf calls missed only by claim order | 501, in 211 programs |
+| leaf calls in the buffer-view-bounds kernels | 0 |
+
+Each missed site would gain an address folded into its memarg, since binaryen's `-O` inlines
+the call anyway, and no bench row has a leaf call to gain it. A few bytes in 2% of programs do
+not buy 2× guest fuel, so the switch stays off until a pass shows a measured need (coordinator
+ruling, 2026-11-28). A new proposal for this inliner brings new numbers.
