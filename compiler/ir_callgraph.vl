@@ -1,0 +1,584 @@
+// The program's call graph over the IR: each claimed function's call sites, recorded at the claim
+// seam (`cgRecord`) after the IR rewrites and before lowering, and queried by function position
+// (`fnStmts` slot; the start bodies are caller `-1`). A function legacy lowers records nothing, so
+// every answer carries `complete`: true only once the claim pass is sealed (`cgSeal`), every unit
+// is claimed, and nothing records after the seal. A caller reads `complete` before trusting a
+// callers set, an escape or a component. Thunks are not callers: a closure's edge is its
+// `RMakeClo`. Recording runs under `gIrGraph`, a temporary switch the first consuming pass
+// replaces with its own enablement.
+import {
+  IrFn,
+  RAfterEffects,
+  RArmUnbox,
+  RAsTail,
+  RAsUnion,
+  RAsgParked,
+  RAsgUnwiden,
+  RAtomEq,
+  RAtomSole,
+  RAtomStr,
+  RAtomWide,
+  RAtomic,
+  RBoxField,
+  RBoxNarrow,
+  RBundlePick,
+  RCall,
+  RCallHost,
+  RCallRef,
+  RCallRefHead,
+  RCast,
+  RCellGet,
+  RCellNew,
+  RCloTag,
+  RClosureEq,
+  RCoalAtomStr,
+  RCoalStr,
+  RCoerce,
+  RDeadNever,
+  RDeadNullTest,
+  REnvDrop,
+  REnvGet,
+  REqHelp,
+  RFieldNull,
+  RFnId,
+  RGetField,
+  RGlobalGet,
+  RHandPick,
+  RHolderPick,
+  RHoleOptBox,
+  RIdentityEq,
+  RInitProgress,
+  RIsStaged,
+  RJoinNull,
+  RListCat,
+  RListClear,
+  RListCopy,
+  RListEmpty,
+  RListEmptyArms,
+  RListEq,
+  RListFitIs,
+  RListGet,
+  RListIsAcross,
+  RListLen,
+  RListNew,
+  RListNewDefault,
+  RListPop,
+  RListPush,
+  RListPushMany,
+  RListSlice,
+  RListStage,
+  RLitArms,
+  RMaFoldInit,
+  RMakeClo,
+  RMakeList,
+  RMakeRec,
+  RMapClear,
+  RMapDelete,
+  RMapEq,
+  RMapFilter,
+  RMapFilterHead,
+  RMapGet,
+  RMapGetOr,
+  RMapHas,
+  RMapIter,
+  RMapNew,
+  RMapOp,
+  RMapSet,
+  RMemAccess,
+  RMemOp,
+  RNicheRead,
+  RNulNicheEq,
+  RNulNoneBox,
+  RNulTest,
+  RNullOf,
+  RNumCast,
+  RNumIntr,
+  RNumIs,
+  RNumUnionBin,
+  RNumUnionConvert,
+  RNumWiden,
+  ROptRead,
+  RPrimOp,
+  RPrint,
+  RPrintOpen,
+  RRawOp,
+  RRecCopyPure,
+  RRecDown,
+  RRecMember,
+  RRecordFitIs,
+  RRecover,
+  RRel,
+  RResultPick,
+  RRetNull,
+  RRetag,
+  RSharedFieldSet,
+  RSharedRead,
+  RSimd,
+  RSpread,
+  RStage,
+  RStashSet,
+  RStrOp,
+  RStrToAtom,
+  RStrToAtomStaged,
+  RStructEq,
+  RTagClo,
+  RTagIs,
+  RTagOf,
+  RTagStash,
+  RTest,
+  RToBox,
+  RTruncSat,
+  RUnionConcreteEq,
+  RUnionEq,
+  RUnionNumCrossEq,
+  RUnionStage,
+  RUnionStagedEq,
+  RUnionVariantEq,
+  RVariantChain,
+  RVariantDiscrim,
+  Rhs,
+  SEffect,
+  SLet,
+  irPushBodies,
+} from "./ir"
+
+// How a site refers to a function: a direct call, a closure made of it, a tagged set member's
+// closure taken, a call through a closure value (callee unknown), or a host import's call.
+export type CgKind = "direct" | "closure" | "setMember" | "indirect" | "host"
+
+// Sites as parallel lists: the other end's function (`-1` for an unknown callee, the import
+// index for a host call), the site's node in the caller, its source node, and its kind.
+export type CgSites = {
+  csFn: i32[],
+  csNode: i32[],
+  csAt: i32[],
+  csKind: CgKind[],
+  csComplete: boolean,
+}
+export type CgFlag = { cfOn: boolean, cfComplete: boolean }
+// The strongly connected components of the direct-call graph over claimed functions, callees'
+// components first, and each function's component index.
+export type CgComps = {
+  ccComps: i32[][],
+  ccOf: {[i32]: i32},
+  ccComplete: boolean,
+}
+
+// Callers in claim order, each one's edge range, name and node count; then the edges.
+let cgCaller: i32[] = []
+let cgIndexOf: {[i32]: i32} = Map()
+let cgLo: i32[] = []
+let cgHi: i32[] = []
+let cgName: string[] = []
+let cgSize: i32[] = []
+let cgCallee: i32[] = []
+let cgNode: i32[] = []
+let cgAt: i32[] = []
+let cgKind: CgKind[] = []
+let cgLegacy = 0
+let cgSealed = false
+// A record after the seal: the graph then answers incomplete rather than stale.
+let cgLate = false
+// Built once on the first query after the seal: callee to edge indices, and the components.
+let cgRev: {[i32]: i32[]} = Map()
+let cgRevBuilt = false
+let cgComps: i32[][] = []
+let cgCompOf: {[i32]: i32} = Map()
+let cgCompsBuilt = false
+
+// Empties the graph for a new compile.
+export function cgReset() {
+  cgCaller = []
+  cgIndexOf = Map()
+  cgLo = []
+  cgHi = []
+  cgName = []
+  cgSize = []
+  cgCallee = []
+  cgNode = []
+  cgAt = []
+  cgKind = []
+  cgLegacy = 0
+  cgSealed = false
+  cgLate = false
+  cgRev = Map()
+  cgRevBuilt = false
+  cgComps = []
+  cgCompOf = Map()
+  cgCompsBuilt = false
+  return 0
+}
+
+function edge(fe: i32, at: i32, k: CgKind) {
+  cgCallee.push(fe)
+  cgNode.push(at)
+  cgAt.push(-1)
+  cgKind.push(k)
+}
+
+// The sites right-hand side `r` at node `at` makes; every other kind names no function.
+function rhsEdges(r: Rhs, at: i32) {
+  match r {
+    RCall => edge(r.caCallee, at, "direct")
+    RCallRef => edge(-1, at, "indirect")
+    RCallHost => edge(r.chImport, at, "host")
+    RMakeClo => edge(r.mcFn, at, "closure")
+    RTagClo => {
+      for fe in r.tcFes { edge(fe, at, "setMember") }
+    }
+    RAfterEffects |
+      RArmUnbox |
+      RAsTail |
+      RAsUnion |
+      RAsgParked |
+      RAsgUnwiden |
+      RAtomEq |
+      RAtomSole |
+      RAtomStr |
+      RAtomWide |
+      RAtomic |
+      RBoxField |
+      RBoxNarrow |
+      RBundlePick |
+      RCallRefHead |
+      RCast |
+      RCellGet |
+      RCellNew |
+      RCloTag |
+      RClosureEq |
+      RCoalAtomStr |
+      RCoalStr |
+      RCoerce |
+      RDeadNever |
+      RDeadNullTest |
+      REnvDrop |
+      REnvGet |
+      REqHelp |
+      RFieldNull |
+      RFnId |
+      RGetField |
+      RGlobalGet |
+      RHandPick |
+      RHolderPick |
+      RHoleOptBox |
+      RIdentityEq |
+      RInitProgress |
+      RIsStaged |
+      RJoinNull |
+      RListCat |
+      RListClear |
+      RListCopy |
+      RListEmpty |
+      RListEmptyArms |
+      RListEq |
+      RListFitIs |
+      RListGet |
+      RListIsAcross |
+      RListLen |
+      RListNew |
+      RListNewDefault |
+      RListPop |
+      RListPush |
+      RListPushMany |
+      RListSlice |
+      RListStage |
+      RLitArms |
+      RMaFoldInit |
+      RMakeList |
+      RMakeRec |
+      RMapClear |
+      RMapDelete |
+      RMapEq |
+      RMapFilter |
+      RMapFilterHead |
+      RMapGet |
+      RMapGetOr |
+      RMapHas |
+      RMapIter |
+      RMapNew |
+      RMapOp |
+      RMapSet |
+      RMemAccess |
+      RMemOp |
+      RNicheRead |
+      RNulNicheEq |
+      RNulNoneBox |
+      RNulTest |
+      RNullOf |
+      RNumCast |
+      RNumIntr |
+      RNumIs |
+      RNumUnionBin |
+      RNumUnionConvert |
+      RNumWiden |
+      ROptRead |
+      RPrimOp |
+      RPrint |
+      RPrintOpen |
+      RRawOp |
+      RRecCopyPure |
+      RRecDown |
+      RRecMember |
+      RRecordFitIs |
+      RRecover |
+      RRel |
+      RResultPick |
+      RRetNull |
+      RRetag |
+      RSharedFieldSet |
+      RSharedRead |
+      RSimd |
+      RSpread |
+      RStage |
+      RStashSet |
+      RStrOp |
+      RStrToAtom |
+      RStrToAtomStaged |
+      RStructEq |
+      RTagIs |
+      RTagOf |
+      RTagStash |
+      RTest |
+      RToBox |
+      RTruncSat |
+      RUnionConcreteEq |
+      RUnionEq |
+      RUnionNumCrossEq |
+      RUnionStage |
+      RUnionStagedEq |
+      RUnionVariantEq |
+      RVariantChain |
+      RVariantDiscrim => {}
+  }
+}
+
+// Records claimed function `f` at position `fe` (`-1` for a start body) with its sites, in walk
+// order. A position recorded twice keeps both ranges' sites under its first entry's name.
+export function cgRecord(fe: i32, f: IrFn) {
+  if cgSealed { cgLate = true }
+  const lo = cgCallee.length
+  const bodies: i32[][] = [f.irBody]
+  const pos: i32[] = [0]
+  while bodies.length > 0 {
+    const top = bodies.length - 1
+    const b = bodies[top]
+    const k = pos[top]
+    if k >= b.length {
+      bodies.pop()
+      pos.pop()
+      continue
+    }
+    pos[top] = k + 1
+    const id = b[k]
+    if id >= 0 && id < f.irNodes.length {
+      const n = f.irNodes[id]
+      if n is SLet { rhsEdges(n.lRhs, id) }
+      if n is SEffect { rhsEdges(n.efRhs, id) }
+      irPushBodies(f, id, bodies, pos)
+    }
+  }
+  let e = lo
+  while e < cgCallee.length {
+    const id = cgNode[e]
+    cgAt[e] = if id < f.irNodeAt.length { f.irNodeAt[id] } else { -1 }
+    e = e + 1
+  }
+  if !cgIndexOf.has(fe) { cgIndexOf[fe] = cgCaller.length }
+  cgCaller.push(fe)
+  cgLo.push(lo)
+  cgHi.push(cgCallee.length)
+  cgName.push(f.irName)
+  cgSize.push(f.irNodes.length)
+  cgRevBuilt = false
+  cgCompsBuilt = false
+  return 0
+}
+
+// Notes a unit legacy lowered: its sites are unknown, so no answer is complete.
+export function cgNoteLegacy() {
+  cgLegacy = cgLegacy + 1
+  return 0
+}
+
+// Closes the claim pass: no function records after this.
+export function cgSeal() {
+  cgSealed = true
+  return 0
+}
+
+function complete(): boolean { return cgSealed && !cgLate && cgLegacy == 0 }
+
+// Whether function `fe` has a record, so its sites are known.
+export function cgHasIr(fe: i32): boolean { return cgIndexOf.has(fe) }
+
+// Function `fe`'s node count as recorded, `-1` when it has no IR.
+export function cgSizeOf(fe: i32): i32 {
+  const i = cgIndexOf[fe] ?? -1
+  return if i >= 0 { cgSize[i] } else { -1 }
+}
+
+// The name of function `fe`'s first record, else `""`.
+export function cgNameOf(fe: i32): string {
+  const i = cgIndexOf[fe] ?? -1
+  return if i >= 0 { cgName[i] } else { "" }
+}
+
+// The sites function `fe` makes, over every record of it; complete when `fe` has IR.
+export function cgCallees(fe: i32): CgSites {
+  const out: CgSites = {
+    csFn: [],
+    csNode: [],
+    csAt: [],
+    csKind: [],
+    csComplete: cgHasIr(fe),
+  }
+  let c = 0
+  while c < cgCaller.length {
+    if cgCaller[c] == fe {
+      let e = cgLo[c]
+      while e < cgHi[c] {
+        out.csFn.push(cgCallee[e])
+        out.csNode.push(cgNode[e])
+        out.csAt.push(cgAt[e])
+        out.csKind.push(cgKind[e])
+        e = e + 1
+      }
+    }
+    c = c + 1
+  }
+  return out
+}
+
+// The caller of edge `e`: the caller whose range holds it.
+function callerOfEdge(e: i32): i32 {
+  let lo = 0
+  let hi = cgCaller.length - 1
+  while lo < hi {
+    const mid = (lo + hi + 1) / 2
+    if cgLo[mid] <= e { lo = mid } else { hi = mid - 1 }
+  }
+  return cgCaller[lo]
+}
+
+function buildRev() {
+  if cgRevBuilt { return 0 }
+  cgRev = Map()
+  let e = 0
+  while e < cgCallee.length {
+    const fe = cgCallee[e]
+    if cgKind[e] != "indirect" && cgKind[e] != "host" {
+      const l = cgRev[fe] ?? []
+      l.push(e)
+      cgRev[fe] = l
+    }
+    e = e + 1
+  }
+  cgRevBuilt = true
+  return 0
+}
+
+// The sites that refer to function `fe` (direct calls, closures made, set members taken), each
+// with its caller in `csFn`. Complete only after the seal with every unit claimed.
+export function cgCallers(fe: i32): CgSites {
+  buildRev()
+  const out: CgSites = {
+    csFn: [],
+    csNode: [],
+    csAt: [],
+    csKind: [],
+    csComplete: complete(),
+  }
+  for e in cgRev[fe] ?? [] {
+    out.csFn.push(callerOfEdge(e))
+    out.csNode.push(cgNode[e])
+    out.csAt.push(cgAt[e])
+    out.csKind.push(cgKind[e])
+  }
+  return out
+}
+
+// Whether `fe` is made into a closure or taken as a set member anywhere: then an indirect call
+// may reach it.
+export function cgEscapes(fe: i32): CgFlag {
+  buildRev()
+  let on = false
+  for e in cgRev[fe] ?? [] {
+    if cgKind[e] == "closure" || cgKind[e] == "setMember" { on = true }
+  }
+  return { cfOn: on, cfComplete: complete() }
+}
+
+// Tarjan's components over the direct edges between recorded functions, iteratively; a
+// component is emitted after every component it calls into, so the list runs callees first.
+function buildComps() {
+  if cgCompsBuilt { return 0 }
+  cgComps = []
+  cgCompOf = Map()
+  const index: {[i32]: i32} = Map()
+  const low: {[i32]: i32} = Map()
+  const onStack: {[i32]: boolean} = Map()
+  const stack: i32[] = []
+  let next = 0
+  for root in cgCaller {
+    if root < 0 || index.has(root) { continue }
+    // The walk: each frame's function and the next of its callees to visit.
+    const fnAt: i32[] = [root]
+    const edgeAt: i32[] = [0]
+    index[root] = next
+    low[root] = next
+    next = next + 1
+    stack.push(root)
+    onStack[root] = true
+    while fnAt.length > 0 {
+      const top = fnAt.length - 1
+      const v = fnAt[top]
+      const outs = cgCallees(v)
+      const k = edgeAt[top]
+      if k < outs.csFn.length {
+        edgeAt[top] = k + 1
+        const w = outs.csFn[k]
+        if outs.csKind[k] != "direct" || w < 0 || !cgHasIr(w) { continue }
+        if !index.has(w) {
+          index[w] = next
+          low[w] = next
+          next = next + 1
+          stack.push(w)
+          onStack[w] = true
+          fnAt.push(w)
+          edgeAt.push(0)
+        } else if onStack[w] ?? false {
+          low[v] = if (index[w] ?? 0) < (low[v] ?? 0) { index[w] ?? 0 } else { low[v] ?? 0 }
+        }
+        continue
+      }
+      fnAt.pop()
+      edgeAt.pop()
+      if fnAt.length > 0 {
+        const u = fnAt[fnAt.length - 1]
+        low[u] = if (low[v] ?? 0) < (low[u] ?? 0) { low[v] ?? 0 } else { low[u] ?? 0 }
+      }
+      if (low[v] ?? 0) == (index[v] ?? 0) {
+        const comp: i32[] = []
+        let w = -1
+        while w != v {
+          w = stack.pop() ?? v
+          onStack[w] = false
+          cgCompOf[w] = cgComps.length
+          comp.push(w)
+        }
+        cgComps.push(comp)
+      }
+    }
+  }
+  cgCompsBuilt = true
+  return 0
+}
+
+// The direct-call components, callees' first, and each recorded function's component.
+export function cgComponents(): CgComps {
+  buildComps()
+  return { ccComps: cgComps, ccOf: cgCompOf, ccComplete: complete() }
+}
+
+// The functions recorded, in claim order, the start bodies as `-1`.
+export function cgFunctions(): i32[] { return cgCaller }

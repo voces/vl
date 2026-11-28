@@ -16,6 +16,7 @@ if (GATED && !ENABLED) {
 }
 
 const FIXTURE = `${ROOT}/tests/ir-analyses/defuse.vl`;
+const CG_FIXTURE = `${ROOT}/tests/ir-analyses/callgraph.vl`;
 
 // `count  row`: how many variables bank that row, then the row.
 const WANT_DU = [
@@ -47,11 +48,49 @@ const WANT_DU = [
   "1 du __lambda_0 param def 0:param,35:assign use 35",
 ];
 
+// The call graph of `callgraph.vl`, banked at the seal: each site as `cg <caller> <kind> <callee>
+// <line>`, each function's callers count and whether it escapes (its node count is checked to be
+// positive, not pinned), the components callees first, and completeness.
+const WANT_CG = [
+  "1 callers leaf 2 local",
+  "1 cg mid direct leaf 2",
+  "1 callers mid 1 local",
+  "1 cg top direct mid 3",
+  "1 cg top direct leaf 3",
+  "1 callers top 1 local",
+  "1 cg isEven direct isOdd 6",
+  "1 callers isEven 2 local",
+  "1 cg isOdd direct isEven 10",
+  "1 callers isOdd 1 local",
+  // `twice` calls its parameter twice; the call site is specialised to `twice$cb0`, which calls
+  // `sq` directly, so `twice` itself has no caller.
+  "2 cg twice indirect ? 12",
+  "1 callers twice 0 local",
+  // `sq` is called twice by `twice$cb0` and made into a closure by the top level: it escapes.
+  "1 callers sq 3 escapes",
+  "2 cg twice$cb0 direct sq 12",
+  "1 callers twice$cb0 1 local",
+  "1 cg @start direct top 14",
+  "1 cg @start direct isEven 15",
+  "1 cg @start closure sq 16",
+  "1 cg @start direct twice$cb0 16",
+  "1 scc 0 leaf",
+  "1 scc 1 mid",
+  "1 scc 2 top",
+  "1 scc 3 isEven,isOdd",
+  "1 scc 4 twice",
+  "1 scc 5 sq",
+  "1 scc 6 twice$cb0",
+  "1 cg complete true",
+];
+
 const run = async (
   graph: string,
+  fixture = FIXTURE,
+  extra: Record<string, string> = {},
 ): Promise<{ code: number; err: string; out: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: ["run", FIXTURE, "--compiler", COMPILER],
+    args: ["run", fixture, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
     env: nativeEnv({
@@ -59,6 +98,8 @@ const run = async (
       VL_NO_CACHE: "1",
       VL_IR_SHADOW: "1",
       VL_IR_GRAPH: graph,
+      VL_TEST_CLAIM_REFUSAL: "",
+      ...extra,
     }),
   }).output();
   return {
@@ -66,6 +107,31 @@ const run = async (
     out: new TextDecoder().decode(stdout),
     err: new TextDecoder().decode(stderr),
   };
+};
+
+// The call-graph rows of a run, as `n row`, each `size <k>` checked positive and dropped.
+const cgRows = (err: string): string[] =>
+  err.split("\n").flatMap((l) => {
+    const m = /^\[ir\] .*: (\d+)\t((?:cg|callers|scc) .*)$/.exec(l);
+    if (!m) return [];
+    const sz = / size (-?\d+)$/.exec(m[2]);
+    if (sz && Number(sz[1]) <= 0) {
+      throw new Error(`want a positive node count, got: ${m[2]}`);
+    }
+    return [`${m[1]} ${sz ? m[2].slice(0, sz.index) : m[2]}`];
+  });
+
+const sameRows = (what: string, got: string[], want: string[]) => {
+  if (JSON.stringify([...got].sort()) === JSON.stringify([...want].sort())) {
+    return;
+  }
+  const missing = want.filter((w) => !got.includes(w));
+  const extra = got.filter((g) => !want.includes(g));
+  throw new Error(
+    `want the hand-computed ${what} rows\nmissing:\n  ${
+      missing.join("\n  ")
+    }\nextra:\n  ${extra.join("\n  ")}`,
+  );
 };
 
 // The `du` rows of a run's `[ir] <path>: <n>\t<row>` lines, as `n row`.
@@ -113,5 +179,19 @@ Deno.test({
         `want no du row with $VL_IR_GRAPH unset, got:\n  ${got.join("\n  ")}`,
       );
     }
+  },
+});
+
+Deno.test({
+  name: "ir-analyses: call-graph rows match the hand-computed answers",
+  ignore: !ENABLED,
+  fn: async () => {
+    const r = await run("1", CG_FIXTURE);
+    if (r.code !== 0 || r.out !== "12\ntrue\n81\n") {
+      throw new Error(
+        `want rc 0 and 12 true 81, got rc ${r.code}: ${r.out}${r.err}`,
+      );
+    }
+    sameRows("call-graph", cgRows(r.err), WANT_CG);
   },
 });
