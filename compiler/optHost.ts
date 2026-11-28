@@ -105,9 +105,14 @@ const validationError = (bytes: Uint8Array): string | undefined => {
 /**
  * Runs `wasm-opt <argv>` on `bytes` through binaryen.js, with the CLI's semantics: every
  * global flag applies to the whole run, plain passes queue, and each `-O<n>` runs the queue,
- * then the default pipeline at its own level. Throws on a flag the compiler never emits.
+ * then the default pipeline at its own level. A `--then` argument ends one run and starts
+ * another on its output, as the native host does. Throws on a flag the compiler never emits.
  */
 export const runWasmOpt = (b: Binaryen, bytes: Uint8Array, argv: readonly string[]): Uint8Array => {
+  const then = argv.indexOf("--then");
+  if (then >= 0) {
+    return runWasmOpt(b, runWasmOpt(b, bytes, argv.slice(0, then)), argv.slice(then + 1));
+  }
   type Step = { pass: string; arg?: string } | { level: [number, number] };
   const steps: Step[] = [];
   let debugInfo = false;

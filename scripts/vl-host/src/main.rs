@@ -7542,12 +7542,23 @@ const BINARYEN_CORES_DEFAULT: usize = 4;
 ///
 /// `map`, when given, is the module's source map: binaryen reads it and writes it back
 /// rewritten for the module it writes (`--source-map`, D3561).
+///
+/// Runs `wasm-opt` over `path` in place, once per `--then`-separated stage of `passes`, each
+/// stage on the one before's output; with no `--then` it is one run.
 fn optimize_in_place<S: AsRef<str>>(
     path: &str,
     flag: &str,
     passes: &[S],
     map: Option<&str>,
 ) -> Result<()> {
+    let all: Vec<&str> = passes.iter().map(AsRef::as_ref).collect();
+    for stage in all.split(|p| *p == "--then") {
+        optimize_stage(path, flag, stage, map)?;
+    }
+    Ok(())
+}
+
+fn optimize_stage(path: &str, flag: &str, passes: &[&str], map: Option<&str>) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
         // The unoptimized module is already on disk at this point. Leaving it there
         // would re-open the hole from the other side: a caller that ignores the exit
@@ -7565,7 +7576,7 @@ fn optimize_in_place<S: AsRef<str>>(
         );
     };
     let mut argv: Vec<&str> = vec![path];
-    argv.extend(passes.iter().map(AsRef::as_ref));
+    argv.extend_from_slice(passes);
     argv.extend_from_slice(BINARYEN_FEATURES);
     if let Some(m) = map {
         argv.extend_from_slice(&["--input-source-map", m, "--output-source-map", m]);
