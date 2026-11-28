@@ -74,6 +74,7 @@ import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx, tyIsValueUnionBox } from "./check_ty_rep"
 import {
   fnTagLateRows,
+  fnTagValueArms,
   ftParamListCopied,
   ftWithinInstancedFn,
 } from "./check_fn_tag"
@@ -11731,6 +11732,12 @@ export function elabRun() {
         elabHoleCallAt(a, identDeclOf(an.callFn))
       }
     }
+    for a in fnTagValueArms(c) {
+      const an = nodeAt(a)
+      if an is Call && elabCallInstFrom(a, -1) < 0 {
+        elabHoleCallAt(a, identDeclOf(an.callFn))
+      }
+    }
     if elabCallInstFrom(c, -1) < 0 { elabHoleCallAt(c, elabSoleCalleeHole(c)) }
     if elabCallInstFrom(c, -1) < 0 && rowed.get(c) == null {
       elabSolvedHoleCallAt(c)
@@ -18285,8 +18292,13 @@ export function elabNodeTyAt(ix: i32, fnIx: i32): i32 {
   }
   const ct = elabCalleeTyOf(ix)
   if ct >= 0 { return ct }
-  const k = if fnIx >= 0 { elabKeyAt(fnIx) } else { elabKeyAtPos(monoArgInstFe.get(ix) ?? -1) }
-  const t = if k >= 0 { elabNodeTy(ix, k) } else if k == -1 { elabRootCallTy(ix) } else { -1 }
+  // An open argument the frame's own key does not type reads at the instance its callee reaches,
+  // at module scope and in a function alike (D17679).
+  const fk = if fnIx >= 0 { elabKeyAt(fnIx) } else { -1 }
+  const ak = elabKeyAtPos(monoArgInstFe.get(ix) ?? -1)
+  const k = if fk != -1 { fk } else { ak }
+  const t0 = if k >= 0 { elabNodeTy(ix, k) } else if k == -1 { elabRootCallTy(ix) } else { -1 }
+  const t = if t0 < 0 && k != ak && ak >= 0 { elabNodeTy(ix, ak) } else { t0 }
   if t >= 0 || ix < 0 || ix >= P.nodes.length { return t }
   const n = nodeAt(ix)
   if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
@@ -23840,8 +23852,10 @@ export function elabHeldFnLitStamps() {
       if ht >= 0 { repStampNode(g, elabStampKeepsTagged(g, ht)) }
       else if ut >= 0 { repStampNode(g, elabStampKeepsTagged(g, ut)) }
     } else if top && k == 1 && !(nested.get(g) ?? false) {
-      // A field whose function an instance calls keeps the rep its calls key.
-      const ut = if elabTreeFnsInstanced(nodeRepTyIxOf(g), []) { -1 } else { elabUncalledFnsClosed(nodeRepTyIxOf(g), []) }
+      // A function's returned literal every call delivers to one closed type is built at it (D17744);
+      // else a field whose function an instance calls keeps the rep its calls key.
+      const rd = elabRetLitDstTy(g)
+      const ut = if rd >= 0 { rd } else if elabTreeFnsInstanced(nodeRepTyIxOf(g), []) { -1 } else { elabUncalledFnsClosed(nodeRepTyIxOf(g), []) }
       if ut >= 0 { elabStampLitTree(g, ut) }
     }
     g = g + 1
@@ -23912,6 +23926,23 @@ function elabStampKeepsTagged(x: i32, t: i32): i32 {
     }
   }
   return if moved { mkObjTy(tt.objFieldNames, tys) } else { t }
+}
+
+// The closed type at literal `x`'s path every call of the function returning it is delivered to
+// (`elabRetDstTy`), or -1 where `x` is no returned value or a call's destination is open.
+function elabRetLitDstTy(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const fr = elabEnclosingFn(x)
+  if fr < 0 { return -1 }
+  const path: string[] = []
+  if !elabRetPathOf(x, fr, path) { return -1 }
+  const dt = elabTyAtPath(elabRetDstTy(fr), path)
+  if dt < 0 || dt >= T.tys.length || tyHasTyVar(dt) { return -1 }
+  // Only a destination of the literal's own kind: a `| null` join's arm is another value's type.
+  const n = nodeAt(x)
+  const same = n is ObjLit && tyAt(dt) is TyObj
+    || n is ArrayLit && tyAt(dt) is TyArray
+  return if same { dt } else { -1 }
 }
 
 // The list and record literals literal `x` holds directly, as elements or field values; `keys`
