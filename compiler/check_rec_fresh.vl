@@ -41,6 +41,9 @@ import {
   recSolePinArg,
 } from "./check_record_origins"
 import { identBoundFnDeclOf } from "./check_scopes"
+import { fnDeclParent } from "./check_decl_scan"
+import { nodeTyIxOf } from "./check_node_tys"
+import { tySame } from "./check_types"
 import { identDeclOf } from "./symbols"
 import { a20RetWalk } from "./check_nj_gate"
 import { rcwCallSites } from "./check_record_writes"
@@ -343,8 +346,9 @@ function recAsgStoresLit(a: i32): boolean {
   return false
 }
 
-// The declaration of the function the call `x` names, when it declares no result and no type
-// parameter, so its result is built where the call delivers it; -1 otherwise.
+// The declaration of the function the call `x` names, when it declares no result and has one
+// instance (no type parameter, or one call site), so its result is built where the call delivers
+// it; -1 otherwise.
 export function recInferredFnOf(x: i32): i32 {
   const c = nodeAt(x)
   if c is Call && c.callFn >= 0 {
@@ -356,11 +360,69 @@ export function recInferredFnOf(x: i32): i32 {
         const f = nodeAt(fd)
         if f is FuncDecl {
           if f.fnRet < 0 && f.fnTyParams.length == 0 { return fd }
+          if f.fnRet < 0 && recGenericOneInstance(fd) { return fd }
         }
       }
     }
   }
   return -1
+}
+
+// Whether generic `fd` has one instance: every call is enumerable, sits in no function each
+// instance or call re-checks, and passes arguments of one type each and takes one result type.
+// Read by the record solve, once every call is typed.
+export function recGenericOneInstance(fd: i32): boolean {
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length == 0 { return false }
+  const c0 = sites[0] / 2
+  for s in sites {
+    if s % 2 != 0 || recWithinInstancedFn(s / 2) { return false }
+    const c = s / 2
+    if c != c0 && !recSameInstanceCall(c0, c) { return false }
+  }
+  return true
+}
+
+// Whether calls `a` and `b` of one function take one result type and argument types alike.
+function recSameInstanceCall(a: i32, b: i32): boolean {
+  const ca = nodeAt(a)
+  const cb = nodeAt(b)
+  if (
+    !(ca is Call)
+    || !(cb is Call)
+    || ca.callArgs.length != cb.callArgs.length
+  ) {
+    return false
+  }
+  if !tySame(nodeTyIxOf(a), nodeTyIxOf(b)) { return false }
+  let i = 0
+  while i < ca.callArgs.length {
+    if !tySame(nodeTyIxOf(ca.callArgs[i]), nodeTyIxOf(cb.callArgs[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Whether `x` sits inside a generic function, or one with an un-annotated parameter, whose body
+// each instance re-checks.
+function recWithinInstancedFn(x: i32): boolean {
+  const seen: i32[] = []
+  let f = fnDeclParent[x] ?? -1
+  while f >= 0 && f < P.nodes.length && !i32ListHas(seen, f) {
+    seen.push(f)
+    const fd = nodeAt(f)
+    if fd is FuncDecl {
+      if fd.fnTyParams.length > 0 { return true }
+      for p in fd.fnParams {
+        const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+        if pn is Param && pn.parType < 0 { return true }
+      }
+    }
+    f = fnDeclParent[f] ?? -1
+  }
+  return false
 }
 
 // The fresh binding or function that `x` reads, through un-annotated aliases, a call or an
