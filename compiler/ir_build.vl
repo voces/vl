@@ -1,3 +1,4 @@
+import { fnTagValueArmFn, ftValueConvertAt } from "./check_fn_tag"
 import {
   irInlineCalls,
   irInlineReset,
@@ -30,7 +31,7 @@ import {
   nulUnitPlaceReadAt,
   spreadGroupConverts,
 } from "./wasmEmit"
-import { lmForUnionArms } from "./emit_classify"
+import { identLetOfRead, lmForUnionArms } from "./emit_classify"
 import { mapUnionForKnownArm, mapUnionForPairTy } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import { litAtomMark, litAtomRollback } from "./emit_lit_atoms"
@@ -59,9 +60,17 @@ import {
   lbPlanAdd,
   lbPlanDrop,
 } from "./emit_bytes"
-import { cloLiftLetFe, cloLifted } from "./emit_lift"
+import {
+  cloLiftLetFe,
+  cloLiftWriteCapAt,
+  cloLiftWriteCount,
+  cloLiftWriteSlot,
+  cloLifted,
+} from "./ir_lift"
+import { cloLiftCalleeOf, cloLiftFramePos } from "./ir_lift_scan"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import {
+  cloNameSigKeyTy,
   sigKeyRetIsVoid,
   sigKeyRetKind,
   sigKeyRetSlot,
@@ -146,6 +155,7 @@ import {
   blockTailIsDead,
   callIsNever,
   condLitTrue,
+  fnNameIsLambda,
   hasNamedArgs,
   i32ToStr,
   isBareBlockIf,
@@ -372,7 +382,6 @@ import {
   clearPlanOf,
   clearRecvIsList,
   cloCellReaches,
-  cloLiftCalleeOf,
   closureValueCoreWhy,
   closureValueIsGeneric,
   closureValueWhy,
@@ -643,7 +652,11 @@ import {
   structRowFnSlotLayout,
   structRowOfRecordTy,
 } from "./emit_shape_rows"
-import { mvValTyIxAt, unMemRefArrArmSlot } from "./emit_map_value_slots"
+import {
+  mvValTyIxAt,
+  tyRefArrElemOf,
+  unMemRefArrArmSlot,
+} from "./emit_map_value_slots"
 import {
   BinNulTest,
   NULL_OWN_ATOM,
@@ -821,6 +834,7 @@ import {
   catWidenSideOfBin,
   cbIdentNamesFn,
   cloSigKeyExt,
+  coalLeftNarrowedFromUnion,
   declaredIndexAt,
   envSlotShift,
   exprIsClosure,
@@ -887,6 +901,7 @@ import {
   structIndexOfExpr,
   structIndexOfObjCtx,
   topLambdaRecordFe,
+  tyOpenHeldAsIds,
   unionBoxStoreTyOf,
 } from "./emit_classify"
 import {
@@ -908,9 +923,6 @@ import {
   LBK_UNION,
   VKind,
   cboxReadsCell,
-  cloLiftWriteCapAt,
-  cloLiftWriteCount,
-  cloLiftWriteSlot,
   coalLinkChainOf,
   emitSoftAt,
   emitSoftFail,
@@ -1000,6 +1012,7 @@ import {
 import { isVoidTy, tyMapValOf } from "./tyquery"
 import { forInBindTy } from "./check_leaf_steps"
 import {
+  fnHasUnannotatedParam,
   listGetIdxReReadable,
   optChainStagesRecv,
   optRecvReReadable,
@@ -3749,10 +3762,8 @@ export function exprTyOf(ix: i32): i32 {
   if n is Call {
     if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return t }
     const d = identDeclOf(n.callFn)
-    const pos = fnIndexOfNode(n.callFn)
-    if d < 0 || pos < 0 || pos >= fnStmts.length || !callTargetIs(pos, d) {
-      return t
-    }
+    const pos = directCallPosOf(n, d)
+    if d < 0 || pos < 0 || pos >= fnStmts.length { return t }
     const fn = nodeAt(fnStmts[pos])
     // Where legacy picks a member of the bundle record after the call, the value is that member.
     if t < 0 || irTyOpen(t) {
@@ -3778,6 +3789,19 @@ export function exprTyOf(ix: i32): i32 {
   return if t < 0 { capturedClosureTy(ix) } else { t }
 }
 
+// The `fnStmts` slot call `c` of a name declared at `d` calls directly, as `callRhs` routes it: a
+// binding of a lambda-lifted function or of a capture-free lambda calls that lambda, a named
+// function itself; -1 for a call through a closure.
+function directCallPosOf(c: Call, d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const bound = nodeAt(d) is LetDecl || nodeAt(d) is Param
+  const lf = if bound { cloLiftCalleeOf(c.callFn, ibFnIx) } else { -1 }
+  if lf >= 0 { return lf }
+  if bound { return constLambdaCallee(c.callFn, d) }
+  const pos = fnIndexOfNode(c.callFn)
+  return if pos >= 0 && pos < fnStmts.length && callTargetIs(pos, d) { pos } else { -1 }
+}
+
 // The element rep index `n`'s list holds closed (`closedListElemTy`), or -1.
 function openIndexRep(n: Index): i32 {
   const et = closedListElemTy(exprTyOf(n.idxArr))
@@ -3789,7 +3813,10 @@ function closedListElemTy(lt: i32): i32 {
   if lt < 0 { return -1 }
   const ln = repNodeAt(repNodeOfTy(lt))
   if !(ln is RList) { return -1 }
-  const et = repTyOf(ln.rlsElem)
+  // A rep's type is whichever type first reached its key (a tagged set's open function at the
+  // `i32` leaf), so a list type's own closed element answers before it (D17768).
+  const own = tyRefArrElemOf(lt)
+  const et = if own >= 0 && !irTyOpen(own) { own } else { repTyOf(ln.rlsElem) }
   return if et >= 0 && !irTyOpen(et) { et } else { -1 }
 }
 
@@ -3918,7 +3945,14 @@ function storedVarOf(ix: i32, t: i32): i32 {
     }
     return if u8sSame(irSlotValtype(ib.irVars[v].vSlot), refRepValtype(vr)) { v } else { -1 }
   }
+  // A scalar the binding's initializer closed (`openLocalInitTy`) is read as that scalar.
+  if repNodeAt(vr) is RPrim && !repNodeOfTyIsValue(t) { return v }
   return if letBindKindIs(d, "closure") { v } else { -1 }
+}
+
+// Whether open type `t`'s own rep holds a value, which a read at it would build.
+function repNodeOfTyIsValue(t: i32): boolean {
+  return t >= 0 && valueRep(repNodeOfTy(t), t)
 }
 
 // Whether legacy's cell for `let` `d` claims a rep of kind `k` (`letBindRep`).
@@ -4132,6 +4166,48 @@ export type SpField = { spFieldRow: i32, spFieldIx: i32 }
 export type SpReturned = { spReturned: i32 }
 export type SpElem = { spElemOf: i32 }
 export type StorePlace = SpBinding | SpField | SpReturned | SpElem
+// The result of `fnStmts` slot `spResultOf`: a place a held-open answer is asked of, with no
+// storage of its own (`placeHeldOpen`).
+export type SpResult = { spResultOf: i32 }
+export type HeldPlace = StorePlace | SpResult
+
+// Whether open type `ty` has an open part not held at rep `rep` in place `p`: every reader of a
+// binding's held-open answer asks it here, so the place's own decision can answer it.
+function placeHeldOpen(_p: HeldPlace, ty: i32, rep: i32): boolean {
+  return irTyHeldOpen(ty, rep)
+}
+
+// The binding place of local or module binding `d` (`global`) in the frame being built.
+function bindPlace(d: i32, global: boolean): StorePlace {
+  const p: SpBinding = {
+    spBinding: d,
+    spFrame: if global { -1 } else { ibFnIx },
+    spGlobal: global,
+  }
+  return p
+}
+
+// The binding place parameter `p` of function `fnIx` is.
+function paramPlace(p: i32, fnIx: i32): StorePlace {
+  const pl: SpBinding = { spBinding: p, spFrame: fnIx, spGlobal: false }
+  return pl
+}
+
+// The binding place capture `name` of `fe` reads: its declaration in the frame that owns it.
+function capPlace(fe: i32, name: string): StorePlace {
+  const p: SpBinding = {
+    spBinding: parentBindingOf(fe, name),
+    spFrame: parentBindingFrameArenaOf(fe, name),
+    spGlobal: false,
+  }
+  return p
+}
+
+// Whether every open part of type `ty` is held at rep `rep` in place `p`, the answer a variable
+// that place declares notes for the verifier (`irVarPlaceHeld`).
+function placeHeldIds(_p: StorePlace, ty: i32, rep: i32): boolean {
+  return tyOpenHeldAsIds(ty, rep, [])
+}
 
 // The storage of place `p`, the one answer every reader of a place's rep takes.
 function storageOf(p: StorePlace): Storage {
@@ -4182,12 +4258,15 @@ function buildStorage(p: SpBinding, s: Storage): Storage {
   const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(n is LetDecl) || n.letInit < 0 { return s }
   // A `let` holds every value written to it, so only a missing answer is its build's.
-  if s.stMiss == "" && (n.letKw != "const" || !irTyHeldOpen(s.stTy, s.stRep)) {
+  if (
+    s.stMiss == ""
+    && (n.letKw != "const" || !placeHeldOpen(p, s.stTy, s.stRep))
+  ) {
     return s
   }
   const ty = initBuildTy(n.letInit, p.spFrame)
   const rep = repNodeOfTy(ty)
-  if ty < 0 || isVoidTy(ty) || !valueRep(rep, ty) || irTyHeldOpen(ty, rep) {
+  if ty < 0 || isVoidTy(ty) || !valueRep(rep, ty) || placeHeldOpen(p, ty, rep) {
     return s
   }
   return storageAt(rep, ty, -2)
@@ -4236,6 +4315,28 @@ function openListLocalTy(d: i32): i32 {
   return if valueRep(repNodeOfTy(t), t) { t } else { -1 }
 }
 
+// The type un-annotated local `d`, typed `t` in this frame, is held at: where `t` is open and `d` is
+// a call the IR makes directly through a binding, the type that call is built at; else `t`.
+function openLocalInitTy(d: i32, t: i32): i32 {
+  if t >= 0 && !irTyOpen(t) { return t }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return t }
+  // Only a call through a binding the IR calls directly: a named function's call already reads.
+  const c = unwrapParen(dn.letInit)
+  const cn = if c >= 0 { nodeAt(c) } else { null }
+  const cf = if cn is Call && cn.callFn >= 0 && nodeAt(cn.callFn) is Ident { identDeclOf(cn.callFn) } else { -1 }
+  const bound = cf >= 0
+    && cf < P.nodes.length
+    && (nodeAt(cf) is LetDecl || nodeAt(cf) is Param)
+  // A copy of a read the IR holds closed (`storedVarOf`) is that read's type too.
+  const copy = cn is Ident && storedVarOf(c, t) >= 0
+  if !copy && (!bound || !(cn is Call) || directCallPosOf(cn, cf) < 0) {
+    return t
+  }
+  const it = exprTyOf(c)
+  return if it >= 0 && !irTyOpen(it) { it } else { t }
+}
+
 // The storage of local binding `d` in the frame being built: a returned record's holder, a map
 // held at its slot's map, a binding legacy's cell holds as an atom, or one held at a row its read
 // type does not record; else its type's own rep (row -2).
@@ -4246,7 +4347,7 @@ function localStorage(d: i32): Storage {
   const ht = holderHeldRecordTy(d, ibFnIx)
   const hm = if ht < 0 && (elabHasRetRecords() || bundleAnyNoted()) { holderMemberTy(d, ibFnIx) } else { -1 }
   const rb = if ht < 0 && hm < 0 { letRecBuiltTy(d, ibFnIx) } else { -1 }
-  const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else if rb >= 0 { rb } else { heldTy(scopeTyAt(d, ibFnIx)) }
+  const ty0 = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else if rb >= 0 { rb } else { heldTy(openLocalInitTy(d, scopeTyAt(d, ibFnIx))) }
   // A map local is held as legacy stores it, its mv slot off its initializer (`mapSlotHeldTy`).
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   const ty1 = if dn is LetDecl { mapSlotHeldTy(ty0, dn.letInit) } else { ty0 }
@@ -4259,7 +4360,7 @@ function localStorage(d: i32): Storage {
     if ol >= 0 { return storageAt(repNodeOfTy(ol), ol, -1) }
     return storageMiss("local rep " + repWhat(rep))
   }
-  if irTyHeldOpen(ty, rep) && !irFnBuiltOnce(ib) {
+  if placeHeldOpen(bindPlace(d, false), ty, rep) && !irFnBuiltOnce(ib) {
     return storageMiss("open local type")
   }
   // Legacy's cell for a binding it holds as the atom is the id, whatever its type's own rep.
@@ -4645,7 +4746,7 @@ function fragLoopVar(d: i32, ix: i32, rep: i32): i32 {
   const known = ibDeclVar[d] ?? -1
   if known >= 0 { return known }
   const ty = heldTy(exprTyOf(ix))
-  if irTyHeldOpen(ty, rep) && !irFnBuiltOnce(ib) {
+  if placeHeldOpen(bindPlace(d, false), ty, rep) && !irFnBuiltOnce(ib) {
     irBMiss("open local type")
     return -1
   }
@@ -4685,6 +4786,10 @@ function declVarAt(d: i32, rep: i32, ty: i32): i32 {
   }
   const v = irVarNew(ib, rep, ty, "local", slot)
   ibDeclVar[d] = v
+  if v >= 0 && irTyOpen(ty) {
+    const p: SpBinding = { spBinding: d, spFrame: ibFnIx, spGlobal: false }
+    ib.irVarPlaceHeld[v] = placeHeldIds(p, ty, rep)
+  }
   return v
 }
 
@@ -4799,7 +4904,7 @@ function ifValueJoin(b: i32[], n0: IfStmt, ix0: i32, rep: i32, ty0: i32): Opnd {
     conds.push(c)
     outs.push(t)
     thens.push(thenB)
-    const nx = if dk == 1 || valueIfLitTrue(n.ifCond) { -1 } else { spineLinkOf(n.ifElse, rep, ty, ty0) }
+    const nx = if dk == 1 || valueIfLitTrue(n.ifCond) { -1 } else { spineLinkOf(n.ifElse) }
     if nx < 0 { break }
     const nn = nodeAt(nx)
     if !(nn is IfStmt) { break }
@@ -4845,9 +4950,8 @@ function ifValueJoin(b: i32[], n0: IfStmt, ix0: i32, rep: i32, ty0: i32): Opnd {
 }
 
 // The `if` an `else` (`elseIx`) holds as its whole value, where it is built as this join builds a
-// link: no prelude or hook of its own, and either the head is built at a destination's type (`ty0`
-// not -1), which every link takes, or the link is a scalar or atom join at `rep` and `ty`; else -1.
-function spineLinkOf(elseIx: i32, rep: i32, ty: i32, ty0: i32): i32 {
+// link: no prelude or hook of its own; else -1. Its arms are built at this join's rep.
+function spineLinkOf(elseIx: i32): i32 {
   if elseIx < 0 || elseIx >= P.nodes.length { return -1 }
   const en = nodeAt(elseIx)
   let tv = elseIx
@@ -4863,13 +4967,7 @@ function spineLinkOf(elseIx: i32, rep: i32, ty: i32, ty0: i32): i32 {
     return -1
   }
   if ifIntMatchWhy(tv, ibFnIx) != "" { return -1 }
-  if ty0 >= 0 { return tv }
-  if exprUnion(tv, ibFnIx) { return -1 }
-  const arm = ifJoinPlanOf(tv, ibFnIx).ijArm
-  if arm != "scalar" && arm != "atom" || exprRepOf(tv) != rep { return -1 }
-  if byteHeld(rowlessRecordTy(tv, nodeTyAt(tv, ibFnIx), rep)) != ty {
-    return -1
-  }
+  // A link is an arm of this join, so it is built at the join's rep, whatever that rep's kind.
   return tv
 }
 
@@ -6050,7 +6148,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !exprIsLitAtom(ix, ibFnIx)
     const member = gh >= 0
       && repNodeOfTy(gh) == cellRep
-      && irTyHeldOpen(heldTy(exprTyOf(ix)), rep)
+      && placeHeldOpen(bindPlace(d, true), heldTy(exprTyOf(ix)), rep)
     const declined = cellRep != rep
       && !narrowed
       && !stored
@@ -6134,7 +6232,12 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       const held = irBLetTempTy(b, gr, ix, cellRep, lt)
       // Retagged to a rep whose type is open, the value would have no type; the member is read as
       // the cell holds it. A cell read at its storage row is read there, as legacy reads it.
-      if lt != bt && irTyHeldOpen(heldTy(exprTyOf(ix)), rep) { return held }
+      if (
+        lt != bt
+        && placeHeldOpen(bindPlace(d, true), heldTy(exprTyOf(ix)), rep)
+      ) {
+        return held
+      }
       if lt != lt0 { return held }
       return repTemp(b, { rgV: held }, ix, rep)
     }
@@ -6243,12 +6346,12 @@ function globalReadTy(d: i32, ix: i32, rep: i32): i32 {
   ) {
     return repTyOf(rep)
   }
-  if !irTyHeldOpen(ty, rep) { return ty }
+  if !placeHeldOpen(bindPlace(d, true), ty, rep) { return ty }
   const ht = globalHolderTy(d)
   if ht >= 0 && repNodeOfTy(ht) == rep { return ht }
   // A read whose own type has no rep is at its cell's (`irBOpenLocalReadRep`), whose type it takes.
   const rt = repTyOf(rep)
-  return if exprRepOf(ix) < 0 && rt >= 0 && !irTyHeldOpen(rt, rep) { rt } else { ty }
+  return if exprRepOf(ix) < 0 && rt >= 0 && !placeHeldOpen(bindPlace(d, true), rt, rep) { rt } else { ty }
 }
 
 // The record type of the struct row global `d`'s cell holds at rep `cellRep`, where the read at
@@ -6270,7 +6373,11 @@ function globalCellRowReadTy(ix: i32, d: i32, cellRep: i32, rep: i32): i32 {
   // A row type open only where its rep closes it (a function field of an un-annotated function,
   // held as its id) is read at, as legacy's `global.get` reads that row.
   const rt = rowStoredTy(row)
-  if rt < 0 || irTyHeldOpen(rt, cellRep) || repNodeOfTy(rt) != cellRep {
+  if (
+    rt < 0
+    || placeHeldOpen(bindPlace(d, true), rt, cellRep)
+    || repNodeOfTy(rt) != cellRep
+  ) {
     return -1
   }
   const t = nodeTyAt(ix, ibFnIx)
@@ -6335,7 +6442,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if unbox && ak < 0 { return irBMiss("capture unbox") }
   const narrowed = unbox || na == "plain" || na == "held"
   // A closure capture read where its type leaves a closure part open, or fills one, is the same
-  // closure struct, retagged.
+  // closure struct, read at the capture's own rep: one value, one layout (D17755).
   const holed = cr != rep
     && !narrowed
     && holeRetagNoted(cr, rep, true)
@@ -6394,8 +6501,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     const own = irBLetTempTy(b, ev, ix, cr, cty)
     // Retagged to a rep whose type is open, the value would have no type; a holder's member is
     // read as its capture holds it, as a global holder's is.
-    if holed && irTyHeldOpen(heldTy(exprTyOf(ix)), rep) { return own }
-    if holed { return repTemp(b, { rgV: own }, ix, rep) }
+    if holed { return own }
     if boxed { return irBLetTemp(b, { sgV: own }, ix, rep) }
     if unbox { return captureUnbox(b, own, ix, rep, ak) }
     return captureRecover(b, own, ix, rep, na)
@@ -6409,8 +6515,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if v < 0 || ib.irVars[v].vRep != held { return irBMiss("capture binding") }
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
-  if holed && irTyHeldOpen(heldTy(exprTyOf(ix)), rep) { return o }
-  if holed { return repTemp(b, { rgV: o }, ix, rep) }
+  if holed { return o }
   if boxed { return irBLetTemp(b, { sgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
@@ -6618,7 +6723,13 @@ function capRepFor(fe: i32, name: string, readRep: i32): i32 {
 function capRepAtTy(fe: i32, name: string, ty: i32): i32 {
   if ty < 0 { return -1 }
   const r = repNodeOfTy(ty)
-  if isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r) { return -1 }
+  if (
+    isVoidTy(ty)
+    || !valueRep(r, ty)
+    || placeHeldOpen(capPlace(fe, name), ty, r)
+  ) {
+    return -1
+  }
   const vt: u8[] = []
   const prev = wTarget(vt)
   fbValtype(captureValKind(fe, name), captureValStructIdx(fe, name))
@@ -6640,7 +6751,7 @@ function capRepAtTy(fe: i32, name: string, ty: i32): i32 {
 // bundle parameter of hole type, held as its record).
 function capReadTy(fe: i32, name: string, ix: i32, cr: i32): i32 {
   const ty = heldTy(exprTyOf(ix))
-  if !irTyHeldOpen(ty, cr) { return ty }
+  if !placeHeldOpen(capPlace(fe, name), ty, cr) { return ty }
   const cty = capTyOf(fe, name)
   return if cty >= 0 && repNodeOfTy(cty) == cr { cty } else { ty }
 }
@@ -7279,6 +7390,9 @@ function globalStorage(d: i32): Storage {
   ) {
     return storageAt(ar, repTyOf(ar), -1)
   }
+  // Past that, legacy's atom cell holds a single string literal: the atom node, typed at that
+  // literal, as a local's cell is.
+  if at >= 0 { return storageAt(repAtomNode(), heldTy(at), -1) }
   // A list global whose storage row is another list, a wider record's, is held at that row.
   const bt = if ht < 0 && repNodeAt(r) is RList { heldTy(letBindTy(d, -1)) } else { -1 }
   const br = if bt >= 0 { globalTyRep(bt) } else { -1 }
@@ -7420,7 +7534,7 @@ function globalStoreTy(d: i32, rep: i32): i32 {
     && rowlessRecord(ht, repNodeOfTy(ht))
     && repNodeAt(rep) is RRecord
     && repNodeOfTy(ht) != rep
-    && !irTyHeldOpen(ct, rep)
+    && !placeHeldOpen(bindPlace(d, true), ct, rep)
   ) {
     return ct
   }
@@ -7469,7 +7583,8 @@ function resultTy(pos: i32, ann: i32, d: i32): i32 {
 function resultFrameTy(pos: i32, t: i32): i32 {
   if t < 0 || isVoidTy(t) { return t }
   const r = repNodeOfTy(t)
-  if valueRep(r, t) && !irTyHeldOpen(t, r) { return t }
+  const rp: SpResult = { spResultOf: pos }
+  if valueRep(r, t) && !placeHeldOpen(rp, t, r) { return t }
   // A hole function's value is the closure legacy returns, whatever its signature (D17579).
   if valueRep(r, t) && holeCloTy(t) { return t }
   const dt = resultDescTy(pos)
@@ -7694,6 +7809,10 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if nullBindingCall(ix) { return { dnAt: ix, dnPad: callEndsNever(ix) } }
   // A binding holding a lambda-lifted function is a direct call of it; any other, a closure's.
   const lf = if d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) { cloLiftCalleeOf(c.callFn, ibFnIx) } else { -1 }
+  // A `const` bound to a lambda that captures nothing holds no other function: its call is the
+  // direct call of that lambda, at its signature's rep.
+  const kl = if lf < 0 && d >= 0 { constLambdaCallee(c.callFn, d) } else { -1 }
+  if kl >= 0 { return directCallAt(b, c, ix, kl) }
   if lf < 0 && d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) {
     if bundleParamOfRead(c.callFn, ibFnIx) >= 0 {
       return bundleCallRhs(b, c, ix)
@@ -7716,6 +7835,41 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("binding call misfit")
   }
   return directCallAt(b, c, ix, pos)
+}
+
+// The lambda `constLambdaPos` names for callee read `cf`, declared at `d`: the binding this
+// instance reads (`identLetOfRead`), a generic instance's own clone, else `d` itself.
+function constLambdaCallee(cf: i32, d: i32): i32 {
+  const dl = identLetOfRead(cf, ibFnIx)
+  return constLambdaPos(if dl >= 0 { dl } else { d })
+}
+
+// The `fnStmts` slot of the lambda `const` declaration `d` binds, when the slot holds that very
+// lambda (not an instance's clone of it), which captures nothing, declares no type parameter and
+// annotates every parameter; -1 for any other binding.
+function constLambdaPos(d: i32): i32 {
+  const ld = nodeAt(d)
+  if !(ld is LetDecl) || ld.letKw != "const" || ld.letInit < 0 { return -1 }
+  const init = unwrapParen(ld.letInit)
+  if init < 0 || !(nodeAt(init) is FuncDecl) { return -1 }
+  const fd = nodeAt(init)
+  if (
+    !(fd is FuncDecl)
+    || fd.fnTyParams.length > 0
+    || !fnNameIsLambda(fd.fnName)
+  ) {
+    return -1
+  }
+  const pos = fnStmtsPosOf(init)
+  if (
+    pos < 0
+    || fnStmts[pos] != init
+    || captureCountOf(pos) > 0
+    || fnHasUnannotatedParam(pos)
+  ) {
+    return -1
+  }
+  return pos
 }
 
 // Call `c` with named arguments, as `emitCallCoreUserFn` sends it to `emitDirectCall`: a name
@@ -15615,6 +15769,9 @@ function mapGetOrFused(n: BinExpr, ix: i32): boolean {
   if lhsIx < 0 { return false }
   const rd = nodeAt(lhsIx)
   if !(rd is Index) { return false }
+  // A read the checker narrowed out of a union value (`is`, `!= null`) holds a smaller union than
+  // the slot the fused read writes; it is the IR's own `??` over the narrowed read.
+  if coalLeftNarrowedFromUnion(n, ibFnIx) { return false }
   const rk = coalResultKindOf(ix, ibFnIx)
   const arm = mapGetOrArmOf(rd.idxArr, n.binRight, ibFnIx, rk)
   if (
@@ -15826,6 +15983,7 @@ function mapGetAt(
   // record member no plan reads is the box read whole, then narrowed; legacy writes it through
   // `emitExpr`, which banks the read's row whatever row a caller expecting the box passed.
   let narrowTo = -1
+  let nicheTo = -1
   // A literal-set member a union box holds as its string is unboxed to that string
   // (`emitUnionUnboxTail` at the string kind), read as the string it is.
   let strMember = false
@@ -15852,6 +16010,19 @@ function mapGetAt(
       "nonNull" => false
     }
     if box < 0 && !repOk && !whole && repNodeAt(rep) is RRecord {
+      narrowTo = rep
+    }
+    // One narrowed to a literal set's `K | null` its box holds: the box read whole, then its
+    // niche read (`RNicheRead`), as a narrowed place prints (`nulLitNicheRead`).
+    if (
+      box < 0
+      && !repOk
+      && !whole
+      && na == "none"
+      && atomNullable(rep)
+      && heldAsBox(m.rmVal)
+    ) {
+      nicheTo = rep
       narrowTo = rep
     }
     if (box >= 0 || !repOk) && narrowTo < 0 {
@@ -15901,6 +16072,14 @@ function mapGetAt(
     }
     const wv = irBLetTempTy(b, wr, ix, m.rmVal, repTyOf(m.rmVal))
     if ibMiss != "" { return wv }
+    if nicheTo >= 0 {
+      return irBLetTemp(
+        b,
+        { nrV: wv, nrAt: ix, nrKind: NICHE_NUL_LIT, nrRow: false },
+        ix,
+        nicheTo,
+      )
+    }
     return irBLetTemp(
       b,
       { bnV: wv, bnAt: ix, bnRep: narrowTo, bnAtom: -1, bnCon: -1 },
@@ -16421,7 +16600,10 @@ function tagDispatchAt(b: i32[], ix: i32, read: boolean): Opnd {
   if kind == null { return irBMiss("tag dispatch result") }
   const rep = repNodeOfTy(ty)
   if read && primRepOf(ix) != rep { return irBMiss("tag dispatch result rep") }
-  const f = tagCallee(b, c.callFn)
+  const f0 = tagCallee(b, c.callFn)
+  if ibMiss != "" { return f0 }
+  // A callee stored as a nullable id is called non-null, as the checker narrowed it.
+  const f = if tagIdBoxRep(irBOpRep(f0)) { readNonNull(b, f0, c.callFn) } else { f0 }
   if ibMiss != "" { return f }
   // A callee its place stores as a closure (D17665) is called through that closure, at the
   // signature every member of the set shares.
@@ -16503,6 +16685,22 @@ function tagCallee(b: i32[], f: i32): Opnd {
       )
     }
   }
+  // A local the dispatch's set stores as its member id, or as a nullable id's box, is read as
+  // stored, its build, whatever rep the call plans for its read.
+  if n is Ident && identReadArmOf(n, f, ibFnIx, false) == "local" {
+    const d = identDeclOf(f)
+    const v = if d >= 0 && nodeAt(d) is LetDecl { readDeclVar(d) } else { -1 }
+    const vr = if v >= 0 { ib.irVars[v].vRep } else { -1 }
+    if (
+      v >= 0
+      && (repPrim(vr) == "i32" || tagIdBoxRep(vr))
+      && vr != exprRepOf(f)
+    ) {
+      ib.irReadVar[f] = v
+      const o: Opnd = { ov: v }
+      return o
+    }
+  }
   if n is Ident && identReadArmOf(n, f, ibFnIx, false) == "capture" {
     const fe = fnStmtsPosOf(ibFnIx)
     const cr = capRepOf(fe, n.identName)
@@ -16551,7 +16749,9 @@ function tagDispatchVoid(b: i32[], ix: i32): i32 {
   for a in arms {
     if lambdaArmUnbuilt(a) { return skip("tag dispatch lambda arm") }
   }
-  const f = tagCallee(b, c.callFn)
+  const f0 = tagCallee(b, c.callFn)
+  if ibMiss != "" { return 0 }
+  const f = if tagIdBoxRep(irBOpRep(f0)) { readNonNull(b, f0, c.callFn) } else { f0 }
   if ibMiss != "" { return 0 }
   if repPrim(irBOpRep(f)) != "i32" { return skip("tag dispatch callee rep") }
   irBNode(b, { efRhs: { tgsV: f } }, -1, ibNoValue, ix)
@@ -17423,7 +17623,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     // it stands, else the callee's own rep. A top-level `const` lambda's call is its record as a
     // named function's is (`topLambdaRecordFe`).
     const tfe = topLambdaRecordFe(unwrapParen(n.callFn))
-    if tfe >= 0 && !(rhs is RCall) {
+    if tfe >= 0 {
       const lt = lambdaRecordTy(tfe)
       const lr = repNodeOfTy(lt)
       const pk = if lr != rep && repNodeAt(rep) is RClosure { bundleResultPickOf(ix, tfe, ibFnIx) } else { noPick() }
@@ -19967,7 +20167,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is TypeDecl || n is UnionDecl { return 0 }
   if n is LetDecl {
     // A `const` bound to a lambda-lifted function holds no value: every use calls it directly.
-    if n.letInit >= 0 && cloLiftLetFe(fnStmtsPosOf(ibFnIx), ix) >= 0 {
+    if n.letInit >= 0 && cloLiftLetFe(cloLiftFramePos(ibFnIx), ix) >= 0 {
       return 0
     }
     const fresh = (ibDeclVar[ix] ?? -1) < 0
@@ -20896,7 +21096,13 @@ function bundleHeldTy(p: i32, ty: i32): i32 {
 function paramFrameTy(p: i32, fnIx: i32): i32 {
   const ty = paramHeldTy(p, fnIx)
   const r = repNodeOfTy(ty)
-  if !isVoidTy(ty) && valueRep(r, ty) && !irTyHeldOpen(ty, r) { return ty }
+  if (
+    !isVoidTy(ty)
+    && valueRep(r, ty)
+    && !placeHeldOpen(paramPlace(p, fnIx), ty, r)
+  ) {
+    return ty
+  }
   const pt = parTyNode(p)
   if (
     vtKindOfParam(p) == "closure"
@@ -20929,13 +21135,17 @@ function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
     const p = fn.fnParams[i]
     const ty = paramFrameTy(p, fnIx)
     const r = repNodeOfTy(ty)
-    if !whole && (isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r)) {
+    const pp = paramPlace(p, fnIx)
+    if (
+      !whole
+      && (isVoidTy(ty) || !valueRep(r, ty) || placeHeldOpen(pp, ty, r))
+    ) {
       i = i + 1
       continue
     }
     if isVoidTy(ty) || !valueRep(r, ty) { return "parameter rep " + repWhat(r) }
     // An unannotated parameter's type is open until a call instances it.
-    if irTyHeldOpen(ty, r) { return "open parameter type" }
+    if placeHeldOpen(pp, ty, r) { return "open parameter type" }
     const v = irVarNew(ib, r, ty, "param", shift + i)
     ibDeclVar[p] = v
     ib.irParams.push(v)
@@ -21129,7 +21339,9 @@ function buildThunk(fe: i32): string {
   for p in fn.fnParams {
     const pt = paramFrameTy(p, d)
     const r = repNodeOfTy(pt)
-    if irTyHeldOpen(pt, r) { return "thunk open parameter type" }
+    if placeHeldOpen(paramPlace(p, d), pt, r) {
+      return "thunk open parameter type"
+    }
     const v = irVarNew(ib, r, pt, "param", 1 + ps.length)
     ib.irParams.push(v)
     ps.push(r)
@@ -21388,6 +21600,12 @@ function nulNonePayload(b: i32[], x: i32, rep: i32): Opnd {
     if ibMiss != "" { return l }
     return nulNonePayload(b, co.binRight, rep)
   }
+  // A null-unit place read carries its read, written for its effect where the null is read.
+  if nulUnitPlaceReadAt(u, ibFnIx) {
+    const rd = exprAtPre(b, u, false, "")
+    if ibMiss != "" { return rd }
+    return repTemp(b, { nuAt: u, nuOwn: NULL_OWN_NONE, nuRead: [rd] }, u, rep)
+  }
   if asgYieldsNullLit(u) && n is BinExpr {
     assign(b, n, u)
     if ibMiss != "" { return irBMiss(ibMiss) }
@@ -21563,7 +21781,7 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     && iu < P.nodes.length
     && nodeAt(iu) is ArrayLit
   const iv = if atBind { nodeAt(iu) } else { null }
-  const d = if iv is ArrayLit { arrayLit(
+  const d0 = if iv is ArrayLit { arrayLit(
     b,
     iv,
     iu,
@@ -21571,9 +21789,12 @@ function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
     arrLitListBuild(iu, ibFnIx),
     heldTy(letBindTy(gst, -1)),
   ) } else { deliver(b, init, rep, -1) }
-  if ibMiss != "" { return d }
+  if ibMiss != "" { return d0 }
   // A record on the cell's own struct heap, or a declared subtype's, is stored retagged; so is a
   // list or closure the body lanes' retags take, unless legacy already stores it as it stands.
+  const dr0 = irBOpRep(d0)
+  const rc = if dr0 != rep { recFreshConvert(b, d0, rep, init) } else { null }
+  const d = if rc != null { rc } else { d0 }
   const dr = irBOpRep(d)
   const v = if dr != rep
     && (recRetagNoted(dr, rep, init)
@@ -21983,7 +22204,86 @@ export function irConvert(
     }
     return irBLetTempTy(b, w, at, dst, repTyOf(dst))
   }
+  const rc = recFreshConvert(b, v, dst, at)
+  if rc != null { return rc }
   return irBMiss("convert " + repWhat(irBOpRep(v)) + " -> " + repWhat(dst))
+}
+
+// Fresh record `v` (a call of a function returning only record literals, at `at`) taken to plain
+// record rep `dst` field by field: each field read and converted to the destination's, built at
+// `dst`'s row as a literal is (D17777). Null where `v` is no such value or a field converts by none.
+function recFreshConvert(b: i32[], v: Opnd, dst: i32, at: i32): Opnd | null {
+  const src = irBOpRep(v)
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if !(a is RRecord) || !(d is RRecord) || a.rrVariant || d.rrVariant {
+    return null
+  }
+  if a.rrFields.length != d.rrFields.length { return null }
+  const u = unwrapParen(at)
+  const cn = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if !(cn is Call) || !ftValueConvertAt(u) { return null }
+  const si = recStorageRow(dst)
+  const ri = recStorageRow(src)
+  const sty = repTyOf(src)
+  const dty = repTyOf(dst)
+  if (
+    si < 0
+    || si >= sFieldStart.length
+    || sFieldCount[si] != d.rrFields.length
+  ) {
+    return null
+  }
+  // The record is read once per field, so a temp is held in a local first.
+  const held = v is OVar
+    && v.ov >= 0
+    && v.ov < ib.irVars.length
+    && ib.irVars[v.ov].vKind != "temp"
+  const t = if held { -1 } else { irVarNew(ib, src, sty, "local", -1) }
+  if t >= 0 { irBNode(b, { asDst: t, asSrc: v }, -1, ibNoValue, at) }
+  const o: Opnd = if t >= 0 { { ov: t } } else { v }
+  const fields: Opnd[] = []
+  for _k in d.rrFields { fields.push({ ov: -1 }) }
+  const layout: i32[] = []
+  let fi = 0
+  while fi < sFieldCount[si] {
+    const nm = sFieldNames[sFieldStart[si] + fi]
+    const dk = repRecordKidOf(dst, dty, nm)
+    const sk = repRecordKidOf(src, sty, nm)
+    if dk < 0 || sk < 0 || dk >= d.rrFields.length || sk >= a.rrFields.length {
+      return null
+    }
+    const fr = a.rrFields[sk]
+    // The source is a call, so its field is read by its own row's layout, with no member node.
+    const sfi = if ri >= 0 && ri < sHeapIdx.length { sFieldIndex(ri, nm) } else { -1 }
+    if sfi < 0 || sFieldIsUnionBox(ri, sfi) { return null }
+    const g: Rhs = { rmbV: o, rmbHeap: sHeapIdx[ri], rmbField: sfi }
+    // The field is typed at the call's own field type, which carries the set its ids name.
+    const ft0 = recFieldTyOf(heldTy(nodeTyAt(u, ibFnIx)), nm)
+    const fv = irBLetTempTy(
+      b,
+      g,
+      at,
+      fr,
+      if ft0 >= 0 { ft0 } else { repTyOf(fr) },
+    )
+    const cv = if fr == d.rrFields[dk] { fv } else { irConvert(b, fv, d.rrFields[dk], repTyOf(d.rrFields[dk]), at) }
+    if ibMiss != "" { return cv }
+    fields[dk] = cv
+    layout.push(dk)
+    fi = fi + 1
+  }
+  const r: Rhs = {
+    mrFields: fields,
+    mrLayout: layout,
+    mrSrc: [],
+    mrAt: at,
+    mrRow: si,
+    mrVariant: false,
+    mrBuiltRow: si,
+    mrSet: false,
+  }
+  return irBLetTempTy(b, r, at, dst, dty)
 }
 
 // `irConvert` into a cell, which stores one rep: a value taken as it stands at another rep is
@@ -22084,10 +22384,23 @@ function tagCrossTakes(v: Opnd, dst: i32, at: i32): boolean {
   }
   if k == TAG_CROSS_TO_CLO || k == TAG_CROSS_BOX_TO_CLO {
     for d in ms {
-      if closureValueCoreWhy(fnStmtsPosOf(d)) != "" { return false }
+      const fe = tagCloMemberFe(d, at, dst)
+      if fe >= 0 && closureValueCoreWhy(fe) != "" { return false }
     }
   }
   return true
+}
+
+// The slot member `d`'s closure is taken at where node `at` converts a set's id into closure
+// rep `dst`: the instance the value arm at `at` pins, else its own slot when that is at `dst`'s
+// signature; -1 when neither, which the lowering refuses rather than take another instance.
+function tagCloMemberFe(d: i32, at: i32, dst: i32): i32 {
+  const u = if at >= 0 { unwrapParen(at) } else { -1 }
+  const id = if u >= 0 { fnTagValueArmFn(u, d, repTyOf(dst)) } else { -1 }
+  if id >= 0 { return fnStmtsPosOf(id) }
+  const own = fnStmtsPosOf(d)
+  const want = cloNameSigKeyTy(repTyOf(dst))
+  return if want == "" || cloSigKeyExt(own) == want { own } else { -1 }
 }
 
 // Whether the value at node `at` is typed nullable there.
@@ -22131,7 +22444,9 @@ function tagCrossInto(b: i32[], v: Opnd, dst: i32, dstTy: i32, at: i32): Opnd {
   if t >= 0 { irBNode(b, { asDst: t, asSrc: v }, -1, ibNoValue, at) }
   const o: Opnd = if t >= 0 { { ov: t } } else { v }
   const toClo = k == TAG_CROSS_TO_CLO || k == TAG_CROSS_BOX_TO_CLO
-  const r: Rhs = if toClo { { tcV: o, tcFns: ms, tcTy: st, tcBox: nul } } else { { ckV: o, ckFns: ms, ckTy: st, ckNul: nul, ckBox: k != TAG_CROSS_TO_ID } }
+  const fes: i32[] = []
+  for d in ms { fes.push(tagCloMemberFe(d, at, dst)) }
+  const r: Rhs = if toClo { { tcV: o, tcFns: ms, tcFes: fes, tcTy: st, tcBox: nul } } else { { ckV: o, ckFns: ms, ckTy: st, ckNul: nul, ckBox: k != TAG_CROSS_TO_ID } }
   return irBLetTempTy(
     b,
     r,

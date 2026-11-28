@@ -42,6 +42,7 @@ import {
   fnTagCallSplitOf,
   fnTagMembers,
   fnTagSetIsTagged,
+  fnTagSetOfMembers,
   fnTagSetOfTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
@@ -97,6 +98,7 @@ import {
   braceNameStmts,
   callTyArgsOf,
   declNameTokOf,
+  fnNameIsLambda,
   i32ToStr,
   nodeAt,
   nodeChildren,
@@ -215,6 +217,7 @@ import {
 } from "./check_core_state"
 import { cstrOwnerTop, cvNow, noteArgCstr } from "./check_cstr_rows"
 import {
+  cstrOwnerStack,
   curFnDeclIx,
   inferQuiet,
   lamCheckDepth,
@@ -614,6 +617,7 @@ import {
   cwBindingWrittenValues,
   cwBoundInitOf,
   cwCalleeDeclOf,
+  cwDeclFnWrites,
   cwElemCallbackRecv,
   cwFnValueDeclOf,
   cwFnValueTargets,
@@ -6941,7 +6945,29 @@ export function holeSetCallRet(ix: i32, callFn: i32, pts: i32[]): i32 {
   if cx < 0 || cx >= P.nodes.length { return -1 }
   // A `?.` callee over a receiver that may be null is typed with the null, its function the set's.
   const ct = if nodeAt(cx) is OptMember { nonNullTy(nodeTyIxOf(cx)) } else { nodeTyIxOf(cx) }
-  return holeSetCallRetOf(ix, fnTagSetOfTy(ct), pts, true)
+  const cs = fnTagSetOfTy(ct)
+  const bs = holeSetBindingWider(cx, cs)
+  return holeSetCallRetOf(ix, if bs >= 0 { bs } else { cs }, pts, true)
+}
+
+// The set of the un-annotated binding read `cx` reads, where a write re-points it at a function
+// outside the read's set `cs`: those members and every function its writes store, since the call
+// may reach any of them though the read is typed at fewer; -1 otherwise.
+function holeSetBindingWider(cx: i32, cs: i32): i32 {
+  if cs < 0 || cx < 0 || !(nodeAt(cx) is Ident) { return -1 }
+  const d = identDeclOf(cx)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 { return -1 }
+  const ms: i32[] = fnTagMembers(cs).slice(0, fnTagMembers(cs).length)
+  let grew = false
+  for w in cwDeclFnWrites(d) {
+    if w < 0 { return -1 }
+    if !i32ListHas(ms, w) {
+      ms.push(w)
+      grew = true
+    }
+  }
+  return if grew { fnTagSetOfMembers(ms) } else { -1 }
 }
 
 // `holeSetCallRet` for set `s`, noting the call for `fnTagDecide` only when `note`: an
@@ -6961,8 +6987,9 @@ export function holeSetCallRetOf(
     if pt < 0 { return -1 }
     // A set of functions is a closed argument, its members instanced at their own calls.
     if tyHasTyVar(pt) && fnTagSetOfTy(pt) < 0 {
-      // An open function type is a hole function handed on, which no instance closes.
-      if curFnDeclIx < 0 || tyAt(pt) is TyFunc { return -1 }
+      // An open function type is a hole function handed on, which no instance closes; so is any
+      // open argument where nothing enclosing the call has an instance (D15777).
+      if !holeSetCursorInstanced() || tyAt(pt) is TyFunc { return -1 }
       open = true
     }
     const w = widenLitTy(pt)
@@ -7023,6 +7050,32 @@ export function holeSetCallRetOf(
     if early.length > 0 { holeSetEarlyCallNote(ix, s, ft, r, early) }
   }
   return r
+}
+
+// Whether a function enclosing the checker's cursor may have instances: it takes a type parameter
+// or an un-annotated parameter. A lambda body the cursor cannot see past answers yes.
+function holeSetCursorInstanced(): boolean {
+  if curFnDeclIx < 0 { return false }
+  const cn = nodeAt(curFnDeclIx)
+  const lam = cn is FuncDecl && fnNameIsLambda(cn.fnName)
+  if lamCheckDepth > (if lam { 1 } else { 0 }) { return true }
+  if holeSetDeclInstanced(curFnDeclIx) { return true }
+  for d in cstrOwnerStack {
+    if holeSetDeclInstanced(d) { return true }
+  }
+  return false
+}
+
+function holeSetDeclInstanced(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) { return false }
+  if fd.fnTyParams.length > 0 { return true }
+  for p in fd.fnParams {
+    const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+    if pn is Param && pn.parType < 0 { return true }
+  }
+  return false
 }
 
 // Whether call `ix` calls a `let` directly.

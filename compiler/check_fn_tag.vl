@@ -1,3 +1,5 @@
+import { nodePos } from "./fmt_util"
+import { quietEnterFlat, quietLeaveFlat } from "./check_cursor"
 import {
   setBindHandedSets,
   setBindParamDeclsOf,
@@ -24,6 +26,8 @@ import {
   recAsgFnWidenedTy,
   recEnclosingFn,
   recFnFieldsWiden,
+  recRetLitOfSoleCall,
+  recRetSharedLeaf,
   recordBoxTy,
   repStampHeldRead,
 } from "./check_fit_rules"
@@ -73,6 +77,7 @@ import {
   callTyArgsOf,
   declHasExportKw,
   fnNameIsLambda,
+  i32ToStr,
   loopVarLoop,
   mkCallN,
   mkIdent,
@@ -125,6 +130,7 @@ import { rcwInferredRetTy } from "./check_rcw"
 import {
   ftArgIsParam,
   ftParamOnlyCalledAt,
+  holeLamRetAt,
   holeSetFitsRetAt,
   holeSetRetDiffersAt,
   holeSetSplitsAt,
@@ -134,6 +140,7 @@ import {
 import { fieldStorageEq } from "./check_ty_relate"
 import {
   T,
+  TY_I32,
   TY_VOID,
   TyArray,
   TyErr,
@@ -147,10 +154,12 @@ import {
   TyUnion,
   TyVar,
   mkArrayTy,
+  mkFuncTy,
   tyAt,
   tyElemOf,
   tyElemOpen,
   tyFieldTyOf,
+  tyHasHole,
   tyKeyOf,
   tySame,
   tyValOf,
@@ -214,14 +223,18 @@ import {
 } from "./check_arrow_facts"
 import { fnDeclParent } from "./check_decl_scan"
 import { identDeclOf, identFromDecl } from "./symbols"
+import { recFnValueLeaves } from "./check_type_shape"
 import { identFnDeclOf } from "./check_scopes"
 import { declIsExportedFn } from "./check_exp_obs"
 import {
   elabListParamSource,
+  fnTagFamilyOf,
   fnTagMembersWithin,
   fnTagRecHoldsListOfLists,
+  fnTagSetCount,
   fnTagSetSplits,
-  fnTagWiderSetHasOneSig,
+  fnTagValueDstOf,
+  fnTagValueSites,
   handBackCalledArgOf,
   handBackCalledIx,
 } from "./check_elab_cap"
@@ -239,6 +252,7 @@ import {
   fnParamHandFromsOf,
   fnParamHandSets,
   fnTagArmMemberNote,
+  fnTagArmMemberOf,
   fnTagArmsAt,
   fnTagArmsAtSet,
   fnTagBindNote,
@@ -279,6 +293,8 @@ import {
   fnTagSharedJoinSet,
   fnTagTaggedSets,
   fnTagUndecide,
+  fnTagValueArmsAt,
+  fnTagValueArmsAtSet,
   fnTagWriteLeavesOf,
   fnWidenedSourceSets,
 } from "./check_elab_cap"
@@ -828,15 +844,25 @@ function ftTryWith(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   ftP = ftRecNew()
   ftSubNeed = []
   ftAssume = [s]
+  ftForcedIds = false
   let ok = ftPlan(rootIx, s, calls, mint)
+  let famIn = false
   let q = 0
-  while ok && q < ftSubNeed.length {
-    const o = ftSubNeed[q]
-    if !i32ListHas(ftAssume, o) && !fnTagSetIsTagged(o) {
-      ftAssume.push(o)
-      ok = ftPlan(rootIx, o, calls, mint)
+  while ok && (q < ftSubNeed.length || (ftForcedIds && !famIn)) {
+    // A plan a member forced to ids (one not filling a closure bundle), its own or a subset's,
+    // plans the family whole: no value may flow from a closure holder into an id holder.
+    if ftForcedIds && !famIn {
+      famIn = true
+      ftSubNeedFamily(s)
     }
-    q = q + 1
+    if q < ftSubNeed.length {
+      const o = ftSubNeed[q]
+      if !i32ListHas(ftAssume, o) && !fnTagSetIsTagged(o) {
+        ftAssume.push(o)
+        ok = ftPlan(rootIx, o, calls, mint)
+      }
+      q = q + 1
+    }
   }
   ftAssume = []
   if !ok || !ftPlLeafTysFill() { return 0 }
@@ -1171,7 +1197,157 @@ function ftCommit(rootIx: i32, k: i32, calls: i32[], mint: i32[]) {
       ftBuildArmsAt(ftFactCallOf(fr), s, ds, leafTy, ftFactRsOf(fr))
     }
   }
+  for vc in fnTagValueSites() {
+    ftBuildValueArms(vc, fnTagValueDstOf(vc), s, ds, leafTy)
+  }
   return 0
+}
+
+// The closed signatures site `c`'s destination converts its value at: the destination itself, or
+// each closed function field of the record it is.
+function ftValueSigs(c: i32): i32[] {
+  const out: i32[] = []
+  const dn = nonNullTy(fnTagValueDstOf(c))
+  if dn < 0 || dn >= T.tys.length { return out }
+  const d = tyAt(dn)
+  if d is TyFunc {
+    out.push(dn)
+  } else if d is TyObj {
+    for ft in d.objFieldTypes {
+      if (
+        ft >= 0
+        && ft < T.tys.length
+        && tyAt(ft) is TyFunc
+        && !i32ListHas(out, ft)
+      ) {
+        out.push(ft)
+      }
+    }
+  }
+  return out
+}
+
+// Every value arm of every noted site, for the elaboration to demand at the root.
+export function fnTagValueArmsAll(): i32[] {
+  const out: i32[] = []
+  for c in fnTagValueSites() {
+    for a in fnTagValueArms(c) { out.push(a) }
+  }
+  return out
+}
+
+// Every value arm `ftBuildValueArms` built at site `c`, over its sets and signatures.
+export function fnTagValueArms(c: i32): i32[] {
+  const out: i32[] = []
+  if fnTagValueDstOf(c) < 0 { return out }
+  const sigs = ftValueSigs(c)
+  for s in fnTagTaggedSets() {
+    for g in sigs {
+      for a in fnTagValueArmsAt(c, s, g) { out.push(a) }
+    }
+  }
+  return out
+}
+
+// Whether call `c`'s fresh record result is delivered where a record type closes a set's field,
+// so the destination converts it field by field.
+export function ftValueConvertAt(c: i32): boolean {
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  return cn is Call && fnTagValueDstOf(c) >= 0 && ftCallFreshLits(cn)
+}
+
+// The declaration site `c`'s value arm for member `d` at a signature `tySame` as `sig` calls,
+// its instance once mono ran; -1.
+export function fnTagValueArmFn(c: i32, d: i32, sig: i32): i32 {
+  if fnTagValueDstOf(c) < 0 || sig < 0 { return -1 }
+  for g in ftValueSigs(c) {
+    if tySame(g, sig) {
+      for s in fnTagTaggedSets() {
+        for a in fnTagValueArmsAt(c, s, g) {
+          const an = nodeAt(a)
+          const fd = if an is Call && fnTagArmMemberOf(a) == d { identDeclOf(an.callFn) } else { -1 }
+          if fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl {
+            return fd
+          }
+        }
+      }
+    }
+  }
+  return -1
+}
+
+// Whether every member of set `s` takes as many parameters as function type `f`.
+function ftMembersTakeArity(s: i32, f: TyFunc): boolean {
+  for d in fnTagMembers(s) {
+    const t = nodeTyIxOf(d)
+    const ft = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    if !(ft is TyFunc) || ft.fnParamTypes.length != f.fnParamTypes.length {
+      return false
+    }
+  }
+  return true
+}
+
+// The value arms of set `s` at site `c`, where a value carrying `s` is delivered at type `dt`: a
+// closed function type, or a record closing the fields that hold `s`. Each member is called at
+// each such signature, so its instance there exists for the conversion to a closure to take.
+function ftBuildValueArms(c: i32, dt: i32, s: i32, ds: i32[], leafTy: i32[]) {
+  // A member with type parameters is instanced by its own calls' type arguments, not an arm's.
+  for d in ds {
+    const dn0 = nodeAt(d)
+    if dn0 is FuncDecl && dn0.fnTyParams.length > 0 { return 0 }
+  }
+  const ct = if c >= 0 && c < P.nodes.length { nonNullTy(nodeTyIxOf(c)) } else { -1 }
+  const dn = if dt >= 0 { nonNullTy(dt) } else { -1 }
+  if ct < 0 || dn < 0 || ct >= T.tys.length || dn >= T.tys.length { return 0 }
+  const so = tyAt(ct)
+  const dob = tyAt(dn)
+  if dob is TyFunc {
+    // A site its holes leave open here is typed at the set in the instance that reads it.
+    const open = fnTagSetOfTy(ct) < 0
+      && tyHasHole(ct)
+      && ftMembersTakeArity(s, dob)
+    if fnTagSetOfTy(ct) != s && !open || tyHasTyVar(dn) || tyHasHole(dn) {
+      return 0
+    }
+    return ftValueArmsAtSig(c, s, dn, ds, leafTy)
+  }
+  if !(so is TyObj) || !(dob is TyObj) { return 0 }
+  let i = 0
+  while i < dob.objFieldNames.length {
+    const ft = dob.objFieldTypes[i]
+    const st = tyFieldTyOf(ct, dob.objFieldNames[i])
+    const held = st >= 0 && fnTagSetOfTy(nonNullTy(st)) == s
+    if (
+      held
+      && ft >= 0
+      && ft < T.tys.length
+      && tyAt(ft) is TyFunc
+      && !tyHasTyVar(ft)
+    ) {
+      ftValueArmsAtSig(c, s, ft, ds, leafTy)
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The value arms of set `s` at site `c` at closed function type `sig`.
+function ftValueArmsAtSig(c: i32, s: i32, sig: i32, ds: i32[], leafTy: i32[]) {
+  const f = tyAt(sig)
+  if !(f is TyFunc) { return 0 }
+  const args: i32[] = []
+  let k = 0
+  while k < f.fnParamTypes.length {
+    const a = mkIdent("$va" + i32ToStr(k), nodePos(c))
+    nodeTySetGrow(a, f.fnParamTypes[k])
+    args.push(a)
+    k = k + 1
+  }
+  const rs: i32[] = []
+  for _d in ds { rs.push(f.fnRet) }
+  const none: string[] = []
+  return ftBuildArmsWith(c, s, sig, ds, leafTy, rs, args, none, f.fnRet)
 }
 
 // Whether member `d`'s name is in scope at every call its set `s` builds arms at: a lambda or a
@@ -1518,8 +1694,9 @@ function ftReturnedPastSet(pd: i32, s: i32): boolean {
   if !(fn is FuncDecl) || fn.fnBody < 0 || ftRetCarries(fd, s) { return false }
   // A parameter called and handed back returns each call's own argument, so its id stays in the
   // set that call's argument is of.
-  const hc = handBackCalledIx(fn)
-  if hc >= 0 && fn.fnParams[hc] == pd && fnTagWiderSetHasOneSig(s) {
+  const hc = handBackCalledWiderIx(fd, -1, s)
+  if hc >= 0 && fn.fnParams[hc] == pd {
+    ftForcedIds = true
     return false
   }
   const vs: i32[] = []
@@ -1711,19 +1888,52 @@ function ftBuildArms(c: i32, s: i32, ds: i32[], leafTy: i32[]) {
 
 // `ftBuildArms` with each member's result at the call given as `rs`, in set order.
 function ftBuildArmsAt(c: i32, s: i32, ds: i32[], leafTy: i32[], rs: i32[]) {
-  let arms = fnTagArmsAt(c, s)
   const cn = nodeAt(c)
   if !(cn is Call) { return 0 }
+  return ftBuildArmsWith(
+    c,
+    s,
+    -1,
+    ds,
+    leafTy,
+    rs,
+    cn.callArgs,
+    cn.callArgNames,
+    nodeTyIxOf(c),
+  )
+}
+
+// The member calls of set `s` at site `c`, each at arguments `args` (named `names`) and result
+// `rs[k]`, joined at `outTy`: a call's arms (`sig` -1), or the value arms pinning each member at
+// closed signature `sig`.
+function ftBuildArmsWith(
+  c: i32,
+  s: i32,
+  sig: i32,
+  ds: i32[],
+  leafTy: i32[],
+  rs: i32[],
+  args: i32[],
+  names: string[],
+  outTy: i32,
+) {
+  let arms = if sig >= 0 { fnTagValueArmsAt(c, s, sig) } else { fnTagArmsAt(c, s) }
+  const pos = nodePos(c)
+  if c < 0 || c >= P.nodes.length { return 0 }
   if arms.length != ds.length {
     arms = []
     for d in ds {
       const f = nodeAt(d)
       let nm = ""
       if f is FuncDecl { nm = f.fnName }
-      const id = mkIdent(nm, cn.pos)
-      arms.push(mkCallN(id, cn.callArgs, cn.callArgNames, cn.pos))
+      const id = mkIdent(nm, pos)
+      arms.push(mkCallN(id, args, names, pos))
     }
-    fnTagArmsAtSet(c, s, arms)
+    if sig >= 0 {
+      fnTagValueArmsAtSet(c, s, sig, arms)
+    } else {
+      fnTagArmsAtSet(c, s, arms)
+    }
   }
   let k = 0
   while k < arms.length {
@@ -1739,11 +1949,11 @@ function ftBuildArmsAt(c: i32, s: i32, ds: i32[], leafTy: i32[], rs: i32[]) {
       nodeTySetGrow(an.callFn, leafTy[k])
       fnTagArmMemberNote(arms[k], ds[k])
     }
-    const armTy = if k < rs.length { rs[k] } else { nodeTyIxOf(c) }
+    const armTy = if k < rs.length { rs[k] } else { outTy }
     nodeTySetGrow(arms[k], armTy)
-    numDeliverStamp(arms[k], armTy, nodeTyIxOf(c))
+    numDeliverStamp(arms[k], armTy, outTy)
     // Each member's result is boxed into the call's joined result where that is a union.
-    recordBoxTy(arms[k], nodeTyIxOf(c))
+    recordBoxTy(arms[k], outTy)
     k = k + 1
   }
   return 0
@@ -2510,7 +2720,9 @@ function ftNamedAtClosed(x: i32, p: i32, g: i32, s: i32): boolean {
   }
   // A field of a record literal the record solve builds at a record whose field is closed.
   if pn is FieldInit {
-    if pn.fiValue != x || g < 0 || !(nodeAt(g) is ObjLit) { return false }
+    if pn.fiValue != x || g < 0 || !(nodeAt(g) is ObjLit) || ftInSharedRet(g) {
+      return false
+    }
     const bt = ftLitBuiltAt(g)
     const rt = if bt >= 0 { bt } else { ftLitAnnotAt(g) }
     return ftClosedFnTy(tyFieldTyOf(rt, pn.fiName))
@@ -2525,13 +2737,30 @@ function ftNamedAtClosed(x: i32, p: i32, g: i32, s: i32): boolean {
   return q is Param && q.parType >= 0 && ftClosedFnTy(nodeTyIxOf(f.fnParams[i]))
 }
 
+// Whether literal `x` is, or is nested in, the one value a function called at several sites
+// returns (`recRetSharedLeaf`): no one destination's build is the literal's.
+function ftInSharedRet(x: i32): boolean {
+  cwIxBuild()
+  // The climb stops at the first node that is no literal or field, so it ends at the tree's top.
+  let c = x
+  while c >= 0 && c < P.nodes.length {
+    const cn = nodeAt(c)
+    if !(cn is ArrayLit || cn is ObjLit || cn is FieldInit) { return false }
+    if recRetSharedLeaf(c) { return true }
+    c = if cwIxCovers(c) { cwIxParent[c] } else { -1 }
+  }
+  return false
+}
+
 // Whether list literal `x`, bound at an annotation, holds set `s` only as members named as its
 // elements or in fields of its record literals, each built at a closed function type there: each
 // is its member's closure and the list holds no id.
 function ftLitAtClosed(x: i32, s: i32): boolean {
   if x < 0 || x >= P.nodes.length { return false }
   const n = nodeAt(x)
-  if !(n is ArrayLit) || n.arrElems.length == 0 { return false }
+  if !(n is ArrayLit) || n.arrElems.length == 0 || ftInSharedRet(x) {
+    return false
+  }
   // The type the record solve stamped it at, else its binding's annotation, is where the records
   // are built, not the literal's own type, and it must hold no set decided with `s`.
   cwIxBuild()
@@ -2901,9 +3130,10 @@ function ftNodeOk(
       const hc = handBackCalledArgOf(x)
       if (
         hc >= 0
-        && fnTagWiderSetHasOneSig(s)
+        && handBackCalledWiderIx(-1, x, s) >= 0
         && (fnTagCallSetOf(x) == s || ftIsS(hc, s))
       ) {
+        ftForcedIds = true
         return ftNodeOk(hc, x, s, ds, leaves, ids)
       }
       if fnTagCallSetOf(x) == s { return true }
@@ -4165,9 +4395,14 @@ function ftListCallHoleArg(c: Call, x: i32, s: i32): boolean {
 }
 
 // Whether argument `x` of call `c`, carrying set `s`, binds a positional, un-annotated parameter
-// of the named top-level function `c` calls.
+// of the named top-level function `c` calls, or of the lambda a `const` it calls holds (D17783).
 function ftHoleParamOf(c: Call, x: i32, s: i32): boolean {
-  const d = ftCalleeFn(ftCalleeSource(c))
+  const src = ftCalleeSource(c)
+  const sn = if src >= 0 && src < P.nodes.length { nodeAt(src) } else { null }
+  const viaConst = src != parenPeelIx(c.callFn)
+    && sn is FuncDecl
+    && fnNameIsLambda(sn.fnName)
+  const d = if viaConst { src } else { ftCalleeFn(src) }
   if d < 0 { return false }
   const f = nodeAt(d)
   if !(f is FuncDecl) { return false }
@@ -5143,6 +5378,40 @@ function ftMapElemOk(el: i32, s: i32): boolean {
   return true
 }
 
+// Whether call `c` names an un-annotated function every value of which is a record literal, so
+// each call hands back a record no other handle holds.
+export function ftCallFreshLits(c: Call): boolean {
+  if (
+    c.callFn < 0
+    || c.callFn >= P.nodes.length
+    || !(nodeAt(c.callFn) is Ident)
+  ) {
+    return false
+  }
+  const fd = identFnDeclOf(c.callFn)
+  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) || fn.fnRet >= 0 { return false }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length == 0 { return false }
+  for lf in leaves {
+    const l = parenPeelIx(lf)
+    const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+    if !(ln is ObjLit) && !ftListOfRecLits(l) { return false }
+  }
+  return true
+}
+
+// Whether node `l` is a list literal of record literals, none spread.
+function ftListOfRecLits(l: i32): boolean {
+  const n = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+  if !(n is ArrayLit) || n.arrElems.length == 0 { return false }
+  for e in n.arrElems {
+    const x = parenPeelIx(e)
+    if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) { return false }
+  }
+  return true
+}
+
 // Whether literal `x` holds set `s` only through values whose deliveries into it the decision
 // coerces to a closure (`fnCloCoerceNote`): after the elaboration, each such value is built as
 // its member's closure, so the literal holds closures and no id (D14884). A written binding
@@ -5164,6 +5433,13 @@ function ftHolderCoerced(x: i32, s: i32): boolean {
   if n is Ident {
     const init = cwSoleReadInit(x)
     return init >= 0 && ftHolderCoerced(init, s)
+  }
+  // A function's one call holds what the literal it alone returns holds; a call of one returning
+  // only fresh literals is converted at its closed destination, whatever its call count (D17777).
+  if n is Call {
+    const rl = recRetLitOfSoleCall(x)
+    if rl >= 0 { return ftHolderCoerced(rl, s) }
+    return ftCallFreshLits(n)
   }
   // An annotated binding of such a literal, and a write of one, hold what the literal holds.
   if n is LetDecl {
@@ -6602,16 +6878,15 @@ function ftHoleArg(c: Call, x: i32): boolean {
   return false
 }
 
-// The declaration call `c` names, through a module-scope `const` holding a lambda; -1 for none.
+// The declaration call `c` names, through a module-scope binding or a function's `const` holding
+// a lambda; -1 for none.
 function ftCallDeclOf(c: Call): i32 {
   const cf = parenPeelIx(c.callFn)
   const d0 = identDeclOf(cf)
-  // A lambda a module-scope `const` holds is called through that binding (D15775).
-  const atTop = d0 >= 0
-    && d0 < P.nodes.length
-    && nodeAt(d0) is LetDecl
-    && recEnclosingFn(d0) < 0
-  return if atTop { cwCalleeDeclOf(cf) } else { d0 }
+  // A lambda such a binding holds is called through it (D15775, D15777).
+  const dn = if d0 >= 0 && d0 < P.nodes.length { nodeAt(d0) } else { null }
+  const via = dn is LetDecl && (dn.letKw == "const" || recEnclosingFn(d0) < 0)
+  return if via { cwCalleeDeclOf(cf) } else { d0 }
 }
 
 // Whether every member of set `s` is a declared function. A flat list of one member is handed on
@@ -6853,4 +7128,155 @@ function ftLiteralArg(x: i32): boolean {
   const v = parenPeelIx(x)
   const n = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
   return n is ArrayLit || n is ObjLit
+}
+
+// The parameter of callee `d` (or of the one `call` names, for `d` -1) handed back though also
+// called (`handBackCalledIx`), where its argument's set (`st`, or for -1 the set of `call`'s
+// argument) lies in a wider set some member of which does not fill the closure bundle of that
+// parameter's call signatures (`fnTagMemberFillsRecord`): the family takes ids; -1 otherwise.
+export function handBackCalledWiderIx(d: i32, call: i32, st: i32): i32 {
+  const cx = parenPeelIx(call)
+  const c = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { nodeAt(0) }
+  const dd = if d >= 0 { d } else if c is Call { identFnDeclOf(parenPeelIx(c.callFn)) } else { -1 }
+  const dn = if dd >= 0 && dd < P.nodes.length { nodeAt(dd) } else { nodeAt(0) }
+  if !(dn is FuncDecl) || dn.fnBody < 0 { return -1 }
+  const i = handBackCalledIx(dn)
+  if i < 0 { return -1 }
+  const as = if st >= 0 { st } else if c is Call && i < c.callArgs.length { fnTagSetOfTy(nodeTyIxOf(c.callArgs[i])) } else { -1 }
+  if as < 0 { return -1 }
+  const pts = ftCalledParamSigs(dn, dn.fnParams[i])
+  const ms = fnTagMembers(as)
+  if pts.length == 0 || ms.length == 0 { return -1 }
+  // The bundle's results: the argument set's own at each signature.
+  const rets: i32[] = []
+  for p in pts {
+    const r = ftMemberRetAt(ms[0], p)
+    if r < 0 { return -1 }
+    rets.push(r)
+  }
+  let k = 0
+  while k < fnTagSetCount() {
+    if (
+      k != as
+      && fnTagMembers(k).length > ms.length
+      && fnTagMembersWithin(as, k)
+    ) {
+      for m in fnTagMembers(k) {
+        if !fnTagMemberFillsRecord(m, pts, rets) { return i }
+      }
+    }
+    k = k + 1
+  }
+  return -1
+}
+
+// Whether member `d` fills a closure bundle of one closure per parameter tuple of `pts`, each
+// returning its `rets` entry: a declared signature at each tuple, or a hole member whose body
+// gives that result there. A generic member is instanced per tuple, so it fills.
+export function fnTagMemberFillsRecord(
+  d: i32,
+  pts: i32[][],
+  rets: i32[],
+): boolean {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) { return false }
+  if dn.fnTyParams.length > 0 { return true }
+  let k = 0
+  while k < pts.length && k < rets.length {
+    const r = ftMemberRetAt(d, pts[k])
+    if r < 0 || !tySame(r, rets[k]) { return false }
+    k = k + 1
+  }
+  return true
+}
+
+// The result function `d` gives at parameter types `pt`: its declared type's where that takes
+// exactly `pt`, else, for a hole member, its body's there (`holeLamRetAt`); -1 where neither.
+function ftMemberRetAt(d: i32, pt: i32[]): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) || dn.fnParams.length != pt.length { return -1 }
+  let holes = false
+  for p in dn.fnParams {
+    const pn = nodeAt(p)
+    if !(pn is Param) || pn.parType < 0 { holes = true }
+  }
+  if !holes {
+    const t = nodeTyIxOf(d)
+    const f = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    if !(f is TyFunc) || f.fnParamTypes.length != pt.length { return -1 }
+    let j = 0
+    while j < pt.length {
+      if !tySame(f.fnParamTypes[j], pt[j]) { return -1 }
+      j = j + 1
+    }
+    return f.fnRet
+  }
+  const noN: string[] = []
+  const noT: i32[] = []
+  // A read-only ask: a body that does not type at `pt` reports nothing here.
+  const q = quietEnterFlat()
+  const r = holeLamRetAt(d, mkFuncTy(pt, TY_I32), noN, noT)
+  quietLeaveFlat(q)
+  return if r >= 0 && !tyHasTyVar(r) { r } else { -1 }
+}
+
+// The argument types of each call through parameter `par` in `dn`'s body, a tuple per call with
+// every argument closed; [] where one is open.
+function ftCalledParamSigs(dn: FuncDecl, par: i32): i32[][] {
+  const out: i32[][] = []
+  const todo: i32[] = [dn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is Call {
+        const cf = parenPeelIx(n.callFn)
+        if cf >= 0 && nodeAt(cf) is Ident && identDeclOf(cf) == par {
+          const tup: i32[] = []
+          for a in n.callArgs {
+            const t = nodeTyIxOf(a)
+            if t < 0 || tyHasTyVar(t) { return [] }
+            tup.push(t)
+          }
+          out.push(tup)
+        }
+      }
+      for k in nodeChildren(x) { todo.push(k) }
+    }
+  }
+  return out
+}
+
+// Whether the plan in progress took a value as an id because a member of its set's family does
+// not fill a closure bundle (`handBackCalledWiderIx`).
+let ftForcedIds = false
+
+// Queues each set of `s`'s family that no other set of it holds whole; the subsets its own plan
+// reaches as leaves.
+function ftSubNeedFamily(s: i32) {
+  const fam = fnTagFamilyOf(s)
+  for o in fam {
+    if (
+      o != s
+      && !fnTagSetIsTagged(o)
+      && !i32ListHas(ftSubNeed, o)
+      && !ftFamHeldWhole(o, fam)
+    ) {
+      ftSubNeed.push(o)
+    }
+  }
+}
+
+// Whether some other set of family `fam` holds every member of set `o`.
+function ftFamHeldWhole(o: i32, fam: i32[]): boolean {
+  for k in fam {
+    if (
+      k != o
+      && fnTagMembers(k).length > fnTagMembers(o).length
+      && fnTagMembersWithin(o, k)
+    ) {
+      return true
+    }
+  }
+  return false
 }

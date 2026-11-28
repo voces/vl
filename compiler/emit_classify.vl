@@ -1,3 +1,4 @@
+import { cloLiftCapN, cloLiftWrName, cloLiftWriteSlot } from "./ir_lift"
 import { tyHasNullMember } from "./tyquery"
 import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
 import { sharedFieldArmNulSet } from "./emit_obj_lit_fits"
@@ -368,6 +369,7 @@ import {
   elabCallResultMember,
   elabCallResultTy,
   elabDeclFnOf,
+  elabDeliveredSlotTy,
   elabFnReturnsRecordAt,
   elabHasHolderMemberTy,
   elabHasHolderRecords,
@@ -386,6 +388,7 @@ import {
   elabPlaceRecordAt,
   elabPlainReturnsRecord,
   elabSlotFieldRecord,
+  elabSlotInstTyAt,
   elabSlotTyAt,
   elabThroughMemberAt,
   elabUnboundTpTy,
@@ -805,9 +808,6 @@ import {
   capStartTbl,
   cboxReadsCell,
   cboxStoreCells,
-  cloLiftCapN,
-  cloLiftWrName,
-  cloLiftWriteSlot,
   coalLinkChainOf,
   emitCurFnIx,
   emitCurFnPos,
@@ -2425,9 +2425,18 @@ function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
   }
   // A function value whose own type's set is tagged is held as that set's id (D15039).
   if fnTagTyIsTagged(own) { return own }
+  // An un-annotated holder of open functions delivered whole at a closed type holds its slot
+  // fact there, as an annotation of that type would (D17729, D17756).
+  const sf = letDeliveredSlotTy(letIx, own, fnIx)
+  if sf >= 0 { return sf }
   // A map read the checker stamped as a held list of a tagged set's records holds that rep.
   const hr = heldRepOf(letIx)
-  if hr >= 0 && hr < T.tys.length && tyAt(hr) is TyNullable { return hr }
+  if hr >= 0 && hr < T.tys.length && tyAt(hr) is TyNullable {
+    // A binding the narrowing typed past null holds the rep without it (D17751).
+    const hn = tyAt(hr)
+    const ownNull = own >= 0 && own < T.tys.length && tyAt(own) is TyNullable
+    return if !ownNull && own >= 0 && hn is TyNullable { hn.nInner } else { hr }
+  }
   // The checker's record solve builds the binding at another record's storage.
   const rb = recBuildTyOf(letIx)
   if rb >= 0 { return rb }
@@ -2440,6 +2449,37 @@ function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
   const mread = letElemReadHeldTy(init)
   if mread >= 0 { return mread }
   return letNamedHeldTy(letIx, init, fnIx)
+}
+
+// The closed slot fact un-annotated holder `letIx` of open functions takes in frame `fnIx`, one
+// reader over holder kinds: a list of `[]` holds its instance frame's own fact, and a map delivered
+// whole at one closed map holds that map; -1 for any other binding or an open fact.
+function letDeliveredSlotTy(letIx: i32, own: i32, fnIx: i32): i32 {
+  if own < 0 || own >= T.tys.length || letIx < 0 || letIx >= P.nodes.length {
+    return -1
+  }
+  const d = nodeAt(letIx)
+  if !(d is LetDecl) || d.letType >= 0 { return -1 }
+  const o = tyAt(own)
+  let st = -1
+  if o is TyArray {
+    // A literal with items is built at its own row; only an empty one takes its fill's.
+    const li = if d.letInit >= 0 { unwrapParen(d.letInit) } else { -1 }
+    const ln = if li >= 0 { nodeAt(li) } else { null }
+    const empty = ln is ArrayLit && ln.arrElems.length == 0
+    if empty && tyAt(tyArrayElemIx(own)) is TyFunc {
+      st = elabSlotInstTyAt(letIx, fnIx)
+    }
+  } else if o is TyMap {
+    const v = tyValOf(o)
+    if tyHasTyVar(v) || tyHasInferHole(v) { st = elabDeliveredSlotTy(letIx) }
+  }
+  if !(tyHasTyVar(own) || tyHasInferHole(own)) || st < 0 || st >= T.tys.length {
+    return -1
+  }
+  const so = tyAt(st)
+  const kind = o is TyArray && so is TyArray || o is TyMap && so is TyMap
+  return if kind && !tyHasTyVar(st) && !tyHasInferHole(st) { st } else { -1 }
 }
 
 // The record a read `xs[i]`, `m[k]` or `m.get(k)` of a container binding holds, nullable where the
@@ -2631,8 +2671,9 @@ function letStoreHeldTy(init: i32): i32 {
   return if own0 != own { mkNullableTy(r) } else { r }
 }
 
-// The record a value `if` or `match` `init` is stamped as built at, where its arms are all built
-// at one record other than its own type (D15654); else -1.
+// The record or list a value `if` or `match` `init` is stamped as built at, where its arms are
+// all built at one record other than its own type (D15654), or its list holds closures the
+// elaboration closed (`elabHeldFnLitStamps`); else -1.
 function letJoinHeldTy(init: i32): i32 {
   const u = unwrapParen(init)
   if u < 0 || !nodeRepStamped(u) { return -1 }
@@ -2640,10 +2681,14 @@ function letJoinHeldTy(init: i32): i32 {
   if !(o is IfStmt) && !(o is MatchExpr) { return -1 }
   const r = nodeRepTyIxOf(u)
   const own = nodeTyIxOf(u)
-  if r < 0 || r >= T.tys.length || !(tyAt(r) is TyObj) || tySameSealed(r, own) {
-    return -1
+  if r < 0 || r >= T.tys.length || tySameSealed(r, own) { return -1 }
+  if (
+    tyAt(r) is TyObj
+    || tyAt(r) is TyArray && !tyHasTyVar(r) && tyHasTyVar(own)
+  ) {
+    return r
   }
-  return r
+  return -1
 }
 
 // The closed type a record or list literal `init` is built at, which may be a declared record its
@@ -4662,8 +4707,10 @@ function structIndexOfObjCtxMemo(objIx: i32, fnIx: i32) {
     if fresh { return sioMemoIx[objIx] }
   }
   const r = structIndexOfObjCtxGo(objIx, fnIx)
-  // A miss over a type still holding a hole is not remembered: a pin fills the hole in place.
-  if r < 0 && tyHasInferHole(nodeTyIxOf(objIx)) { return r }
+  // A miss is remembered only over a closed type (`irTyOpen`'s test): an open part, a hole or a
+  // type variable, is filled in place later (D17779).
+  const ot = nodeTyIxOf(objIx)
+  if r < 0 && (ot < 0 || tyHasTyVar(ot)) { return r }
   sioMemoIx[objIx] = r
   sioMemoFn[objIx] = fnIx
   sioMemoVer[objIx] = sNames.length
@@ -10704,9 +10751,23 @@ export function coalHoleNulNumTy(e: BinExpr, fnIx: i32): i32 {
 
 // True if a binary `e` (other than an operator over a numeric union) yields the union box:
 // a `??` over a union-valued map or a nullable box, or an assignment whose target is one.
+// Whether `??` node `e`'s operand is a map read the checker narrowed out of a union value.
+export function coalLeftNarrowedFromUnion(e: BinExpr, fnIx: i32): boolean {
+  const l = unwrapParen(e.binLeft)
+  if l < 0 || !(nodeAt(l) is Index) { return false }
+  const st = readNarrowedStoreAt(l, fnIx)
+  const su = if st >= 0 { nonNullTy(st) } else { -1 }
+  return su >= 0 && su < T.tys.length && tyAt(su) is TyUnion
+}
+
 function exprUnionBin(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
   // A hole's map read of a nullable number beside a nullable default stays that number's box.
   if e.binOp == "??" && coalHoleNulNumRead(e, fnIx) { return true }
+  // A map read narrowed out of a union value is no slot's box: the `??` is its checked type.
+  if e.binOp == "??" && coalLeftNarrowedFromUnion(e, fnIx) {
+    const nt = nodeTyAt(exprIx, fnIx)
+    return nt >= 0 && repOfTy(nt).rdKind == "union"
+  }
   const cmu = coalesceMvSlot(exprIx, fnIx)
   if cmu >= 0 {
     if mvValKindAt(cmu) == "union" && !mvUnionIsScalarNull(cmu) { return true }
@@ -13040,6 +13101,8 @@ export function letRefListElemTy(letIx: i32, fnIx: i32): i32 {
       }
     }
     if d.letInit < 0 { return -1 }
+    const jt = letJoinHeldTy(d.letInit)
+    if jt >= 0 && tyAt(jt) is TyArray { return tyRefArrElemOf(jt) }
     return tyRefArrElemOf(nodeTyInOf(d.letInit, fnIx))
   }
   return -1
@@ -13072,6 +13135,10 @@ export function letRefListSlot(letIx: i32, fnIx: i32) {
   const held = tyArrayElemIx(heldRepOf(letIx))
   const hs = if held >= 0 { rlSlotOfTy(held) } else { -1 }
   if hs >= 0 { return hs }
+  // A list of functions left open at this frame is built at its slot fact's row (D17729).
+  const sf = if d is LetDecl && d.letType < 0 { letDeliveredSlotTy(letIx, nodeTyAt(letIx, fnIx), fnIx) } else { -1 }
+  const ss = if sf >= 0 { rlSlotOfTy(tyArrayElemIx(sf)) } else { -1 }
+  if ss >= 0 { return ss }
   if d is LetDecl && d.letType < 0 && d.letInit >= 0 {
     const rr = listRowOfExpr(d.letInit, fnIx)
     if rr >= 0 { return rr }
@@ -13524,6 +13591,14 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
           if tsh != -3 { return tsh }
         }
       }
+    }
+    // A map delivered whole at one closed map is built at its shape (D17756).
+    const dm = if d.letType < 0 { letDeliveredSlotTy(letIx, nodeTyIxOf(letIx), fnIx) } else { -1 }
+    if dm >= 0 {
+      const dmo = tyAt(dm)
+      const dv = if dmo is TyMap { tyValOf(dmo) } else { -1 }
+      const dsh = mvShapeOfMapHeldTy(dm, dv, dv)
+      if dsh != -3 { return dsh }
     }
     // A `Map()` whose values are delivered to a record storing a field differently is built
     // at that record's storage, so the delivery is a reference.
@@ -14171,6 +14246,10 @@ export function exprString(exprIx: i32, fnIx: i32) {
       if e.binOp == "=" {
         const sar = asgReadNode(exprIx, fnIx)
         if sar != exprIx { return exprString(sar, fnIx) }
+      }
+      // A map read narrowed out of a union value is no slot's box: its checked type decides.
+      if e.binOp == "??" && coalLeftNarrowedFromUnion(e, fnIx) {
+        return coalTyIsStr(exprIx, fnIx)
       }
       // `m[k] ?? d`/`m.get(k) ?? d` over a string-valued map yields a string ref (the value
       // type); a nullable value with a nullable default stays `string | null`.

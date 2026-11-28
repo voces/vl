@@ -3232,6 +3232,9 @@ let fnTagArms: {[i32]: i32[]} = Map()
 // By call node and set id: the member calls of a generic call whose instances see another tagged
 // set than the one its first note recorded.
 let fnTagArmsBy: {[string]: i32[]} = Map()
+// By delivery site: the closed function type, or the record closing a set's function field, a
+// value carrying a set is delivered at, so each member is pinned there by a value arm (D17777).
+let fnTagValueDst: {[i32]: i32} = Map()
 // By arm call node: the member declaration it calls, recorded when the arm is built, so every
 // pass checks the arm as a call of that member whatever its callee's name resolves to.
 let fnTagArmMember: {[i32]: i32} = Map()
@@ -4782,6 +4785,36 @@ export function fnTagArmsAt(ix: i32, s: i32): i32[] {
   return fnTagArmsBy[fnTagArmsKey(ix, s)] ?? none
 }
 
+// The value arms built at site `ix` for set `s` at closed signature `sig`: [] for none, or when
+// `s` is untagged.
+export function fnTagValueArmsAt(ix: i32, s: i32, sig: i32): i32[] {
+  const none: i32[] = []
+  if s < 0 || !fnTagSetIsTagged(s) { return none }
+  return fnTagArmsBy[fnTagArmsKey(ix, s) + "#" + i32ToStr(sig)] ?? none
+}
+
+// Records `arms` as the value arms at site `ix` for set `s` at signature `sig`.
+export function fnTagValueArmsAtSet(ix: i32, s: i32, sig: i32, arms: i32[]) {
+  fnTagArmsBy[fnTagArmsKey(ix, s) + "#" + i32ToStr(sig)] = arms
+  return 0
+}
+
+// Records that site `c`'s value, carrying a set, is delivered at type `t`, which closes it.
+export function fnTagValueDstNote(c: i32, t: i32) {
+  if c >= 0 && t >= 0 { fnTagValueDst[c] = t }
+  return 0
+}
+
+// The sites `fnTagValueDstNote` recorded, each with its destination at `fnTagValueDstOf`.
+export function fnTagValueSites(): i32[] {
+  const out: i32[] = []
+  for c in fnTagValueDst.keys() { out.push(c) }
+  return out
+}
+
+// The type site `c` is delivered at, or -1.
+export function fnTagValueDstOf(c: i32): i32 { return fnTagValueDst[c] ?? -1 }
+
 // Records that arm call `arm` calls member declaration `d`.
 export function fnTagArmMemberNote(arm: i32, d: i32) {
   if arm >= 0 && d >= 0 { fnTagArmMember[arm] = d }
@@ -5018,6 +5051,7 @@ export function elabCapReset() {
   fnTagRet = Map()
   fnTagArms = Map()
   fnTagArmsBy = Map()
+  fnTagValueDst = Map()
   fnTagArmMember = Map()
   fnTagBind = Map()
   fnTagJoinFrom = Map()
@@ -6075,61 +6109,44 @@ function hbcReturnedValues(body: i32): i32[] {
   return out
 }
 
-// Whether a set holding more members than set `s` holds each of its members and one whose closure
-// rep is fixed at one signature (`fnTagMemberOneSig`): a bundle record of one closure per signature
-// holds that member only at its own field, so a call at another signature reads no closure of it.
-export function fnTagWiderSetHasOneSig(s: i32): boolean {
-  if s < 0 { return false }
-  const n = fnTagMembers(s).length
-  let k = 0
-  while k < fnTagSetCount() {
-    if (
-      k != s
-      && fnTagMembers(k).length > n
-      && fnTagMembersWithin(s, k)
-      && ftcSetHasOneSig(k)
-    ) {
-      return true
+// The sets sharing a member with set `s`, transitively, `s` among them, ascending: one function
+// value has one layout, so every set holding it takes one rep.
+export function fnTagFamilyOf(s: i32): i32[] {
+  if s < 0 || s >= fnSets.length { return [] }
+  const out: i32[] = [s]
+  const mem: i32[] = fnSets[s].slice(0, fnSets[s].length)
+  let grew = true
+  while grew {
+    grew = false
+    let k = 0
+    while k < fnSets.length {
+      if !i32ListHas(out, k) {
+        let shares = false
+        for m in fnSets[k] {
+          if i32ListHas(mem, m) { shares = true }
+        }
+        if shares {
+          out.push(k)
+          for m in fnSets[k] {
+            if !i32ListHas(mem, m) { mem.push(m) }
+          }
+          grew = true
+        }
+      }
+      k = k + 1
     }
-    k = k + 1
   }
-  return false
-}
-
-// Whether set `s` has a member `fnTagMemberOneSig` holds.
-function ftcSetHasOneSig(s: i32): boolean {
-  for d in fnTagMembers(s) {
-    if fnTagMemberOneSig(d) { return true }
+  // Ascending, so the root is the first.
+  let i = 1
+  while i < out.length {
+    const v = out[i]
+    let j = i - 1
+    while j >= 0 && out[j] > v {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = v
+    i = i + 1
   }
-  return false
-}
-
-// Whether function `d` has one closed signature and no other: no type parameter, no hole
-// parameter (which the elaboration instances per signature), a closed function type.
-export function fnTagMemberOneSig(d: i32): boolean {
-  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  if !(dn is FuncDecl) || dn.fnTyParams.length > 0 || dn.fnParams.length == 0 {
-    return false
-  }
-  for p in dn.fnParams {
-    const pn = nodeAt(p)
-    if !(pn is Param) || pn.parType < 0 { return false }
-  }
-  const t = nodeTyIxOf(d)
-  return t >= 0 && t < T.tys.length && tyAt(t) is TyFunc && !tyHasTyVar(t)
-}
-
-// The parameter of callee `d` (or of the one call `call` names, for `d` -1) handed back though
-// also called (`handBackCalledIx`), where the set its argument is of (`st`, or for -1 the set of
-// `call`'s argument there) has a wider set holding a one-signature member
-// (`fnTagWiderSetHasOneSig`); -1 otherwise.
-export function handBackCalledWiderIx(d: i32, call: i32, st: i32): i32 {
-  const cx = parenPeelIx(call)
-  const c = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { nodeAt(0) }
-  const dd = if d >= 0 { d } else if c is Call { identFnDeclOf(parenPeelIx(c.callFn)) } else { -1 }
-  const dn = if dd >= 0 && dd < P.nodes.length { nodeAt(dd) } else { nodeAt(0) }
-  const i = if dn is FuncDecl && dn.fnBody >= 0 { handBackCalledIx(dn) } else { -1 }
-  if i < 0 { return -1 }
-  const as = if st >= 0 { st } else if c is Call && i < c.callArgs.length { fnTagSetOfTy(nodeTyIxOf(c.callArgs[i])) } else { -1 }
-  return if fnTagWiderSetHasOneSig(as) { i } else { -1 }
+  return out
 }

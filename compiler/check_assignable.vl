@@ -166,6 +166,8 @@ import {
   genFnCstrBusy,
   genFnCstrBusySet,
   nodeCtxTyIxOf,
+  nodeRepStamped,
+  nodeRepTyIxOf,
   retNatural,
   retNaturalErr,
   retNaturalErrSet,
@@ -203,6 +205,7 @@ import {
   fnTagHoleLambdaOfTy,
   fnTagSetOfTy,
   fnTagSetValueOfTy,
+  fnTagValueDstNote,
   stampsHeld,
   stampsHeldSet,
   stampsStand,
@@ -238,6 +241,7 @@ import {
   ctnCutClear,
   ctnCutKills,
   ctnWrDeclOf,
+  ctnWrRecv,
   ctnWrUnreachedBy,
   wrDstDecl,
   wrUnreachedBy,
@@ -282,6 +286,7 @@ import {
   rcwPend,
   recAdForce,
   recPendHeldInit,
+  recRetSoleCall,
   recordCopySafe,
   recordCtxTy,
   recordListCopy,
@@ -355,6 +360,7 @@ import {
   BM_PUSH,
   BM_SETKEY,
   BM_SETVAL,
+  CODE_GENERIC_BINDING_CONCRETE_WRITE,
 } from "./check_messages"
 import { boolForNumberNote, letAssignMsg } from "./check_mismatch_notes"
 import { narConvListDelivery, narListDeliveryErr } from "./check_narrow_flow"
@@ -424,6 +430,7 @@ import {
   litLeafFitting,
   substTyDeep,
   tErr,
+  tErrCoded,
   widenLitTy,
 } from "./check_relate_core"
 import { recordListWidenRetag } from "./check_retag_rows"
@@ -437,7 +444,11 @@ import {
   prbLeave,
   quietRunOpen,
 } from "./check_rollback"
-import { recordWidenRetagTails, valBindLambda } from "./check_side_rows"
+import {
+  ctnDeliveryNote,
+  recordWidenRetagTails,
+  valBindLambda,
+} from "./check_side_rows"
 import {
   CSTR_ANYFN,
   SUBST_ALL,
@@ -485,6 +496,7 @@ import {
   dstAdmitsF64,
   fnTyHasHole,
   numKindMask,
+  recFnValueLeaves,
 } from "./check_type_shape"
 import {
   PrimName,
@@ -1243,11 +1255,59 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
   const bTys: i32[] = []
   bindGenWalk(srcTy, nonNullTy(dstTy), bNames, bTys)
   if bNames.length == 0 { return 0 }
+  // A map delivered whole at a closed map takes that map as its slot; a function or list
+  // destination keeps the binding's own reading (a kind rung, D17800).
+  const dmap = nonNullTy(dstTy)
+  const sx = parenPeelIx(srcExpr)
+  // A destination counts only where its type is closed apart from the binding: one holding a hole
+  // is closed by its own pins, which may be what typed the destination (D9182).
+  const whole = sx >= 0
+    && nodeAt(sx) is Ident
+    && identDeclOf(sx) == d
+    && !tyHasInferHole(srcTy)
+  if (
+    !inferQuiet
+    && monoRecheckDepth == 0
+    && whole
+    && dmap >= 0
+    && dmap < T.tys.length
+    && tyAt(dmap) is TyMap
+  ) {
+    ctnDeliveryNote(d, dmap)
+  }
   const at = " (written into `"
     + letNameAt(d)
     + "`, delivered at "
     + tyToStr(dstTy)
     + ")"
+  // A write that fits the destination's own slot is delivered there, as an annotation of the
+  // binding at that type would hold it (D17756).
+  const dm = nonNullTy(dstTy)
+  const dmt = if dm >= 0 && dm < T.tys.length { tyAt(dm) } else { null }
+  const dv = if dmt is TyMap && whole { tyValOf(dmt) } else { -1 }
+  // Each generic function written there is delivered at that slot, adapted as an annotated
+  // holder's write is (`fvaAdapt`).
+  if dv >= 0 && !inferQuiet && monoRecheckDepth == 0 {
+    // The map's slot is the destination's, decided once: each write's bound into it reads that
+    // slot, not the one its first write's own type set (D17756).
+    const sm = if srcTy >= 0 && srcTy < T.tys.length { tyAt(srcTy) } else { null }
+    const old = if sm is TyMap { tyValOf(sm) } else { -1 }
+    let bi = 0
+    while old >= 0 && bi < bndCount(BND_BM) {
+      const bw0 = bndAt(BND_BM, bi)
+      if bw0.a == old && ctnWrDeclOf(bw0.site) == d { bw0.a = dv }
+      bi = bi + 1
+    }
+    for wv0 in ctnWrRecv.keys() {
+      const wv = parenPeelIx(wv0)
+      if ctnWrDeclOf(wv0) == d && wv >= 0 && nodeAt(wv) is Ident {
+        const wd = identDeclOf(wv)
+        if wd >= 0 && wd < P.nodes.length && nodeAt(wd) is FuncDecl {
+          fvaAdapt(wv0, nodeTyOf(wv0), dv)
+        }
+      }
+    }
+  }
   let ci = 0
   while ci < bndCount(BND_BM) {
     if (
@@ -1258,7 +1318,8 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
       const bw = substTyDeep(bndAt(BND_BM, ci).a, bNames, bTys)
       let bc = bndAt(BND_BM, ci).b
       if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
-      if !tyHasHole(bg) && !tyHasHole(bw) {
+      const fitsDst = dv >= 0 && !tyHasHole(bw) && assignable(bw, dv)
+      if !tyHasHole(bg) && !tyHasHole(bw) && !fitsDst {
         if !bmArgPred(bndAt(BND_BM, ci).c, bg, bw, bndAt(BND_BM, ci).site) {
           const m = bmArgMsg(
             bndAt(BND_BM, ci).c,
@@ -2374,6 +2435,12 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         && fvaListSetCopy(srcExpr, srcTy, tyElemOf(dla))
       ) {
         return true
+      }
+      // A fresh record, or list of them, holding a set where the destination closes the
+      // function fields is copied field by field there (D17764).
+      if fvaRecFnCopy(srcExpr, srcTy, dstTy) {
+        // The copy is delivered as a hand-written literal is: adopted there, its field coerced.
+        return assignableExprIn(srcExpr, nodeTyIxOf(srcExpr), dstTy)
       }
       noteRefListView(srcExpr, srcTy, dstTy)
       recordListCopy(srcExpr, srcTy, dstTy)
@@ -3754,6 +3821,28 @@ function letFnRowOutsideCall(ci: i32, c: i32): boolean {
   return own >= 0 && d != own && nodeAt(d) is LetDecl
 }
 
+// Whether value `site` initialises, or is written whole to, a `let` or `const` its own
+// annotation types; an un-annotated binding takes a write per call type instead (D6520).
+function rowLetAnnotated(site: i32): boolean {
+  const x = parenPeelIx(site)
+  if x < 0 || !cwIxCovers(x) { return false }
+  let d = -1
+  if cwIxUpKind[x] == CW_UP_LETINIT { d = cwIxUp[x] }
+  if cwIxUpKind[x] == CW_UP_ASG_RHS {
+    const a = nodeAt(cwIxUp[x])
+    if (
+      a is BinExpr
+      && a.binOp == "="
+      && nodeAt(parenPeelIx(a.binLeft)) is Ident
+    ) {
+      d = identDeclOf(parenPeelIx(a.binLeft))
+    }
+  }
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  return n is LetDecl && n.letType >= 0
+}
+
 // The binding rule for one `BND_LET` bound `row` (row `ci` of its kind) of `calleeFn`: a value the
 // body stores in a `let` or `const` must fit it at the bindings (`letAssignMsg`, attributed to the
 // call); either side still open re-defers.
@@ -3797,6 +3886,31 @@ export function letRule(
     // A generic function value into a declared binding a generic function type annotates:
     // judged now, as no call closes the binding's type (D17322). A write keeps its own rules.
     const gw = if !clash && row.s != "" && tyHasHole(lg) && tyHasHole(lw) { genSigFitWhy(lg, lw, row.s) } else { GEN_SIG_DEFER }
+    // A concrete function into a binding the call leaves at a generic declaration's own
+    // signature: T9.3 holds only a generic function there.
+    if (
+      !clash
+      && !tyHasHole(lg)
+      && lg >= 0
+      && lg < T.tys.length
+      && tyAt(lg) is TyFunc
+      && genSigDecl(lw) >= 0
+      && rowLetAnnotated(row.site)
+      && !letLamJudgedAtCall(ci, ix)
+    ) {
+      tErrCoded(
+        "cannot assign "
+          + tyToStr(lg)
+          + (if row.s != "" { " to '" + row.s + "'" } else { " to a binding" })
+          + " of the generic function type "
+          + genSigStr(lw, genSigDecl(lw))
+          + ": a function written to it must be generic too (T9.3) ("
+          + atCallWhereAs(row.fn, who, row.on, row.a, row.site, ix, "used", "body")
+          + ")",
+        ix,
+        CODE_GENERIC_BINDING_CONCRETE_WRITE,
+      )
+    }
     if gw != GEN_SIG_DEFER && gw != "" && !letLamJudgedAtCall(ci, ix) {
       tErr(
         gw
@@ -4535,9 +4649,15 @@ function listSiteMapCopy(site: i32, lam: i32, pos: i32): boolean {
     callArgNames: names,
     pos: pos,
   }
-  arenaSetNode(site, c)
-  fvaListCopyNote(site)
   fvaListCopyNote(mem)
+  return fvaSiteSet(site, c)
+}
+
+// Writes converting copy `n` over `site`, notes it a copy, and checks it: the one place a
+// copy rewrites a delivered site.
+function fvaSiteSet(site: i32, n: Node): boolean {
+  arenaSetNode(site, n)
+  fvaListCopyNote(site)
   luGrow()
   checkNodeHook(site)
   return true
@@ -4593,6 +4713,8 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
   if !(sa is TyArray) || tyElemOf(sa) == de || fvaListHoldsLetAlias(site) {
     return false
   }
+  // A value already built at the destination's list needs no copy (D17753).
+  if fvaListBuiltAt(site, de) { return false }
   // A set's elements, or a hole parameter's, which an instance binds to one.
   const held = fnTagSetValueOfTy(tyElemOf(sa))
     || fnTagSetOfTy(tyElemOf(sa)) >= 0
@@ -4629,6 +4751,113 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
   }
   const lam = luAt(addNode(fvaLambda(ps, rt, body, site, pos)), site)
   return listSiteMapCopy(site, lam, pos)
+}
+
+// Whether list value `site`, or the literal the binding it reads is built from, is built at a list
+// of closed function type `de`: the one build decision (the rep stamp) already holds closures.
+function fvaListBuiltAt(site: i32, de: i32): boolean {
+  const x = cwPeelValue(site)
+  if x < 0 || x >= P.nodes.length { return false }
+  const d = if nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const v = if dn is LetDecl && dn.letType < 0 && dn.letInit >= 0 { cwPeelValue(dn.letInit) } else { x }
+  if v < 0 || v >= P.nodes.length || !nodeRepStamped(v) { return false }
+  const r = nodeRepTyIxOf(v)
+  const ra = if r >= 0 && r < T.tys.length { tyAt(r) } else { null }
+  return ra is TyArray && tySame(tyElemOf(ra), de)
+}
+
+// A call `site` of record type `srcTy` whose function field holds a set, delivered to `dstTy`
+// closing that field: `site` becomes `{ f: site.f }`, its field coerced there. Only a call of an
+// un-annotated function returning only literals, with another call site, is fresh, so no other
+// handle sees the copy; one call site builds the literal at its destination (D15900).
+export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
+  if site < 0 || srcTy < 0 || dstTy < 0 || inferQuiet || monoRecheckDepth > 0 {
+    return false
+  }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length || fvaListCopyAt(site) {
+    return false
+  }
+  const sx = parenPeelIx(site)
+  const sn = if sx >= 0 && sx < P.nodes.length { nodeAt(sx) } else { null }
+  if (
+    !(sn is Call)
+    || sn.callFn < 0
+    || sn.callFn >= P.nodes.length
+    || !(nodeAt(sn.callFn) is Ident)
+  ) {
+    return false
+  }
+  const fd = identFnDeclOf(sn.callFn)
+  const fn = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) || fn.fnRet >= 0 { return false }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length == 0 { return false }
+  for lf in leaves {
+    const l = parenPeelIx(lf)
+    const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+    if !(ln is ObjLit || ln is ArrayLit) || recRetSoleCall(l) != l {
+      return false
+    }
+  }
+  const sa = tyAt(nonNullTy(srcTy))
+  const da = tyAt(nonNullTy(dstTy))
+  const list = sa is TyArray && da is TyArray
+  const sr = if sa is TyArray { tyElemOf(sa) } else { nonNullTy(srcTy) }
+  const dr = if da is TyArray { tyElemOf(da) } else { nonNullTy(dstTy) }
+  if sr < 0 || dr < 0 || sr >= T.tys.length || dr >= T.tys.length {
+    return false
+  }
+  if list != (da is TyArray) || !fvaRecFieldsClose(sr, dr) { return false }
+  // A list's copy would go through `.map`, which does not yet coerce a set's field at its
+  // lambda's result (D17775); a record of one field is copied without one.
+  const dro = tyAt(dr)
+  // A record of several fields is converted where it is delivered, each member pinned there.
+  if !list && dro is TyObj && dro.objFieldNames.length > 1 {
+    fnTagValueDstNote(sx, dr)
+  }
+  if list || !(dro is TyObj) || dro.objFieldNames.length != 1 { return false }
+  const pos = nodePos(site)
+  const siteNode = nodeAt(site)
+  const moved = addNode(siteNode)
+  adoptNodeTok(moved, site)
+  const nm = dro.objFieldNames[0]
+  const rd = luAt(mkMember(moved, nm, pos), site)
+  const fs: i32[] = []
+  fs.push(luAt(mkFieldInit(nm, rd, pos), site))
+  const lit: Node = { objFields: fs, pos: pos }
+  return fvaSiteSet(site, lit)
+}
+
+// Whether record `src` holds a set or hole function at a field record `dst` declares a closed
+// function type, the two records' field names alike.
+function fvaRecFieldsClose(src: i32, dst: i32): boolean {
+  const so = tyAt(src)
+  const d = tyAt(dst)
+  if (
+    !(so is TyObj)
+    || !(d is TyObj)
+    || so.objFieldNames.length != d.objFieldNames.length
+  ) {
+    return false
+  }
+  let any = false
+  let i = 0
+  while i < d.objFieldNames.length {
+    const k = strListIndexOf(so.objFieldNames, d.objFieldNames[i])
+    if k < 0 { return false }
+    const st = so.objFieldTypes[k]
+    const dt = d.objFieldTypes[i]
+    const dft = if dt >= 0 && dt < T.tys.length { tyAt(dt) } else { null }
+    const held = st >= 0
+      && st < T.tys.length
+      && (fnTagSetValueOfTy(st)
+      || fnTagSetOfTy(st) >= 0
+      || tyHasHole(st))
+    if dft is TyFunc && !tyHasHole(dt) && held && !tySame(st, dt) { any = true }
+    i = i + 1
+  }
+  return any
 }
 
 // Set while `fvaAdaptEnclosing` lets an adapter name the enclosing generic's type parameters.
@@ -5932,6 +6161,14 @@ export function fvaValueRowAt(decl: i32, dt: i32) {
   return elabWideRowNote(decl, names, tys, d.fnRet)
 }
 
+// Notes `site`, a value its holes leave open, delivered at closed function type `dt`, which no
+// adapter is built at: the decision pins each member there by a value arm when the value turns
+// out to carry a set, which the destination converts to a closure.
+function fvaValueSiteNote(site: i32, srcTy: i32, dt: i32) {
+  if !tyHasHole(srcTy) || tyHasTyVar(dt) || tyHasHole(dt) { return 0 }
+  return fnTagValueDstNote(parenPeelIx(site), dt)
+}
+
 // A copy of the node at `site`, keeping its token and the declaration an identifier resolves to,
 // so the site itself can be rewritten around it.
 function fvaMoveSite(site: i32): i32 {
@@ -6015,6 +6252,8 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     }
   }
   if !(s is TyFunc) || !(d is TyFunc) {
+    // A value still open here may be a set's once its holes close; the decision checks the site.
+    if d is TyFunc && tyHasHole(srcTy) { fvaValueSiteNote(srcExpr, srcTy, dt) }
     // A function inside a container is not rewritten on the way, so a call through the
     // destination's function type would reach it at another signature. A union delivers the
     // container to each arm it is assignable to, so each is such a destination (D16296).
