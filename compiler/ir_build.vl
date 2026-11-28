@@ -66,7 +66,7 @@ import {
   cloLiftWriteSlot,
   cloLifted,
 } from "./ir_lift"
-import { cloLiftCalleeOf } from "./ir_lift_scan"
+import { cloLiftCalleeOf, cloLiftFramePos } from "./ir_lift_scan"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import {
   sigKeyRetIsVoid,
@@ -650,7 +650,11 @@ import {
   structRowFnSlotLayout,
   structRowOfRecordTy,
 } from "./emit_shape_rows"
-import { mvValTyIxAt, unMemRefArrArmSlot } from "./emit_map_value_slots"
+import {
+  mvValTyIxAt,
+  tyRefArrElemOf,
+  unMemRefArrArmSlot,
+} from "./emit_map_value_slots"
 import {
   BinNulTest,
   NULL_OWN_ATOM,
@@ -3794,7 +3798,10 @@ function closedListElemTy(lt: i32): i32 {
   if lt < 0 { return -1 }
   const ln = repNodeAt(repNodeOfTy(lt))
   if !(ln is RList) { return -1 }
-  const et = repTyOf(ln.rlsElem)
+  // A rep's type is whichever type first reached its key (a tagged set's open function at the
+  // `i32` leaf), so a list type's own closed element answers before it (D17768).
+  const own = tyRefArrElemOf(lt)
+  const et = if own >= 0 && !irTyOpen(own) { own } else { repTyOf(ln.rlsElem) }
   return if et >= 0 && !irTyOpen(et) { et } else { -1 }
 }
 
@@ -6333,7 +6340,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if unbox && ak < 0 { return irBMiss("capture unbox") }
   const narrowed = unbox || na == "plain" || na == "held"
   // A closure capture read where its type leaves a closure part open, or fills one, is the same
-  // closure struct, retagged.
+  // closure struct, read at the capture's own rep: one value, one layout (D17755).
   const holed = cr != rep
     && !narrowed
     && holeRetagNoted(cr, rep, true)
@@ -6392,8 +6399,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     const own = irBLetTempTy(b, ev, ix, cr, cty)
     // Retagged to a rep whose type is open, the value would have no type; a holder's member is
     // read as its capture holds it, as a global holder's is.
-    if holed && irTyHeldOpen(heldTy(exprTyOf(ix)), rep) { return own }
-    if holed { return repTemp(b, { rgV: own }, ix, rep) }
+    if holed { return own }
     if boxed { return irBLetTemp(b, { sgV: own }, ix, rep) }
     if unbox { return captureUnbox(b, own, ix, rep, ak) }
     return captureRecover(b, own, ix, rep, na)
@@ -6407,8 +6413,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if v < 0 || ib.irVars[v].vRep != held { return irBMiss("capture binding") }
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
-  if holed && irTyHeldOpen(heldTy(exprTyOf(ix)), rep) { return o }
-  if holed { return repTemp(b, { rgV: o }, ix, rep) }
+  if holed { return o }
   if boxed { return irBLetTemp(b, { sgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
@@ -20021,7 +20026,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is TypeDecl || n is UnionDecl { return 0 }
   if n is LetDecl {
     // A `const` bound to a lambda-lifted function holds no value: every use calls it directly.
-    if n.letInit >= 0 && cloLiftLetFe(fnStmtsPosOf(ibFnIx), ix) >= 0 {
+    if n.letInit >= 0 && cloLiftLetFe(cloLiftFramePos(ibFnIx), ix) >= 0 {
       return 0
     }
     const fresh = (ibDeclVar[ix] ?? -1) < 0
