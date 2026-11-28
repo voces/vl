@@ -7757,18 +7757,13 @@ function elabSlotRecordNote(c: i32) {
   // A value that reads a holder stands for the holder's call, and the holder is held whole.
   const linked: i32[] = []
   const stores: i32[] = []
-  // A hole lambda written into the slot is built as the record at its signatures (D17572).
+  // A function value whose declaration is instanced per signature (a hole lambda, or a read of a
+  // generic or hole-parameter function) is built as the record at its signatures (D17572).
   const lams: i32[] = []
   const wraps: i32[] = []
   for v0 in vals {
     const lv = parenPeelIx(v0)
-    const ln = if lv >= 0 && lv < P.nodes.length { nodeAt(lv) } else { null }
-    if (
-      ln is FuncDecl
-      && ln.fnName == ""
-      && elabDeclHasHoleParam(lv)
-      && elabInPlainCode(lv)
-    ) {
+    if elabInstanceableFnOf(lv) {
       lams.push(lv)
       continue
     }
@@ -7947,6 +7942,13 @@ function elabSlotRecordNote(c: i32) {
   for l in lams {
     elabLamProducers.push(l)
     elabLamProducerAt.push(at)
+    // A named declaration is elaborated at each signature its producer is instanced at.
+    if nodeAt(l) is Ident {
+      for sg in rec {
+        const sf = tyAt(sg)
+        if sf is TyFunc { elabEnqueueAtParams(identDeclOf(l), sf.fnParamTypes) }
+      }
+    }
   }
   for w in wraps { elabFnWraps[w] = at }
   for h in linked {
@@ -9498,8 +9500,8 @@ function elabMakerLamRecord(d: i32, dn: FuncDecl): i32[] {
 let elabLamProducers: i32[] = []
 let elabLamProducerAt: i32[] = []
 
-// The record signatures hole lambda `lam` is built as where a slot holding a record is written
-// with it; none for any other lambda.
+// The record signatures producer `lam` (a hole lambda, or a generic or hole-parameter function's
+// read) is built as where a slot holding a record is written with it; none for any other node.
 export function elabLamProducerSigs(lam: i32): i32[] {
   const at = i32ListIndexOf(elabLamProducers, nodeSrc[lam] ?? lam)
   const r = if at >= 0 { elabLamProducerAt[at] } else { -1 }
@@ -9514,6 +9516,19 @@ let elabFnWraps: {[i32]: i32} = Map()
 export function elabFnWrapSigs(x: i32): i32[] {
   const r = elabFnWraps.get(nodeSrc[x] ?? x) ?? -1
   return if r >= 0 && r < elabRecTable.length { elabRecTable[r] } else { [] }
+}
+
+// Whether `x`, in plain code, is a function value instanced per signature: a hole lambda, or a read
+// of a named function with type parameters or a hole parameter.
+function elabInstanceableFnOf(x: i32): boolean {
+  if x < 0 || x >= P.nodes.length || !elabInPlainCode(x) { return false }
+  const xn = nodeAt(x)
+  if xn is FuncDecl { return xn.fnName == "" && elabDeclHasHoleParam(x) }
+  if !(xn is Ident) { return false }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) || dn.fnName == "" { return false }
+  return dn.fnTyParams.length > 0 || elabDeclHasHoleParam(d)
 }
 
 // The member of record `rec` named function read `x`'s closed signature is, where `x` names an
@@ -13863,6 +13878,38 @@ function elabListCallSig(bd: i32, s: i32): i32 {
   return sig
 }
 
+// Whether every declaration in `ds` is a generic function.
+function elabAllGeneric(ds: i32[]): boolean {
+  for d in ds {
+    const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if !(n is FuncDecl) || n.fnTyParams.length == 0 { return false }
+  }
+  return true
+}
+
+// The closed type the `let` call `ix` hands at parameter row `names[i]` holds, read from its
+// holder class as mono pins it (`eplHolderTy`), where it closes and differs from `t`; else -1.
+function elabArgOwnTy(ix: i32, names: string[], i: i32, t: i32): i32 {
+  const cn = nodeAt(ix)
+  const d = elabCallDeclOf(ix)
+  const fd = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(cn is Call) || !(fd is FuncDecl) || i >= names.length { return -1 }
+  let pi = 0
+  while pi < fd.fnParams.length && pi < cn.callArgs.length {
+    if paramHoleName(fd.fnName, d, pi) == names[i] {
+      const a = parenPeelIx(cn.callArgs[pi])
+      const bd = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
+      if bd < 0 || bd >= P.nodes.length || !(nodeAt(bd) is LetDecl) {
+        return -1
+      }
+      const own = eplHolderTy(bd, -1)
+      return if own >= 0 && own != t && tysClosed([own]) { own } else { -1 }
+    }
+    pi = pi + 1
+  }
+  return -1
+}
+
 // Enqueues call `ix`'s row `names`/`tys` with each set of functions taking its rep at `ck`
 // (`elabSetRepTy`), when one moves and the row closes.
 function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
@@ -13888,6 +13935,11 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
     // A set the callee writes functions into through the parameter runs at their signature.
     const held: i32[] = []
     elabFnIdsIn(t, held, [])
+    // A binding the callee writes generics into is built at its own closed type, the one mono
+    // pins it at, not at a type it shares with another binding (D10023).
+    if rt < 0 && ck < 0 && held.length > 0 && elabAllGeneric(held) {
+      rt = elabArgOwnTy(ix, names, i0, t)
+    }
     if rt < 0 && i0 < names.length && held.length > 0 {
       rt = elabWrittenRep(ix, names[i0], t)
     }
@@ -24132,6 +24184,9 @@ function elabStampKeepsTagged(x: i32, t: i32): i32 {
   const tt = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
   if !(n is ObjLit) || !(tt is TyObj) { return t }
   const tys = tt.objFieldTypes.slice(0)
+  // The literal's own rep holds the ids a tagged field is built as, where it closes them.
+  const own = nodeRepTyIxOf(x)
+  const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
   let moved = false
   for fx in n.objFields {
     const f = nodeAt(fx)
@@ -24144,7 +24199,9 @@ function elabStampKeepsTagged(x: i32, t: i32): i32 {
       && vt != tys[k]
       && (fnTagTyIsTagged(vt) || fnTagHoldsTy(vt))
     ) {
-      tys[k] = vt
+      const ok = if ot is TyObj && f is FieldInit { strListIndexOf(ot.objFieldNames, f.fiName) } else { -1 }
+      const of = if ot is TyObj && ok >= 0 && ok < ot.objFieldTypes.length { ot.objFieldTypes[ok] } else { -1 }
+      tys[k] = if of >= 0 && !tyHasTyVar(of) { of } else { vt }
       moved = true
     }
   }
