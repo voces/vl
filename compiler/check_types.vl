@@ -1539,7 +1539,9 @@ export function tyEq(a0: i32, b0: i32) {
   const hits = tyEqGuardHits
   tyEqAStack.push(a)
   tyEqBStack.push(b)
+  eqEnter("eq", a, b, -1, -1)
   const ok = tyEqGo(a, b)
+  eqLeave()
   tyEqAStack.pop()
   tyEqBStack.pop()
   if tyEqAStack.length > 0 && tyEqGuardHits == hits && tyAt(a) is TyObj {
@@ -1598,6 +1600,7 @@ function unionEq(a: i32, b: i32) {
 }
 
 function tyEqGo(a: i32, b: i32) {
+  eqTick()
   // `tyEq` answers "do these render identically", and a nominal newtype renders as its
   // name — so two brands, or a brand and its base, are not equal here either, keeping the
   // predicate consistent with `tyToStr`.
@@ -4796,6 +4799,110 @@ export function oneStrLitSpelling(ty: i32): string {
 // ── type-arena constructors ──────────────────────────────────────────────────
 // Each appends a variant to `T.tys` and returns its index — the same shape as the AST's `mk*`
 // constructors, for the parallel arena.
+
+export const eqCalls: {[string]: i32} = Map()
+export const rcStat: {[string]: i32} = Map()
+export let rcPhase = 0
+export function rcPhaseSet(v: i32): i32 { rcPhase = v; return 0 }
+let eqMuteDepth = 0
+let eqMuteCat = ""
+export function eqMute(on: boolean): i32 {
+  if on {
+    eqMuteDepth = eqDepth
+    eqMuteCat = eqCat
+    eqDepth = 1
+    eqCat = "rcprobe"
+  } else {
+    eqDepth = eqMuteDepth
+    eqCat = eqMuteCat
+  }
+  return 0
+}
+const eqAppName: {[i32]: string} = Map()
+function eqRecName(t: i32): string {
+  const s = structNameOfTy(t)
+  if s != "" { return s }
+  const c = eqAppName.get(t)
+  if c != null { return c }
+  let r = ""
+  let i = 0
+  while i < gaAppTyIxs.length {
+    if gaAppTyIxs[i] == t { r = "app:" + gaAppHeads[i] }
+    i = i + 1
+  }
+  eqAppName.set(t, r)
+  return r
+}
+function eqRecCat(a: i32, b: i32): string {
+  const na = eqRecName(a)
+  const nb = eqRecName(b)
+  let nm = "anon-anon"
+  if na != "" && nb != "" { nm = if na == nb { "samedecl" } else { "crossdecl" } }
+  else if na != "" || nb != "" { nm = "named-anon" }
+  const oa = tyAt(a)
+  const ob = tyAt(b)
+  let shallow = false
+  if oa is TyObj && ob is TyObj {
+    shallow = oa.objFieldNames.length == ob.objFieldNames.length
+    let i = 0
+    while shallow && i < oa.objFieldNames.length {
+      if oa.objFieldNames[i] != ob.objFieldNames[i] || oa.objFieldTypes[i] != ob.objFieldTypes[i] { shallow = false }
+      i = i + 1
+    }
+  }
+  return "-" + nm + (if shallow { "-shalloweq" } else { "-shallowne" })
+}
+export const eqWork: {[string]: i32} = Map()
+export let eqDepth = 0
+export let eqCat = ""
+export function eqKindOf(t: i32): string {
+  if t < 0 || t >= T.tys.length { return "x" }
+  const a = tyAt(t)
+  return match a {
+    TyFunc => "F"
+    TyObj => "O"
+    TyUnion => "U"
+    TyNullable => "N"
+    TyArray => "A"
+    TyMap => "M"
+    TyPrim => "P"
+    TyLit => "L"
+    TyVar => "V"
+    TyErr => "E"
+    TyNeg => "G"
+  }
+}
+export function eqEnter(who: string, a: i32, b: i32, setA: i32, setB: i32): i32 {
+  eqDepth = eqDepth + 1
+  if eqDepth == 1 {
+    let ka = eqKindOf(a)
+    let kb = eqKindOf(b)
+    let cat = who + ":" + (if ka < kb { ka + kb } else { kb + ka })
+    if ka == "F" && kb == "F" {
+      const fa = tyAt(a)
+      const fb = tyAt(b)
+      let same = false
+      if fa is TyFunc && fb is TyFunc {
+        same = fa.fnRet == fb.fnRet && fa.fnParamTypes.length == fb.fnParamTypes.length
+        let i = 0
+        while same && i < fa.fnParamTypes.length {
+          if fa.fnParamTypes[i] != fb.fnParamTypes[i] { same = false }
+          i = i + 1
+        }
+      }
+      cat = cat + (if same && setA == setB { "-merge" } else if same { "-sameshape-otherset" } else { "-differ" })
+    }
+    if ka == "O" && kb == "O" { cat = cat + eqRecCat(a, b) }
+    eqCat = cat
+    eqCalls.set(cat, (eqCalls.get(cat) ?? 0) + 1)
+  }
+  return 0
+}
+export function eqLeave(): i32 { eqDepth = eqDepth - 1; return 0 }
+export function eqTick(): i32 {
+  if eqDepth > 0 { eqWork.set(eqCat, (eqWork.get(eqCat) ?? 0) + 1) }
+  return 0
+}
 
 export const tyFnSiteOf: i32[] = []
 export const tyFnSiteRet: i32[] = []

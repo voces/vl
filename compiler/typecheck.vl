@@ -9,6 +9,10 @@
 // module, so they recurse through `checkNodeHook`, which `checkProgramPass` installs.
 
 import { ovKeyedSplit } from "./check_overload"
+import { callDstTy, cbExpectedFor, cbExpectedRetFor, joinWantAt } from "./check_expected"
+import { eqMute, rcPhase, rcStat, tyEq } from "./check_types"
+import { inferQuiet } from "./check_cursor"
+import { i32ToStr } from "./ast"
 import { identReadFnOfWrite, identTyOf, narTyAtDepth } from "./check_nar_store"
 import { cwFrameReset } from "./check_write_scan"
 import {
@@ -204,6 +208,117 @@ import { lbiArithOp } from "./check_num_lits"
 // node's resolved type-arena index into the typed-IR table. Recording the arena index, not a
 // snapshot, means a hole pinned later in place is reflected when the emitter reads it back — last write wins.
 export function checkNode(ix: i32) {
+  if rcDepth == 0 && (rcSeen.get(ix) ?? 0) > 0 { return rcRoot(ix) }
+  return checkNodeBody(ix)
+}
+
+const rcSeen: {[i32]: i32} = Map()
+const rcKeyAt: {[i32]: string} = Map()
+const rcResAt: {[i32]: i32} = Map()
+const rcFirstAt: {[i32]: string} = Map()
+let rcRootTag = ""
+let rcRootBad = false
+function rcPhaseNow(): string {
+  if rcPhase == 1 { return "pre" }
+  if inferQuiet { return "quiet" }
+  return "real"
+}
+function rcBump(k: string, d: i32): i32 {
+  rcStat.set(k, (rcStat.get(k) ?? 0) + d)
+  return 0
+}
+function rcKindOf(ix: i32): string {
+  const n = nodeAt(ix)
+  return match n {
+    FuncDecl => "FuncDecl"
+    Block => "Block"
+    LetDecl => "LetDecl"
+    Call => "Call"
+    _ => "other"
+  }
+}
+let rcDepth = 0
+let rcVisits = 0
+function rcExpKey(ix: i32): string {
+  let k = i32ToStr(joinWantAt.get(ix) ?? -1) + "," + i32ToStr(callDstTy.get(ix) ?? -1)
+  if nodeAt(ix) is FuncDecl {
+    k = k + "," + i32ToStr(cbExpectedRetFor(ix))
+    const ps = cbExpectedFor(ix)
+    for p in ps { k = k + ":" + i32ToStr(p) }
+  }
+  return k
+}
+function rcTier(same: boolean, t: i32, prev: i32): string {
+  if !same { return "newkey" }
+  if t == prev { return "samekey-ixeq" }
+  if t < 0 || prev < 0 { return "samekey-differ" }
+  eqMute(true)
+  const e = tyEq(t, prev)
+  eqMute(false)
+  if e { return "samekey-tyeq" }
+  return "samekey-differ"
+}
+function rcNote(ix: i32, same: boolean, t: i32, k: string, v0: i32) {
+  const tier = rcTier(same, t, rcResAt.get(ix) ?? -1)
+  rcBump(tier + " roots", 1)
+  rcBump(tier + " visits", rcVisits - v0)
+  rcBump("root " + rcRootTag + " roots", 1)
+  rcBump("root " + rcRootTag + " visits", rcVisits - v0)
+  const cl = if rcRootBad { "dirty" } else { "clean" }
+  rcBump("whole " + cl + " roots", 1)
+  rcBump("whole " + cl + " visits", rcVisits - v0)
+  rcBump("whole " + cl + " " + rcRootTag + " visits", rcVisits - v0)
+  rcResAt.set(ix, t)
+  rcKeyAt.set(ix, k)
+  return 0
+}
+function rcRoot(ix: i32): i32 {
+  const k = rcExpKey(ix)
+  const same = (rcKeyAt.get(ix) ?? "?") == k
+  const v0 = rcVisits
+  rcRootTag = (rcFirstAt.get(ix) ?? "?") + "->" + rcPhaseNow() + " " + rcKindOf(ix)
+  rcDepth = 1
+  rcRootBad = false
+  const t = if same { rcRootSameKey(ix) } else { rcRootNewKey(ix) }
+  rcDepth = 0
+  rcNote(ix, same, t, k, v0)
+  return t
+}
+function rcRootSameKey(ix: i32): i32 {
+  const t = checkNodeBody(ix)
+  return t
+}
+function rcRootNewKey(ix: i32): i32 {
+  const t = checkNodeBody(ix)
+  return t
+}
+function rcEnter(ix: i32): i32 {
+  rcVisits = rcVisits + 1
+  if rcFirstAt.get(ix) == null { rcFirstAt.set(ix, rcPhaseNow()) }
+  rcSeen.set(ix, (rcSeen.get(ix) ?? 0) + 1)
+  rcKeyAt.set(ix, rcExpKey(ix))
+  return 0
+}
+function rcLeave(ix: i32, t: i32, prev: i32, k0: string): i32 {
+  if rcDepth == 1 {
+    if prev == -9 { rcBump("nested new", 1) }
+    else if k0 != rcExpKey(ix) { rcBump("nested newkey", 1); rcRootBad = true }
+    else if prev == t { rcBump("nested ixeq", 1) }
+    else {
+      eqMute(true)
+      const e = prev >= 0 && t >= 0 && tyEq(t, prev)
+      eqMute(false)
+      if e { rcBump("nested tyeq", 1) } else { rcBump("nested differ", 1); rcRootBad = true }
+    }
+  }
+  rcResAt.set(ix, t)
+  return 0
+}
+
+function checkNodeBody(ix: i32) {
+  const rcPrev = rcResAt.get(ix) ?? -9
+  const rcK0 = rcKeyAt.get(ix) ?? "?"
+  rcEnter(ix)
   const savedTail = retTailPos
   if retTailPos {
     if !tailSpineNode(ix) { retTailPosSet(false) }
@@ -212,6 +327,7 @@ export function checkNode(ix: i32) {
   if expObsFn >= 0 { expObsRead(ix, t) }
   checkNodeDone(ix, t, savedTail)
   letDeclBoundRecord(ix)
+  rcLeave(ix, t, rcPrev, rcK0)
   return t
 }
 
