@@ -13449,3 +13449,23 @@ parameter mean one thing on a parameter and another on a `let`. Two consequences
 the unread default that instances a generic handed to a parameter nothing reads (D6213) fixes that
 value's instance and never the type parameter other readers use; and a binding's alias source is
 the value it stores, whatever its annotation names. Ruled by the coordinator.
+
+## A maker's call is built at its destination's record (coordinator ruling, 2026-11-28) — D17226, D17228
+
+A maker's call is built at the record its destination stores. The destination's stored rep
+decides the record, and the elaboration builds the call there once, at the point where that
+record is known. A value join delivers each arm at the join's record (`adoptArmAt`), and a call
+arm is pended to the record solve there exactly as a name arm is. The join then reaches its
+destination at one rep, so every delivery position (a binding, a parameter, an annotated or an
+inferred result, a nested join) goes through the same code, with no per-position branch.
+
+A maker is not a converter. Its call constructs a fresh record, so building it at the
+destination is construction, not a copy, and nothing else holds the old rep. That is why the
+rule is legal only for a fresh record. The record solve is the one reader of that condition:
+it adopts a record built once at its one destination, and refuses loudly a record that is also
+wanted at another record (a write through one would break the other). No second rule is added
+for call arms.
+
+One maker wanted at several destinations of differing records needs one instance per distinct
+destination record, keyed in the intern key (maker × record), never in a side table. That part
+is open as D17228. Ruled by the coordinator.

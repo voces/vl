@@ -101,6 +101,7 @@ import {
   elabWalkTop,
   elabWideTwinOf,
   elabWrittenValueTy,
+  eplSigConflicts,
   eplSlotAnnRets,
   eplSlotDeliveredTys,
   eplSlotPerInstance,
@@ -889,6 +890,12 @@ let monoLamCloneSlots: i32[] = []
 // stays -1, the fall-through to `moduleLocalLetOfUnique`. Rebuilt at the one write to
 // `monoProgStmts`, so it carries no row from an earlier compile.
 let monoProgLetBySid: i32[] = []
+// Elements of a stamped list literal whose place agrees on no signature, each with its frame and
+// the stamp's element: one no path instanced (`monoElemInst`) takes the stamp (D17771).
+let monoStampElemAt: i32[] = []
+let monoStampElemCtx: i32[] = []
+let monoStampElemTy: i32[] = []
+let monoStampElemLit: i32[] = []
 
 // The arena's size, a memo key for the walks below that cache a whole-arena answer.
 function monoArenaStamp() {
@@ -8384,8 +8391,7 @@ export function monoStateReset() {
   monoChoiceBindTy = []
   monoChoiceBindGen = []
   monoDestPinOff = false
-  monoElemTakenSig = Map()
-  monoElemAtSet = Map()
+  monoElemInst = Map()
   monoTopStmts = []
   monoInstIsFirst = false
   monoLastInstFe = 0 - 1
@@ -10504,9 +10510,8 @@ function monoInstanceForReq(
     )
   }
   // A value a call through its set already instanced keeps that instance.
-  if (monoElemAtSet[letInitIx] ?? false) && !monoTysHoldSet(deliveryTys) {
-    return 0
-  }
+  const atSet = monoElemInst.get(letInitIx)?.meSet ?? false
+  if atSet && !monoTysHoldSet(deliveryTys) { return 0 }
   const fn = nodeAt(monoOrigNode[origFe])
   if fn is FuncDecl {
     const params = fn.fnParams
@@ -10915,6 +10920,7 @@ function monoCoerceFnValueTys(
                 if tyNulFuncInner(tnameTy) >= 0 { tyNulFuncInner(tnameTy) } else { tnameTy },
               ),
             )
+            if vr >= 0 { monoElemInstRecord(exprIx) }
             return vr
           }
         }
@@ -13952,6 +13958,22 @@ function monoFlowReadSet(x: i32, g: i32): boolean {
     const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
     if bn is Param && bn.parType < 0 { return false }
   }
+  // A read `xs[k]` of a `const` bound to a list literal names that literal's element `k`, which is
+  // recorded before the read is overwritten (`monoElemInst`).
+  const rk = if xi is Index { nodeAt(xi.idxIndex) } else { null }
+  const ra = if xi is Index { unwrapParen(xi.idxArr) } else { -1 }
+  const rd = if ra >= 0 && nodeAt(ra) is Ident { identDeclOf(ra) } else { -1 }
+  const rdn = if rd >= 0 && rd < P.nodes.length { nodeAt(rd) } else { null }
+  const rl = if rdn is LetDecl && rdn.letKw == "const" && rdn.letInit >= 0 { nodeAt(unwrapParen(rdn.letInit)) } else { null }
+  if rk is NumLit && rl is ArrayLit {
+    let rj = 0
+    while rj < rl.arrElems.length {
+      if i32ToStr(rj) == rk.numText {
+        monoElemInstRecord(unwrapParen(rl.arrElems[rj])).meDirect = true
+      }
+      rj = rj + 1
+    }
+  }
   const n: Node = { identName: nm, pos: nodePos(x) }
   const called = monoFlowCalledAt(x)
   const used = called || monoFlowHandedNarrowed(x)
@@ -14338,6 +14360,11 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   // Stores whose results at the pin disagree share no element rep.
   const pinFt = if pinFts.length == 1 { pinFts[0] } else { -1 }
   if !monoListStoresAgree(lit, repoints, at, pinFt) { return 0 }
+  // A tagged set's member is held as its id at every holder, its `F | null` as the nullable id, so
+  // a literal of them stays typed at the set: a destination wanting a closure converts the id there.
+  for e in lit.arrElems {
+    if fnTagTyIsTagged(nonNullTy(nodeTyIxOf(e))) { return 0 }
+  }
   // The element type is the one the elaboration delivers the slot at, else its slot type here.
   let ft = monoSlotDeliveryTy(lf, path, omit, false)
   if ft < 0 {
@@ -18176,6 +18203,13 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const mt = monoNodeTyAt(m.memObj, ctx)
     if mt >= 0 && !monoTyOpen(mt) { rt = mt }
   }
+  // A literal receiver no binding holds reads as the type it is stamped at, else the value its
+  // holder class closes, as a bound one's binding does (D17771).
+  if (rt < 0 || monoTyOpen(rt)) && nodeAt(unwrapParen(m.memObj)) is ArrayLit {
+    const st = nodeRepTyIxOf(unwrapParen(m.memObj))
+    const vt = if st >= 0 && !monoTyOpen(st) { st } else { eplValueTy(unwrapParen(m.memObj), elabWalkTop()) }
+    if vt >= 0 { rt = vt }
+  }
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = tyAt(rt)
   // A tagged set element is closed: the callback's instance takes the set, as a direct call's does.
@@ -18190,7 +18224,7 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   if lam {
     // A lambda the elaboration keyed at the list's build takes that record as its parameter's type.
     // Over a lambda's `map`, directly or through a `const`, the lambda reads the records of the
-    // list that map built or handed on.
+    // list that map built or handed on; over a stamped literal left open, that literal's.
     let rx = unwrapParen(m.memObj)
     const rd = if rx >= 0 && nodeAt(rx) is Ident { identDeclOf(rx) } else { -1 }
     const rdn = if rd >= 0 && rd < P.nodes.length { nodeAt(rd) } else { null }
@@ -18202,7 +18236,10 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const rcb = if rc is Call && rm is Member && rm.memProp == "map" { unwrapParen(rc.callArgs[0]) } else { -1 }
     const lamMap = rcb >= 0 && nodeAt(rcb) is FuncDecl
     const rw0 = elabCbParamRowTy(ax, ax)
-    const rw = if rw0 < 0 && lamMap { tyElemOf(lt) } else { rw0 }
+    const stamped = nodeAt(unwrapParen(m.memObj)) is ArrayLit
+      && monoTyOpen(nodeTyIxOf(unwrapParen(m.memObj)))
+      && nodeRepTyIxOf(unwrapParen(m.memObj)) == rt
+    const rw = if rw0 < 0 && (lamMap || stamped) { tyElemOf(lt) } else { rw0 }
     const lf = nodeAt(ax)
     const lsf = if nodeTyIxOf(ax) >= 0 { tyAt(nodeTyIxOf(ax)) } else { null }
     // A `map` whose lambda hands each element back returns them at the build too (D16211).
@@ -18465,7 +18502,8 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
   // An element holds one instance, so a call that coerces it to another instance than an earlier
   // call through it did cannot be served by the one value (D10701).
   for el in elems {
-    if monoElemTakenSig.has(el) && monoElemTakenSig[el] != nm {
+    const taken = monoElemInst.get(el)?.meList ?? ""
+    if taken != "" && taken != nm {
       return emitFailAt(
         "emitProgram: a function this call reaches through a list or join is already taken at another function type by an earlier call through it",
         n.callFn,
@@ -18481,7 +18519,7 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
       )
     }
     if monoCoerceFnValueName(el, ctx, ft) < 0 { return -1 }
-    monoElemTakenSig[el] = nm
+    monoElemInstRecord(el).meList = nm
   }
   nodeTyRecord(n.callFn, ft)
   return 1
@@ -18581,7 +18619,7 @@ function monoElemsAtSet(
       )
     }
     if monoInstanceFor(fe, pins, x, -1, rows[k], rows[k]) < 0 { return -1 }
-    monoElemAtSet[x] = true
+    monoElemInstRecord(x).meSet = true
     k = k + 1
   }
   nodeTyRecord(n.callFn, ft)
@@ -18737,8 +18775,24 @@ function monoAllFnValues(xs: i32[]): boolean {
   return true
 }
 
-// The function type a call through each list or join element node coerces it to, by node.
-let monoElemTakenSig: {[i32]: string} = Map()
+// How each list element's function value is instanced, by node: a row is written by every
+// instancing path (a coercion writes the bare row); `meList` the type a call through the list
+// coerced it to (D10701), `meSet` at a tagged set, `meDirect` a read of it turned direct.
+type MonoElemInst = {
+  meList: string,
+  meSet: boolean,
+  meDirect: boolean,
+}
+let monoElemInst: {[i32]: MonoElemInst} = Map()
+
+// Element node `el`'s instancing row, a fresh empty one where none is recorded.
+function monoElemInstRecord(el: i32): MonoElemInst {
+  const have = monoElemInst.get(el)
+  if have != null { return have }
+  const r: MonoElemInst = { meList: "", meSet: false, meDirect: false }
+  monoElemInst[el] = r
+  return r
+}
 
 // The declaration of the function element `el` names in frame `ctx`: the generic itself when an
 // earlier call through the same join already instanced the element (D7842), else
@@ -18894,9 +18948,6 @@ function monoFnReadElsewhere(d: i32): boolean {
   }
   return (monoFnValReads[d] ?? []).length > 0
 }
-
-// The element values `monoElemsAtSet` instanced at a tagged set, by node.
-let monoElemAtSet: {[i32]: boolean} = Map()
 
 // Whether some type of `ts` is a tagged set's.
 function monoTysHoldSet(ts: i32[]): boolean {
@@ -24090,6 +24141,16 @@ function monoWalk(ix: i32, ctx: i32) {
         const efe = if evn is Ident && identFnDeclOf(ev) >= 0 { monoFnFeOfIdent(ev, evn.identName, ctx) } else { -1 }
         if efe >= 0 && efe < monoGen.length && monoGen[efe] == 1 {
           const vs = eplValueSig(ev, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+          const sl = nodeRepTyIxOf(ix)
+          const ss = if sl >= 0 && tyAt(sl) is TyArray { tyArrayElemIx(sl) } else { -1 }
+          // An open place takes the stamp, except one whose calls conflict: the stamp cannot
+          // settle two signatures (D14437).
+          if !monoTyClosedFn(vs) && !eplSigConflicts(vs) && monoTyClosedFn(ss) {
+            monoStampElemAt.push(ev)
+            monoStampElemCtx.push(ctx)
+            monoStampElemTy.push(ss)
+            monoStampElemLit.push(ix)
+          }
           const none: i32[] = []
           if (
             monoTyClosedFn(vs)
@@ -27063,6 +27124,10 @@ export function monomorphize(stmts: i32[]) {
   // The index follows the table it answers for, at the write and not at a build point:
   // between the two there is no reader, so `monoModuleLetOf` cannot see an empty column.
   monoProgLetBySid = []
+  monoStampElemAt = []
+  monoStampElemCtx = []
+  monoStampElemTy = []
+  monoStampElemLit = []
   let mi = 0
   while mi < stmts.length {
     const ms = nodeAt(stmts[mi])
@@ -27214,6 +27279,30 @@ export function monomorphize(stmts: i32[]) {
       }
     }
     fe3 = fe3 + 1
+  }
+  // Every element is instanced or rewritten: a stamped literal's open element no path instanced
+  // (an empty `monoElemInst` row) is delivered at the stamp's element, its holder's one fact.
+  let se = 0
+  while se < monoStampElemAt.length {
+    const sev = monoStampElemAt[se]
+    const sst = monoStampElemTy[se]
+    const none: i32[] = []
+    // A literal an element of which a read named directly is a list of call targets, not a value.
+    const sln = nodeAt(monoStampElemLit[se])
+    let direct = false
+    if sln is ArrayLit {
+      for e in sln.arrElems {
+        if monoElemInst.get(unwrapParen(e))?.meDirect ?? false { direct = true }
+      }
+    }
+    if (
+      monoElemInst.get(sev) == null
+      && !direct
+      && monoCoerceFnValueTys(sev, monoStampElemCtx[se], sst, none, sst) < 0
+    ) {
+      return -1
+    }
+    se = se + 1
   }
   const prc = monoPruneTemplates(nDecl)
   if prc < 0 { return prc }

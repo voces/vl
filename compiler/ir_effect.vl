@@ -1,0 +1,300 @@
+// The effect class of each IR right-hand side, for a pass that deletes or moves one: whether it
+// may trap (or not complete), writes state another node can observe (memory, a list, map or
+// record, a global, a stash or frame slot, output), or calls a function, whose effects the
+// caller resolves through the callee. A right-hand side with none is pure: deletable when its value
+// is unused. Pure does not mean it reads no mutable state, so it is not a licence to move one.
+// The class is conservative: a kind whose lowering is not shown to be safe is may-trap and
+// writes, never pure.
+import {
+  RAfterEffects,
+  RArmUnbox,
+  RAsTail,
+  RAsUnion,
+  RAsgParked,
+  RAsgUnwiden,
+  RAtomEq,
+  RAtomSole,
+  RAtomStr,
+  RAtomWide,
+  RAtomic,
+  RBoxField,
+  RBoxNarrow,
+  RBundlePick,
+  RCall,
+  RCallHost,
+  RCallRef,
+  RCallRefHead,
+  RCast,
+  RCellGet,
+  RCellNew,
+  RCloTag,
+  RClosureEq,
+  RCoalAtomStr,
+  RCoalStr,
+  RCoerce,
+  RDeadNever,
+  RDeadNullTest,
+  REnvDrop,
+  REnvGet,
+  REqHelp,
+  RFieldNull,
+  RFnId,
+  RGetField,
+  RGlobalGet,
+  RHandPick,
+  RHolderPick,
+  RHoleOptBox,
+  RIdentityEq,
+  RInitProgress,
+  RIsStaged,
+  RJoinNull,
+  RListCat,
+  RListClear,
+  RListCopy,
+  RListEmpty,
+  RListEmptyArms,
+  RListEq,
+  RListFitIs,
+  RListGet,
+  RListIsAcross,
+  RListLen,
+  RListNew,
+  RListNewDefault,
+  RListPop,
+  RListPush,
+  RListPushMany,
+  RListSlice,
+  RListStage,
+  RLitArms,
+  RMaFoldInit,
+  RMakeClo,
+  RMakeList,
+  RMakeRec,
+  RMapClear,
+  RMapDelete,
+  RMapEq,
+  RMapFilter,
+  RMapFilterHead,
+  RMapGet,
+  RMapGetOr,
+  RMapHas,
+  RMapIter,
+  RMapNew,
+  RMapOp,
+  RMapSet,
+  RMemAccess,
+  RMemOp,
+  RNicheRead,
+  RNulNicheEq,
+  RNulNoneBox,
+  RNulTest,
+  RNullOf,
+  RNumCast,
+  RNumIntr,
+  RNumIs,
+  RNumUnionBin,
+  RNumUnionConvert,
+  RNumWiden,
+  ROptRead,
+  RPrimOp,
+  RPrint,
+  RPrintOpen,
+  RRawOp,
+  RRecCopyPure,
+  RRecDown,
+  RRecMember,
+  RRecordFitIs,
+  RRecover,
+  RRel,
+  RResultPick,
+  RRetNull,
+  RRetag,
+  RSharedFieldSet,
+  RSharedRead,
+  RSimd,
+  RSpread,
+  RStage,
+  RStashSet,
+  RStrOp,
+  RStrToAtom,
+  RStrToAtomStaged,
+  RStructEq,
+  RTagClo,
+  RTagIs,
+  RTagOf,
+  RTagStash,
+  RTest,
+  RToBox,
+  RTruncSat,
+  RUnionConcreteEq,
+  RUnionEq,
+  RUnionNumCrossEq,
+  RUnionStage,
+  RUnionStagedEq,
+  RUnionVariantEq,
+  RVariantChain,
+  RVariantDiscrim,
+  Rhs,
+} from "./ir"
+
+// A right-hand side's effects: it may trap or not complete, it writes observable state, it calls.
+export type RhsEffect = { rxTrap: boolean, rxWrite: boolean, rxCall: boolean }
+
+function fx(trap: boolean, write: boolean, call: boolean): RhsEffect {
+  return { rxTrap: trap, rxWrite: write, rxCall: call }
+}
+
+// Whether `e` has no effect, so its right-hand side may be deleted when its value is unused.
+export function irEffectPure(e: RhsEffect): boolean {
+  return !e.rxTrap && !e.rxWrite && !e.rxCall
+}
+
+// Whether an integer primitive `op` can trap: division and remainder by zero, and a signed
+// division's overflow. Every other primitive completes.
+function primTraps(r: RPrimOp): boolean {
+  const op = r.poOp
+  return op == "div" || op == "divu" || op == "rem" || op == "remu"
+}
+
+// Whether a `.pop()` writes: it shortens the list. With an index it is a `.get(i)`, a read.
+function listOpWrites(r: RListPop): boolean { return r.lqIx.length == 0 }
+
+// The effect class of right-hand side `r`.
+export function irRhsEffect(r: Rhs): RhsEffect {
+  return match r {
+    // Constants, nulls, identity compares and the operand's own value: no trap, no state.
+    RAtomEq |
+      RAtomSole |
+      RAtomWide |
+      RClosureEq |
+      RDeadNullTest |
+      RFieldNull |
+      RJoinNull |
+      RRel |
+      RRetNull |
+      RRetag |
+      RStage |
+      RTagIs |
+      RNulTest |
+      RCoalStr |
+      RAfterEffects |
+      RNullOf |
+      RTruncSat => fx(false, false, false)
+    // A fresh allocation from operands: unobservable until another node reads it.
+    RCellNew | RMakeClo | RMakeRec | RMapNew | RNulNoneBox | RHoleOptBox => fx(false, false, false)
+    RPrimOp => fx(primTraps(r), false, false)
+    RCast => fx(r.ctOnFail == "trap", false, false)
+    // A direct call: the callee's summary carries its effects.
+    RCall => fx(false, false, true)
+    // A call through a closure value: the callee is unknown, and a null closure traps.
+    RCallRef => fx(true, false, true)
+    // A callback per element, into a list the loop builds in its own slots.
+    RMapFilter => fx(true, true, true)
+    // Casts, recoveries, field, element and table reads, and compares that read through them:
+    // each may trap, none writes.
+    RArmUnbox |
+      RAsTail |
+      RAsUnion |
+      RAsgParked |
+      RAsgUnwiden |
+      RAtomStr |
+      RBoxField |
+      RBoxNarrow |
+      RBundlePick |
+      RCellGet |
+      RCloTag |
+      RCoalAtomStr |
+      RCoerce |
+      RDeadNever |
+      REnvGet |
+      REqHelp |
+      RGetField |
+      RGlobalGet |
+      RHandPick |
+      RHolderPick |
+      RIdentityEq |
+      RListCat |
+      RListEq |
+      RListFitIs |
+      RListGet |
+      RListLen |
+      RListNew |
+      RListNewDefault |
+      RListSlice |
+      RLitArms |
+      RMapEq |
+      RMapGetOr |
+      RMapHas |
+      RMapIter |
+      RNicheRead |
+      RNulNicheEq |
+      RNumCast |
+      RNumIntr |
+      RNumUnionBin |
+      RNumUnionConvert |
+      RNumWiden |
+      ROptRead |
+      RRawOp |
+      RRecCopyPure |
+      RRecDown |
+      RRecMember |
+      RRecordFitIs |
+      RRecover |
+      RResultPick |
+      RStrOp |
+      RStrToAtom |
+      RStructEq |
+      RTagClo |
+      RTest |
+      RToBox |
+      RUnionEq |
+      RUnionNumCrossEq |
+      RUnionStagedEq |
+      RUnionVariantEq |
+      RVariantChain |
+      RVariantDiscrim => fx(true, false, false)
+    RListPop => fx(true, listOpWrites(r), false)
+    RListEmpty => fx(true, r.leFit >= 0, false)
+    RListEmptyArms => fx(true, r.lfFit >= 0, false)
+    RSharedRead => fx(true, r.srStash, false)
+    RUnionConcreteEq => fx(true, r.ucStash || r.ucStage != 0, false)
+    // A map read that prints a miss writes output.
+    RMapGet => fx(true, r.mtPrint >= 0, false)
+    RMapOp => fx(true, r.mpOp == "set" || r.mpOp == "delete", false)
+    RMemAccess => fx(true, r.mmBase == 2, false)
+    // Mutations of a list, map, record, memory or global, and output.
+    RAtomic |
+      RInitProgress |
+      RListClear |
+      RListCopy |
+      RListPush |
+      RListPushMany |
+      RMapClear |
+      RMapDelete |
+      RMapSet |
+      RMemOp |
+      RPrint |
+      RSharedFieldSet |
+      RSimd => fx(true, true, false)
+    // Writes into a stash, frame slot or local that a later node reads, or opens blocks.
+    RCallRefHead |
+      REnvDrop |
+      RIsStaged |
+      RListIsAcross |
+      RListStage |
+      RMaFoldInit |
+      RMakeList |
+      RMapFilterHead |
+      RNumIs |
+      RPrintOpen |
+      RSpread |
+      RStashSet |
+      RStrToAtomStaged |
+      RTagStash |
+      RUnionStage => fx(true, true, false)
+    // A host import: what it does is outside the program.
+    RCallHost => fx(true, true, false)
+    // Kinds the lowering does not take (`rhs outside I1`): unknown, so the worst class.
+    RFnId | RTagOf => fx(true, true, false)
+  }
+}

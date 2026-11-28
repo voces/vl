@@ -4655,6 +4655,14 @@ fn compile_vl_instance(
             set.call(&mut store, 1)?;
         }
     }
+    // `$VL_IR_FACTS_TWICE=1`: an optimised build compiles twice, compile 1 gathering the IR's
+    // facts for compile 2 (`setIrFactsTwice`), as a fact-reading pass will. Measures what that
+    // costs before any pass reads them. A seed without the export ignores it.
+    if std::env::var("VL_IR_FACTS_TWICE").is_ok_and(|v| v == "1") {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setIrFactsTwice") {
+            set.call(&mut store, 1)?;
+        }
+    }
     // `$VL_IR_REQUIRE_CLAIM=1`: a function or start body the IR does not claim fails instead of
     // lowering through legacy. Refused on an old seed, which would build legacy's bytes and pass.
     if std::env::var("VL_IR_REQUIRE_CLAIM").is_ok_and(|v| !v.is_empty() && v != "0") {
