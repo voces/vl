@@ -24,6 +24,7 @@ import {
   StrLit,
   TypeRef,
   callHasTyArgs,
+  declExported,
   letInitAt,
   nodeAt,
   tailValueLeaves,
@@ -466,6 +467,8 @@ function bindHoldsFresh(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
   const dn = nodeAt(d)
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
+  // An exported binding's type is its module's API, not its importers' reads.
+  if declExported(d) { return false }
   const iv = parenPeelIx(dn.letInit)
   if iv < 0 || !bindFreshLit(nodeAt(iv)) && !bindMapCtor(iv) { return false }
   const k = cwKeyOfDecl(d)
@@ -637,11 +640,25 @@ function bindIsNarrowed(d: i32): boolean {
 // Whether a slot of binding `d` is written (`d[i] = v`, `d.push(v)`) with a value other than a
 // fresh literal, which decides its element type as well as any typed read.
 function bindSlotWritten(d: i32): boolean {
+  const seen: i32[] = []
+  return bindSlotWrittenIn(d, seen)
+}
+
+// `bindSlotWritten` of `d` and of each un-annotated alias bound to it (`const e = d`), whose
+// writes reach the same list; `seen` holds the bindings already asked.
+function bindSlotWrittenIn(d: i32, seen: i32[]): boolean {
   const k = if d >= 0 && d < P.nodes.length { cwKeyOfDecl(d) } else { -1 }
-  if k < 0 { return false }
+  if k < 0 || i32ListHas(seen, d) { return false }
+  seen.push(d)
   const ow = cwOccWalk(k)
   while cwOccNext(ow) {
     const u = cwIxNode[ow.row]
+    if cwIxCovers(u) && cwIxUpKind[u] == CW_UP_LETINIT {
+      const al = nodeAt(cwIxUp[u])
+      if al is LetDecl && al.letType < 0 && bindSlotWrittenIn(cwIxUp[u], seen) {
+        return true
+      }
+    }
     if cwIxCovers(u) && cwIxUpKind[u] == CW_UP_OBJ {
       const p = cwIxUp[u]
       if cwIxCovers(p) && cwIxUpKind[p] == CW_UP_ASG_LHS {
@@ -670,7 +687,7 @@ function aliasRoot(d: i32): i32 {
     const n = nodeAt(cur)
     if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return cur }
     const iv = parenPeelIx(n.letInit)
-    if !(nodeAt(iv) is Ident) { return cur }
+    if iv < 0 || iv >= P.nodes.length || !(nodeAt(iv) is Ident) { return cur }
     cur = identDeclOf(iv)
   }
   return cur
@@ -709,6 +726,7 @@ function readWrapStep(d: i32): string {
   const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(n is LetDecl) || n.letInit < 0 { return "" }
   const iv = parenPeelIx(n.letInit)
+  if iv < 0 || iv >= P.nodes.length { return "" }
   if nodeAt(iv) is ArrayLit { return "E" }
   if !bindMapCtor(iv) { return "" }
   const k = cwKeyOfDecl(d)
