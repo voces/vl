@@ -678,20 +678,34 @@ function bindIsNarrowed(d: i32): boolean {
 // fresh literal, which decides its element type as well as any typed read.
 function bindSlotWritten(d: i32): boolean {
   const seen: i32[] = []
-  return bindSlotWrittenIn(d, seen, false)
+  const none: i32[] = []
+  return bindSlotWrittenIn(d, seen, false, none)
+}
+
+// `bindSlotWritten` but for a store of a binding the walk `on` carries its fresh binding through,
+// whose value is the one being typed, not another the slot must also hold.
+function bindSlotWrittenOff(d: i32, on: i32[]): boolean {
+  const seen: i32[] = []
+  return bindSlotWrittenIn(d, seen, false, on)
 }
 
 // Whether a slot of binding `d`, or of an un-annotated alias bound to it, is written at all,
 // whatever the value.
 export function bindSlotStored(d: i32): boolean {
   const seen: i32[] = []
-  return bindSlotWrittenIn(d, seen, true)
+  const none: i32[] = []
+  return bindSlotWrittenIn(d, seen, true, none)
 }
 
 // `bindSlotWritten` of `d` and of each un-annotated alias bound to it (`const e = d`), whose
 // writes reach the same list; `seen` holds the bindings already asked. `any` counts a fresh
-// literal's write too.
-function bindSlotWrittenIn(d: i32, seen: i32[], any: boolean): boolean {
+// literal's write too; a store of a read of a binding in `carried` counts not at all.
+function bindSlotWrittenIn(
+  d: i32,
+  seen: i32[],
+  any: boolean,
+  carried: i32[],
+): boolean {
   const k = if d >= 0 && d < P.nodes.length { cwKeyOfDecl(d) } else { -1 }
   if k < 0 || i32ListHas(seen, d) { return false }
   seen.push(d)
@@ -703,7 +717,7 @@ function bindSlotWrittenIn(d: i32, seen: i32[], any: boolean): boolean {
       if (
         al is LetDecl
         && al.letType < 0
-        && bindSlotWrittenIn(cwIxUp[u], seen, any)
+        && bindSlotWrittenIn(cwIxUp[u], seen, any, carried)
       ) {
         return true
       }
@@ -715,7 +729,7 @@ function bindSlotWrittenIn(d: i32, seen: i32[], any: boolean): boolean {
         if (
           any
           || !(a is BinExpr)
-          || !bindFreshLit(nodeAt(parenPeelIx(a.binRight)))
+          || !bindStoreOk(parenPeelIx(a.binRight), carried)
         ) {
           return true
         }
@@ -729,11 +743,20 @@ function bindSlotWrittenIn(d: i32, seen: i32[], any: boolean): boolean {
       ) {
         const c = nodeAt(cwIxUp[p])
         if any || !(c is Call) || c.callArgs.length != 1 { return true }
-        if !bindFreshLit(nodeAt(parenPeelIx(c.callArgs[0]))) { return true }
+        if !bindStoreOk(parenPeelIx(c.callArgs[0]), carried) { return true }
       }
     }
   }
   return false
+}
+
+// Whether stored value `v` leaves its slot's type to the typed reads: a fresh literal, or a read of
+// a binding in `carried`.
+function bindStoreOk(v: i32, carried: i32[]): boolean {
+  if v < 0 || v >= P.nodes.length { return false }
+  const vn = nodeAt(v)
+  if vn is Ident { return i32ListHas(carried, identDeclOf(v)) }
+  return bindFreshLit(vn)
 }
 
 // The step a typed read of an element of the binding read `x` takes to it (`readWrapStep`), ""
@@ -743,18 +766,20 @@ function elemReadStep(x: i32, path: string, on: i32[]): string {
   if nodeAt(x) is Ident {
     const d = identDeclOf(x)
     const root = aliasRoot(d)
-    if bindIsNarrowed(root) || bindSlotWritten(root) { return "" }
+    if bindIsNarrowed(root) || bindSlotWrittenOff(root, on) { return "" }
     const st = readWrapStep(root)
     if st != "" || on.length == 0 || on[0] == root { return st }
-    if bindIsNarrowed(d) || bindSlotWritten(d) { return "" }
+    if bindIsNarrowed(d) || bindSlotWrittenOff(d, on) { return "" }
   }
   if on.length == 0 { return "" }
   const o = on[0]
   if bindIsNarrowed(o) || bindSlotWritten(o) { return "" }
   const steps = destSteps(path)
   if steps.length == 0 { return readWrapStep(o) }
-  // `x` holds the fresh binding at an element, so it is a list.
-  if steps[0] == "e" { return "E" }
+  // `x` holds the fresh binding at an element, so it is a list, or at a value, so a map; the read's
+  // step is taken straight back off, so the map's key type never reaches the binding's.
+  if steps[0] == "e" || steps[0] == "s" { return "E" }
+  if steps[0] == "v" { return "M" }
   const on0 = nodeAt(o)
   if !(on0 is LetDecl) || on0.letInit < 0 { return "" }
   let lits: i32[] = [parenPeelIx(on0.letInit)]
