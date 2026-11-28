@@ -11,6 +11,7 @@ import {
   OImm,
   OStr,
   OVar,
+  RStage,
   SArmSite,
   SArmWrite,
   SAssign,
@@ -126,10 +127,40 @@ function pureTree(
   return true
 }
 
+// Whether the `let`s of `tree` are the statements right before drop `id` in its body, with no
+// stage among them: then the group pushes and consumes only its own temps, and deleting it
+// leaves every other node's stack as it was.
+function justBefore(f: IrFn, w: DceWalk, id: i32, tree: i32[]): boolean {
+  const bi = w.dwBody[id] ?? -1
+  const p = w.dwPos[id] ?? -1
+  if bi < 0 || p < tree.length { return false }
+  const b = w.dwBodies[bi]
+  const inTree: {[i32]: boolean} = Map()
+  for t in tree {
+    const n = f.irNodes[t]
+    if n is SLet && n.lRhs is RStage { return false }
+    inTree[t] = true
+  }
+  let q = p - tree.length
+  while q < p {
+    if !(inTree[b[q]] ?? false) { return false }
+    q = q + 1
+  }
+  return true
+}
+
+// Whether variable `v` lives in a wasm local, so a read of it is a `local.get` alone: a parameter,
+// or a local with its slot. A valued `if`'s out has no slot of its own, its value on the stack.
+function inLocal(f: IrFn, v: i32): boolean {
+  const x = f.irVars[v]
+  return x.vKind == "param" || x.vKind == "local" && x.vSlot >= 0
+}
+
 // What drop `n` at node `id` deletes, into `dead`: a drop of a variable or an immediate alone; a
 // drop of a temp read only by it with the whole pure tree under it.
 function dropDead(
   f: IrFn,
+  w: DceWalk,
   du: IrDu,
   hidden: {[i32]: boolean},
   n: SDrop,
@@ -143,12 +174,13 @@ function dropDead(
   }
   if !(o is OVar) || o.ov < 0 || o.ov >= f.irVars.length { return 0 }
   if !isTemp(f, o.ov) {
-    dead[id] = true
+    if inLocal(f, o.ov) { dead[id] = true }
     return 0
   }
   if irDuUses(du, o.ov).length != 1 { return 0 }
   const tree: i32[] = []
   if !pureTree(f, du, hidden, o.ov, tree) { return 0 }
+  if !justBefore(f, w, id, tree) { return 0 }
   dead[id] = true
   for t in tree { dead[t] = true }
   return 0
@@ -164,7 +196,7 @@ function deadIn(f: IrFn, w: DceWalk): {[i32]: boolean} {
     if keyed(f, id) { continue }
     const n = f.irNodes[id]
     match n {
-      SDrop => dropDead(f, du, hidden, n, id, dead)
+      SDrop => dropDead(f, w, du, hidden, n, id, dead)
       SArmSite | SArmWrite | SAssign | SBlock | SBoundsCheck | SBr | SCellSet | SCoalBox | SEffect | SForIn | SGlobalSet | SIf | SIntSwitch | SLet | SListSet | SLoop | SRangeLoop | SRawOp | SReturn | SSetField | SSwitch | STrap => {}
     }
   }
