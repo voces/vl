@@ -31,7 +31,7 @@ import {
   nulUnitPlaceReadAt,
   spreadGroupConverts,
 } from "./wasmEmit"
-import { identLetOfRead, lmForUnionArms } from "./emit_classify"
+import { exprValueTyAt, identLetOfRead, lmForUnionArms } from "./emit_classify"
 import { mapUnionForKnownArm, mapUnionForPairTy } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import { litAtomMark, litAtomRollback } from "./emit_lit_atoms"
@@ -79,6 +79,7 @@ import {
   litAliasTyOrSelf,
   monoBundleFe,
   monoBundleReadFe,
+  monoFnBuiltRetLitTy,
   monoGenericAliasFe,
 } from "./emit_mono"
 import {
@@ -1140,20 +1141,38 @@ function declineRefused(msg: string): boolean {
   return false
 }
 
-// Whether the built IR for the pending unit breaks a verifier rule. Such a unit's refusal is an
-// internal compiler error naming the rule, since a build the builder finished must verify.
-function verifierRefused(whole: string): boolean {
+// The internal compiler error for built IR of `whole` that breaks a verifier rule, or "" when it
+// verifies: a build the builder finished must verify, so a failure is the compiler's bug.
+function verifyIce(whole: string): string {
   const v = irBVerify(ib)
-  if v.vfRule == 0 { return false }
+  if v.vfRule == 0 { return "" }
   count("claim fell back: verifier")
-  declRefusal = "internal compiler error: the IR built for "
+  return "internal compiler error: the IR built for "
     + whole
     + " breaks verifier rule "
     + i32ToStr(v.vfRule)
     + " ("
     + v.vfMsg
     + ")"
+}
+
+// Whether the built IR for the pending unit breaks a verifier rule; its refusal is then that error.
+function verifierRefused(whole: string): boolean {
+  const ice = verifyIce(whole)
+  if ice == "" { return false }
+  declRefusal = ice
   return true
+}
+
+// A helper claim's verifier failure (`verifyIce`), raised once its claim scope closes; "" for none.
+let claimIce = ""
+
+// Closes a helper claim's scope, then fails the compile on the verifier failure it met.
+function helperClaimEnd(s: ClaimScope, ok: boolean): boolean {
+  claimScopeEnd(s, ok)
+  if claimIce != "" { emitFail(claimIce) }
+  claimIce = ""
+  return ok
 }
 
 // Records the lowering's why for a decline: a legacy helper's refusal inside it is that refusal.
@@ -7617,7 +7636,10 @@ function resultTy(pos: i32, ann: i32, d: i32): i32 {
     return resultFrameTy(pos, if adt >= 0 { adt } else { at })
   }
   const rec = if pos >= 0 && pos < fRecRetTy.length { fRecRetTy[pos] } else { -1 }
-  const t = if rec >= 0 { rec } else { fnCheckedRetTy(pos) }
+  const t0 = if rec >= 0 { rec } else { fnCheckedRetTy(pos) }
+  // An open result whose every returned literal is stamped at one closed type is built there.
+  const bt = monoFnBuiltRetLitTy(d, t0)
+  const t = if bt >= 0 { bt } else { t0 }
   // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`),
   // whether its result is recorded or checked.
   const bs = if pos >= 0 && pos < fnStmts.length && fnRetHeldAsBundle(pos, t) { fnBundleRetSigs(pos) } else { [] }
@@ -11691,7 +11713,7 @@ function binIsCompare(op: string): boolean {
 // Why operand `ix` is outside the set, or "": it must be typed at a numeric primitive or
 // `boolean`, whose signedness picks the op (`opUnsigned`).
 function operandWhy(ix: i32): string {
-  const p = tyScalarBasePrim(nodeTyAt(ix, ibFnIx))
+  const p = tyScalarBasePrim(exprValueTyAt(ix, ibFnIx))
   if p == null { return OPERAND_TYPE }
   const ps: string = p
   if isNumericPrim(ps) || ps == "boolean" { return "" }
@@ -18326,7 +18348,27 @@ function optRead(b: i32[], n: OptMember, ix: i32, rep: i32): Opnd {
   const o: ROptRead = { orV: r, orAt: ix, orTag: -1 }
   // A staged read is not written again whole: its stash holds what a later chain stages.
   if !staged { ib.irReadOpt[ix] = o }
+  // The read is taken at the field's own rep; a narrowing the checker took past the field's type
+  // (a write before the read) reads that field's value non-null, not the box as the narrowed rep.
+  const fr = if unwrapParen(n.omObj) == base { optLeafOwnRep(r, n.omProp) } else { -1 }
+  const fn0 = if fr >= 0 { repNodeAt(fr) } else { null }
+  if fr != rep && fn0 is RNullable && fn0.rnInner == rep {
+    const fv = irBLetTempTy(b, o, ix, fr, repTyOf(fr))
+    if ibMiss != "" { return fv }
+    return readNonNull(b, fv, ix)
+  }
   return irBLetTempTy(b, o, ix, rep, ty)
+}
+
+// The rep record base `r`'s field `name` is stored at, or -1 where `r` is no closed record.
+function optLeafOwnRep(r: Opnd, name: string): i32 {
+  const br = irBOpRep(r)
+  const bn = repNodeAt(br)
+  const rr = if bn is RNullable { bn.rnInner } else { br }
+  if !(repNodeAt(rr) is RRecord) { return -1 }
+  const k = repRecordKidOf(rr, repTyOf(rr), name)
+  const ks = repNodeKids(rr)
+  return if k >= 0 && k < ks.length { ks[k] } else { -1 }
 }
 
 // The root of the `?.` chain whose receiver is `x`: the first node below its links, unparenthesized;
@@ -21279,7 +21321,7 @@ export function irLowerConstCell(gi: i32, gst: i32, probe: boolean): string {
 export function irClaimConstCell(gi: i32, gst: i32): boolean {
   const s = claimScopeBegin()
   const why = irLowerConstCell(gi, gst, false)
-  claimScopeEnd(s, why == "")
+  helperClaimEnd(s, why == "")
   if why != "" {
     if why.indexOf("a legacy helper refused in ") == 0 {
       count("claim fell back: const cell " + why)
@@ -21333,9 +21375,15 @@ function lowerNodeIn(
   const want = if cellSt >= 0 { globalRep(cellGi, cellSt) } else { repNodeOfTy(if ty >= 0 { ty } else { nodeTyAt(ix, fnIx) }) }
   if irBOpRep(out) != want { return "fragment rep" }
   if repNodeGen() != gen { return "rep epoch moved" }
-  const v = irBVerify(ib)
-  if v.vfRule != 0 {
-    return "verifier rule " + i32ToStr(v.vfRule) + ": " + v.vfMsg
+  // A claimed constant's failure is the compiler's error; a probe's is only its answer.
+  if !probe && cellSt >= 0 {
+    claimIce = verifyIce("this constant initializer")
+    if claimIce != "" { return "verifier" }
+  } else {
+    const v = irBVerify(ib)
+    if v.vfRule != 0 {
+      return "verifier rule " + i32ToStr(v.vfRule) + ": " + v.vfMsg
+    }
   }
   // A variable the fragment made for a declaration it never built took its rep from the type;
   // legacy's slot holds the frame's rep, which may differ (an atom cell, a niche).
@@ -21450,16 +21498,15 @@ function thunkRetTy(ty: i32, r: i32): i32 {
 // in a claimed family, the lowering writes its code entry onto `out` and this answers true.
 export function irClaimThunk(fe: i32, out: u8[]): boolean {
   const s = claimScopeBegin()
-  const ok = claimThunk(fe, out)
-  claimScopeEnd(s, ok)
-  return ok
+  return helperClaimEnd(s, claimThunk(fe, out))
 }
 
 function claimThunk(fe: i32, out: u8[]): boolean {
   const built = buildThunk(fe)
   if softRefused("thunk ") { return false }
   if built != "" { return false }
-  if irBVerify(ib).vfRule != 0 { return thunkFellBack("verifier") }
+  claimIce = verifyIce("this closure thunk")
+  if claimIce != "" { return thunkFellBack("verifier") }
   const why = irLowerHelper(ib, out)
   if why != "" { return thunkFellBack(why) }
   count("claimed thunk")
@@ -21505,16 +21552,15 @@ function buildEqHelp(si: i32): string {
 // it: when it builds and every node is in a claimed family, its code entry goes onto `out`.
 export function irClaimEqHelp(si: i32, out: u8[]): boolean {
   const s = claimScopeBegin()
-  const ok = claimEqHelp(si, out)
-  claimScopeEnd(s, ok)
-  return ok
+  return helperClaimEnd(s, claimEqHelp(si, out))
 }
 
 function claimEqHelp(si: i32, out: u8[]): boolean {
   const built = buildEqHelp(si)
   if softRefused("eq helper ") { return false }
   if built != "" { return false }
-  if irBVerify(ib).vfRule != 0 { return eqHelpFellBack("verifier") }
+  claimIce = verifyIce("this compare helper")
+  if claimIce != "" { return eqHelpFellBack("verifier") }
   const why = irLowerEqHelper(ib, out)
   if why != "" { return eqHelpFellBack(why) }
   count("claimed eq helper")
