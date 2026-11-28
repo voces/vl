@@ -7128,6 +7128,8 @@ let elabLetAssignedMemo: {[i32]: boolean} = Map()
 // is not a plain assignment of a call.
 let elabResWrites: {[i32]: i32[]} = Map()
 let elabResBadWrite: {[i32]: boolean} = Map()
+// Per holder, the function values its plain assignments write (`elabHolderFnWritesAgree`).
+let elabResFnWrites: {[i32]: i32[]} = Map()
 // Per `let` holder, the holders a plain assignment writes into it, and per holder, the holders
 // it is written into.
 let elabResAsgFrom: {[i32]: i32[]} = Map()
@@ -7170,6 +7172,7 @@ function elabResultScanReset() {
   elabLetAssignedMemo = Map()
   elabResWrites = Map()
   elabResBadWrite = Map()
+  elabResFnWrites = Map()
   elabResCopies = Map()
   elabLambdaBound = Map()
   elabResTypedReads = Map()
@@ -7356,6 +7359,10 @@ function elabResScanAssign(g: i32) {
         const ws = elabResWrites.get(d) ?? []
         ws.push(v)
         elabResWrites[d] = ws
+      } else if n.binOp == "=" && n.binCompound == "" && elabFnValueWrite(v) {
+        const fw = elabResFnWrites.get(d) ?? []
+        fw.push(v)
+        elabResFnWrites[d] = fw
       } else if elabResHolderLink(g, d, v) {
         const fs = elabResAsgFrom.get(d) ?? []
         fs.push(identDeclOf(v))
@@ -7939,17 +7946,7 @@ function elabSlotRecordNote(c: i32) {
       elabTriplePut(elabResKeeps, elabSlotValueCall(v), -1, 1)
     }
   }
-  for l in lams {
-    elabLamProducers.push(l)
-    elabLamProducerAt.push(at)
-    // A named declaration is elaborated at each signature its producer is instanced at.
-    if nodeAt(l) is Ident {
-      for sg in rec {
-        const sf = tyAt(sg)
-        if sf is TyFunc { elabEnqueueAtParams(identDeclOf(l), sf.fnParamTypes) }
-      }
-    }
-  }
+  for l in lams { elabFnValueAt(l, rec, at) }
   for w in wraps { elabFnWraps[w] = at }
   for h in linked {
     elabHolderPut(h, -1, at)
@@ -8830,6 +8827,7 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
     || typed.length > 0
     || elabResLinkReads(h) > 0
     || reads == 0
+    || (elabResFnWrites.get(h) ?? []).length > 0
   for t in through {
     const m = elabCallSigMember(t, rec)
     if m < 0 { return 0 }
@@ -8850,6 +8848,7 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
   const at = elabRecTable.length - 1
   elabHolderPut(h, from, at)
   if c >= 0 { elabTriplePut(elabResKeeps, c, from, 1) }
+  for v in elabResFnWrites.get(h) ?? [] { elabFnValueAt(v, rec, at) }
   for t in typed {
     const tn = nodeAt(t)
     if tn is LetDecl {
@@ -9133,6 +9132,7 @@ function elabHolderLinkedHolds(
 // The reads of holder `h` that are the targets of its assignments.
 function elabResWriteReads(h: i32): i32 {
   const n = (elabResWrites.get(h) ?? []).length
+    + (elabResFnWrites.get(h) ?? []).length
   return if n > 1 { n - 1 } else { 0 }
 }
 
@@ -9140,12 +9140,18 @@ function elabResWriteReads(h: i32): i32 {
 // its order, inside the function that declares `h`. A `const` has its initialiser alone.
 function elabHolderWritesAgree(h: i32, from: i32, rec: i32[]): boolean {
   const ws = elabResWrites.get(h) ?? []
-  if ws.length < 2 { return true }
+  if ws.length + (elabResFnWrites.get(h) ?? []).length < 2 { return true }
   if elabResBadWrite.get(h) ?? false { return false }
   const fd = elabEnclosingFn(h)
   for w in ws {
     if elabEnclosingFn(w) != fd { return false }
     if !elabTyListSame(elabCallRecord(w, from), rec) { return false }
+  }
+  // A function value written to the holder is built as the record: a producer, or a function of
+  // one signature the record has a member for (D17740's rule: the set is everything it stores).
+  for v in elabResFnWrites.get(h) ?? [] {
+    if elabEnclosingFn(v) != fd { return false }
+    if !elabInstanceableFnOf(v) && elabWrapFnOf(v, rec) < 0 { return false }
   }
   for t in elabResThrough.get(h) ?? [] {
     if elabEnclosingFn(t) != fd { return false }
@@ -9516,6 +9522,33 @@ let elabFnWraps: {[i32]: i32} = Map()
 export function elabFnWrapSigs(x: i32): i32[] {
   const r = elabFnWraps.get(nodeSrc[x] ?? x) ?? -1
   return if r >= 0 && r < elabRecTable.length { elabRecTable[r] } else { [] }
+}
+
+// Records function value `v`, written where record `rec` (table entry `at`) is held, as built as
+// that record: a producer instanced at each signature, else a function wrapped at its own member.
+function elabFnValueAt(v: i32, rec: i32[], at: i32) {
+  if !elabInstanceableFnOf(v) {
+    elabFnWraps[v] = at
+    return 0
+  }
+  elabLamProducers.push(v)
+  elabLamProducerAt.push(at)
+  // A named declaration is elaborated at each signature its producer is instanced at.
+  if nodeAt(v) is Ident {
+    for sg in rec {
+      const sf = tyAt(sg)
+      if sf is TyFunc { elabEnqueueAtParams(identDeclOf(v), sf.fnParamTypes) }
+    }
+  }
+  return 0
+}
+
+// Whether `v` is a function value a holder's write can store as a record: a read of a named
+// function. A lambda written there is not yet built beside the maker's own (D17804).
+function elabFnValueWrite(v: i32): boolean {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  const d = identDeclOf(v)
+  return d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl
 }
 
 // Whether `x`, in plain code, is a function value instanced per signature: a hole lambda, or a read
@@ -15504,7 +15537,11 @@ function elabSlotFacts() {
           // A closed destination it is delivered at whole decides first, as an annotation would
           // (D17756); then the values written; the classes close what they leave open.
           const dd = deliveredSlotTyOf(ix)
-          const ft = if dd >= 0 && !tyHasTyVar(dd) && !tyHasHole(dd) { dd } else { eplHolderTy(ix, -1) }
+          const dk = dd >= 0
+            && !tyHasTyVar(dd)
+            && !tyHasHole(dd)
+            && eplDeliveredAgrees(ix, dd)
+          const ft = if dk { dd } else { eplHolderTy(ix, -1) }
           // A `let` held per region (`elabRegionsDecide`): each later region a holder of its own.
           const rss = if n is LetDecl && regionUsedOf(ix) { regionStartsOf(ix, fnStmts) } else { [] }
           const rts: i32[] = [ft]
@@ -24023,6 +24060,61 @@ function eplHolderTy(ix: i32, k: i32): i32 {
   EPL.holder = -1
   EPL.k = -1
   return r
+}
+
+// Whether every function leaf of closed type `dd`, holder `ix`'s delivered type, is the one
+// signature its class is called at, or is not called: two signatures, an open argument, or one
+// other than the leaf's own leave the delivery no fact to give (D17800). A nullable binding is
+// delivered only through a narrowing, at a type it does not hold whole.
+function eplDeliveredAgrees(ix: i32, dd: i32): boolean {
+  const own = nodeTyIxOf(ix)
+  if own < 0 || own >= T.tys.length || tyAt(own) is TyNullable { return false }
+  if EPL.stale {
+    eplBuild()
+    EPL.stale = false
+  }
+  EPL.k = -1
+  const root = eplRoot(ix)
+  return root >= 0 && eplLeavesAgree(root, dd, [])
+}
+
+function eplLeavesAgree(p: i32, t: i32, tys: i32[]): boolean {
+  if p < 0 || t < 0 || t >= T.tys.length || i32ListHas(tys, t) { return false }
+  tys.push(t)
+  const r = eplLeavesAgreeGo(p, t, tys)
+  tys.pop()
+  return r
+}
+
+function eplLeavesAgreeGo(p: i32, t: i32, tys: i32[]): boolean {
+  const o = tyAt(t)
+  return match o {
+    TyFunc => {
+      const one = eplOneCall(p)
+      one == -1 || eplSigIs(one, o.fnParamTypes)
+    }
+    TyNullable => eplLeavesAgree(p, o.nInner, tys)
+    TyArray => eplLeavesAgree(eplChild(p, "e"), tyElemOf(o), tys)
+    TyMap => eplLeavesAgree(eplChild(p, "v"), tyValOf(o), tys)
+    TyObj => {
+      let i = 0
+      while i < o.objFieldNames.length && i < o.objFieldTypes.length {
+        if (
+          !eplLeavesAgree(
+            eplChild(p, "f." + o.objFieldNames[i]),
+            o.objFieldTypes[i],
+            tys,
+          )
+        ) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    // A leaf no function value can sit at holds no class to disagree with.
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => true
+  }
 }
 
 // `t`, a type closing open function type `ct`, holding `ct`'s function set where it holds none
