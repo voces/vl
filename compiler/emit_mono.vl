@@ -69,6 +69,7 @@ import {
   elabFnDeclRetAt,
   elabFnDeclRetAtUnder,
   elabFnTyRetAt,
+  elabHolderStorageTy,
   elabInstNodeTy,
   elabIsPatTyIn,
   elabIsTyIn,
@@ -254,6 +255,7 @@ import {
   tyBearsNull,
   tyElemOf,
   tyElemOpen,
+  tyElseBase,
   tyFieldTyOf,
   tyHasHole,
   tyHasInferHole,
@@ -837,7 +839,6 @@ import { valueUnionRetName } from "./check_ret_names"
 import {
   holeNamesTpJoin,
   tpIfJoinAt,
-  tvElseBase,
   tyIsArmedDeferredJoin,
   tyIsTpJoinUnion,
 } from "./check_tp_join"
@@ -2976,7 +2977,7 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
   }
   // An `is` else over a type parameter's list reads its remainder at the instance (`mkTvElseRemTy`);
   // with no closed remainder there the program is refused rather than read unsubtracted.
-  if tvElseBase.get(ty) != null {
+  if tyElseBase(ty) >= 0 {
     if et >= 0 { return if inst >= 0 { inst } else { et } }
     emitFail(
       "monoPinnedTyOf: an `is` else's remainder has no closed type at this instance",
@@ -8766,6 +8767,12 @@ function monoPinRepTyOf(pt: i32): i32 {
   if pt < 0 || pt >= T.tys.length { return -1 }
   if fnTagTyIsTagged(pt) || fnTagListTy(pt) { return fnTagRepTyOf(pt) }
   if monoTagMapTy(pt) { return monoTagMapRepTy(pt, [], []) }
+  // A tagged set's value that may be `null` is held at the nullable of its id rep.
+  const nn = nonNullTy(pt)
+  if nn != pt && fnTagTyIsTagged(nn) {
+    const r = fnTagRepTyOf(nn)
+    return if r >= 0 { mkNullableTy(r) } else { -1 }
+  }
   return -1
 }
 
@@ -11271,8 +11278,6 @@ function monoCoerceChoiceBinding(
   const et = if monoTyConcreteFn(xt) { xt } else { tn }
   const pTys = delTys
   const iv = unwrapParen(d.letInit)
-  // A choice with a `null` arm is taken only where the elaboration types it the nullable of the
-  // destination's function; where the arm's instance differs it stays refused (D17828, D17829).
   // Whether the choice, or an `if` an arm of it hands on, has an arm whose value is `null`.
   let nul = false
   const xs: i32[] = [iv]
@@ -11287,14 +11292,6 @@ function monoCoerceChoiceBinding(
         xs.push(a)
       }
     }
-  }
-  const ht = if nul { elabNodeTy(lf[1], if lf[0] >= 0 { elabKeyAt(lf[0]) } else { -1 }) } else { -1 }
-  const hn = if ht >= 0 && ht < T.tys.length { tyAt(ht) } else { null }
-  if (
-    nul
-    && !(hn is TyNullable && hn.nInner >= 0 && tySameSealed(hn.nInner, et))
-  ) {
-    return 0
   }
   const g0 = monoFirstArmGenName(iv, lf[0], 0)
   const seen = monoChoiceBindNote(
@@ -11317,6 +11314,14 @@ function monoCoerceChoiceBinding(
     // One holding `null` holds the nullable of its arm's instance, as does the read it typed.
     const it = nodeTyIxOf(iv)
     if nul && monoTyConcreteFn(it) {
+      // A destination of another function is delivered through the check's nullable adapter;
+      // without one a call through it would reach the arm at another signature (D17828).
+      if monoTyConcreteFn(et) && !tySameSealed(it, et) {
+        return emitFailAt(
+          "emitProgram: internal: a nullable choice of functions reaches another function type than its arm's instance with no adapter",
+          at,
+        )
+      }
       const nt = mkNullableTy(it)
       if nodeTyIxOf(at) == it { nodeTyRecord(at, nt) }
       nodeTyRecord(iv, nt)
@@ -15915,7 +15920,10 @@ function monoPinMapSlot(mx: i32, at: i32, ctx: i32, fld: string): i32 {
   const v = tyAt(vty)
   let nv = -1
   if v is TyFunc {
-    const ft = monoStoredSlotFnTy(lf, monoSlotPath(fld, ["v"]), stored)
+    // The storage the elaboration closes a holder's stored values to is the slot's (D17813).
+    const hs = if fld == "" { elabHolderStorageTy(at) } else { -1 }
+    const hm = if hs >= 0 && hs < T.tys.length { tyAt(hs) } else { null }
+    const ft = if hm is TyMap { monoInstanceSlotVals(stored, tyValOf(hm)) } else { monoStoredSlotFnTy(lf, monoSlotPath(fld, ["v"]), stored) }
     if ft < 0 { return ft }
     nv = ft
   } else if (
@@ -16450,6 +16458,13 @@ function monoMapStoredFields(stored: i32[][], name: string): i32[][] {
 // pushed onto `spell`; -1 when the slot is pinned at none or two or a function does not close or
 // agree, -2 when instancing one is refused.
 function monoStoredSlotFnTy(lf0: i32[], path: string[], vals: i32[][]): i32 {
+  // A holder the elaboration closes is the elaboration's: one close, never a second here.
+  if lf0.length > 1 && elabHolderStorageTy(lf0[1]) >= 0 {
+    return emitFailAt(
+      "emitProgram: internal: a holder the elaboration closes is closed again by its stored values",
+      lf0[1],
+    )
+  }
   // A map delivered whole at one closed map is that map, as an annotation of it would be (D17756).
   const dd = if path.length == 1 && path[0] == "v" { elabDeliveredSlotTy(lf0[1]) } else { -1 }
   const dm = if dd >= 0 && dd < T.tys.length { tyAt(dd) } else { null }
@@ -18087,10 +18102,11 @@ function monoCoerceAtValueParams(n: Call, dfe: i32, ctx: i32): i32 {
     && (own || i < nparts)
   ) {
     const pt = f.fnParamTypes[i]
+    // A nullable function slot takes a function value as a function slot does (D9820).
     if (
       pt >= 0
       && pt < T.tys.length
-      && tyAt(pt) is TyFunc
+      && (tyAt(pt) is TyFunc || tyNulFuncInner(pt) >= 0)
       && !tyHasTyVar(pt)
       && !tyHoldsHole(pt)
       && nodeAt(unwrapParen(n.callArgs[i])) is Ident
@@ -21457,7 +21473,8 @@ function monoPinHoleParam(
       && monoTagMapRepTy(tyArrayElemIx(held), [], []) >= 0
     if fnTagListTy(held) || hrec { bound = held }
   }
-  const setTy = if fnTagTyIsTagged(bound) || fnTagListTy(bound) || monoTagMapTy(bound) { bound } else { 0 - 1 }
+  // So is one that may be `null`, as a map read of the set's ids is, at the nullable of that rep.
+  const setTy = if fnTagTyIsTagged(nonNullTy(bound)) || fnTagListTy(bound) || monoTagMapTy(bound) { bound } else { 0 - 1 }
   if setTy >= 0 {
     const rn = if monoTagMapTy(setTy) { monoPinSpellShaped(monoTagMapRepTy(setTy, [], [])) } else { fnTagListRepName(setTy) }
     pinned.push(if rn != "" { rn } else { tyToStr(setTy) })
