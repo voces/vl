@@ -13393,3 +13393,24 @@ The coordinator ruled:
 4. **What stays:** an inventory row for a clause-1 defect the finder does not fix in the same PR;
    the `std-api-reviewer` pass on a std export change, which reviews the API and not its prose; and
    CLAUDE.md's rules. A stale doc is deleted when it misleads a lane, not maintained.
+
+## A fresh binding is built at the one destination type its uses name (F2, coordinator ruling (A), 2026-11-27)
+
+A `let` or `const` holding a fresh literal (a record, list or `Map()` literal, or a number, string
+or boolean), never written as a whole, is built at the one destination type its deliveries name:
+an annotated binding, field, element, map or list store, a non-generic parameter or an annotated
+result, followed through un-annotated aliases and inferred results. This is an order-free
+pre-pass (`bindDestAnnots`, `check_rec_fresh.vl`). A reassigned `let` keeps its widened type, two
+different destinations adopt neither, and once adopted a field write is checked at the adopted
+type. Design (B), typing the literal at each read, was refused.
+
+**Addendum (coordinator ruling, 2026-11-27).** Adoption takes a destination only where it is one
+type at every depth, holds no function, sets every literal field the literal has, and has leaves
+that are literal unions or the literal's own types, with at least one that narrows (`destAdopts`,
+`check_statements.vl`). A widening leaf is no adoption: "a container never widens implicitly"
+stands as design. Adopting at `i64`, at `f64` for an int literal, or at a union leaf printed wrong
+values through the binding's own reads; those programs are pinned as D17760, D17761 and D17762.
+`f32` is a narrowing: a float literal adopting `f32` is the literal's own typing at its
+destination, as `const x: f32 = 7.5` is, not a container conversion. The nullable and
+union-of-shapes exclusion is a mechanism limit, not design, and is open as D17763. An annotation
+an adoption reads is load-bearing for the redundant-annotation hint. Ruled by the coordinator.
