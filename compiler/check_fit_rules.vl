@@ -332,7 +332,6 @@ import {
   recBindOrigin,
   recFreshMapDeclOf,
   recFreshOriginDecl,
-  recGenericCalledOnce,
   recHeldCallOrigin,
   recHeldDecl,
   recHeldLit,
@@ -2700,17 +2699,44 @@ function recSitesAllQueuedAt(sites: i32[], dst: i32): boolean {
 function recSiteLandsDirect(c: i32, dst: i32): boolean {
   let i = 0
   while i < recPendSrc.length {
-    const src = cwPeelValue(recPendSrc[i])
-    let hit = src == c
-    if !hit && src >= 0 && valueJoinAt(src) >= 0 {
-      const leaves: i32[] = []
-      tailValueLeaves(src, leaves)
-      for lf in leaves {
-        if cwPeelValue(lf) == c { hit = true }
-      }
+    if (
+      recPendDelivers(i, c)
+      && fieldStorageEq(nonNulTyOf(recPendDstTy[i]), dst)
+    ) {
+      return true
     }
-    if hit && fieldStorageEq(nonNulTyOf(recPendDstTy[i]), dst) { return true }
     i = i + 1
+  }
+  return false
+}
+
+// Whether a queued delivery of call `c`, itself or as a join's tail, lands on a storage other
+// than both `dst`'s and `own`'s.
+function recSiteLandsOff(c: i32, own: i32, dst: i32): boolean {
+  let i = 0
+  while i < recPendSrc.length {
+    const d = nonNulTyOf(recPendDstTy[i])
+    if (
+      recPendDelivers(i, c)
+      && !fieldStorageEq(d, dst)
+      && !fieldStorageEq(d, own)
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether queued delivery `i` is of call `c` itself or of a join whose tail it is.
+function recPendDelivers(i: i32, c: i32): boolean {
+  const src = cwPeelValue(recPendSrc[i])
+  if src == c { return true }
+  if src < 0 || valueJoinAt(src) < 0 { return false }
+  const leaves: i32[] = []
+  tailValueLeaves(src, leaves)
+  for lf in leaves {
+    if cwPeelValue(lf) == c { return true }
   }
   return false
 }
@@ -7029,6 +7055,29 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   return true
 }
 
+// Whether generic `fd`, called at `p`, has a call landing on a record other than `dstTy`'s and
+// its own, which its one instance cannot be built at; then call `p` is refused at its own row.
+function recGenericLandsApart(
+  fd: i32,
+  p: i32,
+  srcTy: i32,
+  dstTy: i32,
+): boolean {
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) || f.fnTyParams.length == 0 { return false }
+  const own = nonNulTyOf(srcTy)
+  const dst = nonNulTyOf(dstTy)
+  if own < 0 || dst < 0 { return false }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 { return false }
+  let apart = recSitesLandApart(fd, own, dst)
+  for s in sites {
+    if s % 2 == 0 && recSiteLandsOff(s / 2, own, dst) { apart = true }
+  }
+  if !apart { return false }
+  return recRefuseAtOwnRow(p, own, dst)
+}
+
 // Whether call `c` is an element of a list literal beside a part built at its own row of `own`'s
 // storage: a record literal, or a spread of a list literal binding built there.
 function recElemBesideOwn(c: i32, own: i32): boolean {
@@ -7350,6 +7399,9 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   }
   if e is Call {
     const fd = recInferredFnOf(p)
+    // A generic maker has one instance, so it is built at one record: calls landing apart keep
+    // its own row, refused (D17225).
+    if fd >= 0 && recGenericLandsApart(fd, p, srcTy, dstTy) { return 0 }
     // A list result is delivered as the bindings its function returns. Literals it returns bare
     // are built at the destination list, and so is the result, when every value is one that can
     // be (D14223); a mix of the two adopts neither.
@@ -9701,20 +9753,13 @@ export function adoptArmAt(x: i32, dstTy: i32) {
 
 // Whether call `p` returns a record it builds: every value its callee returns is a record
 // literal, so the call constructs a fresh record and nothing else holds the old rep. A generic
-// callee counts only with one call site, its one instance (D17225).
+// callee counts too; the solve builds it only where it has one instance (D17225).
 function recCallBuildsFreshRecord(p: i32): boolean {
   const c = nodeAt(p)
   if !(c is Call) { return false }
   const fd = cwCalleeDeclOf(c.callFn)
   const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
-  if (
-    !(f is FuncDecl)
-    || (f.fnTyParams.length > 0 && !recGenericCalledOnce(fd))
-    || f.fnRet >= 0
-    || f.fnBody < 0
-  ) {
-    return false
-  }
+  if (!(f is FuncDecl) || f.fnRet >= 0 || f.fnBody < 0) { return false }
   const rets: i32[] = []
   collectRetValues(f.fnBody, rets)
   for r in rets {
