@@ -4810,9 +4810,10 @@ export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   if list != (da is TyArray) || !fvaRecFieldsClose(sr, dr) { return false }
-  // A list's copy would go through `.map`, which does not yet coerce a set's field at its
-  // lambda's result (D17775); a record of one field is copied without one.
   const dro = tyAt(dr)
+  // A list is copied through `.map`, each element rebuilt at the destination's record, whose
+  // result converts each field: `site.map(($r): R => ({ f: $r.f, … }))`.
+  if list && dro is TyObj { return fvaRecListMapCopy(site, dr, dro) }
   // A record of several fields is converted where it is delivered, each member pinned there.
   if !list && dro is TyObj && dro.objFieldNames.length > 1 {
     fnTagValueDstNote(sx, dr)
@@ -4828,6 +4829,26 @@ export function fvaRecFnCopy(site: i32, srcTy: i32, dstTy: i32): boolean {
   fs.push(luAt(mkFieldInit(nm, rd, pos), site))
   const lit: Node = { objFields: fs, pos: pos }
   return fvaSiteSet(site, lit)
+}
+
+// `fvaRecFnCopy`'s list half: `site` becomes `site.map(($r): dr => ({ f: $r.f, … }))` over every
+// field of record type `dr`.
+function fvaRecListMapCopy(site: i32, dr: i32, dro: TyObj): boolean {
+  const pos = nodePos(site)
+  const rt = fvaAnnot(dr, site, pos)
+  if rt < 0 { return false }
+  const pd = luAt(mkParam("$r" + i32ToStr(site), -1, -1, 0, 0, pos), site)
+  const ps: i32[] = []
+  ps.push(pd)
+  const fs: i32[] = []
+  for nm in dro.objFieldNames {
+    const rd = luAt(mkMember(luRef(pd, site, pos), nm, pos), site)
+    fs.push(luAt(mkFieldInit(nm, rd, pos), site))
+  }
+  const lit: Node = { objFields: fs, pos: pos }
+  const body = luAt(mkParen(luAt(addNode(lit), site), pos), site)
+  const lam = luAt(addNode(fvaLambda(ps, rt, body, site, pos)), site)
+  return listSiteMapCopy(site, lam, pos)
 }
 
 // Whether record `src` holds a set or hole function at a field record `dst` declares a closed
@@ -4879,7 +4900,9 @@ export function fvaDeliveredTy(src: i32, dst: i32): i32 {
     const dft = if dt >= 0 && dt < T.tys.length { tyAt(dt) } else { null }
     const held = st >= 0
       && st < T.tys.length
-      && (fnTagSetValueOfTy(st) || fnTagSetOfTy(st) >= 0 || tyHasHole(st))
+      && (fnTagSetValueOfTy(st)
+      || fnTagSetOfTy(st) >= 0
+      || tyHasHole(st))
     tys.push(if dft is TyFunc && !tyHasHole(dt) && held { dt } else { st })
     i = i + 1
   }
