@@ -471,6 +471,7 @@ import {
   recAdPushSettled,
   recAdPushSettledLit,
   recAdSetGroup,
+  recCovFnNote,
   recPend,
 } from "./check_rec_rows"
 import { pgrNoteCall } from "./check_poly_growth"
@@ -1491,12 +1492,9 @@ function checkHandedFns(a: i32, seen: i32[]) {
   return 0
 }
 
-// The ordinary call: the callee evaluates to a function type, so the arguments are checked
-// against its parameter list — named arguments reordered, an omitted trailing one filled
-// from the declaration default, and type-parameter bindings solved from the argument types.
-// Always answers; the caller's remaining arms cover an error or still-unsolved callee.
 // Whether `n` calls a declared function with no type parameter and every parameter annotated,
-// handing it a read of a parameter of the function being checked.
+// handing a read of a readonly-list parameter of the function being checked to its own
+// readonly-list parameter.
 function elabHandsOnParam(n: Call): boolean {
   const d = identFnDeclOf(n.callFn)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
@@ -1509,23 +1507,41 @@ function elabHandsOnParam(n: Call): boolean {
   }
   const cur = nodeAt(curFnDeclIx)
   if !(cur is FuncDecl) { return false }
-  for a in n.callArgs {
-    const ax = parenPeelIx(a)
+  let i = 0
+  while i < n.callArgs.length && i < dn.fnParams.length {
+    const ax = parenPeelIx(n.callArgs[i])
+    const ad = if ax >= 0 && nodeAt(ax) is Ident { identDeclOf(ax) } else { -1 }
     if (
-      ax >= 0
-      && nodeAt(ax) is Ident
-      && i32ListHas(cur.fnParams, identDeclOf(ax))
+      ad >= 0
+      && i32ListHas(cur.fnParams, ad)
+      && elabRoFnListTy(nodeTyIxOf(ad))
+      && elabRoFnListTy(nodeTyIxOf(dn.fnParams[i]))
     ) {
       return true
     }
+    i = i + 1
   }
   return false
 }
 
+// Whether `t` is a readonly list of functions.
+function elabRoFnListTy(t: i32): boolean {
+  const a = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  return a is TyArray && a.aRead == 1 && tyAt(tyElemOf(a)) is TyFunc
+}
+
+// The ordinary call: the callee evaluates to a function type, so the arguments are checked
+// against its parameter list — named arguments reordered, an omitted trailing one filled
+// from the declaration default, and type-parameter bindings solved from the argument types.
+// Always answers; the caller's remaining arms cover an error or still-unsolved callee.
 function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   let args = n.callArgs
   // An instance's re-check notes a plain function's call handing on one of the instance's own
   // parameters, so the elaboration can instance it at that parameter's storage (D17816).
+  // Such a callee is instanced per storage, which mono must know before it clones a body (D17816).
+  if !inferQuiet && elabHandsOnParam(n) {
+    recCovFnNote(identFnDeclOf(n.callFn))
+  }
   if elabCapOn && elabCapLive() && elabHandsOnParam(n) {
     elabCallDeclNote(ix, identFnDeclOf(n.callFn))
     const none: string[] = []
