@@ -18103,30 +18103,6 @@ function monoCoerceAtValueParams(n: Call, dfe: i32, ctx: i32): i32 {
   return 0
 }
 
-// Whether `x`, parentheses peeled, is a `.map` whose lambda hands each element back, or a
-// `const` bound to one.
-function monoIdentityMapCall(x: i32): boolean {
-  let c = unwrapParen(x)
-  const xn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
-  if xn is Ident {
-    const d = identDeclOf(c)
-    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-    if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 {
-      return false
-    }
-    c = unwrapParen(dn.letInit)
-  }
-  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
-  if !(cn is Call) || cn.callFn < 0 || cn.callArgs.length != 1 { return false }
-  const m = nodeAt(cn.callFn)
-  const cb = unwrapParen(cn.callArgs[0])
-  return m is Member
-    && m.memProp == "map"
-    && cb >= 0
-    && nodeAt(cb) is FuncDecl
-    && fnOnlyReturnsParam(cb)
-}
-
 // Whether `n` is a `.map` / `.filter` whose receiver is a call, or an index into one.
 function monoListCbRecvIsCall(n: Call): boolean {
   if n.callFn < 0 || n.callArgs.length != 1 { return false }
@@ -18183,9 +18159,20 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   monoRecordPinnedRecv(m.memObj, rt, ctx, 0)
   if lam {
     // A lambda the elaboration keyed at the list's build takes that record as its parameter's type.
-    // Over an identity `map`, the lambda reads the records of the list that map hands on.
+    // Over an identity `map`, directly or through a `const`, the lambda reads the records of the
+    // list that map hands on.
+    let rx = unwrapParen(m.memObj)
+    const rd = if rx >= 0 && nodeAt(rx) is Ident { identDeclOf(rx) } else { -1 }
+    const rdn = if rd >= 0 && rd < P.nodes.length { nodeAt(rd) } else { null }
+    if rdn is LetDecl && rdn.letKw == "const" && rdn.letInit >= 0 {
+      rx = unwrapParen(rdn.letInit)
+    }
+    const rc = if rx >= 0 { nodeAt(rx) } else { null }
+    const rm = if rc is Call && rc.callFn >= 0 && rc.callArgs.length == 1 { nodeAt(rc.callFn) } else { null }
+    const rcb = if rc is Call && rm is Member && rm.memProp == "map" { unwrapParen(rc.callArgs[0]) } else { -1 }
+    const idMap = rcb >= 0 && nodeAt(rcb) is FuncDecl && fnOnlyReturnsParam(rcb)
     const rw0 = elabCbParamRowTy(ax, ax)
-    const rw = if rw0 < 0 && monoIdentityMapCall(m.memObj) { tyElemOf(lt) } else { rw0 }
+    const rw = if rw0 < 0 && idMap { tyElemOf(lt) } else { rw0 }
     const lf = nodeAt(ax)
     const lsf = if nodeTyIxOf(ax) >= 0 { tyAt(nodeTyIxOf(ax)) } else { null }
     // A `map` whose lambda hands each element back returns them at the build too (D16211).
