@@ -2314,6 +2314,46 @@ export function elabDeclPinnedByCall(d: i32): boolean {
   return fn is FuncDecl && (fn.fnTyParams.length > 0 || elabDeclHasHoleParam(d))
 }
 
+// The list literals the stamp pass found never read as a value (`elabLitReadOnlyByElemCalls`),
+// decided before any call rewrite, by literal.
+let elabLitElemCalledOnly: {[i32]: boolean} = Map()
+
+// Whether list literal `lit` is never read as a value: every read of the `const` it initialises
+// is the list of a call straight to one of its constant elements (`constListFnElemDecl`).
+export function elabLitOnlyElemCalled(lit: i32): boolean {
+  return elabLitElemCalledOnly[lit] ?? false
+}
+
+function elabLitReadOnlyByElemCalls(lit: i32): boolean {
+  cwIxBuild()
+  if lit < 0 || lit >= cwIxCoveredLen() { return false }
+  let h = cwIxParent[lit]
+  while h >= 0 && nodeAt(h) is Paren { h = cwIxParent[h] }
+  const hd = if h >= 0 { nodeAt(h) } else { null }
+  if !(hd is LetDecl) || hd.letKw != "const" || parenPeelIx(hd.letInit) != lit {
+    return false
+  }
+  const w = cwOccWalk(h)
+  while cwOccNext(w) {
+    const u = cwIxNode[w.row]
+    // The read's call: the nearest call enclosing it, whose callee must index the read.
+    let c = if u != h && u >= 0 && u < cwIxCoveredLen() { cwIxParent[u] } else { -1 }
+    let up = 0
+    while c >= 0 && up < 4 && !(nodeAt(c) is Call) {
+      c = if c < cwIxCoveredLen() { cwIxParent[c] } else { -1 }
+      up = up + 1
+    }
+    const cn = if c >= 0 { nodeAt(c) } else { null }
+    const cx = if cn is Call { nodeAt(parenPeelIx(cn.callFn)) } else { null }
+    const direct = cn is Call
+      && cx is Index
+      && parenPeelIx(cx.idxArr) == u
+      && constListFnElemDecl(cn.callFn) >= 0
+    if u != h && !direct { return false }
+  }
+  return true
+}
+
 // The type maker `d`'s wide twin at closed result `ret` binds its parameter `i` at, the pin the
 // call that banked the twin handed it; -1 for no twin, or two at `ret`.
 export function elabMakerTwinParamTy(d: i32, ret: i32, i: i32): i32 {
@@ -24445,9 +24485,13 @@ export function fnSetTyKeep(ct: i32, t: i32): i32 {
 // at the uncalled default where nothing calls them. Every holder read by its type follows it.
 export function elabHeldFnLitStamps() {
   const nested: {[i32]: boolean} = Map()
+  elabLitElemCalledOnly = Map()
   let g = 0
   while g < P.nodes.length {
     for c in elabLitKids(g, []) { nested[c] = true }
+    if nodeAt(g) is ArrayLit && elabLitReadOnlyByElemCalls(g) {
+      elabLitElemCalledOnly[g] = true
+    }
     g = g + 1
   }
   g = 0
