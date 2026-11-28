@@ -11264,10 +11264,38 @@ function monoCoerceChoiceBinding(
   if !(d is LetDecl) { return 0 }
   // A choice of a tagged set is its member's id, delivered as it is (D15063).
   if fnTagTyIsTagged(nodeTyIxOf(d.letInit)) { return 0 }
-  const xt = expTy
-  const et = if monoTyConcreteFn(expTy) { expTy } else { tnameTy }
+  // A nullable destination delivers its function to the function arms, and its `null` to a `null`
+  // arm (D17818).
+  const xt = if tyNulFuncInner(expTy) >= 0 { tyNulFuncInner(expTy) } else { expTy }
+  const tn = if tyNulFuncInner(tnameTy) >= 0 { tyNulFuncInner(tnameTy) } else { tnameTy }
+  const et = if monoTyConcreteFn(xt) { xt } else { tn }
   const pTys = delTys
   const iv = unwrapParen(d.letInit)
+  // A choice with a `null` arm is taken only where the elaboration types it the nullable of the
+  // destination's function; where the arm's instance differs it stays refused (D17828, D17829).
+  // Whether the choice, or an `if` an arm of it hands on, has an arm whose value is `null`.
+  let nul = false
+  const xs: i32[] = [iv]
+  while xs.length > 0 && !nul {
+    const x = xs.pop() ?? -1
+    const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if xn is IfStmt {
+      for arm in [xn.ifThen, xn.ifElse] {
+        const tv = if arm >= 0 { ifArmValueExpr(arm) } else { -1 }
+        const a = unwrapParen(if tv >= 0 { tv } else { arm })
+        if a >= 0 && nodeAt(a) is NullLit { nul = true }
+        xs.push(a)
+      }
+    }
+  }
+  const ht = if nul { elabNodeTy(lf[1], if lf[0] >= 0 { elabKeyAt(lf[0]) } else { -1 }) } else { -1 }
+  const hn = if ht >= 0 && ht < T.tys.length { tyAt(ht) } else { null }
+  if (
+    nul
+    && !(hn is TyNullable && hn.nInner >= 0 && tySameSealed(hn.nInner, et))
+  ) {
+    return 0
+  }
   const g0 = monoFirstArmGenName(iv, lf[0], 0)
   const seen = monoChoiceBindNote(
     lf,
@@ -11279,12 +11307,21 @@ function monoCoerceChoiceBinding(
     monoRetypeChoiceRead(d.letInit, at)
     return 1
   }
-  if monoCoerceFnValueTys(d.letInit, lf[0], xt, pTys, tnameTy) < 0 { return -1 }
-  if monoTyConcreteFn(et) {
+  if monoCoerceFnValueTys(d.letInit, lf[0], xt, pTys, tn) < 0 { return -1 }
+  // A choice holding `null` is typed at the nullable of its arm's instance (`monoRetypeIfInit`).
+  if monoTyConcreteFn(et) && !nul {
     nodeTyRecord(iv, et)
     nodeTyRecord(d.letInit, et)
   } else {
     monoRetypeIfInit(d.letInit, monoFirstArmGenName(iv, lf[0], 0), at, lf[0])
+    // One holding `null` holds the nullable of its arm's instance, as does the read it typed.
+    const it = nodeTyIxOf(iv)
+    if nul && monoTyConcreteFn(it) {
+      const nt = mkNullableTy(it)
+      if nodeTyIxOf(at) == it { nodeTyRecord(at, nt) }
+      nodeTyRecord(iv, nt)
+      nodeTyRecord(d.letInit, nt)
+    }
   }
   monoRetypeChoiceRead(d.letInit, at)
   return 1
@@ -20101,8 +20138,9 @@ function monoArgCallsBackGeneric(a: i32): boolean {
   return monoInertArgFns(c, fes, at, 0) && fes.length > 0
 }
 
-// Whether argument `a` is an `if` whose arms each name a function, one of them generic or
-// un-annotated, so it takes the type the value arguments bind as either function would (D9005).
+// Whether argument `a` is an `if` whose arms each name a function or are `null`, one of them
+// generic or un-annotated, so it takes the type the value arguments bind as either function would
+// (D9005, D17818).
 function monoArgIsOpenFnChoice(a: i32, depth: i32): boolean {
   const x = unwrapParen(a)
   if x < 0 || depth > MONO_ALIAS_CHAIN_MAX { return false }
@@ -20123,9 +20161,16 @@ function monoArgIsOpenFnChoice(a: i32, depth: i32): boolean {
       const tv = ifArmValueExpr(arm)
       const v = unwrapParen(if tv >= 0 { tv } else { arm })
       if v < 0 { return false }
-      if monoCalleeIsGeneric(v) || monoArgIsOpenFnValue(v, -1) { open = true }
-      else if monoArgIsOpenFnChoice(v, depth + 1) { open = true }
-      else if !(nodeAt(v) is Ident) || fnIndexOfNode(v) < 0 { return false }
+      if monoCalleeIsGeneric(v) || monoArgIsOpenFnValue(v, -1) {
+        open = true
+      } else if monoArgIsOpenFnChoice(v, depth + 1) {
+        open = true
+      } else if (
+        !(nodeAt(v) is NullLit)
+        && (!(nodeAt(v) is Ident) || fnIndexOfNode(v) < 0)
+      ) {
+        return false
+      }
     }
   }
   return open
