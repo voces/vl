@@ -4711,6 +4711,7 @@ fn compile_vl_instance(
     report_guest_fuel(store);
     report_guest_alloc(resident0);
     report_late_demands(inst, store, source_path);
+    report_check_cost(inst, store, source_path);
     report_inst_keys(inst, store, source_path);
     report_touch_set(inst, store, source_path);
     report_cls_census(inst, store, source_path);
@@ -4931,6 +4932,37 @@ fn report_late_demands(inst: &Instance, store: &mut Store<()>, path: &str) {
             .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
             .collect();
         rows.push_str(&format!("[late] {path}: demand {name}\n"));
+    }
+    eprint!("{rows}");
+}
+
+/// Whether `$VL_CHECK_COST=1` asked for each compile's checker cost facts.
+fn check_cost_on() -> bool {
+    std::env::var("VL_CHECK_COST").ok().as_deref() == Some("1")
+}
+
+/// Under `$VL_CHECK_COST=1`, print one `[check-cost] <path>: <row>` line per row of the guest's
+/// checker cost report (`checkStatsCount`): the full check passes, by cause, and the type arena's
+/// rows beside its structurally distinct ones. A seed without the report prints nothing.
+fn report_check_cost(inst: &Instance, store: &mut Store<()>, path: &str) {
+    if !check_cost_on() {
+        return;
+    }
+    let (Ok(count), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "checkStatsCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "checkStatsLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "checkStatsAt"),
+    ) else {
+        return;
+    };
+    let n = count.call(&mut *store, ()).unwrap_or(0);
+    let mut rows = String::new();
+    for i in 0..n {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let row: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        rows.push_str(&format!("[check-cost] {path}: {row}\n"));
     }
     eprint!("{rows}");
 }
@@ -10416,6 +10448,10 @@ fn pump_session(
                 if late_demands_on() {
                     let p = cmd_path.read(&mut store)?;
                     report_late_demands(&inst, &mut store, &p);
+                }
+                if check_cost_on() {
+                    let p = cmd_path.read(&mut store)?;
+                    report_check_cost(&inst, &mut store, &p);
                 }
                 if inst_keys_on() {
                     let p = cmd_path.read(&mut store)?;

@@ -648,6 +648,7 @@ import {
   repVariantShapeRowOf,
   rlElemKindAt,
   sFieldElemTyIxAt,
+  tyClosedByTags,
   tyIsNulScalarBox,
   tyMapKeyKind,
   tyPackedRow,
@@ -1048,6 +1049,8 @@ export function fnSigParamOpen(fe: i32): boolean {
 // The `$fnsig` token of a parameter of type `t` in the lifted function `fx`, "" for none.
 function fnSigTokOfTy(t: i32, fx: i32): string {
   if fnTagTyIsTagged(t) { return repSigTokOfKind("i32") }
+  // A type the tag decision closes has its rep, the one its place holds.
+  if tyClosedByTags(t) { return repSigTokOfTy(t) }
   const c = fnSigClosedTy(t, fx)
   if c < 0 || fnTagTyIsTagged(c) {
     return if c < 0 { "" } else { repSigTokOfKind("i32") }
@@ -2981,7 +2984,9 @@ export function letInitCaptureRow(letIx: i32, fnIx: i32): i32 {
 // The function call `c` reaches in `fnIx` where it returns a hole parameter at that parameter's
 // row (`fnRetCaptureRow`): a named callee, or a binding holding such a closure; -1 otherwise.
 function callCaptureRowFe(c: Call, fnIx: i32): i32 {
-  if c.callFn < 0 || !(nodeAt(c.callFn) is Ident) { return -1 }
+  if c.callFn < 0 { return -1 }
+  if nodeAt(c.callFn) is Member { return capRowLetFe(c.callFn, fnIx) }
+  if !(nodeAt(c.callFn) is Ident) { return -1 }
   const fe = fnIndexOfAt(sidOfNode(c.callFn), fnIx, c.callFn)
   if (
     fe >= 0
@@ -3341,7 +3346,32 @@ function letCellKindGo(letIx: i32, fnIx: i32): VKind {
   }
   const d = nodeAt(letIx)
   if d is LetDecl && d.letType >= 0 { return vtKindOfType(d.letType) }
+  const ow = letOpenCallWidth(letIx, fnIx)
+  if ow != "" { return ow }
   return letBindRepKind(letIx, fnIx) ?? "i32"
+}
+
+// The scalar width an un-annotated `const` holding a call the frame types open is built at: the
+// call's own result width (`cloCallSigKey`), as its print and its store read it; "" else (D17809).
+export function letOpenCallWidth(letIx: i32, fnIx: i32): VKind | "" {
+  const d = if letIx >= 0 && letIx < P.nodes.length { nodeAt(letIx) } else { null }
+  if !(d is LetDecl) || d.letType >= 0 || d.letKw != "const" || d.letInit < 0 {
+    return ""
+  }
+  const ix = unwrapParen(d.letInit)
+  // A `const` copy of such a binding holds its width too.
+  if ix >= 0 && nodeAt(ix) is Ident {
+    const sd = identDeclOf(ix)
+    return if sd >= 0 && sd != letIx { letOpenCallWidth(sd, fnIx) } else { "" }
+  }
+  if ix < 0 || !(nodeAt(ix) is Call) { return "" }
+  const t = exprValueTyAt(ix, fnIx)
+  if t >= 0 && !tyHasTyVar(t) { return "" }
+  const k = sigKeyRetKind(cloCallSigKey(ix, fnIx)) ?? ""
+  if k == "f64" { return "f64" }
+  if k == "f32" { return "f32" }
+  if k == "i64" { return "i64" }
+  return ""
 }
 
 // The map shape beside an inferred `map` or `nulmap` result valtype: the return expression's,
@@ -5703,7 +5733,41 @@ export function exprValueTyAt(exprIx0: i32, fnIx: i32): i32 {
     const el = elabNodeTyAt(exprIx, fnIx)
     if el >= 0 { ty = el }
   }
+  if ty < 0 || tyHasTyVar(ty) {
+    const rt = openReadTy(exprIx, fnIx)
+    if rt >= 0 { return rt }
+    const at = openArithTy(exprIx, fnIx)
+    if at >= 0 { return at }
+  }
   return ty
+}
+
+// A read of an un-annotated `const` holding a call the frame types open is at the width the call
+// is built at (`letOpenCallWidth`); -1 for any other node.
+function openReadTy(exprIx: i32, fnIx: i32): i32 {
+  if !(nodeAt(exprIx) is Ident) { return -1 }
+  const w = letOpenCallWidth(identDeclOf(exprIx), fnIx)
+  if w == "f64" { return TY_F64 }
+  if w == "i64" { return TY_I64 }
+  // An `f32` call keeps its open type here; its slot and print read the width directly.
+  if w == "f32" { return -1 }
+  return -1
+}
+
+// Arithmetic the checker left open is at the width both its operands are read at; -1 for any
+// other node or where they differ.
+function openArithTy(exprIx: i32, fnIx: i32): i32 {
+  const n = nodeAt(exprIx)
+  if !(n is BinExpr) || !binIsArith(n.binOp) { return -1 }
+  const l = exprValueTyAt(n.binLeft, fnIx)
+  const r = exprValueTyAt(n.binRight, fnIx)
+  const lp = if l >= 0 && !tyHasTyVar(l) { tyScalarBasePrim(l) ?? "" } else { "" }
+  return if lp != "" && r >= 0 && lp == (tyScalarBasePrim(r) ?? "") { l } else { -1 }
+}
+
+// Whether `op` is an arithmetic operator, whose result is its operands' width.
+function binIsArith(op: string): boolean {
+  return op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
 }
 
 // `k` where it names a scalar width, else "".
@@ -15027,6 +15091,9 @@ function readCloSigKey(atIx: i32, fnIx: i32): string {
 // `readCloSigKey` short of its last rung; "" where none of the typed rungs keys the read.
 function readCloSigKeyOfDecl(atIx: i32, fnIx: i32, hops: i32): string {
   if atIx < 0 { return "" }
+  // A record field holding a closure that returns its capture at the capture slot's row keys by it.
+  const mf = if nodeAt(atIx) is Member { capRowLetFe(atIx, fnIx) } else { -1 }
+  if mf >= 0 { return cloSigKeyExt(mf) }
   const fk = sigKeyOfTy(monoFieldReadTyAt(atIx, fnIx))
   if fk != "" && cloSigPosOfKey(fk) >= 0 { return fk }
   const nft = narrowedFnTyOf(atIx, fnIx)
@@ -15065,15 +15132,40 @@ function readCloSigKeyOfDecl(atIx: i32, fnIx: i32, hops: i32): string {
   }
 }
 
-// The closure an un-annotated `let` read `atIx` holds where it returns a captured hole parameter
-// at its capture slot's row (`fnRetCaptureRow`); -1 otherwise.
+// The closure an un-annotated `let` read `atIx` holds, or field read `o.b` of such a binding of a
+// record literal holds in `b`, where it returns a captured hole parameter at its capture slot's
+// row (`fnRetCaptureRow`); -1 otherwise.
 function capRowLetFe(atIx: i32, fnIx: i32): i32 {
+  const m = if atIx >= 0 && atIx < P.nodes.length { nodeAt(atIx) } else { null }
+  if m is Member { return capRowFieldFe(m, fnIx) }
   const sd = bindingDeclInScope(atIx)
   const d = if sd >= 0 { sd } else { identDeclOf(atIx) }
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
   const fe = fieldValueFeOfIn(dn.letInit, fnIx)
   return if fe >= 0 && fnRetCaptureRow(fe) >= 0 { fe } else { -1 }
+}
+
+// `capRowLetFe` of field read `m`: the closure field `m.memProp` of the record literal an
+// un-annotated binding `m.memObj` reads is initialized with; -1 otherwise.
+function capRowFieldFe(m: Member, fnIx: i32): i32 {
+  const ob = parenPeelIx(m.memObj)
+  if ob < 0 || !(nodeAt(ob) is Ident) { return -1 }
+  const sd = bindingDeclInScope(ob)
+  const d = if sd >= 0 { sd } else { identDeclOf(ob) }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 { return -1 }
+  const li = parenPeelIx(dn.letInit)
+  const ol = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { null }
+  if !(ol is ObjLit) { return -1 }
+  for fx in ol.objFields {
+    const fi = nodeAt(fx)
+    if fi is FieldInit && fi.fiName == m.memProp {
+      const fe = fieldValueFeOfIn(fi.fiValue, fnIx)
+      return if fe >= 0 && fnRetCaptureRow(fe) >= 0 { fe } else { -1 }
+    }
+  }
+  return -1
 }
 
 // The `$fnsig` key of function type `ty`, its `| null` peeled; "" for any other type.
