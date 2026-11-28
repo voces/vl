@@ -1,3 +1,4 @@
+import { nodePos } from "./fmt_util"
 import { quietEnterFlat, quietLeaveFlat } from "./check_cursor"
 import {
   setBindHandedSets,
@@ -158,6 +159,7 @@ import {
   tyElemOf,
   tyElemOpen,
   tyFieldTyOf,
+  tyHasHole,
   tyKeyOf,
   tySame,
   tyValOf,
@@ -231,7 +233,7 @@ import {
   fnTagRecHoldsListOfLists,
   fnTagSetCount,
   fnTagSetSplits,
-  fnTagValueDstCalls,
+  fnTagValueSites,
   fnTagValueDstOf,
   handBackCalledArgOf,
   handBackCalledIx,
@@ -253,6 +255,8 @@ import {
   fnTagArmMemberOf,
   fnTagArmsAt,
   fnTagArmsAtSet,
+  fnTagValueArmsAt,
+  fnTagValueArmsAtSet,
   fnTagBindNote,
   fnTagCallArms,
   fnTagCallMsgAtOf,
@@ -1193,24 +1197,39 @@ function ftCommit(rootIx: i32, k: i32, calls: i32[], mint: i32[]) {
       ftBuildArmsAt(ftFactCallOf(fr), s, ds, leafTy, ftFactRsOf(fr))
     }
   }
-  for vc in fnTagValueDstCalls() {
+  for vc in fnTagValueSites() {
     ftBuildValueArms(vc, fnTagValueDstOf(vc), s, ds, leafTy)
   }
   return 0
 }
 
-// Every value arm `ftBuildValueArms` built at call `c`, over the sets its result's fields hold.
+// The closed signatures site `c`'s destination converts its value at: the destination itself, or
+// each closed function field of the record it is.
+function ftValueSigs(c: i32): i32[] {
+  const out: i32[] = []
+  const dn = nonNullTy(fnTagValueDstOf(c))
+  if dn < 0 || dn >= T.tys.length { return out }
+  const d = tyAt(dn)
+  if d is TyFunc {
+    out.push(dn)
+  } else if d is TyObj {
+    for ft in d.objFieldTypes {
+      if ft >= 0 && ft < T.tys.length && tyAt(ft) is TyFunc && !i32ListHas(out, ft) {
+        out.push(ft)
+      }
+    }
+  }
+  return out
+}
+
+// Every value arm `ftBuildValueArms` built at site `c`, over its sets and signatures.
 export function fnTagValueArms(c: i32): i32[] {
   const out: i32[] = []
-  const ct = if fnTagValueDstOf(c) >= 0 { nonNullTy(nodeTyIxOf(c)) } else { -1 }
-  const so = if ct >= 0 && ct < T.tys.length { tyAt(ct) } else { null }
-  if !(so is TyObj) { return out }
-  const seen: i32[] = []
-  for ft in so.objFieldTypes {
-    const s = if ft >= 0 { fnTagSetOfTy(nonNullTy(ft)) } else { -1 }
-    if s >= 0 && !i32ListHas(seen, s) && fnTagSetIsTagged(s) {
-      seen.push(s)
-      for a in fnTagArmsAt(c, s) { out.push(a) }
+  if fnTagValueDstOf(c) < 0 { return out }
+  const sigs = ftValueSigs(c)
+  for s in fnTagTaggedSets() {
+    for g in sigs {
+      for a in fnTagValueArmsAt(c, s, g) { out.push(a) }
     }
   }
   return out
@@ -1223,59 +1242,71 @@ export function ftValueConvertAt(c: i32): boolean {
   return cn is Call && fnTagValueDstOf(c) >= 0 && ftCallFreshLits(cn)
 }
 
-// The declaration call `c`'s value arm for member `d` calls, its instance once mono ran; -1.
-export function fnTagValueArmFn(c: i32, d: i32): i32 {
-  for a in fnTagValueArms(c) {
-    const an = nodeAt(a)
-    const fd = if an is Call && fnTagArmMemberOf(a) == d { identDeclOf(an.callFn) } else { -1 }
-    if fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl { return fd }
+// The declaration site `c`'s value arm for member `d` at a signature `tySame` as `sig` calls,
+// its instance once mono ran; -1.
+export function fnTagValueArmFn(c: i32, d: i32, sig: i32): i32 {
+  if fnTagValueDstOf(c) < 0 || sig < 0 { return -1 }
+  for g in ftValueSigs(c) {
+    if tySame(g, sig) {
+      for s in fnTagTaggedSets() {
+        for a in fnTagValueArmsAt(c, s, g) {
+          const an = nodeAt(a)
+          const fd = if an is Call && fnTagArmMemberOf(a) == d { identDeclOf(an.callFn) } else { -1 }
+          if fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl { return fd }
+        }
+      }
+    }
   }
   return -1
 }
 
-// The value arms of set `s` at fresh record call `c` delivered at record type `dt`: each member
-// called at the one closed signature `dt` gives the fields holding `s`, so its instance there
-// exists for the conversion to a closure to take. None where the fields name two signatures.
-function ftBuildValueArms(c: i32, dt: i32, s: i32, ds: i32[], leafTy: i32[]) {
-  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
-  const ct = if cn is Call { nonNullTy(nodeTyIxOf(c)) } else { -1 }
-  const dn = if dt >= 0 { nonNullTy(dt) } else { -1 }
-  if (
-    !(cn is Call)
-    || ct < 0
-    || dn < 0
-    || ct >= T.tys.length
-    || dn >= T.tys.length
-  ) {
-    return 0
+// Whether every member of set `s` takes as many parameters as function type `f`.
+function ftMembersTakeArity(s: i32, f: TyFunc): boolean {
+  for d in fnTagMembers(s) {
+    const t = nodeTyIxOf(d)
+    const ft = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    if !(ft is TyFunc) || ft.fnParamTypes.length != f.fnParamTypes.length { return false }
   }
+  return true
+}
+
+// The value arms of set `s` at site `c`, where a value carrying `s` is delivered at type `dt`: a
+// closed function type, or a record closing the fields that hold `s`. Each member is called at
+// each such signature, so its instance there exists for the conversion to a closure to take.
+function ftBuildValueArms(c: i32, dt: i32, s: i32, ds: i32[], leafTy: i32[]) {
+  const ct = if c >= 0 && c < P.nodes.length { nonNullTy(nodeTyIxOf(c)) } else { -1 }
+  const dn = if dt >= 0 { nonNullTy(dt) } else { -1 }
+  if ct < 0 || dn < 0 || ct >= T.tys.length || dn >= T.tys.length { return 0 }
   const so = tyAt(ct)
   const dob = tyAt(dn)
+  if dob is TyFunc {
+    // A site its holes leave open here is typed at the set in the instance that reads it.
+    const open = fnTagSetOfTy(ct) < 0 && tyHasHole(ct) && ftMembersTakeArity(s, dob)
+    if fnTagSetOfTy(ct) != s && !open || tyHasTyVar(dn) || tyHasHole(dn) { return 0 }
+    return ftValueArmsAtSig(c, s, dn, ds, leafTy)
+  }
   if !(so is TyObj) || !(dob is TyObj) { return 0 }
-  let sig = -1
   let i = 0
   while i < dob.objFieldNames.length {
     const ft = dob.objFieldTypes[i]
     const st = tyFieldTyOf(ct, dob.objFieldNames[i])
     const held = st >= 0 && fnTagSetOfTy(nonNullTy(st)) == s
-    if (
-      held
-      && ft >= 0
-      && ft < T.tys.length
-      && tyAt(ft) is TyFunc
-      && !tyHasTyVar(ft)
-    ) {
-      if sig >= 0 && !tySame(sig, ft) { return 0 }
-      sig = ft
+    if held && ft >= 0 && ft < T.tys.length && tyAt(ft) is TyFunc && !tyHasTyVar(ft) {
+      ftValueArmsAtSig(c, s, ft, ds, leafTy)
     }
     i = i + 1
   }
-  const f = if sig >= 0 { tyAt(sig) } else { null }
+  return 0
+}
+
+// The value arms of set `s` at site `c` at closed function type `sig`.
+function ftValueArmsAtSig(c: i32, s: i32, sig: i32, ds: i32[], leafTy: i32[]) {
+  const f = tyAt(sig)
   if !(f is TyFunc) { return 0 }
   const args: i32[] = []
   let k = 0
   while k < f.fnParamTypes.length {
-    const a = mkIdent("$va" + i32ToStr(k), cn.pos)
+    const a = mkIdent("$va" + i32ToStr(k), nodePos(c))
     nodeTySetGrow(a, f.fnParamTypes[k])
     args.push(a)
     k = k + 1
@@ -1283,7 +1314,7 @@ function ftBuildValueArms(c: i32, dt: i32, s: i32, ds: i32[], leafTy: i32[]) {
   const rs: i32[] = []
   for _d in ds { rs.push(f.fnRet) }
   const none: string[] = []
-  return ftBuildArmsWith(c, s, ds, leafTy, rs, args, none, f.fnRet)
+  return ftBuildArmsWith(c, s, sig, ds, leafTy, rs, args, none, f.fnRet)
 }
 
 // Whether member `d`'s name is in scope at every call its set `s` builds arms at: a lambda or a
@@ -1829,6 +1860,7 @@ function ftBuildArmsAt(c: i32, s: i32, ds: i32[], leafTy: i32[], rs: i32[]) {
   return ftBuildArmsWith(
     c,
     s,
+    -1,
     ds,
     leafTy,
     rs,
@@ -1839,10 +1871,12 @@ function ftBuildArmsAt(c: i32, s: i32, ds: i32[], leafTy: i32[], rs: i32[]) {
 }
 
 // The member calls of set `s` at site `c`, each at arguments `args` (named `names`) and result
-// `rs[k]`, joined at `outTy`: a call's arms, or a value arm pinning each member at a signature.
+// `rs[k]`, joined at `outTy`: a call's arms (`sig` -1), or the value arms pinning each member at
+// closed signature `sig`.
 function ftBuildArmsWith(
   c: i32,
   s: i32,
+  sig: i32,
   ds: i32[],
   leafTy: i32[],
   rs: i32[],
@@ -1850,19 +1884,19 @@ function ftBuildArmsWith(
   names: string[],
   outTy: i32,
 ) {
-  let arms = fnTagArmsAt(c, s)
-  const cn = nodeAt(c)
-  if !(cn is Call) { return 0 }
+  let arms = if sig >= 0 { fnTagValueArmsAt(c, s, sig) } else { fnTagArmsAt(c, s) }
+  const pos = nodePos(c)
+  if c < 0 || c >= P.nodes.length { return 0 }
   if arms.length != ds.length {
     arms = []
     for d in ds {
       const f = nodeAt(d)
       let nm = ""
       if f is FuncDecl { nm = f.fnName }
-      const id = mkIdent(nm, cn.pos)
-      arms.push(mkCallN(id, args, names, cn.pos))
+      const id = mkIdent(nm, pos)
+      arms.push(mkCallN(id, args, names, pos))
     }
-    fnTagArmsAtSet(c, s, arms)
+    if sig >= 0 { fnTagValueArmsAtSet(c, s, sig, arms) } else { fnTagArmsAtSet(c, s, arms) }
   }
   let k = 0
   while k < arms.length {
