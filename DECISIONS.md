@@ -13420,4 +13420,6 @@ of a fresh binding stored into it (by index or `push`), and a `for` over the bin
 An element read whose value is delivered to an annotated destination is a typed read, so it is
 a delivery at the element path, as F1's typed reads pin; an untyped index or member read
 supplies no shape. One destination type across every delivery and typed read at every path,
-with (i)–(iv) at that path; any conflict adopts nothing. Ruled by the coordinator.
+with (i)–(iv) at that path; any conflict adopts nothing. A typed read does not pin a binding
+the program narrows with `is` (the narrowing types its reads) or one whose slot it writes with a
+value other than a fresh literal (the write decides the element type). Ruled by the coordinator.

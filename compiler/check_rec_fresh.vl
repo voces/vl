@@ -47,6 +47,7 @@ import {
   CW_UP_ARG,
   CW_UP_ASG_LHS,
   CW_UP_ASG_RHS,
+  CW_UP_CALLEE,
   CW_UP_CMP,
   CW_UP_COAL,
   CW_UP_ELEM,
@@ -605,7 +606,8 @@ function projDests(
     return true
   }
   if !cwIxCovers(up) || cwIxUpKind[up] == CW_UP_ASG_LHS { return true }
-  const st = readWrapStep(aliasRoot(identDeclOf(x)))
+  const root = aliasRoot(identDeclOf(x))
+  const st = if bindIsNarrowed(root) || bindSlotWritten(root) { "" } else { readWrapStep(root) }
   if st == "" { return true }
   const o2: i32[] = []
   const p2: string[] = []
@@ -617,6 +619,46 @@ function projDests(
     i = i + 1
   }
   return true
+}
+
+// Whether binding `d` is tested with `is`, so its reads are typed by the narrowing, not by
+// where they are delivered.
+function bindIsNarrowed(d: i32): boolean {
+  const k = if d >= 0 && d < P.nodes.length { cwKeyOfDecl(d) } else { -1 }
+  if k < 0 { return false }
+  const ow = cwOccWalk(k)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    if cwIxCovers(u) && cwIxUpKind[u] == CW_UP_IS { return true }
+  }
+  return false
+}
+
+// Whether a slot of binding `d` is written (`d[i] = v`, `d.push(v)`) with a value other than a
+// fresh literal, which decides its element type as well as any typed read.
+function bindSlotWritten(d: i32): boolean {
+  const k = if d >= 0 && d < P.nodes.length { cwKeyOfDecl(d) } else { -1 }
+  if k < 0 { return false }
+  const ow = cwOccWalk(k)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    if cwIxCovers(u) && cwIxUpKind[u] == CW_UP_OBJ {
+      const p = cwIxUp[u]
+      if cwIxCovers(p) && cwIxUpKind[p] == CW_UP_ASG_LHS {
+        const a = nodeAt(cwIxUp[p])
+        if !(a is BinExpr) || !bindFreshLit(nodeAt(parenPeelIx(a.binRight))) {
+          return true
+        }
+      }
+      const pn = nodeAt(p)
+      if pn is Member && cwIxCovers(p) && cwIxUpKind[p] == CW_UP_CALLEE {
+        const c = nodeAt(cwIxUp[p])
+        if !(c is Call) || c.callArgs.length != 1 { return true }
+        if !bindFreshLit(nodeAt(parenPeelIx(c.callArgs[0]))) { return true }
+      }
+    }
+  }
+  return false
 }
 
 // The fresh binding an un-annotated alias chain from `d` (`const g = c`) names, or `d`.
