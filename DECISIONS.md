@@ -13612,3 +13612,16 @@ through the same storage the caller holds. The coordinator ruled:
 **Why.** Copying the record at the call would break aliasing, and admitting it unadapted would
 trap. The design already has a covariant container that carries the contract in its type
 (`readonly T[]`). The owner may overrule.
+
+## An aliased list has one element type; two closed signatures on it are a check refusal (2026-11-28, coordinator ruling)
+
+D17819: `const a = deliver(); const b: { f: (a: f64) => f64 }[] = a` makes `a` and `b` one storage,
+so a call through `a` at `(i32)` and one through `b` at `(f64)` call one closure at two signatures,
+and the module traps. The coordinator ruled that a mutable list is invariant and an alias is the
+same storage, so the storage has one element type, and every holder's annotation and calls
+constrain it. Where the constraints agree, the program runs. Where two of them close the element
+at different signatures, the check refuses, with the container contract ("passed as the same
+storage … copy it with `.map`"). A fresh delivery (a call or a literal, no second holder) keeps the
+`.map` copy. The condition is the conflict on the one storage, never "the binding is used again".
+Rejected: holding the set's id rep at a closed type through the alias. That would be a layout
+minted on ask, and it would still need a refusal for a non-member write. The owner may overrule.
