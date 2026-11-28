@@ -8370,8 +8370,7 @@ export function monoStateReset() {
   monoChoiceBindTy = []
   monoChoiceBindGen = []
   monoDestPinOff = false
-  monoElemTakenSig = Map()
-  monoElemAtSet = Map()
+  monoElemInst = Map()
   monoTopStmts = []
   monoInstIsFirst = false
   monoLastInstFe = 0 - 1
@@ -10490,9 +10489,8 @@ function monoInstanceForReq(
     )
   }
   // A value a call through its set already instanced keeps that instance.
-  if (monoElemAtSet[letInitIx] ?? false) && !monoTysHoldSet(deliveryTys) {
-    return 0
-  }
+  const atSet = monoElemInst.get(letInitIx)?.meSet ?? false
+  if atSet && !monoTysHoldSet(deliveryTys) { return 0 }
   const fn = nodeAt(monoOrigNode[origFe])
   if fn is FuncDecl {
     const params = fn.fnParams
@@ -10901,6 +10899,9 @@ function monoCoerceFnValueTys(
                 if tyNulFuncInner(tnameTy) >= 0 { tyNulFuncInner(tnameTy) } else { tnameTy },
               ),
             )
+            if vr >= 0 {
+              monoElemInstRecord(exprIx).meSig = monoConcreteFnTyName(tnameTy)
+            }
             return vr
           }
         }
@@ -13937,6 +13938,22 @@ function monoFlowReadSet(x: i32, g: i32): boolean {
     const bd = identDeclOf(unwrapParen(xi.idxArr))
     const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
     if bn is Param && bn.parType < 0 { return false }
+  }
+  // A read `xs[k]` of a `const` bound to a list literal names that literal's element `k`, which is
+  // recorded before the read is overwritten (`monoElemInst`).
+  const rk = if xi is Index { nodeAt(xi.idxIndex) } else { null }
+  const ra = if xi is Index { unwrapParen(xi.idxArr) } else { -1 }
+  const rd = if ra >= 0 && nodeAt(ra) is Ident { identDeclOf(ra) } else { -1 }
+  const rdn = if rd >= 0 && rd < P.nodes.length { nodeAt(rd) } else { null }
+  const rl = if rdn is LetDecl && rdn.letKw == "const" && rdn.letInit >= 0 { nodeAt(unwrapParen(rdn.letInit)) } else { null }
+  if rk is NumLit && rl is ArrayLit {
+    let rj = 0
+    while rj < rl.arrElems.length {
+      if i32ToStr(rj) == rk.numText {
+        monoElemInstRecord(unwrapParen(rl.arrElems[rj])).meDirect = true
+      }
+      rj = rj + 1
+    }
   }
   const n: Node = { identName: nm, pos: nodePos(x) }
   const called = monoFlowCalledAt(x)
@@ -18451,7 +18468,8 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
   // An element holds one instance, so a call that coerces it to another instance than an earlier
   // call through it did cannot be served by the one value (D10701).
   for el in elems {
-    if monoElemTakenSig.has(el) && monoElemTakenSig[el] != nm {
+    const taken = monoElemInst.get(el)?.meList ?? ""
+    if taken != "" && taken != nm {
       return emitFailAt(
         "emitProgram: a function this call reaches through a list or join is already taken at another function type by an earlier call through it",
         n.callFn,
@@ -18467,7 +18485,7 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
       )
     }
     if monoCoerceFnValueName(el, ctx, ft) < 0 { return -1 }
-    monoElemTakenSig[el] = nm
+    monoElemInstRecord(el).meList = nm
   }
   nodeTyRecord(n.callFn, ft)
   return 1
@@ -18567,7 +18585,7 @@ function monoElemsAtSet(
       )
     }
     if monoInstanceFor(fe, pins, x, -1, rows[k], rows[k]) < 0 { return -1 }
-    monoElemAtSet[x] = true
+    monoElemInstRecord(x).meSet = true
     k = k + 1
   }
   nodeTyRecord(n.callFn, ft)
@@ -18723,8 +18741,32 @@ function monoAllFnValues(xs: i32[]): boolean {
   return true
 }
 
-// The function type a call through each list or join element node coerces it to, by node.
-let monoElemTakenSig: {[i32]: string} = Map()
+// How each function value node that is a list element was instanced, by node: the one record
+// every instancing path writes (`monoElemInstRecord`). `meList` is the function type a call through
+// the list coerced it to (D10701), `meSig` the one a coercion delivered it at, `meSet` whether
+// `monoElemsAtSet` instanced it at a tagged set, `meDirect` whether a read of it was rewritten to a
+// direct call of its function (`monoFlowReadSet`).
+type MonoElemInst = {
+  meList: string,
+  meSig: string,
+  meSet: boolean,
+  meDirect: boolean,
+}
+let monoElemInst: {[i32]: MonoElemInst} = Map()
+
+// Element node `el`'s instancing row, a fresh empty one where none is recorded.
+function monoElemInstRecord(el: i32): MonoElemInst {
+  const have = monoElemInst.get(el)
+  if have != null { return have }
+  const r: MonoElemInst = {
+    meList: "",
+    meSig: "",
+    meSet: false,
+    meDirect: false,
+  }
+  monoElemInst[el] = r
+  return r
+}
 
 // The declaration of the function element `el` names in frame `ctx`: the generic itself when an
 // earlier call through the same join already instanced the element (D7842), else
@@ -18880,9 +18922,6 @@ function monoFnReadElsewhere(d: i32): boolean {
   }
   return (monoFnValReads[d] ?? []).length > 0
 }
-
-// The element values `monoElemsAtSet` instanced at a tagged set, by node.
-let monoElemAtSet: {[i32]: boolean} = Map()
 
 // Whether some type of `ts` is a tagged set's.
 function monoTysHoldSet(ts: i32[]): boolean {
