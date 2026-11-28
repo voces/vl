@@ -162,9 +162,10 @@ Deno.test({
         }
       }
       const fieldO = await wat(mods["fieldGetter-O"], dir);
-      if (count(fieldO, "struct.get") !== 1 || count(fieldO, "(call ") !== 1) {
+      // The record may be held as field globals and folded, so at most one field read is left.
+      if (count(fieldO, "struct.get") > 1 || count(fieldO, "(call ") !== 1) {
         throw new Error(
-          `fieldGetter -O: want one struct.get and no call but the print, got\n${fieldO}`,
+          `fieldGetter -O: want at most one struct.get and no call but the print, got\n${fieldO}`,
         );
       }
     } finally {

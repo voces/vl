@@ -987,10 +987,10 @@ export function elabTyClosed(t: i32): boolean {
   return elabTyClosedOwn(t, [])
 }
 
-// The answers of `elabTyClosed` walks with no owning declaration, keyed by type, so a type reached
-// along many paths or asked again is walked once; kept while no type is mutated in place
-// (`tyMutEpoch`; a hole solve bumps it, and a link joins only open holes). An answer that met a
-// cycle (`ETC_CUT`) is not kept.
+// The answers of `elabTyClosed` walks with no owning declaration, keyed by type, so a type is
+// walked once; kept while no type is mutated in place (`tyMutEpoch`, which a hole solve and a
+// restart's new arena bump, so a restart drops it). An answer that met a cycle (`ETC_CUT`) is not
+// kept.
 let etcMemo: {[i32]: boolean} = Map()
 let etcN = 0
 let etcEpoch = -1
@@ -1122,10 +1122,10 @@ function elabTyClosedWalk(t: i32, own: i32[]): i32 {
   }
 }
 
-// `elabFnSetTy` (in `check_fn_tag_facts`) maps a function type to an id into `fnSets`: a read of
-// a function's name or a lambda literal types its value at an index only that function has (its
-// singleton `Fn#d`), and a join of two sets is a fresh index.
-// Each interned set, its members ascending; `fnSetByKey` finds one by its spelling.
+// Each interned set, its members ascending; `fnSetByKey` finds one by its spelling, and
+// `elabFnSetTy` (`check_fn_tag_facts`) maps a function type to its id: a function's name or a
+// lambda types at its singleton `Fn#d`, a join at a fresh id. Kept across a restart, so a set id
+// other tables keep still names the same set.
 let fnSets: i32[][] = []
 
 // Every function some set of functions holds, once each: the functions used as values.
@@ -1189,7 +1189,7 @@ let fnRetLeaves: {[i32]: i32[]} = Map()
 // to it; -1 when they read the initialiser's type.
 export function fnLetReadTyOf(bd: i32): i32 { return fnLetReadTy[bd] ?? -1 }
 // By re-pointed `let` node: the set of every function it may hold, or -1 when one is not a
-// function.
+// function. Kept across a restart, as `fnSlotSet` is: a set id names declarations, not types.
 let fnLetSet: {[i32]: i32} = Map()
 let fnSlotSet: {[i32]: i32} = Map()
 
@@ -3229,21 +3229,28 @@ let fnTagLeaf: {[i32]: i32} = Map()
 let fnTagLeafSet: {[i32]: i32} = Map()
 // By function declaration: one whose result is a tagged set's value.
 let fnTagRet: {[i32]: boolean} = Map()
-// By call node: a direct call of each member at the call's arguments, in set order.
+// By call node: a direct call of each member at the call's arguments, in set order. Kept across a
+// restart: each walk binds a kept list before its first use (`fnTagArmsBound`).
 let fnTagArms: {[i32]: i32[]} = Map()
 // By call node and set id: the member calls of a generic call whose instances see another tagged
 // set than the one its first note recorded. Kept across a restart: re-used arms are re-typed whole
 // each walk (`ftArmBind`), and a key whose signature row moved only mints new arms.
 let fnTagArmsBy: {[string]: i32[]} = Map()
+// By the key `fnTagArmsKey` gives: the call arms this walk bound, so each walk binds a kept list
+// before its first use.
+let fnTagArmsBound: {[string]: boolean} = Map()
 // By delivery site: the closed function type, or the record closing a set's function field, a
 // value carrying a set is delivered at, so each member is pinned there by a value arm (D17777).
 let fnTagValueDst: {[i32]: i32} = Map()
 // By arm call node: the member declaration it calls, recorded when the arm is built, so every
-// pass checks the arm as a call of that member whatever its callee's name resolves to.
+// pass checks the arm as a call of that member whatever its callee's name resolves to. Kept
+// across a restart with the arms; it names declarations only.
 let fnTagArmMember: {[i32]: i32} = Map()
-// By `let` declaration: the tagged set it holds, recorded when the set is tagged.
+// By `let` declaration: the tagged set it holds, recorded when the set is tagged. Kept across a
+// restart: a set id names declarations, not types.
 let fnTagBind: {[i32]: i32} = Map()
-// Per union a shared type parameter is bound to (`fnTagSharedJoinSet`), the arguments' sets.
+// Per joined set a shared type parameter is bound to (`fnTagSharedJoinSet`), the arguments' sets;
+// kept across a restart, as `fnTagCallJoin` is, since it holds set ids only.
 let fnTagJoinFrom: {[i32]: i32[]} = Map()
 // Per call and argument, as `call * 64 + i`: the joined set the elaboration binds that argument's
 // shared type parameter to (`elabSetArgBind`).
@@ -3310,7 +3317,8 @@ let fnSetOpenCallee = false
 let fnSlotCallAt: {[string]: i32} = Map()
 let fnSlotCallArgs: i32[][][] = []
 // Each slot's calls that read their callee from it as the slot: not a const element read that
-// names one function.
+// names one function. Kept across a restart, as `fnSlotOpenHands` is: keyed by slot spelling,
+// it holds source call nodes.
 let fnSlotThrough: {[string]: i32[]} = Map()
 
 // The slots a read of which is handed to a parameter whose function type is open, so each call
@@ -3939,6 +3947,7 @@ export function fnTyFactsReset() {
   elabUnboundCallN = []
   elabUnboundCallT = []
   fnTagValueDst = Map()
+  fnTagArmsBound = Map()
   fnSetCallees = []
   fnSetCalleeArgs = []
   fnSetCalleeGens = []
@@ -4819,6 +4828,18 @@ export function fnTagValueArmsAt(ix: i32, s: i32, sig: i32): i32[] {
   return fnTagArmsBy[fnTagArmsKey(ix, s) + "#" + i32ToStr(sig)] ?? none
 }
 
+// Whether this walk bound the member calls built for call `ix` at set `s` (`ftArmBind`); a kept
+// list a restarted walk has not bound yet is re-bound before it is used.
+export function fnTagArmsBoundIs(ix: i32, s: i32): boolean {
+  return fnTagArmsBound[fnTagArmsKey(ix, s)] ?? false
+}
+
+// Records that this walk bound the member calls built for call `ix` at set `s`.
+export function fnTagArmsBoundNote(ix: i32, s: i32) {
+  fnTagArmsBound[fnTagArmsKey(ix, s)] = true
+  return 0
+}
+
 // Records `arms` as the value arms at site `ix` for set `s` at signature `sig`.
 export function fnTagValueArmsAtSet(ix: i32, s: i32, sig: i32, arms: i32[]) {
   fnTagArmsBy[fnTagArmsKey(ix, s) + "#" + i32ToStr(sig)] = arms
@@ -5078,6 +5099,7 @@ export function elabCapReset() {
   fnTagRet = Map()
   fnTagArms = Map()
   fnTagArmsBy = Map()
+  fnTagArmsBound = Map()
   fnTagValueDst = Map()
   fnTagArmMember = Map()
   fnTagBind = Map()
