@@ -85,7 +85,6 @@ vl_compile_gc_test.ts 2
 vl_check_codegen_test.ts 2
 vl_iface_hash_test.ts 2
 vl_instance_state_leak_test.ts 2
-vl_corpuscmp_test.ts 2
 vl_seed_memo_test.ts 2
 vl_zext_load_fold_test.ts 2
 vl_help_test.ts 2.0

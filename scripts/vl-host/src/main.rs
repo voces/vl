@@ -4685,7 +4685,6 @@ fn compile_vl_instance(
         }
     }
     arm_cls_census(inst, &mut store);
-    arm_ir_shadow(inst, &mut store);
     // Identity shadow ($VL_ID_SHADOW=1 records and reports, =2 also keys callback
     // specialization by it): armed before the compile, read back after it. A seed
     // without `setIdShadow` ignores it.
@@ -4713,7 +4712,6 @@ fn compile_vl_instance(
     report_guest_alloc(resident0);
     report_late_demands(inst, store, source_path);
     report_inst_keys(inst, store, source_path);
-    report_ifaces(inst, store, source_path);
     report_touch_set(inst, store, source_path);
     report_cls_census(inst, store, source_path);
     report_ir_shadow(inst, store, source_path);
@@ -4767,36 +4765,10 @@ fn report_id_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
     eprint!("{rows}");
 }
 
-/// The mode `$VL_IR_SHADOW` asks the guest's IR shadow for: 0 off, 1 count, 2 also detail each
-/// dual-emit mismatch class's first examples, 3 disarmed but claiming every I1 family (the claim
-/// path's test), 4 the blocker census (each function's row names every class it missed), 5
-/// disarmed and only reporting, so the shipped claim's `claimed` and fallback rows print, 6 the
-/// order check (each function also built before legacy emits it, and compared).
-fn ir_shadow_mode() -> i32 {
-    match std::env::var("VL_IR_SHADOW").ok().as_deref() {
-        Some("1") => 1,
-        Some("2") => 2,
-        Some("3") => 3,
-        Some("4") => 4,
-        Some("5") => 5,
-        Some("6") => 6,
-        _ => 0,
-    }
-}
-
+/// Whether `$VL_IR_SHADOW` asks for the IR's per-function rows (any value but empty or `0`). The
+/// guest keeps them on every compile, so the switch only prints them.
 fn ir_shadow_on() -> bool {
-    ir_shadow_mode() > 0
-}
-
-/// Under `$VL_IR_SHADOW`, arm the guest's IR shadow. A seed without `irShadowArm` ignores it.
-fn arm_ir_shadow(inst: &Instance, store: &mut Store<()>) {
-    if !ir_shadow_on() {
-        return;
-    }
-    let mode = ir_shadow_mode();
-    if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut *store, "irShadowArm") {
-        let _ = set.call(&mut *store, mode);
-    }
+    std::env::var("VL_IR_SHADOW").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 
@@ -4990,36 +4962,6 @@ fn report_inst_keys(inst: &Instance, store: &mut Store<()>, path: &str) {
             .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
             .collect();
         rows.push_str(&format!("[inst] {path}: {row}\n"));
-    }
-    eprint!("{rows}");
-}
-
-/// Whether `$VL_IFACES=1` asked for each compile's shadow interfaces.
-fn ifaces_on() -> bool {
-    std::env::var("VL_IFACES").ok().as_deref() == Some("1")
-}
-
-/// Under `$VL_IFACES=1`, print `[iface] <path>: <line>` to stderr for each line of the guest's
-/// shadow-interface dump (L2 S0): one per un-annotated top-level function, its parameters, the
-/// demand rows it owns and how its calls agree with its result at their bindings. A seed without
-/// `ifaceDumpBuild` prints nothing.
-fn report_ifaces(inst: &Instance, store: &mut Store<()>, path: &str) {
-    if !ifaces_on() {
-        return;
-    }
-    let (Ok(build), Ok(at)) = (
-        inst.get_typed_func::<(), i32>(&mut *store, "ifaceDumpBuild"),
-        inst.get_typed_func::<i32, i32>(&mut *store, "ifaceDumpAt"),
-    ) else {
-        return;
-    };
-    let n = build.call(&mut *store, ()).unwrap_or(0);
-    let text: String = (0..n)
-        .map(|j| char::from_u32(at.call(&mut *store, j).unwrap_or(63) as u32).unwrap_or('?'))
-        .collect();
-    let mut rows = String::new();
-    for line in text.lines() {
-        rows.push_str(&format!("[iface] {path}: {line}\n"));
     }
     eprint!("{rows}");
 }
@@ -10095,10 +10037,9 @@ fn pump_session(
     stage_vl_root_and_cwd(&mut store, &inst)?;
     let keep_dir = keep_modules_dir(&mut store, &inst)?;
     arm_cls_census(&inst, &mut store);
-    arm_ir_shadow(&inst, &mut store);
     arm_opaque_snames(&inst, &mut store);
-    // $VL_REP_SHADOW under the pump arms the shadow's check-time half (the read query's saved
-    // answers, which `$VL_IFACES` prints); the disagreement report stays a build's.
+    // $VL_REP_SHADOW under the pump arms the shadow's check-time half; the disagreement report
+    // stays a build's.
     if std::env::var_os("VL_REP_SHADOW").is_some() {
         if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setRepShadow") {
             set.call(&mut store, 1)?;
@@ -10468,10 +10409,6 @@ fn pump_session(
                 if inst_keys_on() {
                     let p = cmd_path.read(&mut store)?;
                     report_inst_keys(&inst, &mut store, &p);
-                }
-                if ifaces_on() {
-                    let p = cmd_path.read(&mut store)?;
-                    report_ifaces(&inst, &mut store, &p);
                 }
                 if touch_set_on() {
                     let p = cmd_path.read(&mut store)?;
