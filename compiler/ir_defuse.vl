@@ -1,0 +1,326 @@
+// Def-use over one function's IR: for each variable, the statements that write it, each with
+// its kind, and the statements that read it; and for each node, the statement whose body holds it.
+// Built in one walk from `irBody`; a query reads offsets, never scans. A parameter's entry write
+// is node `-1`. Only nodes the body reaches are counted. A cell's contents are not a variable, and
+// a range loop's bounds are read by its own lowering at `rlAt`, not through an operand. An `IrDu`
+// is a snapshot: any rewrite of `f` makes it wrong, so a rewriting pass drops it and calls
+// `irDuOf` again. Nothing caches one.
+import {
+  IrFn,
+  IrNode,
+  OVar,
+  Opnd,
+  RCall,
+  Rhs,
+  SArmSite,
+  SArmWrite,
+  SAssign,
+  SBlock,
+  SBoundsCheck,
+  SBr,
+  SCellSet,
+  SCoalBox,
+  SDrop,
+  SEffect,
+  SForIn,
+  SGlobalSet,
+  SIf,
+  SIntSwitch,
+  SLet,
+  SListSet,
+  SLoop,
+  SRangeLoop,
+  SRawOp,
+  SReturn,
+  SSetField,
+  SSwitch,
+  STrap,
+  irPushBodies,
+  irRhsOpnds,
+} from "./ir"
+
+// How a statement writes a variable: a parameter at entry, a `let`, an assignment, a loop's own
+// variable (`for` or range), a call's capture write-back, an arm's payload or index, a `break`
+// with a value into its block's out, or a `??` box's present path into its out.
+export type DuDefKind = "param"
+  | "let"
+  | "assign"
+  | "loopVar"
+  | "writeBack"
+  | "armVar"
+  | "brOut"
+  | "coalOut"
+
+// Variable `v`'s writes are `duDef[duDefLo[v] .. duDefLo[v + 1]]` (kinds in `duDefKind` alike),
+// its reads `duUse[duUseLo[v] .. duUseLo[v + 1]]`, in walk order: a statement before the bodies
+// it holds, in `irPushBodies`' order. `duParent[id]`: the statement holding node `id`, `-1` at
+// the top-level body, `-2` for a node the body does not reach.
+export type IrDu = {
+  duDefLo: i32[],
+  duDef: i32[],
+  duDefKind: DuDefKind[],
+  duUseLo: i32[],
+  duUse: i32[],
+  duParent: i32[],
+}
+
+// The (variable, node) pairs one walk found, writes and reads apart, before bucketing.
+type DuPairs = {
+  dpDefV: i32[],
+  dpDefN: i32[],
+  dpDefK: DuDefKind[],
+  dpUseV: i32[],
+  dpUseN: i32[],
+}
+
+function noteUse(p: DuPairs, o: Opnd, at: i32) {
+  if o is OVar {
+    p.dpUseV.push(o.ov)
+    p.dpUseN.push(at)
+  }
+}
+
+function noteUses(p: DuPairs, os: Opnd[], at: i32) {
+  for o in os { noteUse(p, o, at) }
+}
+
+function noteDef(p: DuPairs, v: i32, at: i32, k: DuDefKind) {
+  if v < 0 { return 0 }
+  p.dpDefV.push(v)
+  p.dpDefN.push(at)
+  p.dpDefK.push(k)
+  return 0
+}
+
+// A right-hand side's reads, and the variables a call's captures write back after it.
+function noteRhs(p: DuPairs, r: Rhs, at: i32) {
+  noteUses(p, irRhsOpnds(r), at)
+  if r is RCall {
+    for v in r.caWb { noteDef(p, v, at, "writeBack") }
+  }
+}
+
+// What statement `n` at node `at` reads and writes. An out variable is written by the `SAssign`
+// or `SBr` that ends each arm, so a branching statement writes none itself, except `SCoalBox`'s
+// present path. `outOf` maps each open block's label to its out variable.
+function noteStmt(p: DuPairs, n: IrNode, at: i32, outOf: {[i32]: i32}) {
+  match n {
+    SArmSite => {
+      noteUses(p, n.saOps, at)
+      for v in n.saVars { noteDef(p, v, at, "armVar") }
+      noteDef(p, n.saIdx, at, "armVar")
+    }
+    SArmWrite => {
+      noteUse(p, n.awV, at)
+      for v in n.awVars { noteDef(p, v, at, "armVar") }
+    }
+    SAssign => {
+      noteUse(p, n.asSrc, at)
+      noteDef(p, n.asDst, at, "assign")
+    }
+    SBlock => {
+      outOf[n.bkLabel] = n.bkOut
+    }
+    SBoundsCheck => {
+      noteUse(p, n.bcV, at)
+      noteUse(p, n.bcIx, at)
+    }
+    SBr => {
+      if n.brHas {
+        noteUse(p, n.brVal, at)
+        noteDef(p, outOf[n.brLabel] ?? -1, at, "brOut")
+      }
+    }
+    SCellSet => {
+      noteUse(p, n.csCell, at)
+      noteUse(p, n.csSrc, at)
+    }
+    SCoalBox => {
+      noteUse(p, n.cbL, at)
+      const m = n.cbMap
+      if m != null { noteUse(p, m.prKey, at) }
+      const ix = n.cbIdx
+      if ix != null { noteUse(p, ix, at) }
+      noteDef(p, n.cbOut, at, "coalOut")
+    }
+    SDrop => {
+      noteUse(p, n.dpV, at)
+    }
+    SEffect => {
+      noteRhs(p, n.efRhs, at)
+    }
+    SForIn => {
+      noteUse(p, n.xfList, at)
+      noteDef(p, n.xfVar, at, "loopVar")
+      noteDef(p, n.xfVar2, at, "loopVar")
+    }
+    SGlobalSet => {
+      noteUse(p, n.gsSrc, at)
+    }
+    SIf => {
+      noteUse(p, n.siCond, at)
+    }
+    SIntSwitch => {
+      noteUse(p, n.isOn, at)
+    }
+    SLet => {
+      noteRhs(p, n.lRhs, at)
+      noteDef(p, n.lDst, at, "let")
+    }
+    SListSet => {
+      noteUse(p, n.lsV, at)
+      noteUse(p, n.lsIx, at)
+      noteUse(p, n.lsSrc, at)
+    }
+    SLoop | STrap => {}
+    SRangeLoop => {
+      noteDef(p, n.rlVar, at, "loopVar")
+    }
+    SRawOp => {
+      noteUses(p, n.srArgs, at)
+    }
+    SReturn => {
+      if n.rtHas { noteUse(p, n.rtV, at) }
+    }
+    SSetField => {
+      noteUse(p, n.sfV, at)
+      noteUse(p, n.sfSrc, at)
+    }
+    SSwitch => {
+      if n.swOn >= 0 {
+        p.dpUseV.push(n.swOn)
+        p.dpUseN.push(at)
+      }
+    }
+  }
+}
+
+// Buckets pairs over `nv` variables by `vs`: the `lo` offsets, `nv + 1` long, and the pair
+// indices in bucket order, each bucket in pair order. A pair naming no variable is dropped.
+function bucket(nv: i32, vs: i32[]): { lo: i32[], order: i32[] } {
+  const lo: i32[] = []
+  let i = 0
+  while i <= nv {
+    lo.push(0)
+    i = i + 1
+  }
+  for v in vs {
+    if v >= 0 && v < nv { lo[v + 1] = lo[v + 1] + 1 }
+  }
+  i = 0
+  while i < nv {
+    lo[i + 1] = lo[i + 1] + lo[i]
+    i = i + 1
+  }
+  const fill: i32[] = []
+  const order: i32[] = []
+  i = 0
+  while i < nv {
+    fill.push(lo[i])
+    i = i + 1
+  }
+  while order.length < lo[nv] { order.push(-1) }
+  i = 0
+  while i < vs.length {
+    const v = vs[i]
+    if v >= 0 && v < nv {
+      order[fill[v]] = i
+      fill[v] = fill[v] + 1
+    }
+    i = i + 1
+  }
+  return { lo: lo, order: order }
+}
+
+// The def-use of `f` as it stands.
+export function irDuOf(f: IrFn): IrDu {
+  const p: DuPairs = {
+    dpDefV: [],
+    dpDefN: [],
+    dpDefK: [],
+    dpUseV: [],
+    dpUseN: [],
+  }
+  for v in f.irParams { noteDef(p, v, -1, "param") }
+  const parent: i32[] = []
+  for _n in f.irNodes { parent.push(-2) }
+  const outOf: {[i32]: i32} = Map()
+  // A walk stack of bodies, the next position in each, and the statement holding each.
+  const bodies: i32[][] = [f.irBody]
+  const pos: i32[] = [0]
+  const owner: i32[] = [-1]
+  while bodies.length > 0 {
+    const top = bodies.length - 1
+    const b = bodies[top]
+    const k = pos[top]
+    if k >= b.length {
+      bodies.pop()
+      pos.pop()
+      owner.pop()
+      continue
+    }
+    pos[top] = k + 1
+    const id = b[k]
+    if id >= 0 && id < f.irNodes.length {
+      parent[id] = owner[top]
+      noteStmt(p, f.irNodes[id], id, outOf)
+      irPushBodies(f, id, bodies, pos)
+      while owner.length < bodies.length { owner.push(id) }
+    }
+  }
+  const nv = f.irVars.length
+  const d = bucket(nv, p.dpDefV)
+  const u = bucket(nv, p.dpUseV)
+  const def: i32[] = []
+  const kind: DuDefKind[] = []
+  for i in d.order {
+    def.push(p.dpDefN[i])
+    kind.push(p.dpDefK[i])
+  }
+  const use: i32[] = []
+  for i in u.order { use.push(p.dpUseN[i]) }
+  return {
+    duDefLo: d.lo,
+    duDef: def,
+    duDefKind: kind,
+    duUseLo: u.lo,
+    duUse: use,
+    duParent: parent,
+  }
+}
+
+// The nodes that write variable `v`, `-1` for a parameter's entry; empty for an id out of range.
+export function irDuDefs(d: IrDu, v: i32): i32[] {
+  if v < 0 || v + 1 >= d.duDefLo.length { return [] }
+  return d.duDef.slice(d.duDefLo[v], d.duDefLo[v + 1])
+}
+
+// The nodes that read variable `v`, a node once per operand that names it.
+export function irDuUses(d: IrDu, v: i32): i32[] {
+  if v < 0 || v + 1 >= d.duUseLo.length { return [] }
+  return d.duUse.slice(d.duUseLo[v], d.duUseLo[v + 1])
+}
+
+// The kinds of `irDuDefs(d, v)`, position for position.
+export function irDuDefKinds(d: IrDu, v: i32): DuDefKind[] {
+  if v < 0 || v + 1 >= d.duDefLo.length { return [] }
+  return d.duDefKind.slice(d.duDefLo[v], d.duDefLo[v + 1])
+}
+
+// The statement whose body holds node `id`: `-1` at the top-level body, `-2` when the body does not
+// reach `id` or `id` is not a node of the function.
+export function irDuParent(d: IrDu, id: i32): i32 {
+  if id < 0 || id >= d.duParent.length { return -2 }
+  return d.duParent[id]
+}
+
+// The innermost loop (`SLoop`, `SForIn`, `SRangeLoop`) holding node `id` in `f`, else `-1`.
+export function irDuLoopOf(f: IrFn, d: IrDu, id: i32): i32 {
+  let at = irDuParent(d, id)
+  while at >= 0 {
+    const n = f.irNodes[at]
+    if n is SLoop || n is SForIn || n is SRangeLoop { return at }
+    at = irDuParent(d, at)
+  }
+  return -1
+}
