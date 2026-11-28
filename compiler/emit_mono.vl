@@ -18157,6 +18157,11 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const ew = elabWrittenValueTy(0 - 1, m.memObj, elabWalkTop())
     if ew >= 0 { rt = ew }
   }
+  // A receiver this walk closed, an identity `map`'s, reads as the walk typed it.
+  if rt < 0 || monoTyOpen(rt) {
+    const mt = monoNodeTyAt(m.memObj, ctx)
+    if mt >= 0 && !monoTyOpen(mt) { rt = mt }
+  }
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = tyAt(rt)
   // A tagged set element is closed: the callback's instance takes the set, as a direct call's does.
@@ -18170,7 +18175,20 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   monoRecordPinnedRecv(m.memObj, rt, ctx, 0)
   if lam {
     // A lambda the elaboration keyed at the list's build takes that record as its parameter's type.
-    const rw = elabCbParamRowTy(ax, ax)
+    // Over a lambda's `map`, directly or through a `const`, the lambda reads the records of the
+    // list that map built or handed on.
+    let rx = unwrapParen(m.memObj)
+    const rd = if rx >= 0 && nodeAt(rx) is Ident { identDeclOf(rx) } else { -1 }
+    const rdn = if rd >= 0 && rd < P.nodes.length { nodeAt(rd) } else { null }
+    if rdn is LetDecl && rdn.letKw == "const" && rdn.letInit >= 0 {
+      rx = unwrapParen(rdn.letInit)
+    }
+    const rc = if rx >= 0 { nodeAt(rx) } else { null }
+    const rm = if rc is Call && rc.callFn >= 0 && rc.callArgs.length == 1 { nodeAt(rc.callFn) } else { null }
+    const rcb = if rc is Call && rm is Member && rm.memProp == "map" { unwrapParen(rc.callArgs[0]) } else { -1 }
+    const lamMap = rcb >= 0 && nodeAt(rcb) is FuncDecl
+    const rw0 = elabCbParamRowTy(ax, ax)
+    const rw = if rw0 < 0 && lamMap { tyElemOf(lt) } else { rw0 }
     const lf = nodeAt(ax)
     const lsf = if nodeTyIxOf(ax) >= 0 { tyAt(nodeTyIxOf(ax)) } else { null }
     // A `map` whose lambda hands each element back returns them at the build too (D16211).
@@ -18184,10 +18202,16 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
       if keep { nodeTyRecord(ix, mkArrayTy(rw)) }
     }
     monoListCbLamAt(a, tyElemOf(lt), ctx)
-    // A `.map` whose lambda returns a function gives a list of that function's type (D9171).
+    // A `.map` the checker left open gives a list of its lambda's result with the parameter at
+    // the element, where that result is a function or a record; a scalar keeps the checker's own
+    // type, since mono re-deriving literal typing would be a second typer (`e ?? "m"`, D17561).
     if m.memProp == "map" && monoTyOpen(nodeTyIxOf(ix)) {
       const lr = monoValueRetAt(a, [tyElemOf(lt)], 0)
-      if monoTyClosedFn(lr) { nodeTyRecord(ix, mkArrayTy(lr)) }
+      const lrRec = lr >= 0
+        && lr < T.tys.length
+        && tyAt(lr) is TyObj
+        && !monoTyOpen(lr)
+      if monoTyClosedFn(lr) || lrRec { nodeTyRecord(ix, mkArrayTy(lr)) }
     }
     return 0
   }
