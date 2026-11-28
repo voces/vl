@@ -31,7 +31,12 @@ import {
   nulUnitPlaceReadAt,
   spreadGroupConverts,
 } from "./wasmEmit"
-import { exprValueTyAt, identLetOfRead, lmForUnionArms } from "./emit_classify"
+import {
+  exprValueTyAt,
+  identLetOfRead,
+  letOpenCallTy,
+  lmForUnionArms,
+} from "./emit_classify"
 import { mapUnionForKnownArm, mapUnionForPairTy } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import { litAtomMark, litAtomRollback } from "./emit_lit_atoms"
@@ -794,6 +799,7 @@ import {
   elabInstTyAt,
   elabLamProducerSigs,
   elabMakerLamOf,
+  elabNodeRepAt,
   elabSpreadNote,
   elabStoreMemberOf,
   elabUnionCallMembersOf,
@@ -3469,6 +3475,8 @@ function rowlessRecordRep(ix: i32, t: i32, r: i32): i32 {
   // A read of a place holds the place's rep, which the place decides (`rowlessLetTy`).
   const nd = nodeAt(unwrapParen(ix))
   if nd is Ident || nd is Member { return r }
+  // A call the elaboration stamped is at its stamp's rep (`exprTyOf`), not a storage row's.
+  if nd is Call && elabNodeRepAt(unwrapParen(ix), ibFnIx) >= 0 { return r }
   // An element read off a list laid out at another record's row (`elemRowTy`) is that row's; a
   // read whose type no struct row records is the element its list's row lays out.
   const la = if nd is Index { nd.idxArr } else { -1 }
@@ -3727,6 +3735,9 @@ export function exprTyOf(ix: i32): i32 {
     const st = readNarrowedStoreAt(ix, ibFnIx)
     if st >= 0 { return st }
   }
+  // A call the elaboration stamped is of the type it stamped (`elabNodeRepAt`).
+  const ct = if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Call { elabNodeRepAt(ix, ibFnIx) } else { -1 }
+  if ct >= 0 { return ct }
   // A read of a binding holding a returned record whole is that record (`emitHolderRead`).
   const ht = holderReadTy(ix)
   if ht >= 0 { return ht }
@@ -4376,6 +4387,12 @@ function openLocalInitTy(d: i32, t: i32): i32 {
   if t >= 0 && !irTyOpen(t) { return t }
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return t }
+  // A `const` holding a call its frame types open is stored at the width legacy's one reader
+  // gives it, so the two never disagree (D17808).
+  if dn.letKw == "const" {
+    const w = letOpenCallTy(d, ibFnIx)
+    if w >= 0 { return w }
+  }
   // Only a call through a binding the IR calls directly: a named function's call already reads.
   const c = unwrapParen(dn.letInit)
   const cn = if c >= 0 { nodeAt(c) } else { null }
@@ -17735,7 +17752,14 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
         return irBLetTempTy(b, rhs, ix, sr, calleeResultTyAt(rhs.caCallee, sr))
       }
     }
-    return irBLetTemp(b, rhs, ix, rep)
+    // A result the elaboration stamped at another record than its checked type is laid out at
+    // that record's row (`irBNoteRow`), which its field reads read.
+    const st = elabNodeRepAt(ix, ibFnIx)
+    const moved = st >= 0 && st != nodeTyAt(ix, ibFnIx)
+    return irBNoteRow(
+      irBLetTemp(b, rhs, ix, rep),
+      if moved { structIndexOfTy(st) } else { -1 },
+    )
   }
   // An element read of a list laid out at a struct row is that row's value (`irBNoteRow`).
   if n is Index {
@@ -18473,8 +18497,9 @@ function assignValueHeld(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const got = ibAsgCapGot[at] ?? null
   ibAsgCapGot.delete(at)
   if ibMiss != "" { return irBMiss(ibMiss) }
-  // A store that writes a literal without building its node yields that literal, built again.
-  const v = if got != null { got } else if scalarLitAt(at) { irBExpr(b, at) } else { irBMiss("assignment value built apart from its store") }
+  // A store that writes a literal without building its node yields that literal, built again; any
+  // other value its store does not hand back is the local target read back at its own rep.
+  const v = if got != null { got } else if scalarLitAt(at) { irBExpr(b, at) } else { asgReadBack(b, n, ix) }
   if ibMiss != "" { return v }
   return irConvert(b, v, rep, heldTy(nodeTyAt(ix, ibFnIx)), ix)
 }
@@ -18596,6 +18621,24 @@ function regionStart(b: i32[], n: BinExpr, ix: i32, d: i32): i32 {
   irBNode(b, { asDst: v, asSrc: val }, -1, ibNoValue, ix)
   ibDeclVar[d] = v
   return 0
+}
+
+// Assignment `n` at `ix`: its target read back after its store, at the rep its place holds
+// (D17821). A field or element target is read again whole, so one whose receiver or index has an
+// effect is a miss.
+function asgReadBack(b: i32[], n: BinExpr, ix: i32): Opnd {
+  const t = nodeAt(n.binLeft)
+  if (
+    !(t is Ident)
+    && !((t is Index || t is Member) && exprEffectFree(n.binLeft))
+  ) {
+    return irBMiss("assignment value built apart from its store")
+  }
+  const m = asgReReadEnter(ix)
+  const rr = repNodeOfTy(heldTy(exprTyOf(n.binLeft)))
+  const o = if t is Ident { identRead(b, t, n.binLeft, rr, asgReReadSeated(n.binLeft)) } else { irBExpr(b, n.binLeft) }
+  asgReReadLeave(m)
+  return o
 }
 
 // Whether `x` is a number, boolean, string or `null` literal, whose value a second build repeats.
