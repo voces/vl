@@ -1,0 +1,176 @@
+// Reads the `[ir]` rows a `probe.patch` compiler printed (`run.sh`) and the IR decline templates
+// (`emit-refusal-sites.vl -- --ir`), and prints, per template, the hits and a sample program:
+// `miss` for every recorded miss (`F` the unit's own, `M` a later one), `surfaced` where the
+// compile refused as `cannot yet lower`. Then the unreached templates by family.
+//
+//     vl run scripts/ir-decline-reach/aggregate.vl -- <rows-file> <templates-file>
+
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import { endsWith, split, startsWith } from "std:str"
+import { die, findFrom } from "../lib/common"
+import { padLeft, padRight, readText, sortStrings } from "../lib/corpus"
+
+type Tpl = { text: string, sites: i32, parts: string[] }
+
+// Whether `msg` is an instance of a template's literal chunks, `{}` being any text.
+function matches(parts: string[], msg: string): boolean {
+  if parts.length == 1 { return parts[0] == msg }
+  if !startsWith(msg, parts[0]) || !endsWith(msg, parts[parts.length - 1]) {
+    return false
+  }
+  let at = parts[0].length
+  let i = 1
+  while i < parts.length - 1 {
+    const p = findFrom(msg, parts[i], at)
+    if p < 0 { return false }
+    at = p + parts[i].length
+    i = i + 1
+  }
+  return at <= msg.length - parts[parts.length - 1].length
+}
+
+// The templates of `emit-refusal-sites.vl --ir`: one `` * `t` — n: locs `` line each.
+function templates(path: string): Tpl[] {
+  const out: Tpl[] = []
+  for l in split(readText(path), "\n") {
+    if !startsWith(l, "* `") { continue }
+    const halves = split(l.slice(3, l.length), "` — ")
+    if halves.length < 2 { continue }
+    const t = halves[0]
+    const n = parseI32(split(halves[halves.length - 1], ":")[0]) ?? 0
+    out.push({ text: t, sites: n, parts: split(t, "{}") })
+  }
+  return out
+}
+
+// A row's message, with a surfaced unit's `this statement (…)` wrapper peeled.
+function messageOf(row: string): string {
+  let m = row
+  for p in ["ZS ", "Z F B ", "Z M B ", "Z F L ", "Z M L "] {
+    if startsWith(m, p) { m = m.slice(p.length, m.length) }
+  }
+  for w in ["this statement (", "this function (", "this top-level code ("] {
+    if startsWith(m, w) && endsWith(m, ")") {
+      return m.slice(w.length, m.length - 1)
+    }
+  }
+  return m
+}
+
+// The family a template's leading words name: its first word, or two after an article.
+function familyOf(t: string): string {
+  const w = split(t, " ")
+  if (
+    w.length > 1
+    && (w[0] == "a" || w[0] == "an" || w[0] == "the" || w[0] == "no")
+  ) {
+    return w[0] + " " + w[1]
+  }
+  return if w.length > 0 { w[0] } else { "?" }
+}
+
+function main(args: readonly string[]): i32 {
+  if args.length != 2 {
+    die("usage: aggregate.vl <rows-file> <templates-file>", 2)
+  }
+  const ts = templates(args[1])
+  const miss: Map<string, i32> = Map()
+  const surf: Map<string, i32> = Map()
+  const sample: Map<string, string> = Map()
+  // A reached message no template names: one a wrapper builds or a value carries (`Storage`'s
+  // `stMiss`, a returned reason), which the site count cannot attribute.
+  const loose: Map<string, i32> = Map()
+  for l in split(readText(args[0]), "\n") {
+    // `[ir] <path>: <n>\t<row>`
+    const tab = findFrom(l, "\t", 0)
+    if !startsWith(l, "[ir] ") || tab < 0 { continue }
+    const row = l.slice(tab + 1, l.length)
+    if !startsWith(row, "Z") { continue }
+    const head = l.slice(5, tab)
+    const colon = findFrom(head, ": ", 0)
+    let last = colon
+    while last >= 0 {
+      const nx = findFrom(head, ": ", last + 1)
+      if nx < 0 { break }
+      last = nx
+    }
+    const path = if last >= 0 { head.slice(0, last) } else { head }
+    const n = if last >= 0 { parseI32(head.slice(last + 2, head.length)) ?? 1 } else { 1 }
+    const msg = messageOf(row)
+    let named = false
+    for t in ts {
+      if !matches(t.parts, msg) { continue }
+      named = true
+      if startsWith(row, "ZS ") {
+        surf[t.text] = (surf[t.text] ?? 0) + n
+      } else {
+        miss[t.text] = (miss[t.text] ?? 0) + n
+      }
+      if !sample.has(t.text) { sample[t.text] = path }
+      break
+    }
+    if !named { loose[msg] = (loose[msg] ?? 0) + n }
+  }
+  let reachedT = 0
+  let reachedS = 0
+  print("| template | sites | misses | surfaced | sample |")
+  print("| --- | ---: | ---: | ---: | --- |")
+  for t in ts {
+    const m = miss[t.text] ?? 0
+    const s = surf[t.text] ?? 0
+    if m + s == 0 { continue }
+    reachedT = reachedT + 1
+    reachedS = reachedS + t.sites
+    print(
+      "| `\{t.text}` | \{toString(t.sites)} | \{toString(m)} | \{toString(s)} | \{sample[t.text] ?? ""} |",
+    )
+  }
+  let allS = 0
+  for t in ts { allS = allS + t.sites }
+  print("")
+  print(
+    "reached: \{toString(reachedT)} of \{toString(ts.length)} templates, \{toString(reachedS)} of \{toString(allS)} sites",
+  )
+  if loose.length > 0 {
+    print("")
+    print("reached, attributed to no template (a message a value carries):")
+    for k in sortStrings(loose.keys()) {
+      print("  \{toString(loose[k] ?? 0)}  \{k}")
+    }
+  }
+  const famS: Map<string, i32> = Map()
+  const famT: Map<string, i32> = Map()
+  for t in ts {
+    if (miss[t.text] ?? 0) + (surf[t.text] ?? 0) > 0 { continue }
+    const f = familyOf(t.text)
+    famS[f] = (famS[f] ?? 0) + t.sites
+    famT[f] = (famT[f] ?? 0) + 1
+  }
+  print("")
+  print("unreached, by family (sites, templates):")
+  const keys: string[] = []
+  for k in famS.keys() {
+    keys.push(padLeft(toString(famS[k] ?? 0), 5) + " " + k)
+  }
+  const sorted = sortStrings(keys)
+  let i = sorted.length - 1
+  while i >= 0 {
+    const k = sorted[i]
+    const name = k.slice(6, k.length)
+    print(
+      "  \{k.slice(0, 5)} \{padRight(name, 24)} \{toString(famT[name] ?? 0)}",
+    )
+    i = i - 1
+  }
+  return 0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("aggregate.vl: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
