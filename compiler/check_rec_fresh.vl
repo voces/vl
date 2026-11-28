@@ -33,9 +33,11 @@ import {
 import { parenPeelIx } from "./check_places"
 import {
   recBindDeclOf,
+  recElemPinLit,
   recIndexBase,
   recMapCtorCall,
   recPassThroughArg,
+  recShapePassArg,
   recSolePinArg,
 } from "./check_record_origins"
 import { identBoundFnDeclOf } from "./check_scopes"
@@ -556,8 +558,17 @@ function exprDests(
     const fd = cwCalleeDeclOf(c.callFn)
     const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
     if !(f is FuncDecl) { return false }
-    // A generic parameter takes the argument at whatever it is: no destination of its own.
-    if f.fnTyParams.length > 0 { return true }
+    // A generic parameter takes the argument at whatever it is: no destination of its own, but a
+    // call handing its values back delivers them where the call's value goes, where a rule places
+    // it: in the same shape, or one element of a list literal argument.
+    if f.fnTyParams.length > 0 {
+      if parenPeelIx(recShapePassArg(up)) == x {
+        destsMerge(up, path, out, paths, on)
+      } else if recElemPinLit(up) == x {
+        destsMerge(up, destJoin("E", path), out, paths, on)
+      }
+      return true
+    }
     const a = cwIxUpAux[x]
     if a < 0 || a >= f.fnParams.length { return false }
     const pn = nodeAt(f.fnParams[a])
@@ -617,24 +628,37 @@ function projDests(
 ): boolean {
   const ix = nodeAt(up)
   if ix is Member && nodeAt(x) is Ident && parenPeelIx(ix.memObj) == x {
-    return callbackDests(x, up, path, out, paths)
+    return callbackDests(x, up, path, out, paths, on)
   }
-  if !(ix is Index) || parenPeelIx(ix.idxArr) != x || !(nodeAt(x) is Ident) {
-    return true
-  }
+  if !(ix is Index) || parenPeelIx(ix.idxArr) != x { return true }
+  const xn = nodeAt(x)
+  if !(xn is Ident || xn is Call || xn is Index) { return true }
   if !cwIxCovers(up) || cwIxUpKind[up] == CW_UP_ASG_LHS { return true }
-  const st = elemReadStep(x)
+  const st = elemReadStep(x, path, on)
   if st == "" { return true }
+  destsMerge(up, destJoin(st, path), out, paths, on)
+  return true
+}
+
+// `exprDests` of `x` at `path`, kept only where every consumer is placed: an unplaced one leaves
+// the value untyped here rather than refusing the binding's other destinations.
+function destsMerge(
+  x: i32,
+  path: string,
+  out: i32[],
+  paths: string[],
+  on: i32[],
+) {
   const o2: i32[] = []
   const p2: string[] = []
-  if !exprDests(up, destJoin(st, path), o2, p2, on) { return true }
+  if !exprDests(x, path, o2, p2, on) { return 0 }
   let i = 0
   while i < o2.length {
     out.push(o2[i])
     paths.push(p2[i])
     i = i + 1
   }
-  return true
+  return 0
 }
 
 // Whether binding `d` is tested with `is`, so its reads are typed by the narrowing, not by
@@ -654,12 +678,34 @@ function bindIsNarrowed(d: i32): boolean {
 // fresh literal, which decides its element type as well as any typed read.
 function bindSlotWritten(d: i32): boolean {
   const seen: i32[] = []
-  return bindSlotWrittenIn(d, seen)
+  const none: i32[] = []
+  return bindSlotWrittenIn(d, seen, false, none)
+}
+
+// `bindSlotWritten` but for a store of a binding the walk `on` carries its fresh binding through,
+// whose value is the one being typed, not another the slot must also hold.
+function bindSlotWrittenOff(d: i32, on: i32[]): boolean {
+  const seen: i32[] = []
+  return bindSlotWrittenIn(d, seen, false, on)
+}
+
+// Whether a slot of binding `d`, or of an un-annotated alias bound to it, is written at all,
+// whatever the value.
+export function bindSlotStored(d: i32): boolean {
+  const seen: i32[] = []
+  const none: i32[] = []
+  return bindSlotWrittenIn(d, seen, true, none)
 }
 
 // `bindSlotWritten` of `d` and of each un-annotated alias bound to it (`const e = d`), whose
-// writes reach the same list; `seen` holds the bindings already asked.
-function bindSlotWrittenIn(d: i32, seen: i32[]): boolean {
+// writes reach the same list; `seen` holds the bindings already asked. `any` counts a fresh
+// literal's write too; a store of a read of a binding in `carried` counts not at all.
+function bindSlotWrittenIn(
+  d: i32,
+  seen: i32[],
+  any: boolean,
+  carried: i32[],
+): boolean {
   const k = if d >= 0 && d < P.nodes.length { cwKeyOfDecl(d) } else { -1 }
   if k < 0 || i32ListHas(seen, d) { return false }
   seen.push(d)
@@ -668,7 +714,11 @@ function bindSlotWrittenIn(d: i32, seen: i32[]): boolean {
     const u = cwIxNode[ow.row]
     if cwIxCovers(u) && cwIxUpKind[u] == CW_UP_LETINIT {
       const al = nodeAt(cwIxUp[u])
-      if al is LetDecl && al.letType < 0 && bindSlotWrittenIn(cwIxUp[u], seen) {
+      if (
+        al is LetDecl
+        && al.letType < 0
+        && bindSlotWrittenIn(cwIxUp[u], seen, any, carried)
+      ) {
         return true
       }
     }
@@ -676,7 +726,11 @@ function bindSlotWrittenIn(d: i32, seen: i32[]): boolean {
       const p = cwIxUp[u]
       if cwIxCovers(p) && cwIxUpKind[p] == CW_UP_ASG_LHS {
         const a = nodeAt(cwIxUp[p])
-        if !(a is BinExpr) || !bindFreshLit(nodeAt(parenPeelIx(a.binRight))) {
+        if (
+          any
+          || !(a is BinExpr)
+          || !bindStoreOk(parenPeelIx(a.binRight), carried)
+        ) {
           return true
         }
       }
@@ -688,20 +742,86 @@ function bindSlotWrittenIn(d: i32, seen: i32[]): boolean {
         && cwIxUpKind[p] == CW_UP_CALLEE
       ) {
         const c = nodeAt(cwIxUp[p])
-        if !(c is Call) || c.callArgs.length != 1 { return true }
-        if !bindFreshLit(nodeAt(parenPeelIx(c.callArgs[0]))) { return true }
+        if any || !(c is Call) || c.callArgs.length != 1 { return true }
+        if !bindStoreOk(parenPeelIx(c.callArgs[0]), carried) { return true }
       }
     }
   }
   return false
 }
 
+// Whether stored value `v` leaves its slot's type to the typed reads: a fresh literal, or a read of
+// a binding in `carried`.
+function bindStoreOk(v: i32, carried: i32[]): boolean {
+  if v < 0 || v >= P.nodes.length { return false }
+  const vn = nodeAt(v)
+  if vn is Ident { return i32ListHas(carried, identDeclOf(v)) }
+  return bindFreshLit(vn)
+}
+
 // The step a typed read of an element of the binding read `x` takes to it (`readWrapStep`), ""
-// where the binding is narrowed, slot-written or no fresh literal.
-function elemReadStep(x: i32): string {
-  const root = aliasRoot(identDeclOf(x))
-  if bindIsNarrowed(root) || bindSlotWritten(root) { return "" }
-  return readWrapStep(root)
+// where the binding is narrowed, slot-written or no fresh literal. A read `x` (a binding, a call
+// or an element read) holding the walk's fresh binding `on[0]` at `path` takes the step it shows.
+function elemReadStep(x: i32, path: string, on: i32[]): string {
+  if nodeAt(x) is Ident {
+    const d = identDeclOf(x)
+    const root = aliasRoot(d)
+    if bindIsNarrowed(root) || bindSlotWrittenOff(root, on) { return "" }
+    const st = readWrapStep(root)
+    if st != "" || on.length == 0 || on[0] == root { return st }
+    if bindIsNarrowed(d) || bindSlotWrittenOff(d, on) { return "" }
+  }
+  if on.length == 0 { return "" }
+  const o = on[0]
+  if bindIsNarrowed(o) || bindSlotWritten(o) { return "" }
+  const steps = destSteps(path)
+  if steps.length == 0 { return readWrapStep(o) }
+  // `x` holds the fresh binding at an element, so it is a list, or at a value, so a map; the read's
+  // step is taken straight back off, so the map's key type never reaches the binding's.
+  if steps[0] == "e" || steps[0] == "s" { return "E" }
+  if steps[0] == "v" { return "M" }
+  const on0 = nodeAt(o)
+  if !(on0 is LetDecl) || on0.letInit < 0 { return "" }
+  let lits: i32[] = [parenPeelIx(on0.letInit)]
+  for stp in steps {
+    if stp != "E" { return "" }
+    const next: i32[] = []
+    for l in lits {
+      const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+      if !(ln is ArrayLit) { return "" }
+      for e in ln.arrElems { next.push(parenPeelIx(e)) }
+    }
+    lits = next
+  }
+  if lits.length == 0 { return "" }
+  for l in lits {
+    if l < 0 || l >= P.nodes.length || !(nodeAt(l) is ArrayLit) { return "" }
+  }
+  return "E"
+}
+
+// The steps of `path` with each wrap a following step takes straight back off dropped: a list's
+// element (`E` then `e` or `s`) and a map's value (`M` then `v` or `s`).
+function destSteps(path: string): string[] {
+  const out: string[] = []
+  if path == "" { return out }
+  let a = 0
+  while a <= path.length {
+    let b = a
+    while b < path.length && path.slice(b, b + 1) != "/" { b = b + 1 }
+    const st = path.slice(a, b)
+    const top = if out.length > 0 { out[out.length - 1] } else { "" }
+    if (
+      (top == "E" && (st == "e" || st == "s"))
+      || (top == "M" && (st == "v" || st == "s"))
+    ) {
+      out.pop()
+    } else {
+      out.push(st)
+    }
+    a = b + 1
+  }
+  return out
 }
 
 // The destinations a `for` over binding read `x` gives the binding: each typed read of its
@@ -720,7 +840,7 @@ function iterDests(
     !(l is ForIn)
     || l.fiDecl1 < 0
     || !(nodeAt(x) is Ident)
-    || elemReadStep(x) != "E"
+    || elemReadStep(x, path, on) != "E"
   ) {
     return true
   }
@@ -745,6 +865,7 @@ function callbackDests(
   path: string,
   out: i32[],
   paths: string[],
+  on: i32[],
 ): boolean {
   const m = nodeAt(mem)
   if !(m is Member) || !cwIxCovers(mem) || cwIxUpKind[mem] != CW_UP_CALLEE {
@@ -760,7 +881,7 @@ function callbackDests(
   ) {
     return true
   }
-  if elemReadStep(x) != "E" { return true }
+  if elemReadStep(x, path, on) != "E" { return true }
   const c = nodeAt(cwIxUp[mem])
   if !(c is Call) || c.callArgs.length < 1 { return true }
   const a = parenPeelIx(c.callArgs[0])
