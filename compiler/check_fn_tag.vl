@@ -131,6 +131,7 @@ import { valueTailSplit } from "./check_num_adopt"
 import { collectRetValues } from "./check_nj_join"
 import { rcwInferredRetTy } from "./check_rcw"
 import {
+  assignable,
   ftArgIsParam,
   ftParamOnlyCalledAt,
   holeLamRetAt,
@@ -492,7 +493,8 @@ export function fnTagDecide(rootIx: i32) {
       }
     }
     // A set a read hands to a generic's function-typed parameter: each instance coerces the id
-    // at its own instantiated parameter type (D16832, D16833). Check-time only.
+    // at its own instantiated parameter type (D16832, D16833). So does one delivered at a closed
+    // function type taking every member's result, by its adapter (D17104). Check-time only.
     if !ftLate {
       let ei = 0
       while ei < escTys.length && ei < ftEscapes.length {
@@ -503,8 +505,10 @@ export function fnTagDecide(rootIx: i32) {
           && one == (pass == 1)
           && !i32ListHas(seen, s)
           && !ftHandPartial(s)
-          && ftGenFnParamHand(ftEscapes[ei])
-          && ftHandFits(s, if ei < escDsts.length { escDsts[ei] } else { -1 })
+          && (ftGenFnParamHand(ftEscapes[ei])
+            && ftHandFits(s, if ei < escDsts.length { escDsts[ei] } else { -1 })
+            || ei < escDsts.length
+            && ftValueSiteTakes(ftEscapes[ei], escDsts[ei], s))
         ) {
           seen.push(s)
           ftTry(rootIx, s, calls, mint)
@@ -1365,13 +1369,7 @@ function ftBuildValueArms(c: i32, dt: i32, s: i32, ds: i32[], leafTy: i32[]) {
   const so = tyAt(ct)
   const dob = tyAt(dn)
   if dob is TyFunc {
-    // A site its holes leave open here is typed at the set in the instance that reads it.
-    const open = fnTagSetOfTy(ct) < 0
-      && tyHasHole(ct)
-      && ftMembersTakeArity(s, dob)
-    if fnTagSetOfTy(ct) != s && !open || tyHasTyVar(dn) || tyHasHole(dn) {
-      return 0
-    }
+    if !ftValueSiteTakes(c, dt, s) { return 0 }
     return ftValueArmsAtSig(c, s, dn, ds, leafTy)
   }
   if !(so is TyObj) || !(dob is TyObj) { return 0 }
@@ -1392,6 +1390,28 @@ function ftBuildValueArms(c: i32, dt: i32, s: i32, ds: i32[], leafTy: i32[]) {
     i = i + 1
   }
   return 0
+}
+
+// Whether site `c`, a value carrying set `s` (or one its holes leave open, typed at the set in the
+// instance that reads it), delivered at closed function type `dt`, is built there by a value arm
+// per member: each member's result at `dt`'s parameters fits `dt`'s result.
+function ftValueSiteTakes(c: i32, dt: i32, s: i32): boolean {
+  const ct = if c >= 0 && c < P.nodes.length { nonNullTy(nodeTyIxOf(c)) } else { -1 }
+  const dn = if dt >= 0 { nonNullTy(dt) } else { -1 }
+  if ct < 0 || dn < 0 || ct >= T.tys.length || dn >= T.tys.length {
+    return false
+  }
+  const dob = tyAt(dn)
+  if !(dob is TyFunc) || tyHasTyVar(dn) || tyHasHole(dn) { return false }
+  const open = fnTagSetOfTy(ct) < 0
+    && tyHasHole(ct)
+    && ftMembersTakeArity(s, dob)
+  if fnTagSetOfTy(ct) != s && !open { return false }
+  for d in fnTagMembers(s) {
+    const r = ftMemberRetAt(d, dob.fnParamTypes)
+    if r < 0 || !assignable(r, dob.fnRet) { return false }
+  }
+  return true
 }
 
 // The value arms of set `s` at site `c` at closed function type `sig`.
