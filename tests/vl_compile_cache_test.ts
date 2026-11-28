@@ -1012,6 +1012,7 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   idShadowCount: "uncached",
   idShadowLen: "uncached",
   setIdShadow: "uncached",
+  setIrFactsTwice: "input",
   setIrGraph: "uncached",
   setOpaqueSNames: "input",
   clsCensusAt: "uncached",

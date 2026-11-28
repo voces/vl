@@ -18,7 +18,7 @@ import {
   tyTopLevelSplit,
 } from "./tyname"
 import { callBindTyOf } from "./check_bind_rows"
-import { cwFieldNameOf } from "./check_write_scan"
+import { cwCalleeDeclOf, cwFieldNameOf } from "./check_write_scan"
 import { holeLinkSiteSet } from "./check_hole_links"
 import { decDigitsOf } from "./strutil"
 import { fnOnlyReturnsParam, identDeclOf, nodeSrc } from "./symbols"
@@ -2681,6 +2681,37 @@ function recFnReturns(fd: i32): i32[] {
     i = i + 1
   }
   return out
+}
+
+// Whether every call site in `sites` is a call a queued delivery lands on `dst`'s storage: no site
+// is handed on at its own record or queued for none, so one build at `dst` serves them all.
+function recSitesAllQueuedAt(sites: i32[], dst: i32): boolean {
+  if sites.length < 2 { return false }
+  for s in sites {
+    if s % 2 != 0 { return false }
+    if !recSiteLandsDirect(s / 2, dst) { return false }
+  }
+  return true
+}
+
+// Whether a queued delivery is call `c` itself, or a join whose tail it is, at `dst`'s storage: a
+// call stored into a container's element or field is not one, as its reads hand it on there.
+function recSiteLandsDirect(c: i32, dst: i32): boolean {
+  let i = 0
+  while i < recPendSrc.length {
+    const src = cwPeelValue(recPendSrc[i])
+    let hit = src == c
+    if !hit && src >= 0 && valueJoinAt(src) >= 0 {
+      const leaves: i32[] = []
+      tailValueLeaves(src, leaves)
+      for lf in leaves {
+        if cwPeelValue(lf) == c { hit = true }
+      }
+    }
+    if hit && fieldStorageEq(nonNulTyOf(recPendDstTy[i]), dst) { return true }
+    i = i + 1
+  }
+  return false
 }
 
 // Whether call sites `sites` are `call` and calls each landing `own` on `dst`'s field storage,
@@ -6974,6 +7005,16 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   }
   if !(oa is TyObj) || !(da is TyObj) { return false }
   if fieldStorageEq(own, dst) || !recCopyBoxesOnly(own, dst) { return false }
+  // Calls that all land on one record need no copy: one build at that record serves them all,
+  // whatever their count, where no site needs its own copy (D8201, D17228).
+  if (
+    !fnReturnsCallSpread(fd)
+    && recCallBuildsFreshRecord(p)
+    && recSitesAllQueuedAt(sites, dst)
+  ) {
+    return false
+  }
+
   // A copy only the `null` arm admits is taken where some call lands off `dst`'s storage; calls
   // that all land there share one build, which keeps their identity.
   if (
@@ -9644,11 +9685,42 @@ export function adoptArmAt(x: i32, dstTy: i32) {
   for lf in leaves {
     if lf != x { adoptLitAt(lf, dstTy) }
     const p = cwPeelValue(lf)
-    if p >= 0 && p < P.nodes.length && nodeAt(p) is Ident {
+    // A call arm is delivered at the join as a name arm is: a maker's fresh record is built at the
+    // join's record, a shared one refused by the record solve (D17226).
+    if (
+      p >= 0
+      && p < P.nodes.length
+      && (nodeAt(p) is Ident || recCallBuildsFreshRecord(p))
+    ) {
       recPend(p, nodeTyIxOf(p), dstTy, p)
     }
   }
   return 0
+}
+
+// Whether call `p` returns a record it builds: every value its callee returns is a record
+// literal, so the call constructs a fresh record and nothing else holds the old rep. A generic
+// callee is left out only to keep D17225's check-time half to its own change.
+function recCallBuildsFreshRecord(p: i32): boolean {
+  const c = nodeAt(p)
+  if !(c is Call) { return false }
+  const fd = cwCalleeDeclOf(c.callFn)
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if (
+    !(f is FuncDecl)
+    || f.fnTyParams.length > 0
+    || f.fnRet >= 0
+    || f.fnBody < 0
+  ) {
+    return false
+  }
+  const rets: i32[] = []
+  collectRetValues(f.fnBody, rets)
+  for r in rets {
+    const x = parenPeelIx(r)
+    if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) { return false }
+  }
+  return rets.length > 0
 }
 
 // `adoptArmAt` for an `if` or `match` arm, where a call stored as the join is queued as an

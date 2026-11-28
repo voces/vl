@@ -13435,3 +13435,37 @@ binding is typed at its initialiser (`letDeclGradeAnnotated`'s caller, check_sta
 mono builds it at that parameter's annotation (`monoSubstLetType`), so its read and its variable
 agree. `F`'s own set is never widened: in the instance it is the type of the value it pins, which
 every read of that value shares. Ruled by the coordinator.
+
+## A binding annotated with a type parameter has that parameter's type at the instance (coordinator ruling, 2026-11-28) — D17323, D17324
+
+`let b: F = a1` gives `b` the type `F` is bound to at that call of the function, one type per
+instance. When `F` is bound to a generic signature, that one type is polymorphic, so each call
+through `b` is instanced at its own arguments. When `F` is concrete, a call at another type is
+refused by the contract sentence that names `F` ("`cI32` is passed as `F`, but `mid` calls `F`
+with `string`"). Why: T9.1 checks each call at its own type arguments; an explicit `<T>` behaves
+as an inferred hole (D1431, owner); and a parameter `b: F`, or `let b: F = c` with `c: F`, already
+runs at two types. The other reading, an annotation monomorphic within the body, would make a type
+parameter mean one thing on a parameter and another on a `let`. Two consequences in the compiler:
+the unread default that instances a generic handed to a parameter nothing reads (D6213) fixes that
+value's instance and never the type parameter other readers use; and a binding's alias source is
+the value it stores, whatever its annotation names. Ruled by the coordinator.
+
+## A maker's call is built at its destination's record (coordinator ruling, 2026-11-28) — D17226, D17228
+
+A maker's call is built at the record its destination stores. The destination's stored rep
+decides the record, and the elaboration builds the call there once, at the point where that
+record is known. A value join delivers each arm at the join's record (`adoptArmAt`), and a call
+arm is pended to the record solve there exactly as a name arm is. The join then reaches its
+destination at one rep, so every delivery position (a binding, a parameter, an annotated or an
+inferred result, a nested join) goes through the same code, with no per-position branch.
+
+A maker is not a converter. Its call constructs a fresh record, so building it at the
+destination is construction, not a copy, and nothing else holds the old rep. That is why the
+rule is legal only for a fresh record. The record solve is the one reader of that condition:
+it adopts a record built once at its one destination, and refuses loudly a record that is also
+wanted at another record (a write through one would break the other). No second rule is added
+for call arms.
+
+One maker wanted at several destinations of differing records needs one instance per distinct
+destination record, keyed in the intern key (maker × record), never in a side table. That part
+is open as D17228. Ruled by the coordinator.

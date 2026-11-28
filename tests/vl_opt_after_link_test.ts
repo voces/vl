@@ -87,6 +87,9 @@ const FLAVOUR_READERS = [
   // A plain build's writer folds a local.set read straight back into a local.tee; `-O` keeps the
   // pair, whose shape binaryen's loop hoisting and optMultivalue match.
   "emit_bytes:fbPeepholes gOptimized",
+  // An optimised build that wants the IR facts compiles twice; compile 2 emits what one compile does
+  // (tests/vl_ir_facts_twice_test.ts), so no artifact differs on it.
+  "driver:compileSrc gOptimized",
   // `--low-memory-unused` (only with `-O`) folds an address's constant into the memarg.
   "wasmEmit:memLowFoldFits gLowMemUnused",
   "wasmEmit:memAddrPlanWith gLowMemUnused",
