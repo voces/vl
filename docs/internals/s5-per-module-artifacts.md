@@ -701,7 +701,7 @@ re-linked through `emitLinkSection` equals the direct output:
 | `tests/cases`, 5,086 modules | 6,099 | 84,642 | 56,250 | 0 |
 
 **What `-O` still changes in the emitter.** Before emission the host calls `setOptimized(1)`
-and, with `--low-memory-unused`, `setLowMemoryUnused`. Ten functions read the two flags:
+and, with `--low-memory-unused`, `setLowMemoryUnused`. Eleven functions read the two flags:
 
 | reader | flag | plain | `-O` |
 | --- | --- | --- | --- |
@@ -713,6 +713,7 @@ and, with `--low-memory-unused`, `setLowMemoryUnused`. Ten functions read the tw
 | `mapGetHelperShape` (`wasmEmit.vl`) | `gOptimized` | a mono-valued map get, or a `?? <literal>` one, is one call of `__map_get_<row>__` | the probe and the value read stay at the site |
 | `fbPeepholes` (`emit_bytes.vl`) | `gOptimized` | the writer folds a `local.set` read straight back into a `local.tee` | the pair stays, whose shape binaryen's loop hoisting and `optMultivalue` match |
 | `memAddrPlanWith`, `memLowFoldFits` (`wasmEmit.vl`) | `gLowMemUnused` | the address is computed, and a leaf accessor stays a call | its constant folds into the memarg, and the IR inliner copies a leaf accessor so its address folds too |
+| `compileSrc` (`driver.vl`) | `gOptimized` | one compile | with `setIrFactsTwice`, two from one reset (compile 1 gathers the IR facts); compile 2 emits the bytes one compile does, so no artifact differs on it |
 
 Over the 4,315 single-file cases, the `-O` flavour changes 782 modules: 694 by the map-set
 helper alone, 26 by the pooled-string fill as well, and 62 only in the type section, where
