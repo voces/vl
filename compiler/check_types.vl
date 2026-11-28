@@ -100,11 +100,10 @@ export type TyObj = {
 // A function: parameter type indices and a return type index.
 export type TyFunc = { fnParamTypes: i32[], fnRet: i32 }
 
-// A union `A | B | …`: member type-arena indices, and how a join formed it. `uJoin`: 0 written or
-// joined plainly, 1 a join of type parameters kept apart (re-joined at each pin), 2 such a join of
-// runtime arms (its members stay apart at the pin too). `uHole`: 1 a join with a hole member that a
-// call's bindings re-fold, 2 one whose arms re-join apart. Equality ignores both; identity does not.
-export type TyUnion = { uMembers: i32[], uJoin: i32, uHole: i32 }
+// A union `A | B | …`: member type-arena indices, and how a join formed it, which equality ignores
+// and identity does not: `uJoin` a join of type parameters (`tyJoinMark`), `uHole` a join with a
+// hole member (`tyHoleJoin`), `uElse` the base an `is` else's remainder re-reads (`tyElseBase`).
+export type TyUnion = { uMembers: i32[], uJoin: i32, uHole: i32, uElse: i32 }
 
 // A nullable `T?` / `T | null`: the inner type-arena index, and `nJoin`, the join mark of a join
 // whose null is kept as this wrapper (as `TyUnion.uJoin`). The mark is the nullable's own, never its
@@ -4901,11 +4900,34 @@ export let tyMapMinted = false
 // union row, so how a union is formed belongs to the row from its mint, never to a table on an index.
 export function mkUnionRow(members: i32[], join: i32, hole: i32): i32 {
   if join > 0 { tyJoinMinted = true }
-  const t: Ty = { uMembers: members, uJoin: join, uHole: hole }
+  const t: Ty = { uMembers: members, uJoin: join, uHole: hole, uElse: -1 }
   return addTy(t)
 }
 
-// `TyUnion.uHole` of `t`, 0 for a type that is no union.
+// The remainder of an `is` else over a type parameter's list in union `base`: a row over `base`'s
+// members that each pin re-reads as `base` (`TyUnion.uElse`), so it is never `base` itself.
+export function mkElseRemUnionRow(base: TyUnion, baseIx: i32): i32 {
+  tyElseMinted = true
+  const ms: i32[] = []
+  for m in base.uMembers { ms.push(m) }
+  const t: Ty = { uMembers: ms, uJoin: base.uJoin, uHole: 0, uElse: baseIx }
+  return addTy(t)
+}
+
+// `TyUnion.uElse` of `t`, -1 for a type that is no else remainder.
+export function tyElseBase(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const a = tyAt(t)
+  if a is TyUnion { return a.uElse }
+  return -1
+}
+
+// Whether any else remainder has been minted in this instance; only ever set, so a gate on it
+// skips work, never a remainder.
+export let tyElseMinted = false
+
+// `TyUnion.uHole` of `t`: 1 a join with a hole member that a call's bindings re-fold, 2 one whose
+// arms re-join apart there, 0 any other type.
 export function tyHoleJoin(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return 0 }
   const a = tyAt(t)
@@ -4913,8 +4935,9 @@ export function tyHoleJoin(t: i32): i32 {
   return 0
 }
 
-// The join mark of `t` (`TyUnion.uJoin`, `TyNullable.nJoin`), 0 for any other type; the one
-// reader of a join's mark.
+// The join mark of `t` (`TyUnion.uJoin`, `TyNullable.nJoin`): 1 a join of type parameters kept
+// apart and re-joined at each pin, 2 such a join of runtime arms, whose members stay apart there
+// too, 0 any other type. The one reader of a join's mark.
 export function tyJoinMark(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return 0 }
   const a = tyAt(t)
@@ -4936,7 +4959,14 @@ export function tyJoinMarked(t: i32, join: i32): i32 {
     TyUnion => {
       const ms: i32[] = []
       for m in a.uMembers { ms.push(m) }
-      return mkUnionRow(ms, join, a.uHole)
+      if join > 0 { tyJoinMinted = true }
+      const u: Ty = {
+        uMembers: ms,
+        uJoin: join,
+        uHole: a.uHole,
+        uElse: a.uElse,
+      }
+      return addTy(u)
     }
     TyNullable => {
       if join > 0 { tyJoinMinted = true }

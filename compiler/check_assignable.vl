@@ -541,6 +541,7 @@ import {
   mkArrayTy,
   mkFuncTy,
   mkMapTy,
+  mkNullableTy,
   mkObjTy,
   nestParentOf,
   nwTyIxs,
@@ -1289,8 +1290,9 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
   bindGenWalk(srcTy, nonNullTy(dstTy), bNames, bTys)
   if bNames.length == 0 { return 0 }
   // A binding delivered whole at a closed type takes it as its slot where its classes' calls
-  // agree with it (`eplDeliveredAgrees`, D17800).
-  const dwhole = nonNullTy(dstTy)
+  // agree with it (`eplDeliveredAgrees`, D17800); a binding that may hold `null` keeps the
+  // destination's `null` (D17829).
+  const dwhole = if tyAt(srcTy) is TyNullable { dstTy } else { nonNullTy(dstTy) }
   const sx = parenPeelIx(srcExpr)
   // A destination counts only where its type is closed apart from the binding: one holding a hole
   // is closed by its own pins, which may be what typed the destination (D9182). A read a narrowing
@@ -5164,6 +5166,26 @@ function fvaHoleInstTy(site: i32, dt: i32): i32 {
   return inst
 }
 
+// Generic function type `src` instanced at closed function type `dt`'s parameters, its type
+// variables bound there alone, when its result's rep differs from `dt`'s; -1 when a variable stays
+// unbound or the two do not differ.
+function fvaGenInstTy(src: i32, dt: i32): i32 {
+  const f = if src >= 0 && src < T.tys.length { tyAt(src) } else { null }
+  const d = if dt >= 0 && dt < T.tys.length { tyAt(dt) } else { null }
+  if !(f is TyFunc) || !(d is TyFunc) || f.fnRet < 0 { return -1 }
+  if f.fnParamTypes.length != d.fnParamTypes.length { return -1 }
+  const nm: string[] = []
+  const ty: i32[] = []
+  let i = 0
+  while i < f.fnParamTypes.length {
+    bindGenWalk(f.fnParamTypes[i], d.fnParamTypes[i], nm, ty)
+    i = i + 1
+  }
+  const inst = substTyDeep(src, nm, ty)
+  if inst < 0 || tyHasTyVar(inst) || tyHoldsHole(inst) { return -1 }
+  return if fvaFnMayDiffer(inst, dt, 8) { inst } else { -1 }
+}
+
 // Whether function type `d` is closed but for parameters or a result that are sets of functions,
 // which are closed as a value: each member is instanced at the call through it.
 function fvaSetSlotsClosed(d: TyFunc): boolean {
@@ -6890,21 +6912,27 @@ function fvaAdaptNullable(
   if !(it is TyFunc) || it.fnParamTypes.length != d.fnParamTypes.length {
     return -1
   }
-  if (
-    tyHasTyVar(srcTy)
-    || tyHoldsHole(srcTy)
-    || tyHasTyVar(dstTy)
-    || tyHoldsHole(dstTy)
-  ) {
-    return -1
-  }
-  if fnTagSetValueOfTy(inner) { return -1 }
+  if tyHasTyVar(dstTy) || tyHoldsHole(dstTy) { return -1 }
   const dt = nonNullTy(dstTy)
-  if !fvaFnMayDiffer(inner, dt, 8) { return 0 }
+  // An open source is held at its instance at the destination's parameters, before any reading
+  // of it as a set, as the function arm of `fvaAdapt` holds one; one with no such instance is
+  // left to the general refusal.
+  let held = srcTy
+  if tyHasTyVar(srcTy) || tyHoldsHole(srcTy) {
+    // A generic's instance is the one its type variables take at those parameters.
+    const hh = fvaHoleInstTy(srcExpr, dt)
+    const hi = if hh >= 0 { hh } else { fvaGenInstTy(inner, dt) }
+    if hi < 0 { return -1 }
+    held = mkNullableTy(hi)
+  } else if fnTagSetValueOfTy(inner) {
+    return -1
+  } else if !fvaFnMayDiffer(inner, dt, 8) {
+    return 0
+  }
   const site = srcExpr
   if fvaDone[site] ?? false { return 0 }
   const pos = nodePos(site)
-  const st = fvaAnnot(srcTy, site, pos)
+  const st = fvaAnnot(held, site, pos)
   const rt = fvaAnnot(d.fnRet, site, pos)
   if st < 0 || rt < 0 {
     fvaRefuse(srcExpr, srcTy, dt, "")
