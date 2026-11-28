@@ -11868,14 +11868,21 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // legacy writes it at the kind its consumer asks.
   const du = unwrapParen(ix)
   const dn = if du >= 0 && du < P.nodes.length { nodeAt(du) } else { null }
-  // A hole lambda written into a slot holding a record is that record, one closure per signature
+  // A producer written into a slot holding a record is that record, one closure per signature
   // (D17572), as a maker's `return` builds it.
-  const lps = if ibMiss == "" && dst >= 0 && dn is FuncDecl { elabLamProducerSigs(du) } else { [] }
+  const lps = if ibMiss == "" && dst >= 0 && (dn is FuncDecl || dn is Ident) { elabLamProducerSigs(du) } else { [] }
   const lpn = if lps.length >= 2 { repNodeAt(dst) } else { null }
   const lpInner = if lpn is RNullable { repNodeAt(lpn.rnInner) } else { lpn }
   if lpInner is RRecord {
     const rt = bundleRecordTyOf(lps)
-    const rv = bundleRecBuild(b, du, lps, bundleRecordRowOfSigs(lps), rt, false)
+    const rv = bundleRecBuild(
+      b,
+      du,
+      lps,
+      bundleRecordRowOfSigs(lps),
+      rt,
+      dn is Ident,
+    )
     if ibMiss != "" || lpn is RRecord { return rv }
     return irConvert(b, rv, dst, dstTy, du)
   }
@@ -16691,9 +16698,11 @@ function tagCallee(b: i32[], f: i32): Opnd {
       )
     }
   }
-  // A local the dispatch's set stores as its member id, or as a nullable id's box, is read as
-  // stored, its build, whatever rep the call plans for its read.
-  if n is Ident && identReadArmOf(n, f, ibFnIx, false) == "local" {
+  // A local the dispatch's set stores as its member id, or as a nullable id's box (read on the
+  // plain or the unbox arm), is read as stored, its build, whatever rep the call plans for it.
+  const larm = if n is Ident { identReadArmOf(n, f, ibFnIx, false) } else { "" }
+  const lglobal = n is Ident && globalIndexOfSid(sidOfNode(f)) >= 0
+  if n is Ident && (larm == "local" || (larm == "unbox" && !lglobal)) {
     const d = identDeclOf(f)
     const v = if d >= 0 && nodeAt(d) is LetDecl { readDeclVar(d) } else { -1 }
     const vr = if v >= 0 { ib.irVars[v].vRep } else { -1 }
@@ -16729,6 +16738,10 @@ function tagCallee(b: i32[], f: i32): Opnd {
       const o: Opnd = { ov: v }
       return o
     }
+  }
+  // An element read planned at a closure is the member id the dispatch tests: read at the id.
+  if n is Index && repNodeAt(exprRepOf(f)) is RClosure {
+    return irIndexHook(b, f, repNodeOfTy(TY_I32))
   }
   return irBExpr(b, f)
 }
