@@ -1,0 +1,244 @@
+// Dead-code elimination over one function's IR, after the builder's rewrites and before the
+// verifier: a drop of a variable or an immediate goes, and a drop of a temp goes with the whole
+// tree of pure `let`s (`ir_effect.vl`) it alone reads, round by round until none is left. A
+// definition that may trap, writes or calls stays, read or not, and so does any tree holding
+// one. A temp a side table consumes without an operand (`irSkipBase`, `irPushRecv`,
+// `irNoTail`) counts as read, and a node a lowering table keys on (`irRowOpens`, `irSiteArmAt`,
+// `irSpreadPair`) stays. A source row whose first or last node goes moves to the nodes of its
+// range that stay, or retires.
+import {
+  IrFn,
+  OImm,
+  OStr,
+  OVar,
+  SArmSite,
+  SArmWrite,
+  SAssign,
+  SBlock,
+  SBoundsCheck,
+  SBr,
+  SCellSet,
+  SCoalBox,
+  SDrop,
+  SEffect,
+  SForIn,
+  SGlobalSet,
+  SIf,
+  SIntSwitch,
+  SLet,
+  SListSet,
+  SLoop,
+  SRangeLoop,
+  SRawOp,
+  SReturn,
+  SSetField,
+  SSwitch,
+  STrap,
+  irPushBodies,
+  irRhsOpnds,
+} from "./ir"
+import { IrDu, irDuDefs, irDuOf, irDuUses } from "./ir_defuse"
+import { irEffectPure, irRhsEffect } from "./ir_effect"
+
+// The reachable statements of one walk: each node's body (an index into `bodies`) and position.
+type DceWalk = { dwBodies: i32[][], dwBody: {[i32]: i32}, dwPos: {[i32]: i32} }
+
+function walkOf(f: IrFn): DceWalk {
+  const w: DceWalk = { dwBodies: [], dwBody: Map(), dwPos: Map() }
+  const bodies: i32[][] = [f.irBody]
+  const pos: i32[] = [0]
+  w.dwBodies.push(f.irBody)
+  // Each stacked body's index in `dwBodies`.
+  const bix: i32[] = [0]
+  while bodies.length > 0 {
+    const top = bodies.length - 1
+    const b = bodies[top]
+    const k = pos[top]
+    if k >= b.length {
+      bodies.pop()
+      pos.pop()
+      bix.pop()
+      continue
+    }
+    pos[top] = k + 1
+    const id = b[k]
+    if id >= 0 && id < f.irNodes.length {
+      w.dwBody[id] = bix[top]
+      w.dwPos[id] = k
+      const before = bodies.length
+      irPushBodies(f, id, bodies, pos)
+      let j = before
+      while j < bodies.length {
+        w.dwBodies.push(bodies[j])
+        bix.push(w.dwBodies.length - 1)
+        j = j + 1
+      }
+    }
+  }
+  return w
+}
+
+// The temps a side table consumes without an operand naming them.
+function hiddenReads(f: IrFn): {[i32]: boolean} {
+  const h: {[i32]: boolean} = Map()
+  for k in f.irSkipBase.keys() {
+    h[k] = true
+    h[f.irSkipBase[k] ?? -1] = true
+  }
+  for k in f.irPushRecv.keys() { h[k] = true }
+  for t in f.irNoTail { h[t] = true }
+  return h
+}
+
+// Whether node `id` keys a table the lowering opens something at.
+function keyed(f: IrFn, id: i32): boolean {
+  return f.irRowOpens.has(id) || f.irSiteArmAt.has(id) || f.irSpreadPair.has(id)
+}
+
+function isTemp(f: IrFn, v: i32): boolean {
+  return v >= 0 && v < f.irVars.length && f.irVars[v].vKind == "temp"
+}
+
+// The `let`s of the pure tree temp `v` heads, into `out`: its one definition, a pure `let` not
+// keyed or read by a side table, and so on through each temp operand that only it reads. False,
+// with `out` partial, when any part is not so: deleting part of a tree would leave a temp the
+// lowering's stack order needs consumed (`irLSettle`).
+function pureTree(
+  f: IrFn,
+  du: IrDu,
+  hidden: {[i32]: boolean},
+  v: i32,
+  out: i32[],
+): boolean {
+  if !isTemp(f, v) || (hidden[v] ?? false) { return false }
+  const ds = irDuDefs(du, v)
+  if ds.length != 1 || ds[0] < 0 || keyed(f, ds[0]) { return false }
+  const def = f.irNodes[ds[0]]
+  if !(def is SLet) || !irEffectPure(irRhsEffect(def.lRhs)) { return false }
+  out.push(ds[0])
+  for o in irRhsOpnds(def.lRhs) {
+    if o is OVar && isTemp(f, o.ov) {
+      if irDuUses(du, o.ov).length != 1 || !pureTree(f, du, hidden, o.ov, out) {
+        return false
+      }
+    }
+  }
+  return true
+}
+
+// What drop `n` at node `id` deletes, into `dead`: a drop of a variable or an immediate alone; a
+// drop of a temp read only by it with the whole pure tree under it.
+function dropDead(
+  f: IrFn,
+  du: IrDu,
+  hidden: {[i32]: boolean},
+  n: SDrop,
+  id: i32,
+  dead: {[i32]: boolean},
+) {
+  const o = n.dpV
+  if o is OImm || o is OStr {
+    dead[id] = true
+    return 0
+  }
+  if !(o is OVar) || o.ov < 0 || o.ov >= f.irVars.length { return 0 }
+  if !isTemp(f, o.ov) {
+    dead[id] = true
+    return 0
+  }
+  if irDuUses(du, o.ov).length != 1 { return 0 }
+  const tree: i32[] = []
+  if !pureTree(f, du, hidden, o.ov, tree) { return 0 }
+  dead[id] = true
+  for t in tree { dead[t] = true }
+  return 0
+}
+
+// The statements one round deletes: drops, with the pure trees under them. Every other statement
+// writes, branches or stores, or is a `let` a drop's tree claims, so the walk leaves it.
+function deadIn(f: IrFn, w: DceWalk): {[i32]: boolean} {
+  const du = irDuOf(f)
+  const hidden = hiddenReads(f)
+  const dead: {[i32]: boolean} = Map()
+  for id in w.dwBody.keys() {
+    if keyed(f, id) { continue }
+    const n = f.irNodes[id]
+    match n {
+      SDrop => dropDead(f, du, hidden, n, id, dead)
+      SArmSite | SArmWrite | SAssign | SBlock | SBoundsCheck | SBr | SCellSet | SCoalBox | SEffect | SForIn | SGlobalSet | SIf | SIntSwitch | SLet | SListSet | SLoop | SRangeLoop | SRawOp | SReturn | SSetField | SSwitch | STrap => {}
+    }
+  }
+  return dead
+}
+
+// Moves or retires each source row whose first or last node is in `dead`.
+function respan(f: IrFn, w: DceWalk, dead: {[i32]: boolean}) {
+  let k = 0
+  while k < f.irSpanFirst.length {
+    const a = f.irSpanFirst[k]
+    const z = f.irSpanLast[k]
+    if a >= 0 && z >= 0 && ((dead[a] ?? false) || (dead[z] ?? false)) {
+      const bi = w.dwBody[a] ?? -1
+      const pa = w.dwPos[a] ?? -1
+      const pz = w.dwPos[z] ?? -1
+      if bi >= 0 && pa >= 0 && pz >= pa && (w.dwBody[z] ?? -1) == bi {
+        const b = w.dwBodies[bi]
+        let na = -1
+        let nz = -1
+        let p = pa
+        while p <= pz {
+          if !(dead[b[p]] ?? false) {
+            if na < 0 { na = b[p] }
+            nz = b[p]
+          }
+          p = p + 1
+        }
+        unspan(f, k, a, z)
+        if na >= 0 {
+          f.irSpanFirst[k] = na
+          f.irSpanLast[k] = nz
+          const at = f.irSpansAt[na] ?? []
+          at.push(k)
+          f.irSpansAt[na] = at
+          f.irSpanEnds[nz] = (f.irSpanEnds[nz] ?? 0) + 1
+        }
+      }
+    }
+    k = k + 1
+  }
+  return 0
+}
+
+// Takes span `k` off node `a`'s openings and node `z`'s closings, leaving it unanchored.
+function unspan(f: IrFn, k: i32, a: i32, z: i32) {
+  const at: i32[] = []
+  for s in f.irSpansAt[a] ?? [] {
+    if s != k { at.push(s) }
+  }
+  f.irSpansAt[a] = at
+  f.irSpanEnds[z] = (f.irSpanEnds[z] ?? 1) - 1
+  f.irSpanFirst[k] = -1
+  f.irSpanLast[k] = -1
+  return 0
+}
+
+// Deletes `f`'s dead statements, round by round; answers how many went. Each round deletes at
+// least one statement of a finite arena, or ends.
+export function irDce(f: IrFn): i32 {
+  let total = 0
+  while true {
+    const w = walkOf(f)
+    const dead = deadIn(f, w)
+    if dead.length == 0 { return total }
+    respan(f, w, dead)
+    for b in w.dwBodies {
+      const keep: i32[] = []
+      for id in b {
+        if !(dead[id] ?? false) { keep.push(id) }
+      }
+      while b.length > 0 { b.pop() }
+      for id in keep { b.push(id) }
+    }
+    total = total + dead.length
+  }
+}
