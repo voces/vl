@@ -73,6 +73,12 @@ prints this split on every gate run (the pair's stage 4 is profiled this way) an
 writes time weights; `--weighted` sees their total miss the fuel and falls back to sample shares,
 and says so.
 
+**CHECKER COST: `VL_CHECK_COST=1`.** Each compile prints `[check-cost] <path>:` rows: `passes N`, one
+`pass <cause> N` per cause of a full check pass (`first`, `pin:<phase>`, `settle:<phase>`,
+`wsDecline`, `deepIs`, `etaAgain`), and `arena rows R distinct D`, the type arena's size beside its
+structurally distinct rows (`compiler/check_stats.vl`). Measured 2026-11-28 (#10525): the
+self-compile runs one pass, and its arena holds 180,977 rows, 27,111 distinct.
+
 ## Comparing CPU between two seeds: interleave, and read the ranges
 
 * **Interleave the builds.** A round builds every configuration once (base seed, candidate
