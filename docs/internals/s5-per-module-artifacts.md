@@ -1,5 +1,7 @@
 # S5: per-module compile artifacts
 
+> **Switched off and deleted on 2026-11-28, PR #10748** (the per-module artifact path; it returns only with a consumer).
+
 The plan for compiling a VL module once and reusing its code across every program that
 imports it. The motivating consumer is heregeat. Its test files share no module compiles,
 and `VL_COMPILE_CACHE=1` keys a build on the entry's whole closure, so one edit recompiles
