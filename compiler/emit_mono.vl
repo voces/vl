@@ -11035,11 +11035,20 @@ function monoValueNamesGenerics(v: i32, ctx: i32, depth: i32): boolean {
   if x < 0 { return false }
   const n = nodeAt(x)
   if !(n is IfStmt) { return false }
-  const tn = monoArmEndsNever(n.ifThen)
-  const en = monoArmEndsNever(n.ifElse)
+  // A `null` arm, like one that never returns, hands on no function (D17818).
+  const tn = monoArmEndsNever(n.ifThen) || monoArmIsNull(n.ifThen)
+  const en = monoArmEndsNever(n.ifElse) || monoArmIsNull(n.ifElse)
   if tn && en { return false }
   return (tn || monoArmNamesGenerics(n.ifThen, ctx, depth + 1))
     && (en || monoArmNamesGenerics(n.ifElse, ctx, depth + 1))
+}
+
+// Whether `if` arm `arm`'s value is the `null` literal.
+function monoArmIsNull(arm: i32): boolean {
+  if arm < 0 || arm >= P.nodes.length { return false }
+  const tv = ifArmValueExpr(arm)
+  const v = unwrapParen(if tv >= 0 { tv } else { arm })
+  return v >= 0 && nodeAt(v) is NullLit
 }
 
 // Whether `if` arm block `arm` ends in a call that never returns.
@@ -11263,8 +11272,11 @@ function monoCoerceChoiceBinding(
   if !(d is LetDecl) { return 0 }
   // A choice of a tagged set is its member's id, delivered as it is (D15063).
   if fnTagTyIsTagged(nodeTyIxOf(d.letInit)) { return 0 }
-  const xt = expTy
-  const et = if monoTyConcreteFn(expTy) { expTy } else { tnameTy }
+  // A nullable destination delivers its function to the function arms, and its `null` to a `null`
+  // arm (D17818).
+  const xt = if tyNulFuncInner(expTy) >= 0 { tyNulFuncInner(expTy) } else { expTy }
+  const tn = if tyNulFuncInner(tnameTy) >= 0 { tyNulFuncInner(tnameTy) } else { tnameTy }
+  const et = if monoTyConcreteFn(xt) { xt } else { tn }
   const pTys = delTys
   const iv = unwrapParen(d.letInit)
   const g0 = monoFirstArmGenName(iv, lf[0], 0)
@@ -11278,8 +11290,10 @@ function monoCoerceChoiceBinding(
     monoRetypeChoiceRead(d.letInit, at)
     return 1
   }
-  if monoCoerceFnValueTys(d.letInit, lf[0], xt, pTys, tnameTy) < 0 { return -1 }
-  if monoTyConcreteFn(et) {
+  if monoCoerceFnValueTys(d.letInit, lf[0], xt, pTys, tn) < 0 { return -1 }
+  // A choice holding `null` holds its functions at their own instance's type, which the nullable
+  // delivery then adapts to its destination.
+  if monoTyConcreteFn(et) && !monoChoiceHasNull(iv, 0) {
     nodeTyRecord(iv, et)
     nodeTyRecord(d.letInit, et)
   } else {
@@ -11324,11 +11338,32 @@ function monoRetypeIfInit(init: i32, g0: i32, at: i32, ctx: i32): i32 {
   const it = monoNodeTyAt(g0, fnStmts[inst])
   if !monoTyConcreteFn(it) { return 0 }
   const iv = unwrapParen(init)
-  if iv >= 0 { nodeTyRecord(iv, it) }
-  nodeTyRecord(init, it)
+  const ht = monoChoiceHeldTy(iv, it)
+  if iv >= 0 { nodeTyRecord(iv, ht) }
+  nodeTyRecord(init, ht)
   const rt = nodeTyIxOf(at)
-  if rt < 0 || tyHasTyVar(rt) { nodeTyRecord(at, it) }
+  if rt < 0 || tyHasTyVar(rt) { nodeTyRecord(at, ht) }
   return 0
+}
+
+// The type choice `iv` holds where its functions are at `t`: `t`, or its nullable where an arm is
+// the `null` literal (D17818).
+function monoChoiceHeldTy(iv: i32, t: i32): i32 {
+  return if monoChoiceHasNull(iv, 0) { mkNullableTy(t) } else { t }
+}
+
+// Whether choice `v`, or an `if` an arm of it hands on, has an arm whose value is `null`.
+function monoChoiceHasNull(v: i32, depth: i32): boolean {
+  const x = unwrapParen(v)
+  if x < 0 || x >= P.nodes.length || depth > MONO_ALIAS_CHAIN_MAX { return false }
+  const n = nodeAt(x)
+  if !(n is IfStmt) { return false }
+  for arm in [n.ifThen, n.ifElse] {
+    if monoArmIsNull(arm) { return true }
+    const tv = if arm >= 0 { ifArmValueExpr(arm) } else { -1 }
+    if monoChoiceHasNull(if tv >= 0 { tv } else { arm }, depth + 1) { return true }
+  }
+  return false
 }
 
 // The name node of the declared generic the first arm of value `v` names, through nested `if`
@@ -20116,6 +20151,7 @@ function monoArgIsOpenFnChoice(a: i32, depth: i32): boolean {
       if v < 0 { return false }
       if monoCalleeIsGeneric(v) || monoArgIsOpenFnValue(v, -1) { open = true }
       else if monoArgIsOpenFnChoice(v, depth + 1) { open = true }
+      else if nodeAt(v) is NullLit { open = open }
       else if !(nodeAt(v) is Ident) || fnIndexOfNode(v) < 0 { return false }
     }
   }
