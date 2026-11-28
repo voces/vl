@@ -13625,3 +13625,18 @@ storage … copy it with `.map`"). A fresh delivery (a call or a literal, no sec
 `.map` copy. The condition is the conflict on the one storage, never "the binding is used again".
 Rejected: holding the set's id rep at a closed type through the alias. That would be a layout
 minted on ask, and it would still need a refusal for a non-member write. The owner may overrule.
+
+## Two ratchet rises in PR 3a are accepted as priced (2026-11-28, coordinator ruling)
+
+#10765 (D17816's storage-rep instances) rises two ratchets, both accepted by the coordinator:
+**late demands 12 → 16**, and the **emit_elab phase-state surface +1** (`recCovArgOf`).
+
+- **Late demands:** all four keys are storage instances of the PR's two new pins, not of the
+  compiler, std or any existing corpus program. Mono discovers a `$rep` instance that the
+  elaboration cannot plan ahead without a second checker import. D17820's PR tries to plan the
+  keys ahead from the same check note; if it can, the baseline falls back.
+- **Phase-state:** `recCovArgOf` is the one check table the elaboration reads for storage reps.
+  It is a check fact consumed by elab, not emit reading checker state. Any further storage-rep fact
+  goes through this accessor, never a new one.
+
+Neither is precedent for an unpriced rise. The owner may overrule.
