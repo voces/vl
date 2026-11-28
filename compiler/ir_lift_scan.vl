@@ -57,6 +57,7 @@ import {
   lfOriginOf,
 } from "./emit_state"
 import { fnHasUnannotatedParam } from "./emit_atom_kinds"
+import { identDeclOf } from "./symbols"
 import { fnStmtsPosOf } from "./emit_capture_frames"
 import {
   capCellTargetOf,
@@ -504,22 +505,20 @@ function clSyntax(fe: i32): i32 {
     if caps[ci] == clName { return -1 }
     ci = ci + 1
   }
+  // Another declaration of the name refuses, except another block's `let`/`const` beside a
+  // `const` lambda: a use resolving to that binding is not this one's.
   const nk = hk + clName
-  if clhIdentUse.has(nk) || clhProp.has(nk) { return -1 }
+  const own = if clLet >= 0 { clLet } else { self }
   const decls = clhDecls[nk] ?? clNoRows
-  let di = 0
-  while di < decls.length {
-    if decls[di] != clLet && decls[di] != self { return -1 }
-    di = di + 1
+  for x in decls {
+    if x != own && x != self && !(clLet >= 0 && nodeAt(x) is LetDecl) {
+      return -1
+    }
   }
-  const encs = clhCallEnc[nk] ?? clNoRows
-  const named = clhCallNamed[nk] ?? clNoRows
-  let k = 0
-  while k < encs.length {
-    if encs[k] >= 0 && (encs[k] != self || !localFn) { return -1 }
-    if named[k] != 0 && !localFn { return -1 }
-    k = k + 1
+  if clhProp.has(nk) || clUsesReach(clhUseDecl[nk] ?? clNoRows, decls, own) {
+    return -1
   }
+  if !clCallsDirect(nk, decls, own, self, localFn) { return -1 }
   ci = 0
   while ci < caps.length {
     if (clhDecls[hk + caps[ci]] ?? clNoRows).length > 1 { return -1 }
@@ -528,14 +527,57 @@ function clSyntax(fe: i32): i32 {
   return caps.length
 }
 
+// Whether a use resolving to `d` may name binding `own`: only another `let`/`const` among the
+// host's declarations `decls` of the name, beside a `const` binding `own`, is not it.
+function clMayName(d: i32, decls: i32[], own: i32): boolean {
+  if d == own || d < 0 || !(nodeAt(own) is LetDecl) || !(nodeAt(d) is LetDecl) {
+    return true
+  }
+  for x in decls {
+    if x == d { return false }
+  }
+  return true
+}
+
+// Whether any use resolving to an entry of `uses` may name binding `own`.
+function clUsesReach(uses: i32[], decls: i32[], own: i32): boolean {
+  for d in uses {
+    if clMayName(d, decls, own) { return true }
+  }
+  return false
+}
+
+// Whether every call of the name under `key` that may name `own` is in the host's own code,
+// or, for local function `self`, in its own body, naming no argument unless it is local.
+function clCallsDirect(
+  key: string,
+  decls: i32[],
+  own: i32,
+  self: i32,
+  localFn: boolean,
+): boolean {
+  const encs = clhCallEnc[key] ?? clNoRows
+  const named = clhCallNamed[key] ?? clNoRows
+  const ds = clhCallDecl[key] ?? clNoRows
+  let k = 0
+  while k < encs.length {
+    const mine = k >= ds.length || clMayName(ds[k], decls, own)
+    if mine && encs[k] >= 0 && (encs[k] != self || !localFn) { return false }
+    if mine && named[k] != 0 && !localFn { return false }
+    k = k + 1
+  }
+  return true
+}
+
 // Per host frame, read once from its parameters and body, keyed `<host>:<name>`: each
-// declaration of a name, each non-callee identifier and member property, and each call by a
-// bare name with its innermost enclosing function (-1 for the host's own code) and whether it
-// names arguments. `clhBind` keys `<host>:<lambda>` to the first host-level `const` bound to it.
+// declaration, member property, non-callee identifier and call by a bare name, an identifier
+// or call with the declaration it resolves to, a call with its innermost enclosing function
+// (-1 for the host's own code) and whether it names arguments. `clhBind` keys each `const`.
 let clhDone: {[i32]: boolean} = Map()
 let clhBind: {[string]: i32} = Map()
 let clhDecls: {[string]: i32[]} = Map()
-let clhIdentUse: {[string]: boolean} = Map()
+let clhUseDecl: {[string]: i32[]} = Map()
+let clhCallDecl: {[string]: i32[]} = Map()
 let clhProp: {[string]: boolean} = Map()
 let clhCallEnc: {[string]: i32[]} = Map()
 let clhCallNamed: {[string]: i32[]} = Map()
@@ -546,7 +588,8 @@ function clIndexReset() {
   clhDone = Map()
   clhBind = Map()
   clhDecls = Map()
-  clhIdentUse = Map()
+  clhUseDecl = Map()
+  clhCallDecl = Map()
   clhProp = Map()
   clhCallEnc = Map()
   clhCallNamed = Map()
@@ -577,6 +620,12 @@ function clIndexRoot(): string {
   return hk
 }
 
+function clIndexPush(m: {[string]: i32[]}, key: string, v: i32) {
+  const xs = m[key]
+  if xs == null { m[key] = [v] } else { xs.push(v) }
+  return 0
+}
+
 function clIndexDecl(key: string, ix: i32) {
   const ds = clhDecls[key]
   if ds == null { clhDecls[key] = [ix] } else { ds.push(ix) }
@@ -589,23 +638,20 @@ function clIndexWalk(hk: string, ix: i32, enc: i32, inBody: boolean) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = nodeAt(ix)
   if n is Ident {
-    clhIdentUse[hk + n.identName] = true
+    clIndexPush(clhUseDecl, hk + n.identName, identDeclOf(ix))
     return 0
   }
   if n is Call && n.callFn >= 0 {
     const callee = nodeAt(n.callFn)
     if callee is Ident {
       const key = hk + callee.identName
-      const es = clhCallEnc[key]
-      const nm = if hasNamedArgs(n.callArgNames) { 1 } else { 0 }
-      if es == null {
-        clhCallEnc[key] = [enc]
-        clhCallNamed[key] = [nm]
-      } else {
-        es.push(enc)
-        const ns = clhCallNamed[key]
-        if ns != null { ns.push(nm) }
-      }
+      clIndexPush(clhCallEnc, key, enc)
+      clIndexPush(
+        clhCallNamed,
+        key,
+        if hasNamedArgs(n.callArgNames) { 1 } else { 0 },
+      )
+      clIndexPush(clhCallDecl, key, identDeclOf(n.callFn))
       let ai = 0
       while ai < n.callArgs.length {
         clIndexWalk(hk, n.callArgs[ai], enc, inBody)
