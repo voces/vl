@@ -4488,7 +4488,11 @@ fn arm_seed_store(store: &mut Store<()>) {
         FUEL_WEIGHED_AT.with(|c| c.set(Some(u64::MAX)));
     }
     let mut last = resident_bytes();
+    let stop_on_sigint = prof.is_some() && guest_sigint_stop_arm();
     store.epoch_deadline_callback(move |mut cx| {
+        if stop_on_sigint && GUEST_SIGINT.load(Ordering::Relaxed) {
+            return Err(Error::msg("stopped by SIGINT ($VL_PROFILE_GUEST_SIGINT)"));
+        }
         if let Some(p) = prof.as_ref() {
             if let Some(p) = p.lock().unwrap().as_mut() {
                 let delta = if fuel {
@@ -4509,6 +4513,33 @@ fn arm_seed_store(store: &mut Store<()>) {
         }
         Ok(UpdateDeadline::Continue(1))
     });
+}
+
+/// Set by SIGINT under `$VL_PROFILE_GUEST_SIGINT=1`; the next sample traps the guest.
+static GUEST_SIGINT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn guest_sigint(_: libc::c_int) {
+    GUEST_SIGINT.store(true, Ordering::Relaxed);
+}
+
+/// Under `$VL_PROFILE_GUEST_SIGINT=1`, makes SIGINT stop a profiled guest at its next sample with a
+/// trap, so a hung compile ends with the guest's backtrace and its profile written; false when the
+/// flag is off or the platform has no SIGINT handler.
+fn guest_sigint_stop_arm() -> bool {
+    if std::env::var("VL_PROFILE_GUEST_SIGINT").ok().as_deref() != Some("1") {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let handler: extern "C" fn(libc::c_int) = guest_sigint;
+        unsafe { libc::signal(libc::SIGINT, handler as libc::sighandler_t) };
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Stop sampling and write the profile. Idempotent — the second call finds `None` —
