@@ -38,9 +38,10 @@ const seed = ENABLED ? new WebAssembly.Module(Deno.readFileSync(COMPILER) as Buf
 
 type Inst = { exports: Exports; raw: WebAssembly.Exports };
 
-const instance = (twice: boolean): Inst => {
+const instance = (twice: boolean, lowMemory: number): Inst => {
   const inst = new WebAssembly.Instance(seed!, {});
   const raw = inst.exports;
+  if (lowMemory > 0) (raw.setLowMemoryUnused as (n: number) => number)(lowMemory);
   if (twice) (raw.setIrFactsTwice as (k: number) => number)(1);
   return { exports: raw as unknown as Exports, raw };
 };
@@ -61,12 +62,15 @@ const firstDiff = (a: Uint8Array, b: Uint8Array): number => {
   return a.length === b.length ? -1 : n;
 };
 
-for (const path of PROGRAMS) {
+// `-O` and `-O3` emit alike (the seed reads only `setOptimized`); `--low-memory-unused` changes emit.
+const LOW_MEMORY = [0, 4096];
+
+for (const path of PROGRAMS) for (const low of LOW_MEMORY) {
   Deno.test({
-    name: `ir facts twice: ${path}`,
+    name: `ir facts twice: ${path}${low > 0 ? ` --low-memory-unused=${low}` : ""}`,
     ignore: !ENABLED,
     fn: async () => {
-      const once = instance(false);
+      const once = instance(false, low);
       const a = await emit(once, path);
       const b = await emit(once, path);
       const at = firstDiff(a, b);
@@ -75,7 +79,7 @@ for (const path of PROGRAMS) {
           `${path}: two -O compiles in one instance: want identical bytes, got a difference at byte ${at} (${a.length} vs ${b.length} bytes)`,
         );
       }
-      const twice = await emit(instance(true), path);
+      const twice = await emit(instance(true, low), path);
       const tw = firstDiff(a, twice);
       if (tw >= 0) {
         throw new Error(
