@@ -1,3 +1,5 @@
+import { irDuDefs as pcDefs, irDuOf as pcDuOf, irDuUses as pcUses } from "./ir_defuse"
+import { irRhsEffect as pcEff } from "./ir_effect"
 import { irDce } from "./ir_dce"
 import { gIrGraph, irCgRows, irDuRows, irEffRows } from "./ir_graph_rows"
 import { cgNoteLegacy, cgRecord, cgReset, cgSeal } from "./ir_callgraph"
@@ -1286,6 +1288,7 @@ function claimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   irInlineCalls(ib)
   irMemFoldAdds(ib)
   dceNoted(irDce(ib))
+  pcNote(fnPos, ib)
   if verifierRefused("this function") { return false }
   const why = irLowerClaim(ib, globalCtxOf(fnPos), fnPos, out)
   if why != "" {
@@ -1369,6 +1372,10 @@ function dceNoted(gone: i32) {
 
 // Starts a compile's report.
 export function irShadowBegin() {
+  pcPure = Map()
+  pcCallees = Map()
+  pcSiteCallee = []
+  pcSiteKind = []
   irInlineReset()
   cgReset()
   ibRowKey = []
@@ -1396,6 +1403,7 @@ function count(key: string) {
 // Closes the claim pass for the call graph once every unit's code is written; under `gIrGraph`
 // banks the graph's rows.
 export function irClaimsSealed() {
+  pcSeal()
   if gIrGraph != 1 { return 0 }
   cgSeal()
   for r in irCgRows() { count(r) }
@@ -22892,4 +22900,99 @@ function armTempsOnly(b: i32[], at: i32, v: Opnd): boolean {
     i = i + 1
   }
   return lastDst == v.ov
+}
+
+// Probe only: each claimed function's local purity and direct callees, and each dropped direct
+// call's result or call statement, by callee.
+let pcPure: {[i32]: boolean} = Map()
+let pcCallees: {[i32]: i32[]} = Map()
+let pcSiteCallee: i32[] = []
+let pcSiteKind: string[] = []
+
+function pcRhs(r: Rhs, cs: i32[]): boolean {
+  const e = pcEff(r)
+  if e.rxTrap || e.rxWrite { return false }
+  if e.rxCall {
+    if r is RCall {
+      cs.push(r.caCallee)
+      return true
+    }
+    return false
+  }
+  return true
+}
+
+function pcNote(fe: i32, f: IrFn) {
+  const cs: i32[] = []
+  let pure = true
+  const du = pcDuOf(f)
+  let id = 0
+  while id < f.irNodes.length {
+    const n = f.irNodes[id]
+    if n is SLet {
+      if !pcRhs(n.lRhs, cs) { pure = false }
+    } else if n is SEffect {
+      if !pcRhs(n.efRhs, cs) { pure = false }
+      const r = n.efRhs
+      if r is RCall {
+        pcSiteCallee.push(r.caCallee)
+        pcSiteKind.push("stmt")
+      }
+    } else if n is SDrop {
+      const o = n.dpV
+      if o is OVar && o.ov >= 0 && o.ov < f.irVars.length && f.irVars[o.ov].vKind == "temp" {
+        const ds = pcDefs(du, o.ov)
+        if ds.length == 1 && ds[0] >= 0 && pcUses(du, o.ov).length == 1 {
+          const dn = f.irNodes[ds[0]]
+          if dn is SLet {
+            const r = dn.lRhs
+            if r is RCall {
+              pcSiteCallee.push(r.caCallee)
+              pcSiteKind.push("drop")
+            }
+          }
+        }
+      }
+    } else if n is SIf || n is SBlock || n is SBr || n is SReturn || n is SAssign {
+      // control and local writes only
+    } else {
+      pure = false
+    }
+    id = id + 1
+  }
+  pcPure[fe] = pure
+  pcCallees[fe] = cs
+  return 0
+}
+
+// The least fixpoint: a function is pure when it is locally pure and every callee is, so no
+// recursive function is ever pure (it might not terminate).
+function pcSeal() {
+  const ok: {[i32]: boolean} = Map()
+  let changed = true
+  while changed {
+    changed = false
+    for fe in pcPure.keys() {
+      if ok.has(fe) || !(pcPure[fe] ?? false) { continue }
+      let all = true
+      for c in pcCallees[fe] ?? [] {
+        if !(ok[c] ?? false) { all = false }
+      }
+      if all {
+        ok[fe] = true
+        changed = true
+      }
+    }
+  }
+  let i = 0
+  while i < pcSiteCallee.length {
+    const c = pcSiteCallee[i]
+    const cls = if ok[c] ?? false { "pure callee" } else if pcPure.has(c) { "impure callee" } else { "callee without IR" }
+    count("probe: call " + pcSiteKind[i] + ", " + cls)
+    i = i + 1
+  }
+  let np = 0
+  for fe in ok.keys() { np = np + 1 }
+  count("probe: functions " + i32ToStr(pcPure.length) + " pure " + i32ToStr(np))
+  return 0
 }
