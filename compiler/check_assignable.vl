@@ -535,6 +535,7 @@ import {
   mkArrayTy,
   mkFuncTy,
   mkMapTy,
+  mkNullableTy,
   mkObjTy,
   nestParentOf,
   nwTyIxs,
@@ -5109,6 +5110,22 @@ function fvaHoleDeclOf(site: i32, depth: i32): i32 {
     }
     return fvaHoleDeclOf(l.letInit, depth - 1)
   }
+  // A value `if`, `match` or block holds what each of its tails holds; a `null` tail holds no
+  // function, so a nullable choice holds what its other tails agree on.
+  if valueJoinAt(ix) >= 0 {
+    const spine: i32[] = []
+    const leaves: i32[] = []
+    valueTailSplit(ix, spine, leaves)
+    let jd = -1
+    for lf in leaves {
+      if !(nodeAt(lf) is NullLit) {
+        const ld = fvaHoleDeclOf(lf, depth - 1)
+        if ld < 0 || jd >= 0 && ld != jd { return -1 }
+        jd = ld
+      }
+    }
+    return jd
+  }
   if !(n is Call) { return -1 }
   const cd = cwCalleeDeclOf(n.callFn)
   if cd < 0 || cd >= P.nodes.length { return -1 }
@@ -6871,21 +6888,25 @@ function fvaAdaptNullable(
   if !(it is TyFunc) || it.fnParamTypes.length != d.fnParamTypes.length {
     return -1
   }
-  if (
-    tyHasTyVar(srcTy)
-    || tyHoldsHole(srcTy)
-    || tyHasTyVar(dstTy)
-    || tyHoldsHole(dstTy)
-  ) {
-    return -1
-  }
-  if fnTagSetValueOfTy(inner) { return -1 }
+  if tyHasTyVar(dstTy) || tyHoldsHole(dstTy) { return -1 }
   const dt = nonNullTy(dstTy)
-  if !fvaFnMayDiffer(inner, dt, 8) { return 0 }
+  // An open source is held at its instance at the destination's parameters, before any reading
+  // of it as a set, as the function arm of `fvaAdapt` holds one; one with no such instance is
+  // left to the general refusal.
+  let held = srcTy
+  if tyHasTyVar(srcTy) || tyHoldsHole(srcTy) {
+    const hi = fvaHoleInstTy(srcExpr, dt)
+    if hi < 0 { return -1 }
+    held = mkNullableTy(hi)
+  } else if fnTagSetValueOfTy(inner) {
+    return -1
+  } else if !fvaFnMayDiffer(inner, dt, 8) {
+    return 0
+  }
   const site = srcExpr
   if fvaDone[site] ?? false { return 0 }
   const pos = nodePos(site)
-  const st = fvaAnnot(srcTy, site, pos)
+  const st = fvaAnnot(held, site, pos)
   const rt = fvaAnnot(d.fnRet, site, pos)
   if st < 0 || rt < 0 {
     fvaRefuse(srcExpr, srcTy, dt, "")
