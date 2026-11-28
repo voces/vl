@@ -900,6 +900,7 @@ import {
   structIndexOfExpr,
   structIndexOfObjCtx,
   topLambdaRecordFe,
+  tyOpenHeldAsIds,
   unionBoxStoreTyOf,
 } from "./emit_classify"
 import {
@@ -4164,6 +4165,48 @@ export type SpField = { spFieldRow: i32, spFieldIx: i32 }
 export type SpReturned = { spReturned: i32 }
 export type SpElem = { spElemOf: i32 }
 export type StorePlace = SpBinding | SpField | SpReturned | SpElem
+// The result of `fnStmts` slot `spResultOf`: a place a held-open answer is asked of, with no
+// storage of its own (`placeHeldOpen`).
+export type SpResult = { spResultOf: i32 }
+export type HeldPlace = StorePlace | SpResult
+
+// Whether open type `ty` has an open part not held at rep `rep` in place `p`: every reader of a
+// binding's held-open answer asks it here, so the place's own decision can answer it.
+function placeHeldOpen(_p: HeldPlace, ty: i32, rep: i32): boolean {
+  return irTyHeldOpen(ty, rep)
+}
+
+// The binding place of local or module binding `d` (`global`) in the frame being built.
+function bindPlace(d: i32, global: boolean): StorePlace {
+  const p: SpBinding = {
+    spBinding: d,
+    spFrame: if global { -1 } else { ibFnIx },
+    spGlobal: global,
+  }
+  return p
+}
+
+// The binding place parameter `p` of function `fnIx` is.
+function paramPlace(p: i32, fnIx: i32): StorePlace {
+  const pl: SpBinding = { spBinding: p, spFrame: fnIx, spGlobal: false }
+  return pl
+}
+
+// The binding place capture `name` of `fe` reads: its declaration in the frame that owns it.
+function capPlace(fe: i32, name: string): StorePlace {
+  const p: SpBinding = {
+    spBinding: parentBindingOf(fe, name),
+    spFrame: parentBindingFrameArenaOf(fe, name),
+    spGlobal: false,
+  }
+  return p
+}
+
+// Whether every open part of type `ty` is held at rep `rep` in place `p`, the answer a variable
+// that place declares notes for the verifier (`irVarPlaceHeld`).
+function placeHeldIds(_p: StorePlace, ty: i32, rep: i32): boolean {
+  return tyOpenHeldAsIds(ty, rep, [])
+}
 
 // The storage of place `p`, the one answer every reader of a place's rep takes.
 function storageOf(p: StorePlace): Storage {
@@ -4214,12 +4257,15 @@ function buildStorage(p: SpBinding, s: Storage): Storage {
   const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(n is LetDecl) || n.letInit < 0 { return s }
   // A `let` holds every value written to it, so only a missing answer is its build's.
-  if s.stMiss == "" && (n.letKw != "const" || !irTyHeldOpen(s.stTy, s.stRep)) {
+  if (
+    s.stMiss == ""
+    && (n.letKw != "const" || !placeHeldOpen(p, s.stTy, s.stRep))
+  ) {
     return s
   }
   const ty = initBuildTy(n.letInit, p.spFrame)
   const rep = repNodeOfTy(ty)
-  if ty < 0 || isVoidTy(ty) || !valueRep(rep, ty) || irTyHeldOpen(ty, rep) {
+  if ty < 0 || isVoidTy(ty) || !valueRep(rep, ty) || placeHeldOpen(p, ty, rep) {
     return s
   }
   return storageAt(rep, ty, -2)
@@ -4313,7 +4359,7 @@ function localStorage(d: i32): Storage {
     if ol >= 0 { return storageAt(repNodeOfTy(ol), ol, -1) }
     return storageMiss("local rep " + repWhat(rep))
   }
-  if irTyHeldOpen(ty, rep) && !irFnBuiltOnce(ib) {
+  if placeHeldOpen(bindPlace(d, false), ty, rep) && !irFnBuiltOnce(ib) {
     return storageMiss("open local type")
   }
   // Legacy's cell for a binding it holds as the atom is the id, whatever its type's own rep.
@@ -4699,7 +4745,7 @@ function fragLoopVar(d: i32, ix: i32, rep: i32): i32 {
   const known = ibDeclVar[d] ?? -1
   if known >= 0 { return known }
   const ty = heldTy(exprTyOf(ix))
-  if irTyHeldOpen(ty, rep) && !irFnBuiltOnce(ib) {
+  if placeHeldOpen(bindPlace(d, false), ty, rep) && !irFnBuiltOnce(ib) {
     irBMiss("open local type")
     return -1
   }
@@ -4739,6 +4785,10 @@ function declVarAt(d: i32, rep: i32, ty: i32): i32 {
   }
   const v = irVarNew(ib, rep, ty, "local", slot)
   ibDeclVar[d] = v
+  if v >= 0 && irTyOpen(ty) {
+    const p: SpBinding = { spBinding: d, spFrame: ibFnIx, spGlobal: false }
+    ib.irVarPlaceHeld[v] = placeHeldIds(p, ty, rep)
+  }
   return v
 }
 
@@ -6097,7 +6147,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !exprIsLitAtom(ix, ibFnIx)
     const member = gh >= 0
       && repNodeOfTy(gh) == cellRep
-      && irTyHeldOpen(heldTy(exprTyOf(ix)), rep)
+      && placeHeldOpen(bindPlace(d, true), heldTy(exprTyOf(ix)), rep)
     const declined = cellRep != rep
       && !narrowed
       && !stored
@@ -6181,7 +6231,12 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       const held = irBLetTempTy(b, gr, ix, cellRep, lt)
       // Retagged to a rep whose type is open, the value would have no type; the member is read as
       // the cell holds it. A cell read at its storage row is read there, as legacy reads it.
-      if lt != bt && irTyHeldOpen(heldTy(exprTyOf(ix)), rep) { return held }
+      if (
+        lt != bt
+        && placeHeldOpen(bindPlace(d, true), heldTy(exprTyOf(ix)), rep)
+      ) {
+        return held
+      }
       if lt != lt0 { return held }
       return repTemp(b, { rgV: held }, ix, rep)
     }
@@ -6290,12 +6345,12 @@ function globalReadTy(d: i32, ix: i32, rep: i32): i32 {
   ) {
     return repTyOf(rep)
   }
-  if !irTyHeldOpen(ty, rep) { return ty }
+  if !placeHeldOpen(bindPlace(d, true), ty, rep) { return ty }
   const ht = globalHolderTy(d)
   if ht >= 0 && repNodeOfTy(ht) == rep { return ht }
   // A read whose own type has no rep is at its cell's (`irBOpenLocalReadRep`), whose type it takes.
   const rt = repTyOf(rep)
-  return if exprRepOf(ix) < 0 && rt >= 0 && !irTyHeldOpen(rt, rep) { rt } else { ty }
+  return if exprRepOf(ix) < 0 && rt >= 0 && !placeHeldOpen(bindPlace(d, true), rt, rep) { rt } else { ty }
 }
 
 // The record type of the struct row global `d`'s cell holds at rep `cellRep`, where the read at
@@ -6317,7 +6372,11 @@ function globalCellRowReadTy(ix: i32, d: i32, cellRep: i32, rep: i32): i32 {
   // A row type open only where its rep closes it (a function field of an un-annotated function,
   // held as its id) is read at, as legacy's `global.get` reads that row.
   const rt = rowStoredTy(row)
-  if rt < 0 || irTyHeldOpen(rt, cellRep) || repNodeOfTy(rt) != cellRep {
+  if (
+    rt < 0
+    || placeHeldOpen(bindPlace(d, true), rt, cellRep)
+    || repNodeOfTy(rt) != cellRep
+  ) {
     return -1
   }
   const t = nodeTyAt(ix, ibFnIx)
@@ -6663,7 +6722,13 @@ function capRepFor(fe: i32, name: string, readRep: i32): i32 {
 function capRepAtTy(fe: i32, name: string, ty: i32): i32 {
   if ty < 0 { return -1 }
   const r = repNodeOfTy(ty)
-  if isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r) { return -1 }
+  if (
+    isVoidTy(ty)
+    || !valueRep(r, ty)
+    || placeHeldOpen(capPlace(fe, name), ty, r)
+  ) {
+    return -1
+  }
   const vt: u8[] = []
   const prev = wTarget(vt)
   fbValtype(captureValKind(fe, name), captureValStructIdx(fe, name))
@@ -6685,7 +6750,7 @@ function capRepAtTy(fe: i32, name: string, ty: i32): i32 {
 // bundle parameter of hole type, held as its record).
 function capReadTy(fe: i32, name: string, ix: i32, cr: i32): i32 {
   const ty = heldTy(exprTyOf(ix))
-  if !irTyHeldOpen(ty, cr) { return ty }
+  if !placeHeldOpen(capPlace(fe, name), ty, cr) { return ty }
   const cty = capTyOf(fe, name)
   return if cty >= 0 && repNodeOfTy(cty) == cr { cty } else { ty }
 }
@@ -7468,7 +7533,7 @@ function globalStoreTy(d: i32, rep: i32): i32 {
     && rowlessRecord(ht, repNodeOfTy(ht))
     && repNodeAt(rep) is RRecord
     && repNodeOfTy(ht) != rep
-    && !irTyHeldOpen(ct, rep)
+    && !placeHeldOpen(bindPlace(d, true), ct, rep)
   ) {
     return ct
   }
@@ -7517,7 +7582,8 @@ function resultTy(pos: i32, ann: i32, d: i32): i32 {
 function resultFrameTy(pos: i32, t: i32): i32 {
   if t < 0 || isVoidTy(t) { return t }
   const r = repNodeOfTy(t)
-  if valueRep(r, t) && !irTyHeldOpen(t, r) { return t }
+  const rp: SpResult = { spResultOf: pos }
+  if valueRep(r, t) && !placeHeldOpen(rp, t, r) { return t }
   // A hole function's value is the closure legacy returns, whatever its signature (D17579).
   if valueRep(r, t) && holeCloTy(t) { return t }
   const dt = resultDescTy(pos)
@@ -21018,7 +21084,13 @@ function bundleHeldTy(p: i32, ty: i32): i32 {
 function paramFrameTy(p: i32, fnIx: i32): i32 {
   const ty = paramHeldTy(p, fnIx)
   const r = repNodeOfTy(ty)
-  if !isVoidTy(ty) && valueRep(r, ty) && !irTyHeldOpen(ty, r) { return ty }
+  if (
+    !isVoidTy(ty)
+    && valueRep(r, ty)
+    && !placeHeldOpen(paramPlace(p, fnIx), ty, r)
+  ) {
+    return ty
+  }
   const pt = parTyNode(p)
   if (
     vtKindOfParam(p) == "closure"
@@ -21051,13 +21123,17 @@ function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
     const p = fn.fnParams[i]
     const ty = paramFrameTy(p, fnIx)
     const r = repNodeOfTy(ty)
-    if !whole && (isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r)) {
+    const pp = paramPlace(p, fnIx)
+    if (
+      !whole
+      && (isVoidTy(ty) || !valueRep(r, ty) || placeHeldOpen(pp, ty, r))
+    ) {
       i = i + 1
       continue
     }
     if isVoidTy(ty) || !valueRep(r, ty) { return "parameter rep " + repWhat(r) }
     // An unannotated parameter's type is open until a call instances it.
-    if irTyHeldOpen(ty, r) { return "open parameter type" }
+    if placeHeldOpen(pp, ty, r) { return "open parameter type" }
     const v = irVarNew(ib, r, ty, "param", shift + i)
     ibDeclVar[p] = v
     ib.irParams.push(v)
@@ -21251,7 +21327,9 @@ function buildThunk(fe: i32): string {
   for p in fn.fnParams {
     const pt = paramFrameTy(p, d)
     const r = repNodeOfTy(pt)
-    if irTyHeldOpen(pt, r) { return "thunk open parameter type" }
+    if placeHeldOpen(paramPlace(p, d), pt, r) {
+      return "thunk open parameter type"
+    }
     const v = irVarNew(ib, r, pt, "param", 1 + ps.length)
     ib.irParams.push(v)
     ps.push(r)
