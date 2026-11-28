@@ -78,6 +78,7 @@ import {
   arrLitRowSlotIn,
   envSlotShift,
   exprArray,
+  exprIsLitAtom,
   exprListRep,
   exprPackedRow,
   exprRefArray,
@@ -121,7 +122,6 @@ import {
   arrElemIsNullUnitAt,
 } from "./emit_lit_atoms"
 import { monoIsClashLit } from "./emit_mono"
-import { refPushScratchBaseFor } from "./emit_mv_slots"
 import {
   boxOwedAt,
   listCopyAtNode,
@@ -170,8 +170,6 @@ import {
   RLK_V128_LIST,
   VKind,
   aTy,
-  f32PushScratchBase,
-  f64PushScratchBase,
   fa128Ty,
   fa32Ty,
   fa64Ty,
@@ -186,7 +184,6 @@ import {
   fl64TypeIdx,
   gConstExprEmit,
   heldRepOf,
-  i64PushScratchBase,
   ia64Ty,
   il64Ty,
   il64TypeIdx,
@@ -199,9 +196,7 @@ import {
   mkArrTy,
   mkListIdx,
   mkListTy,
-  pkPushBase,
   pkRowOfPrim,
-  pushScratchBase,
   rlBackIdx,
   rlElemHeap,
   rlElemName,
@@ -212,13 +207,21 @@ import {
   rlWrapIdx,
   sHeapIdx,
   sSuperAt,
-  strPushScratchBase,
   uVariants,
-  v128PushScratchBase,
 } from "./emit_state"
 import { rlElemTyIxAt } from "./emit_struct_order"
 import { forRangeStepIsConst, instanceTyOf } from "./emit_ty_canon"
-import { listIdxKindOf } from "./emit_union_casts"
+import {
+  f32PushScr,
+  f64PushScr,
+  i32PushScr,
+  i64PushScr,
+  listIdxKindOf,
+  pkPushScr,
+  refPushScr,
+  strPushScr,
+  v128PushScr,
+} from "./emit_union_casts"
 import { rlElemUnionName } from "./emit_union_registry"
 import {
   exprListCellBuildKind,
@@ -227,7 +230,7 @@ import {
   scalarListElemKind,
   scalarListElemOfListKind,
 } from "./emit_value_sites"
-import { nonNullTy, primIsSubWord, primNameOf, tyHasTyVar } from "./tyquery"
+import { primIsSubWord, primNameOf, tyHasTyVar } from "./tyquery"
 import { spreadElemWidens, spreadLitElemRow } from "./emit_if_arm_values"
 import { rlElemIsNulNiche, tyRefArrElemOf } from "./emit_map_value_slots"
 import { i32ListHas } from "./listutil"
@@ -393,6 +396,15 @@ export type ArrLitArm = "notLit"
   | "ref"
   | "i32"
 
+// Whether `elems` is non-empty and every element is a literal-union atom.
+function arrElemsAllLitAtom(elems: i32[], fnIx: i32): boolean {
+  if elems.length == 0 { return false }
+  for e in elems {
+    if !exprIsLitAtom(e, fnIx) { return false }
+  }
+  return true
+}
+
 export function arrLitArmOf(arrIx: i32, fnIx: i32, lb: ListBuild): ArrLitArm {
   const a = nodeAt(arrIx)
   if !(a is ArrayLit) { return "notLit" }
@@ -450,11 +462,13 @@ export function arrLitArmOf(arrIx: i32, fnIx: i32, lb: ListBuild): ArrLitArm {
   // A string-list pair claims a literal whose elements name no kind of their own: a
   // `(string | null)[]` niche under a threaded `null` seed, as in a run a variadic `.push`
   // appends (D4553), or an all-`null` run of a spread literal (D2964). An atom literal under
-  // the pair stays an atom list, which the spread converts.
+  // the pair is a string list too, each atom delivered at the string it names.
   if (
     lb.lbKind == LBK_STR_LIST
     && !isRefLit
-    && (listCtxElemIsNulStr(arrIx, fnIx) || arrElemsAllNull(elems))
+    && (listCtxElemIsNulStr(arrIx, fnIx)
+      || arrElemsAllNull(elems)
+      || arrElemsAllLitAtom(elems, fnIx))
   ) {
     isStrLit = true
     isF64Lit = false
@@ -811,7 +825,7 @@ function pushSlotOf(
   const ps: PushSlot = {
     lTy: -1,
     aTy: -1,
-    base: pushScratchBase,
+    base: -1,
     armHeap: -1,
     destKind: null,
     rSlot: -1,
@@ -829,7 +843,7 @@ function pushSlotOf(
     ps.rSlot = rslot
     ps.lTy = rlWrapIdx[rslot]
     ps.aTy = rlBackIdx[rslot]
-    ps.base = refPushScratchBaseFor(rslot)
+    ps.base = refPushScr(rslot)
     // The heap a narrowed arm pushed into a `Circle[]` lands in (D1031) — the slot's own
     // element heap, the same one `rlBackIdx` types the backing with.
     ps.armHeap = rlElemArmHeapOf(rslot)
@@ -838,7 +852,7 @@ function pushSlotOf(
   } else if pv.isStr {
     ps.lTy = mkListTy()
     ps.aTy = mkArrTy()
-    ps.base = strPushScratchBase
+    ps.base = strPushScr(pv.isNsArr)
     // A `(string | null)[]` keeps its nullable slot and stays `null` here.
     if !pv.isNsArr { ps.destKind = "str" }
   } else if pv.sk != null {
@@ -854,10 +868,11 @@ function pushSlotOf(
     const pr = exprPackedRow(recvIx, fnIx)
     ps.lTy = pkWrapAt(pr)
     ps.aTy = pkBackAt(pr)
-    ps.base = pkPushBase(pr)
+    ps.base = pkPushScr(pr)
   } else {
     ps.lTy = lTy()
     ps.aTy = aTy()
+    ps.base = i32PushScr()
   }
   return ps
 }
@@ -880,24 +895,24 @@ export type PushValKinds = {
 export function scalarPushScratchBaseOf(k: VKind, row: i32): i32 {
   match k {
     "f64" => {
-      return f64PushScratchBase
+      return f64PushScr()
     }
     "i64" => {
-      return i64PushScratchBase
+      return i64PushScr()
     }
     "f32" => {
-      return f32PushScratchBase
+      return f32PushScr()
     }
     "v128" => {
-      return v128PushScratchBase
+      return v128PushScr()
     }
     "u8list" => {
-      return pkPushBase(row)
+      return pkPushScr(row)
     }
     // Every other kind pushes through the i32 list's scratch.
     "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" => {}
   }
-  return pushScratchBase
+  return i32PushScr()
 }
 
 export function scalarListUsedOf(k: VKind): boolean {
@@ -972,7 +987,7 @@ export function popPlanOf(callIx: i32, fnIx: i32): PopPlan | null {
       pqEk: null,
       pqWrap: lTy(),
       pqBack: aTy(),
-      pqBase: pushScratchBase,
+      pqBase: i32PushScr(),
       pqRefSlot: -1,
       pqElemRef: false,
     }
@@ -1420,12 +1435,6 @@ export function forInElemRecovers(ek: VKind): boolean {
     || ek == "closure"
     || ek == "reflist"
     || ek == "map"
-}
-
-// Whether the read `ix` is typed as a list, nullable or not, inside `fnIx`.
-export function identReadIsList(ix: i32, fnIx: i32): boolean {
-  const t = nodeTyAt(unwrapParen(ix), fnIx)
-  return t >= 0 && t < T.tys.length && tyAt(nonNullTy(t)) is TyArray
 }
 
 // Whether list literal `ix` is delivered to a list whose element reps as the atom: its

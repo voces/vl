@@ -11702,6 +11702,10 @@ because it is what the emitter already did, now one checker fact in place of two
 alternative, refused for now, is that an unadopted literal is always its own row and a conversion is
 emitted wherever it later meets the union. If the distance ever bites, that is the change to make.
 
+A literal delivered at an annotation of its own record type has been delivered, so the arm pass
+does not adopt it: `const xs: {r: null}[] = [{ r: null }]` beside `Circle` keeps `{r: null}`'s own
+row. An annotated type keeps its declared layout (coordinator ruling, 2026-11-27, D17738).
+
 ## A value-fit list is not delivered at an instance (application of ruling (c), D4981, D5003)
 
 Not a new decision: owner ruling (c) on #3792 (D4928) says a list narrowed by `is K[]` is never
@@ -13525,3 +13529,64 @@ i32-keyed map or a string, and choosing one would be a guessed default rather th
 program is a design refusal whose message names the fix (annotate the container).
 A binding of a fresh literal that is never written as a whole takes the type of its one whole
 destination where the literal fits it (F2); a reassigned binding keeps its widened type.
+## A fresh binding is built at the one destination type its uses name (F2, coordinator ruling (A), 2026-11-27)
+
+A `let` or `const` holding a fresh literal (a record, list or `Map()` literal, or a number, string
+or boolean), never written as a whole, is built at the one destination type its deliveries name:
+an annotated binding, field, element, map or list store, a non-generic parameter or an annotated
+result, followed through un-annotated aliases and inferred results. This is an order-free
+pre-pass (`bindDestAnnots`, `check_rec_fresh.vl`). A reassigned `let` keeps its widened type, two
+different destinations adopt neither, and once adopted a field write is checked at the adopted
+type. Design (B), typing the literal at each read, was refused.
+
+**Addendum (coordinator ruling, 2026-11-27).** Adoption takes a destination only where it is one
+type at every depth, holds no function, sets every literal field the literal has, and has leaves
+that are literal unions or the literal's own types, with at least one that narrows (`destAdopts`,
+`check_statements.vl`). A widening leaf is no adoption: "a container never widens implicitly"
+stands as design. Adopting at `i64`, at `f64` for an int literal, or at a union leaf printed wrong
+values through the binding's own reads; those programs are pinned as D17760, D17761 and D17762.
+`f32` is a narrowing: a float literal adopting `f32` is the literal's own typing at its
+destination, as `const x: f32 = 7.5` is, not a container conversion. The nullable and
+union-of-shapes exclusion is a mechanism limit, not design, and is open as D17763. An annotation
+an adoption reads is load-bearing for the redundant-annotation hint. Ruled by the coordinator.
+
+**Addendum (coordinator ruling, 2026-11-28).** An annotated container's slot is a destination
+of a fresh binding stored into it (by index or `push`), and a `for` over the binding names none.
+An element read whose value is delivered to an annotated destination is a typed read, so it is
+a delivery at the element path, as F1's typed reads pin; an untyped index or member read
+supplies no shape. One destination type across every delivery and typed read at every path,
+with (i)–(iv) at that path; any conflict adopts nothing. A typed read does not pin a binding
+the program narrows with `is` (the narrowing types its reads) or one whose slot it writes with a
+value other than a fresh literal (the write decides the element type), and an exported binding
+is never adopted, since its type is its module's API. Ruled by the coordinator.
+
+## The post-cutover engineering review's order is adopted, with the delivery work running beside it (2026-11-28, coordinator ruling)
+
+Issue #10525 proposed an order for the work after the IR cutover and left adopting it to the
+coordinator. The coordinator ruled:
+
+1. **Adopted as the order for IR and compiler work**, in the issue's five steps: (1) delete the
+   shadow and byte-identity machinery, spill temps to locals, ratchet AST-backed `Rhs` kinds and
+   miss sites, and turn a verifier failure into an internal error rather than "cannot yet lower";
+   (2) IR analyses (call graph, def-use, effects), then DCE, the inliner, bounds-check elimination
+   and scalar replacement on by default; (3) the checker's representation (integer hole ids,
+   hash-consed types, `check(node, expected)`), then L2 S4–S7; (4) the per-module artifact path;
+   (5) the docs, `entry.wasm`, the `-O` benchmark column and the LSP.
+2. **Step 1 goes first and is pure deletion or a byte-identical change**, because byte identity
+   stopped being a gate on 2026-11-26 and the machinery that served it now costs seed size and
+   lane time. A verifier failure becoming an internal error is the one behaviour change in it, and
+   it is graded like a trap: it may surface a clause-1 defect, which is then filed, never hidden.
+3. **Step 4: delete, not finish.** The per-module artifact path is switched off with no consumer.
+   It comes back only with one.
+4. **#9676's remaining half (a view held in a module `const` reloads its descriptor) is step 2's
+   first scalar replacement.** Its post-I8 plan (A) in `refactor-notes/2026-11-23-view-global-reload.md`
+   is built in the IR as the general rule "a module `const` of a record type that nothing writes
+   is held as its fields", not as a view-specific rung; (B), the preheader copy, follows from
+   step 2's effect summaries.
+5. **The capability and soundness burn-down continues beside this.** A lane takes a step-1 or
+   step-2 unit when its delivery queue is empty, and the two never share a PR.
+
+**Why.** The review measured that the cutover changed how code is emitted, not what is emitted.
+The owner's post-cutover direction is to burn the holdouts down by optimizing and generalizing the
+IR, and the holdouts reached zero on 2026-11-28, so the review's order is that direction made
+concrete.

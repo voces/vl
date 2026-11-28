@@ -44,6 +44,7 @@ import {
   OP_INDEX_GET,
   OP_INDEX_SET,
   ObjLit,
+  OptMember,
   P,
   Param,
   Paren,
@@ -179,6 +180,7 @@ import {
   omitFieldNull,
   pinLitServed,
   retNatural,
+  retNaturalErr,
   retNaturalErrSet,
   retNaturalSet,
   voidRetRwBlk,
@@ -360,6 +362,7 @@ import {
   crPathCallRetire,
   narrowedPathTy,
   popScope,
+  readsUnwrittenElem,
 } from "./check_narrow_flow"
 import {
   MC_NULL_READ_MARK,
@@ -1881,6 +1884,13 @@ function memberFloorMsg(objTy: i32, prop: string) {
     + stdFmtMovedNote(prop)
 }
 
+// The design refusal for a read of an element nothing ever wrote (D17734): its type is unknown
+// where it is read as a record or a container, so it needs an annotation. `fallback` otherwise.
+export function unwrittenElemMsgOr(recv: i32, fallback: string): string {
+  if !readsUnwrittenElem(recv) { return fallback }
+  return "the element type of a container that is never written is unknown here; annotate it"
+}
+
 // Raises the member arm's sentence at node `ix` — `memberFloorMsg`'s words, unless the call
 // site banked a missing-import answer for this node, in which case D1230's sentence and its
 // `ufcs-not-imported` code replace them. One home for the raise, since `checkMemberNode`
@@ -1919,6 +1929,11 @@ export function memberFloorErr(objTy: i32, prop: string, ix: i32) {
   // is deferred" — a sentinel its two constraint-pin callers test, and this one, the only
   // one that raises, formatted unconditionally. A rung that answered "" while its own arm
   // went on to refuse printed nothing but a caret (D1004, D1221).
+  const mn = nodeAt(ix)
+  const recv = if mn is Member { mn.memObj } else if mn is OptMember { mn.omObj } else { -1 }
+  if recv >= 0 && readsUnwrittenElem(recv) {
+    return tErr(unwrittenElemMsgOr(recv, ""), ix)
+  }
   const msg = memberFloorMsg(objTy, prop)
   if msg == "" {
     return tErr("member access '." + prop + "' on " + tyToStr(objTy), ix)
@@ -4394,10 +4409,26 @@ export function refuseLocalNomEscape(t: i32, at: i32) {
 // indexed by the arena index itself, since the emitter probes membership on nearly every
 // typed node. Some sets are also iterated in order — write only through `cTyIxSetAdd`.
 
+// The enclosing check's natural return, set aside while an instance body is re-checked: each
+// instance's returns join among themselves, never with another instance's (D17724).
+const monoNatSaved: i32[] = []
+const monoNatErrSaved: boolean[] = []
+
+// Opens an instance's natural return, renewed at its first `return`; `monoRecheckEnd` restores.
+export function monoNatOpen() {
+  monoNatSaved.push(retNatural)
+  monoNatErrSaved.push(retNaturalErr)
+  retNaturalSet(-1)
+  retNaturalErrSet(false)
+  return 0
+}
+
 // The closing half: pops the scope, rolls the `RB_MONO` families (the type-parameter bindings
 // and the diagnostic stream among them) back to `sv`'s mark, then restores the flags — so the
 // global checker state the emitter still reads matches its original values.
 export function monoRecheckEnd(sv: QuietRun) {
+  retNaturalSet(monoNatSaved.pop() ?? -1)
+  retNaturalErrSet(monoNatErrSaved.pop() ?? false)
   tyFreshEnd()
   monoRecheckDepthSet(monoRecheckDepth - 1)
   njFnIxSet(njFnStack.pop() ?? -1)

@@ -1,17 +1,21 @@
-# The I8 burn-down, measured hourly on master; its job summary is the fleet scoreboard. It lists the
+# The I8 burn-down, measured on master (each push, and hourly); its job summary is the fleet scoreboard. It lists the
 # programs that would stop running were legacy's expression emitter deleted, each attributed to the
 # unit and class that blocks it and to the class's owner (red.sh's family rule, the exceptions in
 # scripts/ir-i8-census/owners.tsv). It is CENSUS's recipe, run as is:
-#   census.sh <seed> C; ir-i8-sweep.sh scripts/ir-i8-census/keep --out W; red.sh C W --prev <last>.
+#   census.sh <seed> C; census-failing.sh C > W/failing.tsv; red.sh C W --prev <last>.
 # Artifact `i8-red` holds red.tsv and the sweep report. The job summary carries red.sh's line
 # (programs, units, classes, each with its delta from the previous successful run), its
 # `std:<mod> blocks N programs` lines and scoreboard.sh's per-owner table with deltas. It is red only
 # when a step cannot run; a newly failing program is the measurement, not a failure. Off the PR path.
 name: i8-red-nightly
 
+# GitHub fires schedules late or not at all on a busy repo, so a master push runs it too; the
+# concurrency group keeps one run and one newest pending, so the board tracks master's head.
 on:
   schedule:
     - cron: "41 * * * *"
+  push:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -116,19 +120,13 @@ jobs:
         env:
           JOBS: 4
 
-      # The sweep exits 1 when a program newly fails, which is the measurement, but also on a stale
-      # proven edge or a failed check; only a run that wrote failing.tsv and its report's
-      # `unexplained:` line measured. 2 is a tree that does not build.
-      - name: Sweep
+      # After I8 a unit the IR does not claim fails its program, so the census is the red list's
+      # input; the legacy sweep has nothing left to stub.
+      - name: Failing programs
         run: |
-          rc=0
-          bash scripts/ir-i8-sweep.sh scripts/ir-i8-census/keep --out "$RUNNER_TEMP/sweep" || rc=$?
-          [ "$rc" -eq 0 ] && exit 0
-          [ "$rc" -eq 1 ] && [ -f "$RUNNER_TEMP/sweep/failing.tsv" ] \
-            && grep '^unexplained' "$RUNNER_TEMP/sweep/report.txt" && exit 0
-          echo "ir-i8-sweep: rc $rc without a measurement"; exit 1
-        env:
-          JOBS: 4
+          mkdir -p "$RUNNER_TEMP/sweep"
+          bash scripts/ir-i8-census/census-failing.sh "$RUNNER_TEMP/census" > "$RUNNER_TEMP/sweep/failing.tsv"
+          echo "failing: $(wc -l < "$RUNNER_TEMP/sweep/failing.tsv") programs the census finds unclaimed" > "$RUNNER_TEMP/sweep/report.txt"
 
       - name: Red list
         run: |
@@ -142,9 +140,21 @@ jobs:
             echo "### I8 burn-down at ${GITHUB_SHA::9}"
             echo
             grep '^red.sh:' out/summary.txt
-            grep '^unexplained' out/sweep-report.txt || true
+            grep '^failing' out/sweep-report.txt || true
             echo
             bash scripts/ir-i8-census/scoreboard.sh out/red.tsv prev/red.tsv
+            # After I8 the headline: holdouts per owner, and the red programs no holdout names.
+            if [ -d scripts/ir-i8-census/holdouts ]; then
+              cat scripts/ir-i8-census/holdouts/*.tsv > out/holdouts.tsv
+              echo
+              bash scripts/ir-i8-census/holdouts-board.sh out/holdouts.tsv prev/holdouts.tsv --red out/red.tsv \
+                --measured "$RUNNER_TEMP/census/programs.txt"
+              echo
+              bash scripts/ir-i8-census/convert-board.sh out/holdouts.tsv prev/holdouts.tsv
+            else
+              echo
+              bash scripts/ir-i8-census/convert-board.sh out/red.tsv prev/red.tsv
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v5

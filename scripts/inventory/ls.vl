@@ -11,7 +11,9 @@
 // which it reaches through `/dev/stderr` because VL has no stderr sink (a `dogfood:` row).
 // A reservation is one file per range so concurrent lanes never edit the same file. `--next`
 // and `--reserve` also skip every id a fetched `origin/*` branch adds a row or a reservation
-// for beside `origin/master`, and every row `origin/master` files; `--reserve` refuses a filed id.
+// for beside `origin/master`, and every row `origin/master` files; `--next` also skips every id a
+// commit message on `origin/master` or a file under tests/ cites. `--reserve` refuses a filed id.
+// Both fetch `origin` first, so a pushed reservation is always seen; a failed fetch is an error.
 
 import {
   IoError,
@@ -616,6 +618,73 @@ function cmdReserve(
   return 0
 }
 
+// The ids a merged commit message or a test cites (`D<digits>` as a word), on
+// `origin/master` and in this tree's tracked tests/: an id once cited stays used, even after the row
+// that filed it was dropped. None outside a git checkout.
+function citedIds(): {[i64]: boolean} {
+  const out: {[i64]: boolean} = Map()
+  const texts: string[] = []
+  if (
+    gitLines(["rev-parse", "--verify", "--quiet", "origin/master"]).length
+    > 0
+  ) {
+    for ln in gitLines(["log", "origin/master", "--format=%B"]) {
+      texts.push(ln)
+    }
+    for ln in gitLines(["grep", "-ohE", "D[0-9]+", "origin/master", "--", "tests/"]) {
+      texts.push(ln)
+    }
+  }
+  for ln in gitLines(["grep", "-ohE", "D[0-9]+", "--", "tests/"]) {
+    texts.push(ln)
+  }
+  for t in texts {
+    let i = 0
+    while i < t.length {
+      const before = if i > 0 { t[i - 1] } else { 32 }
+      if t[i] == 68 && !isIdentByte(before) {
+        const d = digitsAt(t, i + 1)
+        if d.end > i + 1 && (d.end >= t.length || !isIdentByte(t[d.end])) {
+          out[d.n] = true
+        }
+        if d.end > i { i = d.end } else { i = i + 1 }
+      } else {
+        i = i + 1
+      }
+    }
+  }
+  return out
+}
+
+function isIdentByte(b: i32): boolean {
+  return b == 95 || isDigit(b) || b >= 65 && b <= 90 || b >= 97 && b <= 122
+}
+
+// Fetches `origin` so a reservation or row a lane pushed a moment ago is seen; false, after
+// saying why, when the fetch fails. A tree outside a git checkout, or with no `origin`, has nothing
+// to fetch and passes.
+function fetchOrigin(): boolean {
+  let hasOrigin = false
+  for r in gitLines(["remote"]) {
+    if r == "origin" { hasOrigin = true }
+  }
+  if !hasOrigin { return true }
+  const r = runProgram("git", ["fetch", "-q", "origin"])
+  if r is IoError {
+    print(
+      "ls.vl: cannot run git fetch origin (\{r.msg}); a pushed reservation would be missed",
+    )
+    return false
+  }
+  if r.code != 0 {
+    print(
+      "ls.vl: git fetch origin failed (exit \{toString(r.code)}): \{stripWs(decodeUtf8Lossy(r.stderr))}; a pushed reservation would be missed",
+    )
+    return false
+  }
+  return true
+}
+
 // ── main ────────────────────────────────────────────────────────────────────────
 
 function nextId(rows: Listed[]): i32 {
@@ -633,6 +702,8 @@ function nextId(rows: Listed[]): i32 {
   const res = reservations()
   for c in remoteClaims(rows) { res.push(c) }
   const skipped: Res[] = []
+  const cited = citedIds()
+  const citedSkip: i64[] = []
   let moved = true
   while moved {
     moved = false
@@ -644,6 +715,11 @@ function nextId(rows: Listed[]): i32 {
         break
       }
     }
+    if !moved && (cited.get(n) ?? false) {
+      citedSkip.push(n)
+      n = n + 1
+      moved = true
+    }
   }
   print("D\{toString(n)}")
   for r in skipped {
@@ -652,6 +728,11 @@ function nextId(rows: Listed[]): i32 {
       ln = "  skipped \{claimText(r)} — on \{r.who}"
     }
     if r.note != "" { ln = ln + ", " + r.note }
+    const e = appendTextFile("/dev/stderr", ln + "\n")
+    if e != null { print(ln) }
+  }
+  for c in citedSkip {
+    const ln = "  skipped D\{toString(c)} — cited by a commit on origin/master or under tests/"
     const e = appendTextFile("/dev/stderr", ln + "\n")
     if e != null { print(ln) }
   }
@@ -695,6 +776,7 @@ function main(args: string[]): i32 {
       let note = ""
       if a == "--reserve" && i + 2 < args.length { who = args[i + 2] }
       if a == "--reserve" && i + 3 < args.length { note = args[i + 3] }
+      if a == "--reserve" && !fetchOrigin() { return 1 }
       return cmdReserve(args[i + 1], who, note, a == "--release")
     } else if startsWith(a, "--") {
       print(USAGE)
@@ -708,7 +790,10 @@ function main(args: string[]): i32 {
     for t in TARGETS { targets.push(t) }
   }
   const rows = allRows(targets)
-  if nxt { return nextId(rows) }
+  if nxt {
+    if !fetchOrigin() { return 1 }
+    return nextId(rows)
+  }
   let picked: Listed[] = []
   for r in rows {
     if want == "" || wanted(want, r.outcome, r.settled) { picked.push(r) }

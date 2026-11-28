@@ -8,8 +8,14 @@ import { f32Bytes, f64Bytes, gIeeeOverflow } from "./emit_bignum"
 import { relCopy, relNote, relTrim } from "./emit_reloc"
 import { i32ListHas } from "./listutil"
 import {
+  ARRNEW_FRAME,
+  ATOMSTAGE_FRAME,
   ByteChunk,
   ByteRope,
+  CLOEQ_FRAME,
+  COALCALL_FRAME,
+  F32PUSH_FRAME,
+  F64PUSH_FRAME,
   FC_CLOSURE,
   FC_F32,
   FC_F32_LIST,
@@ -39,28 +45,45 @@ import {
   FC_UNION,
   FC_V128,
   FC_V128_LIST,
+  I64PUSH_FRAME,
   LBK_F32_LIST,
   LBK_F64_LIST,
   LBK_I64_LIST,
   LBK_REF,
   LBK_STR_LIST,
   LBK_U8_LIST,
+  LCAT_FRAME,
+  LEQG_FRAME,
+  LEQI_FRAME,
+  LEQR_FRAME,
+  LEQS_FRAME,
+  LISTGET_FRAME,
   ListKind,
+  MAP_FRAME,
+  MFDST_FRAME,
+  MFSRC_FRAME,
+  MF_FRAME,
+  MKEYS_FRAME,
+  MVALS_FRAME,
+  NSTRPUSH_FRAME,
+  OPTRECV_FRAME,
+  PKPUSH_FRAME,
   PK_I16,
   PK_I8,
+  PUSH_FRAME,
+  REBOX_FRAME,
+  REFPUSH_FRAME,
+  STRPUSH_FRAME,
+  STR_FRAME,
+  V128PUSH_FRAME,
   VKind,
   W,
   aTy,
-  arrNewScratchBase,
-  atomStageSlot,
   callRefDepth,
-  cloEqScratchBase,
   cloStructIdx,
-  coalesceCallBoolSlot,
-  coalesceCallSlot,
-  coalesceCallStrSlot,
   ctrlDepth,
   curBuf,
+  curBufGen,
   dfeCallee,
   dfeOn,
   emitCurFnIx,
@@ -75,14 +98,20 @@ import {
   envCacheBase,
   envCacheFes,
   envCacheTys,
-  f32PushScratchBase,
-  f64PushScratchBase,
   fa128Ty,
   fa32Ty,
   fa64Ty,
   fbEagerScratch,
   fbFrameLocals,
   fbFrameParams,
+  fbLastArg,
+  fbLastEnd,
+  fbLastGen,
+  fbLastOp,
+  fbNnElideEnd,
+  fbNnElideGen,
+  fbPosEnd,
+  fbPosGen,
   fbRunsWritten,
   fbScratchCur,
   fitGrowFn,
@@ -97,26 +126,16 @@ import {
   fl128Ty,
   fl32Ty,
   fl64Ty,
-  fnListCatKinds,
-  fnListCatSlots,
-  fnListEqGKinds,
-  fnListEqGSlots,
-  fnListEqRSlots,
   fnMemAddrFoldCount,
-  fnRefPushSlots,
   fnUses,
-  i64PushScratchBase,
+  gOptimized,
   ia64Ty,
   il64Ty,
   isSBackTy,
   lTy,
-  lcatBases,
-  leqIScratchBase,
-  leqRBases,
-  leqSScratchBase,
-  leqgBases,
   liBack,
   liFieldKind,
+  liFrameRowAt,
   liKinds,
   liOnceTags,
   liOnceVts,
@@ -125,11 +144,9 @@ import {
   listFitStoodTy,
   listGetDepth,
   listGetIdxOwner,
-  listGetIdxSlot,
   listGetIdxStagedIx,
   listGetIdxStagedSet,
   listGetRecvOwner,
-  listGetRecvSlot,
   listGetRecvStagedIx,
   listGetRecvStagedSet,
   listIdxScratchBase,
@@ -139,15 +156,10 @@ import {
   maFoldScratchBase,
   mapI32Ty,
   mapI64Ty,
-  mapKeysBase,
   mapScratchBase,
   mapTy,
-  mapValsBase,
-  mfDstBases,
   mfDstKinds,
   mfDstSlots,
-  mfScratchBase,
-  mfSrcBases,
   mfSrcKinds,
   mfSrcSlots,
   mkArrTy,
@@ -158,16 +170,12 @@ import {
   mvValKindAt,
   mvValRep,
   mvValStructIdx,
-  optRecvSlot,
   optRecvStagedIx,
   optRecvStagedSet,
   pkBackTy,
   pkRowIn,
   pkRowOfBack,
   pkWrapTy,
-  pushScratchBase,
-  refPushBaseBySlot,
-  refPushScratchBase,
   rlBackIdx,
   rlElemHeap,
   rlElemNullable,
@@ -176,17 +184,12 @@ import {
   sHeapIdx,
   sTy,
   strCatSlotIx,
-  strPushScratchBase,
-  strScratchBase,
   strTrioMinted,
-  u8PushScratchBase,
   uBoxIdx,
   uBoxNewEnd,
   uDeclared,
   unionSinkBase,
-  v128PushScratchBase,
   variantHeap,
-  variantReboxSlot,
   variantRowOf,
 } from "./emit_state"
 
@@ -251,14 +254,14 @@ const OP_F32_EQ = 0x5b
 const OP_F32_LT = 0x5d
 const OP_F32_LE = 0x5f
 const OP_F32_GE = 0x60
+const OP_F32_NEG = 0x8c
+const OP_F64_NEG = 0x9a
 const OP_F64_EQ = 0x61
 const OP_F64_LT = 0x63
 const OP_F64_LE = 0x65
 const OP_F64_GE = 0x66
 const OP_F32_TRUNC = 0x8f
 const OP_F64_TRUNC = 0x9d
-const OP_F32_NEG = 0x8c
-const OP_F64_NEG = 0x9a
 // Reference instructions.
 const OP_REF_NULL = 0xd0
 const OP_REF_IS_NULL = 0xd1
@@ -333,6 +336,7 @@ export function wValRef(ht: i32, nul: boolean) {
 export function wTarget(buf: u8[]) {
   const prev = curBuf
   curBuf = buf
+  curBufGen = curBufGen + 1
   return prev
 }
 // Append one byte (low 8 bits) to the current buffer.
@@ -342,7 +346,22 @@ export function wU8(b: i32) {
 }
 // How many bytes the current buffer holds — the cursor a PEEPHOLE needs to describe
 // the instruction it is about to rewrite.
-export function wLen() { return curBuf.length }
+export function wLen() { return wPos() }
+// The current buffer's length as an offset the caller keeps, noted so that `fbTakeLocalGet`
+// never unwrites a byte a kept offset points past.
+export function wPos(): i32 {
+  const n = curBuf.length
+  if fbPosGen != curBufGen || fbPosEnd < n {
+    fbPosGen = curBufGen
+    fbPosEnd = n
+  }
+  return n
+}
+// Forgets the instruction just written, for a caller that keeps an offset over its bytes.
+export function fbLastForget() {
+  fbLastEnd = -1
+  return 0
+}
 // The byte `back` positions from the END of the current buffer (`0` = the last one),
 // or `-1` when the buffer is shorter than that. Reading past the start is a question,
 // not an error: a peephole asks it precisely to find out whether its pattern fits.
@@ -376,6 +395,7 @@ export function wDropBack(n: i32) {
     curBuf.pop()
     k = k - 1
   }
+  if curBuf.length < fbLastEnd { fbLastEnd = -1 }
   return relTrim()
 }
 // Append every byte of `bs` in order to the current buffer.
@@ -557,15 +577,98 @@ export function ropeAt(r: ByteRope, i: i32): i32 {
 // ── control flow / locals / consts (the universal base — Phase B) ─────────────
 // local.get / local.set / local.tee: 0x20/0x21/0x22 <localidx-uleb>.
 export function fbLocalGet(i: i32) {
+  // A read of the local the last instruction set is that set's `local.tee`, rewritten in place:
+  // the two encodings are the same length, so no recorded position moves.
+  if (
+    fbLastIs(OP_LOCAL_SET, i)
+    && curBuf[fbLastEnd - ulebLen(i) - 1] == OP_LOCAL_SET
+  ) {
+    curBuf[fbLastEnd - ulebLen(i) - 1] = OP_LOCAL_TEE
+    fbLastEnd = -1
+    if fbLocalIsUnsetRef(i - fbFrameParams) { fbRefAsNonNull() }
+    return 0
+  }
   wU8(OP_LOCAL_GET) // 0x20 local.get
   wULEB(i)
-  if fbLocalIsUnsetRef(i - fbFrameParams) { fbRefAsNonNull() }
-  return 0
+  if fbLocalIsUnsetRef(i - fbFrameParams) {
+    fbRefAsNonNull()
+    return 0
+  }
+  return fbLastNote(OP_LOCAL_GET, i)
+}
+// Unwrites the instruction just written when it is a plain `local.get`, returning its local, for
+// a stash that reads that local in place of a copy it would make; -1, unwriting nothing, else.
+export function fbTakeLocalGet(): i32 {
+  const i = fbLastArg
+  if !fbLastIs(OP_LOCAL_GET, i) { return -1 }
+  const at = fbLastEnd - ulebLen(i) - 1
+  if curBuf[at] != OP_LOCAL_GET || fbPosGen == curBufGen && fbPosEnd > at {
+    emitFail(
+      "emitProgram: internal: a kept offset points into a `local.get` an index stash unwrites",
+    )
+    return -1
+  }
+  wDropBack(ulebLen(i) + 1)
+  return i
 }
 export function fbLocalSet(i: i32) {
   wU8(OP_LOCAL_SET) // 0x21 local.set
   wULEB(i)
+  return fbLastNote(OP_LOCAL_SET, i)
+}
+// Notes a receiver written without its non-null recover, since a `struct.get`, which traps on
+// null itself, reads it next; `fbStructGet` checks that it does (`fbNnElideDone`).
+export function fbNnElideNote() {
+  fbNnElideGen = curBufGen
+  fbNnElideEnd = wPos()
   return 0
+}
+
+// Drops a pending `fbNnElideNote`, for a read whose lowering missed before its `struct.get`.
+export function fbNnElideClear() {
+  fbNnElideEnd = -1
+  return 0
+}
+
+// Fails when the `struct.get` after a recover `fbNnElideNote` left out is missing.
+export function fbNnElideDone() {
+  if fbNnElideEnd < 0 { return 0 }
+  fbNnElideEnd = -1
+  emitFail("emitProgram: internal: an elided recover reached no struct.get")
+  return 0
+}
+
+// Whether the writer's peepholes run: not in a build `-O` optimises next, whose passes match the
+// shapes they would rewrite (binaryen's loop hoisting, `optMultivalue`) and do the rewrite too.
+function fbPeepholes(): boolean { return gOptimized == 0 }
+
+// Records the instruction just written, opcode `op` with argument `arg`, as the buffer's last.
+function fbLastNote(op: i32, arg: i32) {
+  fbLastGen = curBufGen
+  fbLastEnd = curBuf.length
+  fbLastOp = op
+  fbLastArg = arg
+  return 0
+}
+
+// Whether the current buffer still ends with the instruction `fbLastNote` recorded as `op` `arg`.
+function fbLastIs(op: i32, arg: i32): boolean {
+  return fbPeepholes()
+    && fbLastOp == op
+    && fbLastArg == arg
+    && fbLastEnd == curBuf.length
+    && fbLastGen == curBufGen
+    && fbLastEnd > 0
+}
+// The number of bytes `wULEB(v)` writes for a non-negative `v`.
+function ulebLen(v: i32): i32 {
+  let n = 1
+  let x = v >> 7
+  while x != 0 {
+    n = n + 1
+    x = x >> 7
+  }
+  return n
 }
 // `local.tee i` — store the stack top into local `i` and LEAVE it on the stack, i.e.
 // `local.set` + `local.get` in one opcode. For a value that is both consumed here and
@@ -923,15 +1026,6 @@ export function fbF32Trunc() {
   wU8(OP_F32_TRUNC)
   return 0
 }
-// f64.neg / f32.neg: 0x9a / 0x8c — flip the sign bit.
-export function fbF64Neg() {
-  wU8(OP_F64_NEG)
-  return 0
-}
-export function fbF32Neg() {
-  wU8(OP_F32_NEG)
-  return 0
-}
 // if: 0x04 <blocktype>. `blockType` is a single byte (0x40 void, or a valtype byte).
 export function fbIf(blockType: i32) {
   fbOpenIf()
@@ -1092,14 +1186,44 @@ export function fbReturnCall(fnIdx: i32) {
 }
 // i32.eqz: 0x45 (used for `!a` and the while-condition inversion).
 export function fbI32Eqz() {
+  // The test of an integer comparison the last instruction made is the inverse comparison,
+  // rewritten in place. A float comparison keeps its `eqz`: NaN fails both it and its inverse.
+  const inv = intCmpInverse(fbLastOp)
+  if inv >= 0 && fbLastIs(fbLastOp, -1) && curBuf[fbLastEnd - 1] == fbLastOp {
+    curBuf[fbLastEnd - 1] = inv
+    fbLastEnd = -1
+    return 0
+  }
   wU8(OP_I32_EQZ) // 0x45 i32.eqz
   return 0
+}
+
+// The opcode of the integer comparison that is false exactly where `op` is true (`eq` and `ne`,
+// `lt` and `ge`, `gt` and `le`, at i32 and i64, signed and unsigned); -1 for any other opcode.
+function intCmpInverse(op: i32): i32 {
+  if op >= 0x46 && op <= 0x4f { return cmpInverseFrom(op, 0x46) }
+  if op >= 0x51 && op <= 0x5a { return cmpInverseFrom(op, 0x51) }
+  return -1
+}
+
+// `intCmpInverse` within one width's ten comparisons, which start at `base` in the order eq, ne,
+// lt_s, lt_u, gt_s, gt_u, le_s, le_u, ge_s, ge_u.
+function cmpInverseFrom(op: i32, base: i32): i32 {
+  const k = op - base
+  if k == 0 { return base + 1 }
+  if k == 1 { return base }
+  // lt (2, 3) and ge (8, 9); gt (4, 5) and le (6, 7).
+  if k == 2 || k == 3 { return op + 6 }
+  if k == 8 || k == 9 { return op - 6 }
+  if k == 4 || k == 5 { return op + 2 }
+  return op - 2
 }
 // One single-byte arithmetic or comparison opcode, at any scalar width. The byte is resolved
 // by `primOpcode` or `lexOpcode` (`ir.vl`); this just writes it.
 export function fbI32Bin(op: i32) {
+  if op == OP_I32_EQZ { return fbI32Eqz() }
   wU8(op)
-  return 0
+  return fbLastNote(op, -1)
 }
 // An i64 key's pair tag: the top 32 bits of `key * 2^64/phi`. Two keys that differ only in their
 // high 32 bits always get different tags (the constant's low half is odd), and the tag is then
@@ -1130,7 +1254,7 @@ export function fbStructNew(heapIdx: i32) {
   wULEB(heapIdx)
   // Leave the return sink's cursor on a UNION-box construction (see `uBoxNewEnd`): the
   // rewrite is legal only while this instruction is still the last one written.
-  if heapIdx == uBoxIdx { uBoxNewEnd = curBuf.length }
+  if heapIdx == uBoxIdx { uBoxNewEnd = wPos() }
   return 0
 }
 // ── string header accessors ───────────────────────────────────────────────────
@@ -1177,6 +1301,14 @@ export function packedStorageOf(heapIdx: i32, field: i32): i32 {
 }
 
 export function fbStructGet(heapIdx: i32, field: i32) {
+  if fbNnElideEnd >= 0 {
+    if fbNnElideEnd != curBuf.length || fbNnElideGen != curBufGen {
+      emitFail(
+        "emitProgram: internal: an elided recover is not followed by its struct.get",
+      )
+    }
+    fbNnElideEnd = -1
+  }
   wU8(GC_PREFIX) // 0xfb GC prefix
   const pk = packedFields[heapIdx * 65536 + field] ?? 0
   wU8(if pk == 0 { GC_STRUCT_GET } else { pk % 16 }) // struct.get, or a packed field's read
@@ -1548,9 +1680,7 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   fbScratchCur = nParams + nLocals
   fbFrameParams = nParams
   fbFrameLocals = nLocals
-  fbReservePushFrames()
   fbReserveCollectionFrames()
-  fbReserveListOpFrames()
   fbReserveStashSlots()
   fbResetLazyFrame()
   fbEagerScratch = fbScratchCur - nParams - nLocals
@@ -1562,164 +1692,25 @@ export function fbEndFunc() {
   fbFrameLocals = 0
   return 0
 }
-// `fbBeginFunc`'s list-push frames: one 4-slot quad per pushed element rep this function
-// uses, the typed ref-push frames in `fnRefPushSlots` order.
-function fbReservePushFrames() {
-  // i32-list push grow quad (val / cap / backing / recvRef).
-  pushScratchBase = fbScratchCur
-  if fnUses.push { fbReserve(4) }
-  // One typed 4-slot ref-push frame per distinct pushed element-type slot, in
-  // `fnRefPushSlots` order; `refPushScratchBase` aliases the FIRST such frame.
-  refPushScratchBase = fbScratchCur
-  let rk = 0
-  while rk < fnRefPushSlots.length {
-    refPushBaseBySlot.push(fbReserve(4))
-    rk = rk + 1
-  }
-  // String-list push quad.
-  strPushScratchBase = fbScratchCur
-  if fnUses.strPush { fbReserve(4) }
-  // f64-list push quad (val f64 / cap / backing / recvRef).
-  f64PushScratchBase = fbScratchCur
-  if fnUses.f64Push { fbReserve(4) }
-  // i64-list push quad (val i64 / cap / backing / recvRef).
-  i64PushScratchBase = fbScratchCur
-  if fnUses.i64Push { fbReserve(4) }
-  // f32-list push quad (val f32 / cap / backing / recvRef).
-  f32PushScratchBase = fbScratchCur
-  if fnUses.f32Push { fbReserve(4) }
-  v128PushScratchBase = fbScratchCur
-  if fnUses.v128Push { fbReserve(4) }
-  // The packed push quads (val i32 / cap / backing / recvRef), one per row in row order. LAST
-  // among the push quads, so every earlier frame base is unchanged in a program with none.
-  u8PushScratchBase = fbScratchCur
-  let pr = 0
-  while pr < 4 {
-    if (fnUses.packedPush & (1 << pr)) != 0 { fbReserve(4) }
-    pr = pr + 1
-  }
-}
 // `fbBeginFunc`'s string-op, map, closure-call and `.map`/`.filter` frames, then the
 // per-mv-slot map frames.
 function fbReserveCollectionFrames() {
   // String-op frame (2 string headers + the out BACKING + 4 i32 temporaries + the two
   // hoisted operand backings + their two `start` offsets, then the literal-equality
   // pre-check's header — 12 slots).
-  strScratchBase = fbScratchCur
-  if fnUses.strOp { fbReserve(12) }
   // G8 map scratch frame (15 slots).
-  mapScratchBase = fbScratchCur
-  if fnUses.mapFrame { fbReserve(15) }
-  // `m.keys()` / `for k in m` key-list builder frame (6 slots).
-  mapKeysBase = fbScratchCur
-  if fnUses.mapKeys { fbReserve(6) }
-  // `m.values()` (mono i32 map) value-list builder frame (6 slots).
-  mapValsBase = fbScratchCur
-  if fnUses.mapVals { fbReserve(6) }
+  mapScratchBase = -1
   callRefDepth = 0
-  // `.map`/`.filter` HOF frame: 3 shared i32 slots (i, n, j), then one typed src-wrapper slot
-  // per distinct receiver list type and one typed dst-backing slot per distinct result element
-  // kind. The callback closure is `mfCallbackLocal`'s.
-  mfScratchBase = fbScratchCur
-  if fnUses.mapFilter { fbReserve(3) }
-  mfSrcBases = []
-  let mfk = 0
-  while mfk < mfSrcKinds.length {
-    mfSrcBases.push(fbReserve(1))
-    mfk = mfk + 1
-  }
-  mfDstBases = []
-  let mfd = 0
-  while mfd < mfDstKinds.length {
-    mfDstBases.push(fbReserve(1))
-    mfd = mfd + 1
-  }
-}
-// `fbBeginFunc`'s list compare and concat frames, one typed frame per compared or
-// concatenated rep.
-function fbReserveListOpFrames() {
-  // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6), appended LAST so
-  // every existing layout is untouched: the i32-list frame (A/B wrappers + the
-  // concat out backing + n + i), the string-list frame, then one typed frame per
-  // compared ref-list slot.
-  leqIScratchBase = fbScratchCur
-  if fnUses.listEqI { fbReserve(5) }
-  leqSScratchBase = fbScratchCur
-  if fnUses.listEqS { fbReserve(4) }
-  leqRBases = []
-  let lqk = 0
-  while lqk < fnListEqRSlots.length {
-    leqRBases.push(fbReserve(4))
-    lqk = lqk + 1
-  }
-  // One 4-slot CONCAT frame per non-i32 list rep this function concatenates (A/B
-  // wrappers, the out backing, n). Reserved AFTER the compare frames, so a function
-  // that only compares keeps the layout it had.
-  lcatBases = []
-  let lck = 0
-  while lck < fnListCatKinds.length {
-    lcatBases.push(fbReserve(4))
-    lck = lck + 1
-  }
-  // One 4-slot generic COMPARE frame per list rep this function compares that has no
-  // core of its own (A/B wrappers, n, i). Reserved AFTER the concat frames, so a
-  // function that only compares or only concatenates keeps the layout it had.
-  leqgBases = []
-  let lgk = 0
-  while lgk < fnListEqGKinds.length {
-    leqgBases.push(fbReserve(4))
-    lgk = lgk + 1
-  }
 }
 // `fbBeginFunc`'s single-purpose stash slots, each appended after every earlier frame so a
 // function that does not use it keeps the layout it had; the staged markers start unset.
 function fbReserveStashSlots() {
-  // Closure equality frame (2 `(ref $cloStruct)` slots), appended LAST so every
-  // existing layout is untouched.
-  cloEqScratchBase = fbScratchCur
-  if fnUses.cloEq { fbReserve(2) }
-  // Array-intrinsic frame (1 i32 slot — the staged runtime length `n` of an
-  // `__array_new__`/`__array_new_default__` allocation), appended after every
-  // existing frame so layouts without it are untouched.
-  arrNewScratchBase = fbScratchCur
-  if fnUses.arrNew { fbReserve(1) }
-  // Call-LHS `??` stash, appended after every existing frame so layouts without it are
-  // untouched: a `(ref $uBoxIdx)` box slot, then a `(ref null $sTypeIdx)` string|null
-  // slot, then an i32 boolean|null slot — one per rep the call result may take.
-  coalesceCallSlot = fbScratchCur
-  if fnUses.coalesceCall { fbReserve(1) }
-  coalesceCallStrSlot = fbScratchCur
-  if fnUses.coalesceCall { fbReserve(1) }
-  coalesceCallBoolSlot = fbScratchCur
-  if fnUses.coalesceCall { fbReserve(1) }
-  // Variant-rebox stash (1 `(ref null struct)` slot, appended after every eager frame):
-  // holds a multi-field CALL result once so `emitStructExprAsVariantBox` re-reads each of
-  // its fields to rebuild the arm's variant struct. Off ⇒ zero slots ⇒ layout untouched.
-  variantReboxSlot = fbScratchCur
-  if fnUses.variantRebox { fbReserve(1) }
   // Union-box sink frame (2 slots: i32 tag, then anyref payload), appended after every
   // eager frame so layouts without it are untouched. Reserved from the prediction
   // (`fbUsesSinkPair`) since a `local.set` in the body needs the index before the body
   // is lowered; the exit block reading them is emitted only if a `return` actually sank.
   unionSinkBase = fbScratchCur
   if fbUsesSinkPair() { fbReserve(2) }
-  // Literal-union atom-NARROW staging slot (1 slot, a non-null `(ref $sTypeIdx)`), appended
-  // after the union-box sink so every earlier base is unchanged in a program that never stages a
-  // narrow — which is every program with no string literal union (`gLitUnionUsed` gates the
-  // scan bit, so the self-hosted compiler reserves nothing).
-  atomStageSlot = fbScratchCur
-  if fnUses.atomStage { fbReserve(1) }
-  // D1671 — the `?.` receiver stash (1 slot, `(ref null struct)`), appended after
-  // the atom-narrow slot so every earlier base is unchanged in a module whose `?.` receivers are
-  // all re-readable places, which is every module the compiler compiles of itself.
-  optRecvSlot = fbScratchCur
-  if fnUses.optRecv { fbReserve(1) }
-  // D1677 — the `.get` operand stash (2 slots: the i32 index, then a `(ref null struct)` for
-  // the list wrapper), appended after `optRecvSlot` so every earlier base is unchanged in a
-  // module whose `.get` operands are all re-readable places.
-  listGetIdxSlot = fbScratchCur
-  listGetRecvSlot = fbScratchCur + 1
-  if fnUses.listGet { fbReserve(2) }
   // Nothing is staged as a frame opens: the marker is set and restored around one chain's
   // lowering, and a failed emission must not carry a dead index into the next function.
   optRecvStagedIx = -1
@@ -1752,6 +1743,11 @@ export function fbResetLazyFrame() {
   liKinds = []
   liSlots = []
   liBack = []
+  liFrameRowAt = Map()
+  mfSrcKinds = []
+  mfSrcSlots = []
+  mfDstKinds = []
+  mfDstSlots = []
   liFieldKind = []
   liOnceVts = []
   liOnceTags = []
@@ -1999,101 +1995,6 @@ export function fbLocalsCount(nLocals: i32) {
   if liKinds.length > 0 { n = n + 1 + liKinds.length }
   return n
 }
-// The list push frames of `fbEmitLocalsVec`: the i32, ref, string, f64, i64, f32 and u8 push
-// quads, each checked against the runs written so far.
-function fbEmitPushFrames() {
-  fbFrameAt(pushScratchBase, "i32-push")
-  // i32-list push grow quad: pushVal i32, pushNewCap i32, pushNewBacking (ref $aTypeIdx),
-  // pushRecvRef (ref $lTypeIdx) — the wrapper ref for a struct-FIELD receiver (gap #3).
-  if fnUses.push {
-    fbI32Run()
-    fbI32Run()
-    fbRefRun(aTy())
-    fbRefRun(lTy())
-  }
-  fbFrameAt(refPushScratchBase, "ref-push")
-  // One typed 4-slot ref-push frame per distinct pushed element-type slot, in
-  // `fnRefPushSlots` order: pushRefVal (ref $elem), pushRefCap i32,
-  // pushRefBacking (ref $back), pushRefRecvRef (ref $wrap).
-  let rfk = 0
-  while rfk < fnRefPushSlots.length {
-    const rfs = fnRefPushSlots[rfk]
-    // The push value slot is normally a non-null `(ref $elem)`, but a nullable-niche
-    // element list (`(P | null)[]`, the interned `rlElemNullable` bit) pushes a
-    // `(ref null $elem)` value, so its value slot must be nullable too — else
-    // `xs.push(null)` mismatches.
-    if rlElemNullable[rfs] == 1 {
-      fbRefNullRun(rlElemHeap[rfs])
-    } else {
-      fbRefRun(rlElemHeap[rfs])
-    }
-    fbI32Run()
-    fbRefRun(rlBackIdx[rfs])
-    fbRefRun(rlWrapIdx[rfs])
-    rfk = rfk + 1
-  }
-  fbFrameAt(strPushScratchBase, "string-push")
-  // String-list push quad: pushStrVal (ref $sTypeIdx), pushStrCap i32,
-  // pushStrBacking (ref $mkArrIdx), pushStrRecvRef (ref $mkListIdx).
-  if fnUses.strPush {
-    // The VALUE slot is `(ref null $aTypeIdx)` in a function that pushes onto a
-    // `(string | null)[]` — the niche shares this backing (whose element slot is already
-    // nullable), so only the staging local differs. The ref-push frame above makes the same
-    // distinction per element slot; here one flag covers the one string backing.
-    if fnUses.nulStrPush { fbRefNullRun(sTy()) } else { fbRefRun(sTy()) }
-    fbI32Run()
-    fbRefRun(mkArrTy())
-    fbRefRun(mkListTy())
-  }
-  fbFrameAt(f64PushScratchBase, "f64-push")
-  // f64-list push quad: pushF64Val f64, pushF64Cap i32, pushF64Backing
-  // (ref $fa64TypeIdx), pushF64RecvRef (ref $fl64TypeIdx).
-  if fnUses.f64Push {
-    fbF64Run()
-    fbI32Run()
-    fbRefRun(fa64Ty())
-    fbRefRun(fl64Ty())
-  }
-  fbFrameAt(i64PushScratchBase, "i64-push")
-  // i64-list push quad: pushI64Val i64, pushI64Cap i32, pushI64Backing
-  // (ref $ia64TypeIdx), pushI64RecvRef (ref $il64TypeIdx).
-  if fnUses.i64Push {
-    fbI64Run()
-    fbI32Run()
-    fbRefRun(ia64Ty())
-    fbRefRun(il64Ty())
-  }
-  fbFrameAt(f32PushScratchBase, "f32-push")
-  // f32-list push quad: pushF32Val f32, pushF32Cap i32, pushF32Backing
-  // (ref $fa32TypeIdx), pushF32RecvRef (ref $fl32TypeIdx).
-  if fnUses.f32Push {
-    fbF32Run()
-    fbI32Run()
-    fbRefRun(fa32Ty())
-    fbRefRun(fl32Ty())
-  }
-  fbFrameAt(v128PushScratchBase, "v128-push")
-  if fnUses.v128Push {
-    fbV128Run()
-    fbI32Run()
-    fbRefRun(fa128Ty())
-    fbRefRun(fl128Ty())
-  }
-  fbFrameAt(u8PushScratchBase, "u8-push")
-  // The packed push quads, one per row in row order: val i32, cap i32, the row's backing and
-  // wrapper refs. The VALUE slot is a plain i32: the truncation to the row's width happens in
-  // `array.set` on the packed backing, not in this local.
-  let pq = 0
-  while pq < 4 {
-    if (fnUses.packedPush & (1 << pq)) != 0 {
-      fbI32Run()
-      fbI32Run()
-      fbRefRun(pkBackTy(pq))
-      fbRefRun(pkWrapTy(pq))
-    }
-    pq = pq + 1
-  }
-}
 // One string-op slot: the string header (or, with `back`, its backing), nullable with `nul`. A
 // body that touches no string has minted no string type, and the slot holds an i32 instead.
 function fbStrSlotRun(back: boolean, nul: boolean) {
@@ -2104,228 +2005,161 @@ function fbStrSlotRun(back: boolean, nul: boolean) {
   return fbRefRun(h)
 }
 
-// The string-op frame and the map frames of `fbEmitLocalsVec`: the shared map frame, the i32-
-// and i64-keyed extras and the key-list and value-list builders.
-function fbEmitStrOpMapFrames() {
-  fbFrameAt(strScratchBase, "string-op")
-  // String-op frame: strScrA/strScrB (string header refs), strScrOut (the backing under
-  // construction), strScrI0..strScrI3 (i32 temporaries), and the hoisted operand
-  // backings/offsets (strScrABk/strScrBBk, strScrAOff/strScrBOff) that keep an element
-  // loop at one `array.get` per step — binaryen's LICM does not hoist a GC `struct.get`.
-  if fnUses.strOp {
-    fbStrSlotRun(false, false)
-    fbStrSlotRun(false, false)
-    fbStrSlotRun(true, false)
-    fbI32Run()
-    fbI32Run()
-    fbI32Run()
-    fbI32Run()
-    fbStrSlotRun(true, true)
-    fbStrSlotRun(true, true)
-    fbI32Run()
-    fbI32Run()
-    // strScrEq: live only between a literal equality's length test and its call.
-    fbStrSlotRun(false, false)
-  }
-  fbFrameAt(mapScratchBase, "map")
-  // G8 map scratch frame, in slot order: mapRef, keyRef, curRef, slot, cap, entry,
-  // keysBk, valsBk, chr, hcur, idxBk, rslot, liveBk, hashBk, valSet (the mono SET
-  // value stash, reserved across the probe). Types match each `fbRefRun`/`fbI32Run`
-  // call below, one per slot, in this same order.
-  if fnUses.mapFrame {
-    fbRefRun(mapTy())
-    fbRefRun(sTy())
-    fbRefRun(sTy())
-    fbI32Run()
-    fbI32Run()
-    fbI32Run()
-    fbRefRun(mkArrTy())
-    fbRefRun(aTy())
-    fbI32Run()
-    fbI32Run()
-    fbRefRun(aTy())
-    fbI32Run()
-    fbRefRun(aTy())
-    fbRefRun(aTy())
-    fbI32Run()
-  }
-  fbFrameAt(mapKeysBase, "map-keys")
-  // `m.keys()` / `for k in m` key-list builder frame (6 slots): outBack (ref $mkArrIdx),
-  // keysBack (ref $mkArrIdx), live (ref $aTypeIdx), i, j, count (3 i32).
-  if fnUses.mapKeys {
-    fbRefRun(mkArrTy())
-    fbRefRun(mkArrTy())
-    fbRefRun(aTy())
-    fbI32Run()
-    fbI32Run()
-    fbI32Run()
-  }
-  fbFrameAt(mapValsBase, "map-values")
-  // `m.values()` value-list builder frame (6 slots): outBack (ref $aTypeIdx), valsBack
-  // (ref $aTypeIdx), live (ref $aTypeIdx), i, j, count (3 i32).
-  if fnUses.mapVals {
-    fbRefRun(aTy())
-    fbRefRun(aTy())
-    fbRefRun(aTy())
-    fbI32Run()
-    fbI32Run()
-    fbI32Run()
-  }
+// Slot `j` of the string-op frame (`strScr`): strScrA/strScrB (string header refs), strScrOut (the
+// backing under construction), four i32 temporaries, the hoisted operand backings and their
+// `start` offsets, and strScrEq, live only between a literal equality's length test and its call.
+function fbStrFrameSlotRun(j: i32) {
+  if j == 0 || j == 1 || j == 11 { return fbStrSlotRun(false, false) }
+  if j == 2 { return fbStrSlotRun(true, false) }
+  if j == 7 || j == 8 { return fbStrSlotRun(true, true) }
+  return fbI32Run()
 }
-// The `.map`/`.filter` frame of `fbEmitLocalsVec`: its shared slots, then one typed source
-// wrapper per receiver kind and one typed destination backing per result kind.
-function fbEmitMapFilterFrames() {
-  fbFrameAt(mfScratchBase, "map/filter")
-  // `.map`/`.filter` HOF frame: i, n, j (3 i32), then the typed src-wrapper slots, then the
-  // typed dst-backing slots — in `fbBeginFunc`'s reservation order.
-  if fnUses.mapFilter {
-    fbI32Run()
-    fbI32Run()
-    fbI32Run()
+
+// A single-purpose stash slot of row code `code`: the array-intrinsic length; the call-LHS `??`
+// stash's box, `string | null` and `boolean | null` (an i32 where the module mints no such heap,
+// D3995); the variant-rebox and `?.` stashes and the `.get` wrapper as any struct, and the index.
+function fbStashSlotRun(code: i32) {
+  if code == COALCALL_FRAME {
+    if uDeclared { return fbRefRun(uBoxIdx) }
+    return fbI32Run()
   }
-  let mfv = 0
-  while mfv < mfSrcKinds.length {
-    // The map-filter SOURCE wrapper valtype per element kind — the declarative ListKind->type-index
-    // table as an EXHAUSTIVE `match` (a new `ListKind` member with no arm is a compile error).
-    const sk = mfSrcKinds[mfv]
-    match sk {
+  if code == COALCALL_FRAME + 1 {
+    if strTrioMinted() { return fbRefNullRun(sTy()) }
+    return fbI32Run()
+  }
+  if code == REBOX_FRAME || code == OPTRECV_FRAME || code == LISTGET_FRAME + 1 {
+    return fbStructNullRun()
+  }
+  return fbI32Run()
+}
+
+// Slot `j` of the map frame (`mapScr`), in slot order: mapRef, keyRef, curRef, slot, cap, entry,
+// keysBk, valsBk, chr, hcur, idxBk, rslot, liveBk, hashBk, and valSet, the mono set's value stash.
+function fbMapFrameSlotRun(j: i32) {
+  if j == 0 { return fbRefRun(mapTy()) }
+  if j == 1 || j == 2 { return fbRefRun(sTy()) }
+  if j == 6 { return fbRefRun(mkArrTy()) }
+  if j == 7 || j == 10 || j == 12 || j == 13 { return fbRefRun(aTy()) }
+  return fbI32Run()
+}
+
+// A slot of a list compare or concat frame (`leqIScr` and its kin), row code `code` and key `key`:
+// wrapper refs, the concat out backing, then i32 counters, the heaps read off the one home the
+// lowering writes (`catWrapIdxOf`, `catBackIdxOf`).
+function fbListOpFrameSlotRun(code: i32, key: i32) {
+  if code >= LEQG_FRAME {
+    if code - LEQG_FRAME < 2 {
+      return fbRefRun(catWrapIdxOf(key / 65536, key % 65536))
+    }
+    return fbI32Run()
+  }
+  if code >= LCAT_FRAME {
+    const j = code - LCAT_FRAME
+    if j < 2 { return fbRefRun(catWrapIdxOf(key / 65536, key % 65536)) }
+    if j == 2 { return fbRefRun(catBackIdxOf(key / 65536, key % 65536)) }
+    return fbI32Run()
+  }
+  if code >= LEQR_FRAME {
+    if code - LEQR_FRAME < 2 { return fbRefRun(rlWrapIdx[key]) }
+    return fbI32Run()
+  }
+  if code >= LEQS_FRAME {
+    if code - LEQS_FRAME < 2 { return fbRefRun(mkListTy()) }
+    return fbI32Run()
+  }
+  const j = code - LEQI_FRAME
+  if j < 2 { return fbRefRun(lTy()) }
+  if j == 2 { return fbRefRun(aTy()) }
+  return fbI32Run()
+}
+
+// Slot `j` of the map key-list (`mapKeysScr`) or mono value-list (`mapValsScr`) builder: the out
+// and source backings, the live bitmap, then i, j and count.
+function fbMapIterSlotRun(keys: boolean, j: i32) {
+  if j < 2 { return fbRefRun(if keys { mkArrTy() } else { aTy() }) }
+  if j == 2 { return fbRefRun(aTy()) }
+  return fbI32Run()
+}
+
+// Slot `j` of push quad `code` (value, capacity, backing, receiver wrapper), `key` its packed row or
+// ref-list row: the value slot is the element's, nullable for a nullable-niche element.
+function fbPushSlotRun(code: i32, j: i32, key: i32) {
+  if j == 1 { return fbI32Run() }
+  if code == REFPUSH_FRAME {
+    if j == 0 && rlElemNullable[key] == 1 {
+      return fbRefNullRun(rlElemHeap[key])
+    }
+    if j == 0 { return fbRefRun(rlElemHeap[key]) }
+    return fbRefRun(if j == 2 { rlBackIdx[key] } else { rlWrapIdx[key] })
+  }
+  if code == PKPUSH_FRAME {
+    if j == 0 { return fbI32Run() }
+    return fbRefRun(if j == 2 { pkBackTy(key) } else { pkWrapTy(key) })
+  }
+  if code == STRPUSH_FRAME || code == NSTRPUSH_FRAME {
+    if j == 0 && code == NSTRPUSH_FRAME { return fbRefNullRun(sTy()) }
+    if j == 0 { return fbRefRun(sTy()) }
+    return fbRefRun(if j == 2 { mkArrTy() } else { mkListTy() })
+  }
+  if code == F64PUSH_FRAME {
+    if j == 0 { return fbF64Run() }
+    return fbRefRun(if j == 2 { fa64Ty() } else { fl64Ty() })
+  }
+  if code == I64PUSH_FRAME {
+    if j == 0 { return fbI64Run() }
+    return fbRefRun(if j == 2 { ia64Ty() } else { il64Ty() })
+  }
+  if code == F32PUSH_FRAME {
+    if j == 0 { return fbF32Run() }
+    return fbRefRun(if j == 2 { fa32Ty() } else { fl32Ty() })
+  }
+  if code == V128PUSH_FRAME {
+    if j == 0 { return fbV128Run() }
+    return fbRefRun(if j == 2 { fa128Ty() } else { fl128Ty() })
+  }
+  if j == 0 { return fbI32Run() }
+  return fbRefRun(if j == 2 { aTy() } else { lTy() })
+}
+
+// A `.map`/`.filter` source wrapper (`src`) or destination backing slot, typed by its table row.
+function fbMapFilterSlotRun(src: boolean, k: i32) {
+  const lk = if src { mfSrcKinds[k] } else { mfDstKinds[k] }
+  const slot = if src { mfSrcSlots[k] } else { mfDstSlots[k] }
+  if src {
+    match lk {
       "f64list" => fbRefRun(fl64Ty())
       "i64list" => fbRefRun(il64Ty())
       "f32list" => fbRefRun(fl32Ty())
       "v128list" => fbRefRun(fl128Ty())
-      "reflist" => fbRefRun(rlWrapIdx[mfSrcSlots[mfv]])
+      "reflist" => fbRefRun(rlWrapIdx[slot])
       "strlist" => fbRefRun(mkListTy())
       "list" => fbRefRun(lTy())
-      "u8list" => fbRefRun(pkWrapAt(mfSrcSlots[mfv]))
+      "u8list" => fbRefRun(pkWrapAt(slot))
     }
-    mfv = mfv + 1
+    return 0
   }
-  let mfw = 0
-  while mfw < mfDstKinds.length {
-    // The map-filter DEST backing valtype per result element kind — same declarative table.
-    const dk = mfDstKinds[mfw]
-    match dk {
-      "f64list" => fbRefRun(fa64Ty())
-      "i64list" => fbRefRun(ia64Ty())
-      "f32list" => fbRefRun(fa32Ty())
-      "v128list" => fbRefRun(fa128Ty())
-      "reflist" => fbRefRun(rlBackIdx[mfDstSlots[mfw]])
-      "strlist" => fbRefRun(mkArrTy())
-      "list" => fbRefRun(aTy())
-      "u8list" => fbRefRun(pkBackAt(mfDstSlots[mfw]))
-    }
-    mfw = mfw + 1
+  match lk {
+    "f64list" => fbRefRun(fa64Ty())
+    "i64list" => fbRefRun(ia64Ty())
+    "f32list" => fbRefRun(fa32Ty())
+    "v128list" => fbRefRun(fa128Ty())
+    "reflist" => fbRefRun(rlBackIdx[slot])
+    "strlist" => fbRefRun(mkArrTy())
+    "list" => fbRefRun(aTy())
+    "u8list" => fbRefRun(pkBackAt(slot))
   }
+  return 0
 }
-// The push, string-op, map and map/filter scratch frames of `fbEmitLocalsVec`, in
-// `fbBeginFunc`'s reservation order, each checked against the runs written so far.
-function fbEmitPushMapFrames() {
-  fbEmitPushFrames()
-  fbEmitStrOpMapFrames()
-  fbEmitMapFilterFrames()
-}
+
 // The ref-valued map, list-compare, closure-equality and single-slot staging frames of
 // `fbEmitLocalsVec`, through the address-fold slots that end the eager frames.
 function fbEmitStagingFrames() {
-  fbFrameAt(leqIScratchBase, "i32-list compare")
-  // List `==`/`!=`/`+` frames, in `fbBeginFunc`'s reservation order: the
-  // i32-list frame (A/B wrapper refs, the concat out backing, n, i), the
-  // string-list frame (A/B wrapper refs, n, i), then one typed frame per
-  // compared ref-list slot (A/B wrapper refs, n, i).
-  if fnUses.listEqI {
-    fbRefRun(lTy())
-    fbRefRun(lTy())
-    fbRefRun(aTy())
-    fbI32Run()
-    fbI32Run()
-  }
-  fbFrameAt(leqSScratchBase, "string-list compare")
-  if fnUses.listEqS {
-    fbRefRun(mkListTy())
-    fbRefRun(mkListTy())
-    fbI32Run()
-    fbI32Run()
-  }
-  let lqv = 0
-  while lqv < fnListEqRSlots.length {
-    const lqs = fnListEqRSlots[lqv]
-    fbRefRun(rlWrapIdx[lqs])
-    fbRefRun(rlWrapIdx[lqs])
-    fbI32Run()
-    fbI32Run()
-    lqv = lqv + 1
-  }
-  // The concat frames, in `fbBeginFunc`'s reservation order: A/B wrapper refs, the
-  // freshly-allocated out BACKING, then n. The two heap indices come off the ONE home
-  // the emitter reads (`catWrapIdxOf`/`catBackIdxOf`), so a slot declared here and a
-  // slot written by `emitListConcatG` cannot be two different types.
-  let lcv = 0
-  while lcv < fnListCatKinds.length {
-    const lck2 = fnListCatKinds[lcv]
-    const lcs = fnListCatSlots[lcv]
-    fbRefRun(catWrapIdxOf(lck2, lcs))
-    fbRefRun(catWrapIdxOf(lck2, lcs))
-    fbRefRun(catBackIdxOf(lck2, lcs))
-    fbI32Run()
-    lcv = lcv + 1
-  }
-  // The generic COMPARE frames, in `fbBeginFunc`'s reservation order: A/B wrapper refs,
-  // then the two i32 loop counters. Same one home for the wrapper index as the concat
-  // frames above (`catWrapIdxOf`), so a slot declared here and a slot written by
-  // `emitListEqGCore` cannot be two different types.
-  let lgv = 0
-  while lgv < fnListEqGKinds.length {
-    fbRefRun(catWrapIdxOf(fnListEqGKinds[lgv], fnListEqGSlots[lgv]))
-    fbRefRun(catWrapIdxOf(fnListEqGKinds[lgv], fnListEqGSlots[lgv]))
-    fbI32Run()
-    fbI32Run()
-    lgv = lgv + 1
-  }
-  fbFrameAt(cloEqScratchBase, "closure equality")
-  // Closure equality frame (2 `(ref $cloStruct)` slots, appended LAST).
-  if fnUses.cloEq {
-    fbRefRun(cloStructIdx)
-    fbRefRun(cloStructIdx)
-  }
-  fbFrameAt(arrNewScratchBase, "array-intrinsic")
-  // Array-intrinsic frame (1 i32 slot — the staged allocation length).
-  if fnUses.arrNew { fbI32Run() }
-  fbFrameAt(coalesceCallSlot, "call-LHS `??`")
-  // Call-LHS `??` stash (3 slots, appended LAST): the `(ref $uBoxIdx)` box, the
-  // `(ref null $sTypeIdx)` string|null niche, then the i32 boolean|null niche.
-  // A slot whose heap type this module does not mint holds an i32 instead: nothing stores the box
-  // or the string there, and an unminted index names a type of the previous program (D3995).
-  if fnUses.coalesceCall {
-    if uDeclared { fbRefRun(uBoxIdx) } else { fbI32Run() }
-    if strTrioMinted() { fbRefNullRun(sTy()) } else { fbI32Run() }
-    fbI32Run()
-  }
-  fbFrameAt(variantReboxSlot, "variant-rebox")
-  // Variant-rebox stash: one `(ref null struct)` slot (holds any plain-struct source ref;
-  // recovered by `ref.cast (ref $plainStruct)` at each field re-read).
-  if fnUses.variantRebox { fbStructNullRun() }
   fbFrameAt(unionSinkBase, "union-box sink")
   // Union-box sink frame: the i32 tag, then the `anyref` payload — the two operands of
   // the box's single `struct.new`, in the field order it pops them.
   if fbUsesSinkPair() {
     fbI32Run()
     fbAnyRun()
-  }
-  fbFrameAt(atomStageSlot, "atom-narrow staging")
-  // The atom-narrow staging slot — likewise non-null, `local.set` before every read.
-  if fnUses.atomStage {
-    if strTrioMinted() { fbRefRun(sTy()) } else { fbI32Run() }
-  }
-  fbFrameAt(optRecvSlot, "`?.` receiver stash")
-  // The `?.` receiver stash: any struct row, so the abstract `structref` — nullable,
-  // because a `?.` receiver is exactly the value whose null-ness is being tested.
-  if fnUses.optRecv { fbStructNullRun() }
-  fbFrameAt(listGetIdxSlot, "`.get` operand stash")
-  // The `.get` operand stash, in `fbBeginFunc`'s order: the i32 index, then the list wrapper
-  // as the abstract `structref` — any list kind, recovered by `ref.cast` at each re-read.
-  if fnUses.listGet {
-    fbI32Run()
-    fbStructNullRun()
   }
   fbFrameAt(maFoldScratchBase, "declaration-time address fold")
   // One i32 run per declaration-time address-fold scratch slot — `fnMemAddrFoldCount` of
@@ -2385,7 +2219,31 @@ function fbLazyListKindRun(lk: ListKind, lix: i32) {
 // itself, and every other row by its element kind through `fbLazyListKindRun`.
 export function fbLazyListSlotRun(lix: i32) {
   const lk = liKinds[lix]
-  if liBack[lix] >= 200 {
+  if liBack[lix] >= STR_FRAME && liBack[lix] < STR_FRAME + 12 {
+    fbStrFrameSlotRun(liBack[lix] - STR_FRAME)
+  } else if liBack[lix] >= MAP_FRAME && liBack[lix] < MAP_FRAME + 15 {
+    fbMapFrameSlotRun(liBack[lix] - MAP_FRAME)
+  } else if liBack[lix] >= ARRNEW_FRAME && liBack[lix] < LISTGET_FRAME + 2 {
+    fbStashSlotRun(liBack[lix])
+  } else if liBack[lix] >= PUSH_FRAME && liBack[lix] < REFPUSH_FRAME + 4 {
+    fbPushSlotRun(
+      liBack[lix] - liBack[lix] % 10,
+      liBack[lix] % 10,
+      liSlots[lix],
+    )
+  } else if liBack[lix] == ATOMSTAGE_FRAME {
+    if strTrioMinted() { fbRefRun(sTy()) } else { fbI32Run() }
+  } else if liBack[lix] >= MKEYS_FRAME && liBack[lix] < MVALS_FRAME + 6 {
+    fbMapIterSlotRun(liBack[lix] < MVALS_FRAME, liBack[lix] % 10)
+  } else if liBack[lix] >= MF_FRAME && liBack[lix] < MF_FRAME + 3 {
+    fbI32Run()
+  } else if liBack[lix] == MFSRC_FRAME || liBack[lix] == MFDST_FRAME {
+    fbMapFilterSlotRun(liBack[lix] == MFSRC_FRAME, liSlots[lix])
+  } else if liBack[lix] == CLOEQ_FRAME || liBack[lix] == CLOEQ_FRAME + 1 {
+    fbRefRun(cloStructIdx)
+  } else if liBack[lix] >= LEQI_FRAME && liBack[lix] < LEQG_FRAME + 4 {
+    fbListOpFrameSlotRun(liBack[lix], liSlots[lix])
+  } else if liBack[lix] >= 200 {
     // D1510 — an object-literal order stash slot whose field has only its code.
     fbFieldStorageRun(null, liBack[lix] - 200, liSlots[lix])
   } else if liBack[lix] >= 100 {
@@ -2675,7 +2533,6 @@ export function fbEmitLocalsVec(body: u8[], nLocals: i32) {
     }
     li = li + 1
   }
-  fbEmitPushMapFrames()
   fbEmitStagingFrames()
   fbEmitLazyListFrame()
   wTarget(prev)
@@ -3414,5 +3271,16 @@ export function fbValtype(kind: VKind, structIdx: i32) {
       wU8(HT_NONE)
     }
   }
+  return 0
+}
+
+// f64.neg / f32.neg: 0x9a / 0x8c — flip the sign bit.
+export function fbF64Neg() {
+  wU8(OP_F64_NEG)
+  return 0
+}
+
+export function fbF32Neg() {
+  wU8(OP_F32_NEG)
   return 0
 }

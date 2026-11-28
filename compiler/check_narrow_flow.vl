@@ -22,8 +22,17 @@ import {
   CW_DST_ELEM,
   CW_DST_VAL,
   CW_DST_WHOLE,
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  cwIxBuild,
+  cwIxKind,
+  cwIxNode,
   cwLetWritesStraight,
+  cwOccNext,
+  cwOccWalk,
 } from "./check_write_scan"
+import { a20RetWalk } from "./check_nj_gate"
+import { recFreshMapDeclOf } from "./check_rec_fresh"
 import {
   declareSlot,
   fnWriteAliasNote,
@@ -552,6 +561,7 @@ import {
   pendNulListTysSet,
   pendTys,
   pendTysSet,
+  readOnlyDefaultRows,
   readOnlyKeyRows,
   recordArmJoin,
 } from "./check_side_rows"
@@ -1342,7 +1352,15 @@ function defaultOpenHoles(ty: i32, depth: i32, apply: boolean): boolean {
 function holdsDefaultableHole(ty: i32): boolean {
   if calleeWrittenElem(ty) >= 0 { return false }
   const om: i32[] = [-1]
-  if !unresolvedHole(ty) && recOpenHolePath(ty, om) == "" { return false }
+  // An open map held whole as a value (`cc["k"] = Map()`) counts too, so one leaving a function
+  // waits for its caller's reads (D17746).
+  if (
+    !unresolvedHole(ty)
+    && recOpenHolePath(ty, om) == ""
+    && !tyHoldsOpenMap(ty)
+  ) {
+    return false
+  }
   return !defaultOpenHoles(ty, 8, false)
 }
 
@@ -1398,7 +1416,44 @@ export function defaultReadOnlyContainer(ty: i32): boolean {
   } else {
     return false
   }
+  readOnlyDefaultRows.push(ty)
   return true
+}
+
+// Whether `x` reads an element of a row the read-only default settled, through un-annotated
+// bindings, `??` defaults, `.get` calls and `for … in` variables.
+export function readsUnwrittenElem(x: i32): boolean {
+  const seen: i32[] = []
+  let cur = parenPeelIx(x)
+  while cur >= 0 && cur < P.nodes.length && !i32ListHas(seen, cur) {
+    seen.push(cur)
+    const e = nodeAt(cur)
+    let row = -1
+    let next = -1
+    if e is Index { row = nodeTyIxOf(e.idxArr) }
+    if e is BinExpr && e.binOp == "??" { next = e.binLeft }
+    if e is Call && e.callFn >= 0 && e.callFn < P.nodes.length {
+      const f = nodeAt(e.callFn)
+      if f is Member && f.memProp == "get" { row = nodeTyIxOf(f.memObj) }
+    }
+    if e is Ident {
+      const d = identDeclOf(cur)
+      const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+      if dn is LetDecl && dn.letType < 0 { next = dn.letInit }
+      const lp = if dn is LoopVar && dn.lvSlot == 0 { dn.lvLoop } else { -1 }
+      const ln = if lp >= 0 && lp < P.nodes.length { nodeAt(lp) } else { null }
+      if ln is ForIn { row = nodeTyIxOf(ln.fiIter) }
+    }
+    const r0 = if row >= 0 { nonNullTy(row) } else { -1 }
+    if (
+      r0 >= 0
+      && (i32ListHas(readOnlyDefaultRows, r0) || rowSettledByDefault(r0))
+    ) {
+      return true
+    }
+    cur = if next >= 0 { parenPeelIx(next) } else { -1 }
+  }
+  return false
 }
 
 // Whether expression `ix` hands back a container no binding holds: a `Map()` or `Set()` call, a
@@ -1417,11 +1472,51 @@ export function freshContainerExpr(ix: i32): boolean {
 // parameters it hands back (`handBackIx`, `handBackShared`), and each of their arguments is fresh.
 function freshCallResult(c: Call): boolean {
   const back = handedBackParams(calleeNamesDecl(c.callFn))
-  if back.length == 0 { return false }
+  if back.length == 0 { return freshReturnsOnly(calleeNamesDecl(c.callFn)) }
   for i in back {
     if i >= c.callArgs.length { return false }
     if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
     if !freshContainerExpr(c.callArgs[i]) { return false }
+  }
+  return true
+}
+
+// Whether un-annotated function `d` returns only a container it makes: a fresh one, or a local
+// holding just its empty `Map()` that nothing but those returns reads. False for any other.
+function freshReturnsOnly(d: i32): boolean {
+  const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(f is FuncDecl)
+    || f.fnRet >= 0
+    || f.fnTyParams.length > 0
+    || f.fnBody < 0
+  ) {
+    return false
+  }
+  const rv: i32[] = []
+  a20RetWalk(f.fnBody, true, rv)
+  if rv.length == 0 { return false }
+  const reads: i32[] = []
+  for v in rv { reads.push(parenPeelIx(v)) }
+  for v in reads {
+    if v < 0 { return false }
+    if freshContainerExpr(v) { continue }
+    const b = if nodeAt(v) is Ident { recFreshMapDeclOf(v) } else { -1 }
+    if b < 0 || !cwReadOnlyAt(b, reads) { return false }
+  }
+  return true
+}
+
+// Whether every occurrence of binding `b` past its declaration is a read among `reads`.
+function cwReadOnlyAt(b: i32, reads: i32[]): boolean {
+  cwIxBuild()
+  const ow = cwOccWalk(b)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_BIND { continue }
+    if cwIxKind[r] != CW_OCC_USE || !i32ListHas(reads, cwIxNode[r]) {
+      return false
+    }
   }
   return true
 }
@@ -1664,6 +1759,41 @@ export function flushOpenArgMaps() {
   return 0
 }
 
+// Bindings whose default a read blocked, judged once every later pin and default has run.
+let unfixedReadNames: string[] = []
+let unfixedReadTys: i32[] = []
+let unfixedReadAts: i32[] = []
+
+// Queues binding `name` of `ty` at `at`, whose default a read reached, for `flushUnfixedReads`.
+function unfixedReadRefuse(name: string, ty: i32, at: i32) {
+  unfixedReadNames.push(name)
+  unfixedReadTys.push(ty)
+  unfixedReadAts.push(at)
+  return 0
+}
+
+// Refuses each queued binding still holding an open container a read reached, which nothing
+// wrote and no read typed (D17747): its holes would otherwise reach emit open.
+export function flushUnfixedReads() {
+  let i = 0
+  while i < unfixedReadTys.length {
+    const ty = unfixedReadTys[i]
+    if calleeWrittenElem(ty) < 0 && defaultOpenHoles(ty, 8, false) {
+      tErr(
+        "cannot infer a type for '"
+          + unfixedReadNames[i]
+          + "' — an empty container it holds is read but never written, and no read gives its type; annotate it",
+        unfixedReadAts[i],
+      )
+    }
+    i = i + 1
+  }
+  unfixedReadNames = []
+  unfixedReadTys = []
+  unfixedReadAts = []
+  return 0
+}
+
 // Flush every pending binding recorded at scope `depth`, called just before the scope is popped
 // and for the global scope at program end. A binding whose hole is still open at this point
 // will never be pinned, so it takes the unified "cannot infer a type" diagnostic.
@@ -1702,7 +1832,11 @@ export function flushUninferred(depth: i32) {
       pendDepths[i] == depth
       && i32ListHas(deferredDefaultAts, pendAts[i])
     ) {
-      if holdsDefaultableHole(pendTys[i]) { defaultUnfixed(pendTys[i]) }
+      if holdsDefaultableHole(pendTys[i]) {
+        defaultUnfixed(pendTys[i])
+      } else {
+        unfixedReadRefuse(pendNames[i], pendTys[i], pendAts[i])
+      }
     } else if pendDepths[i] == depth {
       if unresolvedHole(pendTys[i]) {
         if !arrDefHoleToI32(pendTys[i]) && !calleeWritePin(pendTys[i]) {
@@ -1730,7 +1864,9 @@ export function flushUninferred(depth: i32) {
         } else {
           // A container it holds that no write fixed, a map's value or a list's element stored
           // whole (`m["k"] = Map()`), takes the default as a binding of it would (D16341).
-          defaultUnfixed(pendTys[i])
+          if !defaultUnfixed(pendTys[i]) {
+            unfixedReadRefuse(pendNames[i], pendTys[i], pendAts[i])
+          }
         }
       }
     } else {
@@ -3663,19 +3799,26 @@ function narListDeliveryFields(o: ObjLit, dst: i32): boolean {
 
 // The fields of `r` (the record `nt`) a member of `mems` that holds every `nt` stores wider.
 function narFitMembers(p: i32, nt: i32, r: TyObj, mems: i32[]) {
+  // The members strictly wider than `nt`, the same for every field.
+  const wide: i32[] = []
+  for m in mems {
+    if (
+      m >= 0
+      && m != nt
+      && tyAt(m) is TyObj
+      && assignable(nt, m)
+      && !assignable(m, nt)
+    ) {
+      wide.push(m)
+    }
+  }
+  if wide.length == 0 { return 0 }
   let f = 0
   while f < r.objFieldNames.length {
     const ft = r.objFieldTypes[f]
     let wider = false
-    for m in mems {
-      if (
-        !wider
-        && m >= 0
-        && m != nt
-        && tyAt(m) is TyObj
-        && assignable(nt, m)
-        && !assignable(m, nt)
-      ) {
+    for m in wide {
+      if !wider {
         const mo = tyAt(m)
         if mo is TyObj {
           const mt = objFieldType(mo, r.objFieldNames[f])
@@ -4648,9 +4791,12 @@ function crFilterCond(condIx: i32, places: i32[], tys: i32[], mark: i32) {
 // read through.
 export function crReadHook(name: string, ix: i32): i32 {
   if crRows.retNames.length == 0 { return -1 }
+  const nl = name.length
   let p = crRows.pendNames.length - 1
   while p >= 0 {
-    if crRows.pendNames[p] == name {
+    // The length test is inline so a name of another length skips the string compare's call.
+    const pn = crRows.pendNames[p]
+    if pn.length == nl && pn == name {
       // A re-test after the call narrowed the binding again, on a frame the call did not see.
       if narNewerThan(identSlotOf(ix, name), crRows.pendFrames[p]) { return -1 }
       let tail = " earlier in this statement may reassign it — read '"
@@ -4682,7 +4828,7 @@ export function crReadHook(name: string, ix: i32): i32 {
   const root = crCurRoot()
   let r = crRows.retNames.length - 1
   while r >= 0 {
-    if crRows.retNames[r] == name && crRows.retRoots[r] == root {
+    if crRows.retRoots[r] == root && crRows.retNames[r] == name {
       if crRows.retWideTys[r] == cur {
         crRows.rdRet.push(r)
         crRows.rdIx.push(ix)

@@ -103,6 +103,7 @@ import {
   Param,
   Paren,
   Program,
+  RetStmt,
   TypeRef,
   annTsOf,
   declExported,
@@ -138,7 +139,12 @@ import {
   mintFactSetOf,
   mintReset,
 } from "./check_mint"
-import { elabFnSetTy, fnTagged, fvaListCopyReset } from "./check_fn_tag_facts"
+import {
+  elabFnSetTy,
+  fnSetRep,
+  fnTagged,
+  fvaListCopyReset,
+} from "./check_fn_tag_facts"
 export { fnTagTyIsTagged } from "./check_fn_tag_facts"
 
 // Whether an elaboration is recording, and the quiet depth it records at.
@@ -1151,7 +1157,7 @@ export function elabFnSetMembersUntagged(): i32[] {
     if (
       s >= 0
       && s < fnSets.length
-      && !(fnTagged[s] ?? false)
+      && fnSetRep(s) != "id"
       && !i32ListHas(called, s)
     ) {
       called.push(s)
@@ -1386,6 +1392,9 @@ export function elabFnWriteTy(t: i32, fn: i32, w: i32): i32 {
 }
 
 // The functions a value of type `t` may be, ascending; [] when `t` carries no set.
+// Whether no type carries a function set yet, so `elabFnSetOf` answers [] for every type.
+export function elabFnSetsNone(): boolean { return elabFnSetTy.length == 0 }
+
 export function elabFnSetOf(t: i32): i32[] {
   const none: i32[] = []
   const s = elabFnSetTy[t] ?? -1
@@ -2550,7 +2559,9 @@ function fnWriteLeavesAt(
   if cwSlotWrittenValues(cwKeyOfDecl(bd), path, vals, ats) < 0 { return -1 }
   let et = -1
   for v in vals {
-    if cwFnValueDeclOf(v) == d && !i32ListHas(out, v) {
+    // A call handing back its argument through a parameter it also calls writes that argument.
+    const wd = if cwFnValueDeclOf(v) >= 0 { cwFnValueDeclOf(v) } else { cwFnValueDeclOf(handBackCalledArgOf(v)) }
+    if wd == d && !i32ListHas(out, v) {
       if !fnWriteOnlyInto(v, s, path) { return -2 }
       out.push(v)
       et = elem
@@ -3221,6 +3232,9 @@ let fnTagArms: {[i32]: i32[]} = Map()
 // By call node and set id: the member calls of a generic call whose instances see another tagged
 // set than the one its first note recorded.
 let fnTagArmsBy: {[string]: i32[]} = Map()
+// By delivery site: the closed function type, or the record closing a set's function field, a
+// value carrying a set is delivered at, so each member is pinned there by a value arm (D17777).
+let fnTagValueDst: {[i32]: i32} = Map()
 // By arm call node: the member declaration it calls, recorded when the arm is built, so every
 // pass checks the arm as a call of that member whatever its callee's name resolves to.
 let fnTagArmMember: {[i32]: i32} = Map()
@@ -4707,16 +4721,14 @@ function fnTagRepTyStep(t: i32, deep: boolean, path: i32[]): i32 {
 }
 
 // Whether set `s` is tagged.
-export function fnTagSetIsTagged(s: i32): boolean {
-  return fnTagged[s] ?? false
-}
+export function fnTagSetIsTagged(s: i32): boolean { return fnSetRep(s) == "id" }
 
 // The tagged sets' ids, ascending.
 export function fnTagTaggedSets(): i32[] {
   const r: i32[] = []
   let s = 0
   while s < fnSets.length {
-    if fnTagged[s] ?? false { r.push(s) }
+    if fnSetRep(s) == "id" { r.push(s) }
     s = s + 1
   }
   return r
@@ -4773,6 +4785,36 @@ export function fnTagArmsAt(ix: i32, s: i32): i32[] {
   return fnTagArmsBy[fnTagArmsKey(ix, s)] ?? none
 }
 
+// The value arms built at site `ix` for set `s` at closed signature `sig`: [] for none, or when
+// `s` is untagged.
+export function fnTagValueArmsAt(ix: i32, s: i32, sig: i32): i32[] {
+  const none: i32[] = []
+  if s < 0 || !fnTagSetIsTagged(s) { return none }
+  return fnTagArmsBy[fnTagArmsKey(ix, s) + "#" + i32ToStr(sig)] ?? none
+}
+
+// Records `arms` as the value arms at site `ix` for set `s` at signature `sig`.
+export function fnTagValueArmsAtSet(ix: i32, s: i32, sig: i32, arms: i32[]) {
+  fnTagArmsBy[fnTagArmsKey(ix, s) + "#" + i32ToStr(sig)] = arms
+  return 0
+}
+
+// Records that site `c`'s value, carrying a set, is delivered at type `t`, which closes it.
+export function fnTagValueDstNote(c: i32, t: i32) {
+  if c >= 0 && t >= 0 { fnTagValueDst[c] = t }
+  return 0
+}
+
+// The sites `fnTagValueDstNote` recorded, each with its destination at `fnTagValueDstOf`.
+export function fnTagValueSites(): i32[] {
+  const out: i32[] = []
+  for c in fnTagValueDst.keys() { out.push(c) }
+  return out
+}
+
+// The type site `c` is delivered at, or -1.
+export function fnTagValueDstOf(c: i32): i32 { return fnTagValueDst[c] ?? -1 }
+
 // Records that arm call `arm` calls member declaration `d`.
 export function fnTagArmMemberNote(arm: i32, d: i32) {
   if arm >= 0 && d >= 0 { fnTagArmMember[arm] = d }
@@ -4805,7 +4847,7 @@ export function fnTagBindReadSet(e: i32): i32 {
   const b = identDeclOf(x)
   if b < 0 || b >= P.nodes.length || !(nodeAt(b) is LetDecl) { return -1 }
   const s = fnTagBind[b] ?? -1
-  return if s >= 0 && (fnTagged[s] ?? false) { s } else { -1 }
+  return if fnSetRep(s) == "id" { s } else { -1 }
 }
 
 // Whether `d` is a function declared under the name `name`.
@@ -4853,7 +4895,7 @@ export function fnTagLeafJoin(ix: i32, d: i32, t: i32): boolean {
     ix < 0
     || d < 0
     || s < 0
-    || !(fnTagged[s] ?? false)
+    || fnSetRep(s) != "id"
     || !i32ListHas(fnTagMembers(s), d)
   ) {
     return false
@@ -5009,6 +5051,7 @@ export function elabCapReset() {
   fnTagRet = Map()
   fnTagArms = Map()
   fnTagArmsBy = Map()
+  fnTagValueDst = Map()
   fnTagArmMember = Map()
   fnTagBind = Map()
   fnTagJoinFrom = Map()
@@ -5994,4 +6037,116 @@ export function elabParamCopyOf(d: i32, fn: FuncDecl): i32 {
     cur = src
   }
   return -1
+}
+
+// The parameter every value `dn` returns reads where its every other read is the callee of a
+// call whose arguments do not read it; -1 otherwise. The tag plan's hand-back, not the checker's
+// (`handBackIx`), whose typing of those calls reads a parameter only returned.
+export function handBackCalledIx(dn: FuncDecl): i32 {
+  const vs = hbcReturnedValues(dn.fnBody)
+  let at = -1
+  for v in vs {
+    const x = parenPeelIx(v)
+    const i = if x >= 0 && nodeAt(x) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(x)) } else { -1 }
+    if i < 0 || at >= 0 && i != at { return -1 }
+    at = i
+  }
+  if at < 0 { return -1 }
+  const par = dn.fnParams[at]
+  const rets: i32[] = []
+  for v in vs { rets.push(parenPeelIx(v)) }
+  const todo: i32[] = [dn.fnBody]
+  const up: i32[] = [-1]
+  let called = false
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = up.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == par && !i32ListHas(rets, x) {
+        const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        if !(pn is Call) || parenPeelIx(pn.callFn) != x { return -1 }
+        called = true
+      }
+      for k in nodeChildren(x) {
+        todo.push(k)
+        up.push(x)
+      }
+    }
+  }
+  return if called { at } else { -1 }
+}
+
+// The argument call `x` hands back through a parameter its callee also calls
+// (`handBackCalledIx`), else -1.
+export function handBackCalledArgOf(x: i32): i32 {
+  const px = parenPeelIx(x)
+  const c = if px >= 0 && px < P.nodes.length { nodeAt(px) } else { nodeAt(0) }
+  if !(c is Call) { return -1 }
+  const d = identFnDeclOf(parenPeelIx(c.callFn))
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
+  const i = if dn is FuncDecl && dn.fnBody >= 0 { handBackCalledIx(dn) } else { -1 }
+  return if i >= 0 && i < c.callArgs.length { c.callArgs[i] } else { -1 }
+}
+
+// The values the `return` statements under `body` return, nested functions' excluded; [] where
+// one returns nothing.
+function hbcReturnedValues(body: i32): i32[] {
+  const out: i32[] = []
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is RetStmt {
+        if n.retArg < 0 { return [] }
+        out.push(n.retArg)
+      }
+      if !(n is FuncDecl) || x == body {
+        for k in nodeChildren(x) { todo.push(k) }
+      }
+    }
+  }
+  return out
+}
+
+// The sets sharing a member with set `s`, transitively, `s` among them, ascending: one function
+// value has one layout, so every set holding it takes one rep.
+export function fnTagFamilyOf(s: i32): i32[] {
+  if s < 0 || s >= fnSets.length { return [] }
+  const out: i32[] = [s]
+  const mem: i32[] = fnSets[s].slice(0, fnSets[s].length)
+  let grew = true
+  while grew {
+    grew = false
+    let k = 0
+    while k < fnSets.length {
+      if !i32ListHas(out, k) {
+        let shares = false
+        for m in fnSets[k] {
+          if i32ListHas(mem, m) { shares = true }
+        }
+        if shares {
+          out.push(k)
+          for m in fnSets[k] {
+            if !i32ListHas(mem, m) { mem.push(m) }
+          }
+          grew = true
+        }
+      }
+      k = k + 1
+    }
+  }
+  // Ascending, so the root is the first.
+  let i = 1
+  while i < out.length {
+    const v = out[i]
+    let j = i - 1
+    while j >= 0 && out[j] > v {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = v
+    i = i + 1
+  }
+  return out
 }

@@ -1,6 +1,7 @@
 // The statements: `let`, `if` with its narrowing head, `while`, `for` over a range or a
 // collection, `return` and a block.
 
+import { bindDestAnnots } from "./check_rec_fresh"
 import { recInferRetPend } from "./check_rec_rows"
 import { checkTailArmsAgainst } from "./check_fn_decl"
 import { noteOpenUnionRows } from "./check_hole_links"
@@ -18,26 +19,45 @@ import {
 } from "./check_node_tys"
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
+  Index,
   IsExpr,
   LetDecl,
+  LoopVar,
+  MatchExpr,
+  Member,
   Node,
+  NullLit,
+  NumLit,
   ObjLit,
   OptMember,
   P,
   Param,
   Paren,
+  Program,
   RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
   TypeRef,
   Unary,
+  UnionDecl,
   WhileStmt,
   arenaSetNode,
   blockTailIsDead,
@@ -127,7 +147,6 @@ import {
   inferVoidRetBlks,
   inferVoidRetSites,
   moduleBeforeDecl,
-  noteDeadTailBlk,
   pgUpArmIx,
   pgUpArmIxSet,
   pgUpKeys,
@@ -352,17 +371,19 @@ import {
   noteValBindLambda,
   recordDeadTest,
 } from "./check_side_rows"
-import { redunTypedReadLets } from "./check_state"
+import { redunAdoptedAnnots, redunTypedReadLets } from "./check_state"
 import { symDecl, symNameIsMinted } from "./check_sym_occ"
 import { nomBaseTyIx } from "./check_ty_rep"
 import {
   T,
   TY_BOOL,
   TY_ERR,
+  TY_F64,
   TY_I32,
   TY_NEVER,
   TY_NULL,
   TY_OPEN,
+  TY_STR,
   TY_VOID,
   TyArray,
   TyErr,
@@ -377,8 +398,10 @@ import {
   TyVar,
   mkArrayTy,
   mkFuncTy,
+  mkMapTy,
   mkNullableTy,
   mkObjTy,
+  objFieldType,
   tyAt,
   tyElemOf,
   tyElemOpen,
@@ -389,6 +412,7 @@ import {
   tyIsStructBearingUnion,
   tyKeyOf,
   tyKeyOpen,
+  tyMayHoldFn,
   tyPinKey,
   tyPinVal,
   tySame,
@@ -404,16 +428,20 @@ import {
   cwFollowEnd,
   cwLetUnwritten,
   cwLoopVarTypedLet,
+  cwMapReadCoalDefault,
   cwMapReadTypedLet,
   cwSoleReadInit,
   fnDeclIx,
 } from "./check_write_scan"
 import { identDeclOf, identFromDecl, identRedirect } from "./symbols"
+import { numLexIsFloat } from "./emit_bignum"
+import { recMapCtorCall } from "./check_record_origins"
 import {
   isNeverTy,
   isNullTy,
   isStringTy,
   isVoidTy,
+  primNameOf,
   tyHasTyVar,
   tyHoldsHole,
   tyMentionsVoid,
@@ -473,6 +501,175 @@ function tpEnvNamesRepeat(): boolean {
 
 // Resolves the annotation of `n` by reading its TypeRef child inline, refusing an unknown type
 // (or a map key with no hash) and recording the resolved type on the annotation node.
+// The one closed type every whole delivery of binding `d` names, each annotation projected down
+// to the binding's value (`bindDestAnnots`), or -1.
+function letAdoptedDestTy(d: i32): i32 {
+  const trs: i32[] = []
+  const paths: string[] = []
+  if !bindDestAnnots(d, trs, paths) { return -1 }
+  let t = -1
+  let i = 0
+  while i < trs.length {
+    const tn = nodeAt(trs[i])
+    if !(tn is TypeRef) { return -1 }
+    let a = letAnnHeldTyAt(trs[i])
+    if a < 0 { a = nameToTyAt(tn.tyName, trs[i]) }
+    a = destProject(a, paths[i])
+    if a < 0 || a == TY_ERR || tyHasTyVar(a) || tyIsHole(a) || !destAdopts(a) {
+      return -1
+    }
+    if t >= 0 && !tySame(t, a) { return -1 }
+    t = a
+    i = i + 1
+  }
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if t >= 0 && n is LetDecl && !litFieldsWithin(parenPeelIx(n.letInit), t) {
+    return -1
+  }
+  if t >= 0 {
+    for tr in trs {
+      if !i32ListHas(redunAdoptedAnnots, tr) { redunAdoptedAnnots.push(tr) }
+    }
+  }
+  return t
+}
+
+// Whether every field literal `x` sets, at any depth, is one destination type `t` declares, and a
+// number literal at an `f32` leaf is a float literal: one with a field its destination drops keeps
+// its own shape, which width subtyping delivers, and an integer literal is no `f32`'s own typing.
+function litFieldsWithin(x: i32, t: i32): boolean {
+  if x < 0 || x >= P.nodes.length || t < 0 || t >= T.tys.length { return true }
+  const n = nodeAt(x)
+  if !(n is ObjLit) { return litElemsWithin(x, t) }
+  const c = tyAt(t)
+  if !(c is TyObj) { return false }
+  for f in n.objFields {
+    const fi = nodeAt(f)
+    if !(fi is FieldInit) || !strListHas(c.objFieldNames, fi.fiName) {
+      return false
+    }
+    const ft = objFieldType(c, fi.fiName)
+    if !litFieldsWithin(parenPeelIx(fi.fiValue), ft) { return false }
+  }
+  return true
+}
+
+// `litFieldsWithin` of each element of list literal `x`, at `t`'s element; any other node is a
+// leaf (`litLeafWithin`).
+function litElemsWithin(x: i32, t: i32): boolean {
+  const n = nodeAt(x)
+  if !(n is ArrayLit) { return litLeafWithin(x, t) }
+  const c = tyAt(t)
+  if !(c is TyArray) { return false }
+  for e in n.arrElems {
+    if !litFieldsWithin(parenPeelIx(e), tyElemOf(c)) { return false }
+  }
+  return true
+}
+
+// Whether leaf `x` may be built at `t`: anything but an integer literal at an `f32`.
+function litLeafWithin(x: i32, t: i32): boolean {
+  const n = nodeAt(x)
+  if !(n is NumLit) || primNameOf(t) != "f32" { return true }
+  const s = n.numText
+  if s.length > 1 && s.slice(0, 2) == "0x" { return false }
+  let i = 0
+  while i < s.length {
+    const ch = s.slice(i, i + 1)
+    if ch == "." || ch == "e" || ch == "E" { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether a binding may be built at destination type `t`: one type at every depth (no nullable
+// or union of shapes, D17763), no function, and leaves a literal takes without a widening, which
+// a container never takes implicitly. One leaf at least narrows the literal's own type (a literal
+// union, `f32`); else the binding is that type already.
+function destAdopts(t: i32): boolean {
+  if t < 0 || t >= T.tys.length || tyMayHoldFn(t) { return false }
+  const seen: i32[] = []
+  const nar: i32[] = []
+  return destAdoptsIn(t, seen, nar) && nar.length > 0
+}
+
+function destAdoptsIn(t: i32, seen: i32[], nar: i32[]): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  if i32ListHas(seen, t) { return true }
+  seen.push(t)
+  const c = tyAt(t)
+  if c is TyNullable { return false }
+  if c is TyUnion {
+    for m in c.uMembers {
+      if !(tyAt(m) is TyLit) { return false }
+    }
+    nar.push(t)
+    return true
+  }
+  if c is TyLit {
+    nar.push(t)
+    return true
+  }
+  if c is TyObj {
+    for ft in c.objFieldTypes {
+      if !destAdoptsIn(ft, seen, nar) { return false }
+    }
+    return true
+  }
+  if c is TyArray { return destAdoptsIn(tyElemOf(c), seen, nar) }
+  if c is TyMap {
+    return destAdoptsIn(tyKeyOf(c), seen, nar)
+      && destAdoptsIn(tyValOf(c), seen, nar)
+  }
+  const pn = primNameOf(t)
+  // A float literal at `f32` is that literal's own typing at its destination, no conversion.
+  if pn == "f32" { nar.push(t) }
+  return pn == "i32"
+    || pn == "f64"
+    || pn == "f32"
+    || pn == "string"
+    || pn == "boolean"
+}
+
+// Type `t` projected down `path` (`e` an element, `f:name` a field, `/`-joined), or -1.
+function destProject(t: i32, path: string): i32 {
+  if path == "" || t < 0 { return t }
+  let cur = t
+  let a = 0
+  while a <= path.length {
+    let b = a
+    while b < path.length && path.slice(b, b + 1) != "/" { b = b + 1 }
+    const step = path.slice(a, b)
+    if cur < 0 || cur >= T.tys.length { return -1 }
+    const c = tyAt(cur)
+    if step == "e" {
+      if !(c is TyArray) { return -1 }
+      cur = tyElemOf(c)
+    } else if step == "s" {
+      // A slot: a list's element or a map's value.
+      if c is TyArray { cur = tyElemOf(c) }
+      else if c is TyMap { cur = tyValOf(c) }
+      else { return -1 }
+    } else if step == "E" {
+      // An element read's destination: the binding is a list of it.
+      cur = mkArrayTy(cur)
+    } else if step == "M" {
+      // A string-keyed map read's destination: the binding is a map of it.
+      cur = mkMapTy(TY_STR, cur, 0)
+    } else if step == "v" {
+      if !(c is TyMap) { return -1 }
+      cur = tyValOf(c)
+    } else if step.length > 2 && step.slice(0, 2) == "f:" {
+      if !(c is TyObj) { return -1 }
+      cur = objFieldType(c, step.slice(2, step.length))
+    } else {
+      return -1
+    }
+    a = b + 1
+  }
+  return cur
+}
+
 function letDeclResolveAnnot(n: LetDecl): LetAnnot {
   let annot = -1
   // Read immediately after resolution and compared against THIS annotation's own answer.
@@ -668,7 +865,9 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   if n.letType < 0 { storeLetPush(n.letInit, ix) }
   if n.letInit >= 0 { wrDstDeclPut(n.letInit, ix) }
   const la = letDeclResolveAnnot(n)
-  const annot = la.ty
+  // An un-annotated binding of a fresh literal every delivery of which names one destination
+  // type is typed at it, as if annotated so (`bindDestAnnots`).
+  const annot = if la.ty < 0 { letAdoptedDestTy(ix) } else { la.ty }
   let initTy = -1
   // Bidirectional: an annotated `const f: (i32) => i32 = (x) => ...` infers each un-annotated
   // lambda param from the annotation before the initializer is checked.
@@ -957,7 +1156,7 @@ function letDeclInitVerdicts(
   // enclosing body declares; an un-annotated binding would hold a value of no type (D17575). An
   // initializer that already raised a diagnostic has said why, so this one would only repeat it.
   const quiet = T.diags.length == initD0
-  const unbName = if quiet && n.letInit >= 0 && annot < 0 { tyUnscopedVarName(initTy, []) } else { "" }
+  const unbName = if quiet && n.letInit >= 0 && annot < 0 { tyUnscopedVarFrom(initTy) } else { "" }
   if unbName != "" {
     const call = nodeAt(n.letInit)
     const cf = if call is Call && call.callFn >= 0 { nodeAt(call.callFn) } else { null }
@@ -978,6 +1177,7 @@ function letDeclInitVerdicts(
   // seed the annotation supplied (an un-annotated lambda param) — comparing then would be circular (D1442).
   if (
     annot >= 0
+    && n.letType >= 0
     && initTy >= 0
     && n.letInit >= 0
     && cbSeedUsed == seedMark
@@ -1825,6 +2025,76 @@ function typedReadLetTy(dl: i32): i32 {
   return t
 }
 
+// The type a `??` default `x` supplies, read off its spelling: a string, number, boolean or
+// `null` literal, a read of an annotated `let`, or a record literal of such fields; -1 otherwise.
+export function coalDefaultTy(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const e = nodeAt(x)
+  match e {
+    Paren => {
+      return coalDefaultTy(e.parInner)
+    }
+    StrLit => {
+      return TY_STR
+    }
+    BoolLit => {
+      return TY_BOOL
+    }
+    NullLit => {
+      return TY_NULL
+    }
+    NumLit => {
+      return if numLexIsFloat(e.numText) { TY_F64 } else { TY_I32 }
+    }
+    Ident => {
+      return typedReadLetTy(identDeclOf(x))
+    }
+    ObjLit => {
+      return coalDefaultObjTy(e)
+    }
+    // An empty list supplies the shape and leaves its element to the reads that type it.
+    ArrayLit => {
+      return coalDefaultListTy(e)
+    }
+    // So does a fresh `Map()`, its key and value left open the same way.
+    Call => {
+      if recMapCtorCall(e) { return mkMapTy(TY_OPEN, TY_OPEN, 0) }
+      return -1
+    }
+    // no other default spells its type
+    CharLit | Unary | BinExpr | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+  }
+  return -1
+}
+
+// `coalDefaultTy` for list literal `l`: an open list when empty, else the list of the one type
+// every element spells; -1 when they spell none or differ.
+function coalDefaultListTy(l: ArrayLit): i32 {
+  if l.arrElems.length == 0 { return mkArrayTy(TY_OPEN) }
+  let t = -1
+  for x in l.arrElems {
+    const et = coalDefaultTy(x)
+    if et < 0 || t >= 0 && et != t { return -1 }
+    t = et
+  }
+  return mkArrayTy(t)
+}
+
+// `coalDefaultTy` for record literal `o`: the record of its fields' types, -1 when one has none.
+function coalDefaultObjTy(o: ObjLit): i32 {
+  const names: string[] = []
+  const tys: i32[] = []
+  for f in o.objFields {
+    const fn = nodeAt(f)
+    if !(fn is FieldInit) { return -1 }
+    const ft = coalDefaultTy(fn.fiValue)
+    if ft < 0 { return -1 }
+    names.push(fn.fiName)
+    tys.push(ft)
+  }
+  return if names.length == 0 { -1 } else { mkObjTy(names, tys) }
+}
+
 // Pins the open key and value of read-only map or set `bound`, bound by `let` `ix`, to the type
 // the annotated `let` a key or value read is delivered to names (`cwMapReadTypedLet`), before the
 // declaration default settles what stays open (DECISIONS.md "No default type").
@@ -1837,6 +2107,11 @@ function mapPinFromTypedReads(bound: i32, ix: i32) {
     if vt >= 0 {
       tyPinVal(t, vt)
       redunTypedReadLets.push(dl)
+    } else {
+      // With no write, every value read answers its `??` default, so the default's type is the
+      // value type (D17734).
+      const ct = coalDefaultTy(cwMapReadCoalDefault(ix))
+      if ct >= 0 { tyPinVal(t, ct) }
     }
   }
   if tyKeyOpen(t) {
@@ -2230,7 +2505,6 @@ export function checkBlockNode(n: Block, ix: i32) {
     // rest are not the block's value, so they never carry the return tail.
     if i == stmts.length - 1 {
       tailDead = blockTailIsDead(stmts)
-      if tailDead { noteDeadTailBlk(ix) }
       retTailPosSet(savedRTP && !tailDead)
     } else {
       retTailPosSet(false)
@@ -2701,12 +2975,18 @@ function forInHoleUnion(t: i32): boolean {
   return true
 }
 
+// `tyUnscopedVarName` from `ty`, its visited types a map of this walk's own.
+function tyUnscopedVarFrom(ty: i32): string {
+  const seen: {[i32]: boolean} = Map()
+  return tyUnscopedVarName(ty, seen)
+}
+
 // The name of the first type variable in `ty` that is no inference hole and that no enclosing body
 // declares, through lists, nullables, maps, records and unions; "" for none. A function type's own
 // type variables are its generics', so it is not entered.
-function tyUnscopedVarName(ty: i32, seen: i32[]): string {
-  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return "" }
-  seen.push(ty)
+function tyUnscopedVarName(ty: i32, seen: {[i32]: boolean}): string {
+  if ty < 0 || ty >= T.tys.length || seen.has(ty) { return "" }
+  seen[ty] = true
   const t = tyAt(ty)
   return match t {
     TyVar => {
@@ -2726,7 +3006,7 @@ function tyUnscopedVarName(ty: i32, seen: i32[]): string {
 }
 
 // `tyUnscopedVarName` over each of `tys`, the first name found; "" for none.
-function tyUnscopedFirst(tys: i32[], seen: i32[]): string {
+function tyUnscopedFirst(tys: i32[], seen: {[i32]: boolean}): string {
   for m in tys {
     const n = tyUnscopedVarName(m, seen)
     if n != "" { return n }

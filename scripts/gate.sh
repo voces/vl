@@ -144,15 +144,12 @@ row_mem() {
     "rep-fuzz") echo 1600 ;;
     "deno task test") echo 4300 ;;
     "plumb-shape cost") echo 1400 ;;
-    "ir shadow"|"ir shadow cases") echo 1600 ;;
-    "ir shadow suite") echo 600 ;;
     "lsp suites (ci list)") echo 1100 ;;
     "scaling shape") echo 1000 ;;
     "capability probes"|"kind-ladder sets") echo 800 ;;
     "dead-export budget"|"render-parse budget") echo 600 ;;
     "late demands"|"phase state") echo 500 ;;
     "self ir misses") echo 4400 ;;
-    "ir claims"|"ir claim refusals"|"ir claim cross") echo 4600 ;;
     "lsp typecheck"|"inventory refs") echo 400 ;;
     *) echo 200 ;;
   esac
@@ -248,9 +245,6 @@ run "deno task test"           deno test --preload tests/support/signal_guard.ts
 run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check --parallel $CI_NATIVE
 # shellcheck disable=SC2086
 run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check --parallel $LSP_CI
-# The IR shadow suite on this tree's seed. The full gate runs it inside `ci-native`; `--fast`
-# skips that row, so here it runs alone, and a stale miss expectation reds before the queue.
-[ "$FAST" = 1 ] && run "ir shadow suite"   env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_ir_shadow_test.ts tests/vl_ir_prepost_test.ts
 # Root deno.json excludes lsp/ and every suite runs --no-check, so a type error
 # in lsp/src/*.ts is invisible to all the other gates (esbuild strips types
 # without checking). Mirrors ci.yml's "Type-check (lsp)" step.
@@ -301,9 +295,6 @@ run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED"
 # The late-demand RATCHET: elaboration keys minted after `elabRun` returned, per file,
 # against scripts/late-demands-baseline.txt. `$VL_BIN` makes the sweep use this host.
 run "late demands"             env VL_BIN="$VL" "$VL" run scripts/late-demands.vl --compiler "$SEED" -- --check --seed "$SEED"
-# The self-compile IR-miss RATCHET: compiler functions the IR builder misses (the blocker census,
-# `$VL_IR_SHADOW=4`), against scripts/self-ir-misses-baseline.txt, which only lowers. One self-check.
-run "self ir misses"           env VL_BIN="$VL" "$VL" run scripts/self-ir-misses.vl --compiler "$SEED" -- --check --seed "$SEED"
 # The phase-state RATCHET (L5): hidden-argument globals, cross-phase tables and the checker
 # symbols other phases import, per module, against scripts/phase-state-baseline.txt.
 run "phase state"              "$VL" run scripts/phase-state-census.vl --compiler "$SEED" -- --check
@@ -382,6 +373,9 @@ run "inventory refs"           deno test --preload tests/support/signal_guard.ts
 run "capability probes"        bash -c "\"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --live-sites --compiler \"$SEED\" && \"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --floor --compiler \"$SEED\""
 run "conflict markers"        deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_no_conflict_markers_test.ts
 run "splice scan"              bash -c "\"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\""
+# THE IR'S DEBT: the AST-backed `Rhs` kinds and the builder/lowering miss sites may only fall
+# (engineering review 2026-11-27); a fall passes and the PR that earned it runs --write-baseline.
+run "ir debt"                  "$VL" run scripts/ir-debt.vl --compiler "$SEED" -- --check
 # ON MASTER the same run also requires the committed baseline to describe the committed seed
 # exactly (`--verify-fresh`: exit 1 when any cell moved, after the runs-lost check). A branch
 # is SUPPOSED to disagree with it — that disagreement is the change being measured. On master
@@ -394,24 +388,6 @@ if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
 else
   run "distilled corpus"       "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm
 fi
-# The IR shadow over the same corpus: every covered function's lowering must match legacy's
-# bytes and spans, and any verifier failure or mismatch class above
-# `ir-shadow-baseline.txt` reds. The shadow is the check behind every IR claim.
-run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --prepost
-# The same shadow over every tests/cases program, against its own baseline; a byte difference
-# reds in either population, since a claimable function ships its bytes unmatched.
-run "ir shadow cases"          "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --cases --prepost
-# The shipped claim, disarmed: a claimed function emits the IR's bytes, so any fallback reds.
-run "ir claims"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --claims
-# A claim never skips a refusal legacy raises: every program legacy refuses at emit (`@emit-error`
-# cases, tests/ir-claim-fallback, the emit_reject witnesses) is refused alike with claims on and
-# off, strict, held at 0 differs (coordinator ruling 2026-11-24); bytes are not graded (ruling
-# 2026-11-26). About 57 CPU-s.
-run "ir claim refusals"        "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop refusals --behaviour-only --out "$LOGS/ir-claim-refusals.tsv"
-# The invariant G3 exists for: a shipped build is never invalid, refused or running otherwise where
-# the claimless build builds and runs clean (coordinator ruling 2026-11-24). Every capability probe
-# and IR pin, and a fixed 1-in-12 of tests/cases. About 135 CPU-s in the gate.
-run "ir claim cross"           "$VL" run scripts/ir-parity.vl --compiler "$SEED" -- --seed "$SEED" --pop cases,probes,pins --sample 12 --cross --out "$LOGS/ir-claim-cross.tsv"
 
 # THE OOM WATCH. A kill the kernel made during the run fails the gate, whatever the rows read:
 # a test that expected a failure, or a grader that reads a refusal, takes a killed child for one.

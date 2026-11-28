@@ -4009,6 +4009,38 @@ export function cwMapReadTypedLet(bd: i32, slot: i32): i32 {
   return first
 }
 
+// The default of the first `m[k] ?? d` or `m.get(k) ?? d` value read of map binding `bd`, or -1.
+export function cwMapReadCoalDefault(bd: i32): i32 {
+  if bd < 0 || bd >= P.nodes.length || !(nodeAt(bd) is LetDecl) { return -1 }
+  const ow = cwOccWalk(bd)
+  while cwOccNext(ow) {
+    const r = ow.row
+    const u = cwIxNode[r]
+    if cwIxKind[r] == CW_OCC_USE && u >= 0 && u < cwIxParent.length {
+      const p = cwIxParent[u]
+      const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+      let rd = -1
+      if pn is Index && pn.idxArr == u { rd = p }
+      if (
+        pn is Member
+        && pn.memObj == u
+        && pn.memProp == "get"
+        && p < cwIxParent.length
+      ) {
+        const c = cwIxParent[p]
+        const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+        if cn is Call && cn.callFn == p { rd = c }
+      }
+      const q = if rd >= 0 && rd < cwIxParent.length { cwIxParent[rd] } else { -1 }
+      const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
+      if qn is BinExpr && qn.binOp == "??" && qn.binLeft == rd {
+        return qn.binRight
+      }
+    }
+  }
+  return -1
+}
+
 // `cwMapReadTypedLet` for one use `u` of the binding.
 function cwMapUseTypedLet(u: i32, slot: i32): i32 {
   if u < 0 || u >= cwIxParent.length || u >= cwIxUpKind.length { return -1 }
@@ -4081,7 +4113,46 @@ function cwReadIsTypedDest(x: i32): boolean {
   if q < 0 || q >= P.nodes.length { return false }
   const qn = nodeAt(q)
   if qn is LetDecl { return qn.letType >= 0 && qn.letInit == x }
+  if qn is Paren { return cwReadIsTypedDest(q) }
+  // A comparison with a literal supplies the literal's type (D17734).
+  if qn is BinExpr && (qn.binOp == "==" || qn.binOp == "!=") {
+    const o = if qn.binLeft == x { qn.binRight } else if qn.binRight == x { qn.binLeft } else { -1 }
+    if o >= 0 && cwScalarLit(o) { return true }
+  }
+  if qn is Call && qn.callFn != x && cwArgParamAnnotated(qn, x) { return true }
   return cwIsAssignedValue(q, x)
+}
+
+// Whether argument `x` of call `c` meets an annotated parameter of a named function declaring no
+// type parameter, so the parameter's type is the one it is delivered at.
+function cwArgParamAnnotated(c: Call, x: i32): boolean {
+  if (
+    c.callFn < 0
+    || c.callFn >= P.nodes.length
+    || !(nodeAt(c.callFn) is Ident)
+  ) {
+    return false
+  }
+  const d = cwCalleeDeclOf(c.callFn)
+  const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+  let i = 0
+  while i < c.callArgs.length && i < f.fnParams.length {
+    if c.callArgs[i] == x {
+      if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
+      const pn = nodeAt(f.fnParams[i])
+      return pn is Param && pn.parType >= 0
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether `x`, parentheses peeled, is a string, number, character or boolean literal.
+function cwScalarLit(x: i32): boolean {
+  const e = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if e is Paren { return cwScalarLit(e.parInner) }
+  return e is StrLit || e is NumLit || e is CharLit || e is BoolLit
 }
 
 // Whether `x` is the value the assignment at `q` stores; any other parent fixes no type.

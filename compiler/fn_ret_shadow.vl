@@ -1,13 +1,10 @@
-// The recorded result of each emitted function, and its shadow against the emitter's voidness.
-// One answer per `fnStmts` entry, from the elaboration where the function is an instance or
-// lives in one, else from the checker; `recordedVoidFns` reads it for voidness, and the
-// shadow grades that column and the result kind against it. Off unless a host arms it; armed, each emitted function is
-// counted by class (`docs/internals/refactor-notes/2026-10-25-scoreboard-baselines.md`, pass rows).
+// The recorded result of each emitted function: one answer per `fnStmts` entry, from the
+// elaboration where the function is an instance or lives in one, else from the checker.
+// `recordedVoidFns` reads it for voidness and `fnRetColsAt` for the return columns.
 import { mapTwinUnionMember } from "./check_ty_rep"
 import {
   ArrayLit,
   BinExpr,
-  Block,
   Call,
   FuncDecl,
   Ident,
@@ -16,7 +13,6 @@ import {
   Member,
   ObjLit,
   P,
-  i32ToStr,
   nodeAt,
   nodeChildrenPush,
 } from "./ast"
@@ -83,25 +79,13 @@ import {
 import { unwrapParen } from "./emit_base"
 import { scopeTyAt } from "./emit_capture_frames"
 import { callsOfCallee, globalIndexOfSid } from "./emit_fn_ret_kinds"
-import {
-  cloSigKeyExt,
-  fnBundleRetRow,
-  fnRetHeldAsBundle,
-  letBindTy,
-} from "./emit_classify"
-import { repOfTy, repSigKindOfTy, repSigTokHasSlot } from "./emit_rep"
+import { fnBundleRetRow, fnRetHeldAsBundle, letBindTy } from "./emit_classify"
+import { repOfTy, repSigTokHasSlot } from "./emit_rep"
 import { repSigRetTokOfTy, repSlotOfKind } from "./emit_rep_slot"
 import {
   VKind,
   arrLitMint,
   emitPhaseReached,
-  fRetBool,
-  fRetKind,
-  fRetLitAtom,
-  fRetRArrElem,
-  fRetRListRow,
-  fRetStructIdx,
-  fRetVoid,
   fnParent,
   fnStmts,
   fnStmtsPosOf,
@@ -123,43 +107,6 @@ import {
 import { fnIndexOfInScopeAt } from "./emit_local_scope"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { nonNullTy, tyHasTyVar } from "./tyquery"
-
-let frsArmed = false
-let frsNamed = false
-let frsKindArmed = false
-let frsColArmed = false
-let frsDrop = 0
-let frsRowKey: string[] = []
-let frsRowN: i32[] = []
-
-// Arm (1) or disarm (0) the shadow for the compiles that follow; 2 also names each function.
-export function fnRetShadowArm(on: i32) {
-  frsArmed = on != 0
-  frsNamed = on == 2
-  return 0
-}
-
-// Arm (1) or disarm (0) the result-kind shadow for the compiles that follow; 2 also names each
-// function. It counts beside the voidness rows, once `fnRetColsFromRecorded` has settled.
-export function fnKindShadowArm(on: i32) {
-  frsKindArmed = on != 0
-  frsNamed = on == 2
-  return 0
-}
-
-// Arm (1) or disarm (0) the return-column shadow (`fnColShadowRun`); 2 also names each function.
-export function fnColShadowArm(on: i32) {
-  frsColArmed = on != 0
-  frsNamed = on == 2
-  return 0
-}
-
-// For the shadow's own test: the shadow reads the column as answering nothing (1) or `void`
-// everywhere (2). What the emitter reads is unchanged.
-export function fnRetShadowDropSet(d: i32) {
-  frsDrop = d
-  return 0
-}
 
 // The result type emitted function `fe` returns, as recorded: `void` for a pruned template's
 // stub, its instance's result when it owns an elaboration slot, its own type inside the
@@ -807,332 +754,6 @@ function frsFnRet(ft0: i32): i32 {
   const f = tyAt(ft)
   if f is TyFunc { return f.fnRet }
   return -1
-}
-
-// Count every emitted function by how its recorded result meets `fRetVoid`. Run once the
-// voidness has settled (after `recordedVoidFns#2`).
-export function fnRetShadowRun() {
-  if !frsArmed { return 0 }
-  frsRowKey = []
-  frsRowN = []
-  let fe = 0
-  while fe < fnStmts.length && fe < fRetVoid.length {
-    const fn = nodeAt(fnStmts[fe])
-    if fn is FuncDecl {
-      let key = frsClass(fe)
-      if frsNamed { key = key + " | " + fn.fnName }
-      frsCount(key)
-    }
-    fe = fe + 1
-  }
-  return 0
-}
-
-// The class of emitted function `fe`.
-function frsClass(fe: i32): string {
-  const c = frsClassCore(fe)
-  if (
-    c == "agree"
-    || c.slice(0, 9) == "recorded "
-    || c.slice(0, 9) == "emit-time"
-  ) {
-    return c
-  }
-  if fRetVoid[fe] == 1 { return c + ", emitter void" }
-  return c + ", emitter value"
-}
-
-function frsClassCore(fe: i32): string {
-  let r = frsRecordedOrAnn(fe)
-  if frsDrop == 1 { r = -1 }
-  if frsDrop == 2 { r = TY_VOID }
-  const nested = fe < fnParent.length && fnParent[fe] >= 0
-  if r == TY_NEVER { return "never" }
-  if r != TY_VOID && (r < 0 || r >= T.tys.length) {
-    const fn = nodeAt(fnStmts[fe])
-    if fn is FuncDecl {
-      if fn.fnRet >= 0 { return "no result recorded, annotated" }
-    }
-    if elabKeyAtPos(fe) >= 0 || nested {
-      return "no result recorded, instance or nested"
-    }
-    return "no result recorded"
-  }
-  const recVoid = r == TY_VOID
-  const emitVoid = fRetVoid[fe] == 1
-  if recVoid == emitVoid { return "agree" }
-  if recVoid { return "recorded void, emitter value" }
-  if frsTailIsAssign(fnStmts[fe]) {
-    return "emit-time: tail assignment lowered void"
-  }
-  if frsTailCallsVoid(fnStmts[fe]) {
-    return "emit-time: tail call of a function lowered void"
-  }
-  return "recorded value, emitter void"
-}
-
-// Whether the function `fx` ends in an assignment: the emitter lowers that tail as a statement
-// unless a reader takes its value, where the recorded result is the assignment's value.
-function frsTailIsAssign(fx: i32): boolean {
-  const fn = nodeAt(fx)
-  if !(fn is FuncDecl) || fn.fnBody < 0 { return false }
-  const b = nodeAt(fn.fnBody)
-  if !(b is Block) || b.blkStmts.length == 0 { return false }
-  const t = nodeAt(b.blkStmts[b.blkStmts.length - 1])
-  return t is BinExpr && t.binOp == "="
-}
-
-// Whether the function `fx` ends in a call of a function the emitter lowered void.
-function frsTailCallsVoid(fx: i32): boolean {
-  const fn = nodeAt(fx)
-  if !(fn is FuncDecl) || fn.fnBody < 0 { return false }
-  const b = nodeAt(fn.fnBody)
-  if !(b is Block) || b.blkStmts.length == 0 { return false }
-  const t = nodeAt(b.blkStmts[b.blkStmts.length - 1])
-  if !(t is Call) { return false }
-  const cd = identDeclOf(t.callFn)
-  if cd < 0 { return false }
-  const ce = fnStmtsPosOf(cd)
-  return ce >= 0 && ce < fRetVoid.length && fRetVoid[ce] == 1
-}
-
-// Count every function the emitter lowers valued by how the kind of its recorded result meets
-// `fRetKind`. Run once the kinds have settled (after `fnRetColsFromRecorded`).
-export function fnKindShadowRun() {
-  if !frsKindArmed { return 0 }
-  if frsArmed == false {
-    frsRowKey = []
-    frsRowN = []
-  }
-  let fe = 0
-  while fe < fnStmts.length && fe < fRetVoid.length {
-    const fn = nodeAt(fnStmts[fe])
-    if fn is FuncDecl {
-      if fRetVoid[fe] == 0 {
-        let key = frsKindClass(fe)
-        if frsNamed { key = key + " | " + fn.fnName }
-        frsCount(key)
-      }
-    }
-    fe = fe + 1
-  }
-  return 0
-}
-
-// The kind class of valued function `fe`: the `$fnsig` result token its recorded result
-// crosses as, against the one its lowered signature (`cloSigKeyExt`) carries.
-function frsKindClass(fe: i32): string {
-  let r = frsRecordedOrAnn(fe)
-  if frsDrop == 1 { r = -1 }
-  if frsDrop == 2 { r = TY_VOID }
-  if r == TY_VOID || r == TY_NEVER { return "kind: recorded void or never" }
-  if r < 0 || r >= T.tys.length { return "kind: no result recorded" }
-  const rec = repSigRetTokOfTy(r)
-  if rec == "" { return "kind: recorded result has no token" }
-  const low = cloSigKeyExt(fe)
-  let gt = -1
-  let i = 0
-  while i < low.length {
-    if low[i] == '>' { gt = i }
-    i = i + 1
-  }
-  if gt < 0 { return "kind: lowered signature has no token" }
-  const lr = low.slice(gt, low.length)
-  if lr == rec { return "kind agree" }
-  const k = repSigKindOfTy(r)
-  if k != null && repSigTokHasSlot(k) { return frsRowClass(fe, lr) }
-  return "kind: recorded " + rec + ", lowered " + lr
-}
-
-// The row class of valued function `fe` whose recorded result has a slot the lowering keys
-// elsewhere: each value it returns, by the row its stamp names, against token `lr`.
-function frsRowClass(fe: i32, lr: string): string {
-  const fn = nodeAt(fnStmts[fe])
-  if !(fn is FuncDecl) { return "row: not a function" }
-  const vals: i32[] = []
-  collectRetValues(fn.fnBody, vals)
-  if vals.length == 0 { return "row: no value returned" }
-  const k = elabKeyAtPos(fe)
-  let i = 0
-  while i < vals.length {
-    // A call-built value is built at the row its root call is stamped at.
-    const root = retValueRootCall(vals[i])
-    let sty = nodeRepTyIxOf(if root >= 0 { root } else { vals[i] })
-    // An instance's body is typed at its template, so its stamp closes under the binding.
-    if sty >= 0 && tyHasTyVar(sty) && k >= 0 { sty = elabSubstClosed(sty, k) }
-    const st = frsFoldSetTok(repSigRetTokOfTy(sty))
-    if st != frsFoldSetTok(lr) {
-      return "row: stamped " + st + ", lowered " + lr
-    }
-    i = i + 1
-  }
-  return "row agree"
-}
-
-// Token `t` with a set's map shape folded to its map sibling, as the lowering keys it
-// (`mapShapeFoldSet`): `-2`, `-5` and `-7` read as `-1`, `-4` and `-6`.
-function frsFoldSetTok(t: string): string {
-  if t.length < 4 || (t[1] != 'm' && t[1] != 'M') { return t }
-  const sh = t.slice(2, t.length - 1)
-  if sh == "-2" { return t.slice(0, 2) + "-1;" }
-  if sh == "-5" { return t.slice(0, 2) + "-4;" }
-  if sh == "-7" { return t.slice(0, 2) + "-6;" }
-  return t
-}
-
-// The result the shadow grades function `fe` by: its recorded one, else the annotation of a
-// function the emitter mints after the checker (`$eqc`, `$extv`), which no checker node types.
-function frsRecordedOrAnn(fe: i32): i32 {
-  const r = fnRecordedRetTy(fe)
-  if r >= 0 || fe < 0 || fe >= fnStmts.length { return r }
-  const fn = nodeAt(fnStmts[fe])
-  if fn is FuncDecl {
-    if fn.fnRet >= 0 { return nodeTyIxOf(fn.fnRet) }
-  }
-  return r
-}
-
-function frsCount(key: string) {
-  let i = 0
-  while i < frsRowKey.length {
-    if frsRowKey[i] == key {
-      frsRowN[i] = frsRowN[i] + 1
-      return 0
-    }
-    i = i + 1
-  }
-  frsRowKey.push(key)
-  frsRowN.push(1)
-  return 0
-}
-
-export function fnRetShadowRowCount() { return frsRowKey.length }
-
-export function fnRetShadowRowLen(i: i32) { return frsRowKey[i].length }
-
-export function fnRetShadowRowAt(i: i32, j: i32) { return frsRowKey[i][j] }
-
-export function fnRetShadowRowN(i: i32) { return frsRowN[i] }
-
-// Count every un-annotated function the emitter lowers valued by how the rep of its recorded
-// result meets the return columns, each class prefixed with `at`: the pass about to run or
-// just run.
-export function fnColShadowRun(at: string) {
-  if !frsColArmed { return 0 }
-  if at == "post seed" { frsColSnap() }
-  let fe = 0
-  while fe < fnStmts.length && fe < fRetVoid.length && fe < fRetKind.length {
-    const fn = nodeAt(fnStmts[fe])
-    if fn is FuncDecl {
-      if fRetVoid[fe] == 0 && fn.fnRet < 0 {
-        const cls = frsColClass(fe)
-        let key = at + ": " + cls
-        if frsNamed { key = key + " | " + fn.fnName }
-        frsCount(key)
-        // Whether the run just ended moved the columns `buildFnMap` seeded, by class.
-        if at == "post settled" && fe < frsSnapKind.length {
-          const mv = if frsColMoved(fe) { "moved" } else { "unmoved" }
-          let mk = "post moved: " + mv + ": " + cls
-          if frsNamed { mk = mk + " | " + fn.fnName }
-          frsCount(mk)
-        }
-      }
-    }
-    fe = fe + 1
-  }
-  return 0
-}
-
-let frsSnapKind: VKind[] = []
-let frsSnapSlot: i32[] = []
-let frsSnapElem: string[] = []
-let frsSnapBool: i32[] = []
-
-// Snapshot the return columns, for `frsColMoved`.
-function frsColSnap() {
-  frsSnapKind = []
-  frsSnapSlot = []
-  frsSnapElem = []
-  frsSnapBool = []
-  let fe = 0
-  while fe < fRetKind.length {
-    frsSnapKind.push(fRetKind[fe])
-    frsSnapSlot.push(fRetStructIdx[fe])
-    frsSnapElem.push(
-      if fe < fRetRArrElem.length { fRetRArrElem[fe] } else { "" },
-    )
-    frsSnapBool.push(if fe < fRetBool.length { fRetBool[fe] } else { 0 })
-    fe = fe + 1
-  }
-  return 0
-}
-
-// Whether function `fe`'s kind, slot, element name or boolean flag differs from the snapshot.
-function frsColMoved(fe: i32): boolean {
-  if frsSnapKind[fe] != fRetKind[fe] || frsSnapSlot[fe] != fRetStructIdx[fe] {
-    return true
-  }
-  if fe < fRetRArrElem.length && frsSnapElem[fe] != fRetRArrElem[fe] {
-    return true
-  }
-  return fe < fRetBool.length && frsSnapBool[fe] != fRetBool[fe]
-}
-
-// The first return column of valued function `fe` that its recorded result's columns
-// (`fnRetColsAt`) do not reproduce, as a class; a missing fact is named by its class.
-function frsColClass(fe: i32): string {
-  let r = fnRecordedRetTy(fe)
-  if frsDrop == 1 { r = -1 }
-  if frsDrop == 2 { r = TY_VOID }
-  const miss = frsColsOfTy(fe, r)
-  if miss != "" { return miss }
-  if frcKind != fRetKind[fe] {
-    return "kind " + frcKind + " vs " + fRetKind[fe]
-  }
-  if (
-    frcKind == "reflist"
-    && fe < fRetRListRow.length
-    && frcRow != fRetRListRow[fe]
-  ) {
-    return "row reflist: "
-      + i32ToStr(frcRow)
-      + " vs "
-      + i32ToStr(fRetRListRow[fe])
-  }
-  if frcSlot != fRetStructIdx[fe] {
-    if frcKind == "map" || frcKind == "nulmap" {
-      return "slot "
-        + frcKind
-        + ": "
-        + i32ToStr(frcRow)
-        + " vs "
-        + i32ToStr(fRetStructIdx[fe])
-    }
-    if !repSigTokHasSlot(frcKind) {
-      return "slot " + frcKind + ": no-slot kind, slots differ"
-    }
-    if frcSlot < 0 {
-      return "slot " + frcKind + ": recorded names no row, column does"
-    }
-    if fRetStructIdx[fe] < 0 {
-      return "slot " + frcKind + ": column names no row, recorded does"
-    }
-    return "slot " + frcKind + ": rows differ"
-  }
-  if fe < fRetRArrElem.length && frcElem != fRetRArrElem[fe] {
-    if fRetRArrElem[fe] == "" {
-      return "elem " + frcKind + ": column names none"
-    }
-    if frcElem == "" { return "elem " + frcKind + ": recorded names none" }
-    return "elem " + frcKind + ": names differ"
-  }
-  if fe < fRetBool.length && frcBool != fRetBool[fe] {
-    return if frcBool == 1 { "bool: recorded boolean, column not" } else { "bool: column boolean, recorded not" }
-  }
-  if fe < fRetLitAtom.length && frcAtom != fRetLitAtom[fe] {
-    return if frcAtom == 1 { "atom: recorded atom, column not" } else { "atom: column atom, recorded not" }
-  }
-  return "agree " + frcKind
 }
 
 // The return columns `fnRetColsAt` last answered: kind, slot, ref-list element name,

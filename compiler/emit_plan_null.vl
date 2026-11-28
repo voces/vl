@@ -7,6 +7,7 @@ import {
   AsExpr,
   BinExpr,
   Block,
+  BoolLit,
   Call,
   FuncDecl,
   Ident,
@@ -107,9 +108,7 @@ import {
   refListSlotOfExpr,
   structIndexOfExpr,
   tyListRep,
-  unionNameOfRead,
 } from "./emit_classify"
-import { identNullableBoolPop } from "./emit_closure_sites"
 import { elabNodeRepAt, readNarrowedStoreAt } from "./emit_elab"
 import { popTakesElem } from "./emit_list_rep"
 import { declaredNulString } from "./emit_local_scope"
@@ -135,11 +134,9 @@ import {
   nodeTyIsNulScalarBox,
   nullValKind,
   repDescIsNullRef,
-  repOfNode,
   repOfNodeAt,
   repOfTy,
   tyPackedRow,
-  vbHeapIdxOfKind,
 } from "./emit_rep"
 import {
   coalesceResultIsBox,
@@ -175,7 +172,6 @@ import { msSetOfTy, msSetOfTyAny, msSubNull } from "./emit_union_registry"
 import { holeBindsFunc, scalarListElemKind } from "./emit_value_sites"
 import {
   isNullTy,
-  nonNullTy,
   tyAdmitsNull,
   tyExcludesNull,
   tyHasTyVar,
@@ -394,15 +390,25 @@ export function nulNoneEqSides(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
 }
 
 // Whether legacy's `==`/`!=` at `leftIx`/`rightIx` takes the `null` pair's route (`emitNulNoneEq`):
-// `nulNoneEqSides`, or an assignment of `null` typed `null` (`asgYieldsNullLit`) on a side, which
-// stores and is then the unit, against the unit or a bare `null`.
+// `nulNoneEqSides`, or an assignment of the `null` unit typed `null` (`asgYieldsNulNoneValue`) on
+// a side, which stores and is then the unit, against the unit or a bare `null`.
 export function nulNoneEqRoute(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
   if nulNoneEqSides(leftIx, rightIx, fnIx) { return true }
-  const la = asgYieldsNullLit(unwrapParen(leftIx))
-  const ra = asgYieldsNullLit(unwrapParen(rightIx))
+  const la = asgYieldsNulNoneValue(unwrapParen(leftIx), fnIx)
+  const ra = asgYieldsNulNoneValue(unwrapParen(rightIx), fnIx)
   if !la && !ra { return false }
   return (la || nulNoneEqSide(leftIx, fnIx))
     && (ra || nulNoneEqSide(rightIx, fnIx))
+}
+
+// Whether assignment `ix` typed `null` stores the `null` unit: the `null` literal
+// (`asgYieldsNullLit`) or a value `exprIsNulNone` names, such as a `null`-typed call (D17424).
+function asgYieldsNulNoneValue(ix: i32, fnIx: i32): boolean {
+  if asgYieldsNullLit(ix) { return true }
+  const a = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+  if !(a is BinExpr) || a.binOp != "=" || a.binCompound != "" { return false }
+  return tyPrimNameOf(nodeTyIxOf(ix)) == "null"
+    && exprIsNulNone(a.binRight, fnIx)
 }
 
 // One side of `nulNoneEqSides`: a `null`-typed value, or a bare `null` literal.
@@ -947,59 +953,6 @@ export function coalValBoxArm(a: CoalValArm): CoalBoxArm | null {
   }
 }
 
-export function coalBoxArmOf(
-  e: BinExpr,
-  lhsIx: i32,
-  exprIx: i32,
-  fnIx: i32,
-): CoalBoxArm {
-  if nodeAt(lhsIx) is Ident {
-    if identNullableBoolPop(lhsIx, fnIx) { return "boolPop" }
-    if unionNameOfRead(lhsIx, fnIx) != "" {
-      const cak = coalValUnionResidualKind(lhsIx, fnIx)
-      if cak == -2 { return "valNoKind" }
-      if cak >= 0 && cak != nullValKind() {
-        return if coalKeepsBox(e, exprIx, fnIx) { "valBox" } else { "valScalar" }
-      }
-    }
-  }
-  if coalElemBoxFits(e, exprIx, fnIx) { return "elem" }
-  const kak = coalStashResidualKind(lhsIx)
-  if kak == -2 { return "callNoKind" }
-  if kak >= 0 && kak != nullValKind() {
-    return if coalKeepsBox(e, exprIx, fnIx) { "callBox" } else { "callScalar" }
-  }
-  return "next"
-}
-
-// Whether the `??` at `exprIx` over a box keeps the box: the checker typed it a union, or its
-// default is nullable.
-export function coalKeepsBox(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
-  return coalResultBoxName(exprIx, fnIx) != ""
-    || coalesceDefaultNullable(e.binRight, fnIx)
-}
-
-// Whether `e.binLeft` is a nullable value-union list element whose atom and the `??`'s result are
-// numeric scalars, the element's widening to the result's.
-function coalElemBoxFits(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
-  // A struct field's rep can come from a row its literal merged onto, which the storage does
-  // not honour, so the arm is bounded to a list element read (D1411).
-  const nbRep = repOfNode(e.binLeft, fnIx)
-  if (
-    !isListElementRead(e.binLeft, fnIx)
-    || nbRep.rdKind != "union"
-    || nbRep.rdNul != 4
-  ) {
-    return false
-  }
-  const nbKind = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
-  const nbElem = boxTagOfTy(nonNullTy(nodeTyIxOf(e.binLeft)))
-  return nulBoxScalarValtype(nbKind) >= 0
-    && vbHeapIdxOfKind(nbElem) >= 0
-    && nulBoxScalarValtype(nbElem) >= 0
-    && scalarKindWidens(nbElem, nbKind)
-}
-
 // The box type of an operand of `??` that cannot be re-read, a tagged set's nullable id read as
 // the `i32 | null` box it is stored as.
 export function coalStashTy(lhsIx: i32): i32 {
@@ -1076,16 +1029,6 @@ export function coalResultBoxName(exprIx: i32, fnIx: i32): string {
   const mn = nodeMixedUnionName(exprIx, fnIx)
   if mn != "" { return mn }
   return nodeJoinRowName(exprIx, fnIx)
-}
-
-// Is `exprIx` a list ELEMENT read — a subscript `a[i]`, or the `.get(i)` spelling of one? The
-// `??` box-unbox arm's bound: an element's rep comes from its list's element slot, where a
-// struct field's can come from a row the literal merged onto (D1411). A map `.get` is claimed
-// by the fused map arm long before this and is excluded by name, not by arrival order.
-export function isListElementRead(exprIx: i32, fnIx: i32): boolean {
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is Index { return true }
-  return isListGetCall(exprIx, fnIx)
 }
 
 // The `.get(i)` half of `isListElementRead`, asked on its own because a `.get` is the CHECKED
@@ -1285,4 +1228,40 @@ function nullRetOwn(own: i32): NullRet {
 
 function nullRetHeap(h: i32): NullRet {
   return { nrOwn: -1, nrHeap: h, nrBox: false }
+}
+
+// The call of an optional call's guard (`drwOptGuard`: `if r != null { call } else { null }`)
+// whose receiver `r` this instance closes with no `null`: the guard is then the call,
+// and its `null` arm has no rep (D16333). -1 for any other `if`.
+export function optGuardCallOf(ifIx: i32, fnIx: i32): i32 {
+  const n = nodeAt(ifIx)
+  if !(n is IfStmt) || n.ifElse < 0 || fnIx < 0 { return -1 }
+  const ci = unwrapParen(n.ifCond)
+  if ci < 0 || ci >= P.nodes.length { return -1 }
+  const c = nodeAt(ci)
+  // The guard's test may already be folded to `true` where the receiver's read cannot be null.
+  const folded = c is BoolLit && c.boolVal == 1
+  if !folded {
+    if !(c is BinExpr) || c.binOp != "!=" || !(nodeAt(c.binRight) is NullLit) {
+      return -1
+    }
+    // Only a read the template leaves open, which this instance closes with no `null`.
+    if (
+      !tyHasTyVar(nodeTyIxOf(c.binLeft))
+      || !tyExcludesNull(nodeTyAt(c.binLeft, fnIx))
+    ) {
+      return -1
+    }
+  }
+  const eb = nodeAt(n.ifElse)
+  const tb = nodeAt(n.ifThen)
+  if (
+    !(eb is Block)
+    || eb.blkStmts.length != 1
+    || !(nodeAt(eb.blkStmts[0]) is NullLit)
+  ) {
+    return -1
+  }
+  if !(tb is Block) || tb.blkStmts.length != 1 { return -1 }
+  return tb.blkStmts[0]
 }

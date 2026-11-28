@@ -215,7 +215,16 @@ export function recRepFnHas(fd: i32): boolean {
 // Deliveries of a binding, call or element at a record its own storage matches, kept to be
 // asked, once the pass is over, whether the value is also built elsewhere at another storage.
 export let recOwnSrc: i32[] = []
-export function recOwnSrcSet(v: i32[]) { return recOwnSrc = v }
+// The nodes `recOwnSrc` holds, so a membership test scans no list.
+let recOwnSrcIn: {[i32]: boolean} = Map()
+export function recOwnSrcSet(v: i32[]) {
+  recOwnSrcIn = Map()
+  for x in v { recOwnSrcIn[x] = true }
+  return recOwnSrc = v
+}
+
+// Whether `recOwnSrc` holds node `p`.
+export function recOwnSrcHas(p: i32): boolean { return recOwnSrcIn.has(p) }
 
 // Queue `srcExpr` (a `srcTy`) when it holds a record and could name a fresh binding or call. A list
 // or record literal queues each element or field value its own storage delivers at (D15180).
@@ -223,13 +232,13 @@ export function recOwnPend(srcExpr: i32, srcTy: i32) {
   return recOwnPendAt(srcExpr, srcTy, false, 8)
 }
 
-// A value an inferred result takes: a list is handed on at its inferred type, as an annotated
-// result's is (D16772).
+// A value an inferred result takes: a list or map is handed on at its inferred type, as an
+// annotated result's is (D16772).
 export function recInferRetPend(srcExpr: i32, srcTy: i32) {
   if inferQuiet || srcExpr < 0 || srcTy < 0 || srcTy >= T.tys.length {
     return 0
   }
-  return if tyIsArray(srcTy) { recOwnPend(srcExpr, srcTy) } else { 0 }
+  return if tyIsArray(srcTy) || tyAt(srcTy) is TyMap { recOwnPend(srcExpr, srcTy) } else { 0 }
 }
 
 // `recOwnPend`, where `part` says `srcExpr` is a literal's element or field, queued only when its
@@ -266,6 +275,7 @@ function recOwnPendAt(srcExpr: i32, srcTy: i32, part: boolean, depth: i32) {
   ) {
     if !part || fieldStorageEq(nodeTyIxOf(p), srcTy) {
       recOwnSrc.push(p)
+      recOwnSrcIn[p] = true
       // A list handed on at its own type lands a build reaching it there (D16772).
       if tyIsArray(srcTy) { recPendHeld(p, srcTy, p) }
     }
@@ -702,6 +712,66 @@ export function recAdPushDrop(decl: i32, own: i32, dst: i32, at: i32) {
   recAdPass.whole.push(-1)
   recAdPass.at.push(at)
   return 0
+}
+
+// The record list type `ty` holds at its innermost element, through lists alone; else -1.
+function recListInnerObj(ty: i32): i32 {
+  let t = ty
+  let k = 0
+  while k < REC_STORE_DEPTH && t >= 0 && t < T.tys.length {
+    const n = tyAt(t)
+    if n is TyObj { return t }
+    if !(n is TyArray) { return -1 }
+    t = tyElemOf(n)
+    k = k + 1
+  }
+  return -1
+}
+
+// How many lists `ty` nests before its element is no list.
+function recListDepth(ty: i32): i32 {
+  let t = ty
+  let k = 0
+  while (
+    k < REC_STORE_DEPTH
+    && t >= 0
+    && t < T.tys.length
+    && tyAt(t) is TyArray
+  ) {
+    const n = tyAt(t)
+    t = if n is TyArray { tyElemOf(n) } else { -1 }
+    k = k + 1
+  }
+  return k
+}
+
+// A literal binding of record lists typed `own` delivered whole as `whole`, a list of lists of
+// another record as deep: it adopts `whole`, demanded at its innermost records. False where the
+// depths differ, either has no innermost record or holds a hole, or the binding takes no adoption.
+export function recAdPushWhole(
+  decl: i32,
+  own: i32,
+  whole: i32,
+  at: i32,
+): boolean {
+  if decl < 0 || !(nodeAt(decl) is LetDecl) || recAdProg.noAdopt.has(decl) {
+    return false
+  }
+  const ow = recListInnerObj(own)
+  const dw = recListInnerObj(whole)
+  if ow < 0 || dw < 0 || tyHoldsHole(own) || tyHoldsHole(whole) { return false }
+  if recListDepth(own) != recListDepth(whole) { return false }
+  if !(tyAt(ow) is TyObj) || !(tyAt(dw) is TyObj) || fieldStorageEq(ow, dw) {
+    return false
+  }
+  if recNumChanges(ow, dw, REC_STORE_DEPTH) { recAdProg.width[decl] = true }
+  recAdPass.decl.push(decl)
+  recAdPass.own.push(ow)
+  recAdPass.dst.push(dw)
+  recAdPass.elem.push(true)
+  recAdPass.whole.push(whole)
+  recAdPass.at.push(at)
+  return true
 }
 
 // A literal list binding of records `own` delivered as a list of the record union `dst`: it

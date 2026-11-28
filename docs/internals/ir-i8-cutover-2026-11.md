@@ -205,7 +205,7 @@ that takes an expression index. Porting the hook leaves its whole kept subtree u
 
 **An edge the IR provably never takes may stay until I8** (coordinator ruling, 2026-11-25). A kept
 helper that legacy also calls, such as `fitRecvRead`'s `emitExpr` fallback, keeps its arm until the
-I8 PR deletes it. The edge goes in `scripts/ir-i8-census/edges-proven.txt` with its proof, and the
+I8 PR deletes it. The edge goes in `scripts/ir-i8-census/edges-proven.txt` (deleted with the arms at I8) with its proof, and the
 target before I8 is zero unproven edges. Its guard is the sweep: `--check` reds when any program
 reaches a proven edge, so a broken proof surfaces in CI rather than at I8.
 
@@ -219,7 +219,9 @@ start body.
 **The dress rehearsal and its red list** (coordinator ruling, 2026-11-25). A draft PR titled "I8
 DRESS REHEARSAL" holds the I8 PR built on fresh master: `--apply`, the driver arms as
 `emitUnclaimed`, the hand fixes, `ir-i8-rebaseline.sh`. INFRA regenerates it every few hours and
-posts the red list there; this table is the latest, by owner.
+posts the red list there; this table is the latest, by owner. One regeneration is
+`scripts/ir-i8-regen.sh`: it replays the draft's hand commits onto `--apply` on fresh master, so a
+hand fix is a commit on the draft and is never redone by hand.
 
 | as of | what fails | count | owner |
 |---|---|---:|---|
@@ -253,9 +255,12 @@ claimless side is master's fetched seed for that PR only; afterwards there is no
 and each program's run is graded against its `@log`/Want alone. A program that prints nothing is
 graded by exit code and validity: 316 of the 26,238 programs the job covers.
 
-## 8. The I8 PR's checklist (a plan; nothing is deleted before the I8 PR)
+## 8. The I8 PR's checklist
 
-The coordinator ruled on 2026-11-25 that this checklist be kept as a plan. The I8 PR carries it out
+**Status: carried out by the I8 PR**, which cut over before 100% coverage (owner ruling,
+2026-11-26, DECISIONS.md): the programs still unclaimed are the holdouts,
+`scripts/ir-i8-census/holdouts/` (one file per program), and step 1's "newly failing programs at zero" became "every
+newly failing program is a holdout". The coordinator ruled on 2026-11-25 that this checklist be kept as a plan. The I8 PR carries it out
 in one pass, in this order. Each step is one commit, and each commit is one mechanism.
 
 1. **Preconditions.** The newest regeneration of the dress rehearsal shows each of these at zero:
@@ -297,8 +302,8 @@ I8 (testing-strategy.md's kill-matrix rule). A check with no survivor is convert
 
 | check | where it runs | what it compares | at I8 | the survivor that catches its breakage |
 |---|---|---|---|---|
-| `ci-ir-identity` (`ir-identity.sh --cases` / `--claimless`, `ir-identity-annotate.sh`) | ci.yml, 4 shards; the queue | claims-on behaviour against the same tree's claimless build; bytes informational (done 2026-11-25) | **convert** the claimless side: master's fetched seed for the I8 PR only, then each program's run against its `@log`/Want alone (§7) | itself, converted |
-| `ir-parity.vl --cross` (`ir claim cross`), `tests/vl_ir_identity_compare_test.ts`, `vl_ir_parity_legacy_wrong_test.ts` | gate.sh full; ci-native | claimed against claimless runs; the comparators' controls | **convert** to `--behaviour-only` over the same populations; the tests keep their controls on the behaviour grading | themselves, converted |
+| `ci-ir-identity` (`ir-identity.sh --cases` / `--claimless`, `ir-identity-annotate.sh`) | ci.yml, 4 shards; the queue | claims-on behaviour against the same tree's claimless build; bytes informational (done 2026-11-25) | **retired** after I8, once every program it alone built had its output pinned (coordinator ruling, 2026-11-27): the 88 check-mode cases it alone built carry `@run` and their `@log`, and the `runs` witnesses their `Want:` | the corpus oracle (`tests/cases`), `ci-distilled` (each cell's manifest stdout), `ci-witnesses` (`Want:`), the capability probes (`Should print`); every build is rc 70 on an invalid module |
+| `ir-parity.vl --cross` (`ir claim cross`), `tests/vl_ir_identity_compare_test.ts`, `vl_ir_parity_legacy_wrong_test.ts` | gate.sh full; ci-native | claimed against claimless runs; the comparators' controls | **retired** with `ci-ir-identity` (2026-11-27): no claimless build is left to run against | the pinned-output graders above |
 | the claims-off fallback tests (`vl_ir_claim_fallback_test`, `vl_claim_fallback_wasm_test`, `playground_claim_fallback_test`) | ci-native; the ci.yml editor step | an invalid claimed module falls back to legacy (rc 70 under strict) | **convert** to one test per host that an invalid module (the `$VL_FAULT_INJECT` seam) is rc 70 with the validator's message. The outcome "an invalid claimed module legacy refuses" (`claims_off_rebuild`'s `Err(refusal)` arm) is retired unwitnessed since #10213: a claim raises or declines wherever legacy refuses, so no program reaches it, and the arm goes with the fallback (coordinator ruling, 2026-11-25) | themselves, converted |
 | `scripts/ir-divergence-baseline.txt` (17 rows) | read by `ir-identity.sh`, `ir-parity.vl`, `ir-shadow.vl` | the listed byte differences between claimed and claimless builds | **retire** | behaviour parity: a `legacy-wrong:` row's program keeps its `@log`/Want, and parity grades it |
 | `ir-parity.vl --pop refusals` (`ir claim refusals`) | gate.sh full | a program legacy refuses at emit is refused alike with claims on | **retire** | the `@emit-error` cases (`deno task test`) and the `emit_reject` witnesses (`ci-witnesses`): a refusal that turns into a build fails its expected error |
@@ -315,7 +320,6 @@ I8 (testing-strategy.md's kill-matrix rule). A check with no survivor is convert
 | `--test-emit-refusal` (the emit-refusal hook) and the four guards that use it (`selfhost_native_diag_pos` ×2, `vl_emit_diag_position`, the editor's positioned emit diagnostic, `vl_check_codegen`) | ci-native, checks-suites | that an emit refusal is positioned and reported | **convert**: the hook refuses in the IR, so the guards keep measuring (done 2026-11-26: the claim raises it, and claims are tried under the hook) | themselves, converted |
 | `ci-verdict.sh` `TREE_SKIPS`, `ci_verdict_test`, `ci_proof_test`'s local rows | ci.yml | job and row names | **follow** the renames and retirements above | themselves |
 
-Behaviour parity is the conversion target for `ci-ir-identity` and `--cross`, and the survivor most
-retired rows name. It keeps the `ir-identity` paths filter in ci.yml, and it is the only check that
-still needs the shards. The I8 PR proves each retirement against its survivor, using the kill
+Behaviour parity, the survivor most retired rows name, is each program's pinned output: once every
+program `ci-ir-identity` alone built carried a pin, the job and its shards retired (2026-11-27). The I8 PR proves each retirement against its survivor, using the kill
 matrix's mutant for that row where one exists.

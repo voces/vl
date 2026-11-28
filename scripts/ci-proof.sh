@@ -21,7 +21,6 @@ ROWS=(
   "lint-self + fmt"
   "seed size"
   "late demands"
-  "self ir misses"
   "phase state"
   "no-python"
   "kind-ladder sets"
@@ -35,7 +34,7 @@ ROWS=(
   "corpus oracle"
   "rep-fuzz"
   "splice scan"
-  "ir shadow cases"
+  "ir debt"
 )
 
 case "${1:-}" in

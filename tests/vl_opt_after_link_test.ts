@@ -86,9 +86,11 @@ const FLAVOUR_READERS = [
   "wasmEmit:emitPushAppend gOptimized",
   // A failing list-index guard reads the shared empty backing in a plain build; `-O` keeps its trap.
   "wasmEmit:emitListIdxTrapOf gOptimized",
+  // A plain build's writer folds a local.set read straight back into a local.tee; `-O` keeps the
+  // pair, whose shape binaryen's loop hoisting and optMultivalue match.
+  "emit_bytes:fbPeepholes gOptimized",
   // `--low-memory-unused` (only with `-O`) folds an address's constant into the memarg.
-  "wasmEmit:emitLowMemAccessorCall gLowMemUnused",
-  "wasmEmit:lowMemFoldsCallee gLowMemUnused",
+  "wasmEmit:memLowFoldFits gLowMemUnused",
   "wasmEmit:memAddrPlanWith gLowMemUnused",
 ];
 const FLAVOUR_GLOBALS = ["gOptimized", "gLowMemUnused"];

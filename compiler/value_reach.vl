@@ -535,6 +535,10 @@ function vrFnValue(f0: i32, path: string): i32[] {
     }
     return out
   }
+  // A lambda an un-annotated `const` holds, only ever called through it, returns to those calls
+  // as a declared function does.
+  const lb = if fnNameIsLambda(fn.fnName) { vrConstLamBinding(f) } else { -1 }
+  if lb >= 0 { return vrCalleeUsesCalls(lb, path) }
   if (
     fnNameIsLambda(fn.fnName)
     || monoNameIsExported(fn.fnName)
@@ -543,7 +547,13 @@ function vrFnValue(f0: i32, path: string): i32[] {
   ) {
     return vrLost()
   }
-  for u in vrUses[f] ?? [] {
+  return vrCalleeUsesCalls(f, path)
+}
+
+// The calls each read of declaration `d` reaches at `path`, where every read is a callee; else lost.
+function vrCalleeUsesCalls(d: i32, path: string): i32[] {
+  const out: i32[] = []
+  for u in vrUses[d] ?? [] {
     let callee = u
     let c = sidArrGet(vrParent, u)
     while c >= 0 && nodeAt(c) is Paren {
@@ -556,6 +566,18 @@ function vrFnValue(f0: i32, path: string): i32[] {
     if !vrJoin(out, vrCalls(c, path)) { return vrLost() }
   }
   return out
+}
+
+// The un-annotated `const` binding whose initialiser is lambda `f`, no export, else -1.
+function vrConstLamBinding(f: i32): i32 {
+  const b = sidArrGet(vrParent, f)
+  const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { null }
+  if !(bn is LetDecl) || bn.letKw != "const" || bn.letType >= 0 { return -1 }
+  if unwrapParen(bn.letInit) != f || declExported(b) || !vrIndexed(b) {
+    return -1
+  }
+  if vrUnres[bn.letName] ?? false { return -1 }
+  return b
 }
 
 // The calls every read of the binding or parameter declared at `d`, no export, reaches at
@@ -602,7 +624,8 @@ function vrBin(n: BinExpr, p: i32, x: i32, path: string): i32[] {
   if n.binOp != "=" { return vrLost() }
   if x == n.binLeft { return out }
   const t = unwrapParen(n.binLeft)
-  if t >= 0 && vrFollow && !(nodeAt(t) is Ident) {
+  // A capture cell's slot written from any frame is a write of the captured binding.
+  if t >= 0 && (vrFollow || vrCellSlot(t)) && !(nodeAt(t) is Ident) {
     const roots: i32[] = []
     const paths: string[] = []
     if !vrPlaceRoots(t, path, roots, paths) { return vrLost() }
@@ -629,6 +652,23 @@ function vrBin(n: BinExpr, p: i32, x: i32, path: string): i32[] {
     return vrLost()
   }
   return out
+}
+
+// Whether place `t` is a capture cell's slot, `c[0]`: `c` an un-annotated `let` holding a list
+// literal of one element, the binding a write from a closure that captures it stores into.
+function vrCellSlot(t: i32): boolean {
+  const n = nodeAt(t)
+  if !(n is Index) { return false }
+  const k = nodeAt(n.idxIndex)
+  const a = unwrapParen(n.idxArr)
+  if !(k is NumLit) || k.numText != "0" || a < 0 || !(nodeAt(a) is Ident) {
+    return false
+  }
+  const d = identDeclOf(a)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
+  const init = nodeAt(unwrapParen(dn.letInit))
+  return init is ArrayLit && init.arrElems.length == 1
 }
 
 // Pushes to `roots` each binding whose reads may reach the storage the place `t` writes into, and

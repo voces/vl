@@ -941,6 +941,20 @@ const CASES: Case[] = [
       `import { g, reg9 } from "./lib"\nfunction w9(): void { g = null }\nreg9(w9)\n`,
   },
   {
+    // The call inside lib's new narrowing runs a hook main fills with the binding's writer.
+    name: "lib starts narrowing across a hook a served writer fills",
+    want: "decline",
+    why: "writer",
+    badWhy: "decor",
+    from: "export function noop9(): void { print(1) }\n",
+    to:
+      "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    hk9()\n    const k: i32 = g\n    return k\n  }\n  return 0\n}\n",
+    libUses:
+      "export function noop9(): void { print(1) }\nlet hk9: () => void = () => { print(0) }\nexport function setHk9(h: () => void): void { hk9 = h }\n",
+    uses:
+      `import { g, setHk9 } from "./lib"\nfunction w9(): void { g = null }\nsetHk9(w9)\n`,
+  },
+  {
     name: "lib starts narrowing a binding no served function writes",
     want: "serve",
     badWhy: "decor",
@@ -1016,14 +1030,14 @@ const CASES: Case[] = [
       'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
   {
-    // The builder's declaring statement is an input: a leaf that becomes an element read of an
-    // aliased list is kept, where a literal leaf is built at the destination. An element of the
-    // list literal's own binding is built there too (D15930), so the read goes through an alias.
+    // The builder's declaring statement is an input: a leaf that becomes an element read of a
+    // reassigned list is kept, where a literal leaf is built at the destination. An element of a
+    // list only literals and aliases hold is built there (D15930), so the list is reassigned.
     name: "lib's builder leaf becomes an element read",
     want: "decline",
     why: "fresh",
     from: "{ return { f: 4 } }",
-    to: "{ const t = [{ f: 4 }]; const u = t; return u[0] }",
+    to: "{ let t = [{ f: 4 }]; const u = t; t = u; return t[0] }",
     libUses: "export function mk() { return { f: 4 } }\n",
     uses:
       'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
@@ -1491,7 +1505,7 @@ Deno.test({
       ["a served function's call into lib moves its write", 2048],
       // `SK_NO_WRITER` drops the writer closure of a name a whole-program question asked about.
       ["a private lib lambda starts writing a binding main narrows", 16],
-      ["lib starts narrowing a binding a served escaping function writes", 16],
+      ["lib starts narrowing across a hook a served writer fills", 16],
       // `IH_NO_REACH_TOKENS` drops a reach row's signature tokens, which alone spell a default:
       // the checked type renders the same with it or without.
       ["a defaulted param loses its default", 16777216],

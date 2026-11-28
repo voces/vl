@@ -39,13 +39,6 @@ const LOCAL: Record<string, string> = {
     "ci-witnesses grades it in two --shard runs, not the one command the row runs",
   "distilled corpus":
     "ci-distilled runs its runs-lost check; on master gate.sh adds --verify-fresh",
-  "ir shadow": "no ci.yml job runs the IR shadow over the distilled corpus",
-  "ir claims":
-    "no ci.yml job runs the shipped IR claim over the distilled corpus",
-  "ir claim refusals":
-    "no ci.yml job builds the programs legacy refuses at emit claimed and claimless (`ir-parity.vl --pop refusals`)",
-  "ir claim cross":
-    "no ci.yml job builds and runs the probes, pins and a cases sample claimed and claimless (`ir-parity.vl --cross`)",
 };
 
 // What ci.yml must run for each covered row: fragments of the same command, on the seed.
@@ -65,9 +58,6 @@ const CI_RUNS: Record<string, string[]> = {
   ],
   "late demands": [
     "vl run scripts/late-demands.vl --compiler build/vl-compiler.wasm -- --check --seed build/vl-compiler.wasm",
-  ],
-  "self ir misses": [
-    "vl run scripts/self-ir-misses.vl --compiler build/vl-compiler.wasm -- --check --seed build/vl-compiler.wasm",
   ],
   "phase state": [
     "vl run scripts/phase-state-census.vl --compiler build/vl-compiler.wasm -- --check",
@@ -96,11 +86,11 @@ const CI_RUNS: Record<string, string[]> = {
   "conflict markers": [],
   "corpus oracle": ["- name: Corpus oracle on the wasm compiler"],
   "rep-fuzz": ["run: bash scripts/rep-fuzz-check.sh"],
+  "ir debt": [
+    "vl run scripts/ir-debt.vl --compiler build/vl-compiler.wasm -- --check",
+  ],
   "splice scan": [
     "vl run scripts/inventory/splice-scan.vl --compiler build/vl-compiler.wasm -- --self-test",
-  ],
-  "ir shadow cases": [
-    "vl run scripts/silent-sweep/distilled/ir-shadow.vl --compiler build/vl-compiler.wasm -- --seed build/vl-compiler.wasm --cases --prepost",
   ],
 };
 

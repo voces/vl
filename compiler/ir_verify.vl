@@ -37,6 +37,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RCloTag,
   RClosureEq,
   RCoalAtomStr,
   RCoalStr,
@@ -111,6 +112,7 @@ import {
   RRawOp,
   RRecCopyPure,
   RRecDown,
+  RRecMember,
   RRecordFitIs,
   RRecover,
   RRel,
@@ -127,6 +129,7 @@ import {
   RStrToAtom,
   RStrToAtomStaged,
   RStructEq,
+  RTagClo,
   RTagIs,
   RTagOf,
   RTagStash,
@@ -205,6 +208,7 @@ import {
 import { sHeapIdx } from "./emit_state"
 import {
   boxListRetag,
+  boxRetag,
   cloHoleRetag,
   irNodeEndsPath,
   listRetag,
@@ -232,6 +236,19 @@ import { AsExpr, Call, P, i32ToStr, nodeAt } from "./ast"
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
 export type IrVerdict = { vfRule: i32, vfNode: i32, vfMsg: string }
+
+// Whether `src` is an i32 niche (a sentinel's or an atom's, discipline 2 or 3) and `dst` its own
+// inner rep: the same i32 past its null, which a test of that null guards.
+function nicheNarrowRetag(src: i32, dst: i32): boolean {
+  const n = repNodeAt(src)
+  return n is RNullable && (n.rnDisc == 2 || n.rnDisc == 3) && n.rnInner == dst
+}
+
+// Whether rep `r` is held as a union box: a box, or a null-tagged one.
+function heldBox(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RBox || n is RNullable && n.rnDisc == 4
+}
 
 let vf = irFnNew(-1, "")
 let vfRule = 0
@@ -1143,6 +1160,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if (
         !listRetag(opRep(r.rgV), dst)
         && !boxListRetag(opRep(r.rgV), dst)
+        && !boxRetag(opRep(r.rgV), dst)
         && !mapRetag(opRep(r.rgV), dst)
         && !listRetagHole(vf, opRep(r.rgV), dst)
         && !vfCloListUndeclared(opRep(r.rgV), dst)
@@ -1158,11 +1176,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         && (!(d is RNullable)
           || !nicheRetag(d.rnDisc, d.rnInner)
           || d.rnInner != opRep(r.rgV))
+        && !nicheNarrowRetag(opRep(r.rgV), dst)
       ) {
         return fail(
           2,
           at,
-          "a retag is not of an atom or a string into its own nullable niche, the bottom ref into a nullable reference, a box map as another, a ref list as itself or into its hole, a variant record as its struct twin, or a record as one whose fields, or leading fields, lower alike or widen to its nullable fields",
+          "a retag is not of an atom or a string into its own nullable niche, an i32 niche past its null, the bottom ref into a nullable reference, a box or box map as another, a ref list as itself or into its hole, a variant record as its struct twin, or a record as one whose fields, or leading fields, lower alike or widen to its nullable fields",
         )
       }
       0
@@ -1617,7 +1636,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(2, at, "a list arms' emptiness test is a bool")
       }
       // The lowering reads the receiver once per arm read, so it is a variable, not a temp.
-      if !(r.lfV is OVar) || !(repNodeAt(opRep(r.lfV)) is RBox) {
+      const ln = repNodeAt(opRep(r.lfV))
+      const nulList = ln is RNullable && repNodeAt(ln.rnInner) is RList
+      if !(r.lfV is OVar) || !(ln is RBox) && !nulList {
         return fail(2, at, "a list arms' emptiness test reads a box variable")
       }
       0
@@ -1801,6 +1822,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const sameBox = m is RMap
         && repNodeAt(repBoxCore(dst)) is RBox
         && repBoxCore(dst) == repBoxCore(m.rmVal)
+      // …or that box held at the smaller union the read is narrowed to: box tags are global.
+      const narrowBox = m is RMap && heldBox(dst) && heldBox(m.rmVal)
       // A scalar value's read the box plan boxes (`mtBox`) is a box of the union it delivers to.
       const scalarBox = r.mtBox >= 0
         && m is RMap
@@ -1813,6 +1836,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         && !unboxed
         && !container
         && !sameBox
+        && !narrowBox
         && !scalarBox
       ) {
         return fail(
@@ -2006,6 +2030,36 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RTagClo => {
+      use(r.tcV, at)
+      if (
+        r.tcBox != tagIdBoxed(opRep(r.tcV))
+        || !r.tcBox && opRep(r.tcV) != vfI32
+      ) {
+        return fail(2, at, "a tag closure reads an i32 set id or its box")
+      }
+      if dst < 0 || !cloRepOrNullable(dst, r.tcBox) {
+        return fail(2, at, "a tag closure is a closure")
+      }
+      // The members are the id type's whole set, so the trap past the last test is unreachable.
+      if !i32sSame(r.tcFns, irFactKidTyOf(vf, at)) {
+        return fail(2, at, "a tag closure's members are its id type's set")
+      }
+      0
+    }
+    RCloTag => {
+      use(r.ckV, at)
+      if !cloRepOrNullable(opRep(r.ckV), r.ckNul) || r.ckNul && !r.ckBox {
+        return fail(2, at, "a closure tag reads a closure")
+      }
+      if dst < 0 || r.ckBox != tagIdBoxed(dst) || !r.ckBox && dst != vfI32 {
+        return fail(2, at, "a closure tag is an i32 set id or its box")
+      }
+      if !i32sSame(r.ckFns, irFactKidTyOf(vf, at)) {
+        return fail(2, at, "a closure tag's members are its closure type's set")
+      }
+      0
+    }
     RFnId => if dst >= 0 && dst != vfI32 { fail(2, at, "a function id is an i32") } else { 0 }
     RAtomSole => if dst >= 0 && !(repNodeAt(dst) is RAtom) { fail(2, at, "a sole atom is an atom") } else { 0 }
     RDeadNullTest => {
@@ -2068,6 +2122,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       if dst >= 0 && !(repNodeAt(dst) is RClosure) {
         return fail(2, at, "a hand member of a non-closure rep")
+      }
+      0
+    }
+    RRecMember => {
+      use(r.rmbV, at)
+      if !(repNodeAt(opRep(r.rmbV)) is RRecord) {
+        return fail(2, at, "a record member of a non-record value")
       }
       0
     }
@@ -2562,8 +2623,9 @@ function mapValOf(mrep: i32): i32 {
 }
 
 // Why a fused map read whose default computes is ill-formed, or "": it probes a map receiver by a
-// key along an inline form, `i32` (1), mv (2), a scalar union value's (3), a ref niche's (4) or a union box's (5), into an out of the read's
-// own rep.
+// key along an inline form, `i32` (1), mv (2), a scalar union value's (3), a ref niche's (4), a union
+// box's (5), the sentinel's (6), a scalar join's or box's (7, 8) or a widened scalar's (9), into an
+// out of the read's own rep.
 function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   const mp = n.cbMap
   if mp == null { return "a fused map read holds no probe" }
@@ -2571,7 +2633,7 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   if !mapRecvOk(mp.prSym, n.cbL, id) {
     return "a map read of a receiver that is no map"
   }
-  if mp.prForm < 1 || mp.prForm > 6 {
+  if mp.prForm < 1 || mp.prForm > 9 {
     return "a fused map read writes its default in no miss arm"
   }
   const o = n.cbOut
@@ -2608,6 +2670,24 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
     )
   ) {
     return "a map read's niche yields no value of its map"
+  }
+  // A scalar join's read is a union's box, a scalar box's the boxed `T | null`, of a scalar value.
+  const on = repNodeAt(vf.irVars[o].vRep)
+  if (
+    (mp.prForm == 7 || mp.prForm == 8)
+    && (!repIsScalar(
+      mapValOf(
+        if mp.prSym >= 0 { irGlobalRepOf(vf, mp.prSym) } else { opRep(n.cbL) },
+      ),
+    )
+      || mp.prForm == 7 && !(on is RBox)
+      || mp.prForm == 8 && !(on is RNullable && on.rnDisc == 4))
+  ) {
+    return "a map read's scalar join is no scalar map value boxed into a union"
+  }
+  // A widened read is at a wider number than its map's scalar value.
+  if mp.prForm == 9 && p != "i64" && p != "f64" && p != "f32" {
+    return "a map read's widening yields no wider number"
   }
   // A union value's read peels to its scalar.
   if mp.prForm == 3 && (!(mr is RMap) || p == null) {
@@ -3483,6 +3563,7 @@ function rhsReadsList(r: Rhs): boolean {
       RCast |
       RCellGet |
       RCellNew |
+      RCloTag |
       RClosureEq |
       RCoalAtomStr |
       RCoalStr |
@@ -3556,6 +3637,7 @@ function rhsReadsList(r: Rhs): boolean {
       RRawOp |
       RRecCopyPure |
       RRecDown |
+      RRecMember |
       RRecordFitIs |
       RRecover |
       RRel |
@@ -3572,6 +3654,7 @@ function rhsReadsList(r: Rhs): boolean {
       RStrToAtom |
       RStrToAtomStaged |
       RStructEq |
+      RTagClo |
       RTagIs |
       RTagOf |
       RTagStash |
@@ -3644,42 +3727,6 @@ function stagePairsWhy(f: IrFn): string {
   return ""
 }
 
-// Why a box whose head the lowering writes ahead of a dispatch (`irBoxLeadFirst`) does not directly
-// follow that dispatch's nodes in one body, or "": a node between would land above the head.
-function boxLeadsWhy(f: IrFn): string {
-  const bodies: i32[][] = [f.irBody]
-  const pos: i32[] = [0]
-  let found = 0
-  while bodies.length > 0 {
-    const top = bodies.length - 1
-    const body = bodies[top]
-    const i = pos[top]
-    if i >= body.length {
-      bodies.pop()
-      pos.pop()
-      continue
-    }
-    pos[top] = i + 1
-    const id = body[i]
-    let k = 0
-    while k < f.irBoxLeadBox.length {
-      if f.irBoxLeadBox[k] == id {
-        const n = f.irBoxLeadN[k]
-        if n < 1 || i < n || body[i - n] != f.irBoxLeadFirst[k] {
-          return "node "
-            + i32ToStr(id)
-            + ": a led box does not directly follow its dispatch"
-        }
-        found = found + 1
-      }
-      k = k + 1
-    }
-    irPushBodies(f, id, bodies, pos)
-  }
-  if found != f.irBoxLeadBox.length { return "a led box no body holds" }
-  return ""
-}
-
 // The bounds rule, installed with the list builder; it answers "" or what broke, naming the node.
 // Whether a map get of value rep `val` may deliver into `dst`: the value itself, or it nullable.
 function mapGetDstOk(val: i32, dst: i32): boolean {
@@ -3731,7 +3778,18 @@ function vfNicheTakes(r: i32, v: i32): boolean {
 // builder noted for them (`irRepValtype`).
 function vfStoresAs(dst: i32, src: i32): boolean {
   const a = vf.irRepValtype[dst] ?? []
-  return a.length > 0 && u8sSame(a, vf.irRepValtype[src] ?? [])
+  const c = vf.irRepValtype[src] ?? []
+  if a.length > 0 && u8sSame(a, c) { return true }
+  // A `(ref ht)` is a value of `(ref null ht)`, wasm's subtyping.
+  if a.length < 2 || a.length != c.length || a[0] != 0x63 || c[0] != 0x64 {
+    return false
+  }
+  let i = 1
+  while i < a.length {
+    if a[i] != c[i] { return false }
+    i = i + 1
+  }
+  return true
 }
 
 // Whether a closure list at rep `src` that writes no valtype is the closure list at `dst` that
@@ -3894,10 +3952,6 @@ export function irVerify(f: IrFn): IrVerdict {
   if vfRule == 0 && vfStaged {
     const sp = stagePairsWhy(f)
     if sp != "" { fail(10, -1, sp) }
-  }
-  if vfRule == 0 && f.irBoxLeadBox.length > 0 {
-    const bl = boxLeadsWhy(f)
-    if bl != "" { fail(10, -1, bl) }
   }
   if vfRule == 0 && vfSetAt.length > 0 {
     fail(2, -1, "a stash set no record reads")
@@ -4083,4 +4137,28 @@ function gfRecvRecord(r: RGetField): i32 {
     return vn.rnInner
   }
   return v
+}
+
+// Whether i32 lists `a` and `b` are equal.
+function i32sSame(a: i32[], b: i32[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+// Whether rep `r` is a closure, or with `nul` a niche nullable closure.
+function cloRepOrNullable(r: i32, nul: boolean): boolean {
+  const n = repNodeAt(r)
+  if !nul { return n is RClosure }
+  return n is RNullable && n.rnDisc == 1 && repNodeAt(n.rnInner) is RClosure
+}
+
+// Whether rep `r` is the `i32 | null` box a nullable tagged id is stored as.
+function tagIdBoxed(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RNullable && n.rnDisc == 4 && repPrim(n.rnInner) == "i32"
 }

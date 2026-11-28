@@ -60,7 +60,6 @@ import {
   UnionDecl,
   WhileStmt,
   externGlobalLinkOfNode,
-  isExprKid,
   nodeAt,
   nodeChildren,
 } from "./ast"
@@ -229,171 +228,6 @@ export function coalLhsStashes(lIx: i32): boolean {
 export const scrArrNew = 1
 export const scrCoalesceCall = 2
 
-// The bits of `rem` nothing in the expression at `exprIx` needs; one walk answers both, and it
-// stops once every bit is found.
-export function exprScratchMisses(exprIx: i32, rem: i32): i32 {
-  if exprIx < 0 || rem == 0 { return rem }
-  const e = nodeAt(exprIx)
-  match e {
-    Call => {
-      let r = rem
-      if (r & scrArrNew) != 0 && e.callFn >= 0 && e.callFn < P.nodes.length {
-        const callee = nodeAt(e.callFn)
-        if callee is Ident {
-          if (
-            callee.identName == "__array_new__"
-            || callee.identName == "__array_new_default__"
-          ) {
-            r = r - scrArrNew
-          }
-        }
-      }
-      r = exprScratchMisses(e.callFn, r)
-      const args = e.callArgs
-      let i = 0
-      while i < args.length && r != 0 {
-        r = exprScratchMisses(args[i], r)
-        i = i + 1
-      }
-      return r
-    }
-    BinExpr => {
-      let r = rem
-      if (r & scrCoalesceCall) != 0 && e.binOp == "??" {
-        if coalChainHasCallLhs(exprIx) { r = r - scrCoalesceCall }
-      }
-      r = exprScratchMisses(e.binLeft, r)
-      return exprScratchMisses(e.binRight, r)
-    }
-    Member => {
-      return exprScratchMisses(e.memObj, rem)
-    }
-    // The `?.` receiver, walked like the `.` one above (D1667).
-    OptMember => {
-      return exprScratchMisses(e.omObj, rem)
-    }
-    Index => {
-      return exprScratchMisses(e.idxIndex, exprScratchMisses(e.idxArr, rem))
-    }
-    Unary => {
-      return exprScratchMisses(e.unArg, rem)
-    }
-    Paren => {
-      return exprScratchMisses(e.parInner, rem)
-    }
-    IsExpr => {
-      return exprScratchMisses(isExprKid(e), rem)
-    }
-    AsExpr => {
-      return exprScratchMisses(e.asObj, rem)
-    }
-    // An if-expression is an `IfStmt` node in value position; without this arm neither its
-    // allocator length nor its `??` would reach the frame the scan reserves.
-    IfStmt => {
-      return ifChainScratchMisses(exprIx, rem)
-    }
-    ObjLit => {
-      const fields = e.objFields
-      let r = rem
-      let i = 0
-      while i < fields.length && r != 0 {
-        const f = nodeAt(fields[i])
-        if f is FieldInit { r = exprScratchMisses(f.fiValue, r) }
-        i = i + 1
-      }
-      return r
-    }
-    // A spread's source is an operand like any other (D2334).
-    Spread => {
-      return exprScratchMisses(e.spdArg, rem)
-    }
-    ArrayLit => {
-      const elems = e.arrElems
-      let r = rem
-      let i = 0
-      while i < elems.length && r != 0 {
-        r = exprScratchMisses(elems[i], r)
-        i = i + 1
-      }
-      return r
-    }
-    // a leaf or a form whose operands this scan does not reach
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ForRange | ForIn | MatchExpr | ImportDecl | LoopVar => {}
-  }
-  return rem
-}
-
-// `exprScratchMisses` over every statement in the block at `blockIx`, descending into if/else
-// arms and loop bodies. The non-statement case falls through to the expression walker rather
-// than enumerating shapes — an expression-bodied lambda's synthetic one-statement Block is
-// exactly what a fixed set would miss.
-export function blockScratchMisses(blockIx: i32, rem: i32): i32 {
-  const b = nodeAt(blockIx)
-  let r = rem
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length && r != 0 {
-      const s = nodeAt(stmts[i])
-      if s is LetDecl {
-        r = exprScratchMisses(s.letInit, r)
-      } else if s is RetStmt {
-        r = exprScratchMisses(s.retArg, r)
-      } else if s is IfStmt {
-        r = ifChainScratchMisses(stmts[i], r)
-      } else if s is WhileStmt {
-        r = blockScratchMisses(s.whileBody, exprScratchMisses(s.whileCond, r))
-      } else if s is ForIn {
-        r = blockScratchMisses(s.fiBody, exprScratchMisses(s.fiIter, r))
-      } else if s is ForRange {
-        r = exprScratchMisses(s.frFrom, r)
-        r = exprScratchMisses(s.frTo, r)
-        r = exprScratchMisses(s.frStep, r)
-        r = blockScratchMisses(s.frBody, r)
-      } else {
-        r = exprScratchMisses(stmts[i], r)
-      }
-      i = i + 1
-    }
-  }
-  return r
-}
-
-// `exprScratchMisses` over every arm of the `if` / `else if` chain at `ifIx` — condition,
-// then-branch, `else` block, or a chained `else if`.
-function ifChainScratchMisses(ifIx: i32, rem: i32): i32 {
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-  let r = rem
-  let cur = ifIx
-  while cur >= 0 && r != 0 {
-    const s = nodeAt(cur)
-    cur = -1
-    if s is IfStmt {
-      r = blockScratchMisses(s.ifThen, exprScratchMisses(s.ifCond, r))
-      if s.ifElse >= 0 && r != 0 {
-        const els = nodeAt(s.ifElse)
-        match els {
-          Block => {
-            return blockScratchMisses(s.ifElse, r)
-          }
-          IfStmt => {
-            cur = s.ifElse
-          }
-          // any other else holds no scratch
-          NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-        }
-      }
-    }
-  }
-  return r
-}
-
-// `blockScratchMisses` over the body of the FuncDecl at `fnIx`; `rem` for any other node.
-export function fnScratchMisses(fnIx: i32, rem: i32): i32 {
-  const fn = nodeAt(fnIx)
-  if fn is FuncDecl { return blockScratchMisses(fn.fnBody, rem) }
-  return rem
-}
 // True if the expression at `ix` is an if-EXPRESSION (an `IfStmt` in value position).
 export function exprIsIfStmt(ix: i32) {
   if ix < 0 { return false }
@@ -785,6 +619,24 @@ export function paramTypeNodeOfRead(fnIx: i32, atIx: i32): i32 {
   return -1
 }
 
+// The annotation of an enclosing function's parameter that the read at `atIx` captures, where its
+// type is closed; -1 for any other read.
+export function capturedParamTyNodeOfRead(atIx: i32): i32 {
+  const d = identDeclOf(unwrapParen(atIx))
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is Param) { return -1 }
+  const pt = parTyNode(d)
+  return if pt >= 0 && !tyHasTyVar(nodeTyIxOf(pt)) { pt } else { -1 }
+}
+
+// The `let` the read at `atIx` resolves to, wherever it is declared, where its type is closed; -1
+// for any other read.
+export function closedLetOfRead(atIx: i32): i32 {
+  const d = identDeclOf(unwrapParen(atIx))
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return -1 }
+  const t = nodeTyIxOf(d)
+  return if t >= 0 && !tyHasTyVar(t) { d } else { -1 }
+}
+
 // The position of `fnIx`'s parameter that declaration `d` is, or -1. An instance's parameter
 // is the copy minted from the template's, so it matches through its original or its position.
 export function paramPosOfDecl(fnIx: i32, d: i32): i32 {
@@ -851,16 +703,6 @@ export function letIsSet(letIx: i32, fnIx: i32) {
       const callee = nodeAt(init.callFn)
       if callee is Ident { return callee.identName == "Set" }
     }
-  }
-  return false
-}
-// True if the `LetDecl`/global at `letIx` declares an `f32` binding. Annotation-only: a bare
-// float literal stays f64 by default, so only an annotation whose recorded type is `f32`
-// selects the f32 slot (valtype `0x7d`, kind 13) and lowers the initializer as `f32.const`.
-export function letIsF32(letIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return nodeTyPrimName(d.letType) == "f32" }
   }
   return false
 }

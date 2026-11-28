@@ -14,10 +14,12 @@ import {
   IsExpr,
   Member,
   NullLit,
+  NumLit,
   ObjLit,
   OptMember,
   P,
   StrLit,
+  Unary,
   callIsNever,
   isDefaultGlobalRef,
   nodeAt,
@@ -292,9 +294,14 @@ import {
   PK_I8,
   PK_U16,
   PK_U8,
+  RLK_F32_LIST,
+  RLK_F64_LIST,
   RLK_I32_LIST,
+  RLK_I64_LIST,
   RLK_REF_LIST,
   RLK_STRUCT,
+  RLK_STR_LIST,
+  RLK_V128_LIST,
   V128_LIST_KIND,
   VKind,
   bl8Ty,
@@ -2201,6 +2208,11 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   ) {
     return holeBox("map", unionTy, -1)
   }
+  // A number literal an instance's pin stamps at a union (`dstRetypeLitArgs`) is no box: it is
+  // boxed as the union's one number, a wide one as the literal written at that width.
+  const nk = if planSignedNumLit(bareIx) { litUnionNumKind(nodeTyAt(bareIx, fnIx)) } else { -1 }
+  if nk == 0 { return holeBox("atom", 0, -1) }
+  if nk >= 3 { return holeBox("lit", nk, -1) }
   if exprUnion(exprIx, fnIx) { return holePassPlanOf(exprIx, unionTy, fnIx) }
   if memberBoxPasses(exprIx, unionTy, fnIx) {
     return holeBox("memberBox", -1, -1)
@@ -2313,6 +2325,19 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     const at = refArrBoxTagOf(exprIx, fnIx, as, unionTy)
     return if at >= 0 { holeBox("refList", at, -1) } else { ladder }
   }
+  // `emitUnionCoerceRefArray`'s nested rung: a ref list literal no arm takes by its own slot or
+  // its element, built at the union's one nested-list arm, which the checker stamped on it.
+  if (
+    bare is ArrayLit
+    && exprRefArray(exprIx, fnIx)
+    && listLitRefArmSlotOf(unionTy, exprIx, fnIx) < 0
+  ) {
+    const ns = unionNestedArrayArmSlot(unRowOfTyKey(unionTy))
+    if ns >= 0 && arrLitRefSlotAtTy(bareIx, fnIx) == ns {
+      const nt = refArrBoxTagOf(exprIx, fnIx, ns, unionTy)
+      return if nt >= 0 { holeBox("refList", nt, -1) } else { ladder }
+    }
+  }
   if exprIsNulNone(exprIx, fnIx) || !unionTyHasValueAtom(unionTy) {
     return ladder
   }
@@ -2393,6 +2418,49 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     "asgLit" | "radix" => holeBox("atom", k, -1)
     "convert" => ladder
   }
+}
+
+// The slot of union row `u`'s one nested-list arm, or -1 where it has none or several.
+function unionNestedArrayArmSlot(u: i32) {
+  // The arm rows come off the recorded member types, asking `unMemRefArrArmSlot` (does a
+  // row exist for the member's element) rather than the shape predicate `unMemIsRefElemArray`,
+  // since an inert over-accept is still not an equality.
+  const mems: i32[] = []
+  if !unionMemberTysOfRow(u, mems) { return -1 }
+  let found = -1
+  let n = 0
+  let i = 0
+  while i < mems.length {
+    const slot = unMemRefArrArmSlot(mems[i])
+    if slot >= 0 && slot < rlElemTyIx.length {
+      const k = rlElemKindAt(slot)
+      if (
+        k == RLK_I32_LIST
+        || k == RLK_STR_LIST
+        || k == RLK_F64_LIST
+        || k == RLK_I64_LIST
+        || k == RLK_REF_LIST
+        || k == RLK_F32_LIST
+        || k == RLK_V128_LIST
+      ) {
+        found = slot
+        n = n + 1
+      }
+    }
+    i = i + 1
+  }
+  if n == 1 { return found }
+  return -1
+}
+
+// Whether valued `if` `exprIx`, typed as a union, is a box that passes as `unionTy`'s unchanged
+// (`holePassPlanOf`'s "pass"), which the ladder's if rung would box arm by arm.
+export function ifJoinBoxPasses(exprIx: i32, unionTy: i32, fnIx: i32): boolean {
+  const bx = unwrapParen(exprIx)
+  if bx < 0 || !(nodeAt(bx) is IfStmt) || !exprUnion(exprIx, fnIx) {
+    return false
+  }
+  return holePassPlanOf(exprIx, unionTy, fnIx).hbArm == "pass"
 }
 
 // The one list arm slot of union `unionTy` whose wrapper is ref-list slot `slot`'s, or -1 when
@@ -2667,6 +2735,32 @@ export function armValuePlainOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
 }
 
 // The value-atom kind of primitive `pn`, -1 for one that is no value atom here.
+// The value-atom kind of union `t`'s one number member (a nullable's inner included), or -1 where
+// it holds none or several.
+function litUnionNumKind(t: i32): i32 {
+  const u = if t >= 0 { tyAt(t) } else { null }
+  const ms = if u is TyUnion { u.uMembers } else if u is TyNullable { [u.nInner] } else { [] }
+  let one = -1
+  for m in ms {
+    const p = tyScalarBasePrim(m)
+    const k = if p == null { -1 } else { holePrimKind(p) }
+    if k == 0 || k >= 3 {
+      if one >= 0 { return -1 }
+      one = k
+    }
+  }
+  return one
+}
+
+// Whether `ix` is a number literal under any parentheses and minus signs.
+function planSignedNumLit(ix: i32): boolean {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is NumLit { return true }
+  return n is Unary && n.unOp == "-" && planSignedNumLit(n.unArg)
+}
+
 function holePrimKind(pn: PrimName): i32 {
   return match pn {
     "i32" => 0
