@@ -13450,6 +13450,10 @@ the unread default that instances a generic handed to a parameter nothing reads 
 value's instance and never the type parameter other readers use; and a binding's alias source is
 the value it stores, whatever its annotation names. Ruled by the coordinator.
 
+The same rule holds one layer down: a type parameter's binding in an instance key comes from the
+facts about the TYPE; a value nothing reads gets its default or stub instance separately, keyed by
+the value, never by the type parameter (D17878). Ruled by the coordinator.
+
 ## A maker's call is built at its destination's record (coordinator ruling, 2026-11-28) — D17226, D17228
 
 A maker's call is built at the record its destination stores. The destination's stored rep
