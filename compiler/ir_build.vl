@@ -1904,7 +1904,9 @@ function isStagedTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   const vr = irBOpRep(v)
   if !stagedKeyHolds(k, vr) { return irBMiss("is staged rep") }
   const ty = heldTy(outTyOf(unwrapParen(n.isObj), vr))
-  if irTyHeldOpen(ty, vr) { return irBMiss("open temp type") }
+  if placeHeldOpen(exprPlace(unwrapParen(n.isObj)), ty, vr) {
+    return irBMiss("open temp type")
+  }
   const sv = irVarNew(ib, vr, ty, "local", -1)
   const n0 = b.length
   isRecvStagedIx = unwrapParen(n.isObj)
@@ -2653,7 +2655,7 @@ function objLitAt(
   // Built at a destination's row, or at the storage row of a type no row records
   // (`rowlessRecordTy`), the record is that row's type, not the literal's own. A type open only in
   // parts held as ids (a tagged function set's i32) is closed at its rep.
-  if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
+  if placeHeldOpen(exprPlace(ix), ty, rep) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "temp", -1)
   irBNode(b, { lDst: t, lRhs: rhs }, ty, rep, ix)
   const o: Opnd = { ov: t }
@@ -4052,7 +4054,7 @@ export function irBLetTempTy(
     || p == "f32"
     || p == "f64"
     || p == "bool"
-  const ty2 = if scalar && irTyHeldOpen(ty1, rep) && repTyOf(rep) >= 0 { repTyOf(rep) } else { ty1 }
+  const ty2 = if scalar && placeHeldOpen(exprPlace(ix), ty1, rep) && repTyOf(rep) >= 0 { repTyOf(rep) } else { ty1 }
   // A closure held at an open type's uniform closure rep is typed at that rep's own type, which
   // rule 1 takes as held (`closureHeld`), so its type and rep agree for rule 3.
   const crt = repTyOf(rep)
@@ -4060,7 +4062,7 @@ export function irBLetTempTy(
     && repNodeOfTy(ty2) != rep
     && crt >= 0
     && repNodeOfTy(crt) == rep
-    && !irTyHeldOpen(crt, rep)
+    && !placeHeldOpen(exprPlace(ix), crt, rep)
   const ty = if cloHeld { crt } else { ty2 }
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
   // the verifier can close, so its function stays legacy's.
@@ -4168,7 +4170,9 @@ export type StorePlace = SpBinding | SpField | SpReturned | SpElem
 // The result of `fnStmts` slot `spResultOf`: a place a held-open answer is asked of, with no
 // storage of its own (`placeHeldOpen`).
 export type SpResult = { spResultOf: i32 }
-export type HeldPlace = StorePlace | SpResult
+// The value expression node `spExprAt` builds: a temp's place, which a call's held record names.
+export type SpExpr = { spExprAt: i32 }
+export type HeldPlace = StorePlace | SpResult | SpExpr
 
 // Whether open type `ty` has an open part not held at rep `rep` in place `p`: every reader of a
 // binding's held-open answer asks it here, so the place's own decision can answer it.
@@ -4183,6 +4187,12 @@ function bindPlace(d: i32, global: boolean): StorePlace {
     spFrame: if global { -1 } else { ibFnIx },
     spGlobal: global,
   }
+  return p
+}
+
+// The place of the value expression node `ix` builds.
+function exprPlace(ix: i32): HeldPlace {
+  const p: SpExpr = { spExprAt: ix }
   return p
 }
 
@@ -4460,7 +4470,11 @@ function slotListRowTy(d: i32, rep: i32): i32 {
   const st = if st0 >= 0 && repNodeOfTy(st0) == rr { st0 } else { repTyOf(rr) }
   const lt = if st >= 0 { listTyOfElem(st) } else { -1 }
   const ln = if lt >= 0 { repNodeAt(repNodeOfTy(lt)) } else { null }
-  if !(ln is RList) || ln.rlsElem != rr || irTyHeldOpen(lt, repNodeOfTy(lt)) {
+  if (
+    !(ln is RList)
+    || ln.rlsElem != rr
+    || placeHeldOpen(bindPlace(d, false), lt, repNodeOfTy(lt))
+  ) {
     return -1
   }
   return lt
@@ -4483,7 +4497,7 @@ function elemRowLetTy(d: i32, rep: i32): i32 {
   const rr = if row >= 0 { rowRep(row) } else { -1 }
   if rr < 0 || rr == rep || !(repNodeAt(rr) is RRecord) { return -1 }
   const st = rowStoredTy(row)
-  return if st >= 0 && repNodeOfTy(st) == rr && !irTyHeldOpen(st, rr) { st } else { -1 }
+  return if st >= 0 && repNodeOfTy(st) == rr && !placeHeldOpen(bindPlace(d, false), st, rr) { st } else { -1 }
 }
 
 // Whether struct row `si`'s record and type `ty` are records of one field-name set: a value the record
@@ -4651,7 +4665,7 @@ function builtHeldTy(v: i32, d: i32, built: i32): i32 {
     return -1
   }
   const t = repTyOf(built)
-  return if t >= 0 && !irTyHeldOpen(t, built) { t } else { -1 }
+  return if t >= 0 && !placeHeldOpen(bindPlace(d, false), t, built) { t } else { -1 }
 }
 
 // Whether `const` `d`'s variable `v` is held at its build (`builtHeldTy`), its type's rep not its own.
@@ -4888,7 +4902,9 @@ function ifValueJoin(b: i32[], n0: IfStmt, ix0: i32, rep: i32, ty0: i32): Opnd {
     dk = if c is OImm && bareConstIs(c, n.ifCond, cb, cat) { if c.oiBits != 0 { 1 } else { 0 } } else { -1 }
     if ix == ix0 {
       ty = if ty0 >= 0 { ty0 } else { byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)) }
-      if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
+      if placeHeldOpen(exprPlace(ix0), ty, rep) {
+        return irBMiss("open temp type")
+      }
     }
     const t = irVarNew(ib, rep, ty, "local", -1)
     let thenB: i32[] = []
@@ -5030,7 +5046,9 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   // A non-record join delivered at another rep than its own type's (an arm list delivered at its
   // destination's element rep) is typed at the rep it is held at.
   const ty = if kind != "struct" && ty0 >= 0 && repNodeOfTy(ty0) != jr { repTyOf(jr) } else { ty0 }
-  if ty < 0 || irTyHeldOpen(ty, jr) { return irBMiss("open temp type") }
+  if ty < 0 || placeHeldOpen(exprPlace(ix), ty, jr) {
+    return irBMiss("open temp type")
+  }
   // A record join whose narrowed arm names no row here (legacy reads it off the arm in its scope)
   // is built at its rep's own record row (D4645's spellings).
   // So is one with an arm that is itself a value `if`, whose row legacy reads off that arm's own
@@ -12396,7 +12414,7 @@ function objLitAtVariantRow(b: i32[], ix: i32, vi: i32): Opnd {
   if ty < 0 { return irBMiss("variant row literal type") }
   // In a generic instance the row's registered type may still carry a variable.
   const rep = repNodeOfTy(ty)
-  if irTyOpen(ty) || irTyHeldOpen(ty, rep) {
+  if irTyOpen(ty) || placeHeldOpen(exprPlace(ix), ty, rep) {
     return irBMiss("open variant row literal type")
   }
   return objLitAt(b, unwrapParen(ix), rep, ty, vi, true)
@@ -14816,7 +14834,7 @@ function spreadLit(
   // A minted literal (a variadic push's run) has no checker type; it holds its build's. A literal
   // held at its laid-out row is typed at that row's list (`outTyOf`).
   const own = if rebuilt { heldTy(bt) } else { heldTy(outTyOf(ix, rep)) }
-  const ty = if irTyHeldOpen(own, rep) && bt >= 0 { heldTy(bt) } else { own }
+  const ty = if placeHeldOpen(exprPlace(ix), own, rep) && bt >= 0 { heldTy(bt) } else { own }
   return irBLetTempTy(b, r, ix, rep, ty)
 }
 
@@ -18452,7 +18470,12 @@ function cellNullBeside(t: i32, rep: i32): boolean {
 function regionTakesOwnVar(x: i32, cur: i32, curTy: i32): boolean {
   const ty = heldTy(nodeTyAt(x, ibFnIx))
   const r = repNodeOfTy(ty)
-  if r < 0 || r == cur || !valueRep(r, ty) || irTyHeldOpen(ty, r) {
+  if (
+    r < 0
+    || r == cur
+    || !valueRep(r, ty)
+    || placeHeldOpen(exprPlace(x), ty, r)
+  ) {
     return false
   }
   const o: Opnd = { oiRep: r, oiBits: 0 }
@@ -19869,7 +19892,7 @@ function elseStmts(e: i32): i32[] {
 function switchOperand(b: i32[], n0: i32, on: Opnd, at: i32): Opnd {
   if intSwitchOn(b, n0, on) { return on }
   const ty = nodeTyAt(at, ibFnIx)
-  if ty < 0 || irTyHeldOpen(ty, irBOpRep(on)) {
+  if ty < 0 || placeHeldOpen(exprPlace(at), ty, irBOpRep(on)) {
     return irBMiss("int switch scrutinee type")
   }
   const v = irVarNew(ib, irBOpRep(on), ty, "local", -1)
@@ -19902,7 +19925,7 @@ function valuedSwitch(
   const on = switchOperand(b, n0, on0, p.ispOn)
   if ibMiss != "" { return on }
   const ty = if ty0 >= 0 { ty0 } else { byteHeld(rowlessRecordTy(ix, nodeTyAt(ix, ibFnIx), rep)) }
-  if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
+  if placeHeldOpen(exprPlace(ix), ty, rep) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const arms: i32[][] = []
   for th in p.ispThens { arms.push(ifArmAt(th, t, rep, ty)) }
@@ -22384,7 +22407,7 @@ function tagCrossTakes(v: Opnd, dst: i32, at: i32): boolean {
 // signature; -1 when neither, which the lowering refuses rather than take another instance.
 function tagCloMemberFe(d: i32, at: i32, dst: i32): i32 {
   const u = if at >= 0 { unwrapParen(at) } else { -1 }
-  const id = if u >= 0 { fnTagValueArmFn(u, d) } else { -1 }
+  const id = if u >= 0 { fnTagValueArmFn(u, d, repTyOf(dst)) } else { -1 }
   if id >= 0 { return fnStmtsPosOf(id) }
   const own = fnStmtsPosOf(d)
   const want = cloNameSigKeyTy(repTyOf(dst))
