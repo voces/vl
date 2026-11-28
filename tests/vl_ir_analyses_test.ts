@@ -17,6 +17,7 @@ if (GATED && !ENABLED) {
 
 const FIXTURE = `${ROOT}/tests/ir-analyses/defuse.vl`;
 const CG_FIXTURE = `${ROOT}/tests/ir-analyses/callgraph.vl`;
+const EFF_FIXTURE = `${ROOT}/tests/ir-analyses/effect.vl`;
 
 // `count  row`: how many variables bank that row, then the row.
 const WANT_DU = [
@@ -82,6 +83,20 @@ const WANT_CG = [
   "1 scc 5 sq",
   "1 scc 6 twice$cb0",
   "1 cg complete true",
+];
+
+// The effect class of each line of `effect.vl` holding a right-hand side, one function per class:
+// arithmetic is pure, a division may trap, a push traps and writes, a recursive call calls.
+const WANT_EFF = [
+  "1 eff addUp 2 pure",
+  "1 eff addUp 3 pure",
+  "1 eff divide 6 trap",
+  "1 eff grow 10 trap,write",
+  // `.length` reads the list, which the class keeps as may-trap.
+  "1 eff grow 11 trap",
+  "1 eff down 14 pure",
+  "1 eff down 15 call",
+  "1 eff down 16 pure",
 ];
 
 const run = async (
@@ -193,5 +208,23 @@ Deno.test({
       );
     }
     sameRows("call-graph", cgRows(r.err), WANT_CG);
+  },
+});
+
+Deno.test({
+  name: "ir-analyses: effect classes match the hand-computed answers",
+  ignore: !ENABLED,
+  fn: async () => {
+    const r = await run("1", EFF_FIXTURE);
+    if (r.code !== 0 || r.out !== "10\n3\n4\n10\n") {
+      throw new Error(
+        `want rc 0 and 10 3 4 10, got rc ${r.code}: ${r.out}${r.err}`,
+      );
+    }
+    const got = r.err.split("\n").flatMap((l) => {
+      const m = /^\[ir\] .*: (\d+)\t(eff .*)$/.exec(l);
+      return m ? [`${m[1]} ${m[2]}`] : [];
+    });
+    sameRows("effect", got, WANT_EFF);
   },
 });
