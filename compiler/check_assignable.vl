@@ -1231,6 +1231,19 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
   return 0
 }
 
+// The one slot a holder type `t` keeps its function values in: a map's value, a list's element;
+// -1 for any other type, whose values are not written into a slot.
+function ctnSlotTyOf(t0: i32): i32 {
+  const t = nonNullTy(t0)
+  if t < 0 || t >= T.tys.length { return -1 }
+  const o = tyAt(t)
+  return match o {
+    TyMap => tyValOf(o)
+    TyArray => tyElemOf(o)
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg | TyFunc | TyObj | TyNullable => -1
+  }
+}
+
 // `ctnWrittenCstrsAt`, then for a value it does not refuse the place the value reads, traced
 // through aliases and returns (D10150). A value an assignment replaced on every path to the
 // delivery is judged by neither (D10202).
@@ -1281,16 +1294,16 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
     + ")"
   // A write that fits the destination's own slot is delivered there, as an annotation of the
   // binding at that type would hold it (D17756).
-  const dm = nonNullTy(dstTy)
-  const dmt = if dm >= 0 && dm < T.tys.length { tyAt(dm) } else { null }
-  const dv = if dmt is TyMap && whole { tyValOf(dmt) } else { -1 }
+  // Only a `const` holder's writes all reach the delivery; a `let` may be rebound first.
+  const dcn = nodeAt(d)
+  const held = dcn is LetDecl && dcn.letKw == "const"
+  const dv = if whole && held { ctnSlotTyOf(dstTy) } else { -1 }
   // Each generic function written there is delivered at that slot, adapted as an annotated
   // holder's write is (`fvaAdapt`).
   if dv >= 0 && !inferQuiet && monoRecheckDepth == 0 {
-    // The map's slot is the destination's, decided once: each write's bound into it reads that
-    // slot, not the one its first write's own type set (D17756).
-    const sm = if srcTy >= 0 && srcTy < T.tys.length { tyAt(srcTy) } else { null }
-    const old = if sm is TyMap { tyValOf(sm) } else { -1 }
+    // The holder's slot is the destination's, decided once: each write's bound into it reads that
+    // slot, not the one its first write's own type set (D17756, D17810).
+    const old = ctnSlotTyOf(srcTy)
     let bi = 0
     while old >= 0 && bi < bndCount(BND_BM) {
       const bw0 = bndAt(BND_BM, bi)
@@ -1303,6 +1316,20 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
         const wd = identDeclOf(wv)
         if wd >= 0 && wd < P.nodes.length && nodeAt(wd) is FuncDecl {
           fvaAdapt(wv0, nodeTyOf(wv0), dv)
+        }
+      }
+    }
+    // A list literal the binding starts from holds its first writes.
+    const li = if dcn is LetDecl && dcn.letInit >= 0 { parenPeelIx(dcn.letInit) } else { -1 }
+    const ll = if li >= 0 { nodeAt(li) } else { null }
+    if ll is ArrayLit {
+      for el in ll.arrElems {
+        const ex = parenPeelIx(el)
+        if ex >= 0 && nodeAt(ex) is Ident && spreadArgOf(el) < 0 {
+          const ed = identDeclOf(ex)
+          if ed >= 0 && ed < P.nodes.length && nodeAt(ed) is FuncDecl {
+            fvaAdapt(el, nodeTyOf(el), dv)
+          }
         }
       }
     }
