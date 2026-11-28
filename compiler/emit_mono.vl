@@ -11042,14 +11042,6 @@ function monoValueNamesGenerics(v: i32, ctx: i32, depth: i32): boolean {
     && (en || monoArmNamesGenerics(n.ifElse, ctx, depth + 1))
 }
 
-// Whether `if` arm `arm`'s value is the `null` literal.
-function monoArmIsNull(arm: i32): boolean {
-  if arm < 0 || arm >= P.nodes.length { return false }
-  const tv = ifArmValueExpr(arm)
-  const v = unwrapParen(if tv >= 0 { tv } else { arm })
-  return v >= 0 && nodeAt(v) is NullLit
-}
-
 // Whether `if` arm block `arm` ends in a call that never returns.
 function monoArmEndsNever(arm: i32): boolean {
   if arm < 0 || arm >= P.nodes.length { return false }
@@ -11278,7 +11270,31 @@ function monoCoerceChoiceBinding(
   const et = if monoTyConcreteFn(xt) { xt } else { tn }
   const pTys = delTys
   const iv = unwrapParen(d.letInit)
-  if monoChoiceHasNull(iv, 0) && !monoNullChoiceAtDest(lf, et) { return 0 }
+  // A choice with a `null` arm is taken only where the elaboration types it the nullable of the
+  // destination's function; where the arm's instance differs it stays refused (D17828, D17829).
+  // Whether the choice, or an `if` an arm of it hands on, has an arm whose value is `null`.
+  let nul = false
+  const xs: i32[] = [iv]
+  while xs.length > 0 && !nul {
+    const x = xs.pop() ?? -1
+    const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if xn is IfStmt {
+      for arm in [xn.ifThen, xn.ifElse] {
+        const tv = if arm >= 0 { ifArmValueExpr(arm) } else { -1 }
+        const a = unwrapParen(if tv >= 0 { tv } else { arm })
+        if a >= 0 && nodeAt(a) is NullLit { nul = true }
+        xs.push(a)
+      }
+    }
+  }
+  const ht = if nul { elabNodeTy(lf[1], if lf[0] >= 0 { elabKeyAt(lf[0]) } else { -1 }) } else { -1 }
+  const hn = if ht >= 0 && ht < T.tys.length { tyAt(ht) } else { null }
+  if (
+    nul
+    && !(hn is TyNullable && hn.nInner >= 0 && tySameSealed(hn.nInner, et))
+  ) {
+    return 0
+  }
   const g0 = monoFirstArmGenName(iv, lf[0], 0)
   const seen = monoChoiceBindNote(
     lf,
@@ -11292,11 +11308,19 @@ function monoCoerceChoiceBinding(
   }
   if monoCoerceFnValueTys(d.letInit, lf[0], xt, pTys, tn) < 0 { return -1 }
   // A choice holding `null` is typed at the nullable of its arm's instance (`monoRetypeIfInit`).
-  if monoTyConcreteFn(et) && !monoChoiceHasNull(iv, 0) {
+  if monoTyConcreteFn(et) && !nul {
     nodeTyRecord(iv, et)
     nodeTyRecord(d.letInit, et)
   } else {
     monoRetypeIfInit(d.letInit, monoFirstArmGenName(iv, lf[0], 0), at, lf[0])
+    // One holding `null` holds the nullable of its arm's instance, as does the read it typed.
+    const it = nodeTyIxOf(iv)
+    if nul && monoTyConcreteFn(it) {
+      const ht = mkNullableTy(it)
+      if nodeTyIxOf(at) == it { nodeTyRecord(at, ht) }
+      nodeTyRecord(iv, ht)
+      nodeTyRecord(d.letInit, ht)
+    }
   }
   monoRetypeChoiceRead(d.letInit, at)
   return 1
@@ -11337,45 +11361,11 @@ function monoRetypeIfInit(init: i32, g0: i32, at: i32, ctx: i32): i32 {
   const it = monoNodeTyAt(g0, fnStmts[inst])
   if !monoTyConcreteFn(it) { return 0 }
   const iv = unwrapParen(init)
-  const ht = monoChoiceHeldTy(iv, it)
-  if iv >= 0 { nodeTyRecord(iv, ht) }
-  nodeTyRecord(init, ht)
+  if iv >= 0 { nodeTyRecord(iv, it) }
+  nodeTyRecord(init, it)
   const rt = nodeTyIxOf(at)
-  if rt < 0 || tyHasTyVar(rt) { nodeTyRecord(at, ht) }
+  if rt < 0 || tyHasTyVar(rt) { nodeTyRecord(at, it) }
   return 0
-}
-
-// Whether choice binding `lf`, which has a `null` arm, is typed by the elaboration as the nullable
-// of destination function `et`: where the arm's instance differs, it is left to the refusal
-// (D17828, D17829).
-function monoNullChoiceAtDest(lf: i32[], et: i32): boolean {
-  const ht = elabNodeTy(lf[1], if lf[0] >= 0 { elabKeyAt(lf[0]) } else { -1 })
-  const h = if ht >= 0 && ht < T.tys.length { tyAt(ht) } else { null }
-  return h is TyNullable && h.nInner >= 0 && tySameSealed(h.nInner, et)
-}
-
-// The type choice `iv` holds where its functions are at `t`: `t`, or its nullable where an arm is
-// the `null` literal (D17818).
-function monoChoiceHeldTy(iv: i32, t: i32): i32 {
-  return if monoChoiceHasNull(iv, 0) { mkNullableTy(t) } else { t }
-}
-
-// Whether choice `v`, or an `if` an arm of it hands on, has an arm whose value is `null`.
-function monoChoiceHasNull(v: i32, depth: i32): boolean {
-  const x = unwrapParen(v)
-  if x < 0 || x >= P.nodes.length || depth > MONO_ALIAS_CHAIN_MAX {
-    return false
-  }
-  const n = nodeAt(x)
-  if !(n is IfStmt) { return false }
-  for arm in [n.ifThen, n.ifElse] {
-    if monoArmIsNull(arm) { return true }
-    const tv = if arm >= 0 { ifArmValueExpr(arm) } else { -1 }
-    if monoChoiceHasNull(if tv >= 0 { tv } else { arm }, depth + 1) {
-      return true
-    }
-  }
-  return false
 }
 
 // The name node of the declared generic the first arm of value `v` names, through nested `if`
