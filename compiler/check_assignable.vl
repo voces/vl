@@ -6703,6 +6703,7 @@ function lamRetFreshNone(_lx: i32, _own: i32, _dst: i32): boolean {
 let fvaAliasSite: i32[] = []
 let fvaAliasDecl: i32[] = []
 let fvaAliasElem: i32[] = []
+let fvaAliasSrc: i32[] = []
 
 // Notes a delivery of a binding's list of a set's records to a mutable list closing a field.
 function fvaAliasNote(site: i32, srcTy: i32, dstTy: i32) {
@@ -6724,6 +6725,7 @@ function fvaAliasNote(site: i32, srcTy: i32, dstTy: i32) {
   fvaAliasSite.push(site)
   fvaAliasDecl.push(d)
   fvaAliasElem.push(dr)
+  fvaAliasSrc.push(sr)
   return 0
 }
 
@@ -6732,11 +6734,13 @@ export function fvaAliasReset() {
   fvaAliasSite = []
   fvaAliasDecl = []
   fvaAliasElem = []
+  fvaAliasSrc = []
   return 0
 }
 
-// Refuses each noted alias delivery where a call through the binding's element field meets the
-// destination's closed field at another signature: the two names are one storage. One walk.
+// Refuses each noted alias delivery where a call of a function the aliased field's set holds,
+// read from that storage or from none a binding names, meets the destination's closed field at
+// another signature: the two names are one storage, called at one signature. One walk.
 export function fvaAliasConflictsAll() {
   if fvaAliasSite.length == 0 { return 0 }
   const refused: boolean[] = []
@@ -6744,14 +6748,15 @@ export function fvaAliasConflictsAll() {
   let i = 0
   while i < P.nodes.length {
     const n = nodeAt(i)
-    const fm = if n is Call { fvaCalleeMember(n.callFn) } else { -1 }
-    const m = if fm >= 0 { nodeAt(fm) } else { null }
-    if n is Call && m is Member {
+    const cs = if n is Call { fnTagSetOfTy(nodeTyIxOf(n.callFn)) } else { -1 }
+    const root = if n is Call && cs >= 0 { fvaCallRoot(n.callFn) } else { -1 }
+    if n is Call && cs >= 0 {
       let k = 0
       while k < fvaAliasSite.length {
         if (
           !refused[k]
-          && fvaAliasCallMeets(n.callArgs, m, fvaAliasDecl[k], fvaAliasElem[k])
+          && (root == fvaAliasDecl[k] || root < 0)
+          && fvaAliasCallMeets(n.callArgs, cs, fvaAliasSrc[k], fvaAliasElem[k])
         ) {
           refused[k] = true
           tErr(fvaAliasMsg(fvaAliasDecl[k]), fvaAliasSite[k])
@@ -6764,68 +6769,57 @@ export function fvaAliasConflictsAll() {
   return 0
 }
 
-// Whether a call of field read `m` with arguments `args` reads an element of binding `d` and
-// does not store them as record `dr`'s closed field takes them.
-function fvaAliasCallMeets(args: i32[], m: Member, d: i32, dr: i32): boolean {
-  const ro = tyAt(dr)
-  if !(ro is TyObj) { return false }
-  const k = strListIndexOf(ro.objFieldNames, m.memProp)
-  return k >= 0
-    && fvaElemOfDecl(m.memObj, d)
-    && !fvaArgsStoreAt(args, ro.objFieldTypes[k])
-}
-
-// The field read callee `c` calls: `c` itself, or the read a `const` it names is bound to; -1.
-function fvaCalleeMember(c: i32): i32 {
+// The binding whose storage callee `c` reads its function from: the root of the object of the
+// field it reads, or of the field read a binding it names holds; -1 where no binding is known.
+function fvaCallRoot(c: i32): i32 {
   const x = parenPeelIx(c)
   if x < 0 || x >= P.nodes.length { return -1 }
   const n = nodeAt(x)
-  if n is Member { return x }
+  if n is Member { return fvaStorageRoot(n.memObj) }
   if !(n is Ident) { return -1 }
   const dd = identDeclOf(x)
   const dn = if dd >= 0 && dd < P.nodes.length { nodeAt(dd) } else { null }
-  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+  if !(dn is LetDecl) || dn.letInit < 0 { return -1 }
   const ix = parenPeelIx(dn.letInit)
-  return if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Member { ix } else { -1 }
+  const iv = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+  return if iv is Member { fvaStorageRoot(iv.memObj) } else { -1 }
 }
 
-// Whether expression `x` reads an element of binding `d`'s list: `d[i]`, a `for` variable over
-// `d`, or a `const` bound to one of these.
-function fvaElemOfDecl(x0: i32, d: i32): boolean {
+// The binding whose storage expression `x` reads: through an index, a `for` variable or a
+// binding initialised from such a read, to the binding that holds anything else; -1 where none.
+function fvaStorageRoot(x0: i32): i32 {
   const x = parenPeelIx(x0)
-  if x < 0 || x >= P.nodes.length { return false }
+  if x < 0 || x >= P.nodes.length { return -1 }
   const n = nodeAt(x)
-  if n is Index { return fvaNamesDecl(n.idxArr, d) }
-  if !(n is Ident) { return false }
+  if n is Index { return fvaStorageRoot(n.idxArr) }
+  if !(n is Ident) { return -1 }
   const dd = identDeclOf(x)
   const dn = if dd >= 0 && dd < P.nodes.length { nodeAt(dd) } else { null }
   if dn is LoopVar {
     const l = if dn.lvLoop >= 0 && dn.lvLoop < P.nodes.length { nodeAt(dn.lvLoop) } else { null }
-    return l is ForIn && fvaNamesDecl(l.fiIter, d)
+    return if l is ForIn { fvaStorageRoot(l.fiIter) } else { -1 }
   }
-  if (
-    dn is LetDecl
-    && dn.letKw == "const"
-    && dn.letInit >= 0
-    && dn.letInit != x
-  ) {
-    return fvaElemOfDecl(dn.letInit, d)
-  }
-  return false
+  if !(dn is LetDecl) { return -1 }
+  const ix = if dn.letInit >= 0 { parenPeelIx(dn.letInit) } else { -1 }
+  const iv = if ix >= 0 && ix < P.nodes.length && ix != x { nodeAt(ix) } else { null }
+  if iv is Ident || iv is Index { return fvaStorageRoot(ix) }
+  return dd
 }
 
-// Whether expression `x` is a read of binding `d`, or of a `const` bound to one.
-function fvaNamesDecl(x0: i32, d: i32): boolean {
-  const x = parenPeelIx(x0)
-  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return false }
-  const dd = identDeclOf(x)
-  if dd == d { return true }
-  const dn = if dd >= 0 && dd < P.nodes.length { nodeAt(dd) } else { null }
-  return dn is LetDecl
-    && dn.letKw == "const"
-    && dn.letInit >= 0
-    && dn.letInit != x
-    && fvaNamesDecl(dn.letInit, d)
+// Whether a call through set `cs` with arguments `args` calls a set record `sr`'s field holds,
+// and does not store them as record `dr`'s closed field takes them.
+function fvaAliasCallMeets(args: i32[], cs: i32, sr: i32, dr: i32): boolean {
+  const so = tyAt(sr)
+  const ro = tyAt(dr)
+  if !(so is TyObj) || !(ro is TyObj) { return false }
+  let k = 0
+  while k < ro.objFieldNames.length {
+    const j = strListIndexOf(so.objFieldNames, ro.objFieldNames[k])
+    const fs = if j >= 0 { fnTagSetOfTy(so.objFieldTypes[j]) } else { -1 }
+    if fs == cs && !fvaArgsStoreAt(args, ro.objFieldTypes[k]) { return true }
+    k = k + 1
+  }
+  return false
 }
 
 // Whether arguments `args` store as the closed function type `ft` takes them.
