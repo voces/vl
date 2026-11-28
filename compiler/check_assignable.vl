@@ -166,6 +166,8 @@ import {
   genFnCstrBusy,
   genFnCstrBusySet,
   nodeCtxTyIxOf,
+  nodeRepStamped,
+  nodeRepTyIxOf,
   retNatural,
   retNaturalErr,
   retNaturalErrSet,
@@ -355,6 +357,7 @@ import {
   BM_PUSH,
   BM_SETKEY,
   BM_SETVAL,
+  CODE_GENERIC_BINDING_CONCRETE_WRITE,
 } from "./check_messages"
 import { boolForNumberNote, letAssignMsg } from "./check_mismatch_notes"
 import { narConvListDelivery, narListDeliveryErr } from "./check_narrow_flow"
@@ -424,6 +427,7 @@ import {
   litLeafFitting,
   substTyDeep,
   tErr,
+  tErrCoded,
   widenLitTy,
 } from "./check_relate_core"
 import { recordListWidenRetag } from "./check_retag_rows"
@@ -3754,6 +3758,28 @@ function letFnRowOutsideCall(ci: i32, c: i32): boolean {
   return own >= 0 && d != own && nodeAt(d) is LetDecl
 }
 
+// Whether value `site` initialises, or is written whole to, a `let` or `const` its own
+// annotation types; an un-annotated binding takes a write per call type instead (D6520).
+function rowLetAnnotated(site: i32): boolean {
+  const x = parenPeelIx(site)
+  if x < 0 || !cwIxCovers(x) { return false }
+  let d = -1
+  if cwIxUpKind[x] == CW_UP_LETINIT { d = cwIxUp[x] }
+  if cwIxUpKind[x] == CW_UP_ASG_RHS {
+    const a = nodeAt(cwIxUp[x])
+    if (
+      a is BinExpr
+      && a.binOp == "="
+      && nodeAt(parenPeelIx(a.binLeft)) is Ident
+    ) {
+      d = identDeclOf(parenPeelIx(a.binLeft))
+    }
+  }
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  return n is LetDecl && n.letType >= 0
+}
+
 // The binding rule for one `BND_LET` bound `row` (row `ci` of its kind) of `calleeFn`: a value the
 // body stores in a `let` or `const` must fit it at the bindings (`letAssignMsg`, attributed to the
 // call); either side still open re-defers.
@@ -3797,6 +3823,31 @@ export function letRule(
     // A generic function value into a declared binding a generic function type annotates:
     // judged now, as no call closes the binding's type (D17322). A write keeps its own rules.
     const gw = if !clash && row.s != "" && tyHasHole(lg) && tyHasHole(lw) { genSigFitWhy(lg, lw, row.s) } else { GEN_SIG_DEFER }
+    // A concrete function into a binding the call leaves at a generic declaration's own
+    // signature: T9.3 holds only a generic function there.
+    if (
+      !clash
+      && !tyHasHole(lg)
+      && lg >= 0
+      && lg < T.tys.length
+      && tyAt(lg) is TyFunc
+      && genSigDecl(lw) >= 0
+      && rowLetAnnotated(row.site)
+      && !letLamJudgedAtCall(ci, ix)
+    ) {
+      tErrCoded(
+        "cannot assign "
+          + tyToStr(lg)
+          + (if row.s != "" { " to '" + row.s + "'" } else { " to a binding" })
+          + " of the generic function type "
+          + genSigStr(lw, genSigDecl(lw))
+          + ": a function written to it must be generic too (T9.3) ("
+          + atCallWhereAs(row.fn, who, row.on, row.a, row.site, ix, "used", "body")
+          + ")",
+        ix,
+        CODE_GENERIC_BINDING_CONCRETE_WRITE,
+      )
+    }
     if gw != GEN_SIG_DEFER && gw != "" && !letLamJudgedAtCall(ci, ix) {
       tErr(
         gw
@@ -4593,6 +4644,8 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
   if !(sa is TyArray) || tyElemOf(sa) == de || fvaListHoldsLetAlias(site) {
     return false
   }
+  // A value already built at the destination's list needs no copy (D17753).
+  if fvaListBuiltAt(site, de) { return false }
   // A set's elements, or a hole parameter's, which an instance binds to one.
   const held = fnTagSetValueOfTy(tyElemOf(sa))
     || fnTagSetOfTy(tyElemOf(sa)) >= 0
@@ -4629,6 +4682,20 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
   }
   const lam = luAt(addNode(fvaLambda(ps, rt, body, site, pos)), site)
   return listSiteMapCopy(site, lam, pos)
+}
+
+// Whether list value `site`, or the literal the binding it reads is built from, is built at a list
+// of closed function type `de`: the one build decision (the rep stamp) already holds closures.
+function fvaListBuiltAt(site: i32, de: i32): boolean {
+  const x = cwPeelValue(site)
+  if x < 0 || x >= P.nodes.length { return false }
+  const d = if nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const v = if dn is LetDecl && dn.letType < 0 && dn.letInit >= 0 { cwPeelValue(dn.letInit) } else { x }
+  if v < 0 || v >= P.nodes.length || !nodeRepStamped(v) { return false }
+  const r = nodeRepTyIxOf(v)
+  const ra = if r >= 0 && r < T.tys.length { tyAt(r) } else { null }
+  return ra is TyArray && tySame(tyElemOf(ra), de)
 }
 
 // Set while `fvaAdaptEnclosing` lets an adapter name the enclosing generic's type parameters.

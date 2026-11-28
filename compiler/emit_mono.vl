@@ -14325,6 +14325,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
       nodeTyRecord(e, ft)
     }
   }
+  monoRetypeElemTakeAliases(ctx, at, ft)
   let ri = 0
   while ri + 1 < repoints.length {
     const rl = nodeAt(repoints[ri])
@@ -16925,6 +16926,64 @@ function monoRetypeMethodReads(ctx: i32, at: i32, method: string, t: i32) {
   return 0
 }
 
+// Types, at `ft` or `ft | null` where the checker left them open, each `const` the list binding
+// declared at `at` hands an element by `pop` or `get` in frame `ctx`, through further such
+// `const`s, that call and the aliases' reads, so a call through a narrowed read has the pinned
+// element's signature.
+function monoRetypeElemTakeAliases(ctx: i32, at: i32, ft: i32) {
+  const d = nodeAt(at)
+  if !(d is LetDecl) { return 0 }
+  const nt = mkNullableTy(ft)
+  const nodes = monoFrameNodes(ctx)
+  const aliases: i32[] = []
+  for ax in nodes {
+    const a = nodeAt(ax)
+    const ii = if a is LetDecl && a.letKw == "const" && a.letType < 0 { unwrapParen(a.letInit) } else { -1 }
+    for m in ["pop", "get"] {
+      const recv = monoMethodCallRecv(ii, m)
+      if (
+        recv >= 0
+        && monoReadsBinding(recv, d.letName, ctx, at)
+        && monoTyOpen(nodeTyIxOf(ii))
+      ) {
+        nodeTyRecord(ii, nt)
+        aliases.push(ax)
+      }
+    }
+  }
+  let ai = 0
+  while ai < aliases.length {
+    const a = nodeAt(aliases[ai])
+    if a is LetDecl {
+      if monoTyOpen(nodeTyIxOf(aliases[ai])) { nodeTyRecord(aliases[ai], nt) }
+      for ix in nodes {
+        const ty = nodeTyIxOf(ix)
+        if (
+          ty >= 0
+          && ty < T.tys.length
+          && monoTyOpen(ty)
+          && monoReadsBinding(ix, a.letName, ctx, aliases[ai])
+        ) {
+          nodeTyRecord(ix, if tyAt(ty) is TyNullable { nt } else { ft })
+        }
+        const b = nodeAt(ix)
+        if (
+          b is LetDecl
+          && b.letKw == "const"
+          && b.letType < 0
+          && b.letInit >= 0
+          && monoReadsBinding(unwrapParen(b.letInit), a.letName, ctx, aliases[ai])
+          && !i32ListHas(aliases, ix)
+        ) {
+          aliases.push(ix)
+        }
+      }
+    }
+    ai = ai + 1
+  }
+  return 0
+}
+
 // Whether node `ix` reads a value of the map or list the binding `name` declared at `at` holds
 // (`monoReadsSlotOf`), `d[k]` or `d.get(k)`.
 function monoIsMapValueRead(
@@ -18302,6 +18361,73 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
     monoElemTakenSig[el] = nm
   }
   nodeTyRecord(n.callFn, ft)
+  return 1
+}
+
+// Call `n` (node `ix`) straight through an element of a list literal written in place, whose
+// function elements the check left open and whose arguments are closed values: each element is
+// instanced at the argument types, and the literal and callee typed at that one signature.
+// 1 when it typed the callee, 0 when none applies, -1 on a failure.
+function monoInlineListCallAt(n: Call, ix: i32, ctx: i32): i32 {
+  const cx = unwrapParen(n.callFn)
+  const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
+  if !(cn is Index) { return 0 }
+  const lx = unwrapParen(cn.idxArr)
+  const lit = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  if (
+    !(lit is ArrayLit)
+    || lit.arrElems.length == 0
+    || !monoTyOpen(nodeTyIxOf(cx))
+  ) {
+    return 0
+  }
+  const pts: i32[] = []
+  for a in n.callArgs {
+    const at = nodeTyIxOf(unwrapParen(a))
+    if at < 0 || at >= T.tys.length || monoTyOpen(at) || tyAt(at) is TyFunc {
+      return 0
+    }
+    pts.push(at)
+  }
+  const hN: string[] = []
+  const hT: i32[] = []
+  monoOneInstHoleBinds(hN, hT)
+  let ft = -1
+  for el in lit.arrElems {
+    const fx = if nodeAt(el) is Spread { -1 } else { elabOpenFnArgDecl(el) }
+    const f = if fx >= 0 { nodeAt(fx) } else { null }
+    if (
+      !(f is FuncDecl)
+      || f.fnTyParams.length > 0
+      || f.fnParams.length != pts.length
+    ) {
+      return 0
+    }
+    for p in f.fnParams {
+      const pn = nodeAt(p)
+      if !(pn is Param) || pn.parType >= 0 { return 0 }
+    }
+    const r = monoFnDeclRetAtUnder(fx, pts, hN, hT)
+    if r < 0 { return 0 }
+    const et = mkFuncTy(pts, r)
+    if !monoTyClosedFn(et) || (ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft)) {
+      return 0
+    }
+    ft = et
+  }
+  for el in lit.arrElems {
+    if monoLamLitTakeTys(el, ctx, [], ft) != 0 {
+      return emitFailAt(
+        "emitProgram: a lambda this call reaches through a list cannot take the call's function type",
+        el,
+      )
+    }
+    if monoCoerceFnValueName(el, ctx, ft) < 0 { return -1 }
+    if monoTyOpen(nodeTyIxOf(el)) { nodeTyRecord(el, ft) }
+  }
+  nodeTyRecord(lx, mkArrayTy(ft))
+  nodeTyRecord(cx, ft)
+  if monoTyOpen(nodeTyIxOf(ix)) { nodeTyRecord(ix, monoFnTyRet(ft)) }
   return 1
 }
 
@@ -23538,6 +23664,10 @@ function monoWalk(ix: i32, ctx: i32) {
         elemsTyped = monoOpenCallAtElems(n, ix, ctx)
         if elemsTyped < 0 { return -1 }
       }
+      if elemsTyped == 0 {
+        elemsTyped = monoInlineListCallAt(n, ix, ctx)
+        if elemsTyped < 0 { return -1 }
+      }
       if n.callFn < 0 { return 0 }
       const callee = nodeAt(n.callFn)
       // An `if` called in place asks the split as a binding of it does (D7848).
@@ -24951,7 +25081,8 @@ function monoMapValTy(t: i32): i32 {
 }
 
 // `monoDeliverLitAt` for a list or record literal `v` stored into place `e`, or into its slot
-// `kid` when not "", whose type there is `ty`; nothing for any other value.
+// `kid` when not "", whose type there is `ty`; nothing for any other value. A slot still open is
+// the literal's own closed stamp, the type its declaration laid it out at (D17742).
 function monoDeliverLitAtPlace(
   v: i32,
   e: i32,
@@ -24964,7 +25095,9 @@ function monoDeliverLitAtPlace(
   const path: string[] = []
   const d = monoPlaceRoot(e, path, 0)
   if kid != "" { path.push(kid) }
-  return monoDeliverLitAt(x, d, path, ty, ctx, 0)
+  const own = nodeRepTyIxOf(x)
+  const at = if tyHasTyVar(ty) && own >= 0 && !tyHasTyVar(own) { own } else { ty }
+  return monoDeliverLitAt(x, d, path, at, ctx, 0)
 }
 
 // Each function list or record literal `v` holds, at slot `path` of binding `d` (-1 for none)

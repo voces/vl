@@ -30,7 +30,7 @@ import {
   nulUnitPlaceReadAt,
   spreadGroupConverts,
 } from "./wasmEmit"
-import { lmForUnionArms } from "./emit_classify"
+import { identLetOfRead, lmForUnionArms } from "./emit_classify"
 import { mapUnionForKnownArm, mapUnionForPairTy } from "./wasmEmit"
 import { asExprNumCastDomain } from "./emit_union_casts"
 import { litAtomMark, litAtomRollback } from "./emit_lit_atoms"
@@ -66,7 +66,7 @@ import {
   cloLiftWriteSlot,
   cloLifted,
 } from "./ir_lift"
-import { cloLiftCalleeOf } from "./ir_lift_scan"
+import { cloLiftCalleeOf, cloLiftFramePos } from "./ir_lift_scan"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import {
   sigKeyRetIsVoid,
@@ -650,7 +650,11 @@ import {
   structRowFnSlotLayout,
   structRowOfRecordTy,
 } from "./emit_shape_rows"
-import { mvValTyIxAt, unMemRefArrArmSlot } from "./emit_map_value_slots"
+import {
+  mvValTyIxAt,
+  tyRefArrElemOf,
+  unMemRefArrArmSlot,
+} from "./emit_map_value_slots"
 import {
   BinNulTest,
   NULL_OWN_ATOM,
@@ -3586,10 +3590,7 @@ function openCallValue(b: i32[], n: Call, ix: i32): Opnd {
   ) {
     return repMissAt(ix, miss)
   }
-  // A call through a `const` bound to a lambda that captures nothing, whose closure call has no
-  // rep, is the direct call of that lambda, at its signature's rep: the binding holds no other.
-  const kl = constLambdaCallee(n, ix)
-  const rhs = if kl >= 0 { directCallAt(b, n, ix, kl) } else { callRhs(b, n, ix) }
+  const rhs = callRhs(b, n, ix)
   if ibMiss != "" { return irBMiss("call") }
   // A closure call is at the scalar its key's result names, as legacy's `call_ref` leaves it.
   if rhs is RCallRef && !rhs.crNever && !rhs.crVoid {
@@ -3797,7 +3798,10 @@ function closedListElemTy(lt: i32): i32 {
   if lt < 0 { return -1 }
   const ln = repNodeAt(repNodeOfTy(lt))
   if !(ln is RList) { return -1 }
-  const et = repTyOf(ln.rlsElem)
+  // A rep's type is whichever type first reached its key (a tagged set's open function at the
+  // `i32` leaf), so a list type's own closed element answers before it (D17768).
+  const own = tyRefArrElemOf(lt)
+  const et = if own >= 0 && !irTyOpen(own) { own } else { repTyOf(ln.rlsElem) }
   return if et >= 0 && !irTyOpen(et) { et } else { -1 }
 }
 
@@ -4807,7 +4811,7 @@ function ifValueJoin(b: i32[], n0: IfStmt, ix0: i32, rep: i32, ty0: i32): Opnd {
     conds.push(c)
     outs.push(t)
     thens.push(thenB)
-    const nx = if dk == 1 || valueIfLitTrue(n.ifCond) { -1 } else { spineLinkOf(n.ifElse, rep, ty, ty0) }
+    const nx = if dk == 1 || valueIfLitTrue(n.ifCond) { -1 } else { spineLinkOf(n.ifElse) }
     if nx < 0 { break }
     const nn = nodeAt(nx)
     if !(nn is IfStmt) { break }
@@ -4853,9 +4857,8 @@ function ifValueJoin(b: i32[], n0: IfStmt, ix0: i32, rep: i32, ty0: i32): Opnd {
 }
 
 // The `if` an `else` (`elseIx`) holds as its whole value, where it is built as this join builds a
-// link: no prelude or hook of its own, and either the head is built at a destination's type (`ty0`
-// not -1), which every link takes, or the link is a scalar or atom join at `rep` and `ty`; else -1.
-function spineLinkOf(elseIx: i32, rep: i32, ty: i32, ty0: i32): i32 {
+// link: no prelude or hook of its own; else -1. Its arms are built at this join's rep.
+function spineLinkOf(elseIx: i32): i32 {
   if elseIx < 0 || elseIx >= P.nodes.length { return -1 }
   const en = nodeAt(elseIx)
   let tv = elseIx
@@ -4871,13 +4874,7 @@ function spineLinkOf(elseIx: i32, rep: i32, ty: i32, ty0: i32): i32 {
     return -1
   }
   if ifIntMatchWhy(tv, ibFnIx) != "" { return -1 }
-  if ty0 >= 0 { return tv }
-  if exprUnion(tv, ibFnIx) { return -1 }
-  const arm = ifJoinPlanOf(tv, ibFnIx).ijArm
-  if arm != "scalar" && arm != "atom" || exprRepOf(tv) != rep { return -1 }
-  if byteHeld(rowlessRecordTy(tv, nodeTyAt(tv, ibFnIx), rep)) != ty {
-    return -1
-  }
+  // A link is an arm of this join, so it is built at the join's rep, whatever that rep's kind.
   return tv
 }
 
@@ -6343,7 +6340,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if unbox && ak < 0 { return irBMiss("capture unbox") }
   const narrowed = unbox || na == "plain" || na == "held"
   // A closure capture read where its type leaves a closure part open, or fills one, is the same
-  // closure struct, retagged.
+  // closure struct, read at the capture's own rep: one value, one layout (D17755).
   const holed = cr != rep
     && !narrowed
     && holeRetagNoted(cr, rep, true)
@@ -6402,8 +6399,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     const own = irBLetTempTy(b, ev, ix, cr, cty)
     // Retagged to a rep whose type is open, the value would have no type; a holder's member is
     // read as its capture holds it, as a global holder's is.
-    if holed && irTyHeldOpen(heldTy(exprTyOf(ix)), rep) { return own }
-    if holed { return repTemp(b, { rgV: own }, ix, rep) }
+    if holed { return own }
     if boxed { return irBLetTemp(b, { sgV: own }, ix, rep) }
     if unbox { return captureUnbox(b, own, ix, rep, ak) }
     return captureRecover(b, own, ix, rep, na)
@@ -6417,8 +6413,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if v < 0 || ib.irVars[v].vRep != held { return irBMiss("capture binding") }
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
-  if holed && irTyHeldOpen(heldTy(exprTyOf(ix)), rep) { return o }
-  if holed { return repTemp(b, { rgV: o }, ix, rep) }
+  if holed { return o }
   if boxed { return irBLetTemp(b, { sgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
@@ -7287,6 +7282,9 @@ function globalStorage(d: i32): Storage {
   ) {
     return storageAt(ar, repTyOf(ar), -1)
   }
+  // Past that, legacy's atom cell holds a single string literal: the atom node, typed at that
+  // literal, as a local's cell is.
+  if at >= 0 { return storageAt(repAtomNode(), heldTy(at), -1) }
   // A list global whose storage row is another list, a wider record's, is held at that row.
   const bt = if ht < 0 && repNodeAt(r) is RList { heldTy(letBindTy(d, -1)) } else { -1 }
   const br = if bt >= 0 { globalTyRep(bt) } else { -1 }
@@ -7702,6 +7700,10 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if nullBindingCall(ix) { return { dnAt: ix, dnPad: callEndsNever(ix) } }
   // A binding holding a lambda-lifted function is a direct call of it; any other, a closure's.
   const lf = if d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) { cloLiftCalleeOf(c.callFn, ibFnIx) } else { -1 }
+  // A `const` bound to a lambda that captures nothing holds no other function: its call is the
+  // direct call of that lambda, at its signature's rep.
+  const kl = if lf < 0 && d >= 0 { constLambdaCallee(c.callFn, d) } else { -1 }
+  if kl >= 0 { return directCallAt(b, c, ix, kl) }
   if lf < 0 && d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) {
     if bundleParamOfRead(c.callFn, ibFnIx) >= 0 {
       return bundleCallRhs(b, c, ix)
@@ -7726,18 +7728,16 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   return directCallAt(b, c, ix, pos)
 }
 
-// The lambda `constLambdaPos` names for call `n` at `ix` through a binding the lift does not take
-// and whose closure key names no scalar result; -1 for any other call.
-function constLambdaCallee(n: Call, ix: i32): i32 {
-  if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return -1 }
-  const d = identDeclOf(n.callFn)
-  if d < 0 || cloLiftCalleeOf(n.callFn, ibFnIx) >= 0 { return -1 }
-  if keyScalarRep(sigKeyRetKind(callRefPlainKey(ix, ibFnIx))) >= 0 { return -1 }
-  return constLambdaPos(d)
+// The lambda `constLambdaPos` names for callee read `cf`, declared at `d`: the binding this
+// instance reads (`identLetOfRead`), a generic instance's own clone, else `d` itself.
+function constLambdaCallee(cf: i32, d: i32): i32 {
+  const dl = identLetOfRead(cf, ibFnIx)
+  return constLambdaPos(if dl >= 0 { dl } else { d })
 }
 
-// The `fnStmts` slot of the lambda `const` declaration `d` binds, when the lambda captures
-// nothing, declares no type parameter and annotates every parameter; -1 for any other binding.
+// The `fnStmts` slot of the lambda `const` declaration `d` binds, when the slot holds that very
+// lambda (not an instance's clone of it), which captures nothing, declares no type parameter and
+// annotates every parameter; -1 for any other binding.
 function constLambdaPos(d: i32): i32 {
   const ld = nodeAt(d)
   if !(ld is LetDecl) || ld.letKw != "const" || ld.letInit < 0 { return -1 }
@@ -7752,7 +7752,12 @@ function constLambdaPos(d: i32): i32 {
     return -1
   }
   const pos = fnStmtsPosOf(init)
-  if pos < 0 || captureCountOf(pos) > 0 || fnHasUnannotatedParam(pos) {
+  if (
+    pos < 0
+    || fnStmts[pos] != init
+    || captureCountOf(pos) > 0
+    || fnHasUnannotatedParam(pos)
+  ) {
     return -1
   }
   return pos
@@ -17477,7 +17482,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     // it stands, else the callee's own rep. A top-level `const` lambda's call is its record as a
     // named function's is (`topLambdaRecordFe`).
     const tfe = topLambdaRecordFe(unwrapParen(n.callFn))
-    if tfe >= 0 && !(rhs is RCall) {
+    if tfe >= 0 {
       const lt = lambdaRecordTy(tfe)
       const lr = repNodeOfTy(lt)
       const pk = if lr != rep && repNodeAt(rep) is RClosure { bundleResultPickOf(ix, tfe, ibFnIx) } else { noPick() }
@@ -20021,7 +20026,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is TypeDecl || n is UnionDecl { return 0 }
   if n is LetDecl {
     // A `const` bound to a lambda-lifted function holds no value: every use calls it directly.
-    if n.letInit >= 0 && cloLiftLetFe(fnStmtsPosOf(ibFnIx), ix) >= 0 {
+    if n.letInit >= 0 && cloLiftLetFe(cloLiftFramePos(ibFnIx), ix) >= 0 {
       return 0
     }
     const fresh = (ibDeclVar[ix] ?? -1) < 0
@@ -21441,6 +21446,12 @@ function nulNonePayload(b: i32[], x: i32, rep: i32): Opnd {
     const l = nulNoneEffect(b, co.binLeft, u, null)
     if ibMiss != "" { return l }
     return nulNonePayload(b, co.binRight, rep)
+  }
+  // A null-unit place read carries its read, written for its effect where the null is read.
+  if nulUnitPlaceReadAt(u, ibFnIx) {
+    const rd = exprAtPre(b, u, false, "")
+    if ibMiss != "" { return rd }
+    return repTemp(b, { nuAt: u, nuOwn: NULL_OWN_NONE, nuRead: [rd] }, u, rep)
   }
   if asgYieldsNullLit(u) && n is BinExpr {
     assign(b, n, u)
