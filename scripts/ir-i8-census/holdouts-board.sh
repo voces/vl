@@ -24,6 +24,11 @@ awk -F'\t' -v prev="$PREV" '
   function d(x) { return x > 0 ? "+" x : (x < 0 ? x : "0") }
   END {
     has = (prev != "/dev/null")
+    if (ct == 0) {
+      if (has && pt > 0) printf "0 holdouts (%d before)\n", pt
+      else print "0 holdouts"
+      exit
+    }
     print has ? "| owner | holdouts | Δ |" : "| owner | holdouts |"
     print has ? "|---|--:|--:|" : "|---|--:|"
     for (w in o) printf "%d\t%s\n", c[w], has ? sprintf("| %s | %d | %s |", w, c[w], d(c[w] - p[w])) : sprintf("| %s | %d |", w, c[w]) | "sort -t\"\t\" -k1,1nr | cut -f2-"
