@@ -6919,43 +6919,97 @@ function fvaCalleeField(c: i32): i32 {
   return if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Member { ix } else { -1 }
 }
 
-// Whether expression `x`'s value may be, or be read from, binding `d`'s storage: through an
-// index, a field, a list or record literal, a binding's initialiser, a `for` variable, a call's
-// returned values, a method's receiver, and a parameter some call or method hands it to.
-function fvaReaches(x0: i32, d: i32, seen: i32[]): boolean {
-  const x = parenPeelIx(x0)
+// Whether expression `x`'s value may be, or be read from, binding `d`'s storage. Each kind either
+// follows its edge or is named as yielding no storage, so the walk misses no kind. The alias
+// analysis a def-use points-to pass should replace.
+function fvaReaches(x: i32, d: i32, seen: i32[]): boolean {
   if x < 0 || x >= P.nodes.length || i32ListHas(seen, x) { return false }
   seen.push(x)
   const n = nodeAt(x)
-  if n is Index { return fvaReaches(n.idxArr, d, seen) }
-  if n is Member { return fvaReaches(n.memObj, d, seen) }
-  if n is ArrayLit {
-    for e in n.arrElems {
-      if fvaReaches(e, d, seen) { return true }
+  match n {
+    Ident => {
+      return fvaDeclReaches(identDeclOf(x), d, seen)
     }
-    return false
-  }
-  if n is ObjLit {
-    for f in n.objFields {
-      const fi = nodeAt(f)
-      if fi is FieldInit && fvaReaches(fi.fiValue, d, seen) { return true }
+    Index => {
+      return fvaReaches(n.idxArr, d, seen)
     }
-    return false
+    Member => {
+      return fvaReaches(n.memObj, d, seen)
+    }
+    OptMember => {
+      return fvaReaches(n.omObj, d, seen)
+    }
+    Paren => {
+      return fvaReaches(n.parInner, d, seen)
+    }
+    AsExpr => {
+      return fvaReaches(n.asObj, d, seen)
+    }
+    Spread => {
+      return fvaReaches(n.spdArg, d, seen)
+    }
+    Call => {
+      return fvaCallReaches(n, d, seen)
+    }
+    ArrayLit => {
+      for e in n.arrElems {
+        if fvaReaches(e, d, seen) { return true }
+      }
+      return false
+    }
+    ObjLit => {
+      for f in n.objFields {
+        if fvaReaches(f, d, seen) { return true }
+      }
+      return false
+    }
+    FieldInit => {
+      return fvaReaches(n.fiValue, d, seen)
+    }
+    // An assignment yields its value, and `??` either operand; every other operator a scalar.
+    BinExpr => {
+      if n.binOp == "??" && fvaReaches(n.binLeft, d, seen) { return true }
+      return (n.binOp == "??" || n.binOp == "=")
+        && fvaReaches(n.binRight, d, seen)
+    }
+    IfStmt | MatchExpr | Block => {
+      const leaves: i32[] = []
+      tailValueLeaves(x, leaves)
+      for lf in leaves {
+        if lf != x && fvaReaches(lf, d, seen) { return true }
+      }
+      return false
+    }
+    // Scalars, a parse error's leaf, and declarations or statements, which yield no storage.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | IsExpr | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | UnionDecl | ForRange | ForIn | ImportDecl | LoopVar => {
+      return false
+    }
   }
-  if n is Call { return fvaCallReaches(n, d, seen) }
-  if !(n is Ident) { return false }
-  const dd = identDeclOf(x)
+}
+
+// Whether a read of declaration `dd` may yield binding `d`'s storage: `d` itself, a binding's
+// initialiser, a `for` variable's list, or a parameter some call hands it.
+function fvaDeclReaches(dd: i32, d: i32, seen: i32[]): boolean {
   if dd == d { return true }
   if dd < 0 || dd >= P.nodes.length || i32ListHas(seen, dd) { return false }
   seen.push(dd)
   const dn = nodeAt(dd)
-  if dn is LetDecl { return dn.letInit >= 0 && fvaReaches(dn.letInit, d, seen) }
-  if dn is LoopVar {
-    const l = if dn.lvLoop >= 0 && dn.lvLoop < P.nodes.length { nodeAt(dn.lvLoop) } else { null }
-    return l is ForIn && fvaReaches(l.fiIter, d, seen)
+  match dn {
+    LetDecl => {
+      return dn.letInit >= 0 && fvaReaches(dn.letInit, d, seen)
+    }
+    LoopVar => {
+      const l = if dn.lvLoop >= 0 && dn.lvLoop < P.nodes.length { nodeAt(dn.lvLoop) } else { null }
+      return l is ForIn && fvaReaches(l.fiIter, d, seen)
+    }
+    Param => {
+      return fvaParamReaches(dd, d, seen)
+    }
+    // A function, a type, an import or a loop counter names no list or record storage.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {
+      return false
+    }
   }
-  if dn is Param { return fvaParamReaches(dd, d, seen) }
-  return false
 }
 
 // Whether call `n`'s result may be read from binding `d`'s storage: a method's receiver, or a
