@@ -13414,3 +13414,14 @@ values through the binding's own reads; those programs are pinned as D17760, D17
 destination, as `const x: f32 = 7.5` is, not a container conversion. The nullable and
 union-of-shapes exclusion is a mechanism limit, not design, and is open as D17763. An annotation
 an adoption reads is load-bearing for the redundant-annotation hint. Ruled by the coordinator.
+
+## A type parameter's pin is not a binding's set (coordinator ruling, 2026-11-28) — D17117, D17321
+
+A type parameter is a type, not a function's identity. Its by-name pin describes the value bound to
+the parameter it annotates. It says nothing about what another binding of that type holds. A
+binding holds what its writes store (the D17740 rule). So `let b: F = a1`, with `a1: G`, holds
+`a1`'s function, and a call through `b` runs it, never `F`'s pinned function. In an instance, the
+binding is typed at its initialiser (`letDeclGradeAnnotated`'s caller, check_statements.vl), and
+mono builds it at that parameter's annotation (`monoSubstLetType`), so its read and its variable
+agree. `F`'s own set is never widened: in the instance it is the type of the value it pins, which
+every read of that value shares. Ruled by the coordinator.
