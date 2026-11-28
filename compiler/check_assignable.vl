@@ -114,6 +114,7 @@ import {
   fvaRefuseNested,
   fvaUnionArm,
   luDecl,
+  resolveAnnot,
 } from "./check_annot_resolve"
 import {
   IV_DECL,
@@ -4719,6 +4720,31 @@ function listSiteMapCopy(site: i32, lam: i32, pos: i32): boolean {
   return fvaSiteSet(site, c)
 }
 
+// The receiver `recv` of a `.map` or `.filter` whose callback `cb` annotates its parameter at a
+// record closing a set field the receiver's elements leave open, when `recv` is a `.map` or a
+// binding of one: the parameter is the inner map's consumer, so its callback is typed there
+// (D17827). The receiver's new type, or -1 (also for a binding, whose read keeps its type).
+export function fvaMapRecvTyped(recv: i32, recvTy: i32, cb: i32): i32 {
+  const lx = parenPeelIx(cb)
+  const l = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  if !(l is FuncDecl) || l.fnParams.length != 1 { return -1 }
+  const pn = nodeAt(l.fnParams[0])
+  if !(pn is Param) || pn.parType < 0 { return -1 }
+  const ptn = nodeAt(pn.parType)
+  const pt = if ptn is TypeRef { resolveAnnot(ptn.tyName, l.fnTyParams) } else { -1 }
+  if pt < 0 || pt >= T.tys.length { return -1 }
+  // A binding the call reads holds the inner map, typed at the same consumer (D17826's alias).
+  const rx = parenPeelIx(recv)
+  const rd = if rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Ident { identDeclOf(rx) } else { -1 }
+  const rn = if rd >= 0 && rd < P.nodes.length { nodeAt(rd) } else { null }
+  if rn is LetDecl && rn.letType < 0 && rn.letInit >= 0 {
+    fvaMapCbTyped(rn.letInit, nodeTyIxOf(rn.letInit), mkArrayTy(pt))
+    return -1
+  }
+  if !fvaMapCbTyped(recv, recvTy, mkArrayTy(pt)) { return -1 }
+  return nodeTyIxOf(rx)
+}
+
 // Types `.map` call `site`'s un-annotated callback at the element record of `dstTy` that closes a
 // set or hole function field its result leaves open, and re-checks the call; false where `site` is
 // no such call.
@@ -6662,7 +6688,8 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     while T.diags.length > mark { T.diags.pop() }
     fvaRefuse(site, srcTy, dt, why)
   }
-  if stable && callee >= 0 { fvaCopyCalleeAtInstance(callee, t) }
+  // A set's value is called as the set, at its id, so its read keeps the set's type (D17823).
+  if stable && callee >= 0 && !setSrc { fvaCopyCalleeAtInstance(callee, t) }
   return true
 }
 
@@ -7120,7 +7147,7 @@ function fvaAliasNote(site: i32, srcTy: i32, dstTy: i32) {
   const sr = tyElemOf(sa)
   const dr = tyElemOf(da)
   if sr < 0 || dr < 0 || sr >= T.tys.length || dr >= T.tys.length { return 0 }
-  if !fvaRecFieldsClose(sr, dr) { return 0 }
+  if !fvaRecFieldsClose(sr, dr) && !fvaFnElemCloses(sr, dr) { return 0 }
   fvaAliasSite.push(site)
   fvaAliasDecl.push(d)
   fvaAliasElem.push(dr)
@@ -7133,8 +7160,28 @@ function fvaAliasNote(site: i32, srcTy: i32, dstTy: i32) {
   return 0
 }
 
+// Whether a list element of function type `sr`, open (a generic, a hole or a set), is delivered at
+// a closed function type `dr`: the storage's one element type is then `dr` (D17843).
+function fvaFnElemCloses(sr: i32, dr: i32): boolean {
+  if !(tyAt(sr) is TyFunc) || !(tyAt(dr) is TyFunc) || tySame(sr, dr) {
+    return false
+  }
+  if tyHasTyVar(dr) || tyHasHole(dr) { return false }
+  return tyHasTyVar(sr) || tyHasHole(sr) || fnTagSetOfTy(sr) >= 0
+}
+
+// The bindings whose one storage `fvaAliasConflictsAll` found met at two closed signatures.
+let fvaAliasConflicted: i32[] = []
+
+// Whether binding `d`'s one storage meets two closed signatures: the container contract's
+// conflict, refused at check; a later phase that would build the storage at one of them asks it.
+export function fvaAliasConflictAt(d: i32): boolean {
+  return i32ListHas(fvaAliasConflicted, d)
+}
+
 // Forgets the noted alias deliveries, at the start of a program's check.
 export function fvaAliasReset() {
+  fvaAliasConflicted = []
   fvaAliasSite = []
   fvaAliasDecl = []
   fvaAliasElem = []
@@ -7148,6 +7195,23 @@ export function fvaAliasConflictsAll() {
   if fvaAliasSite.length == 0 { return 0 }
   const refused: boolean[] = []
   for _ in fvaAliasSite { refused.push(false) }
+  // Two deliveries of one binding at different closed element types meet its one storage.
+  let j = 0
+  while j < fvaAliasSite.length {
+    let k = 0
+    while k < j && !refused[j] {
+      if (
+        fvaAliasDecl[k] == fvaAliasDecl[j]
+        && !tySame(fvaAliasElem[k], fvaAliasElem[j])
+      ) {
+        refused[j] = true
+        fvaAliasConflicted.push(fvaAliasDecl[j])
+        tErr(fvaAliasMsg(fvaAliasDecl[j]), fvaAliasSite[j])
+      }
+      k = k + 1
+    }
+    j = j + 1
+  }
   let i = 0
   while i < P.nodes.length {
     const n = nodeAt(i)
@@ -7156,6 +7220,7 @@ export function fvaAliasConflictsAll() {
       while k < fvaAliasSite.length {
         if (
           !refused[k]
+          && !fvaAliasConflictAt(fvaAliasDecl[k])
           && fvaCallMeetsStorage(
             n.callFn,
             n.callArgs,
@@ -7164,6 +7229,7 @@ export function fvaAliasConflictsAll() {
           )
         ) {
           refused[k] = true
+          fvaAliasConflicted.push(fvaAliasDecl[k])
           tErr(fvaAliasMsg(fvaAliasDecl[k]), fvaAliasSite[k])
         }
         k = k + 1
@@ -7179,6 +7245,15 @@ export function fvaAliasConflictsAll() {
 // field `f` takes them.
 function fvaCallMeetsStorage(c: i32, args: i32[], d: i32, dr: i32): boolean {
   const ro = tyAt(dr)
+  // A list of functions is called through an element read.
+  const cx = parenPeelIx(c)
+  const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
+  if ro is TyFunc {
+    const seen0: i32[] = []
+    return cn is Index
+      && !fvaArgsStoreAt(args, dr)
+      && fvaReaches(cn.idxArr, d, seen0)
+  }
   const m = fvaCalleeField(c)
   const mn = if m >= 0 { nodeAt(m) } else { null }
   if !(ro is TyObj) || !(mn is Member) { return false }
@@ -7360,7 +7435,7 @@ function fvaAliasMsg(d: i32): string {
   const a = if dn is LetDecl { dn.letName } else { "the list" }
   return "a list is passed as the same storage, so its element type cannot differ between `"
     + a
-    + "` and this destination, and a call through `"
+    + "` and this destination, and `"
     + a
-    + "` takes its function field at another signature; copy it with `.map` for the other use"
+    + "` meets another closed signature there; copy it with `.map` for the other use"
 }
