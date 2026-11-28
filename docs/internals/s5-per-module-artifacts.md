@@ -1,5 +1,7 @@
 # S5: per-module compile artifacts
 
+> **Switched off and deleted on 2026-11-28, PR #10748** (the per-module artifact path; it returns only with a consumer).
+
 The plan for compiling a VL module once and reusing its code across every program that
 imports it. The motivating consumer is heregeat. Its test files share no module compiles,
 and `VL_COMPILE_CACHE=1` keys a build on the entry's whole closure, so one edit recompiles
@@ -24,7 +26,7 @@ exports into the artifacts, and §16 measures what the tail and the runtime stil
 
 ## 1. What a body encodes: the census
 
-`scripts/s5-relocs.vl census` decodes every instruction in every code body. It counts each
+`scripts/s5-relocs.vl census` (deleted, #10748) decodes every instruction in every code body. It counts each
 index immediate by the space it names, and it counts the global and element initialisers
 the same way. Measured 2026-10-19, before the rebase onto `3fbefe6d6`.
 
@@ -44,7 +46,7 @@ re-encodes them as minimal LEBs, moving later offsets through `movedOffset`. Dec
 need no record.
 
 The other kind is a program-dependent index that travels as a **value**, an `i32.const`
-that a decoder cannot tell from an ordinary constant. `scripts/s5-relocs.vl consts A B`
+that a decoder cannot tell from an ordinary constant. `scripts/s5-relocs.vl consts A B` (deleted, #10748)
 finds them by diffing a compile against a perturbed twin. The twin is a scratch compiler
 that adds 1000 to union tags, 2000 to closure table slots and 3000 to literal-atom ids. On
 the self-build, 18,650 constants moved:
@@ -236,7 +238,7 @@ the bytes:
 A folded const global's row is banked per global (`relFoldBank`) and noted again wherever
 the fold is copied (`relFoldNote`).
 
-**Proof.** `vl run scripts/s5-relocs.vl -- proof ARMED [PERTURBED]` takes a module or a
+**Proof.** `vl run scripts/s5-relocs.vl -- proof ARMED [PERTURBED]` (deleted, #10748) takes a module or a
 directory. For every row it checks that a decoded `i32.const` sits at that offset with that
 value. It then rebuilds the module from a skeleton with every relocated LEB removed, from
 the rows and the decoded sites alone, and compares the bytes. Given a perturbed twin, it
@@ -370,7 +372,7 @@ Under `RELOC_ARMED`, `emitLinkSection` (`compiler/emit_link.vl`) runs once after
 finished. It cuts the module into one artifact per source module plus program-level input,
 rebuilds the module through `link()` (`compiler/link.vl`), and compares the result with what
 the emitter wrote, section by section and body by body. It writes the outcome as a `vl.link`
-custom section, which `scripts/s5-relocs.vl link <dir> [<twin dir>]` reads.
+custom section, which `scripts/s5-relocs.vl link <dir> [<twin dir>]` (deleted, #10748) reads.
 
 An artifact holds its functions (body bytes plus references by symbol), its global cells and
 definitions, its initialiser constants, its init guards, and its pooled and `is` strings.

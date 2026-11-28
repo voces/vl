@@ -3341,7 +3341,32 @@ function letCellKindGo(letIx: i32, fnIx: i32): VKind {
   }
   const d = nodeAt(letIx)
   if d is LetDecl && d.letType >= 0 { return vtKindOfType(d.letType) }
+  const ow = letOpenCallWidth(letIx, fnIx)
+  if ow != "" { return ow }
   return letBindRepKind(letIx, fnIx) ?? "i32"
+}
+
+// The scalar width an un-annotated `const` holding a call the frame types open is built at: the
+// call's own result width (`cloCallSigKey`), as its print and its store read it; "" else (D17809).
+export function letOpenCallWidth(letIx: i32, fnIx: i32): VKind | "" {
+  const d = if letIx >= 0 && letIx < P.nodes.length { nodeAt(letIx) } else { null }
+  if !(d is LetDecl) || d.letType >= 0 || d.letKw != "const" || d.letInit < 0 {
+    return ""
+  }
+  const ix = unwrapParen(d.letInit)
+  // A `const` copy of such a binding holds its width too.
+  if ix >= 0 && nodeAt(ix) is Ident {
+    const sd = identDeclOf(ix)
+    return if sd >= 0 && sd != letIx { letOpenCallWidth(sd, fnIx) } else { "" }
+  }
+  if ix < 0 || !(nodeAt(ix) is Call) { return "" }
+  const t = exprValueTyAt(ix, fnIx)
+  if t >= 0 && !tyHasTyVar(t) { return "" }
+  const k = sigKeyRetKind(cloCallSigKey(ix, fnIx)) ?? ""
+  if k == "f64" { return "f64" }
+  if k == "f32" { return "f32" }
+  if k == "i64" { return "i64" }
+  return ""
 }
 
 // The map shape beside an inferred `map` or `nulmap` result valtype: the return expression's,
@@ -5703,7 +5728,41 @@ export function exprValueTyAt(exprIx0: i32, fnIx: i32): i32 {
     const el = elabNodeTyAt(exprIx, fnIx)
     if el >= 0 { ty = el }
   }
+  if ty < 0 || tyHasTyVar(ty) {
+    const rt = openReadTy(exprIx, fnIx)
+    if rt >= 0 { return rt }
+    const at = openArithTy(exprIx, fnIx)
+    if at >= 0 { return at }
+  }
   return ty
+}
+
+// A read of an un-annotated `const` holding a call the frame types open is at the width the call
+// is built at (`letOpenCallWidth`); -1 for any other node.
+function openReadTy(exprIx: i32, fnIx: i32): i32 {
+  if !(nodeAt(exprIx) is Ident) { return -1 }
+  const w = letOpenCallWidth(identDeclOf(exprIx), fnIx)
+  if w == "f64" { return TY_F64 }
+  if w == "i64" { return TY_I64 }
+  // An `f32` call keeps its open type here; its slot and print read the width directly.
+  if w == "f32" { return -1 }
+  return -1
+}
+
+// Arithmetic the checker left open is at the width both its operands are read at; -1 for any
+// other node or where they differ.
+function openArithTy(exprIx: i32, fnIx: i32): i32 {
+  const n = nodeAt(exprIx)
+  if !(n is BinExpr) || !binIsArith(n.binOp) { return -1 }
+  const l = exprValueTyAt(n.binLeft, fnIx)
+  const r = exprValueTyAt(n.binRight, fnIx)
+  const lp = if l >= 0 && !tyHasTyVar(l) { tyScalarBasePrim(l) ?? "" } else { "" }
+  return if lp != "" && r >= 0 && lp == (tyScalarBasePrim(r) ?? "") { l } else { -1 }
+}
+
+// Whether `op` is an arithmetic operator, whose result is its operands' width.
+function binIsArith(op: string): boolean {
+  return op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
 }
 
 // `k` where it names a scalar width, else "".

@@ -386,6 +386,7 @@ import {
   TY_OPEN,
   TY_STR,
   TY_VOID,
+  Ty,
   TyArray,
   TyErr,
   TyFunc,
@@ -508,15 +509,29 @@ function letAdoptedDestTy(d: i32): i32 {
   const trs: i32[] = []
   const paths: string[] = []
   if !bindDestAnnots(d, trs, paths) { return -1 }
+  // A typed read pins a function element's signature too, as it pins a scalar's (F2).
+  let readsOnly = litOneHoleFn(d)
+  if readsOnly {
+    for pth in paths {
+      if !destPathReads(pth) { readsOnly = false }
+    }
+  }
   let t = -1
   let i = 0
   while i < trs.length {
     const tn = nodeAt(trs[i])
-    if !(tn is TypeRef) { return -1 }
+    // Only the pin reads a function type's annotation; any other destination is a named type.
+    if !(tn is TypeRef) && !readsOnly { return -1 }
     let a = letAnnHeldTyAt(trs[i])
-    if a < 0 { a = nameToTyAt(tn.tyName, trs[i]) }
+    if a < 0 && tn is TypeRef { a = nameToTyAt(tn.tyName, trs[i]) }
     a = destProject(a, paths[i])
-    if a < 0 || a == TY_ERR || tyHasTyVar(a) || tyIsHole(a) || !destAdopts(a) {
+    if (
+      a < 0
+      || a == TY_ERR
+      || tyHasTyVar(a)
+      || tyIsHole(a)
+      || !destAdopts(a, readsOnly)
+    ) {
       return -1
     }
     if t >= 0 && !tySame(t, a) { return -1 }
@@ -527,6 +542,8 @@ function letAdoptedDestTy(d: i32): i32 {
   if t >= 0 && n is LetDecl && !litFieldsWithin(parenPeelIx(n.letInit), t) {
     return -1
   }
+  // A pinned function element is its own type: the annotation's index carries that place's set.
+  if t >= 0 && readsOnly { t = destFnFresh(t) }
   if t >= 0 {
     for tr in trs {
       if !i32ListHas(redunAdoptedAnnots, tr) { redunAdoptedAnnots.push(tr) }
@@ -587,11 +604,59 @@ function litLeafWithin(x: i32, t: i32): boolean {
 // or union of shapes, D17763), no function, and leaves a literal takes without a widening, which
 // a container never takes implicitly. One leaf at least narrows the literal's own type (a literal
 // union, `f32`); else the binding is that type already.
-function destAdopts(t: i32): boolean {
-  if t < 0 || t >= T.tys.length || tyMayHoldFn(t) { return false }
+function destAdopts(t: i32, fnOk: boolean): boolean {
+  if t < 0 || t >= T.tys.length || (!fnOk && tyMayHoldFn(t)) { return false }
   const seen: i32[] = []
   const nar: i32[] = []
   return destAdoptsIn(t, seen, nar) && nar.length > 0
+}
+
+// Whether binding `d`'s literal is a list whose elements all name one function that declares
+// no type parameter: the one-member set a typed read's pin closes. A list of several functions is
+// built at its readers' type through its tagged set (D14438), and a declared generic keeps its own.
+function litOneHoleFn(d: i32): boolean {
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(n is LetDecl) || n.letInit < 0 { return false }
+  const l = nodeAt(parenPeelIx(n.letInit))
+  if !(l is ArrayLit) || l.arrElems.length == 0 { return false }
+  let fd = -1
+  for e in l.arrElems {
+    const x = parenPeelIx(e)
+    if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return false }
+    const g = identFnDeclOf(x)
+    if g < 0 || (fd >= 0 && g != fd) { return false }
+    fd = g
+  }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  return f is FuncDecl && f.fnTyParams.length == 0
+}
+
+// List type `t` with its function element minted afresh at the same signature, so the binding
+// shares no function set with the place whose annotation named it; any other type is itself.
+function destFnFresh(t: i32): i32 {
+  const c = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if !(c is TyArray) { return t }
+  const e = tyElemOf(c)
+  const ef = if e >= 0 && e < T.tys.length { tyAt(e) } else { null }
+  if !(ef is TyFunc) { return t }
+  const ps: i32[] = []
+  for p in ef.fnParamTypes { ps.push(p) }
+  const g: Ty = { fnParamTypes: ps, fnRet: ef.fnRet }
+  T.tys.push(g)
+  return mkArrayTy(T.tys.length - 1)
+}
+
+// Whether destination path `p` passes through a typed element read (`E`, `M`).
+function destPathReads(p: string): boolean {
+  let i = 0
+  while i < p.length {
+    const ch = p.slice(i, i + 1)
+    if (ch == "E" || ch == "M") && (i == 0 || p.slice(i - 1, i) == "/") {
+      return true
+    }
+    i = i + 1
+  }
+  return false
 }
 
 function destAdoptsIn(t: i32, seen: i32[], nar: i32[]): boolean {
@@ -608,6 +673,11 @@ function destAdoptsIn(t: i32, seen: i32[], nar: i32[]): boolean {
     return true
   }
   if c is TyLit {
+    nar.push(t)
+    return true
+  }
+  // Reached only where a typed read pins a function element: it closes the element's holes.
+  if c is TyFunc {
     nar.push(t)
     return true
   }
