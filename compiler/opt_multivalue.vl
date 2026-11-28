@@ -1,15 +1,15 @@
 // The `-O` multi-value step, ported from the host (docs/internals/optimizer-in-vl.md, rung
 // R5): a call whose small record result is only read field by field calls a twin of its
 // producer returning the fields as multi-value results, a record argument its callee only
-// reads is passed as its fields, and a local or an if/else holding such a record holds its
-// fields (DECISIONS.md, D3625). The host stages the module with `optInLoad`, calls
+// reads is passed as its fields, and a local, a global or an if/else holding such a record
+// holds its fields (DECISIONS.md, D3625). The host stages the module with `optInLoad`, calls
 // `optMultivalue` with whether to explain and whether the module validates, then reads the
 // rewritten module, `optMultivalueMoves` (where each output body's ops came from) and
 // `optMultivalueExplain` (the `$VL_MV_EXPLAIN` log) through `optOut*`. A module this cannot
 // decode is left untouched.
 
 import { WasmCursor, wcByte, wcNew, wcOp, wcU32 } from "./wasm_read"
-import { wmRead } from "./wasm_write"
+import { readVal, wmRead } from "./wasm_write"
 import {
   copyBytes,
   putText,
@@ -43,6 +43,8 @@ const K_SET = 5
 const K_TEE = 6
 const K_EXIT = 7
 const K_MERGE = 8
+const K_GGET = 9
+const K_GSET = 10
 
 // What the op after a recorded one is: a `struct.get`, a `local.set`, an exit, or the
 // `else`/`end` closing an arm of an `if`.
@@ -51,6 +53,7 @@ const NX_GET = 1
 const NX_SET = 2
 const NX_EXIT = 3
 const NX_ARM = 4
+const NX_GSET = 5
 
 // What a plan does at an op.
 const A_CALL = 1
@@ -60,6 +63,8 @@ const A_SETF = 4
 const A_PICK = 5
 const A_EXTRACT = 6
 const A_MERGEIF = 7
+const A_GGETF = 8
+const A_GSETF = 9
 
 // Per operator, two characters: its pops then its pushes, `cc` when they depend on its
 // immediates or the control stack, `??` when the step does not read it.
@@ -114,6 +119,12 @@ let tainted: i32[] = []
 let hasNames = false
 let tagType: i32[] = []
 let anyCandidate = false
+// The globals: how many are imported, each defined one's packed type and whether it may be
+// held as fields (mutable, not exported, initialized to null, of a numeric record type).
+let nGImports = 0
+let gType: i32[] = []
+let gCand: boolean[] = []
+let gExported: {[i32]: i32} = Map()
 
 // Per body (code-section order): its byte range, where its ops start, its locals entries, and
 // its recorded ops, merges and op ordinals' key base.
@@ -165,6 +176,13 @@ let allowedKeys: i32[] = []
 let fo: {[i32]: i32} = Map()
 let foR: {[i32]: i32} = Map()
 let foLocal: i32[][] = []
+// The globals held as fields, by global index, each with its first field global's index; and
+// the recorded gets a `ref.as_non_null` follows.
+let gLive: {[i32]: i32} = Map()
+let gBase: {[i32]: i32} = Map()
+let gOrder: i32[] = []
+let ggNN: {[i32]: i32} = Map()
+let planBroken = false
 // The candidates of the body `fieldOnlyLocals` is reading, dense by local index: a slot is
 // current when its stamp equals `foGen` (per body) or `foRound` (per fixpoint round).
 let foGen = 0
@@ -318,7 +336,7 @@ function runStep(b: u8[], valid: boolean): u8[] {
   }
   postPass()
   analyse()
-  if !anyProducer() && !anyFo() {
+  if !anyProducer() && !anyFo() && gOrder.length == 0 {
     if explaining { explain(0) }
     return none
   }
@@ -339,7 +357,12 @@ function runStep(b: u8[], valid: boolean): u8[] {
     planContext(twF[w], twLo[w], twHi[w], twR[w])
     w = w + 1
   }
-  if tooMany || twF.length == 0 {
+  if tooMany || planBroken || twF.length == 0 && gOrder.length == 0 {
+    if explaining && planBroken {
+      logLine(
+        "mv-explain: step abandoned: a read of a global held as fields was not rewritten",
+      )
+    }
     if explaining && tooMany {
       logText("mv-explain: step abandoned: more than ")
       logDec(MV_MAX_TWINS)
@@ -409,6 +432,15 @@ function resetModule(b: u8[]) {
   mergeAt = Map()
   consK = []
   consJ = []
+  nGImports = 0
+  gType = []
+  gCand = []
+  gExported = Map()
+  gLive = Map()
+  gBase = Map()
+  gOrder = []
+  ggNN = Map()
+  planBroken = false
 }
 
 // Reads the types, imports, functions, tags and body ranges; false when any does not decode.
@@ -447,6 +479,8 @@ function readModule(b: u8[]): boolean {
     wcU32(c)
     if id == 2 { readImports(c) }
     if id == 13 { readTags(c) }
+    if id == 6 { readGlobals(c) }
+    if id == 7 { readExports(c) }
     if id == 0 && isNameSection(c) { hasNames = true }
     if id == 10 { readBodyStarts(c) }
     if c.failed { return false }
@@ -470,7 +504,67 @@ function readModule(b: u8[]): boolean {
     f = f + 1
   }
   readComponents(supA, supB, structGroups)
+  let gi = 0
+  while gi < gType.length {
+    if (
+      gCand[gi]
+      && !gExported.has(nGImports + gi)
+      && globalRecord(nGImports + gi) >= 0
+    ) {
+      anyCandidate = true
+    } else {
+      gCand[gi] = false
+    }
+    gi = gi + 1
+  }
   return true
+}
+
+// The defined globals' types, and which are mutable with a `ref.null` initializer.
+function readGlobals(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    gType.push(normVal(readVal(c)))
+    const mutable = wcByte(c) == 1
+    let isNull = false
+    if c.pos < c.end && c.b[c.pos] == 0xd0 {
+      const op = wcOp(c)
+      isNull = op == 0xd0 && c.pos < c.end && c.b[c.pos] == 0x0b
+    }
+    while !c.failed && wcOp(c) != 0x0b {}
+    gCand.push(mutable && isNull)
+    i = i + 1
+  }
+}
+
+function readExports(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const len = wcU32(c)
+    c.pos = c.pos + len
+    const kind = wcByte(c)
+    const ix = wcU32(c)
+    if kind == 3 { gExported[ix] = 1 }
+    if c.pos > c.end {
+      c.failed = true
+      c.pos = c.end
+    }
+    i = i + 1
+  }
+}
+
+// The numeric record global `g` holds, or -1 when it may not be held as fields.
+function globalRecord(g: i32): i32 {
+  const d = g - nGImports
+  if d < 0 || d >= gType.length || !gCand[d] { return -1 }
+  const t = recordOf(gType[d])
+  if t < 0 || fVals[t].length > MV_RECORD_MAX_FIELDS { return -1 }
+  for v in fVals[t] {
+    if !isNum(v) { return -1 }
+  }
+  return t
 }
 
 function readType(
@@ -533,6 +627,7 @@ function readImports(c: WasmCursor) {
     } else if kind == 3 {
       skipValType(c)
       wcByte(c)
+      nGImports = nGImports + 1
     } else if kind == 4 {
       wcByte(c)
       tagType.push(wcU32(c))
@@ -1149,6 +1244,36 @@ function scanBody(bi: i32, f: i32): boolean {
       const p1 = lebEnd(at + 1, c.pos)
       follow(last, k, NX_GET, lebAt(p1, c.pos), lebAt(lebEnd(p1, c.pos), c.pos))
     }
+    // A global op on a record global is recorded as a local op is; a `ref.as_non_null` right
+    // after a recorded get is read as part of it, keeping the get as the value's producer.
+    if op == 0xd4 && last >= 0 && iKind[last] == K_GGET && iK[last] + 1 == k {
+      ggNN[last] = 1
+      k = k + 1
+      continue
+    }
+    if (op == 0x23 || op == 0x24) && gType.length > 0 {
+      const g: i32 = if c.pos == at + 2 { mB[at + 1] } else { lebAt(at + 1, c.pos) }
+      if globalRecord(g) >= 0 {
+        const top = frH.length - 1
+        const base = frH[top]
+        const prev = last
+        if op == 0x24 && prev >= 0 { follow(prev, k, NX_GSET, g, 0) }
+        sK = k
+        sReach = !frUnr[top]
+        sDepth = frH.length
+        sBase = base
+        sSegLo = seg[seg.length - 1]
+        ownLen = h
+        last = if op == 0x23 { record(K_GGET, g, NONE, argv.length) } else { record(K_GSET, g, producerBelow(h), argv.length) }
+        const below = if op == 0x23 { h } else { h - 1 }
+        const old = h
+        h = if below > base { below } else { base }
+        if op == 0x23 { h = h + 1 }
+        ownWrite(old, if op == 0x23 { h - 1 } else { h }, h, k)
+        k = k + 1
+        continue
+      }
+    }
     // An op read by its arity alone records nothing and leaves the control stack alone.
     const par = if op == 0xfb0002 { 0x11 } else if op >= 0 && op < 256 { plainAr[op] } else { plainArity(op) }
     if par >= 0 {
@@ -1569,7 +1694,7 @@ function scanArm(
 
 // Records that the op after recorded op `prev` is `nx` (with its operands), when op `k` is it.
 function follow(prev: i32, k: i32, nx: i32, na: i32, nb: i32) {
-  if prev >= 0 && iK[prev] + 1 == k {
+  if prev >= 0 && (iK[prev] + 1 == k || iK[prev] + 2 == k && ggNN.has(prev)) {
     iNext[prev] = nx
     iNA[prev] = na
     iNB[prev] = nb
@@ -1886,6 +2011,64 @@ function analyse() {
   while f < nFuncs {
     foLocal.push(fieldOnlyLocals(f))
     f = f + 1
+  }
+  fieldOnlyGlobals()
+}
+
+// The record globals held as fields: every reachable get is read field by field or passed to
+// a field-only parameter, and every reachable set stores a producer's result or a
+// `struct.new`. A read before the first set is the emitter's to refuse (an init guard), so a
+// field global's zero is never read in its place.
+function fieldOnlyGlobals() {
+  const bad: {[i32]: i32} = Map()
+  const seen: i32[] = []
+  let bi = 0
+  while bi < bR0.length {
+    const f = nImports + bi
+    let ii = bInsLo[bi]
+    while ii < bInsHi[bi] {
+      const kind = iKind[ii]
+      if (kind == K_GGET || kind == K_GSET) {
+        const g = iA[ii]
+        const t = globalRecord(g)
+        if !bad.has(g) && !gBase.has(g) {
+          gBase[g] = 0
+          seen.push(g)
+        }
+        let ok = !iReach[ii]
+        if t < 0 || !shapeOf(t) {
+          ok = false
+        } else if iReach[ii] && kind == K_GGET {
+          ok = fieldUse(f, ii, t)
+        } else if iReach[ii] {
+          const tp = iTop[ii]
+          const si = if tp != NONE && tp + 1 == iK[ii] { at(bi, tp) } else { -1 }
+          if si >= 0 && iReach[si] {
+            const sk = iKind[si]
+            if sk == K_CALL {
+              const h = iA[si]
+              ok = producer[h] && sameShape(resultRecord(h), t)
+            } else if sk == K_NEW {
+              ok = sameShape(iA[si], t)
+            }
+          }
+        }
+        if !ok { bad[g] = 1 }
+      }
+      ii = ii + 1
+    }
+    bi = bi + 1
+  }
+  gBase = Map()
+  sortInts(seen)
+  let next = nGImports + gType.length
+  for g in seen {
+    if !bad.has(g) {
+      gLive[g] = 1
+      gBase[g] = next
+      gOrder.push(g)
+      next = next + fieldsOf(globalRecord(g)).length
+    }
   }
 }
 
@@ -2230,6 +2413,15 @@ function planContext(f: i32, slo: i32, shi: i32, r: boolean) {
         takeMerge(bi, mergeAt[base + k] ?? 0)
         setAct(k + 1, A_PICK, iNB[ii], fieldsOf(l).length)
       }
+    } else if kind == K_GGET && iReach[ii] && gLive.has(l) && nx == NX_GET {
+      const nn = if ggNN.has(ii) { 1 } else { 0 }
+      setAct(k, A_GGETF, l, iNB[ii])
+      if nn == 1 { setAct(k + 1, A_DELETE, 0, 0) }
+      setAct(k + 1 + nn, A_DELETE, 0, 0)
+    } else if kind == K_GSET && iReach[ii] && gLive.has(l) {
+      setAct(k, A_GSETF, l, 0)
+      const si = if iTop[ii] == NONE { -1 } else { at(bi, iTop[ii]) }
+      if si >= 0 && iKind[si] == K_NEW { setAct(iK[si], A_DELETE, 0, 0) }
     }
     ii = ii + 1
   }
@@ -2282,6 +2474,7 @@ function planContext(f: i32, slo: i32, shi: i32, r: boolean) {
     }
     ii = ii - 1
   }
+  if gOrder.length > 0 { checkGlobalPlan(bi) }
   const keys: i32[] = []
   for k in actKind { keys.push(k) }
   sortInts(keys)
@@ -2293,6 +2486,35 @@ function planContext(f: i32, slo: i32, shi: i32, r: boolean) {
     pB.push(actB[k] ?? 0)
   }
   pHi.push(pK.length)
+}
+
+// Whether body `bi`'s plan rewrites every reachable get and set of a global held as fields;
+// when it does not, `planBroken` abandons the step, since only the field globals are written.
+function checkGlobalPlan(bi: i32) {
+  let ii = bInsLo[bi]
+  while ii < bInsHi[bi] {
+    const kind = iKind[ii]
+    if (kind == K_GGET || kind == K_GSET) && iReach[ii] && gLive.has(iA[ii]) {
+      const k = iK[ii]
+      const want = if kind == K_GGET { A_GGETF } else { A_GSETF }
+      if (actKind[k] ?? 0) != want { planBroken = true }
+      if kind == K_GSET && iTop[ii] != NONE {
+        const si = at(bi, iTop[ii])
+        if si >= 0 && iKind[si] == K_CALL {
+          const tw = (actA[iTop[ii]] ?? 0) - nFuncs
+          if (
+            (actKind[iTop[ii]] ?? 0) != A_CALL
+            || tw < 0
+            || tw >= twR.length
+            || !twR[tw]
+          ) {
+            planBroken = true
+          }
+        }
+      }
+    }
+    ii = ii + 1
+  }
 }
 
 function planCall(
@@ -2319,6 +2541,8 @@ function planCall(
       && scalarLocal(iNA[ii], np, slo, shi)
     ) {
       rr = true
+    } else if iNext[ii] == NX_GSET && gLive.has(iNA[ii]) {
+      rr = true
     }
   }
   let lo = 0
@@ -2343,12 +2567,21 @@ function planCall(
         ok = scalarLocal(s, np, slo, shi)
           && lt >= 0
           && (sameShape(lt, pt) || s < np && sameArg(lt, pt))
+      } else if sk == K_GGET {
+        ok = gLive.has(s)
+          && iReach[si]
+          && pt >= 0
+          && sameArg(pt, globalRecord(s))
       }
       if ok {
         if j < 32 { lo = lo | (1 << j) } else { hi = hi | (1 << (j - 32)) }
         if sk == K_CALL { rCalls[q] = 1 }
         if sk == K_NEW { setAct(q, A_DELETE, 0, 0) }
         if sk == K_GET { setAct(q, A_GETF, s, -1) }
+        if sk == K_GGET {
+          setAct(q, A_GGETF, s, -1)
+          if ggNN.has(si) { setAct(q + 1, A_DELETE, 0, 0) }
+        }
         if sk == K_MERGE { takeMerge(bi, mergeAt[bOpBase[bi] + q] ?? 0) }
       }
     }
@@ -2701,6 +2934,26 @@ function emitBody(f: i32, slo: i32, shi: i32, plan: i32): boolean {
         putUleb(code, sb + i)
         i = i - 1
       }
+    } else if act == A_GGETF {
+      const gb = gBase[a] ?? -1
+      const n = fieldsOf(globalRecord(a)).length
+      if gb < 0 || n == 0 || b >= n { return false }
+      let i = if b >= 0 { b } else { 0 }
+      const stop = if b >= 0 { b + 1 } else { n }
+      while i < stop {
+        code.push(0x23)
+        putUleb(code, gb + i)
+        i = i + 1
+      }
+    } else if act == A_GSETF {
+      const gb = gBase[a] ?? -1
+      let i = fieldsOf(globalRecord(a)).length - 1
+      if gb < 0 || i < 0 { return false }
+      while i >= 0 {
+        code.push(0x24)
+        putUleb(code, gb + i)
+        i = i - 1
+      }
     } else if act == A_PICK {
       nextLocal = emitPickOp(code, op, off, end, a, b, nextLocal, extra)
       if nextLocal < 0 { return false }
@@ -2942,7 +3195,8 @@ function assemble(): u8[] {
     twinTypes.push(ti)
     i = i + 1
   }
-  // Reassemble: the type, function and code sections grow; every other section is copied.
+  // Reassemble: the type, function, global and code sections grow; every other section is
+  // copied.
   rpReset()
   rpInput(0, 8)
   const pairAt: i32[] = []
@@ -2956,7 +3210,17 @@ function assemble(): u8[] {
     const body = c.pos
     const sectionEnd = c.pos + len
     const s: u8[] = []
-    if id == 1 || id == 3 {
+    if id == 6 && gOrder.length > 0 {
+      const r = wcNew(mB, body, sectionEnd)
+      const n = wcU32(r)
+      if r.failed || !assembleFieldGlobals(s, n, r.pos, sectionEnd) {
+        return none
+      }
+      rpByte(id)
+      rpLeb(s.length)
+      rpRange(s, 0, s.length)
+      saw = saw | 8
+    } else if id == 1 || id == 3 {
       const r = wcNew(mB, body, sectionEnd)
       const n = wcU32(r)
       if r.failed { return none }
@@ -2979,12 +3243,12 @@ function assemble(): u8[] {
       rpByte(id)
       rpLeb(s.length)
       rpRange(s, 0, s.length)
-    } else if id != 10 {
+    } else if id != 10 && !(id == 6 && gOrder.length > 0) {
       rpInput(start, sectionEnd - start)
     }
     c.pos = sectionEnd
   }
-  if saw != 7 {
+  if saw != (if gOrder.length > 0 { 15 } else { 7 }) {
     rpReset()
     return none
   }
@@ -3007,6 +3271,34 @@ function assemble(): u8[] {
   }
   if !hasNames { return out }
   return assembleTwinNames(out)
+}
+
+// The global section with each held global's field globals after the module's own: mutable,
+// of the field's type, starting at zero.
+function assembleFieldGlobals(s: u8[], n: i32, from: i32, end: i32): boolean {
+  let added = 0
+  for g in gOrder { added = added + fieldsOf(globalRecord(g)).length }
+  putUleb(s, n + added)
+  copyBytes(s, mB, from, end - from)
+  for g in gOrder {
+    for v in fieldsOf(globalRecord(g)) {
+      if !putVal(s, v) { return false }
+      s.push(1)
+      // The zero of the field's type: `i32.const 0`, `i64.const 0`, or the float's bytes.
+      const zeros = if v == 0x7f || v == 0x7e { 1 } else if v == 0x7d { 4 } else if v == 0x7c { 8 } else { -1 }
+      if zeros < 0 { return false }
+      s.push(
+        if v == 0x7f { 0x41 } else if v == 0x7e { 0x42 } else if v == 0x7d { 0x43 } else { 0x44 },
+      )
+      let z = 0
+      while z < zeros {
+        s.push(0)
+        z = z + 1
+      }
+      s.push(0x0b)
+    }
+  }
+  return true
 }
 
 // Twin `i`'s signature's type index, or -1.
@@ -3085,6 +3377,17 @@ function explain(nPlans: i32) {
   while f < nFuncs {
     explainProducer(f, nPlans)
     f = f + 1
+  }
+  for g in gOrder {
+    logText("mv-explain: global ")
+    logDec(g)
+    logText(" -> type ")
+    logDec(globalRecord(g))
+    logText(": held as globals ")
+    logDec(gBase[g] ?? 0)
+    logText(" to ")
+    logDec((gBase[g] ?? 0) + fieldsOf(globalRecord(g)).length - 1)
+    logLine(", one per field")
   }
 }
 

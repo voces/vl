@@ -42,6 +42,8 @@ const FIXTURES: [string, Want][] = [
   ["fresh-argument-written", "kept"],
   ["fresh-argument-stored", "kept"],
   ["fresh-argument-held", "output"],
+  ["module-const", "melts"],
+  ["module-var", "output"],
 ];
 // The step runs before the rung's binaryen passes and writes the same dump at both, so only
 // `melts`, whose count is read after those passes, is graded at `-O3` as well.
