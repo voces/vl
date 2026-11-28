@@ -98,7 +98,8 @@ mkdir -p "$WORK" || exit 1
 KERNELS="scale-view scale-accessor scale-buf scale-hoist scale-seedtwice
 reduce-view reduce-buf reduce-hoist
 axpy-view axpy-fencedhoist axpy-buf axpy-hoist
-rows-view rows-buf rows-hoist"
+rows-view rows-buf rows-hoist
+gscale-view gscale-at"
 RUNGS="none O O3"
 
 # VB_ONLY is an ERE matched against each kernel name — for re-measuring one
@@ -123,12 +124,13 @@ acc_of() {
     reduce) echo 1 ;;  # one load
     axpy) echo 3 ;;    # two loads + one store
     rows) echo 2 ;;    # one load + one store
+    gscale) echo 2 ;;  # one load + one store, the view in a module const
   esac
 }
 
 # Expected stdout, R>0 and R=0. The pair is the elision detector.
-want_of() { case "$1" in scale) echo 2 ;; reduce) echo 525336576 ;; axpy) echo 501 ;; rows) echo 501 ;; esac; }
-want0_of() { case "$1" in scale) echo 1 ;; reduce) echo 0 ;; axpy) echo 0 ;; rows) echo 0 ;; esac; }
+want_of() { case "$1" in scale|gscale) echo 2 ;; reduce) echo 525336576 ;; axpy) echo 501 ;; rows) echo 501 ;; esac; }
+want0_of() { case "$1" in scale|gscale) echo 1 ;; reduce) echo 0 ;; axpy) echo 0 ;; rows) echo 0 ;; esac; }
 
 flag_of() { case "$1" in none) echo "" ;; O) echo "-O" ;; O3) echo "-O3" ;; esac; }
 
